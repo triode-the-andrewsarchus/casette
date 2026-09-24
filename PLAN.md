@@ -31,35 +31,40 @@ what actually happened lives in `PROGRESS.md`. Hard-won pattern lessons live in
 | [PROGRESS.md](PROGRESS.md) | Current progress summary + table of contents; detailed dated logs live in `progress/`. |
 | [PROBLEMS.md](PROBLEMS.md) | Table of contents for hard-won pattern lessons; detailed entries live in `problems/`. |
 
-## Architecture (target, per INITIAL.md)
+## Architecture (Linux Target with Rust & egui)
 
 ```text
-Native macOS UI (SwiftUI)
+Native Linux GUI (`crates/casette-gui` with egui / eframe)
+  ↕ tokio mpsc channels / request_repaint()
+Process Manager (`crates/casette-kernel` with Tokio & SIGINT control)
+  ↕ JSONL framing over stdin/stdout
+Sage Worker (`v0/01-worker-protocol/worker.py` via Python 3 / SageMath)
   ↕
-SessionController
-  ↕ JSONL over stdin/stdout
-Sage worker  (sage -python worker.py)
-  ↕
-Persistent Sage namespace
+Persistent Sage namespace & cysignals
 ```
 
-Three UI regions: large results pane / session tape (left), tabbed sidebar
-(Symbols / History / Inspector / Actions), bottom input pane.
+Alongside the pure Rust parsing and lowering crate:
+```text
+`crates/friendly-compiler`: Pure Rust library porting all FriendlyCompiler AST,
+lexer, IRs (unary, binary, derivative, integral, matrix, stats, etc.), and lowering.
+```
 
-## Build system
+Three UI regions:
+- Large scrollable session tape with formatted math, matrix grids, plot images, and `#ROW` referencing.
+- Bottom input pane with real-time "Generated Sage" lowering preview and formula chip templates.
+- Tabbed sidebar (Symbols introspection, History, Selected Row Inspector with Matrix Properties, Sage Doctor diagnostics).
 
-No Xcode IDE, no xcodebuild, no XcodeGen — Xcode is only a toolchain provider.
+## Build System
 
-- `swift build` compiles the SwiftPM `Casette` executable target.
-- `./build.sh [debug|release]` assembles `build/Casette.app` (Info.plist,
-  icon, PkgInfo) and codesigns (ad-hoc fallback when no identity is set).
-- `Makefile` drives it. `make help` lists targets. Key ones:
-  - `make` / `make build` — debug build → `build/Casette.app`
-  - `make check` — compile-only gate (CI / agent)
-  - `make test` — SwiftPM test suite
-  - `make run` — build + launch
-  - `make icon` — regenerate `build/AppIcon.icns` (cassette glyph)
-  - `make dist` — sign → notarize → staple → zip (needs a `vX.Y.Z` tag + signing identity)
+Driven by Cargo workspace (`Cargo.toml`) and standard `Makefile`:
+- `make` / `make build` — debug build of workspace crates (`target/debug/casette`)
+- `make run` — build and launch the Casette Linux GUI
+- `make test` — run complete unit, lowering, and live kernel integration test suites
+- `make check` — run `cargo check` and `cargo clippy --workspace --all-targets`
+- `make fmt` — format all source code with `cargo fmt`
+- `make release` — build optimized binary in `target/release/casette`
+- `make install` — install to `~/.local/bin/casette` with `.desktop` launcher
+- `make clean` — clean cargo build target directory
 
 ## Status
 
