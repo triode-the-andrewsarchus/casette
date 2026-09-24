@@ -9,7 +9,7 @@ Current gates are green: `swift test` (**642/642**, 97 suites), `make check`,
 latest matrix-inspector work. Detailed historical notes live in [`progress/`](progress/),
 newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
 
-**Rust & egui Port Progress (Phases 0, 1 & 2 Complete):**
+**Rust & egui Port Progress (Phases 0 through 5 Complete):**
 - **Phase 0:** Root Cargo workspace scaffolding (`friendly-compiler`, `casette-kernel`, `casette-gui`) configured with Linux target dependencies.
 - **Phase 1:** Complete pure Rust port of `FriendlyCompiler` with 100% test parity across all compiler and IR lowerings (`cargo test` passes all 21 test suites).
 - **Phase 2:** Complete Tokio-based `casette-kernel` crate:
@@ -19,7 +19,21 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
   - Real worker PID capture from ready handshake envelope.
   - Fast interrupt delivery via `SIGINT` to worker PID for swift cysignals/Sage computation cancellation with zero worker corruption; clean session restart on stuck processes.
   - Automatic boot prelude execution (`var('u, v, w, x, y, z, ...')`) pre-populating standard calculator variables.
-  - Verified with comprehensive live integration tests (`kernel_integration_tests.rs`) covering eval, ping, symbols, precision config, and SIGINT cancellation. All 30 workspace tests pass cleanly with 0 warnings on `cargo clippy`.
+  - Verified with comprehensive live integration tests (`kernel_integration_tests.rs`) covering eval, ping, symbols, precision config, and SIGINT cancellation.
+- **Phase 3:** `casette-gui` Core Shell & Math/Plot Rendering:
+  - `theme.rs`: Refined dark theme adhering to typography scale and visual hierarchy with clean cassette accents.
+  - `render/texture_cache.rs`: Vector SVG rendering with `resvg`/`usvg`/`tiny-skia` and raster PNG artifact loading into cached `egui::TextureHandle`s.
+  - `render/math_view.rs`: Numbers/macOS-styled interactive matrix grid rendering (`[` `]`, padded cells, zero deemphasis), plot image renditions, error diagnostic cards, and row action menus (Copy Plain, Copy LaTeX, Differentiate, Integrate, Simplify).
+  - `views/tape_view.rs`: Virtualized scrollable session tape with row number badges (`#1`), execution time pills, live state tracking, input expression rows, and compiled Sage indicators.
+- **Phase 4:** Input Pane & Live Lowering:
+  - `views/input_view.rs`: Multi-line editor with history navigation (Arrow Up/Down, Esc to clear, Enter to evaluate).
+  - Synchronous "Generated Sage" live preview bar evaluating `friendly_compiler::compile` on every keystroke with auto-variable chips.
+  - One-click formula chip templates (`factor`, `expand`, `diff`, `integral`, `solve`, `matrix`, `plot`, `taylor`, `sum`).
+  - Prominent Cancel button wired to `SIGINT` interruption during long-running evaluations.
+- **Phase 5:** Sidebar, Persistence & Doctor:
+  - `views/sidebar_view.rs`: Tabbed sidebar with Symbols introspection (name/kind/summary table, filter, and hidden boot variables filter), History replay list, Inspector (selected row deep metadata, matrix properties), and Sage Doctor.
+  - `persistence.rs`: Clean-sheet JSON session serialization and Markdown notebook export.
+  - All 32 workspace tests passing cleanly, 0 warnings on `cargo clippy`.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift
