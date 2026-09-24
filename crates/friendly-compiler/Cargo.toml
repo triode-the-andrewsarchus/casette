@@ -1,0 +1,15 @@
+[package]
+name = "friendly-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Fast, pure friendly input compiler and command shim for Casette"
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
