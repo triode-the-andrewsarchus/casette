@@ -16,7 +16,11 @@ pub struct CompileError {
 
 impl CompileError {
     /// Creates a new compile error.
-    pub fn new(message: impl Into<String>, position: Option<usize>, suggestion: Option<String>) -> Self {
+    pub fn new(
+        message: impl Into<String>,
+        position: Option<usize>,
+        suggestion: Option<String>,
+    ) -> Self {
         Self {
             message: message.into(),
             position,
