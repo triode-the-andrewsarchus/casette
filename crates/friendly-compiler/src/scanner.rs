@@ -46,7 +46,7 @@ pub fn balance_error(s: &str) -> Option<BalanceError> {
     let mut stack: Vec<(char, usize)> = Vec::new();
 
     for (offset, ch) in s.char_indices() {
-        if let Some(_) = matching_close(ch) {
+        if matching_close(ch).is_some() {
             stack.push((ch, offset));
         } else if is_closer(ch) {
             match stack.pop() {

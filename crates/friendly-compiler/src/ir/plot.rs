@@ -282,10 +282,10 @@ impl ParametricPlotFormulaIR {
         let mut x_expression = String::new();
         let mut y_expression = String::new();
 
-        if pair_text.starts_with('(') {
-            let mut inner = scanner::trimmed_shim(&pair_text[1..]);
-            if inner.ends_with(')') {
-                inner = scanner::trimmed_shim(&inner[..inner.len() - 1]);
+        if let Some(stripped_prefix) = pair_text.strip_prefix('(') {
+            let mut inner = scanner::trimmed_shim(stripped_prefix);
+            if let Some(stripped_suffix) = inner.strip_suffix(')') {
+                inner = scanner::trimmed_shim(stripped_suffix);
             }
             let coords = scanner::split_top_level_commas(inner);
             if let Some(first) = coords.first() {

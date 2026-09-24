@@ -419,10 +419,10 @@ pub fn leading_command(input: &str) -> Option<CommandMatch> {
 
     for &kw in Keyword::ALL {
         for &phrase in kw.phrases() {
-            if matches_command(&lower, phrase, input) {
-                if best.is_none() || phrase.len() > best.unwrap().1.len() {
-                    best = Some((kw, phrase));
-                }
+            if matches_command(&lower, phrase, input)
+                && (best.is_none() || phrase.len() > best.unwrap().1.len())
+            {
+                best = Some((kw, phrase));
             }
         }
     }
@@ -2200,8 +2200,8 @@ fn utf8_offset(needle: &str, haystack: &str) -> usize {
 
 fn dropping_integral_trailing_comma(s: &str) -> &str {
     let trimmed = scanner::trimmed_shim(s);
-    if trimmed.ends_with(',') {
-        scanner::trimmed_shim(&trimmed[..trimmed.len() - 1])
+    if let Some(stripped) = trimmed.strip_suffix(',') {
+        scanner::trimmed_shim(stripped)
     } else {
         trimmed
     }

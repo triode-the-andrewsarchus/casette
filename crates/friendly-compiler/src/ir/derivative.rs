@@ -43,8 +43,8 @@ impl DerivativeFormulaIR {
             explicit_variable =
                 Some(scanner::trimmed_shim(&body[wrt.value_range.clone()]).to_string());
             let before = scanner::trimmed_shim(&body[..wrt.clause_start]);
-            let stripped = if before.ends_with(',') {
-                scanner::trimmed_shim(&before[..before.len() - 1])
+            let stripped = if let Some(s) = before.strip_suffix(',') {
+                scanner::trimmed_shim(s)
             } else {
                 before
             };

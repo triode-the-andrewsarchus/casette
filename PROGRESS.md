@@ -9,15 +9,17 @@ Current gates are green: `swift test` (**642/642**, 97 suites), `make check`,
 latest matrix-inspector work. Detailed historical notes live in [`progress/`](progress/),
 newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
 
-**Rust & egui Port Planning (Linux Target):** Formulated and agreed on the full
-migration roadmap to port Casette from native macOS SwiftUI to a native Linux
-desktop application written in Rust using `egui` (`eframe`). See
-[`plans/RUST-EGUI-PORT.md`](plans/RUST-EGUI-PORT.md). The design establishes a
-Cargo workspace with a pure `friendly-compiler` crate (targeting 100% test parity
-across the 69 parser tests), a Tokio-based `casette-kernel` managing the
-persistent Sage worker process and JSONL communications, an offline vector
-`MathRenderer` in egui, a clean-sheet serde session persistence format, and a
-phased implementation plan culminating in the retirement of legacy Swift code.
+**Rust & egui Port Progress (Phases 0, 1 & 2 Complete):**
+- **Phase 0:** Root Cargo workspace scaffolding (`friendly-compiler`, `casette-kernel`, `casette-gui`) configured with Linux target dependencies.
+- **Phase 1:** Complete pure Rust port of `FriendlyCompiler` with 100% test parity across all compiler and IR lowerings (`cargo test` passes all 21 test suites).
+- **Phase 2:** Complete Tokio-based `casette-kernel` crate:
+  - Linux Sage environment discovery via `SageDiscovery` probing `python3 -c "import sage.all, sage.version..."` and candidate binary paths.
+  - JSONL protocol types (`WorkerRequest`, `WorkerResponse`, `ArtifactPayload`, `TruncationPayload`, `MatrixPropertyPayload`, `ErrorPayload`, `SymbolPayload`) with full serde support and RFC 1574 rustdoc.
+  - Asynchronous `SageKernel` client managing `worker.py` in its own process group (`setsid`).
+  - Real worker PID capture from ready handshake envelope.
+  - Fast interrupt delivery via `SIGINT` to worker PID for swift cysignals/Sage computation cancellation with zero worker corruption; clean session restart on stuck processes.
+  - Automatic boot prelude execution (`var('u, v, w, x, y, z, ...')`) pre-populating standard calculator variables.
+  - Verified with comprehensive live integration tests (`kernel_integration_tests.rs`) covering eval, ping, symbols, precision config, and SIGINT cancellation. All 30 workspace tests pass cleanly with 0 warnings on `cargo clippy`.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift
