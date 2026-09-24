@@ -42,7 +42,23 @@ async fn test_kernel_boot_eval_ping() {
     let prec = kernel.config_precision(20).await.expect("config precision");
     assert_eq!(prec, 20);
 
-    // 5. Test shutdown
+    // 5. Test math artifact generation on integration
+    let math_resp = kernel
+        .eval("integrate(1/(1-x^2), x)", false, None)
+        .await
+        .expect("eval math");
+    assert!(math_resp.ok);
+    assert!(math_resp.latex.is_some());
+    let math_art = math_resp
+        .artifacts
+        .iter()
+        .find(|a| a.r#type == "math")
+        .expect("should produce a math artifact");
+    assert_eq!(math_art.format, "svg");
+    let art_path = math_art.path.as_deref().expect("artifact path");
+    assert!(std::path::Path::new(art_path).exists(), "SVG artifact file should exist");
+
+    // 6. Test shutdown
     kernel.shutdown().await.expect("shutdown");
 }
 

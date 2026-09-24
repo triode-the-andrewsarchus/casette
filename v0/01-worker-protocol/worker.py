@@ -685,6 +685,50 @@ def _save_plot_artifact(plot_obj):
     return artifacts
 
 
+def _render_math_artifact(latex_str):
+    """Save a LaTeX math expression to an SVG image artifact.
+
+    Uses matplotlib's built-in Computer Modern mathtext renderer to produce
+    crisp, transparent vector typography matching native math typesetting.
+    """
+    global _PLOT_COUNTER
+    _PLOT_COUNTER += 1
+    stem = "math-%05d" % _PLOT_COUNTER
+    path = os.path.join(_session_dir(), "%s.svg" % stem)
+    try:
+        import io, re, matplotlib
+        matplotlib.rcParams["mathtext.fontset"] = "cm"
+        import matplotlib.mathtext as mathtext
+        from matplotlib.font_manager import FontProperties
+
+        cleaned = " ".join(latex_str.strip().strip("$").split())
+        if not cleaned:
+            return None
+
+        buf = io.BytesIO()
+        prop = FontProperties(size=20)
+        mathtext.math_to_image(f"${cleaned}$", buf, prop=prop, dpi=180, format="svg", color="#F0F6FC")
+        svg = buf.getvalue().decode("utf-8")
+        # Ensure the background rectangle is transparent
+        svg_clean = re.sub(
+            r'(<g id="patch_1">\s*<path [^>]*style=")[^"]*"',
+            r'\1fill: none;"',
+            svg,
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(svg_clean)
+        return {
+            "type": "math",
+            "format": "svg",
+            "path": path,
+            "bytes": os.path.getsize(path),
+        }
+    except Exception as exc:  # noqa: BLE001 - math render errors must never fail eval
+        _log("math rendering failed for %s: %s" % (latex_str[:40], exc))
+        return None
+
+
+
 # Per-eval collector for plots captured via `.show()`. Reset at the start of
 # each eval; a list of (object) refs in call order, de-duplicated by identity.
 _SHOWN_PLOTS = []
@@ -1269,6 +1313,12 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
 
     actions = _actions_for(value, kind)
 
+    artifacts_list = list(artifacts) if artifacts else []
+    if latex_str and kind not in ("plot", "matrix", "error", "interrupted"):
+        math_art = _render_math_artifact(latex_str)
+        if math_art:
+            artifacts_list.append(math_art)
+
     env = {
         "kind": kind,
         "plain": plain,
@@ -1279,7 +1329,7 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
         "exact": exact,
         "primary_is_approx": primary_is_approx,
         "actions": actions,
-        "artifacts": list(artifacts) if artifacts else [],
+        "artifacts": artifacts_list,
         "truncated": truncated,
     }
     matrix_properties = _matrix_properties(value)

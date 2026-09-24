@@ -159,3 +159,18 @@ fn test_tape_references_expansion_and_reusable_expression() {
     assert!(assign_code.contains("__casette_tape_refs[1] = (integrate(1/(1-x^2), x))"));
     assert!(assign_code.contains("globals().get('__casette_tape_refs'"));
 }
+
+#[test]
+fn test_math_rendering_and_texture_cache() {
+    let ctx = egui::Context::default();
+    let mut cache = casette_gui::render::TextureCache::new();
+
+    // Test on-the-fly LaTeX rendering of integral result
+    let latex = r"\frac{1}{2} \log\left(x + 1\right) - \frac{1}{2} \log\left(x - 1\right)";
+    let handle = cache.get_or_render_latex(&ctx, latex);
+    assert!(handle.is_some(), "LaTeX should be rendered to a texture");
+    let texture = handle.unwrap();
+    let size = texture.size_vec2();
+    assert!(size.x > 50.0);
+    assert!(size.y > 10.0);
+}

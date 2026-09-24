@@ -42,6 +42,11 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
     - Added automatic worker registration of successful row expressions to `__casette_tape_refs[ROW] = (<expr>)` and prune retired entries outside the 20-entry window.
     - Commands like `plot #1, x=-10..10` now correctly resolve row references into Sage `Graphics` objects without Python comment collisions.
     - Added automated unit and integration tests in `friendly_compiler_tests.rs` and `gui_tests.rs` verifying tape expansion, error row skipping, assignment code generation, and plot lowering. All 38 workspace tests green with 0 clippy warnings.
+  - **Bug 3 (LaTeX Mathematical Typography Rendering):** Fixed math expression display to match original macOS Casette TeX typography:
+    - In `v0/01-worker-protocol/worker.py`: Added `_render_math_artifact(latex_str)` leveraging matplotlib's built-in Computer Modern (`cm`) mathtext engine (`FontProperties(size=20)`, `#F0F6FC` primary text color matching dark theme, transparent background patch). Emitted as `{"type": "math", "format": "svg", ...}` in result envelopes whenever Sage generates a valid `latex` representation.
+    - In `crates/casette-gui/src/render/texture_cache.rs`: Upgraded SVG rasterization to 2.0x scale for crisp HiDPI/Retina display; added `get_or_render_latex(&mut self, ctx: &Context, latex: &str)` caching fallback to `/tmp/casette_math_<hash>.svg` for restored or offline sessions.
+    - In `crates/casette-gui/src/render/math_view.rs`: Refactored result routing so plot cards only render `artifact.r#type == "image"`, matrix views render grids, and mathematical results route to `render_primary_math` displaying vector math textures at natural proportional size with graceful fallback to `render_primary_text`.
+    - Added automated GUI test `test_math_rendering_and_texture_cache` and kernel integration test `test_kernel_boot_eval_ping` asserting math SVG generation and valid on-disk artifacts. All 39 tests pass with 0 warnings.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift

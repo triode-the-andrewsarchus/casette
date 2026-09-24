@@ -64,6 +64,60 @@ impl TextureCache {
         Some(ctx.load_texture(name, image, TextureOptions::LINEAR))
     }
 
+    /// Gets or renders a LaTeX expression to a cached texture.
+    pub fn get_or_render_latex(&mut self, ctx: &Context, latex: &str) -> Option<&TextureHandle> {
+        let trimmed = latex.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Cache key based on content hash
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            trimmed.hash(&mut hasher);
+            hasher.finish()
+        };
+        let path = std::env::temp_dir().join(format!("casette_math_{:016x}.svg", hash));
+
+        if !path.exists() {
+            Self::render_latex_to_svg(trimmed, &path)?;
+        }
+
+        self.get_or_load(ctx, &path)
+    }
+
+    fn render_latex_to_svg(latex: &str, out_path: &Path) -> Option<()> {
+        let script = r##"
+import sys, io, re, matplotlib
+matplotlib.rcParams['mathtext.fontset'] = 'cm'
+import matplotlib.mathtext as mathtext
+from matplotlib.font_manager import FontProperties
+
+latex = " ".join(sys.argv[1].strip().strip("$").split())
+out_file = sys.argv[2]
+buf = io.BytesIO()
+prop = FontProperties(size=20)
+mathtext.math_to_image(f"${latex}$", buf, prop=prop, dpi=180, format="svg", color="#F0F6FC")
+svg = buf.getvalue().decode("utf-8")
+svg_clean = re.sub(r'(<g id="patch_1">\s*<path [^>]*style=")[^"]*"', r'\1fill: none;"', svg)
+with open(out_file, "w", encoding="utf-8") as f:
+    f.write(svg_clean)
+"##;
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(latex)
+            .arg(out_path.as_os_str())
+            .output()
+            .ok()?;
+        if output.status.success() && out_path.exists() {
+            Some(())
+        } else {
+            None
+        }
+    }
+
     fn load_svg(path: &Path) -> Option<ColorImage> {
         let svg_data = fs::read(path).ok()?;
         let opt = usvg::Options::default();
@@ -72,11 +126,12 @@ impl TextureCache {
             .ok()?;
 
         let pixmap_size = tree.size().to_int_size();
-        let width = pixmap_size.width().clamp(1, 2048);
-        let height = pixmap_size.height().clamp(1, 2048);
+        let scale = 2.0_f32;
+        let width = ((pixmap_size.width() as f32 * scale).round() as u32).clamp(1, 4096);
+        let height = ((pixmap_size.height() as f32 * scale).round() as u32).clamp(1, 4096);
 
         let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
-        resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
 
         let pixels = pixmap
             .data()

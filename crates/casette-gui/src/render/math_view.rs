@@ -40,21 +40,16 @@ pub fn render_result(
     }
 
     // Check if this row produced plot artifacts
-    let has_plot = result
-        .artifacts
-        .iter()
-        .any(|a| a.format == "svg" || a.format == "png");
-    if has_plot || result.kind.as_deref() == Some("plot") {
+    let has_plot_artifact = result.artifacts.iter().any(|a| a.r#type == "image");
+    if has_plot_artifact || result.kind.as_deref() == Some("plot") {
         render_plot_card(ui, result, texture_cache);
     }
 
     // Render matrix or primary math/plain text
     if result.kind.as_deref() == Some("matrix") {
         render_matrix_view(ui, result);
-    } else if let Some(plain) = &result.plain {
-        if !plain.is_empty() && result.kind.as_deref() != Some("plot") {
-            render_primary_text(ui, plain, result.latex.as_deref());
-        }
+    } else if result.kind.as_deref() != Some("plot") {
+        render_primary_math(ui, result, texture_cache);
     }
 
     // Secondary approximation line if available
@@ -84,6 +79,50 @@ pub fn render_result(
 
     // Action buttons bar
     render_action_bar(ui, row, result, on_action);
+}
+
+fn render_primary_math(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut TextureCache) {
+    let ctx = ui.ctx().clone();
+
+    // 1. Try to display pre-rendered math SVG artifact from worker
+    let math_art_path = result
+        .artifacts
+        .iter()
+        .find(|a| a.r#type == "math")
+        .and_then(|a| a.path.as_deref());
+
+    let math_texture = if let Some(path) = math_art_path {
+        texture_cache.get_or_load(&ctx, path)
+    } else if let Some(latex) = result.latex.as_deref() {
+        texture_cache.get_or_render_latex(&ctx, latex)
+    } else {
+        None
+    };
+
+    if let Some(texture) = math_texture {
+        let size = texture.size_vec2();
+        // Texture is rasterized at 2.0x scale for crisp HiDPI typography
+        let logical_w = size.x / 2.0;
+        let logical_h = size.y / 2.0;
+
+        let max_w = (ui.available_width() - 24.0).max(50.0);
+        let (display_w, display_h) = if logical_w > max_w {
+            let scale = max_w / logical_w;
+            (max_w, logical_h * scale)
+        } else {
+            (logical_w, logical_h)
+        };
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.image((texture.id(), vec2(display_w, display_h)));
+        });
+        ui.add_space(4.0);
+    } else if let Some(plain) = &result.plain {
+        if !plain.is_empty() {
+            render_primary_text(ui, plain, result.latex.as_deref());
+        }
+    }
 }
 
 fn render_primary_text(ui: &mut Ui, plain: &str, _latex: Option<&str>) {
@@ -177,22 +216,24 @@ fn render_matrix_view(ui: &mut Ui, result: &WorkerResponse) {
 fn render_plot_card(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut TextureCache) {
     let ctx = ui.ctx().clone();
     for artifact in &result.artifacts {
-        if let Some(path) = &artifact.path {
-            if let Some(texture) = texture_cache.get_or_load(&ctx, path) {
-                let size = texture.size_vec2();
-                let aspect = size.x / size.y.max(1.0);
-                let target_width = (460.0_f32).min(ui.available_width() - 20.0).max(100.0);
-                let target_height = target_width / aspect;
+        if artifact.r#type == "image" {
+            if let Some(path) = &artifact.path {
+                if let Some(texture) = texture_cache.get_or_load(&ctx, path) {
+                    let size = texture.size_vec2();
+                    let aspect = size.x / size.y.max(1.0);
+                    let target_width = (460.0_f32).min(ui.available_width() - 20.0).max(100.0);
+                    let target_height = target_width / aspect;
 
-                ui.add_space(6.0);
-                Frame::new()
-                    .fill(Color32::from_rgb(255, 255, 255))
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.image((texture.id(), vec2(target_width, target_height)));
-                    });
-                ui.add_space(6.0);
+                    ui.add_space(6.0);
+                    Frame::new()
+                        .fill(Color32::from_rgb(255, 255, 255))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.image((texture.id(), vec2(target_width, target_height)));
+                        });
+                    ui.add_space(6.0);
+                }
             }
         }
     }
