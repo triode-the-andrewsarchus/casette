@@ -16,17 +16,24 @@ fn test_session_state_push_and_clear() {
     assert_eq!(state.rows.len(), 1);
     assert_eq!(state.next_row_number, 2);
 
-    let row2 = state.push_row("diff(#1, x)".into(), "diff(__casette_tape_refs[1], x)".into());
+    let row2 = state.push_row(
+        "diff(#1, x)".into(),
+        "diff(__casette_tape_refs[1], x)".into(),
+    );
     assert_eq!(row2, 2);
     assert_eq!(state.rows.len(), 2);
     assert_eq!(state.next_row_number, 3);
 
     // Complete row 1
-    let resp1: WorkerResponse = serde_json::from_str(r#"{"ok": true, "plain": "2", "kind": "integer"}"#)
-        .expect("deserialize");
+    let resp1: WorkerResponse =
+        serde_json::from_str(r#"{"ok": true, "plain": "2", "kind": "integer"}"#)
+            .expect("deserialize");
     state.rows[0].complete(resp1, Duration::from_millis(15));
     assert!(!state.rows[0].is_evaluating);
-    assert_eq!(state.rows[0].result.as_ref().unwrap().plain.as_deref(), Some("2"));
+    assert_eq!(
+        state.rows[0].result.as_ref().unwrap().plain.as_deref(),
+        Some("2")
+    );
 
     // Clear tape
     state.clear_tape();
@@ -61,7 +68,12 @@ fn test_session_persistence_roundtrip() {
     assert_eq!(restored_state.rows[0].row_number, 1);
     assert_eq!(restored_state.rows[0].input_raw, "factor(x^2 - 1)");
     assert_eq!(
-        restored_state.rows[0].result.as_ref().unwrap().plain.as_deref(),
+        restored_state.rows[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .plain
+            .as_deref(),
         Some("(x - 1)*(x + 1)")
     );
     assert!(!restored_state.rows[0].is_live); // Restored rows start as not live
