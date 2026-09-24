@@ -22,5 +22,17 @@ So this:
 
 * *It accepts Matlab matrix definition notation*.
 
-It will probably get better. Importantly: this repo should be pretty discoverable for Claude or Codex; it has a straightforward design, and it's basically pure SwiftUI surfacing stuff from a SageMath process. Knock yourself out!
+It will probably get better. Importantly: this repo is written in **Rust** using **egui** (`eframe`) for high-performance native Linux desktop execution, with a Tokio-based process manager connecting to a persistent SageMath background worker. Knock yourself out!
+
+### Building & Running (Linux)
+
+Requires Rust (1.80+) and SageMath (Sage 10+ / Python 3 with `sage.all`).
+
+```bash
+make run      # Build and launch the Casette GUI
+make test     # Run all unit, lowering, and kernel integration tests
+make check    # Run compiler checks and clippy
+make release  # Build optimized release binary
+make install  # Install to ~/.local/bin and add desktop launcher
+```
 
