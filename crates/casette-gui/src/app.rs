@@ -90,7 +90,8 @@ impl CasetteApp {
     }
 
     fn submit_evaluation(&mut self, input: String, numeric: bool) {
-        let compiled = match friendly_compiler::compile(&input) {
+        let refs = self.state.tape_references();
+        let compiled = match friendly_compiler::compile_with_refs(&input, &refs) {
             friendly_compiler::CompileResult::Success { generated_sage, .. } => generated_sage,
             friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
             _ => input.clone(),
@@ -126,6 +127,7 @@ impl App for CasetteApp {
             }
             if clear_tape {
                 self.state.clear_tape();
+                let _ = self.action_tx.send(GuiAction::ClearTape);
             }
         });
 

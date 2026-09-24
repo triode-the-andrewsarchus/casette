@@ -17,12 +17,15 @@ pub fn render_input_pane(
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             // 1. Live "Generated Sage" preview bar
-            render_live_lowering_preview(ui, &state.draft_input);
+            let tape_refs = state.tape_references();
+            render_live_lowering_preview(ui, &state.draft_input, &tape_refs);
 
             ui.add_space(6.0);
 
             // 2. Formula quick chips bar
-            render_formula_chips(ui, &mut state.draft_input);
+            if render_formula_chips(ui, &mut state.draft_input) {
+                state.request_input_focus = true;
+            }
 
             ui.add_space(6.0);
 
@@ -32,12 +35,18 @@ pub fn render_input_pane(
 
             let response = ui.add(
                 TextEdit::multiline(&mut state.draft_input)
+                    .id_salt("casette_main_input_editor")
                     .hint_text("Type math or command (e.g. diff(#1, x), factor, matrix) - Enter to evaluate")
                     .font(FontId::new(14.0, FontFamily::Proportional))
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .lock_focus(true),
             );
+
+            if state.request_input_focus {
+                response.request_focus();
+                state.request_input_focus = false;
+            }
 
             // Keyboard navigation: Enter to submit, Up/Down for history
             if response.has_focus() {
@@ -117,13 +126,17 @@ pub fn render_input_pane(
         });
 }
 
-fn render_live_lowering_preview(ui: &mut Ui, draft: &str) {
+fn render_live_lowering_preview(
+    ui: &mut Ui,
+    draft: &str,
+    refs: &friendly_compiler::TapeReferenceTable,
+) {
     let trimmed = draft.trim();
     if trimmed.is_empty() {
         return;
     }
 
-    match friendly_compiler::compile(trimmed) {
+    match friendly_compiler::compile_with_refs(trimmed, refs) {
         friendly_compiler::CompileResult::Success {
             generated_sage,
             required_variables,
@@ -155,8 +168,12 @@ fn render_live_lowering_preview(ui: &mut Ui, draft: &str) {
         friendly_compiler::CompileResult::Bypass { .. } => {}
         friendly_compiler::CompileResult::Error(err) => {
             ui.horizontal(|ui| {
+                let mut msg = format!("Hint: {}", err.message);
+                if let Some(sug) = &err.suggestion {
+                    msg.push_str(&format!(" ({})", sug));
+                }
                 ui.label(
-                    RichText::new(format!("Hint: {}", err))
+                    RichText::new(msg)
                         .color(Colors::NUMERIC_AMBER)
                         .font(FontId::new(11.0, FontFamily::Proportional))
                         .italics(),
@@ -176,7 +193,7 @@ fn render_live_lowering_preview(ui: &mut Ui, draft: &str) {
     }
 }
 
-fn render_formula_chips(ui: &mut Ui, draft: &mut String) {
+fn render_formula_chips(ui: &mut Ui, draft: &mut String) -> bool {
     let chips = [
         ("factor", "factor(EXPR)"),
         ("expand", "expand(EXPR)"),
@@ -188,6 +205,8 @@ fn render_formula_chips(ui: &mut Ui, draft: &mut String) {
         ("taylor", "taylor(EXPR, x, 0, 5)"),
         ("sum", "sum(k^2, k, 1..10)"),
     ];
+
+    let mut clicked = false;
 
     ui.horizontal(|ui| {
         ui.label(
@@ -209,6 +228,7 @@ fn render_formula_chips(ui: &mut Ui, draft: &mut String) {
                 )
                 .clicked()
             {
+                clicked = true;
                 if draft.is_empty() {
                     *draft = snippet.to_string();
                 } else {
@@ -217,6 +237,8 @@ fn render_formula_chips(ui: &mut Ui, draft: &mut String) {
             }
         }
     });
+
+    clicked
 }
 
 fn navigate_history(state: &mut SessionState, up: bool) {

@@ -287,3 +287,45 @@ fn test_no_implicit_multiplication() {
     expect_success("factor 2*x", "factor(2*x)");
     expect_success("factor 2x", "factor(2x)");
 }
+
+// MARK: - Tape reference compilation
+
+#[test]
+fn test_tape_references_compilation() {
+    use friendly_compiler::{compile_with_refs, TapeReferenceTable};
+
+    let mut refs = TapeReferenceTable::empty();
+    refs.insert(1, "1/(1 - x^2)".into());
+    refs.insert(57, "x^4 - 1".into());
+
+    // 1. Plot referencing #1
+    let r = compile_with_refs("plot #1, x=-10..10", &refs);
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = r
+    {
+        assert_eq!(generated_sage, "plot(__casette_tape_refs[1], (x, -10, 10))");
+        // __casette_tape_refs must NOT be treated as a free variable needing declaration
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for plot #1, got {:?}", r);
+    }
+
+    // 2. Factor referencing #57
+    let r2 = compile_with_refs("expand #57", &refs);
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = r2
+    {
+        assert_eq!(generated_sage, "expand(__casette_tape_refs[57])");
+        assert!(required_variables.is_empty());
+    } else {
+        panic!("expected success for expand #57, got {:?}", r2);
+    }
+
+    // 3. Missing reference yields compile error
+    let r3 = compile_with_refs("plot #2, x=-10..10", &refs);
+    assert!(matches!(r3, CompileResult::Error(_)));
+}

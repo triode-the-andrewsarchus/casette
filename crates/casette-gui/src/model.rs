@@ -74,6 +74,48 @@ impl TapeRow {
         self.duration = Some(duration);
         self.result = Some(response);
     }
+
+    /// Returns the Sage expression that can be safely reused for follow-up commands
+    /// (e.g. tape references `#ROW`). Returns `None` if the row failed, was interrupted,
+    /// or cannot be expressed as a single reusable value.
+    #[must_use]
+    pub fn reusable_expression(&self) -> Option<String> {
+        let res = self.result.as_ref()?;
+        if !res.ok
+            || res.kind.as_deref() == Some("error")
+            || res.kind.as_deref() == Some("interrupted")
+        {
+            return None;
+        }
+
+        let sage = self.compiled_sage.trim();
+        if sage.is_empty() {
+            return None;
+        }
+
+        // Echoed assignment check: "A = ...\nA"
+        let lines: Vec<&str> = sage
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.len() == 2 {
+            if let Some((lhs, _)) = lines[0].split_once('=') {
+                let target = lhs.trim();
+                if lines[1] == target && friendly_compiler::variables::is_plausible_variable(target)
+                {
+                    return Some(target.to_string());
+                }
+            }
+        }
+
+        // Multiline non-assignment cannot be safely reused as a single expression
+        if lines.len() > 1 {
+            return None;
+        }
+
+        Some(sage.to_string())
+    }
 }
 
 /// Actions dispatched from the UI thread to the asynchronous kernel task.
@@ -81,6 +123,8 @@ impl TapeRow {
 pub enum GuiAction {
     /// Submit expression to evaluate.
     Evaluate { input: String, numeric: bool },
+    /// Clear all tape references and reset row numbering.
+    ClearTape,
     /// Probe worker responsiveness.
     Ping,
     /// Introspect session symbol table.
@@ -140,6 +184,8 @@ pub struct SessionState {
     pub draft_input: String,
     /// Force numeric evaluation mode toggle.
     pub force_numeric: bool,
+    /// Flag requesting the input editor to take focus.
+    pub request_input_focus: bool,
 }
 
 impl Default for SessionState {
@@ -157,6 +203,7 @@ impl Default for SessionState {
             history_pointer: None,
             draft_input: String::new(),
             force_numeric: false,
+            request_input_focus: true,
         }
     }
 }
@@ -180,26 +227,24 @@ impl SessionState {
         self.rows.clear();
         self.next_row_number = 1;
         self.selected_row_index = None;
+        self.request_input_focus = true;
     }
 
-    /// Rebuilds the tape reference mapping code `__casette_tape_refs[#] = ...`
-    /// for all valid past rows in the last 20-entry reference window.
+    /// Returns a [`friendly_compiler::TapeReferenceTable`] containing valid reusable expressions from the tape.
     #[must_use]
-    pub fn tape_reference_code(&self) -> String {
-        // Collect successful rows in last 20 entries
-        let window_start = self.rows.len().saturating_sub(20);
-        let mut refs = Vec::new();
-
-        for row in &self.rows[window_start..] {
-            if let Some(res) = &row.result {
-                if res.ok && res.kind.as_deref() != Some("error") {
-                    // Row is valid reference
-                    refs.push(row.row_number);
-                }
-            }
+    pub fn tape_references(&self) -> friendly_compiler::TapeReferenceTable {
+        let mut table = friendly_compiler::TapeReferenceTable::empty();
+        let valid_rows: Vec<(usize, String)> = self
+            .rows
+            .iter()
+            .filter_map(|r| r.reusable_expression().map(|expr| (r.row_number, expr)))
+            .collect();
+        let start = valid_rows
+            .len()
+            .saturating_sub(friendly_compiler::TapeReferenceTable::CAPACITY);
+        for (num, expr) in &valid_rows[start..] {
+            table.insert(*num, expr.clone());
         }
-
-        // Format initialization of dictionary if not yet present
-        "__casette_tape_refs = globals().get('__casette_tape_refs', {})\n".to_string()
+        table
     }
 }

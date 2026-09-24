@@ -43,6 +43,9 @@ fn is_ident_continue(ch: char) -> bool {
 
 /// Returns true if `name` is a plausible symbolic variable.
 pub fn is_plausible_variable(name: &str) -> bool {
+    if name.starts_with("__") || name == "__casette_tape_refs" {
+        return false;
+    }
     match name.chars().next() {
         Some(first) if is_ident_start(first) => !is_reserved(name),
         _ => false,

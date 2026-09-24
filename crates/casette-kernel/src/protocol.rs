@@ -120,7 +120,7 @@ impl WorkerRequest {
 ///
 /// Responses include the ready envelope emitted at worker startup, op replies (ping,
 /// symbols, config), evaluation result envelopes, and error or interrupted envelopes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct WorkerResponse {
     /// Request identifier echoed back from the matching request.
     #[serde(default)]
@@ -224,6 +224,24 @@ pub struct WorkerResponse {
 }
 
 impl WorkerResponse {
+    /// Constructs a failed response representing a client-side or kernel-side error.
+    #[must_use]
+    pub fn new_error(error_type: String, message: String, traceback: Option<String>) -> Self {
+        Self {
+            ok: false,
+            kind: Some("error".into()),
+            plain: Some(message.clone()),
+            repr: Some(message.clone()),
+            actions: vec!["copy_traceback".into()],
+            error: Some(ErrorPayload {
+                r#type: error_type,
+                message,
+                traceback,
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Returns `true` if this response represents the initial worker ready banner.
     #[must_use]
     pub fn is_ready(&self) -> bool {

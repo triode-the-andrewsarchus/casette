@@ -46,12 +46,13 @@ Persistent Sage namespace & cysignals
 Alongside the pure Rust parsing and lowering crate:
 ```text
 `crates/friendly-compiler`: Pure Rust library porting all FriendlyCompiler AST,
-lexer, IRs (unary, binary, derivative, integral, matrix, stats, etc.), and lowering.
+lexer, IRs (unary, binary, derivative, integral, matrix, stats, etc.), lowering,
+and `TapeReferenceTable` for expanding `#ROW` tape references to `__casette_tape_refs[ROW]`.
 ```
 
 Three UI regions:
 - Large scrollable session tape with formatted math, matrix grids, plot images, and `#ROW` referencing.
-- Bottom input pane with real-time "Generated Sage" lowering preview and formula chip templates.
+- Bottom input pane with real-time "Generated Sage" lowering preview, formula chip templates, and stable ID-salted TextEdit widget avoiding focus drops during live lowering preview updates.
 - Tabbed sidebar (Symbols introspection, History, Selected Row Inspector with Matrix Properties, Sage Doctor diagnostics).
 
 ## Build System

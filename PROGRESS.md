@@ -34,6 +34,14 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
   - `views/sidebar_view.rs`: Tabbed sidebar with Symbols introspection (name/kind/summary table, filter, and hidden boot variables filter), History replay list, Inspector (selected row deep metadata, matrix properties), and Sage Doctor.
   - `persistence.rs`: Clean-sheet JSON session serialization and Markdown notebook export.
   - All 32 workspace tests passing cleanly, 0 warnings on `cargo clippy`.
+- **Phase 6 (Post-Port Polish & Tape Reference Pipeline):**
+  - **Bug 1 (Input Focus Loss):** Fixed issue where typing a command word like `"integrate"` caused the `TextEdit` editor to drop focus. Condition was caused by egui dynamic ID generation when the live lowering preview conditionally rendered widgets before an un-salted `TextEdit`. Resolved by assigning a stable `.id_salt("casette_main_input_editor")` and explicitly preserving focus across template clicks and clears.
+  - **Bug 2 (Tape References `#ROW` & Plotting):** Implemented `TapeReferenceTable` in `friendly-compiler` and GUI evaluation pipeline:
+    - Pre-compilation expansion of `#ROW` tokens outside quotes to `__casette_tape_refs[ROW]`, with validation against the 20-entry sliding reference window and descriptive errors for unavailable references.
+    - Excluded `__casette_tape_refs` and private dunder identifiers from `required_variables` in `free_variables` inference so `var('__casette_tape_refs')` is never emitted.
+    - Added automatic worker registration of successful row expressions to `__casette_tape_refs[ROW] = (<expr>)` and prune retired entries outside the 20-entry window.
+    - Commands like `plot #1, x=-10..10` now correctly resolve row references into Sage `Graphics` objects without Python comment collisions.
+    - Added automated unit and integration tests in `friendly_compiler_tests.rs` and `gui_tests.rs` verifying tape expansion, error row skipping, assignment code generation, and plot lowering. All 38 workspace tests green with 0 clippy warnings.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift
