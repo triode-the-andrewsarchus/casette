@@ -9,6 +9,16 @@ Current gates are green: `swift test` (**642/642**, 97 suites), `make check`,
 latest matrix-inspector work. Detailed historical notes live in [`progress/`](progress/),
 newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
 
+**Rust & egui Port Planning (Linux Target):** Formulated and agreed on the full
+migration roadmap to port Casette from native macOS SwiftUI to a native Linux
+desktop application written in Rust using `egui` (`eframe`). See
+[`plans/RUST-EGUI-PORT.md`](plans/RUST-EGUI-PORT.md). The design establishes a
+Cargo workspace with a pure `friendly-compiler` crate (targeting 100% test parity
+across the 69 parser tests), a Tokio-based `casette-kernel` managing the
+persistent Sage worker process and JSONL communications, an offline vector
+`MathRenderer` in egui, a clean-sheet serde session persistence format, and a
+phased implementation plan culminating in the retirement of legacy Swift code.
+
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift
 maps that to persisted `matrixProperties`, and the Inspector's (i) tab renders
