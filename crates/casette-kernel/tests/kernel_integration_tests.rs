@@ -33,10 +33,18 @@ async fn test_kernel_boot_eval_ping() {
     let plain = resp.plain.as_deref().unwrap();
     assert!(plain.contains("x - 1") && plain.contains("x + 1"));
 
-    // 3. Test symbols query
+    // 3. Test symbols query (including shadowed Sage builtin like n)
+    kernel
+        .eval("n = 104729", false, None)
+        .await
+        .expect("eval n assignment");
     let symbols = kernel.symbols().await.expect("symbols");
-    // x should be recognized
     assert!(symbols.iter().any(|s| s.name == "x"));
+    let n_sym = symbols
+        .iter()
+        .find(|s| s.name == "n")
+        .expect("n should be reported in symbols after reassignment");
+    assert_eq!(n_sym.kind, "integer");
 
     // 4. Test precision config
     let prec = kernel.config_precision(20).await.expect("config precision");
