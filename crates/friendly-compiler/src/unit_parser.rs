@@ -103,7 +103,10 @@ pub fn is_valid_target_unit(target: &str) -> bool {
 }
 
 /// Transforms natural unit juxtaposition (e.g. `32 mi`, `52 mi^2`, `9.8 m/s^2`)
-/// into explicit multiplication expressions (`32*mi`, `52*mi^2`).
+/// into explicit multiplication expressions (`(32*mi)`, `(52*mi^2)`).
+///
+/// Also wraps explicit quantities after division (`/ 2*hr`) into `/(2*hr)`
+/// so operator precedence does not invert division into multiplication.
 #[must_use]
 pub fn desugar_unit_juxtaposition(input: &str) -> String {
     let mut lex = Token::lexer(input);
@@ -115,30 +118,80 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
         }
     }
 
-    if tokens.len() < 2 {
+    if tokens.is_empty() {
         return input.to_string();
     }
 
-    let mut result = String::with_capacity(input.len() + 16);
+    let mut result = String::with_capacity(input.len() + 32);
     let mut last_idx = 0;
+    let mut i = 0;
 
-    for i in 0..tokens.len() - 1 {
-        let (tok, span) = &tokens[i];
-        let (next_tok, next_span) = &tokens[i + 1];
+    while i < tokens.len() {
+        let is_after_slash = i > 0 && matches!(tokens[i - 1].0, Token::Slash);
 
-        result.push_str(&input[last_idx..span.end]);
-        last_idx = span.end;
+        if let Token::Number(_) = tokens[i].0 {
+            // Case 1: Number [whitespace] Ident (where Ident is a known unit, e.g. "32 mi", "2 hr")
+            if i + 1 < tokens.len() {
+                if let Token::Ident(name) = tokens[i + 1].0 {
+                    if units::is_known_unit(name) {
+                        let end_tok_idx = if i + 3 < tokens.len()
+                            && matches!(tokens[i + 2].0, Token::Caret)
+                            && matches!(tokens[i + 3].0, Token::Number(_))
+                        {
+                            i + 3
+                        } else {
+                            i + 1
+                        };
 
-        // Check for juxtaposition pattern:
-        // Number followed by a known unit Ident (e.g. "32" followed by "mi")
-        if let Token::Number(_) = tok {
-            if let Token::Ident(name) = next_tok {
-                if units::is_known_unit(name) {
-                    result.push('*');
-                    last_idx = next_span.start;
+                        let start_pos = tokens[i].1.start;
+                        let num_end = tokens[i].1.end;
+                        let unit_start = tokens[i + 1].1.start;
+                        let end_pos = tokens[end_tok_idx].1.end;
+
+                        result.push_str(&input[last_idx..start_pos]);
+                        result.push('(');
+                        result.push_str(&input[start_pos..num_end]);
+                        result.push('*');
+                        result.push_str(&input[unit_start..end_pos]);
+                        result.push(')');
+
+                        last_idx = end_pos;
+                        i = end_tok_idx + 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Case 2: After slash, Number * Ident (e.g. / 2*hr)
+            if is_after_slash && i + 2 < tokens.len() && matches!(tokens[i + 1].0, Token::Star) {
+                if let Token::Ident(name) = tokens[i + 2].0 {
+                    if units::is_known_unit(name) {
+                        let end_tok_idx = if i + 4 < tokens.len()
+                            && matches!(tokens[i + 3].0, Token::Caret)
+                            && matches!(tokens[i + 4].0, Token::Number(_))
+                        {
+                            i + 4
+                        } else {
+                            i + 2
+                        };
+
+                        let start_pos = tokens[i].1.start;
+                        let end_pos = tokens[end_tok_idx].1.end;
+
+                        result.push_str(&input[last_idx..start_pos]);
+                        result.push('(');
+                        result.push_str(&input[start_pos..end_pos]);
+                        result.push(')');
+
+                        last_idx = end_pos;
+                        i = end_tok_idx + 1;
+                        continue;
+                    }
                 }
             }
         }
+
+        i += 1;
     }
 
     result.push_str(&input[last_idx..]);
@@ -151,13 +204,15 @@ mod tests {
 
     #[test]
     fn test_desugar_juxtaposition() {
-        assert_eq!(desugar_unit_juxtaposition("32 mi"), "32*mi");
-        assert_eq!(desugar_unit_juxtaposition("52 mi^2"), "52*mi^2");
+        assert_eq!(desugar_unit_juxtaposition("32 mi"), "(32*mi)");
+        assert_eq!(desugar_unit_juxtaposition("52 mi^2"), "(52*mi^2)");
         assert_eq!(desugar_unit_juxtaposition("32*mi"), "32*mi");
-        assert_eq!(desugar_unit_juxtaposition("32 mi + 5 km"), "32*mi + 5*km");
+        assert_eq!(desugar_unit_juxtaposition("100 km / 2 hr"), "(100*km) / (2*hr)");
+        assert_eq!(desugar_unit_juxtaposition("100*km / 2*hr"), "100*km / (2*hr)");
+        assert_eq!(desugar_unit_juxtaposition("32 mi + 5 km"), "(32*mi) + (5*km)");
         assert_eq!(
             desugar_unit_juxtaposition("solve 32 mi * x^2 = 52 mi^2"),
-            "solve 32*mi * x^2 = 52*mi^2"
+            "solve (32*mi) * x^2 = (52*mi^2)"
         );
     }
 

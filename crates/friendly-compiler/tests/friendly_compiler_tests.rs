@@ -351,7 +351,7 @@ fn test_solve_with_units() {
         required_variables,
     } = res_jux
     {
-        assert_eq!(generated_sage, "solve(32*mi * x^2 == 52*mi^2, x)");
+        assert_eq!(generated_sage, "solve((32*mi) * x^2 == (52*mi^2), x)");
         assert_eq!(required_variables, vec!["x"]);
     } else {
         panic!("expected success for juxtaposition solve, got: {:?}", res_jux);
@@ -366,7 +366,7 @@ fn test_unit_conversions() {
         required_variables,
     } = res1
     {
-        assert_eq!(generated_sage, "__casette_convert(__casette_convert(32*mi + 5*km), miles)");
+        assert_eq!(generated_sage, "__casette_convert((32*mi) + (5*km), miles)");
         assert!(required_variables.is_empty());
     } else {
         panic!("expected success for conversion to miles, got: {:?}", res1);
@@ -378,7 +378,7 @@ fn test_unit_conversions() {
         required_variables,
     } = res2
     {
-        assert_eq!(generated_sage, "__casette_convert(__casette_convert(100*km / 2*hr), mph)");
+        assert_eq!(generated_sage, "__casette_convert((100*km) / (2*hr), mph)");
         assert!(required_variables.is_empty());
     } else {
         panic!("expected success for speed conversion, got: {:?}", res2);

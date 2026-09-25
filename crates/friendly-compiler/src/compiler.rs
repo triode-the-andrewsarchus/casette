@@ -11,6 +11,30 @@ use crate::scanner::{self, BalanceError, BalanceErrorKind};
 use crate::variables;
 use std::collections::{HashMap, HashSet};
 
+/// If a compiled Sage string was already wrapped in single-argument `__casette_convert(...)`,
+/// unwrap its contents so conversion clauses don't double-wrap.
+fn unwrap_single_arg_casette_convert(s: &str) -> &str {
+    if let Some(inner) = s.strip_prefix("__casette_convert(").and_then(|s| s.strip_suffix(')')) {
+        let mut depth = 0;
+        let mut has_top_comma = false;
+        for c in inner.chars() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    has_top_comma = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !has_top_comma {
+            return inner;
+        }
+    }
+    s
+}
+
 /// Compile one line of friendly or raw input.
 pub fn compile(raw_input: &str) -> CompileResult {
     let input_clean = raw_input.replace('\n', " ");
@@ -31,9 +55,10 @@ pub fn compile(raw_input: &str) -> CompileResult {
             CompileResult::Bypass { raw_sage } => raw_sage,
             other => return other,
         };
-        let required = free_variables(&inner_sage);
+        let clean_inner = unwrap_single_arg_casette_convert(&inner_sage);
+        let required = free_variables(clean_inner);
         return CompileResult::Success {
-            generated_sage: format!("__casette_convert({inner_sage}, {})", conv.target_unit),
+            generated_sage: format!("__casette_convert({clean_inner}, {})", conv.target_unit),
             required_variables: required,
         };
     }
