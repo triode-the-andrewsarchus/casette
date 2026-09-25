@@ -576,8 +576,8 @@ def _install_casette_units(ns):
             "oz": _u.units.mass.avoirdupois_ounce,
             "ounce": _u.units.mass.avoirdupois_ounce,
             # Force, Work, Power, Pressure
-            "N": _u.units.force.newton,
             "newton": _u.units.force.newton,
+            "newtons": _u.units.force.newton,
             "J": _u.units.energy.joule,
             "joule": _u.units.energy.joule,
             "W": _u.units.power.watt,
@@ -611,6 +611,25 @@ def _install_casette_units(ns):
             "luminous_intensity": _u.units.luminous_intensity.candela,
             "angles": _u.units.angles.radian,
         }
+
+        def _casette_approx(expr, *args, **kwargs):
+            try:
+                if hasattr(expr, "variables"):
+                    unit_symbols = [v for v in expr.variables() if str(v) in _u.unit_to_type]
+                    non_unit_vars = [v for v in expr.variables() if str(v) not in _u.unit_to_type]
+                    if unit_symbols and not non_unit_vars:
+                        subs_one = {v: 1 for v in unit_symbols}
+                        coeff = expr.subs(subs_one)
+                        num_coeff = numerical_approx(coeff, *args, **kwargs)
+                        unit_part = expr / coeff
+                        return num_coeff * unit_part
+            except Exception:
+                pass
+            return numerical_approx(expr, *args, **kwargs)
+
+        ns["N"] = _casette_approx
+        ns["approx"] = _casette_approx
+        ns["numerical_approx"] = _casette_approx
 
         def __casette_convert(expr, target=None):
             if target is not None:
@@ -1134,7 +1153,7 @@ def _matrix_preview_keys(count):
 
 
 def _vector_latex(value):
-    """Custom LaTeX for standalone Sage vectors.
+    r"""Custom LaTeX for standalone Sage vectors.
 
     Sage's default tuple-style vector LaTeX (`\left(0,\,1,\,...\right)`) can
     assert inside SwiftMath while measuring. Render vectors as a single-row
@@ -1167,7 +1186,7 @@ def _vector_latex(value):
 
 
 def _vector_sequence_latex(value):
-    """Custom LaTeX for a Sage sequence of vectors, e.g. `M.right_kernel().basis()`.
+    r"""Custom LaTeX for a Sage sequence of vectors, e.g. `M.right_kernel().basis()`.
 
     Sage's default tuple-list shape (`\left[\left(1,\,-2,\,1\right)\right]`)
     is semantically thin for a vector-space basis and can crash SwiftMath during
@@ -1358,9 +1377,19 @@ def _napprox_string(value, kind, digits):
     """
     if kind not in ("rational", "real", "complex", "symbolic"):
         return None
-    # A symbolic with free variables has no single numeric value.
+    # A symbolic with free variables has no single numeric value, unless they are physical units.
     try:
         if hasattr(value, "variables") and len(value.variables()) > 0:
+            import sage.symbolic.units as _u
+            unit_symbols = [v for v in value.variables() if str(v) in _u.unit_to_type]
+            non_unit_vars = [v for v in value.variables() if str(v) not in _u.unit_to_type]
+            if unit_symbols and not non_unit_vars:
+                subs_one = {v: 1 for v in unit_symbols}
+                coeff = value.subs(subs_one)
+                approx_coeff = _napprox_string(coeff, "rational", digits)
+                if approx_coeff is not None:
+                    unit_part = value / coeff
+                    return f"{approx_coeff}*{unit_part}"
             return None
     except Exception:
         pass

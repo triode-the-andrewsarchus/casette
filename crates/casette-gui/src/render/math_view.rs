@@ -278,83 +278,127 @@ fn render_action_bar(
     result: &WorkerResponse,
     on_action: &mut dyn FnMut(&str, &str),
 ) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        // Quick copy buttons
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+
+        // Helper for consistent macOS-styled action buttons
+        let make_btn = |ui: &mut Ui, icon: &str, label: &str, text_color: Color32, hover_tip: &str| -> bool {
+            let label_text = if icon.is_empty() {
+                RichText::new(label)
+            } else {
+                RichText::new(format!("{icon} {label}"))
+            }
+            .color(text_color)
+            .font(FontId::new(11.5, FontFamily::Proportional));
+
+            ui.add(
+                Button::new(label_text)
+                    .fill(Color32::from_rgb(38, 38, 44))
+                    .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
+                    .corner_radius(CornerRadius::same(5))
+                    .min_size(vec2(0.0, 24.0)),
+            )
+            .on_hover_text(hover_tip)
+            .clicked()
+        };
+
+        // 1. Copy Plain Text
         if let Some(plain) = &result.plain {
-            if ui
-                .add(
-                    Button::new(
-                        RichText::new("Copy").font(FontId::new(11.0, FontFamily::Proportional)),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text("Copy plain text output")
-                .clicked()
-            {
+            let copied_id = ui.id().with(("copied_plain", row.row_number));
+            let is_copied = ui.ctx().data(|d| d.get_temp::<bool>(copied_id)).unwrap_or(false);
+            let (icon, label, color) = if is_copied {
+                ("✓", "Copied", Colors::EXACT_GREEN)
+            } else {
+                ("📋", "Copy", Colors::TEXT_SECONDARY)
+            };
+
+            if make_btn(ui, icon, label, color, "Copy plain text output to clipboard") {
                 ui.ctx().copy_text(plain.clone());
+                ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
             }
         }
 
+        // 2. Copy LaTeX
         if let Some(latex) = &result.latex {
-            if ui
-                .add(
-                    Button::new(
-                        RichText::new("Copy LaTeX")
-                            .font(FontId::new(11.0, FontFamily::Proportional)),
-                    )
-                    .frame(false),
-                )
-                .on_hover_text("Copy LaTeX expression")
-                .clicked()
-            {
+            let copied_id = ui.id().with(("copied_latex", row.row_number));
+            let is_copied = ui.ctx().data(|d| d.get_temp::<bool>(copied_id)).unwrap_or(false);
+            let (icon, label, color) = if is_copied {
+                ("✓", "Copied LaTeX", Colors::EXACT_GREEN)
+            } else {
+                ("TeX", "Copy LaTeX", Colors::TEXT_SECONDARY)
+            };
+
+            if make_btn(ui, icon, label, color, "Copy LaTeX expression to clipboard") {
                 ui.ctx().copy_text(latex.clone());
+                ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
             }
         }
 
-        // Mathematical quick transformations
-        let row_ref = format!("#{}", row.row_number);
+        // Mathematical quick transformations for valid results
+        let is_ok = result.ok
+            && result.kind.as_deref() != Some("error")
+            && result.kind.as_deref() != Some("interrupted");
 
-        if ui
-            .add(
-                Button::new(
-                    RichText::new("Differentiate")
-                        .color(Colors::ACCENT_PRIMARY)
-                        .font(FontId::new(11.0, FontFamily::Proportional)),
-                )
-                .frame(false),
-            )
-            .clicked()
-        {
-            on_action("diff", &format!("diff({}, x)", row_ref));
-        }
+        if is_ok {
+            let row_ref = format!("#{}", row.row_number);
+            let is_plot = result.kind.as_deref() == Some("plot")
+                || result.artifacts.iter().any(|a| a.r#type == "image");
+            let is_matrix = result.kind.as_deref() == Some("matrix");
 
-        if ui
-            .add(
-                Button::new(
-                    RichText::new("Integrate")
-                        .color(Colors::ACCENT_PRIMARY)
-                        .font(FontId::new(11.0, FontFamily::Proportional)),
+            // 3. Approximate (Decimal representation)
+            if !is_plot
+                && make_btn(
+                    ui,
+                    "≈",
+                    "Approximate",
+                    Colors::NUMERIC_AMBER,
+                    "Evaluate decimal approximation of this result (approx #...)",
                 )
-                .frame(false),
-            )
-            .clicked()
-        {
-            on_action("integral", &format!("integral({}, x)", row_ref));
-        }
+            {
+                on_action("approx", &format!("approx {}", row_ref));
+            }
 
-        if ui
-            .add(
-                Button::new(
-                    RichText::new("Simplify")
-                        .color(Colors::ACCENT_PRIMARY)
-                        .font(FontId::new(11.0, FontFamily::Proportional)),
+            // 4. Differentiate
+            if !is_plot
+                && !is_matrix
+                && make_btn(
+                    ui,
+                    "∂/∂x",
+                    "Differentiate",
+                    Colors::ACCENT_PRIMARY,
+                    "Differentiate expression with respect to x",
                 )
-                .frame(false),
-            )
-            .clicked()
-        {
-            on_action("simplify", &format!("simplify({})", row_ref));
+            {
+                on_action("diff", &format!("diff({}, x)", row_ref));
+            }
+
+            // 5. Integrate
+            if !is_plot
+                && !is_matrix
+                && make_btn(
+                    ui,
+                    "∫",
+                    "Integrate",
+                    Colors::ACCENT_PURPLE,
+                    "Integrate expression with respect to x",
+                )
+            {
+                on_action("integral", &format!("integral({}, x)", row_ref));
+            }
+
+            // 6. Simplify
+            if !is_plot
+                && make_btn(
+                    ui,
+                    "✦",
+                    "Simplify",
+                    Colors::EXACT_GREEN,
+                    "Simplify mathematical expression",
+                )
+            {
+                on_action("simplify", &format!("simplify({})", row_ref));
+            }
         }
     });
 }

@@ -118,12 +118,9 @@ pub fn render_tape(
                         render_result(ui, row, texture_cache, on_action);
                     });
 
-                // Clicking anywhere on row card selects it for inspector
-                if card_response
-                    .response
-                    .interact(egui::Sense::click())
-                    .clicked()
-                {
+                // Clicking on row card selects it for inspector without intercepting child buttons
+                let card_rect = card_response.response.rect;
+                if ui.rect_contains_pointer(card_rect) && ui.input(|i| i.pointer.primary_clicked()) {
                     state.selected_row_index = Some(idx);
                 }
 

@@ -186,17 +186,20 @@ impl App for CasetteApp {
 
         // 4. Central Panel: Session Tape
         CentralPanel::default().show(ctx, |ui| {
-            let mut action_to_submit = None;
+            let mut action_to_submit: Option<(String, bool)> = None;
 
             render_tape(
                 ui,
                 &mut self.state,
                 &mut self.texture_cache,
-                &mut |_action, snippet| action_to_submit = Some(snippet.to_string()),
+                &mut |action, snippet| {
+                    let is_numeric = action == "approx";
+                    action_to_submit = Some((snippet.to_string(), is_numeric));
+                },
             );
 
-            if let Some(snippet) = action_to_submit {
-                self.submit_evaluation(snippet, false);
+            if let Some((snippet, is_numeric)) = action_to_submit {
+                self.submit_evaluation(snippet, is_numeric);
             }
         });
     }

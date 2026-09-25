@@ -174,3 +174,54 @@ fn test_math_rendering_and_texture_cache() {
     assert!(size.x > 50.0);
     assert!(size.y > 10.0);
 }
+
+#[test]
+fn test_action_buttons_and_approx_compilation() {
+    let mut state = SessionState::default();
+    let r1 = state.push_row("355/113".into(), "355/113".into());
+    let resp1: WorkerResponse = serde_json::from_str(
+        r#"{
+            "ok": true,
+            "kind": "rational",
+            "plain": "355/113",
+            "latex": "\\frac{355}{113}"
+        }"#,
+    )
+    .expect("deserialize");
+    state.rows[r1 - 1].complete(resp1, Duration::from_millis(5));
+
+    let refs = state.tape_references();
+
+    // 1. Approx action snippet: "approx #1"
+    let approx_compiled = friendly_compiler::compile_with_refs("approx #1", &refs);
+    if let friendly_compiler::CompileResult::Success { generated_sage, .. } = approx_compiled {
+        assert_eq!(generated_sage, "N(__casette_tape_refs[1])");
+    } else {
+        panic!("expected success for approx #1, got {:?}", approx_compiled);
+    }
+
+    // 2. Diff action snippet: "diff(#1, x)"
+    let diff_compiled = friendly_compiler::compile_with_refs("diff(#1, x)", &refs);
+    if let friendly_compiler::CompileResult::Bypass { raw_sage } = diff_compiled {
+        assert_eq!(raw_sage, "diff(__casette_tape_refs[1], x)");
+    } else {
+        panic!("expected bypass for diff(#1, x), got {:?}", diff_compiled);
+    }
+
+    // 3. Integrate action snippet: "integral(#1, x)"
+    let int_compiled = friendly_compiler::compile_with_refs("integral(#1, x)", &refs);
+    if let friendly_compiler::CompileResult::Bypass { raw_sage } = int_compiled {
+        assert_eq!(raw_sage, "integral(__casette_tape_refs[1], x)");
+    } else {
+        panic!("expected bypass for integral(#1, x), got {:?}", int_compiled);
+    }
+
+    // 4. Simplify action snippet: "simplify(#1)"
+    let simp_compiled = friendly_compiler::compile_with_refs("simplify(#1)", &refs);
+    if let friendly_compiler::CompileResult::Bypass { raw_sage } = simp_compiled {
+        assert_eq!(raw_sage, "simplify(__casette_tape_refs[1])");
+    } else {
+        panic!("expected bypass for simplify(#1), got {:?}", simp_compiled);
+    }
+}
+

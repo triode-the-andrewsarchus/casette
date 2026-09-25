@@ -57,6 +57,16 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Added sequence and relation recursion in worker runtime `__casette_convert`: equations and solve results involving units automatically evaluate compatible units (e.g. `solve 3 hr + x sec = 12 days` simplifies to `[x == 1026000]` rather than unreduced dimensional fractions like `3*(4*day - hour)/second`).
       - Parses conversion clauses (`... to <unit>` / `... in <unit>`).
     - Added comprehensive unit tests in `friendly_compiler_tests.rs` and integration tests in `kernel_integration_tests.rs`. All 45 workspace tests green with 0 clippy warnings.
+  - **Phase 8 (Action Bar Ergonomics, Hit-Testing & Decimal Approximation):**
+    - **Issue 1 (Action Bar Visual Styling):** Replaced unstyled flat text buttons with macOS-styled pill buttons featuring rounded corners (`CornerRadius::same(5)`), subtle borders (`BORDER_SUBTLE`), dark container fill (`#26262C`), proportional typography (11.5pt), semantic icon glyphs (`📋 Copy`, `TeX Copy LaTeX`, `≈ Approximate`, `∂/∂x Differentiate`, `∫ Integrate`, `✦ Simplify`), and interactive hover tooltips.
+    - **Issue 2 (Card Hit-Testing / Unclickable Buttons):** Discovered root cause of unclickable buttons in `tape_view.rs`: `card_response.response.interact(egui::Sense::click())` registered a broad hit-testing rectangle over the entire card bounding box *after* the inner widgets had rendered, causing egui's hit-tester to prioritize the card rect and swallow all child button clicks. Replaced with non-intrusive pointer state inspection (`ui.rect_contains_pointer(card_rect) && ui.input(|i| i.pointer.primary_clicked())`), completely restoring direct clickability to all action buttons while preserving card selection in the inspector.
+    - **Issue 3 (Clipboard Feedback):** Added dynamic temporary visual feedback for "Copy" and "Copy LaTeX" (`✓ Copied`, `✓ Copied LaTeX` in accent green) stored per-row in egui temporary state.
+    - **Feature (Approximate Button & Decimal Conversion):**
+      - Added "Approximate" button (`≈ Approximate`) to result action bars for rational numbers, fractions, constants, and unit expressions. Emits `approx #<row>` to compute high-precision decimal values.
+      - Fixed `worker.py` and `friendly-compiler` keyword collision between Sage's built-in `N` / `numerical_approx` and unit `"N"` (Newton): desugared standalone `"N"` token to `"newton"` in parser and registered `_casette_approx` on `N`, `approx`, and `numerical_approx`.
+      - Enhanced `_casette_approx` and `_napprox_string` in `worker.py` to evaluate numerical approximations on dimensional expressions by approximating numerical coefficients while retaining physical units (e.g. `100*mi / (3*hr)` -> `33.3333333333333*mile/hour`).
+      - Wired `app.rs` action submission to propagate `is_numeric` flag when approx is triggered.
+      - Added automated test `test_action_buttons_and_approx_compilation` in `gui_tests.rs`. All 46 tests green, 0 clippy warnings.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift

@@ -235,17 +235,22 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
                         } else {
                             i + 1
                         };
+                        let end_pos = tokens[end_tok_idx].1.end;
 
                         let start_pos = tokens[i].1.start;
                         let left_end = tokens[i].1.end;
                         let unit_start = tokens[i + 1].1.start;
-                        let end_pos = tokens[end_tok_idx].1.end;
+                        let unit_piece = if name == "N" {
+                            "newton"
+                        } else {
+                            &input[unit_start..end_pos]
+                        };
 
                         result.push_str(&input[last_idx..start_pos]);
                         result.push('(');
                         result.push_str(&input[start_pos..left_end]);
                         result.push('*');
-                        result.push_str(&input[unit_start..end_pos]);
+                        result.push_str(unit_piece);
                         result.push(')');
 
                         last_idx = end_pos;
@@ -300,11 +305,16 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
                     let rparen_end = tokens[i].1.end;
                     let unit_start = tokens[i + 1].1.start;
                     let end_pos = tokens[end_tok_idx].1.end;
+                    let unit_piece = if name == "N" {
+                        "newton"
+                    } else {
+                        &input[unit_start..end_pos]
+                    };
 
                     result.push_str(&input[last_idx..rparen_end]);
                     result.push('*');
                     result.push('(');
-                    result.push_str(&input[unit_start..end_pos]);
+                    result.push_str(unit_piece);
                     result.push(')');
 
                     last_idx = end_pos;
