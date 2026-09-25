@@ -88,6 +88,59 @@ fn test_session_persistence_roundtrip() {
 }
 
 #[test]
+fn test_persistence_refuses_newer_schema_and_recovers_running_rows() {
+    let temp_dir = std::env::temp_dir();
+    let future_path = temp_dir.join(format!("casette_future_session_{}.json", std::process::id()));
+
+    // 1. Future schema refusal
+    let future_json = r#"{
+        "schema_version": 999,
+        "rows": []
+    }"#;
+    std::fs::write(&future_path, future_json).expect("write future file");
+
+    let mut state = SessionState::default();
+    let res = load_session(&mut state, &future_path);
+    assert!(res.is_err(), "should refuse newer schema version");
+    assert!(
+        res.unwrap_err().to_string().contains("refused session schema version 999"),
+        "error message should cite refused schema version"
+    );
+    let _ = std::fs::remove_file(future_path);
+
+    // 2. Restoring a row that was saved while evaluating (running)
+    let running_path = temp_dir.join(format!("casette_running_session_{}.json", std::process::id()));
+    let running_json = r#"{
+        "schema_version": 1,
+        "rows": [
+            {
+                "row_number": 1,
+                "input_raw": "while True: pass",
+                "compiled_sage": "while True: pass",
+                "result": null,
+                "is_evaluating": true,
+                "duration": null,
+                "is_live": true,
+                "timestamp_secs": 1000
+            }
+        ]
+    }"#;
+    std::fs::write(&running_path, running_json).expect("write running file");
+
+    let mut state2 = SessionState::default();
+    load_session(&mut state2, &running_path).expect("load running session");
+    assert_eq!(state2.rows.len(), 1);
+    assert!(!state2.rows[0].is_evaluating, "restored row must not be evaluating/spinning");
+    assert!(!state2.rows[0].is_live, "restored row must not be marked live");
+    let result = state2.rows[0].result.as_ref().expect("result must be populated");
+    assert_eq!(result.kind.as_deref(), Some("interrupted"));
+    assert!(result.plain.as_deref().unwrap().contains("quit before this evaluation finished"));
+
+    let _ = std::fs::remove_file(running_path);
+}
+
+
+#[test]
 fn test_tape_references_expansion_and_reusable_expression() {
     let mut state = SessionState::default();
 

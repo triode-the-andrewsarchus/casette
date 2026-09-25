@@ -242,6 +242,23 @@ impl WorkerResponse {
         }
     }
 
+    /// Constructs an interrupted response envelope.
+    #[must_use]
+    pub fn new_interrupted(message: String) -> Self {
+        Self {
+            ok: false,
+            kind: Some("interrupted".into()),
+            plain: Some(message.clone()),
+            repr: Some(message.clone()),
+            error: Some(ErrorPayload {
+                r#type: "Interrupted".into(),
+                message,
+                traceback: None,
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Returns `true` if this response represents the initial worker ready banner.
     #[must_use]
     pub fn is_ready(&self) -> bool {

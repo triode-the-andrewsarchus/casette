@@ -5,7 +5,6 @@ Each entry preserves the verified operational lesson for the SageMath worker, pr
 
 | # | Problem | Intersects |
 | ---: | --- | --- |
-| 1 | [Restoring a session: refusing a newer schema must also disable SAVING, "restored" is not a persisted fact, and a restored `running` row must not spin](problems/001-restoring-a-session-refusing-a-newer-schema-must-also.md) | Persistence schema refusals, transient restore UI state, stale in-flight rows. |
 | 2 | [Restart re-init must CHAIN on the serial kernel queue — only the kill/boot itself may run un-chained, or the next submission races the fresh worker's preludes](problems/002-restart-re-init-must-chain-on-the-serial-kernel.md) | Restart ordering, queued worker re-init, post-restart state races. |
 | 9 | [The V0.7 friendly compiler FLATTENS NEWLINES — route multiline input around it, or raw Sage gets corrupted](problems/009-the-v0-7-friendly-compiler-flattens-newlines-route-multiline.md) | Multiline input routing, friendly compiler boundaries, raw Sage preservation. |
 | 10 | [`posix_spawn` children INHERIT the parent's signal dispositions — spawn the worker with `POSIX_SPAWN_SETSIGDEF` + `SETSIGMASK` or interrupts silently die](problems/010-posix-spawn-children-inherit-the-parent-s-signal-dispositions.md) | POSIX signal inheritance, SIGINT delivery, worker signal masks. |
