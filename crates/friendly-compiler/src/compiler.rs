@@ -14,13 +14,33 @@ use std::collections::{HashMap, HashSet};
 /// Compile one line of friendly or raw input.
 pub fn compile(raw_input: &str) -> CompileResult {
     let input_clean = raw_input.replace('\n', " ");
-    let input = scanner::trimmed_shim(&input_clean);
+    let input_trimmed = scanner::trimmed_shim(&input_clean);
 
-    if input.is_empty() {
+    if input_trimmed.is_empty() {
         return CompileResult::Bypass {
             raw_sage: String::new(),
         };
     }
+
+    // 1. Check for unit conversion clause (e.g. `32 mi + 5 km to km` or `100 km / 2 hr in mph`)
+    if let Some(conv) = crate::unit_parser::parse_unit_conversion(input_trimmed) {
+        let desugared_inner = crate::unit_parser::desugar_unit_juxtaposition(&conv.expression);
+        let inner_compiled = compile(&desugared_inner);
+        let inner_sage = match inner_compiled {
+            CompileResult::Success { generated_sage, .. } => generated_sage,
+            CompileResult::Bypass { raw_sage } => raw_sage,
+            other => return other,
+        };
+        let required = free_variables(&inner_sage);
+        return CompileResult::Success {
+            generated_sage: format!("__casette_convert({inner_sage}, {})", conv.target_unit),
+            required_variables: required,
+        };
+    }
+
+    // 2. Desugar natural unit juxtaposition (e.g. `32 mi` -> `32*mi`, `52 mi^2` -> `52*mi^2`)
+    let desugared = crate::unit_parser::desugar_unit_juxtaposition(input_trimmed);
+    let input = desugared.as_str();
 
     let cmd_match = leading_command(input);
     let cmd = match cmd_match {
@@ -31,6 +51,12 @@ pub fn compile(raw_input: &str) -> CompileResult {
             }
             if let Some(assignment) = simple_assignment_echo(input) {
                 return assignment;
+            }
+            if crate::units::contains_any_unit(input) {
+                return CompileResult::Success {
+                    generated_sage: format!("__casette_convert({input})"),
+                    required_variables: free_variables(input),
+                };
             }
             return CompileResult::Bypass {
                 raw_sage: input.to_string(),

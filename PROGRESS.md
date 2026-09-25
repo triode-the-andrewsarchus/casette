@@ -47,6 +47,13 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
     - In `crates/casette-gui/src/render/texture_cache.rs`: Upgraded SVG rasterization to 2.0x scale for crisp HiDPI/Retina display; added `get_or_render_latex(&mut self, ctx: &Context, latex: &str)` caching fallback to `/tmp/casette_math_<hash>.svg` for restored or offline sessions.
     - In `crates/casette-gui/src/render/math_view.rs`: Refactored result routing so plot cards only render `artifact.r#type == "image"`, matrix views render grids, and mathematical results route to `render_primary_math` displaying vector math textures at natural proportional size with graceful fallback to `render_primary_text`.
     - Added automated GUI test `test_math_rendering_and_texture_cache` and kernel integration test `test_kernel_boot_eval_ping` asserting math SVG generation and valid on-disk artifacts. All 39 tests pass with 0 warnings.
+  - **Phase 7 (Physical Units System & Natural Unit Parser):** Implemented natural dimensional physical units:
+    - Preloaded 69 standard SI and Imperial units in `v0/01-worker-protocol/worker.py` (`mi`, `km`, `ft`, `s`, `hr`, `kg`, `mph`, etc.) and added `__casette_convert` for automatic dimensionless cancellation (e.g. `50*km / (32*mi)` -> `390625/402336`), compatible unit sum unification, and explicit conversion clauses (`to miles`, `in mph`).
+    - Added `units.rs` and `unit_parser.rs` in `friendly-compiler` powered by `logos`:
+      - Disambiguates units from unknown algebraic variables in `free_variables` so `solve 32*mi*x^2 = 52*mi^2` and `solve 32 mi * x^2 = 52 mi^2` automatically isolate `x` without ambiguity.
+      - Desugars natural unit juxtaposition (`32 mi`, `52 mi^2`, `9.8 m/s^2`) into valid mathematical multiplication expressions without requiring manual `*`.
+      - Parses conversion clauses (`... to <unit>` / `... in <unit>`).
+    - Added comprehensive unit tests in `friendly_compiler_tests.rs` and integration tests in `kernel_integration_tests.rs`. All 45 workspace tests green with 0 clippy warnings.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift

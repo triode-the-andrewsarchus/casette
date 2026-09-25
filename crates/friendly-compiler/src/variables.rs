@@ -46,6 +46,9 @@ pub fn is_plausible_variable(name: &str) -> bool {
     if name.starts_with("__") || name == "__casette_tape_refs" {
         return false;
     }
+    if crate::units::is_unambiguous_unit(name) {
+        return false;
+    }
     match name.chars().next() {
         Some(first) if is_ident_start(first) => !is_reserved(name),
         _ => false,

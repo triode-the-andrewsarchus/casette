@@ -329,3 +329,73 @@ fn test_tape_references_compilation() {
     let r3 = compile_with_refs("plot #2, x=-10..10", &refs);
     assert!(matches!(r3, CompileResult::Error(_)));
 }
+
+#[test]
+fn test_solve_with_units() {
+    let res = compile("solve 32*mi*x^2 = 52*mi^2");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res
+    {
+        assert_eq!(generated_sage, "solve(32*mi*x^2 == 52*mi^2, x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for solve with units, got: {:?}", res);
+    }
+
+    // Natural juxtaposition without *
+    let res_jux = compile("solve 32 mi * x^2 = 52 mi^2");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res_jux
+    {
+        assert_eq!(generated_sage, "solve(32*mi * x^2 == 52*mi^2, x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for juxtaposition solve, got: {:?}", res_jux);
+    }
+}
+
+#[test]
+fn test_unit_conversions() {
+    let res1 = compile("32 mi + 5 km to miles");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res1
+    {
+        assert_eq!(generated_sage, "__casette_convert(__casette_convert(32*mi + 5*km), miles)");
+        assert!(required_variables.is_empty());
+    } else {
+        panic!("expected success for conversion to miles, got: {:?}", res1);
+    }
+
+    let res2 = compile("100 km / 2 hr in mph");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res2
+    {
+        assert_eq!(generated_sage, "__casette_convert(__casette_convert(100*km / 2*hr), mph)");
+        assert!(required_variables.is_empty());
+    } else {
+        panic!("expected success for speed conversion, got: {:?}", res2);
+    }
+}
+
+#[test]
+fn test_bare_unit_expressions() {
+    let res = compile("50*km / (32*mi)");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res
+    {
+        assert_eq!(generated_sage, "__casette_convert(50*km / (32*mi))");
+        assert!(required_variables.is_empty());
+    } else {
+        panic!("expected success for bare unit ratio, got: {:?}", res);
+    }
+}

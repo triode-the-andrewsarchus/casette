@@ -8,6 +8,8 @@ pub mod ir;
 pub mod result;
 pub mod scanner;
 pub mod tape_ref;
+pub mod unit_parser;
+pub mod units;
 pub mod variables;
 
 pub use compiler::{compile, free_variables, CommandMatch, Keyword, PartialRange, Range};

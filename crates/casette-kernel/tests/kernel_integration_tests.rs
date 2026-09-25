@@ -58,7 +58,23 @@ async fn test_kernel_boot_eval_ping() {
     let art_path = math_art.path.as_deref().expect("artifact path");
     assert!(std::path::Path::new(art_path).exists(), "SVG artifact file should exist");
 
-    // 6. Test shutdown
+    // 6. Test units: solve with units and conversion
+    let solve_units = kernel
+        .eval("solve(32*mi*x^2 == 52*mi^2, x)", false, None)
+        .await
+        .expect("eval solve units");
+    assert!(solve_units.ok);
+    let solve_plain = solve_units.plain.as_deref().unwrap_or("");
+    assert!(solve_plain.contains("sqrt(mile)"), "expected solve output to contain sqrt(mile), got: {}", solve_plain);
+
+    let ratio_resp = kernel
+        .eval("__casette_convert(50*km / (32*mi))", false, None)
+        .await
+        .expect("eval ratio units");
+    assert!(ratio_resp.ok);
+    assert_eq!(ratio_resp.plain.as_deref(), Some("390625/402336"));
+
+    // 7. Test shutdown
     kernel.shutdown().await.expect("shutdown");
 }
 
