@@ -67,6 +67,39 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Enhanced `_casette_approx` and `_napprox_string` in `worker.py` to evaluate numerical approximations on dimensional expressions by approximating numerical coefficients while retaining physical units (e.g. `100*mi / (3*hr)` -> `33.3333333333333*mile/hour`).
       - Wired `app.rs` action submission to propagate `is_numeric` flag when approx is triggered.
       - Added automated test `test_action_buttons_and_approx_compilation` in `gui_tests.rs`. All 46 tests green, 0 clippy warnings.
+  - **Phase 9 (Problems Audit & Obsolete Swift Documentation Cleanup):**
+    - Audited all 28 entries in the `problems/` directory against the Rust codebase (`casette-rs`), Tokio process manager, Sage `worker.py`, and `friendly-compiler`.
+    - **Retained (16 applicable):**
+      - `001`: Session persistence schema refusals, non-persisted transient restore UI state, in-flight row interruption.
+      - `002`: Restart re-init chaining on serial kernel queue ahead of subsequent evaluations.
+      - `009`: Friendly compiler newline flattening vs multiline raw Sage preserving.
+      - `010`: POSIX child signal inheritance, `SIGINT` delivery, and CPython/cysignals signal masks.
+      - `011`: Session persistence with missing temporary plot artifacts and schema version peeking.
+      - `013`: Symbolic Ring exactness (`is_exact() == False`) and tree-walking symbolic expressions.
+      - `014`: Numeric precision clamping to native `prec()` to prevent `.n(bits)` exceptions.
+      - `015`: Friendly compiler space boundary bypass and symbolic definite integrals.
+      - `016`: Symbol table baseline diffing by object identity (accounting for Sage's `n`/`N`/`i`).
+      - `020`: Classifying Sage results across quadratic number fields, sequence generics, and booleans.
+      - `021`: Numeric approximation preserving native precision without blind `digits=` calls.
+      - `022`: Interrupting Sage with cysignals owning `SIGINT` for prompt C computation aborts.
+      - `023`: Worker restart generation isolation for reader queues and EOF events.
+      - `024`: `sage -python` bash wrapper process group targeting for clean termination without orphans.
+      - `025`: Protocol stdout separation using private dup'd fds and OS-level fd redirection.
+      - `026`: Sage value-echo parsing preparsed code via `ast` and suppressing `None`.
+    - **Removed (12 obsolete Swift/SwiftUI/AppKit/SwiftPM entries):**
+      - `003`: SwiftUI `AttributeGraph` spin on `NSView` self-invalidation during graph updates.
+      - `004`: SwiftUI `.windowResizability(.contentMinSize)` min-height explosion with wrapping text.
+      - `005`: Parallel `swift-testing` test runner environment races with `setenv`.
+      - `006`: SwiftMath `MTMathUILabel` NSView layout performance in `LazyVStack`.
+      - `007`: macOS SwiftUI `.popover` key window focus and Cocoa `cancelOperation:` interception.
+      - `008`: macOS automation harness event tap consuming keyCode 53 (Esc).
+      - `012`: Swift `Foundation.Process` lacking `setsid` (Rust `tokio::process` handles this natively).
+      - `017`: macOS AppKit `NSImage` rendering matplotlib SVG `<use>` elements as black blobs.
+      - `018`: LaTeXSwiftUI / MathJax in JavaScriptCore failing braced scripts.
+      - `019`: SwiftMath missing `array` environment and macOS `NSView.fittingSize` vs `intrinsicContentSize`.
+      - `027`: SwiftMath `MTTypesetter` layout assertions on nested `\left...\right` groups.
+      - `028`: SwiftPM `Bundle.module` resource bundle patching for hand-assembled `.app`s.
+    - Updated master `PROBLEMS.md` index to cleanly reflect active lessons.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift
