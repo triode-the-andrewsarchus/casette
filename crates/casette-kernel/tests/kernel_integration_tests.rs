@@ -127,6 +127,29 @@ async fn test_kernel_boot_eval_ping() {
     assert!(ratio_resp.ok);
     assert_eq!(ratio_resp.plain.as_deref(), Some("390625/402336"));
 
+    // 6b. Test Problem 025: private dup'd fd for protocol stream and OS-level fd 1/2 redirection
+    let raw_fd_resp = kernel
+        .eval(
+            "import os; os.write(1, b\"RAW_FD1_DATA\\n\"); print(\"PYTHON_PRINT_DATA\"); 42",
+            false,
+            None,
+        )
+        .await
+        .expect("eval raw fd and print write");
+    assert!(raw_fd_resp.ok);
+    assert_eq!(raw_fd_resp.plain.as_deref(), Some("42"));
+    let captured_stdout = raw_fd_resp.stdout.as_deref().unwrap_or("");
+    assert!(
+        captured_stdout.contains("RAW_FD1_DATA"),
+        "expected OS-level fd 1 write to be captured into stdout, got: {}",
+        captured_stdout
+    );
+    assert!(
+        captured_stdout.contains("PYTHON_PRINT_DATA"),
+        "expected Python print to be captured into stdout, got: {}",
+        captured_stdout
+    );
+
     // 7. Test shutdown
     kernel.shutdown().await.expect("shutdown");
 }
