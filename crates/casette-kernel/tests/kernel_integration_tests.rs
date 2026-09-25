@@ -125,3 +125,34 @@ async fn test_kernel_interrupt() {
 
     kernel.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn test_kernel_restart_chains_preludes() {
+    let env = SageDiscovery::discover().await.expect("discover sage");
+    let config = KernelConfig {
+        python_path: env.python_path,
+        worker_script: env.worker_script,
+        startup_timeout: Duration::from_secs(15),
+        default_eval_timeout: Duration::from_secs(15),
+        initial_precision: Some(10),
+        ..Default::default()
+    };
+
+    let kernel = SageKernel::launch(config).await.expect("launch kernel");
+
+    // 1. Initial eval with predefined variable x
+    let r1 = kernel.eval("expand((x + 1)^2)", false, None).await.expect("eval r1");
+    assert!(r1.ok);
+    assert_eq!(r1.plain.as_deref(), Some("x^2 + 2*x + 1"));
+
+    // 2. Restart kernel
+    kernel.restart().await.expect("restart");
+
+    // 3. Problem 002 verification: immediate submission after restart must not race boot preludes
+    let r2 = kernel.eval("expand((x + 1)^2)", false, None).await.expect("eval r2");
+    assert!(r2.ok, "expand((x+1)^2) must succeed immediately after restart without NameError");
+    assert_eq!(r2.plain.as_deref(), Some("x^2 + 2*x + 1"));
+
+    kernel.shutdown().await.expect("shutdown");
+}
+
