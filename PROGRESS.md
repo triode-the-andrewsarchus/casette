@@ -100,6 +100,27 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - `027`: SwiftMath `MTTypesetter` layout assertions on nested `\left...\right` groups.
       - `028`: SwiftPM `Bundle.module` resource bundle patching for hand-assembled `.app`s.
     - Updated master `PROBLEMS.md` index to cleanly reflect active lessons.
+  - **Phase 10 (One-by-One Problem Resolution, Automated Testing & Markdown Retirement):**
+    - Methodically verified and addressed all 16 applicable problems commit-by-commit:
+      - **Problem 001 (`20fd4a9`):** Implemented schema versioning (`CURRENT_SCHEMA_VERSION`), version peek before decoding, future version refusal (`bail!`), in-flight evaluation interruption on restore, and clearing transient UI live state. Verified in `casette-gui/tests/gui_tests.rs`.
+      - **Problem 002 (`c73426f`):** Enforced serial order on `WorkerActor` loop so `boot_prelude` (`var('u, v, w, x, y, z...')`) always finishes before subsequent user evaluations. Verified in `kernel_integration_tests.rs`.
+      - **Problem 009 (`a5dbc5c`):** Preserved multi-line Sage code newlines without single-line compiler flattening when input contains `\n`. Verified in `gui_tests.rs`.
+      - **Problem 010 (`e8bf937`):** Reset child process signal dispositions (`SigSet::empty()`, `SIG_DFL`) in `cmd.pre_exec` so child workers don't inherit ignored SIGINT from parent.
+      - **Problem 011 (`be7a409`):** Rendered graceful placeholder cards for missing or expired temporary plot artifacts in `render_plot_card`. Verified in `gui_tests.rs`.
+      - **Problem 013 (`c2abf8f`):** Enforced Sage Symbolic Ring exactness distinction in `worker.py` (`_is_exact`, `_symbolic_has_inexact_atom`), correctly handling exact symbolic constants like `sin(1)` vs floating approximations.
+      - **Problem 014 (`e4da26c`):** Clamped `.n(bits)` approximation requests in `worker.py` to concrete objects' native `value.prec()`, preventing Sage bit-overflow exceptions.
+      - **Problem 015 (`f7b36e1`):** Verified friendly compiler whitespace boundary rules on symbol bypass and symbolic classification of definite integrals in `friendly_compiler_tests.rs`.
+      - **Problem 016 (`a8d8584`):** Diffed symbol table namespace against baseline by object identity (`live_value is not baseline_obj`), allowing shadowed Sage builtins (`n = 104729`, `N`, `i`) to be reported. Verified in `kernel_integration_tests.rs`.
+      - **Problem 020 (`761e9d2`):** Corrected Sage type classification in `_classify` for Gaussian literals (`QQ[i]`), `Sequence_generic` (`solve`), and `bool` preceding `int`. Verified in `kernel_integration_tests.rs`.
+      - **Problem 021 (`24d565b`):** Ensured numeric approximation respects native precision on concrete reals/complexes without blind `digits=` calls, and gated `approx` to scalar types. Verified in `kernel_integration_tests.rs`.
+      - **Problem 022 (`273a727`):** Let cysignals own SIGINT by installing worker handlers prior to Sage imports, and directed SIGINT to real worker PID for prompt aborts of C/GMP loops. Verified in `kernel_integration_tests.rs`.
+      - **Problem 023 (`7c1040e`):** Provided each worker generation its own isolated `WorkerProcess` and stream readers, eliminating restart EOF races.
+      - **Problem 024 (`c5030c9`):** Spawned child processes with `process_group(0)` and signaled the entire process group (`-pid`) in `kill_and_reap` to ensure wrapper scripts (e.g. `sage -python`) and child Python workers are cleanly terminated without leaks.
+      - **Problem 025 (`a6d4a39`):** Maintained private dup'd file descriptors (`os.dup(1)`, `os.dup(2)`) for JSONL protocol communication, redirecting both Python `sys.stdout` and OS-level fds 1/2 to capture buffers without stream desynchronization. Verified in `kernel_integration_tests.rs`.
+      - **Problem 026 (`2888fb4`):** Evaluated preparsed AST and suppressed `None` returns in `_eval_code` to prevent bare prints or assignments from returning `None` values, and verified unordered factor terms. Verified in `kernel_integration_tests.rs`.
+    - Removed all 28 individual problem markdown files from `problems/` and updated master `PROBLEMS.md` and `PLAN.md`.
+
+
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift

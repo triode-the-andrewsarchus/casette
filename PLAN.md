@@ -30,7 +30,7 @@ what actually happened lives in `PROGRESS.md`. Hard-won pattern lessons live in
 | [docs/COMPLETIONS-GUIDE.md](docs/COMPLETIONS-GUIDE.md) | The shipped completion vocabulary: every trigger/alias, accepted forms, chips, and Sage lowering for all 58 completions, plus the deliberately-deferred list. |
 | [SWIFTUI-RULES.md](SWIFTUI-RULES.md) | Imperative SwiftUI rules + the failure modes that taught them. Apply up front; use as a review checklist. |
 | [PROGRESS.md](PROGRESS.md) | Current progress summary + table of contents; detailed dated logs live in `progress/`. |
-| [PROBLEMS.md](PROBLEMS.md) | Table of contents for hard-won pattern lessons; detailed entries live in `problems/`. |
+| [PROBLEMS.md](PROBLEMS.md) | Historical index and verified resolutions for all 28 hard-won pattern lessons enforced in Rust workspace tests. |
 
 ## Architecture (Linux Target with Rust & egui)
 
