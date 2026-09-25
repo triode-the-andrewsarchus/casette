@@ -215,10 +215,13 @@ fn render_matrix_view(ui: &mut Ui, result: &WorkerResponse) {
 
 fn render_plot_card(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut TextureCache) {
     let ctx = ui.ctx().clone();
+    let mut rendered_any = false;
+
     for artifact in &result.artifacts {
         if artifact.r#type == "image" {
             if let Some(path) = &artifact.path {
                 if let Some(texture) = texture_cache.get_or_load(&ctx, path) {
+                    rendered_any = true;
                     let size = texture.size_vec2();
                     let aspect = size.x / size.y.max(1.0);
                     let target_width = (460.0_f32).min(ui.available_width() - 20.0).max(100.0);
@@ -236,6 +239,19 @@ fn render_plot_card(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut Te
                 }
             }
         }
+    }
+
+    if !rendered_any {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("📊 Plot artifact expired (re-evaluate row to regenerate)")
+                    .color(Colors::TEXT_MUTED)
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .italics(),
+            );
+        });
+        ui.add_space(4.0);
     }
 }
 
