@@ -69,6 +69,32 @@ async fn test_kernel_boot_eval_ping() {
     let bool_resp = kernel.eval("True", false, None).await.expect("eval True");
     assert_eq!(bool_resp.kind.as_deref(), Some("boolean"));
 
+    // 4c. Test Problem 021 numeric approximation: native precision clamping and kind gating
+    // (a) CC(3, 4) with 53 bits native precision does not raise on approx
+    let cc_resp = kernel
+        .eval("CC(3, 4)", false, None)
+        .await
+        .expect("eval CC(3, 4)");
+    assert!(cc_resp.ok);
+    assert!(cc_resp.approx.is_some());
+    assert!(cc_resp.approx.as_deref().unwrap().contains("3.00"));
+
+    // (b) Symbolic with free variables has NO scalar approx
+    let free_sym_resp = kernel
+        .eval("x^2 + 5*x + 6", false, None)
+        .await
+        .expect("eval free sym");
+    assert!(free_sym_resp.ok);
+    assert_eq!(free_sym_resp.approx, None);
+
+    // (c) Matrix has NO scalar approx
+    let mat_resp = kernel
+        .eval("matrix([[1, 2], [3, 4]])", false, None)
+        .await
+        .expect("eval matrix");
+    assert!(mat_resp.ok);
+    assert_eq!(mat_resp.approx, None);
+
     // 5. Test math artifact generation on integration
     let math_resp = kernel
         .eval("integrate(1/(1-x^2), x)", false, None)
