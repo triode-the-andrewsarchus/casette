@@ -150,6 +150,33 @@ async fn test_kernel_boot_eval_ping() {
         captured_stdout
     );
 
+    // 6c. Test Problem 026: value echo suppresses None and factor(x^4 - 1) unordered terms
+    let print_resp = kernel
+        .eval("print(\"suppress_none_test\")", false, None)
+        .await
+        .expect("eval bare print");
+    assert!(print_resp.ok);
+    assert_eq!(print_resp.kind.as_deref(), Some("none"));
+    assert_eq!(print_resp.value, Some(false));
+    assert_eq!(print_resp.plain.as_deref(), Some(""));
+    assert!(print_resp
+        .stdout
+        .as_deref()
+        .unwrap_or("")
+        .contains("suppress_none_test"));
+
+    let factor_resp = kernel
+        .eval("factor(x^4 - 1)", false, None)
+        .await
+        .expect("eval factor x^4 - 1");
+    assert!(factor_resp.ok);
+    let factor_plain = factor_resp.plain.as_deref().unwrap_or("");
+    assert!(
+        factor_plain.contains("x - 1")
+            && factor_plain.contains("x + 1")
+            && factor_plain.contains("x^2 + 1")
+    );
+
     // 7. Test shutdown
     kernel.shutdown().await.expect("shutdown");
 }
