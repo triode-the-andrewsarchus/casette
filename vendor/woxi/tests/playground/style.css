@@ -1,0 +1,822 @@
+/* Embedded typefaces — the same ones used by the native rasterizer and
+ * PDF exporter, so that graphics rendered by the browser in the playground
+ * match the glyphs users see when they Export[…] a plot to PNG / PDF. */
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  src: url("AtkinsonHyperlegibleNext-VariableFont_wght.ttf")
+      format("truetype-variations"),
+    url("AtkinsonHyperlegibleNext-VariableFont_wght.ttf") format("truetype");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible Mono";
+  src: url("AtkinsonHyperlegibleMono-VariableFont_wght.ttf")
+      format("truetype-variations"),
+    url("AtkinsonHyperlegibleMono-VariableFont_wght.ttf") format("truetype");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Plot / Graphics SVGs emitted by Woxi set font-family="sans-serif" or
+ * "monospace" inline on every <text> element. CSS on inline SVG text
+ * overrides those presentation attributes, so this one rule makes the
+ * playground pick up the embedded fonts without touching SVG generation. */
+svg text {
+  font-family: "Atkinson Hyperlegible Next", sans-serif;
+}
+svg text[font-family~="monospace"],
+svg text[font-family*="Mono"],
+svg text[font-family*="Courier"] {
+  font-family: "Atkinson Hyperlegible Mono", monospace;
+}
+
+:root {
+  --bg: #f5f5f5;
+  --surface: #ffffff;
+  --text: #333;
+  --text-secondary: #555;
+  --text-muted: #666;
+  --text-hint: #999;
+  --link: #4977a8;
+  --border: #ddd;
+  --border-focus: #4977a8;
+  --shadow: rgba(0, 0, 0, 0.1);
+  --btn-bg: #f8f9fa;
+  --btn-bg-hover: #e9ecef;
+  --btn-border-hover: #adb5bd;
+  --btn-text: #555;
+  --btn-text-hover: #333;
+  --active-line: #f0f4ff;
+  --output-bg: #f8f9fa;
+  --output-text: #333;
+  --output-border: #ddd;
+  --run-bg: #28a745;
+  --run-bg-hover: #1e7e34;
+  --run-disabled: #6c757d;
+  --clear-bg: #6c757d;
+  --clear-bg-hover: #545b62;
+  --hr: #ddd;
+  --status-info-bg: #d1ecf1;
+  --status-info-text: #0c5460;
+  --status-info-border: #bee5eb;
+  --status-error-bg: #f8d7da;
+  --status-error-text: #721c24;
+  --status-error-border: #f5c6cb;
+}
+
+html.dark {
+  --bg: #1a1a1a;
+  --surface: #242424;
+  --text: #e0e0e0;
+  --text-secondary: #b0b0b0;
+  --text-muted: #909090;
+  --text-hint: #707070;
+  --link: #6fa8dc;
+  --border: #3a3a3a;
+  --border-focus: #6fa8dc;
+  --shadow: rgba(0, 0, 0, 0.4);
+  --btn-bg: #2e2e2e;
+  --btn-bg-hover: #3a3a3a;
+  --btn-border-hover: #555;
+  --btn-text: #b0b0b0;
+  --btn-text-hover: #e0e0e0;
+  --active-line: #2a2a2a;
+  --output-bg: #1a1a1a;
+  --output-text: #c9c9c9;
+  --output-border: #3a3a3a;
+  --run-bg: #238636;
+  --run-bg-hover: #2ea043;
+  --run-disabled: #484848;
+  --clear-bg: #484848;
+  --clear-bg-hover: #606060;
+  --hr: #3a3a3a;
+  --status-info-bg: #1a3a3a;
+  --status-info-text: #79c0c0;
+  --status-info-border: #2a4a4a;
+  --status-error-bg: #3a1a1a;
+  --status-error-text: #f08080;
+  --status-error-border: #5a2a2a;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: "Atkinson Hyperlegible Next", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Helvetica, Arial, sans-serif;
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 4px var(--shadow);
+}
+
+header h1 {
+  color: var(--text);
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+header nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.editor-pane,
+.output-pane {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.editor-pane {
+  border-right: 1px solid var(--border);
+}
+
+#themeBtn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+  font-size: 18px;
+  cursor: pointer;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+#themeBtn:hover {
+  background-color: var(--btn-bg-hover);
+  border-color: var(--btn-border-hover);
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.examples {
+  display: flex;
+  gap: 0.5rem;
+  margin: 1.5rem 0 1rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.examples span {
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: bold;
+}
+
+.example-btn {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--btn-bg);
+  color: var(--btn-text);
+  transition: all 0.2s;
+}
+
+.example-btn:hover {
+  background: var(--btn-bg-hover);
+  border-color: var(--btn-border-hover);
+  color: var(--btn-text-hover);
+}
+
+/* CodeMirror editor — fills the editor pane, no margin or border. */
+.editor-container {
+  flex: 1;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.editor-container .cm-editor {
+  font-size: 12px;
+  height: 100%;
+}
+
+.editor-container .cm-editor.cm-focused {
+  outline: none;
+}
+
+.editor-container .cm-scroller {
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  line-height: 1.5;
+  padding: 0.5rem 0;
+}
+
+.editor-container .cm-content {
+  padding: 0 0.75rem;
+}
+
+.editor-container .cm-activeLine {
+  background-color: var(--active-line);
+}
+
+.controls {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  margin: 0;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.controls-right {
+  display: flex;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+#runBtn {
+  background-color: var(--run-bg);
+  color: white;
+}
+
+#runBtn:hover:not(:disabled) {
+  background-color: var(--run-bg-hover);
+}
+
+#runBtn:disabled {
+  background-color: var(--run-disabled);
+  cursor: not-allowed;
+}
+
+#clearBtn {
+  background: none;
+  color: var(--text-muted);
+}
+
+#clearBtn:hover {
+  background-color: var(--clear-bg);
+  color: white;
+}
+
+#shareBtn {
+  background: none;
+  color: var(--text-muted);
+}
+
+#shareBtn:hover {
+  background-color: color-mix(in srgb, var(--border-focus) 15%, transparent);
+}
+
+button {
+  padding: 0.5rem 1.5rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color 0.2s;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+[data-tooltip] {
+  position: relative;
+}
+
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: normal;
+  white-space: nowrap;
+  background: var(--text);
+  color: var(--bg);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+
+[data-tooltip]:hover::after {
+  opacity: 1;
+}
+
+#outputs {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.5rem;
+  overflow: auto;
+  transition: opacity 0.2s;
+}
+
+#outputs.stale {
+  opacity: 0.4;
+}
+
+.output-box {
+  padding: 0.4rem 0.6rem;
+  border: 2px solid var(--output-border);
+  border-radius: 4px;
+  /* Keep natural height when the outputs column overflows — otherwise flexbox
+   * shrinks each box to fit the viewport, squashing/clipping tall outputs. */
+  flex-shrink: 0;
+}
+
+pre.output-box {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin: 0;
+}
+
+.output-box.text-box,
+.output-box.print-box {
+  background: var(--output-bg);
+  color: var(--output-text);
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 15px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.output-box.text-box svg {
+  display: block;
+}
+
+.output-box.graphics-box {
+  background: var(--surface);
+}
+
+.output-box.graphics-box svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.output-box.warning-box {
+  background: var(--status-info-bg);
+  color: var(--status-info-text);
+  border-color: var(--status-info-border);
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 14px;
+}
+
+.output-box.error-box {
+  background: var(--status-error-bg);
+  color: var(--status-error-text);
+  border-color: var(--status-error-border);
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 14px;
+}
+
+.output-box.sound-box {
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.output-box.sound-box audio {
+  display: block;
+  width: 100%;
+  max-width: 24rem;
+}
+
+.output-box.sound-box .sound-label {
+  color: var(--output-text);
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 13px;
+}
+
+.output-box.sound-box .sound-note {
+  color: var(--status-info-text);
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.output-box.manipulate-box {
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.manipulate-controls {
+  /* One shared grid for all control rows so the label column is exactly as
+     wide as the widest label (sliders stay aligned across rows) instead of a
+     fixed 6rem gutter. `fit-content(12rem)` sizes the column to its content
+     but caps it, so a short label like `t` sits snug against its slider while
+     a long label can't swallow it. Rows use `display: contents` (below) so
+     their label/slider/value cells land directly in this grid.
+     The slider column is `minmax(0, 22rem)` rather than `1fr`: it still
+     shrinks on narrow viewports but never stretches a slider past ~22rem, so
+     the controls stay a comfortable width on a wide window. */
+  display: grid;
+  grid-template-columns: fit-content(12rem) minmax(0, 22rem) auto;
+  justify-content: start;
+  align-items: center;
+  column-gap: 0.6rem;
+  row-gap: 0.35rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.manipulate-control-row {
+  display: contents;
+}
+
+.manipulate-label {
+  font-weight: 500;
+  color: var(--text);
+}
+
+/* A static heading row between controls (a string or Style[…] Manipulate
+   argument, e.g. "signal 1"). Spans the whole control grid. */
+.manipulate-heading {
+  grid-column: 1 / -1;
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* A Delimiter argument: a horizontal separator between control groups. */
+.manipulate-delimiter {
+  grid-column: 1 / -1;
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0.15rem 0;
+}
+
+.manipulate-control-row input[type="range"] {
+  width: 100%;
+}
+
+.manipulate-value {
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 3rem;
+  text-align: right;
+}
+
+/* Segmented SetterBar (a small set of discrete choices as toggle buttons) */
+.manipulate-setterbar {
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.manipulate-setterbar .setter-btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-right-width: 0;
+  /* Square by default so the inner (touching) corners stay flush; only the
+     outer corners of the first/last segment are rounded below. */
+  border-radius: 0;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 0.2rem 0.7rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.manipulate-setterbar .setter-btn:first-child {
+  border-top-left-radius: 6px;
+  border-bottom-left-radius: 6px;
+}
+
+.manipulate-setterbar .setter-btn:last-child {
+  border-right-width: 1px;
+  border-top-right-radius: 6px;
+  border-bottom-right-radius: 6px;
+}
+
+.manipulate-setterbar .setter-btn:hover:not(.active) {
+  background: var(--surface-3, rgba(127, 127, 127, 0.22));
+}
+
+.manipulate-setterbar .setter-btn.active {
+  background: var(--accent, #3b82f6);
+  border-color: var(--accent, #3b82f6);
+  color: #fff;
+}
+
+/* A control whose `Enabled -> Dynamic[…]` condition is currently false is
+   greyed out and non-interactive. */
+.manipulate-control-row.disabled {
+  opacity: 0.45;
+}
+
+.manipulate-control-row.disabled input[type="range"] {
+  cursor: not-allowed;
+}
+
+.manipulate-setterbar.disabled .setter-btn {
+  cursor: not-allowed;
+}
+
+.manipulate-setterbar .setter-btn:disabled {
+  cursor: not-allowed;
+}
+
+/* `Appearance -> None` hides the control rows entirely — the animation just
+   runs. An animated widget keeps its play/pause bar below. */
+.manipulate-controls.appearance-none .manipulate-control-row {
+  display: none;
+}
+
+/* Animate/ListAnimate play-pause bar. The controls panel is a shared grid, so
+   span every column and left-align the button under the sliders. */
+.manipulate-animator {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  padding-top: 0.15rem;
+}
+
+.manipulate-play {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  width: 2rem;
+  height: 1.6rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.manipulate-play:hover {
+  background: var(--surface-3, rgba(127, 127, 127, 0.22));
+}
+
+/* 2D slider pad (ControlType -> Slider2D) */
+.manipulate-pad {
+  position: relative;
+  width: 100%;
+  max-width: 12rem;
+  aspect-ratio: 1 / 1;
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.manipulate-pad-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin-left: -6px;
+  margin-bottom: -6px;
+  border-radius: 50%;
+  background: var(--accent, #3b82f6);
+  border: 2px solid var(--surface);
+  pointer-events: none;
+}
+
+/* Multi-point locator pad (ControlType -> Locator): the handles receive
+   pointer events themselves so a double-click can remove a point. */
+.manipulate-locator-pad .manipulate-pad-handle {
+  pointer-events: auto;
+  cursor: grab;
+}
+
+/* SetterBar buttons whose label is a rendered Graphics icon */
+.manipulate-setterbar .setter-btn-icon svg {
+  display: block;
+  width: 24px;
+  height: 14px;
+  pointer-events: none;
+}
+
+/* Interval slider (ControlType -> IntervalSlider) */
+.manipulate-interval {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 100%;
+}
+
+.manipulate-interval input[type="range"] {
+  width: 100%;
+}
+
+.manipulate-output {
+  min-height: 2rem;
+  transition: opacity 0.1s ease-out;
+}
+
+.manipulate-output.stale {
+  opacity: 0.6;
+}
+
+.manipulate-output svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.manipulate-output pre {
+  margin: 0;
+  font-family: "Atkinson Hyperlegible Mono", "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+  font-size: 14px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+/* ── Manipulate extra-display elements (Checkbox grids, panels, …) ── */
+.manipulate-displays {
+  margin-top: 0.75rem;
+}
+
+.manipulate-display-panel {
+  display: inline-block;
+  padding: 0.5rem;
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 4px;
+  background: var(--panel-bg, rgba(127, 127, 127, 0.06));
+}
+
+.manipulate-display-grid {
+  display: inline-grid;
+  gap: 2px;
+}
+
+.manipulate-display-grid-row {
+  display: flex;
+  gap: 2px;
+}
+
+.manipulate-display-column {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.manipulate-display-row {
+  display: flex;
+  flex-direction: row;
+  gap: 4px;
+  align-items: center;
+}
+
+.manipulate-display-checkbox {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.manipulate-display-checkbox:disabled {
+  cursor: default;
+}
+
+/* One choice of a TogglerBar[Dynamic[var], …]: a toggle button whose
+   pressed state mirrors the value's membership in the list variable. */
+.manipulate-display-toggler {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color, #bbb);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.manipulate-display-toggler.selected {
+  background: var(--accent-color, #4a90d9);
+  border-color: var(--accent-color, #4a90d9);
+  color: #fff;
+}
+
+/* A caption `Button[label, action]`: pressing it runs the held action. */
+.manipulate-display-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border: 1px solid var(--border-color, #bbb);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.manipulate-display-button:hover {
+  background: var(--border-color, #eee);
+}
+
+.status {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  padding: 0.75rem 1rem;
+  border-radius: 4px;
+  display: none;
+  z-index: 100;
+  font-size: 14px;
+}
+
+.status.info {
+  background-color: var(--status-info-bg);
+  color: var(--status-info-text);
+  border: 1px solid var(--status-info-border);
+}
+
+.status.error {
+  background-color: var(--status-error-bg);
+  color: var(--status-error-text);
+  border: 1px solid var(--status-error-border);
+}
+
+.spinner {
+  display: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top: 2px solid #ffffff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 640px) {
+  #wrapper {
+    padding: 1rem;
+  }
+
+  .controls {
+    flex-wrap: wrap;
+  }
+
+  .controls-right {
+    width: 100%;
+  }
+
+  .controls-right button {
+    flex: 1;
+  }
+}

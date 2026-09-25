@@ -1,0 +1,3222 @@
+use super::*;
+use crate::functions::math_ast::{is_sqrt, make_sqrt, rat_reduce};
+use std::collections::BTreeMap;
+
+// ─── Unit dimension system ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Dimension {
+  Length,
+  Mass,
+  Time,
+  ElectricCurrent,
+  AmountOfSubstance,
+  Information,
+}
+
+/// Conversion factor to SI base unit as a rational (numerator, denominator).
+/// E.g. Kilometers → Meters is (1000, 1).
+struct UnitInfo {
+  /// Dimension exponent map, e.g. Joules = {Mass: 1, Length: 2, Time: -2}
+  dimensions: BTreeMap<Dimension, i64>,
+  /// to_si = number of SI base units per 1 of this unit as rational
+  to_si: (i128, i128),
+}
+
+fn dims(pairs: &[(Dimension, i64)]) -> BTreeMap<Dimension, i64> {
+  pairs.iter().copied().collect()
+}
+
+fn get_unit_info(name: &str) -> Option<UnitInfo> {
+  use Dimension::{
+    AmountOfSubstance, ElectricCurrent, Information, Length, Mass, Time,
+  };
+  let info = match name {
+    // ── Length → Meters ───────────────────────────────────────────────
+    "Meters" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1, 1),
+    },
+    "Kilometers" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1000, 1),
+    },
+    "Centimeters" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1, 100),
+    },
+    "Millimeters" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1, 1000),
+    },
+    "Feet" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (381, 1250),
+    },
+    "Inches" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (127, 5000),
+    },
+    "Miles" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (201168, 125),
+    },
+    "Yards" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1143, 1250),
+    },
+    "Micrometers" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1, 1000000),
+    },
+    "Nanometers" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1, 1000000000),
+    },
+    "NauticalMiles" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1852, 1),
+    },
+    // 1 ly = c (m/s) × Julian year (s) = 299792458 × 31557600 m (exact).
+    "LightYears" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (9460730472580800, 1),
+    },
+    // IAU 2012 definition.
+    "AstronomicalUnit" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (149597870700, 1),
+    },
+    "Angstroms" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (1, 10000000000),
+    },
+    // 1 furlong = 1/8 mile = 201168/1000 m = 25146/125 m.
+    "Furlongs" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (25146, 125),
+    },
+
+    // ── Mass → Kilograms ─────────────────────────────────────────────
+    "Kilograms" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (1, 1),
+    },
+    "Grams" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (1, 1000),
+    },
+    "Milligrams" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (1, 1000000),
+    },
+    "Pounds" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (45359237, 100000000),
+    },
+    "Tonnes" | "MetricTons" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (1000, 1),
+    },
+    "MetricKilotons" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (1000000, 1),
+    },
+    "Ounces" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (45359237, 1600000000),
+    },
+    // 1 Da = 1.66053906660×10⁻²⁷ kg (CODATA 2018).
+    "Daltons" | "AtomicMassUnit" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (166053906660, 100000000000000000000000000000000000000),
+    },
+
+    // ── Time → Seconds ───────────────────────────────────────────────
+    "Seconds" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (1, 1),
+    },
+    "Minutes" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (60, 1),
+    },
+    "Hours" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (3600, 1),
+    },
+    "Days" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (86400, 1),
+    },
+    "Weeks" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (604800, 1),
+    },
+    "Milliseconds" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (1, 1000),
+    },
+    "Microseconds" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (1, 1000000),
+    },
+    "Nanoseconds" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (1, 1000000000),
+    },
+
+    // ── Volume = Length^3, SI base Meters^3 ───────────────────────────
+    // 1 L = 1/1000 m^3; factors are relative to Meters^3.
+    "Liters" => UnitInfo {
+      dimensions: dims(&[(Length, 3)]),
+      to_si: (1, 1000),
+    },
+    "Milliliters" => UnitInfo {
+      dimensions: dims(&[(Length, 3)]),
+      to_si: (1, 1000000),
+    },
+    "Gallons" => UnitInfo {
+      dimensions: dims(&[(Length, 3)]),
+      to_si: (473176473, 125000000000),
+    },
+
+    // ── Area = Length^2, SI base Meters^2 ─────────────────────────────
+    // Factors are relative to Meters^2. Hectares and Acres are genuine named
+    // units kept as-is; "SquareMeters"/"SquareKilometers" are aliases that
+    // canonicalize to "Meters"^2 / "Kilometers"^2 (see
+    // format_expand_compound_unit). Imperial "Square…" names like
+    // "SquareFeet" are not standalone WL units — they stay unevaluated.
+    "Hectares" => UnitInfo {
+      dimensions: dims(&[(Length, 2)]),
+      to_si: (10000, 1),
+    },
+    "Acres" => UnitInfo {
+      dimensions: dims(&[(Length, 2)]),
+      to_si: (316160658, 78125),
+    },
+
+    // ── Electric Current → Amperes ───────────────────────────────────
+    "Amperes" => UnitInfo {
+      dimensions: dims(&[(ElectricCurrent, 1)]),
+      to_si: (1, 1),
+    },
+    "Milliamperes" => UnitInfo {
+      dimensions: dims(&[(ElectricCurrent, 1)]),
+      to_si: (1, 1000),
+    },
+
+    // ── Amount of substance → Moles ──────────────────────────────────
+    "Moles" => UnitInfo {
+      dimensions: dims(&[(AmountOfSubstance, 1)]),
+      to_si: (1, 1),
+    },
+    "Millimoles" => UnitInfo {
+      dimensions: dims(&[(AmountOfSubstance, 1)]),
+      to_si: (1, 1000),
+    },
+
+    // ── Force: Newtons = kg⋅m/s² ─────────────────────────────────────
+    "Newtons" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 1), (Time, -2)]),
+      to_si: (1, 1),
+    },
+    // 1 dyne = 1e-5 N
+    "Dynes" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 1), (Time, -2)]),
+      to_si: (1, 100000),
+    },
+
+    // ── Pressure: Pascals = kg/(m⋅s²) ────────────────────────────────
+    "Pascals" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, -1), (Time, -2)]),
+      to_si: (1, 1),
+    },
+    "Bars" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, -1), (Time, -2)]),
+      to_si: (100000, 1),
+    },
+    "Atmospheres" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, -1), (Time, -2)]),
+      to_si: (101325, 1),
+    },
+    "Kilopascals" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, -1), (Time, -2)]),
+      to_si: (1000, 1),
+    },
+    "Megapascals" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, -1), (Time, -2)]),
+      to_si: (1_000_000, 1),
+    },
+    "Gigapascals" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, -1), (Time, -2)]),
+      to_si: (1_000_000_000, 1),
+    },
+
+    // ── Energy: Joules = kg⋅m²/s² ────────────────────────────────────
+    "Joules" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (1, 1),
+    },
+    "Millijoules" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (1, 1000),
+    },
+    "Kilojoules" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (1000, 1),
+    },
+    "Calories" | "DietaryCalories" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (4184, 1),
+    },
+    "ThermochemicalCalories" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (4184, 1000),
+    },
+    "Kilocalories" | "ThermochemicalKilocalories" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (4184, 1),
+    },
+    "ElectronVolts" | "Electronvolts" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (1602176634, 10000000000000000000000000000),
+    },
+    "Megaelectronvolts" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (1602176634, 10000000000000000000000),
+    },
+
+    // ── Power: Watts = kg⋅m²/s³ ──────────────────────────────────────
+    "Watts" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -3)]),
+      to_si: (1, 1),
+    },
+    "Milliwatts" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -3)]),
+      to_si: (1, 1000),
+    },
+    "Kilowatts" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -3)]),
+      to_si: (1000, 1),
+    },
+
+    // ── Voltage: Volts = kg⋅m²/(A⋅s³) ────────────────────────────────
+    "Volts" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -3),
+        (ElectricCurrent, -1),
+      ]),
+      to_si: (1, 1),
+    },
+    "Millivolts" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -3),
+        (ElectricCurrent, -1),
+      ]),
+      to_si: (1, 1000),
+    },
+    "Kilovolts" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -3),
+        (ElectricCurrent, -1),
+      ]),
+      to_si: (1000, 1),
+    },
+
+    // ── Charge: Coulombs = A⋅s ────────────────────────────────────────
+    "Coulombs" => UnitInfo {
+      dimensions: dims(&[(ElectricCurrent, 1), (Time, 1)]),
+      to_si: (1, 1),
+    },
+
+    // ── Capacitance: Farads = A²⋅s⁴/(kg⋅m²) ─────────────────────────
+    "Farads" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, -1),
+        (Length, -2),
+        (Time, 4),
+        (ElectricCurrent, 2),
+      ]),
+      to_si: (1, 1),
+    },
+    "Millifarads" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, -1),
+        (Length, -2),
+        (Time, 4),
+        (ElectricCurrent, 2),
+      ]),
+      to_si: (1, 1000),
+    },
+    "Microfarads" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, -1),
+        (Length, -2),
+        (Time, 4),
+        (ElectricCurrent, 2),
+      ]),
+      to_si: (1, 1000000),
+    },
+    "Nanofarads" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, -1),
+        (Length, -2),
+        (Time, 4),
+        (ElectricCurrent, 2),
+      ]),
+      to_si: (1, 1000000000),
+    },
+    "Picofarads" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, -1),
+        (Length, -2),
+        (Time, 4),
+        (ElectricCurrent, 2),
+      ]),
+      to_si: (1, 1000000000000),
+    },
+
+    // ── Resistance: Ohms = kg⋅m²/(A²⋅s³) ─────────────────────────────
+    "Ohms" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -3),
+        (ElectricCurrent, -2),
+      ]),
+      to_si: (1, 1),
+    },
+    "Kilohms" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -3),
+        (ElectricCurrent, -2),
+      ]),
+      to_si: (1000, 1),
+    },
+    "Megohms" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -3),
+        (ElectricCurrent, -2),
+      ]),
+      to_si: (1000000, 1),
+    },
+
+    // ── Inductance: Henries = kg⋅m²/(A²⋅s²) ──────────────────────────
+    "Henries" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -2),
+        (ElectricCurrent, -2),
+      ]),
+      to_si: (1, 1),
+    },
+    "Millihenries" => UnitInfo {
+      dimensions: dims(&[
+        (Mass, 1),
+        (Length, 2),
+        (Time, -2),
+        (ElectricCurrent, -2),
+      ]),
+      to_si: (1, 1000),
+    },
+
+    // ── Energy (time-based): WattHours = kg⋅m²/(s) ⋅ 3600 ────────────
+    // 1 Wh = 3600 J, dimension same as Joules: kg⋅m²/s²
+    // Note: wolframscript normalization of these names varies by version/environment.
+    // The verify script skips Quantity tests due to this variability.
+    "WattHours" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (3600, 1),
+    },
+    "KilowattHours" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -2)]),
+      to_si: (3600000, 1),
+    },
+
+    // ── Frequency: Hertz = 1/s ──────────────────────────────────────
+    "Hertz" => UnitInfo {
+      dimensions: dims(&[(Time, -1)]),
+      to_si: (1, 1),
+    },
+    "Kilohertz" => UnitInfo {
+      dimensions: dims(&[(Time, -1)]),
+      to_si: (1000, 1),
+    },
+    "Megahertz" => UnitInfo {
+      dimensions: dims(&[(Time, -1)]),
+      to_si: (1000000, 1),
+    },
+    "Gigahertz" => UnitInfo {
+      dimensions: dims(&[(Time, -1)]),
+      to_si: (1000000000, 1),
+    },
+
+    // ── Magnetic flux density: Teslas = kg/(A⋅s²) ──────────────────
+    "Teslas" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (ElectricCurrent, -1), (Time, -2)]),
+      to_si: (1, 1),
+    },
+    "Milliteslas" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (ElectricCurrent, -1), (Time, -2)]),
+      to_si: (1, 1000),
+    },
+
+    // ── Speed (named): Knots = NauticalMiles/Hours ──────────────────
+    "Knots" => UnitInfo {
+      dimensions: dims(&[(Length, 1), (Time, -1)]),
+      to_si: (1852, 3600),
+    },
+
+    // ── Misc. mass / force / power / time units (exact SI factors) ──
+    // 1 carat = 0.2 g = 1/5000 kg.
+    "Carats" | "Carat" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (1, 5000),
+    },
+    // 1 lbf = 0.45359237 kg * 9.80665 m/s^2 = 4.4482216152605 N.
+    "PoundsForce" | "PoundForce" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 1), (Time, -2)]),
+      to_si: (8_896_443_230_521, 2_000_000_000_000),
+    },
+    // 1 mechanical horsepower = 745.69987158227022 W.
+    "Horsepower" => UnitInfo {
+      dimensions: dims(&[(Mass, 1), (Length, 2), (Time, -3)]),
+      to_si: (37_284_993_579_113_511, 50_000_000_000_000),
+    },
+    // wolframscript's year is exactly 365 days = 31536000 s.
+    "Years" | "Year" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (31_536_000, 1),
+    },
+    // 1 fortnight = 14 days = 1209600 s.
+    "Fortnights" | "Fortnight" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (1_209_600, 1),
+    },
+    // wolframscript's month is exactly a 365-day year / 12 = 2628000 s.
+    "Months" | "Month" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (2_628_000, 1),
+    },
+    // Decade / century use the Gregorian year (365.2425 days), not the 365-day
+    // "Years" unit: 1 decade = 10·365.2425·86400 = 315569520 s.
+    "Decades" | "Decade" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (315_569_520, 1),
+    },
+    "Centuries" | "Century" => UnitInfo {
+      dimensions: dims(&[(Time, 1)]),
+      to_si: (3_155_695_200, 1),
+    },
+    // 1 chain = 66 ft = 66·381/1250 = 12573/625 m.
+    "Chains" | "Chain" => UnitInfo {
+      dimensions: dims(&[(Length, 1)]),
+      to_si: (12_573, 625),
+    },
+    // 1 stone = 14 lb = 6.35029318 kg.
+    "Stones" | "Stone" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (317_514_659, 50_000_000),
+    },
+    // 1 slug = 14.5939029372... kg (1 lbf·s²/ft).
+    "Slugs" | "Slug" => UnitInfo {
+      dimensions: dims(&[(Mass, 1)]),
+      to_si: (8_896_443_230_521, 609_600_000_000),
+    },
+
+    // ── Information → Bits (SI base, matching wolframscript) ─────────
+    // A Byte is 8 Bits; decimal (SI) prefixes are powers of 1000, binary
+    // prefixes (Kibi-, …) powers of 1024 — both expressed in Bits here.
+    "Bits" | "Bit" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (1, 1),
+    },
+    "Bytes" | "Byte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8, 1),
+    },
+    "Kilobytes" | "Kilobyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_000, 1),
+    },
+    "Megabytes" | "Megabyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_000_000, 1),
+    },
+    "Gigabytes" | "Gigabyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_000_000_000, 1),
+    },
+    "Terabytes" | "Terabyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_000_000_000_000, 1),
+    },
+    "Petabytes" | "Petabyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_000_000_000_000_000, 1),
+    },
+    "Kibibytes" | "Kibibyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_192, 1),
+    },
+    "Mebibytes" | "Mebibyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_388_608, 1),
+    },
+    "Gibibytes" | "Gibibyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_589_934_592, 1),
+    },
+    "Tebibytes" | "Tebibyte" => UnitInfo {
+      dimensions: dims(&[(Information, 1)]),
+      to_si: (8_796_093_022_208, 1),
+    },
+
+    _ => return None,
+  };
+  Some(info)
+}
+
+/// Try to resolve a lowercase unit name by capitalizing the first letter.
+/// E.g. "days" → "Days", "kilometers" → "Kilometers", "feet" → "Feet".
+/// Returns the canonical name if found, None otherwise.
+fn resolve_lowercase_unit(name: &str) -> Option<String> {
+  if name.is_empty() {
+    return None;
+  }
+  // Only attempt if the first character is lowercase
+  let first = name.chars().next()?;
+  if !first.is_ascii_lowercase() {
+    return None;
+  }
+  let capitalized = {
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    let rest: String = chars.collect();
+    format!("{}{}", first.to_uppercase(), rest)
+  };
+  // Check direct match
+  if get_unit_info(&capitalized).is_some() {
+    return Some(capitalized);
+  }
+  // Try singular → plural on the capitalized form
+  let plural = normalize_singular_to_plural(&capitalized);
+  if get_unit_info(&plural).is_some() {
+    return Some(plural);
+  }
+  None
+}
+
+// ─── Compound unit decomposition ────────────────────────────────────────────
+
+/// A decomposed compound unit: list of (base_unit_name, exponent) pairs
+/// plus a combined SI conversion factor as a rational.
+struct CompoundUnitInfo {
+  /// Each base unit and its exponent, e.g. [("Kilometers", 1), ("Seconds", -2)]
+  components: Vec<(String, i64)>,
+  /// Combined SI conversion factor as rational numer/denom
+  si: (i128, i128),
+  /// Dimension exponent map for compatibility checking
+  dimensions: BTreeMap<Dimension, i64>,
+}
+
+fn rat_div(a: (i128, i128), b: (i128, i128)) -> (i128, i128) {
+  rat_reduce(a.0 * b.1, a.1 * b.0)
+}
+
+fn rat_mul(a: (i128, i128), b: (i128, i128)) -> (i128, i128) {
+  rat_reduce(a.0 * b.0, a.1 * b.1)
+}
+
+/// Raise a rational to an integer power.
+fn rat_pow(a: (i128, i128), exp: i64) -> (i128, i128) {
+  if exp == 0 {
+    return (1, 1);
+  }
+  if exp > 0 {
+    rat_reduce(a.0.pow(exp as u32), a.1.pow(exp as u32))
+  } else {
+    // Negative exponent: swap numer/denom
+    rat_reduce(a.1.pow((-exp) as u32), a.0.pow((-exp) as u32))
+  }
+}
+
+/// Try to decompose a CamelCase "Per" compound unit name.
+/// E.g. "KilometersPerHour" → Kilometers / Hours,
+///      "MetersPerSecondSquared" → Meters / Seconds^2
+fn resolve_per_unit(s: &str) -> Option<Expr> {
+  // Split on "Per" (only the first occurrence)
+  let idx = s.find("Per")?;
+  if idx == 0 {
+    return None; // starts with "Per" — not a compound unit
+  }
+  let numer_part = &s[..idx];
+  let denom_part = &s[idx + 3..];
+  if denom_part.is_empty() {
+    return None;
+  }
+
+  // Check if denominator ends with "Squared" or "Cubed"
+  let (denom_base, exp) = if let Some(base) = denom_part.strip_suffix("Squared")
+  {
+    (base, 2)
+  } else if let Some(base) = denom_part.strip_suffix("Cubed") {
+    (base, 3)
+  } else {
+    (denom_part, 1)
+  };
+
+  // Validate both parts are known units (try plural form too)
+  let numer_name = if get_unit_info(numer_part).is_some() {
+    numer_part.to_string()
+  } else {
+    let plural = format!("{numer_part}s");
+    if get_unit_info(&plural).is_some() {
+      plural
+    } else {
+      return None;
+    }
+  };
+  let denom_name = if get_unit_info(denom_base).is_some() {
+    denom_base.to_string()
+  } else {
+    let plural = format!("{denom_base}s");
+    if get_unit_info(&plural).is_some() {
+      plural
+    } else {
+      return None;
+    }
+  };
+
+  let numer_expr = Expr::String(numer_name);
+  let denom_expr = if exp == 1 {
+    Expr::String(denom_name)
+  } else {
+    pow2(Expr::String(denom_name.clone()), Expr::Integer(exp))
+  };
+
+  Some(div2(numer_expr, denom_expr))
+}
+
+/// Resolve common unit abbreviation strings to full unit names.
+fn resolve_unit_abbreviation(s: &str) -> Option<Expr> {
+  // Simple abbreviations → single unit
+  let simple = match s {
+    "m" => "Meters",
+    "km" => "Kilometers",
+    "cm" => "Centimeters",
+    "mm" => "Millimeters",
+    "μm" | "um" => "Micrometers",
+    "nm" => "Nanometers",
+    "nmi" => "NauticalMiles",
+    "ft" => "Feet",
+    "in" => "Inches",
+    "mi" => "Miles",
+    "yd" => "Yards",
+    "kg" => "Kilograms",
+    "g" => "Grams",
+    "mg" => "Milligrams",
+    "lb" | "lbs" => "Pounds",
+    "t" => "MetricTons",
+    "oz" => "Ounces",
+    "s" => "Seconds",
+    "ms" => "Milliseconds",
+    "μs" | "us" => "Microseconds",
+    "ns" => "Nanoseconds",
+    "min" => "Minutes",
+    "h" | "hr" => "Hours",
+    "d" => "Days",
+    "L" => "Liters",
+    "mL" => "Milliliters",
+    "gal" => "Gallons",
+    "A" => "Amperes",
+    "mA" => "Milliamperes",
+    "V" => "Volts",
+    "mV" => "Millivolts",
+    "kV" => "Kilovolts",
+    "J" => "Joules",
+    "mJ" => "Millijoules",
+    "kJ" => "Kilojoules",
+    "cal" => "ThermochemicalCalories",
+    "kcal" => "ThermochemicalKilocalories",
+    "eV" => "Electronvolts",
+    "MeV" => "Megaelectronvolts",
+    "Da" => "Daltons",
+    "W" => "Watts",
+    "mW" => "Milliwatts",
+    "kW" => "Kilowatts",
+    "F" => "Farads",
+    "mF" => "Millifarads",
+    "μF" => "Microfarads",
+    "nF" => "Nanofarads",
+    "pF" => "Picofarads",
+    "C" => "Coulombs",
+    "N" => "Newtons",
+    "dyn" => "Dynes",
+    "Pa" => "Pascals",
+    "kPa" => "Kilopascals",
+    "MPa" => "Megapascals",
+    "GPa" => "Gigapascals",
+    "bar" => "Bars",
+    "atm" => "Atmospheres",
+    "Ω" => "Ohms",
+    "kΩ" => "Kilohms",
+    "MΩ" => "Megohms",
+    "Wh" => "WattHours",
+    "kWh" => "KilowattHours",
+    "H" => "Henries",
+    "mH" => "Millihenries",
+    "Hz" => "Hertz",
+    "kHz" => "Kilohertz",
+    "MHz" => "Megahertz",
+    "GHz" => "Gigahertz",
+    "T" => "Teslas",
+    "mT" => "Milliteslas",
+    "kn" => "Knots",
+    "kt" => "MetricKilotons",
+    _ => "",
+  };
+  if !simple.is_empty() {
+    return Some(Expr::String(simple.to_string()));
+  }
+
+  // Compound abbreviations
+  let make_div = |n: &str, d: &str| -> Expr {
+    div2(Expr::String(n.to_string()), Expr::String(d.to_string()))
+  };
+  match s {
+    "mph" => Some(make_div("Miles", "Hours")),
+    "km/h" | "kph" => Some(make_div("Kilometers", "Hours")),
+    "m/s" => Some(make_div("Meters", "Seconds")),
+    _ => {
+      // Try parsing "X/Y" pattern
+      if let Some((num, den)) = s.split_once('/') {
+        let num_expr = resolve_unit_abbreviation(num).or_else(|| {
+          get_unit_info(num).map(|_| Expr::String(num.to_string()))
+        })?;
+        let den_expr = resolve_unit_abbreviation(den).or_else(|| {
+          get_unit_info(den).map(|_| Expr::String(den.to_string()))
+        })?;
+        Some(div2(num_expr, den_expr))
+      } else {
+        None
+      }
+    }
+  }
+}
+
+/// Resolve named compound constants like SpeedOfLight.
+/// Returns (magnitude_factor, unit_components).
+fn resolve_compound_constant(
+  name: &str,
+) -> Option<((i128, i128), Vec<(String, i64)>)> {
+  match name {
+    "SpeedOfLight" => Some((
+      (299792458, 1),
+      vec![("Meters".to_string(), 1), ("Seconds".to_string(), -1)],
+    )),
+    _ => None,
+  }
+}
+
+/// Try to parse a compound unit string (e.g. "Meters/Seconds^2") into an Expr
+/// by running it through the Wolfram parser.
+fn try_parse_unit_string(s: &str) -> Option<Expr> {
+  // Only attempt if it looks like a compound expression (contains / or ^)
+  if !s.contains('/') && !s.contains('^') && !s.contains('*') {
+    return None;
+  }
+  let pairs = crate::parse(s).ok()?;
+  for pair in pairs {
+    if pair.as_rule() == crate::Rule::Expression {
+      return Some(identifiers_to_strings(&crate::syntax::pair_to_expr(pair)));
+    }
+    for inner in pair.into_inner() {
+      if inner.as_rule() == crate::Rule::Expression {
+        return Some(identifiers_to_strings(&crate::syntax::pair_to_expr(
+          inner,
+        )));
+      }
+    }
+  }
+  None
+}
+
+/// Convert all Identifier nodes to String nodes in a parsed unit expression.
+/// This ensures that units parsed from strings like "Meters/Seconds^2" are
+/// stored as String nodes, matching Wolfram's internal representation.
+fn identifiers_to_strings(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Identifier(s) => Expr::String(s.clone()),
+    Expr::BinaryOp { op, left, right } => binop(
+      *op,
+      identifiers_to_strings(left),
+      identifiers_to_strings(right),
+    ),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.iter().map(identifiers_to_strings).collect(),
+    },
+    other => other.clone(),
+  }
+}
+
+/// Recursively decompose a unit Expr into a CompoundUnitInfo.
+fn decompose_unit_expr(expr: &Expr) -> Option<CompoundUnitInfo> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Quantity" && args.len() == 2 => {
+      decompose_unit_expr(&args[1])
+    }
+    Expr::Integer(n) => {
+      // Dimensionless numeric factor (e.g. the 1 in "1/Seconds")
+      Some(CompoundUnitInfo {
+        components: vec![],
+        si: (*n, 1),
+        dimensions: BTreeMap::new(),
+      })
+    }
+    Expr::Identifier(name) | Expr::String(name) => {
+      // Normalize spelling/case variants (e.g. "Lightyears", "Lightyear") to
+      // the canonical unit name before resolving.
+      let name_canonical = unit_alias(name).to_string();
+      let name = &name_canonical;
+      // Try direct unit lookup
+      if let Some(info) = get_unit_info(name) {
+        return Some(CompoundUnitInfo {
+          components: vec![(name.clone(), 1)],
+          si: info.to_si,
+          dimensions: info.dimensions,
+        });
+      }
+      // Named compound aliases (e.g. "SquareMeters" → Meters^2,
+      // "KilowattHours" → Hours*Kilowatts) expand to their product form.
+      if let Some(expanded) = format_expand_compound_unit(name) {
+        return decompose_unit_expr(&expanded);
+      }
+      // Try compound constants (e.g. SpeedOfLight)
+      if let Some((mag, components)) = resolve_compound_constant(name) {
+        let mut si: (i128, i128) = mag;
+        let mut dims = BTreeMap::new();
+        for (unit_name, exp) in &components {
+          let uinfo = get_unit_info(unit_name)?;
+          let (pn, pd) = rat_pow(uinfo.to_si, *exp);
+          si.0 *= pn;
+          si.1 *= pd;
+          for (dim, dim_exp) in &uinfo.dimensions {
+            *dims.entry(*dim).or_insert(0) += dim_exp * exp;
+          }
+        }
+        si = rat_reduce(si.0, si.1);
+        return Some(CompoundUnitInfo {
+          components,
+          si,
+          dimensions: dims,
+        });
+      }
+      // Try abbreviation resolution
+      if let Some(resolved) = resolve_unit_abbreviation(name) {
+        return decompose_unit_expr(&resolved);
+      }
+      // Try CamelCase "Per" decomposition (e.g. "KilometersPerHour")
+      if let Some(resolved) = resolve_per_unit(name) {
+        return decompose_unit_expr(&resolved);
+      }
+      // Try parsing as a compound unit expression (e.g. "Meters/Seconds^2")
+      if let Some(parsed) = try_parse_unit_string(name) {
+        return decompose_unit_expr(&parsed);
+      }
+      // Try singular → plural normalization (e.g. "Kilometer" → "Kilometers")
+      let plural = normalize_singular_to_plural(name);
+      if let Some(info) = get_unit_info(&plural) {
+        return Some(CompoundUnitInfo {
+          components: vec![(plural, 1)],
+          si: info.to_si,
+          dimensions: info.dimensions,
+        });
+      }
+      // Try lowercase → canonical (e.g. "days" → "Days")
+      if let Some(canonical) = resolve_lowercase_unit(name)
+        && let Some(info) = get_unit_info(&canonical)
+      {
+        return Some(CompoundUnitInfo {
+          components: vec![(canonical, 1)],
+          si: info.to_si,
+          dimensions: info.dimensions,
+        });
+      }
+      None
+    }
+    Expr::BinaryOp { op, left, right } => {
+      match op {
+        BinaryOperator::Divide => {
+          let mut left_info = decompose_unit_expr(left)?;
+          let right_info = decompose_unit_expr(right)?;
+          // Negate right exponents
+          for (name, exp) in &right_info.components {
+            left_info.components.push((name.clone(), -exp));
+          }
+          // SI factor: left / right
+          left_info.si = rat_div(left_info.si, right_info.si);
+          // Merge dimensions
+          for (dim, exp) in &right_info.dimensions {
+            *left_info.dimensions.entry(*dim).or_insert(0) -= exp;
+          }
+          left_info.dimensions.retain(|_, v| *v != 0);
+          Some(left_info)
+        }
+        BinaryOperator::Times => {
+          let mut left_info = decompose_unit_expr(left)?;
+          let right_info = decompose_unit_expr(right)?;
+          for (name, exp) in &right_info.components {
+            left_info.components.push((name.clone(), *exp));
+          }
+          left_info.si = rat_mul(left_info.si, right_info.si);
+          for (dim, exp) in &right_info.dimensions {
+            *left_info.dimensions.entry(*dim).or_insert(0) += exp;
+          }
+          left_info.dimensions.retain(|_, v| *v != 0);
+          Some(left_info)
+        }
+        BinaryOperator::Power => {
+          let base_info = decompose_unit_expr(left)?;
+          let exp_val = match right.as_ref() {
+            Expr::Integer(n) => *n as i64,
+            _ => return None,
+          };
+          let components: Vec<(String, i64)> = base_info
+            .components
+            .iter()
+            .map(|(n, e)| (n.clone(), e * exp_val))
+            .collect();
+          let (pn, pd) = rat_pow(base_info.si, exp_val);
+          let dims: BTreeMap<Dimension, i64> = base_info
+            .dimensions
+            .iter()
+            .map(|(d, e)| (*d, e * exp_val))
+            .filter(|(_, e)| *e != 0)
+            .collect();
+          Some(CompoundUnitInfo {
+            components,
+            si: (pn, pd),
+            dimensions: dims,
+          })
+        }
+        _ => None,
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut result: Option<CompoundUnitInfo> = None;
+      for arg in args {
+        let info = decompose_unit_expr(arg)?;
+        match &mut result {
+          None => result = Some(info),
+          Some(r) => {
+            for (name, exp) in &info.components {
+              r.components.push((name.clone(), *exp));
+            }
+            r.si = rat_mul(r.si, info.si);
+            for (dim, exp) in &info.dimensions {
+              *r.dimensions.entry(*dim).or_insert(0) += exp;
+            }
+            r.dimensions.retain(|_, v| *v != 0);
+          }
+        }
+      }
+      result
+    }
+    // Power in function-call form, e.g. Power["Meters", 2] — produced by
+    // si_base_unit_expr and by the "SquareMeters" area-unit alias. Mirrors the
+    // BinaryOp Power case above so both spellings decompose identically.
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      let base_info = decompose_unit_expr(&args[0])?;
+      let exp_val = match &args[1] {
+        Expr::Integer(n) => *n as i64,
+        _ => return None,
+      };
+      let components: Vec<(String, i64)> = base_info
+        .components
+        .iter()
+        .map(|(n, e)| (n.clone(), e * exp_val))
+        .collect();
+      let (pn, pd) = rat_pow(base_info.si, exp_val);
+      let dims: BTreeMap<Dimension, i64> = base_info
+        .dimensions
+        .iter()
+        .map(|(d, e)| (*d, e * exp_val))
+        .filter(|(_, e)| *e != 0)
+        .collect();
+      Some(CompoundUnitInfo {
+        components,
+        si: (pn, pd),
+        dimensions: dims,
+      })
+    }
+    _ => None,
+  }
+}
+
+/// Simplify compound unit components by merging units with the same dimension signature.
+/// Returns (simplified_components, conversion_factor).
+/// The conversion factor should be applied to the magnitude.
+fn simplify_compound_unit(
+  components: &[(String, i64)],
+) -> (Vec<(String, i64)>, (i128, i128)) {
+  // Group by dimension signature (full BTreeMap<Dimension, i64>)
+  let mut sig_groups: BTreeMap<BTreeMap<Dimension, i64>, Vec<(String, i64)>> =
+    BTreeMap::new();
+  let mut unknown: Vec<(String, i64)> = Vec::new();
+
+  for (name, exp) in components {
+    if let Some(info) = get_unit_info(name) {
+      sig_groups
+        .entry(info.dimensions)
+        .or_default()
+        .push((name.clone(), *exp));
+    } else {
+      unknown.push((name.clone(), *exp));
+    }
+  }
+
+  let mut conv: (i128, i128) = (1, 1);
+  let mut simplified: Vec<(String, i64)> = Vec::new();
+
+  for units in sig_groups.values() {
+    // Find the "canonical" unit: the one with the largest total absolute exponent
+    let canonical =
+      units.iter().max_by_key(|(_, e)| e.abs()).unwrap().0.clone();
+    let canonical_info = get_unit_info(&canonical).unwrap();
+
+    let mut total_exp: i64 = 0;
+    for (name, exp) in units {
+      if name == &canonical {
+        total_exp += exp;
+      } else {
+        // Convert this unit to canonical: factor = (this_si / canonical_si)^exp
+        let this_info = get_unit_info(name).unwrap();
+        let unit_conv = rat_div(this_info.to_si, canonical_info.to_si);
+        let (pn, pd) = rat_pow(unit_conv, *exp);
+        conv = rat_mul(conv, (pn, pd));
+        total_exp += exp;
+      }
+    }
+
+    if total_exp != 0 {
+      simplified.push((canonical, total_exp));
+    }
+  }
+
+  simplified.extend(unknown);
+
+  (simplified, conv)
+}
+
+/// Build a unit Expr from simplified components.
+/// Positive exponents go in numerator, negative in denominator.
+fn components_to_unit_expr(components: &[(String, i64)]) -> Expr {
+  // wolframscript orders the factors of a compound unit alphabetically by
+  // name (e.g. `Hours*Watts`, `Amperes*Seconds`), so sort the numerator and
+  // denominator parts by unit name rather than by dimension signature.
+  let mut sorted: Vec<(String, i64)> = components.to_vec();
+  sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+  let mut numer_parts: Vec<Expr> = Vec::new();
+  let mut denom_parts: Vec<Expr> = Vec::new();
+
+  for (name, exp) in &sorted {
+    let base = Expr::String(name.clone());
+    let abs_exp = exp.abs();
+    let part = if abs_exp == 1 {
+      base
+    } else {
+      pow2(base, Expr::Integer(abs_exp as i128))
+    };
+    if *exp > 0 {
+      numer_parts.push(part);
+    } else {
+      denom_parts.push(part);
+    }
+  }
+
+  let numer = if numer_parts.is_empty() {
+    Expr::Integer(1)
+  } else if numer_parts.len() == 1 {
+    numer_parts.remove(0)
+  } else {
+    call("Times", numer_parts)
+  };
+
+  if denom_parts.is_empty() {
+    numer
+  } else {
+    let denom = if denom_parts.len() == 1 {
+      denom_parts.remove(0)
+    } else {
+      call("Times", denom_parts)
+    };
+    div2(numer, denom)
+  }
+}
+
+/// Decompose, simplify, and rebuild a compound unit expression.
+/// Returns (simplified_unit_expr, conversion_factor).
+fn simplify_unit_expr(unit: &Expr) -> Option<(Expr, (i128, i128))> {
+  let info = decompose_unit_expr(unit)?;
+  let (simplified, conv) = simplify_compound_unit(&info.components);
+  if simplified.is_empty() {
+    return Some((Expr::Integer(1), conv));
+  }
+  Some((components_to_unit_expr(&simplified), conv))
+}
+
+/// Map a full unit name to its standard SI abbreviation.
+/// Returns `None` for unknown units.
+pub fn unit_to_abbreviation(name: &str) -> Option<&'static str> {
+  Some(match name {
+    // Length
+    "Meters" => "m",
+    "Kilometers" => "km",
+    "Centimeters" => "cm",
+    "Millimeters" => "mm",
+    "Micrometers" => "\u{03bc}m", // μm
+    "Nanometers" => "nm",
+    "NauticalMiles" => "nmi",
+    "Feet" => "ft",
+    "Inches" => "in",
+    "Miles" => "mi",
+    "Yards" => "yd",
+    // Mass
+    "Kilograms" => "kg",
+    "Grams" => "g",
+    "Milligrams" => "mg",
+    "Pounds" => "lb",
+    "MetricTons" => "t",
+    "Ounces" => "oz",
+    // Time
+    "Seconds" => "s",
+    "Milliseconds" => "ms",
+    "Microseconds" => "\u{03bc}s", // μs
+    "Nanoseconds" => "ns",
+    "Minutes" => "min",
+    "Hours" => "h",
+    "Days" => "days",
+    // Volume
+    "Liters" => "L",
+    "Milliliters" => "mL",
+    "Gallons" => "gal",
+    // Electrical / Energy / Power
+    "Amperes" => "A",
+    "Milliamperes" => "mA",
+    "Volts" => "V",
+    "Millivolts" => "mV",
+    "Kilovolts" => "kV",
+    "Joules" => "J",
+    "Millijoules" => "mJ",
+    "Kilojoules" => "kJ",
+    "ThermochemicalCalories" => "cal",
+    "ThermochemicalKilocalories" => "kcal",
+    "Electronvolts" => "eV",
+    "Megaelectronvolts" => "MeV",
+    "Daltons" => "Da",
+    "Watts" => "W",
+    "Milliwatts" => "mW",
+    "Kilowatts" => "kW",
+    "Farads" => "F",
+    "Millifarads" => "mF",
+    "Microfarads" => "\u{03bc}F", // μF
+    "Nanofarads" => "nF",
+    "Picofarads" => "pF",
+    "Coulombs" => "C",
+    "Newtons" => "N",
+    "Pascals" => "Pa",
+    "Kilopascals" => "kPa",
+    "Megapascals" => "MPa",
+    "Gigapascals" => "GPa",
+    "Bars" => "bar",
+    "Atmospheres" => "atm",
+    "Ohms" => "\u{03a9}",     // Ω
+    "Kilohms" => "k\u{03a9}", // kΩ
+    "Megohms" => "M\u{03a9}", // MΩ
+    "WattHours" => "Wh",
+    "KilowattHours" => "kWh",
+    "Henries" => "H",
+    "Millihenries" => "mH",
+    "Hertz" => "Hz",
+    "Kilohertz" => "kHz",
+    "Megahertz" => "MHz",
+    "Gigahertz" => "GHz",
+    "Teslas" => "T",
+    "Milliteslas" => "mT",
+    "Knots" => "kn",
+    "MetricKilotons" => "kt",
+    _ => return None,
+  })
+}
+
+// ─── Quantity helpers ───────────────────────────────────────────────────────
+
+/// Extract (magnitude, unit_string) from a Quantity FunctionCall.
+/// Unit can be an Identifier or a String.
+pub fn is_quantity(expr: &Expr) -> Option<(&Expr, &Expr)> {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Quantity"
+    && args.len() == 2
+  {
+    return Some((&args[0], &args[1]));
+  }
+  None
+}
+
+/// Get the unit name from a unit expression (Identifier or String).
+fn unit_name(expr: &Expr) -> Option<&str> {
+  match expr {
+    Expr::Identifier(s) => Some(s.as_str()),
+    Expr::String(s) => Some(s.as_str()),
+    _ => None,
+  }
+}
+
+/// Check if two unit expressions represent compatible (same dimension) units.
+fn units_compatible(u1: &Expr, u2: &Expr) -> bool {
+  if let (Some(info1), Some(info2)) =
+    (decompose_unit_expr(u1), decompose_unit_expr(u2))
+  {
+    return info1.dimensions == info2.dimensions;
+  }
+  // If we can't decompose, they're compatible only if identical
+  expr_to_string(u1) == expr_to_string(u2)
+}
+
+/// Check if two unit expressions are the same unit.
+fn units_equal(u1: &Expr, u2: &Expr) -> bool {
+  expr_to_string(u1) == expr_to_string(u2)
+}
+
+/// Normalize input spelling/case variants to the canonical unit-table key.
+/// (Singular/plural for units that only differ by a trailing "s" — Angstrom,
+/// Furlong — is already handled by normalize_singular_to_plural.)
+fn unit_alias(name: &str) -> &str {
+  match name {
+    "Lightyears" | "Lightyear" | "LightYear" => "LightYears",
+    "AstronomicalUnits" => "AstronomicalUnit",
+    _ => name,
+  }
+}
+
+/// Map unit aliases to their canonical Wolfram names.
+fn canonical_unit_name(name: &str) -> &str {
+  match name {
+    "Calories" | "Kilocalories" => "DietaryCalories",
+    "Tonnes" => "MetricTons",
+    _ => name,
+  }
+}
+
+/// Expand compound energy units to their product form (matching Wolfram canonical output).
+/// Used at format time to display entity-resolved compound units.
+fn format_expand_compound_unit(name: &str) -> Option<Expr> {
+  match name {
+    "KilowattHours" => Some(times2(
+      Expr::String("Hours".to_string()),
+      Expr::String("Kilowatts".to_string()),
+    )),
+    "WattHours" => Some(times2(
+      Expr::String("Hours".to_string()),
+      Expr::String("Watts".to_string()),
+    )),
+    // Area aliases canonicalize to a squared length, matching Wolfram:
+    // Quantity[1, "SquareMeters"] → Quantity[1, Meters^2].
+    "SquareMeters" => Some(squared_length_unit("Meters")),
+    "SquareKilometers" => Some(squared_length_unit("Kilometers")),
+    _ => None,
+  }
+}
+
+/// Build the unit expression `"<length>"^2` (e.g. Meters^2) used to canonicalize
+/// "Square…" area aliases.
+fn squared_length_unit(length: &str) -> Expr {
+  pow(Expr::String(length.to_string()), Expr::Integer(2))
+}
+
+/// Try to produce the plural form of a singular unit name.
+/// E.g. "Meter" → "Meters", "Foot" → "Feet", "Henry" → "Henries", "Inch" → "Inches".
+fn normalize_singular_to_plural(name: &str) -> String {
+  // Irregular plurals
+  match name {
+    "Foot" => return "Feet".to_string(),
+    "Inch" => return "Inches".to_string(),
+    _ => {}
+  }
+  // Names ending in "y" → "ies" (Henry → Henries)
+  if let Some(base) = name.strip_suffix('y') {
+    let candidate = format!("{base}ies");
+    if get_unit_info(&candidate).is_some() {
+      return candidate;
+    }
+  }
+  // Default: add "s"
+  format!("{name}s")
+}
+
+/// Full normalization for UnitConvert output: expands abbreviations, "Per" compounds,
+/// singular forms, and compound unit strings. Used for UnitConvert results where
+/// wolframscript normalizes the target unit to canonical form.
+fn normalize_unit_for_output(mut unit: Expr) -> Expr {
+  match &mut unit {
+    Expr::String(s) => {
+      let s = unit_alias(s).to_string();
+      if let Some(compound) = format_expand_compound_unit(&s) {
+        compound
+      } else if get_unit_info(&s).is_some() {
+        Expr::String(canonical_unit_name(&s).to_string())
+      } else if let Some(expanded) = resolve_unit_abbreviation(&s) {
+        normalize_unit_for_output(expanded)
+      } else if let Some(expanded) = resolve_per_unit(&s) {
+        normalize_unit_for_output(expanded)
+      } else if let Some(parsed) = try_parse_unit_string(&s) {
+        normalize_unit_for_output(parsed)
+      } else {
+        let plural = normalize_singular_to_plural(&s);
+        if let Some(compound) = format_expand_compound_unit(&plural) {
+          compound
+        } else if get_unit_info(&plural).is_some() {
+          Expr::String(canonical_unit_name(&plural).to_string())
+        } else if let Some(canonical) = resolve_lowercase_unit(&s) {
+          Expr::String(canonical_unit_name(&canonical).to_string())
+        } else {
+          Expr::String(s)
+        }
+      }
+    }
+    Expr::BinaryOp { .. } => {
+      if has_bare_identifier_units(&unit) {
+        unit
+      } else if let Expr::BinaryOp { op, left, right } = &mut unit {
+        let op = *op;
+        let left = *std::mem::replace(left, Box::new(Expr::Integer(0)));
+        let right = *std::mem::replace(right, Box::new(Expr::Integer(0)));
+        binop(
+          op,
+          normalize_unit_for_output(left),
+          normalize_unit_for_output(right),
+        )
+      } else {
+        unreachable!()
+      }
+    }
+    Expr::FunctionCall { name, args } => {
+      let name = std::mem::take(name);
+      let args = std::mem::take(args);
+      Expr::FunctionCall {
+        name,
+        args: args.into_iter().map(normalize_unit_for_output).collect(),
+      }
+    }
+    Expr::Identifier(s) => {
+      let s = unit_alias(s).to_string();
+      if let Some(compound) = format_expand_compound_unit(&s) {
+        return compound;
+      }
+      if get_unit_info(&s).is_some() {
+        return Expr::String(canonical_unit_name(&s).to_string());
+      }
+      if let Some(expanded) = resolve_unit_abbreviation(&s) {
+        return normalize_unit_for_output(expanded);
+      }
+      if let Some(expanded) = resolve_per_unit(&s) {
+        return normalize_unit_for_output(expanded);
+      }
+      let plural = normalize_singular_to_plural(&s);
+      if let Some(compound) = format_expand_compound_unit(&plural) {
+        return compound;
+      }
+      if get_unit_info(&plural).is_some() {
+        return Expr::String(canonical_unit_name(&plural).to_string());
+      }
+      if let Some(canonical) = resolve_lowercase_unit(&s) {
+        return Expr::String(canonical_unit_name(&canonical).to_string());
+      }
+      unit
+    }
+    _ => unit,
+  }
+}
+
+/// Recursively normalize unit expressions at evaluation time.
+/// Expands native abbreviations, "Per" compounds, singular forms, and compound
+/// strings.
+fn normalize_unit(mut unit: Expr) -> Expr {
+  match &mut unit {
+    Expr::String(s) => {
+      let s = unit_alias(s).to_string();
+      // Temperature scales canonicalize to their Wolfram output spelling:
+      // "Celsius" -> "DegreesCelsius", "Fahrenheit" -> "DegreesFahrenheit",
+      // "Kelvin" -> "Kelvins". Done before the general unit lookup because
+      // these scales are recognised only via temperature_scale, not
+      // get_unit_info.
+      if let Some(scale) = temperature_scale(&Expr::String(s.clone())) {
+        return Expr::String(temp_output_unit(scale).to_string());
+      }
+      if let Some(compound) = format_expand_compound_unit(&s) {
+        compound
+      } else if get_unit_info(&s).is_some() {
+        Expr::String(canonical_unit_name(&s).to_string())
+      } else if let Some(expanded) = resolve_unit_abbreviation(&s) {
+        normalize_unit(expanded)
+      } else if let Some(expanded) = resolve_per_unit(&s) {
+        normalize_unit(expanded)
+      } else if let Some(parsed) = try_parse_unit_string(&s) {
+        normalize_unit(parsed)
+      } else {
+        // Try singular → plural normalization
+        let plural = normalize_singular_to_plural(&s);
+        if get_unit_info(&plural).is_some() {
+          Expr::String(canonical_unit_name(&plural).to_string())
+        } else if let Some(canonical) = resolve_lowercase_unit(&s) {
+          Expr::String(canonical_unit_name(&canonical).to_string())
+        } else {
+          Expr::String(s)
+        }
+      }
+    }
+    Expr::BinaryOp { .. } => {
+      // Wolfram doesn't recognize compound expressions with bare symbols as units.
+      // E.g. Kilometers/Seconds^2 is symbolic, not a unit specification.
+      // Only normalize compound expressions that use string-based unit names.
+      if has_bare_identifier_units(&unit) {
+        unit
+      } else if let Expr::BinaryOp { op, left, right } = &mut unit {
+        let op = *op;
+        let left = *std::mem::replace(left, Box::new(Expr::Integer(0)));
+        let right = *std::mem::replace(right, Box::new(Expr::Integer(0)));
+        binop(op, normalize_unit(left), normalize_unit(right))
+      } else {
+        unreachable!()
+      }
+    }
+    Expr::FunctionCall { name, args } => {
+      let name = std::mem::take(name);
+      let args = std::mem::take(args);
+      Expr::FunctionCall {
+        name,
+        args: args.into_iter().map(normalize_unit).collect(),
+      }
+    }
+    // Bare identifiers are not valid unit specifications in Wolfram. Leave
+    // them unchanged — QuantityQ will report False for them.
+    Expr::Identifier(_) => unit,
+    _ => unit,
+  }
+}
+
+fn is_pure_number(expr: &Expr) -> bool {
+  matches!(
+    expr,
+    Expr::Integer(_)
+      | Expr::Real(_)
+      | Expr::BigInteger(_)
+      | Expr::BigFloat(_, _)
+  ) || matches!(
+    expr,
+    Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2
+  )
+}
+
+fn make_quantity(magnitude: Expr, unit: Expr) -> Expr {
+  let unit = normalize_unit(unit);
+  call("Quantity", vec![magnitude, unit])
+}
+
+/// Convert a magnitude from `from_unit` to `to_unit` (must be same dimension).
+/// Returns magnitude * (from_factor / to_factor) as exact rational arithmetic.
+fn convert_magnitude(
+  magnitude: &Expr,
+  from_unit: &str,
+  to_unit: &str,
+) -> Result<Expr, InterpreterError> {
+  let from = get_unit_info(from_unit).ok_or_else(|| {
+    InterpreterError::EvaluationError(format!("Unknown unit: {from_unit}"))
+  })?;
+  let to = get_unit_info(to_unit).ok_or_else(|| {
+    InterpreterError::EvaluationError(format!("Unknown unit: {to_unit}"))
+  })?;
+
+  if from.dimensions != to.dimensions {
+    return Err(InterpreterError::EvaluationError(format!(
+      "{from_unit} and {to_unit} are incompatible units."
+    )));
+  }
+
+  // conversion = from / to
+  let conv = rat_div(from.to_si, to.to_si);
+
+  multiply_magnitude_by_rational(magnitude, conv)
+}
+
+/// Multiply a magnitude expression by a rational (numer/denom).
+fn multiply_magnitude_by_rational(
+  magnitude: &Expr,
+  (numer, denom): (i128, i128),
+) -> Result<Expr, InterpreterError> {
+  // Simplify the conversion factor
+  let (numer, denom) = rat_reduce(numer, denom);
+
+  if numer == 1 && denom == 1 {
+    return Ok(magnitude.clone());
+  }
+
+  match magnitude {
+    Expr::Integer(m) => {
+      let (rn, rd) = rat_reduce(m * numer, denom);
+      if rd == 1 {
+        Ok(Expr::Integer(rn))
+      } else {
+        Ok(crate::functions::math_ast::make_rational(rn, rd))
+      }
+    }
+    // Collapse the rational scale to a f64 first so the multiplication
+    // rounds once, matching wolframscript (e.g. 3.8 Pounds → 1.723651006 kg,
+    // not 1.7236510059999999).
+    Expr::Real(f) => Ok(Expr::Real(f * ((numer as f64) / (denom as f64)))),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(mn), Expr::Integer(md)) = (&args[0], &args[1]) {
+        let rn = mn * numer;
+        let rd = md * denom;
+        Ok(crate::functions::math_ast::make_rational(rn, rd))
+      } else {
+        // Symbolic magnitude — wrap in Times
+        Ok(crate::functions::math_ast::times_ast(&[
+          magnitude.clone(),
+          crate::functions::math_ast::make_rational(numer, denom),
+        ])?)
+      }
+    }
+    _ => {
+      // Symbolic magnitude — wrap in Times
+      let factor = if denom == 1 {
+        Expr::Integer(numer)
+      } else {
+        crate::functions::math_ast::make_rational(numer, denom)
+      };
+      crate::functions::math_ast::times_ast(&[magnitude.clone(), factor])
+    }
+  }
+}
+
+// ─── Quantity[mag, unit] constructor ────────────────────────────────────────
+
+pub fn quantity_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  match args.len() {
+    1 => {
+      // A bare number is not a valid unit specification: wolframscript emits
+      // Quantity::unkunit and leaves Quantity[n] unevaluated (rather than
+      // treating the number as a unit with magnitude 1).
+      if is_pure_number(&args[0]) {
+        crate::emit_message(&format!(
+          "Quantity::unkunit: Unable to interpret unit specification {}.",
+          expr_to_output(&args[0])
+        ));
+        return Ok(unevaluated("Quantity", args));
+      }
+      // Quantity["Meters"] → Quantity[1, Meters]
+      let unit = args[0].clone();
+      Ok(make_quantity(Expr::Integer(1), unit))
+    }
+    2 => {
+      // Thread over lists: Quantity[{a, b}, unit] → {Quantity[a, unit], Quantity[b, unit]}
+      if let Expr::List(items) = &args[0] {
+        let results: Vec<Expr> = items
+          .iter()
+          .map(|item| make_quantity(item.clone(), args[1].clone()))
+          .collect();
+        return Ok(Expr::List(results.into()));
+      }
+      let magnitude = args[0].clone();
+      let unit = args[1].clone();
+      // When the unit is a pure number (Integer, Real, or Rational), Quantity[m, n]
+      // reduces to the product m*n to match Mathematica's behavior.
+      if is_pure_number(&unit) {
+        let product = call("Times", vec![magnitude, unit]);
+        return crate::evaluator::evaluate_expr_to_expr(&product);
+      }
+      Ok(make_quantity(magnitude, unit))
+    }
+    _ => Err(InterpreterError::EvaluationError(
+      "Quantity expects 1 or 2 arguments".into(),
+    )),
+  }
+}
+
+// ─── QuantityMagnitude ──────────────────────────────────────────────────────
+
+pub fn quantity_magnitude_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  match args.len() {
+    1 => {
+      // QuantityMagnitude[Quantity[m, u]] → m
+      if let Some((mag, _unit)) = is_quantity(&args[0]) {
+        return Ok(mag.clone());
+      }
+      // Thread over a list of quantities (matches wolframscript).
+      if let Expr::List(items) = &args[0] {
+        let mapped: Result<Vec<Expr>, InterpreterError> = items
+          .iter()
+          .map(|it| quantity_magnitude_ast(std::slice::from_ref(it)))
+          .collect();
+        return Ok(Expr::List(mapped?.into()));
+      }
+      Ok(unevaluated("QuantityMagnitude", args))
+    }
+    2 => {
+      // QuantityMagnitude[Quantity[m, u], target_unit] → convert, return magnitude
+      if let Some((mag, unit)) = is_quantity(&args[0]) {
+        let target = &args[1];
+        let from_name = unit_name(unit);
+        let to_name = unit_name(target);
+        if let (Some(from), Some(to)) = (from_name, to_name) {
+          return convert_magnitude(mag, from, to);
+        }
+        return Ok(unevaluated("QuantityMagnitude", args));
+      }
+      // Thread over a list of quantities; pass the target unit through.
+      if let Expr::List(items) = &args[0] {
+        let mapped: Result<Vec<Expr>, InterpreterError> = items
+          .iter()
+          .map(|it| quantity_magnitude_ast(&[it.clone(), args[1].clone()]))
+          .collect();
+        return Ok(Expr::List(mapped?.into()));
+      }
+      Ok(unevaluated("QuantityMagnitude", args))
+    }
+    _ => Err(InterpreterError::EvaluationError(
+      "QuantityMagnitude expects 1 or 2 arguments".into(),
+    )),
+  }
+}
+
+// ─── QuantityUnit ───────────────────────────────────────────────────────────
+
+/// Convert unit expression identifiers to strings (Wolfram stores units as strings)
+fn unit_idents_to_strings(unit: &Expr) -> Expr {
+  match unit {
+    Expr::Identifier(s) => Expr::String(s.clone()),
+    Expr::BinaryOp { op, left, right } => binop(
+      *op,
+      unit_idents_to_strings(left),
+      unit_idents_to_strings(right),
+    ),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.iter().map(unit_idents_to_strings).collect(),
+    },
+    _ => unit.clone(),
+  }
+}
+
+pub fn quantity_unit_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "QuantityUnit expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over lists (Listable): QuantityUnit[{q1, q2, ...}]
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| quantity_unit_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  if let Some((_mag, unit)) = is_quantity(&args[0]) {
+    Ok(unit_idents_to_strings(unit))
+  } else {
+    Ok(unevaluated("QuantityUnit", args))
+  }
+}
+
+// ─── QuantityQ ──────────────────────────────────────────────────────────────
+
+pub fn quantity_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "QuantityQ expects exactly 1 argument".into(),
+    ));
+  }
+  // Must be a Quantity[magnitude, unit] with a unit specification that
+  // KnownUnitQ would accept (matching wolframscript's stricter behaviour —
+  // Quantity[3, "Maters"] fails because "Maters" is unknown, even though
+  // the head is Quantity).
+  let result = match is_quantity(&args[0]) {
+    Some((_mag, unit)) => known_unit_q_recursive(unit),
+    None => false,
+  };
+  Ok(bool_expr(result))
+}
+
+// ─── CompatibleUnitQ ────────────────────────────────────────────────────────
+
+/// Recursive helper: returns true iff `unit` is a recognised Wolfram unit
+/// specification. Accepts the dimensionless constant `1`, canonical-plural
+/// string unit names ("Feet", "Meters", ...), and products / divisions /
+/// integer powers of such strings. Rejects everything else — including
+/// symbols, numeric literals other than 1, singular forms ("Foot"), and
+/// lowercase aliases ("meter") — matching wolframscript's behaviour.
+fn known_unit_q_recursive(unit: &Expr) -> bool {
+  match unit {
+    Expr::Integer(n) => *n == 1,
+    Expr::String(s) => get_unit_info(s).is_some(),
+    Expr::BinaryOp { op, left, right } => match op {
+      BinaryOperator::Times | BinaryOperator::Divide => {
+        known_unit_q_recursive(left) && known_unit_q_recursive(right)
+      }
+      BinaryOperator::Power => {
+        known_unit_q_recursive(left)
+          && matches!(right.as_ref(), Expr::Integer(_))
+      }
+      _ => false,
+    },
+    Expr::FunctionCall { name, args } => {
+      if (name == "Times" || name == "Divide") && !args.is_empty() {
+        args.iter().all(known_unit_q_recursive)
+      } else if name == "Power" && args.len() == 2 {
+        known_unit_q_recursive(&args[0]) && matches!(&args[1], Expr::Integer(_))
+      } else {
+        false
+      }
+    }
+    _ => false,
+  }
+}
+
+pub fn known_unit_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "KnownUnitQ expects exactly 1 argument".into(),
+    ));
+  }
+  let ok = known_unit_q_recursive(&args[0]);
+  Ok(bool_expr(ok))
+}
+
+pub fn compatible_unit_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "CompatibleUnitQ expects exactly 2 arguments".into(),
+    ));
+  }
+  let u1 = if let Some((_m, u)) = is_quantity(&args[0]) {
+    u
+  } else {
+    &args[0]
+  };
+  let u2 = if let Some((_m, u)) = is_quantity(&args[1]) {
+    u
+  } else {
+    &args[1]
+  };
+  let result = units_compatible(u1, u2);
+  Ok(bool_expr(result))
+}
+
+// ─── UnitConvert ────────────────────────────────────────────────────────────
+
+/// Check if a unit expression is a compound (BinaryOp or multi-arg FunctionCall).
+fn is_compound_unit_expr(e: &Expr) -> bool {
+  matches!(
+    e,
+    Expr::BinaryOp { .. } | Expr::FunctionCall { name: _, args: _ }
+  ) && !matches!(e, Expr::FunctionCall { name, args } if name == "Quantity" || args.is_empty())
+}
+
+/// Check if a unit expression contains bare identifiers in compound form.
+/// Wolfram doesn't recognize compound expressions with bare symbols as units
+/// (e.g. `Kilometers/Seconds^2` as opposed to `"Kilometers/Seconds^2"`).
+fn has_bare_identifier_units(e: &Expr) -> bool {
+  match e {
+    Expr::Identifier(_) => true,
+    Expr::String(_) | Expr::Integer(_) => false,
+    Expr::BinaryOp { left, right, .. } => {
+      has_bare_identifier_units(left) || has_bare_identifier_units(right)
+    }
+    expr if is_sqrt(expr).is_some() => {
+      has_bare_identifier_units(is_sqrt(expr).unwrap())
+    }
+    Expr::FunctionCall { name, args } if name == "Power" || name == "Times" => {
+      args.iter().any(has_bare_identifier_units)
+    }
+    _ => false,
+  }
+}
+
+/// Build an SI base-unit expression from a dimension exponent map.
+/// E.g. {Mass: 1} → "Kilograms"; {Length: 1, Time: -2} → "Meters/Seconds^2".
+fn si_base_unit_expr(dimensions: &BTreeMap<Dimension, i64>) -> Expr {
+  use Dimension::{
+    AmountOfSubstance, ElectricCurrent, Information, Length, Mass, Time,
+  };
+  let base_name = |d: Dimension| -> &'static str {
+    match d {
+      Length => "Meters",
+      Mass => "Kilograms",
+      Time => "Seconds",
+      ElectricCurrent => "Amperes",
+      AmountOfSubstance => "Moles",
+      Information => "Bits",
+    }
+  };
+  // Collect positive and negative exponents
+  let mut positives: Vec<(Dimension, i64)> = Vec::new();
+  let mut negatives: Vec<(Dimension, i64)> = Vec::new();
+  for (&d, &e) in dimensions {
+    if e > 0 {
+      positives.push((d, e));
+    } else if e < 0 {
+      negatives.push((d, -e));
+    }
+  }
+  let build_product = |entries: &[(Dimension, i64)]| -> Option<Expr> {
+    if entries.is_empty() {
+      return None;
+    }
+    let mut terms: Vec<Expr> = entries
+      .iter()
+      .map(|(d, e)| {
+        // Use string unit names so compound SI bases (e.g. "Meters"^3) are
+        // accepted as unit specifications by the conversion path (bare
+        // identifiers in a compound unit are treated as non-units).
+        let base = Expr::String(base_name(*d).to_string());
+        if *e == 1 {
+          base
+        } else {
+          pow(base, Expr::Integer(*e as i128))
+        }
+      })
+      .collect();
+    if terms.len() == 1 {
+      terms.pop()
+    } else {
+      Some(call("Times", terms))
+    }
+  };
+  let numer = build_product(&positives);
+  let denom = build_product(&negatives);
+  match (numer, denom) {
+    (Some(n), None) => n,
+    (None, Some(d)) => pow(d, Expr::Integer(-1)),
+    (Some(n), Some(d)) => call("Times", vec![n, pow(d, Expr::Integer(-1))]),
+    (None, None) => Expr::Integer(1),
+  }
+}
+
+/// Canonical temperature-scale name for a unit expr (string or identifier),
+/// or None for non-temperature units. Accepts both Wolfram spellings.
+fn temperature_scale(unit: &Expr) -> Option<&'static str> {
+  let name = match unit {
+    Expr::String(s) => s.as_str(),
+    Expr::Identifier(s) => s.as_str(),
+    _ => return None,
+  };
+  match name {
+    "Celsius" | "DegreesCelsius" => Some("Celsius"),
+    "Kelvin" | "Kelvins" => Some("Kelvin"),
+    "Fahrenheit" | "DegreesFahrenheit" => Some("Fahrenheit"),
+    _ => None,
+  }
+}
+
+/// Affine map (mult_num, mult_den, off_num, off_den) taking a value `v` in the
+/// scale to Kelvin: `K = (mult)·v + (off)`.
+fn temp_to_kelvin_affine(scale: &str) -> (i128, i128, i128, i128) {
+  match scale {
+    "Kelvin" => (1, 1, 0, 1),
+    "Celsius" => (1, 1, 5463, 20), // K = C + 273.15
+    "Fahrenheit" => (5, 9, 45967, 180), // K = (F + 459.67)·5/9
+    _ => unreachable!(),
+  }
+}
+
+/// The unit name Wolfram emits for a target temperature scale.
+fn temp_output_unit(scale: &str) -> &'static str {
+  match scale {
+    "Kelvin" => "Kelvins",
+    "Celsius" => "DegreesCelsius",
+    "Fahrenheit" => "DegreesFahrenheit",
+    _ => unreachable!(),
+  }
+}
+
+/// UnitConvert between temperature scales, which is affine (an offset is
+/// involved) rather than the multiplicative conversion the general path uses.
+/// Returns None when the source is not a temperature quantity or the target is
+/// not a temperature scale (the caller then falls through).
+fn try_temperature_convert(
+  args: &[Expr],
+) -> Result<Option<Expr>, InterpreterError> {
+  let Some((mag, unit)) = is_quantity(&args[0]) else {
+    return Ok(None);
+  };
+  let Some(src) = temperature_scale(unit) else {
+    return Ok(None);
+  };
+  // Default target (1-arg form) is the SI base, Kelvin.
+  let tgt = if args.len() == 2 {
+    match temperature_scale(&args[1]) {
+      Some(t) => t,
+      None => return Ok(None),
+    }
+  } else {
+    "Kelvin"
+  };
+
+  let (msn, msd, bsn, bsd) = temp_to_kelvin_affine(src);
+  let (mtn, mtd, btn, btd) = temp_to_kelvin_affine(tgt);
+  let int = Expr::Integer;
+  // K = (msn/msd)·v + bsn/bsd; result = (K − btn/btd) / (mtn/mtd).
+  let term = div2(times2(int(msn), mag.clone()), int(msd));
+  let bs = div2(int(bsn), int(bsd));
+  let bt = div2(int(btn), int(btd));
+  let kelvin = plus2(term, bs);
+  let shifted = minus2(kelvin, bt);
+  let result = div2(times2(shifted, int(mtd)), int(mtn));
+  let new_mag = crate::evaluator::evaluate_expr_to_expr(&result)?;
+
+  Ok(Some(call(
+    "Quantity",
+    vec![new_mag, Expr::String(temp_output_unit(tgt).to_string())],
+  )))
+}
+
+pub fn unit_convert_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // Temperature scales convert affinely (with an offset), so handle them
+  // before the general multiplicative path.
+  if !args.is_empty()
+    && let Some(result) = try_temperature_convert(args)?
+  {
+    return Ok(result);
+  }
+  // 1-arg form: UnitConvert[quantity] → convert to base SI units
+  if args.len() == 1 {
+    if let Some((_mag, unit)) = is_quantity(&args[0])
+      && let Some(from) = decompose_unit_expr(unit)
+    {
+      let target = si_base_unit_expr(&from.dimensions);
+      // Evaluate the 2-argument call so the freshly-built target unit is
+      // normalized the same way a typed unit specification would be.
+      return crate::evaluator::evaluate_expr_to_expr(&call(
+        "UnitConvert",
+        vec![args[0].clone(), target],
+      ));
+    }
+    // A dimensionless numeric argument (a plain number, Pi, Sqrt[2], 1 + I, …)
+    // is already "converted": it passes through unchanged, matching
+    // wolframscript. `Infinity` and symbolic expressions are not numeric and
+    // stay unevaluated. This is what makes e.g.
+    // `Quantity[1, "Hours"] / Quantity[1, "Minutes"] // UnitConvert` → 60
+    // rather than the spurious `UnitConvert[60]`.
+    if crate::functions::predicate_ast::is_numeric_q(&args[0]) {
+      return Ok(args[0].clone());
+    }
+    return Ok(unevaluated("UnitConvert", args));
+  }
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "UnitConvert expects 1 or 2 arguments".into(),
+    ));
+  }
+  if let Some((mag, unit)) = is_quantity(&args[0]) {
+    let target = &args[1];
+
+    // Wolfram doesn't recognize compound expressions with bare symbols as units.
+    // E.g. Kilometers/Seconds^2 is symbolic, not a unit specification.
+    // Only string-based units like "Kilometers/Seconds^2" work.
+    if is_compound_unit_expr(unit) && has_bare_identifier_units(unit) {
+      return Ok(unevaluated("UnitConvert", args));
+    }
+
+    // Try compound unit decomposition for both sides
+    let from_info = decompose_unit_expr(unit);
+    let to_info = decompose_unit_expr(target);
+
+    if let (Some(from), Some(to)) = (from_info, to_info) {
+      // Check dimension compatibility
+      if from.dimensions != to.dimensions {
+        return Err(InterpreterError::EvaluationError(format!(
+          "{} and {} are incompatible units.",
+          expr_to_string(unit),
+          expr_to_string(target)
+        )));
+      }
+      // Convert: new_mag = mag * (from_si / to_si)
+      let conv = rat_div(from.si, to.si);
+      let new_mag = multiply_magnitude_by_rational(mag, conv)?;
+      // Build target unit expression from decomposed target components
+      // (preserves the user's target unit naming)
+      // UnitConvert normalizes the target to canonical form
+      let target_unit = if let Some((_, u)) = is_quantity(target) {
+        u.clone()
+      } else {
+        target.clone()
+      };
+      let norm_target = normalize_unit_for_output(target_unit);
+      Ok(call("Quantity", vec![new_mag, norm_target]))
+    } else {
+      // Fallback: return unevaluated
+      Ok(unevaluated("UnitConvert", args))
+    }
+  } else {
+    Ok(unevaluated("UnitConvert", args))
+  }
+}
+
+/// Matches a dimension exponent map against named derived SI units.
+fn named_si_derived_unit(dims: &BTreeMap<Dimension, i64>) -> Option<&'static str> {
+  use Dimension::{ElectricCurrent, Length, Mass, Time};
+  let mut d: Vec<(Dimension, i64)> = dims
+    .iter()
+    .filter(|(_, e)| **e != 0)
+    .map(|(k, v)| (*k, *v))
+    .collect();
+  d.sort();
+
+  let mut p_newtons = [(Mass, 1), (Length, 1), (Time, -2)];
+  p_newtons.sort();
+  let mut p_joules = [(Mass, 1), (Length, 2), (Time, -2)];
+  p_joules.sort();
+  let mut p_watts = [(Mass, 1), (Length, 2), (Time, -3)];
+  p_watts.sort();
+  let mut p_pascals = [(Mass, 1), (Length, -1), (Time, -2)];
+  p_pascals.sort();
+  let mut p_volts = [(Mass, 1), (Length, 2), (Time, -3), (ElectricCurrent, -1)];
+  p_volts.sort();
+  let mut p_coulombs = [(ElectricCurrent, 1), (Time, 1)];
+  p_coulombs.sort();
+  let mut p_farads = [(Mass, -1), (Length, -2), (Time, 4), (ElectricCurrent, 2)];
+  p_farads.sort();
+  let mut p_ohms = [(Mass, 1), (Length, 2), (Time, -3), (ElectricCurrent, -2)];
+  p_ohms.sort();
+  let mut p_siemens = [(Mass, -1), (Length, -2), (Time, 3), (ElectricCurrent, 2)];
+  p_siemens.sort();
+  let mut p_webers = [(Mass, 1), (Length, 2), (Time, -2), (ElectricCurrent, -1)];
+  p_webers.sort();
+  let mut p_teslas = [(Mass, 1), (Time, -2), (ElectricCurrent, -1)];
+  p_teslas.sort();
+  let mut p_henries = [(Mass, 1), (Length, 2), (Time, -2), (ElectricCurrent, -2)];
+  p_henries.sort();
+
+  if d == p_newtons {
+    Some("Newtons")
+  } else if d == p_joules {
+    Some("Joules")
+  } else if d == p_watts {
+    Some("Watts")
+  } else if d == p_pascals {
+    Some("Pascals")
+  } else if d == p_volts {
+    Some("Volts")
+  } else if d == p_coulombs {
+    Some("Coulombs")
+  } else if d == p_farads {
+    Some("Farads")
+  } else if d == p_ohms {
+    Some("Ohms")
+  } else if d == p_siemens {
+    Some("Siemens")
+  } else if d == p_webers {
+    Some("Webers")
+  } else if d == p_teslas {
+    Some("Teslas")
+  } else if d == p_henries {
+    Some("Henries")
+  } else {
+    None
+  }
+}
+
+/// Recursively simplify units in an expression.
+fn unit_simplify_expr(expr: &Expr) -> Result<Expr, InterpreterError> {
+  if let Some((mag, unit)) = is_quantity(expr) {
+    if let Some(from) = decompose_unit_expr(unit) {
+      let non_zero_dims: Vec<(Dimension, i64)> = from
+        .dimensions
+        .iter()
+        .filter(|(_, e)| **e != 0)
+        .map(|(d, e)| (*d, *e))
+        .collect();
+
+      // Dimensionless quantity: returns scalar magnitude multiplied by unit conversion ratio
+      if non_zero_dims.is_empty() {
+        return multiply_magnitude_by_rational(mag, from.si);
+      }
+
+      // If dimensions match a named SI derived unit (e.g. N*m -> Joules, kg*m/s^2 -> Newtons, J/s -> Watts)
+      if let Some(derived_name) = named_si_derived_unit(&from.dimensions) {
+        let is_already_named = match unit {
+          Expr::String(s) | Expr::Identifier(s) => s == derived_name,
+          _ => false,
+        };
+        if is_already_named {
+          return Ok(expr.clone());
+        }
+        return unit_convert_ast(&[expr.clone(), Expr::String(derived_name.to_string())]);
+      }
+
+      // Simplify compound unit components (e.g. cancelling compatible unit factors)
+      if let Some((simplified_unit, conv)) = simplify_unit_expr(unit) {
+        if matches!(&simplified_unit, Expr::Integer(1)) {
+          return multiply_magnitude_by_rational(mag, conv);
+        }
+        let new_mag = if conv.0 != 1 || conv.1 != 1 {
+          multiply_magnitude_by_rational(mag, conv)?
+        } else {
+          mag.clone()
+        };
+        return Ok(make_quantity(new_mag, simplified_unit));
+      }
+    }
+    return Ok(expr.clone());
+  }
+
+  match expr {
+    Expr::List(elements) => {
+      let mut res = Vec::with_capacity(elements.len());
+      for el in elements {
+        res.push(unit_simplify_expr(el)?);
+      }
+      Ok(Expr::List(res.into()))
+    }
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "List" => {
+        let mut res = Vec::with_capacity(args.len());
+        for a in args {
+          res.push(unit_simplify_expr(a)?);
+        }
+        Ok(call("List", res))
+      }
+      "Equal" | "Unequal" | "Less" | "Greater" | "LessEqual" | "GreaterEqual"
+      | "Rule" | "RuleDelayed" => {
+        let mut res = Vec::with_capacity(args.len());
+        for a in args {
+          res.push(unit_simplify_expr(a)?);
+        }
+        Ok(call(name, res))
+      }
+      _ => Ok(expr.clone()),
+    },
+    _ => Ok(expr.clone()),
+  }
+}
+
+/// UnitSimplify[expr] / UnitSimplify[expr, unit_system]
+pub fn unit_simplify_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Err(InterpreterError::EvaluationError(
+      "UnitSimplify expects at least 1 argument".into(),
+    ));
+  }
+  unit_simplify_expr(&args[0])
+}
+
+/// UnitDimensions[unit] / UnitDimensions[Quantity[m, unit]] — the physical
+/// dimensions of a unit as `{{DimensionName, exponent}, …}`. Wolfram orders
+/// the pairs alphabetically by dimension name (e.g. ElectricCurrentUnit <
+/// LengthUnit < MassUnit < TemperatureUnit < TimeUnit), which a `BTreeMap`
+/// keyed on the name reproduces. Volume folds into `LengthUnit` raised to the
+/// third power.
+pub fn unit_dimensions_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("UnitDimensions", args));
+  if args.len() != 1 {
+    return unevaluated();
+  }
+  // Accept a bare unit or a Quantity.
+  let unit = match is_quantity(&args[0]) {
+    Some((_mag, u)) => u.clone(),
+    None => args[0].clone(),
+  };
+
+  // Temperature scales are not part of the multiplicative dimension system.
+  if temperature_scale(&unit).is_some() {
+    return Ok(Expr::List(
+      vec![Expr::List(
+        vec![
+          // Dimension names are Strings (`"TemperatureUnit"`), matching the
+          // general path below and wolframscript — not bare symbols.
+          Expr::String("TemperatureUnit".to_string()),
+          Expr::Integer(1),
+        ]
+        .into(),
+      )]
+      .into(),
+    ));
+  }
+
+  let Some(info) = decompose_unit_expr(&unit) else {
+    return unevaluated();
+  };
+
+  // Fold the Woxi dimension map onto Wolfram dimension names, sorted by name.
+  let mut acc: BTreeMap<&'static str, i64> = BTreeMap::new();
+  for (dim, exp) in &info.dimensions {
+    let (name, factor) = match dim {
+      Dimension::Length => ("LengthUnit", 1),
+      Dimension::Mass => ("MassUnit", 1),
+      Dimension::Time => ("TimeUnit", 1),
+      Dimension::ElectricCurrent => ("ElectricCurrentUnit", 1),
+      Dimension::AmountOfSubstance => ("AmountUnit", 1),
+      Dimension::Information => ("InformationUnit", 1),
+    };
+    *acc.entry(name).or_insert(0) += exp * factor;
+  }
+
+  let pairs: Vec<Expr> = acc
+    .into_iter()
+    .filter(|(_, exp)| *exp != 0)
+    .map(|(name, exp)| {
+      Expr::List(
+        vec![Expr::String(name.to_string()), Expr::Integer(exp as i128)].into(),
+      )
+    })
+    .collect();
+  Ok(Expr::List(pairs.into()))
+}
+
+// ─── Arithmetic integration ────────────────────────────────────────────────
+
+/// Handle Plus when Quantity arguments are present.
+/// Returns Some(result) if handled, None if not applicable.
+pub fn try_quantity_plus(
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  // Check if any argument is a Quantity
+  let has_quantity = args.iter().any(|a| is_quantity(a).is_some());
+  if !has_quantity {
+    return None;
+  }
+
+  // Separate quantity args from non-quantity args
+  let mut quantity_args: Vec<&Expr> = Vec::new();
+  let mut other_args: Vec<Expr> = Vec::new();
+
+  for arg in args {
+    if is_quantity(arg).is_some() {
+      quantity_args.push(arg);
+    } else {
+      other_args.push(arg.clone());
+    }
+  }
+
+  if quantity_args.is_empty() {
+    return None;
+  }
+
+  // Use the first quantity's unit as a reference for compatibility checks.
+  let (_ref_mag, ref_unit) = is_quantity(quantity_args[0]).unwrap();
+
+  // Check all quantities are compatible with the first.
+  for q in &quantity_args[1..] {
+    let (_m, u) = is_quantity(q).unwrap();
+    if !units_compatible(ref_unit, u) {
+      let u1_name = expr_to_string(ref_unit);
+      let u2_name = expr_to_string(u);
+      crate::emit_message(&format!(
+        "Quantity::compat: {u1_name} and {u2_name} are incompatible units."
+      ));
+      // Return unevaluated Plus with operands sorted canonically (Plus is
+      // Orderless — e.g. Quantity[3, Seconds] should precede
+      // Quantity[6, Meters] because 3 < 6).
+      let mut sorted_args = args.to_vec();
+      sorted_args
+        .sort_by(crate::functions::list_helpers_ast::sorting::canonical_cmp);
+      return Some(Ok(call("Plus", sorted_args)));
+    }
+  }
+
+  // Pick the target unit: match Mathematica by choosing the smallest SI
+  // conversion factor (si.0 / si.1). For example, meter vs centimeter
+  // → centimeter (cm has 1/100 m, smaller than 1 m). Ties fall back to the
+  // first quantity's unit.
+  let mut target_idx = 0usize;
+  {
+    let mut best: Option<(i128, i128)> = None;
+    for (i, q) in quantity_args.iter().enumerate() {
+      let (_m, u) = is_quantity(q).unwrap();
+      if let Some(info) = decompose_unit_expr(u) {
+        // Compare (info.si.0 / info.si.1) with best via cross-multiply.
+        if let Some((bn, bd)) = best {
+          // info < best iff info.si.0 * bd < bn * info.si.1
+          if info.si.0 * bd < bn * info.si.1 {
+            best = Some(info.si);
+            target_idx = i;
+          }
+        } else {
+          best = Some(info.si);
+          target_idx = i;
+        }
+      }
+    }
+  }
+  let (target_mag, target_unit) =
+    is_quantity(quantity_args[target_idx]).unwrap();
+  let target_unit_name = unit_name(target_unit);
+
+  // All quantities are compatible — convert to target unit and sum magnitudes.
+  let target_decomposed = decompose_unit_expr(target_unit);
+  let mut magnitudes: Vec<Expr> = Vec::with_capacity(quantity_args.len());
+  for (i, q) in quantity_args.iter().enumerate() {
+    if i == target_idx {
+      magnitudes.push(target_mag.clone());
+      continue;
+    }
+    let (m, u) = is_quantity(q).unwrap();
+    // Try compound unit conversion via decomposition. Convert source `u`
+    // into `target_unit` by multiplying magnitude by
+    //   (u_si / target_si) = (u_si.0/u_si.1) * (target_si.1/target_si.0).
+    if let (Some(source_info), Some(target_info)) =
+      (decompose_unit_expr(u), &target_decomposed)
+    {
+      let conv = rat_div(source_info.si, target_info.si);
+      if conv.0 == conv.1 {
+        magnitudes.push(m.clone());
+      } else {
+        match multiply_magnitude_by_rational(m, conv) {
+          Ok(converted) => magnitudes.push(converted),
+          Err(e) => return Some(Err(e)),
+        }
+      }
+    } else {
+      // Fallback: simple unit names
+      let from = unit_name(u);
+      if let (Some(from), Some(to)) = (from, target_unit_name) {
+        if from == to {
+          magnitudes.push(m.clone());
+        } else {
+          match convert_magnitude(m, from, to) {
+            Ok(converted) => magnitudes.push(converted),
+            Err(e) => return Some(Err(e)),
+          }
+        }
+      } else {
+        magnitudes.push(m.clone());
+      }
+    }
+  }
+
+  // Sum the magnitudes
+  let sum_mag = match crate::functions::math_ast::plus_ast(&magnitudes) {
+    Ok(s) => s,
+    Err(e) => return Some(Err(e)),
+  };
+
+  let result = make_quantity(sum_mag, target_unit.clone());
+
+  if other_args.is_empty() {
+    Some(Ok(result))
+  } else {
+    // Mix of Quantity and non-Quantity — return unevaluated Plus with quantities combined
+    other_args.push(result);
+    // Sort: non-quantity first, quantity last (matching Wolfram behavior)
+    Some(Ok(call("Plus", other_args)))
+  }
+}
+
+/// Handle Times when Quantity arguments are present.
+pub fn try_quantity_times(
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  let has_quantity = args.iter().any(|a| is_quantity(a).is_some());
+  if !has_quantity {
+    return None;
+  }
+
+  let mut quantity_args: Vec<(Expr, Expr)> = Vec::new(); // (magnitude, unit)
+  let mut scalar_args: Vec<Expr> = Vec::new();
+
+  for arg in args {
+    if let Some((m, u)) = is_quantity(arg) {
+      quantity_args.push((m.clone(), u.clone()));
+    } else {
+      scalar_args.push(arg.clone());
+    }
+  }
+
+  if quantity_args.len() == 1 {
+    // scalar * Quantity → Quantity[scalar * mag, unit]
+    let (mag, unit) = &quantity_args[0];
+    let mut all_mags = scalar_args;
+    all_mags.push(mag.clone());
+    let new_mag = match crate::functions::math_ast::times_ast(&all_mags) {
+      Ok(m) => m,
+      Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(make_quantity(new_mag, unit.clone())))
+  } else {
+    // Multiple Quantities → compound unit with simplification
+    let mut all_mags: Vec<Expr> = scalar_args;
+    let mut unit_parts: Vec<Expr> = Vec::new();
+
+    for (mag, unit) in &quantity_args {
+      all_mags.push(mag.clone());
+      unit_parts.push(unit.clone());
+    }
+
+    let raw_compound = if unit_parts.len() == 1 {
+      unit_parts.remove(0)
+    } else {
+      call("Times", unit_parts)
+    };
+
+    // Try to simplify compound unit (merge same-dimension units)
+    let (final_unit, extra_conv) =
+      simplify_unit_expr(&raw_compound).unwrap_or((raw_compound, (1, 1)));
+
+    let mut new_mag = match crate::functions::math_ast::times_ast(&all_mags) {
+      Ok(m) => m,
+      Err(e) => return Some(Err(e)),
+    };
+
+    // Apply conversion factor from unit simplification
+    if extra_conv.0 != 1 || extra_conv.1 != 1 {
+      new_mag = match multiply_magnitude_by_rational(&new_mag, extra_conv) {
+        Ok(m) => m,
+        Err(e) => return Some(Err(e)),
+      };
+    }
+
+    // If all units cancelled out, return bare magnitude
+    if matches!(&final_unit, Expr::Integer(1)) {
+      Some(Ok(new_mag))
+    } else {
+      Some(Ok(make_quantity(new_mag, final_unit)))
+    }
+  }
+}
+
+/// Max/Min over a list of quantities: compare magnitudes after converting to a
+/// common unit and return the winning quantity in its original unit. Returns
+/// `None` unless every item is a Quantity and all are pairwise comparable.
+pub fn try_quantity_extreme(items: &[&Expr], is_max: bool) -> Option<Expr> {
+  if items.is_empty() || !items.iter().all(|i| is_quantity(i).is_some()) {
+    return None;
+  }
+  let mut best = items[0];
+  for &item in &items[1..] {
+    let ord = try_quantity_compare(item, best)?;
+    let take = if is_max {
+      ord == std::cmp::Ordering::Greater
+    } else {
+      ord == std::cmp::Ordering::Less
+    };
+    if take {
+      best = item;
+    }
+  }
+  Some(best.clone())
+}
+
+/// Thread a unary numeric function through a `Quantity`'s magnitude.
+/// Most rounding/part functions keep the unit (`Abs[Quantity[-5, m]] ->
+/// Quantity[5, m]`), while `Sign` reduces to the dimensionless sign of the
+/// magnitude. Returns `None` when `arg` is not a Quantity or `name` is not one
+/// of the supported functions.
+pub fn try_quantity_unary(
+  name: &str,
+  arg: &Expr,
+) -> Option<Result<Expr, InterpreterError>> {
+  let (mag, unit) = is_quantity(arg)?;
+  let mag = mag.clone();
+  let unit = unit.clone();
+  match name {
+    // Sign and the sign predicates reduce to the (dimensionless) result for
+    // the magnitude.
+    "Sign" | "Positive" | "Negative" | "NonNegative" | "NonPositive" => {
+      Some(crate::evaluator::evaluate_function_call_ast(name, &[mag]))
+    }
+    // These apply to the magnitude and keep the unit.
+    "Abs" | "Floor" | "Ceiling" | "Round" | "IntegerPart"
+    | "FractionalPart" | "Re" | "Im" | "Conjugate" => {
+      match crate::evaluator::evaluate_function_call_ast(name, &[mag]) {
+        Ok(new_mag) => Some(Ok(make_quantity(new_mag, unit))),
+        Err(e) => Some(Err(e)),
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Handle Divide when Quantity arguments are present.
+pub fn try_quantity_divide(
+  a: &Expr,
+  b: &Expr,
+) -> Option<Result<Expr, InterpreterError>> {
+  let q_a = is_quantity(a);
+  let q_b = is_quantity(b);
+
+  match (q_a, q_b) {
+    (Some((mag_a, unit_a)), Some((mag_b, unit_b))) => {
+      // Quantity / Quantity → Quantity[a/b, u1/u2]
+      let mut new_mag = match crate::functions::math_ast::divide_ast(&[
+        mag_a.clone(),
+        mag_b.clone(),
+      ]) {
+        Ok(m) => m,
+        Err(e) => return Some(Err(e)),
+      };
+      if units_equal(unit_a, unit_b) {
+        // Same units cancel out
+        Some(Ok(new_mag))
+      } else {
+        let raw_compound = div2(unit_a.clone(), unit_b.clone());
+        // Try to simplify (merge same-dimension units)
+        let (final_unit, conv) =
+          simplify_unit_expr(&raw_compound).unwrap_or((raw_compound, (1, 1)));
+        if conv.0 != 1 || conv.1 != 1 {
+          new_mag = match multiply_magnitude_by_rational(&new_mag, conv) {
+            Ok(m) => m,
+            Err(e) => return Some(Err(e)),
+          };
+        }
+        if matches!(&final_unit, Expr::Integer(1)) {
+          Some(Ok(new_mag))
+        } else {
+          Some(Ok(make_quantity(new_mag, final_unit)))
+        }
+      }
+    }
+    (Some((mag, unit)), None) => {
+      // Quantity / scalar
+      let new_mag =
+        match crate::functions::math_ast::divide_ast(&[mag.clone(), b.clone()])
+        {
+          Ok(m) => m,
+          Err(e) => return Some(Err(e)),
+        };
+      Some(Ok(make_quantity(new_mag, unit.clone())))
+    }
+    (None, Some((mag, unit))) => {
+      // scalar / Quantity → Quantity[scalar/mag, unit^-1]
+      let new_mag =
+        match crate::functions::math_ast::divide_ast(&[a.clone(), mag.clone()])
+        {
+          Ok(m) => m,
+          Err(e) => return Some(Err(e)),
+        };
+      let inv_unit = pow2(unit.clone(), Expr::Integer(-1));
+      // Try to simplify
+      let (final_unit, conv) =
+        simplify_unit_expr(&inv_unit).unwrap_or((inv_unit, (1, 1)));
+      let final_mag = if conv.0 != 1 || conv.1 != 1 {
+        match multiply_magnitude_by_rational(&new_mag, conv) {
+          Ok(m) => m,
+          Err(e) => return Some(Err(e)),
+        }
+      } else {
+        new_mag
+      };
+      Some(Ok(make_quantity(final_mag, final_unit)))
+    }
+    _ => None,
+  }
+}
+
+use crate::functions::math_ast::expr_to_rational;
+
+/// Raise a unit expression to a rational power (p/q) by decomposing the unit
+/// into its base components, multiplying each exponent by p/q, and rebuilding.
+/// Returns None if the unit cannot be decomposed.
+fn power_unit_expr(unit: &Expr, p: i128, q: i128) -> Option<Expr> {
+  let info = decompose_unit_expr(unit)?;
+  let mut numer_parts: Vec<Expr> = Vec::new();
+  let mut denom_parts: Vec<Expr> = Vec::new();
+
+  for (name, e) in &info.components {
+    // New exponent: e * p / q
+    let new_n = (*e as i128) * p;
+    let new_d = q;
+    if new_n == 0 {
+      continue;
+    }
+    let (rn, rd) = rat_reduce(new_n, new_d);
+    let base = Expr::String(name.clone());
+    let abs_rn = rn.abs();
+
+    let part = if rd == 1 && abs_rn == 1 {
+      base
+    } else if rd == 1 {
+      pow2(base, Expr::Integer(abs_rn))
+    } else if abs_rn == 1 && rd == 2 {
+      // Power[base, 1/2] → Sqrt[base] (matching Wolfram convention for units)
+      make_sqrt(base)
+    } else {
+      pow2(base, crate::functions::math_ast::make_rational(abs_rn, rd))
+    };
+
+    if rn > 0 {
+      numer_parts.push(part);
+    } else {
+      denom_parts.push(part);
+    }
+  }
+
+  let numer = if numer_parts.is_empty() {
+    Expr::Integer(1)
+  } else if numer_parts.len() == 1 {
+    numer_parts.remove(0)
+  } else {
+    call("Times", numer_parts)
+  };
+
+  if denom_parts.is_empty() {
+    Some(numer)
+  } else {
+    let denom = if denom_parts.len() == 1 {
+      denom_parts.remove(0)
+    } else {
+      call("Times", denom_parts)
+    };
+    Some(div2(numer, denom))
+  }
+}
+
+/// Handle Power when base is Quantity.
+pub fn try_quantity_power(
+  base: &Expr,
+  exp: &Expr,
+) -> Option<Result<Expr, InterpreterError>> {
+  let q = is_quantity(base);
+  q?;
+
+  let (mag, unit) = q.unwrap();
+
+  let new_mag =
+    match crate::functions::math_ast::power_ast(&[mag.clone(), exp.clone()]) {
+      Ok(m) => m,
+      Err(e) => return Some(Err(e)),
+    };
+
+  // Try to simplify unit^exp by decomposing the unit and distributing the power
+  if let Some((p, q)) = expr_to_rational(exp)
+    && let Some(new_unit) = power_unit_expr(unit, p, q)
+  {
+    // If all units cancelled out, return bare magnitude
+    if matches!(&new_unit, Expr::Integer(1)) {
+      return Some(Ok(new_mag));
+    }
+    return Some(Ok(make_quantity(new_mag, new_unit)));
+  }
+
+  // Fallback: wrap unit in Power without simplification
+  let new_unit = pow2(unit.clone(), exp.clone());
+
+  Some(Ok(make_quantity(new_mag, new_unit)))
+}
+
+/// Compare two Quantity expressions. Returns Some(ordering) if comparable.
+pub fn try_quantity_compare(
+  left: &Expr,
+  right: &Expr,
+) -> Option<std::cmp::Ordering> {
+  let (mag_l, unit_l) = is_quantity(left)?;
+  let (mag_r, unit_r) = is_quantity(right)?;
+
+  if !units_compatible(unit_l, unit_r) {
+    return None;
+  }
+
+  // Convert right magnitude to left's unit via decomposition
+  let left_info = decompose_unit_expr(unit_l);
+  let right_info = decompose_unit_expr(unit_r);
+
+  let converted_r = if let (Some(li), Some(ri)) = (left_info, right_info) {
+    let conv = rat_div(ri.si, li.si);
+    if conv.0 == conv.1 {
+      mag_r.clone()
+    } else {
+      multiply_magnitude_by_rational(mag_r, conv).ok()?
+    }
+  } else {
+    // Fallback to simple conversion
+    let from = unit_name(unit_r)?;
+    let to = unit_name(unit_l)?;
+    if from == to {
+      mag_r.clone()
+    } else {
+      convert_magnitude(mag_r, from, to).ok()?
+    }
+  };
+
+  // Try numeric comparison
+  let l = crate::functions::math_ast::try_eval_to_f64(mag_l)?;
+  let r = crate::functions::math_ast::try_eval_to_f64(&converted_r)?;
+  l.partial_cmp(&r)
+}
+
+/// Convert `mag` from `from_unit` to `to_unit` (assumed compatible), returning
+/// the converted magnitude or `None` if the conversion factor is unknown.
+fn convert_mag(mag: &Expr, from_unit: &Expr, to_unit: &Expr) -> Option<Expr> {
+  if let (Some(fi), Some(ti)) =
+    (decompose_unit_expr(from_unit), decompose_unit_expr(to_unit))
+  {
+    // factor = from_si / to_si.
+    let conv = rat_div(fi.si, ti.si);
+    if conv.0 == conv.1 {
+      Some(mag.clone())
+    } else {
+      multiply_magnitude_by_rational(mag, conv).ok()
+    }
+  } else {
+    let from = unit_name(from_unit)?;
+    let to = unit_name(to_unit)?;
+    if from == to {
+      Some(mag.clone())
+    } else {
+      convert_magnitude(mag, from, to).ok()
+    }
+  }
+}
+
+/// `Mod[Quantity[a, ua], Quantity[b, ub]]` for compatible units: convert `a`
+/// to the divisor's unit `ub`, take the modulus, and return the result in `ub`
+/// (matching wolframscript, e.g. Mod[Quantity[7, m], Quantity[300, cm]] ->
+/// Quantity[100, cm]). Returns `None` unless both are Quantities with
+/// compatible units.
+pub fn try_quantity_mod(
+  a: &Expr,
+  b: &Expr,
+) -> Option<Result<Expr, InterpreterError>> {
+  let (mag_a, unit_a) = is_quantity(a)?;
+  let (mag_b, unit_b) = is_quantity(b)?;
+  if !units_compatible(unit_a, unit_b) {
+    return None;
+  }
+  let converted_a = convert_mag(mag_a, unit_a, unit_b)?;
+  match crate::evaluator::evaluate_function_call_ast(
+    "Mod",
+    &[converted_a, mag_b.clone()],
+  ) {
+    Ok(m) => Some(Ok(make_quantity(m, unit_b.clone()))),
+    Err(e) => Some(Err(e)),
+  }
+}
+
+// ── Text forms ───────────────────────────────────────────────────────────
+//
+// `ToString[Quantity[3, "Meters"]]` is "3 meters" and
+// `TextString[Quantity[3, "Meters"]]` is "3 m" — the wrapper form
+// `Quantity[3, Meters]` is what the script-mode echo shows, so only the two
+// string conversions go through here.
+
+/// How a unit attaches to its magnitude.
+pub enum UnitText {
+  /// Written after the magnitude, separated by a space ("3 meters").
+  Words(String),
+  /// Written directly in front of the magnitude ("$3").
+  Prefix(String),
+  /// Written directly after the magnitude ("3%").
+  Suffix(String),
+  /// A prefix on the magnitude plus trailing words ("$3 per hour").
+  PrefixWords(String, String),
+}
+
+/// The abbreviation of a unit, as `TextString` writes it. A unit with no
+/// abbreviation of its own (Days, Percent, …) falls back to its words.
+fn unit_abbreviation(name: &str) -> Option<&'static str> {
+  Some(match name {
+    "Meters" => "m",
+    "Kilometers" => "km",
+    "Centimeters" => "cm",
+    "Millimeters" => "mm",
+    "Micrometers" => "\u{3bc}m",
+    "Nanometers" => "nm",
+    "NauticalMiles" => "nmi",
+    "Feet" => "ft",
+    "Inches" => "in",
+    "Miles" => "mi",
+    "Yards" => "yd",
+    "Kilograms" => "kg",
+    "Grams" => "g",
+    "Milligrams" => "mg",
+    "Pounds" => "lb",
+    "Ounces" => "oz",
+    "MetricTons" => "t",
+    "Seconds" => "s",
+    "Milliseconds" => "ms",
+    "Microseconds" => "\u{3bc}s",
+    "Nanoseconds" => "ns",
+    "Minutes" => "min",
+    "Hours" => "h",
+    "Weeks" => "wk",
+    "Months" => "mo",
+    "Years" => "yr",
+    "Liters" => "L",
+    "Milliliters" => "mL",
+    "Gallons" => "gal",
+    "Amperes" => "A",
+    "Milliamperes" => "mA",
+    "Volts" => "V",
+    "Millivolts" => "mV",
+    "Kilovolts" => "kV",
+    "Joules" => "J",
+    "Millijoules" => "mJ",
+    "Kilojoules" => "kJ",
+    "Electronvolts" => "eV",
+    "Megaelectronvolts" => "MeV",
+    "Daltons" => "Da",
+    "Watts" => "W",
+    "Milliwatts" => "mW",
+    "Kilowatts" => "kW",
+    "Farads" => "F",
+    "Millifarads" => "mF",
+    "Microfarads" => "\u{3bc}F",
+    "Nanofarads" => "nF",
+    "Picofarads" => "pF",
+    "Coulombs" => "C",
+    "Newtons" => "N",
+    "Dynes" => "dyn",
+    "Pascals" => "Pa",
+    "Kilopascals" => "kPa",
+    "Megapascals" => "MPa",
+    "Gigapascals" => "GPa",
+    "Bars" => "bar",
+    "Atmospheres" => "atm",
+    "Ohms" => "\u{3a9}",
+    "Kilohms" => "k\u{3a9}",
+    "Megohms" => "M\u{3a9}",
+    "WattHours" => "Wh",
+    "KilowattHours" => "kWh",
+    "Henries" => "H",
+    "Millihenries" => "mH",
+    "Hertz" => "Hz",
+    "Kilohertz" => "kHz",
+    "Megahertz" => "MHz",
+    "Gigahertz" => "GHz",
+    "Teslas" => "T",
+    "Milliteslas" => "mT",
+    "Knots" => "kn",
+    "Kelvins" => "K",
+    "DegreesCelsius" => "\u{b0}C",
+    "DegreesFahrenheit" => "\u{b0}F",
+    "Radians" => "rad",
+    "Moles" => "mol",
+    "Candelas" => "cd",
+    "DietaryCalories" => "Cal",
+    "Bytes" => "B",
+    "Bits" => "b",
+    _ => return None,
+  })
+}
+
+/// A unit written as an affix of the magnitude rather than a following word.
+fn unit_affix(name: &str) -> Option<UnitText> {
+  Some(match name {
+    "USDollars" => UnitText::Prefix("$".to_string()),
+    "Euros" => UnitText::Prefix("\u{20ac}".to_string()),
+    "BritishPounds" => UnitText::Prefix("\u{a3}".to_string()),
+    "Percent" => UnitText::Suffix("%".to_string()),
+    "AngularDegrees" | "Degrees" => UnitText::Suffix("\u{b0}".to_string()),
+    _ => return None,
+  })
+}
+
+/// Split a CamelCase unit name into its words, keeping acronym runs together
+/// ("NauticalMiles" → ["Nautical", "Miles"], "USDollars" → ["US", "Dollars"]).
+fn camel_case_words(name: &str) -> Vec<String> {
+  let chars: Vec<char> = name.chars().collect();
+  let mut words: Vec<String> = Vec::new();
+  let mut current = String::new();
+  for (i, c) in chars.iter().enumerate() {
+    let starts_word = c.is_uppercase()
+      && i > 0
+      && (!chars[i - 1].is_uppercase()
+        || chars.get(i + 1).is_some_and(|n| n.is_lowercase()));
+    if starts_word && !current.is_empty() {
+      words.push(std::mem::take(&mut current));
+    }
+    current.push(*c);
+  }
+  if !current.is_empty() {
+    words.push(current);
+  }
+  words
+}
+
+/// The singular of an English unit noun.
+fn singularize(word: &str) -> String {
+  match word {
+    "feet" => return "foot".to_string(),
+    // "henries" is the plural of "henry"; "calories" of "calorie", so the
+    // "-ies" ending alone does not decide the stem.
+    "henries" => return "henry".to_string(),
+    _ => {}
+  }
+  for ending in ["ches", "shes", "sses", "xes", "zes"] {
+    if let Some(stem) = word.strip_suffix(ending) {
+      return format!("{stem}{}", &ending[..ending.len() - 2]);
+    }
+  }
+  // A word that does not end in a plural "s" (hertz, percent) is invariant.
+  match word.strip_suffix('s') {
+    Some(stem) if !word.ends_with("ss") && !word.ends_with("us") => {
+      stem.to_string()
+    }
+    _ => word.to_string(),
+  }
+}
+
+/// Units whose spelled-out words the derivation cannot reach.
+fn unit_word_override(name: &str) -> Option<(&'static str, &'static str)> {
+  Some(match name {
+    // The dietary Calorie keeps its capital; the thermochemical one does not.
+    "DietaryCalories" => ("dietary Calorie", "dietary Calories"),
+    _ => return None,
+  })
+}
+
+/// The words of a unit name: `(singular, plural)`. Derived from the name
+/// itself, so a unit the table does not know still reads correctly.
+fn unit_words(name: &str) -> (String, String) {
+  if let Some((one, many)) = unit_word_override(name) {
+    return (one.to_string(), many.to_string());
+  }
+  // Qualifiers that keep their capital in the spelled-out form.
+  let proper = |w: &str| matches!(w, "Celsius" | "Fahrenheit" | "Rankine");
+  let words: Vec<String> = camel_case_words(name)
+    .into_iter()
+    .map(|w| {
+      if w.chars().all(|c| c.is_uppercase() && c.is_alphabetic())
+        && w.chars().count() > 1
+        || proper(&w)
+      {
+        w
+      } else {
+        w.to_lowercase()
+      }
+    })
+    .collect();
+  if words.is_empty() {
+    return (name.to_string(), name.to_string());
+  }
+  let plural = words.join(" ");
+  // Only the head noun is singularized: "degrees Celsius" → "degree Celsius".
+  let head = if words.len() > 1 && proper(&words[words.len() - 1]) {
+    words.len() - 2
+  } else {
+    words.len() - 1
+  };
+  let mut singular_words = words.clone();
+  singular_words[head] = singularize(&words[head]);
+  (singular_words.join(" "), plural)
+}
+
+/// The unit name behind a unit expression leaf.
+fn unit_leaf_name(unit: &Expr) -> Option<String> {
+  match unit {
+    Expr::String(s) => Some(s.clone()),
+    Expr::Identifier(s) => Some(s.clone()),
+    _ => None,
+  }
+}
+
+/// Whether the unit carries an exponent other than ±1. Such a unit is always
+/// spelled out, even by `TextString`: `Quantity[3, "Meters"/"Seconds"^2]` is
+/// "3 meters per second squared" in both forms.
+fn unit_has_named_power(unit: &Expr) -> bool {
+  match unit {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      !matches!(&args[1], Expr::Integer(-1))
+    }
+    Expr::FunctionCall { args, .. } => args.iter().any(unit_has_named_power),
+    Expr::BinaryOp { op, left, right } => {
+      matches!(op, BinaryOperator::Power)
+        && !matches!(right.as_ref(), Expr::Integer(-1))
+        || unit_has_named_power(left)
+        || unit_has_named_power(right)
+    }
+    _ => false,
+  }
+}
+
+/// `base^|exponent|` — the factor a negative exponent contributes to the
+/// other side of the quotient (the bare base when the exponent is -1).
+fn unit_power(base: &Expr, exponent: &Expr) -> Expr {
+  match exponent {
+    Expr::Integer(-1) => base.clone(),
+    Expr::Integer(n) => pow(base.clone(), Expr::Integer(-n)),
+    _ => base.clone(),
+  }
+}
+
+/// Split a unit expression into its numerator and denominator factors.
+fn unit_factors(unit: &Expr) -> (Vec<Expr>, Vec<Expr>) {
+  let mut numerator = Vec::new();
+  let mut denominator = Vec::new();
+  fn walk(e: &Expr, num: &mut Vec<Expr>, den: &mut Vec<Expr>, flip: bool) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for a in args {
+          walk(a, num, den, flip);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        walk(left, num, den, flip);
+        walk(right, num, den, flip);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left,
+        right,
+      } => {
+        walk(left, num, den, flip);
+        walk(right, num, den, !flip);
+      }
+      // A negative exponent moves the factor to the other side, keeping the
+      // magnitude of the exponent: `Seconds^-2` is a "per second squared".
+      Expr::FunctionCall { name, args }
+        if name == "Power"
+          && args.len() == 2
+          && matches!(&args[1], Expr::Integer(n) if *n < 0) =>
+      {
+        walk(&unit_power(&args[0], &args[1]), num, den, !flip);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } if matches!(right.as_ref(), Expr::Integer(n) if *n < 0) => {
+        walk(&unit_power(left, right), num, den, !flip);
+      }
+      // A bare 1 numerator (`1/"Seconds"`) contributes nothing.
+      Expr::Integer(1) => {}
+      other => {
+        if flip {
+          den.push(other.clone());
+        } else {
+          num.push(other.clone());
+        }
+      }
+    }
+  }
+  walk(unit, &mut numerator, &mut denominator, false);
+  (numerator, denominator)
+}
+
+/// One factor of a unit phrase, spelled out or abbreviated.
+fn unit_factor_text(
+  factor: &Expr,
+  singular: bool,
+  abbreviated: bool,
+) -> Option<String> {
+  // An exponent of 2 or 3 reads as "squared" / "cubed".
+  let power_parts = match factor {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      Some((&args[0], &args[1]))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => Some((left.as_ref(), right.as_ref())),
+    _ => None,
+  };
+  if let Some((base, exponent)) = power_parts {
+    let word = match exponent {
+      Expr::Integer(2) => "squared",
+      Expr::Integer(3) => "cubed",
+      _ => return None,
+    };
+    // The base carries the number: "meters squared" but "per second squared".
+    let base_text = unit_factor_text(base, singular, false)?;
+    return Some(format!("{base_text} {word}"));
+  }
+  let name = unit_leaf_name(factor)?;
+  if abbreviated && let Some(abbr) = unit_abbreviation(&name) {
+    return Some(abbr.to_string());
+  }
+  let (one, many) = unit_words(&name);
+  Some(if singular { one } else { many })
+}
+
+/// The spelled-out singular words of the denominator factors, used where an
+/// abbreviation would not read as English ("per second", "$3 per hour").
+fn spelled_out_denominator(factors: &[Expr]) -> Option<String> {
+  let mut parts = Vec::with_capacity(factors.len());
+  for f in factors {
+    parts.push(unit_factor_text(f, true, false)?);
+  }
+  Some(parts.join(" "))
+}
+
+/// The text of a whole unit expression: `(3, "Meters"/"Seconds")` reads
+/// "meters per second" spelled out and "m/s" abbreviated. `singular` selects
+/// the form for a magnitude of 1.
+pub fn quantity_unit_text(
+  unit: &Expr,
+  singular: bool,
+  abbreviated: bool,
+) -> Option<UnitText> {
+  // A named power is always spelled out.
+  let abbreviated = abbreviated && !unit_has_named_power(unit);
+  if let Some(name) = unit_leaf_name(unit) {
+    if abbreviated && let Some(affix) = unit_affix(&name) {
+      return Some(affix);
+    }
+    return unit_factor_text(unit, singular, abbreviated).map(UnitText::Words);
+  }
+  let (numerator, denominator) = unit_factors(unit);
+  let join = |factors: &[Expr], last_plural: bool| -> Option<String> {
+    let mut parts = Vec::with_capacity(factors.len());
+    for (i, f) in factors.iter().enumerate() {
+      let is_last = i + 1 == factors.len();
+      parts.push(unit_factor_text(f, !(is_last && last_plural), abbreviated)?);
+    }
+    // Abbreviated factors are separated by a thin space: "m N".
+    Some(parts.join(if abbreviated { "\u{2009}" } else { " " }))
+  };
+  let numerator_text = if numerator.is_empty() {
+    None
+  } else {
+    Some(join(&numerator, !singular)?)
+  };
+  if denominator.is_empty() {
+    return numerator_text.map(UnitText::Words);
+  }
+  // Denominator factors are always singular: "meters per second".
+  let denominator_text = join(&denominator, false)?;
+  // A currency keeps its symbol on the magnitude and spells the rest out:
+  // "$3 per hour".
+  if abbreviated
+    && numerator.len() == 1
+    && let Some(name) = unit_leaf_name(&numerator[0])
+    && let Some(UnitText::Prefix(prefix)) = unit_affix(&name)
+  {
+    let words = spelled_out_denominator(&denominator)?;
+    return Some(UnitText::PrefixWords(prefix, format!("per {words}")));
+  }
+  Some(UnitText::Words(match numerator_text {
+    Some(n) if abbreviated => format!("{n}/{denominator_text}"),
+    Some(n) => format!("{n} per {denominator_text}"),
+    // A reciprocal unit spells its denominator out in both forms:
+    // "3 per second" and "3 reciprocal seconds".
+    None if abbreviated => {
+      format!("per {}", spelled_out_denominator(&denominator)?)
+    }
+    None => {
+      let plural = join(&denominator, true)?;
+      format!("reciprocal {plural}")
+    }
+  }))
+}

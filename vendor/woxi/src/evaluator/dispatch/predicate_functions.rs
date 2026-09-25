@@ -1,0 +1,2358 @@
+use super::*;
+
+/// True if `expr` contains any Real or BigFloat node — used to decide
+/// between exact and inexact number predicates.
+use crate::functions::math_ast::contains_inexact_real as contains_real;
+
+/// ExactNumberQ[x]: True for Integer/Rational/exact Complex (and their
+/// expanded forms). `I`, `1 + I`, `4 I + 5/6` are all exact.
+fn is_exact_number(expr: &Expr) -> bool {
+  use crate::functions::math_ast::try_extract_complex_exact;
+  if contains_real(expr) {
+    return false;
+  }
+  if matches!(expr, Expr::Integer(_) | Expr::BigInteger(_)) {
+    return true;
+  }
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Rational"
+    && args.len() == 2
+    && matches!(args[0], Expr::Integer(_) | Expr::BigInteger(_))
+    && matches!(args[1], Expr::Integer(_) | Expr::BigInteger(_))
+  {
+    return true;
+  }
+  // Pure imaginary unit and exact complex combinations — try the exact
+  // (integer/rational) extractor.
+  matches!(expr, Expr::Identifier(s) if s == "I")
+    || try_extract_complex_exact(expr).is_some_and(|((_, rd), (_, id))| {
+      // Both denominators must be non-zero for a meaningful exact rational.
+      rd != 0 && id != 0
+    })
+}
+
+/// InexactNumberQ[x]: True when `x` is a numeric value that contains a
+/// Real or BigFloat (and otherwise extracts to a complex form).
+fn is_inexact_number(expr: &Expr) -> bool {
+  use crate::functions::math_ast::try_extract_complex_float;
+  if matches!(expr, Expr::Real(_) | Expr::BigFloat(_, _)) {
+    return true;
+  }
+  contains_real(expr) && try_extract_complex_float(expr).is_some()
+}
+
+/// RootOfUnityQ[z]: True iff `z` is exactly a root of unity, i.e. `z^n == 1`
+/// for some positive integer `n`. Inexact (machine-precision) inputs such as
+/// `1.0` and non-numeric inputs such as `x` are always False, matching
+/// wolframscript — only exact algebraic numbers on the unit circle qualify.
+///
+/// A candidate order is located numerically on the unit circle and then
+/// confirmed exactly with `PossibleZeroQ[z^n - 1]`, so unit-modulus numbers
+/// whose argument is an irrational multiple of `2 Pi` (e.g. `3/5 + 4/5 I`)
+/// correctly return False.
+fn root_of_unity_q(z: &Expr) -> bool {
+  use crate::functions::math_ast::try_extract_complex_float;
+  // Inexact inputs are never roots of unity.
+  if contains_real(z) {
+    return false;
+  }
+  // Numeric complex value via N[z]; non-numeric inputs (symbols) → False.
+  let n_call = call1("N", z.clone());
+  let Ok(num) = evaluate_expr_to_expr(&n_call) else {
+    return false;
+  };
+  let Some((re, im)) = try_extract_complex_float(&num) else {
+    return false;
+  };
+  // Roots of unity lie on the unit circle.
+  let mag2 = re * re + im * im;
+  if (mag2 - 1.0).abs() > 1e-9 {
+    return false;
+  }
+  // Search for a candidate order n with z^n ≈ 1 (tight tolerance so an
+  // irrational angle never matches within the bound), then verify exactly.
+  const MAX_ORDER: usize = 10000;
+  let (mut pr, mut pi) = (1.0_f64, 0.0_f64);
+  for n in 1..=MAX_ORDER {
+    let nr = pr * re - pi * im;
+    let ni = pr * im + pi * re;
+    pr = nr;
+    pi = ni;
+    if (pr - 1.0).abs() < 1e-9 && pi.abs() < 1e-9 {
+      // Candidate order n found; confirm exactly with PossibleZeroQ[z^n - 1].
+      let zn = pow(z.clone(), Expr::Integer(n as i128));
+      let diff = call("Plus", vec![zn, Expr::Integer(-1)]);
+      if let Ok(result) = crate::functions::predicate_ast::possible_zero_q_ast(
+        std::slice::from_ref(&diff),
+      ) && matches!(&result, Expr::Identifier(s) if s == "True")
+      {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+/// Mirror of the same-family rule in core_eval's Comparison handler, but
+/// for Inequality's string operator names. Returns true iff the chain
+/// should be split into pairwise `&&`.
+fn should_split_inequality(names: &[&str]) -> bool {
+  // Homogeneous → never split.
+  if names.iter().skip(1).all(|n| *n == names[0]) {
+    return false;
+  }
+  let mut has_unequal = false;
+  let mut has_less = false;
+  let mut has_greater = false;
+  for n in names {
+    match *n {
+      "Unequal" | "NotEqual" | "UnsameQ" => has_unequal = true,
+      "Less" | "LessEqual" => has_less = true,
+      "Greater" | "GreaterEqual" => has_greater = true,
+      _ => {}
+    }
+  }
+  has_unequal || (has_less && has_greater)
+}
+
+pub fn dispatch_predicate_functions(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  // A comparison of fewer than two elements is vacuously True:
+  // Less[] = Less[x] = Greater[5] = True, matching Equal/Unequal.
+  if args.len() < 2
+    && matches!(name, "Less" | "LessEqual" | "Greater" | "GreaterEqual")
+  {
+    return Some(Ok(bool_expr(true)));
+  }
+  match name {
+    // Inequality[a, Less, b, Less, c, ...] - evaluate chained comparisons
+    "Inequality" if args.len() >= 3 && args.len() % 2 == 1 => {
+      let comparison_op = |op_name: &str| -> Option<fn(f64, f64) -> bool> {
+        match op_name {
+          "Less" => Some(|a: f64, b: f64| a < b),
+          "LessEqual" => Some(|a: f64, b: f64| a <= b),
+          "Greater" => Some(|a: f64, b: f64| a > b),
+          "GreaterEqual" => Some(|a: f64, b: f64| a >= b),
+          "Equal" => Some(|a: f64, b: f64| (a - b).abs() < f64::EPSILON),
+          _ => None,
+        }
+      };
+      // Try to evaluate all numeric values
+      let mut all_numeric = true;
+      let mut values: Vec<f64> = Vec::new();
+      let mut ops: Vec<fn(f64, f64) -> bool> = Vec::new();
+      for (idx, arg) in args.iter().enumerate() {
+        if idx % 2 == 0 {
+          // Value position
+          if let Some(f) = crate::functions::math_ast::try_eval_to_f64(arg) {
+            values.push(f);
+          } else {
+            all_numeric = false;
+            break;
+          }
+        } else {
+          // Operator position
+          if let Expr::Identifier(op_name) = arg {
+            if let Some(op) = comparison_op(op_name) {
+              ops.push(op);
+            } else {
+              all_numeric = false;
+              break;
+            }
+          } else {
+            all_numeric = false;
+            break;
+          }
+        }
+      }
+      if all_numeric && ops.len() + 1 == values.len() {
+        let result = ops
+          .iter()
+          .zip(values.windows(2))
+          .all(|(op, pair)| op(pair[0], pair[1]));
+        return Some(Ok(bool_expr(result)));
+      }
+      // For mixed-direction chains (e.g. `Greater` with `LessEqual`, or
+      // any NotEqual mixed in), split into pairwise `&&` — wolframscript's
+      // behavior. Preserves the `Inequality[…]` head in all other cases so
+      // `ToString[Inequality[0, LessEqual, x, LessEqual, 1], InputForm]`
+      // still renders the head form.
+      if args.len() >= 5 && args.len() % 2 == 1 {
+        let op_names: Vec<Option<&str>> = args
+          .iter()
+          .enumerate()
+          .filter(|(i, _)| i % 2 == 1)
+          .map(|(_, a)| match a {
+            Expr::Identifier(s) => Some(s.as_str()),
+            _ => None,
+          })
+          .collect();
+        if op_names.iter().all(std::option::Option::is_some) {
+          let names: Vec<&str> = op_names.into_iter().flatten().collect();
+          if should_split_inequality(&names) {
+            let operands: Vec<Expr> = args
+              .iter()
+              .enumerate()
+              .filter(|(i, _)| i % 2 == 0)
+              .map(|(_, a)| a.clone())
+              .collect();
+            let op_for = |s: &str| -> Option<ComparisonOp> {
+              match s {
+                "Equal" => Some(ComparisonOp::Equal),
+                "Unequal" | "NotEqual" => Some(ComparisonOp::NotEqual),
+                "Less" => Some(ComparisonOp::Less),
+                "LessEqual" => Some(ComparisonOp::LessEqual),
+                "Greater" => Some(ComparisonOp::Greater),
+                "GreaterEqual" => Some(ComparisonOp::GreaterEqual),
+                "SameQ" => Some(ComparisonOp::SameQ),
+                "UnsameQ" => Some(ComparisonOp::UnsameQ),
+                _ => None,
+              }
+            };
+            if names.iter().all(|n| op_for(n).is_some()) {
+              let mut terms: Vec<Expr> = Vec::new();
+              for (i, n) in names.iter().enumerate() {
+                terms.push(Expr::Comparison {
+                  operands: vec![operands[i].clone(), operands[i + 1].clone()],
+                  operators: vec![op_for(n).unwrap()],
+                });
+              }
+              return Some(crate::evaluator::evaluate_function_call_ast(
+                "And", &terms,
+              ));
+            }
+          }
+        }
+      }
+    }
+    "NumberQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::number_q_ast(args));
+    }
+    "RealValuedNumberQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::real_valued_number_q_ast(
+        args,
+      ));
+    }
+    "RealValuedNumericQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::real_valued_numeric_q_ast(
+        args,
+      ));
+    }
+    "Element" if args.len() == 2 => {
+      return Some(element_ast(&args[0], &args[1]));
+    }
+    "NotElement" if args.len() == 2 => {
+      return Some(not_element_ast(&args[0], &args[1]));
+    }
+    "IntegerQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::integer_q_ast(args));
+    }
+    "QuadraticIrrationalQ" if args.len() == 1 => {
+      return Some(
+        crate::functions::predicate_ast::quadratic_irrational_q_ast(args),
+      );
+    }
+    "MachineNumberQ" if args.len() == 1 => {
+      // Machine reals only — `contains_inexact` would also count a
+      // `BigFloat`, and an arbitrary-precision number is not a machine one.
+      fn contains_machine_real(e: &Expr) -> bool {
+        matches!(e, Expr::Real(_))
+          || crate::syntax::expr_children(e)
+            .into_iter()
+            .any(contains_machine_real)
+      }
+      let contains_real = contains_machine_real;
+      let is_machine = match &args[0] {
+        Expr::Real(_) => true,
+        Expr::FunctionCall { name, args: ca }
+          if name == "Complex" && ca.len() == 2 =>
+        {
+          matches!(&ca[0], Expr::Real(_)) || matches!(&ca[1], Expr::Real(_))
+        }
+        _ => {
+          // A Plus/Times expression like `1.5 + 2.3 I` that forms a complex number
+          // with at least one machine Real component.
+          crate::functions::predicate_ast::is_complex_number(&args[0])
+            && contains_real(&args[0])
+        }
+      };
+      return Some(Ok(bool_expr(is_machine)));
+    }
+    "MissingQ" if args.len() == 1 => {
+      let is_missing = matches!(
+        &args[0],
+        Expr::FunctionCall { name, .. } if name == "Missing"
+      );
+      return Some(Ok(bool_expr(is_missing)));
+    }
+    // FailureQ[expr] is True for $Failed, $Aborted, and Failure[...] objects
+    // (note: Missing[...] is NOT a failure).
+    "FailureQ" if args.len() == 1 => {
+      let is_failure = match &args[0] {
+        Expr::Identifier(s) => s == "$Failed" || s == "$Aborted",
+        Expr::FunctionCall { name, .. } => name == "Failure",
+        _ => false,
+      };
+      return Some(Ok(bool_expr(is_failure)));
+    }
+    // AlgebraicIntegerQ[a] is True when a is an algebraic integer: an
+    // algebraic number whose minimal polynomial over the rationals is monic
+    // (leading coefficient ±1). MinimalPolynomial returns the primitive
+    // integer polynomial, so the test reduces to a unit leading coefficient.
+    "RootOfUnityQ" if args.len() == 1 => {
+      let b = root_of_unity_q(&args[0]);
+      return Some(Ok(bool_expr(b)));
+    }
+    "AlgebraicIntegerQ" if args.len() == 1 => {
+      let false_result = || Some(Ok(bool_expr(false)));
+      // Inexact (machine-number) inputs are never algebraic integers.
+      if contains_real(&args[0]) {
+        return false_result();
+      }
+      // A fresh variable avoids any collision with symbols in the input.
+      let var = id_expr("AlgebraicIntegerQ$x");
+      let mp = match evaluate_expr_to_expr(&call(
+        "MinimalPolynomial",
+        vec![args[0].clone(), var.clone()],
+      )) {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+      };
+      // MinimalPolynomial stays unevaluated for transcendental or non-numeric
+      // inputs (Pi, symbols, …), which are not algebraic integers.
+      if matches!(&mp, Expr::FunctionCall { name, .. }
+        if name == "MinimalPolynomial")
+      {
+        return false_result();
+      }
+      // Leading coefficient = Coefficient[mp, var, Exponent[mp, var]].
+      let degree = match evaluate_expr_to_expr(&call(
+        "Exponent",
+        vec![mp.clone(), var.clone()],
+      )) {
+        Ok(d) => d,
+        Err(e) => return Some(Err(e)),
+      };
+      let lead = match evaluate_expr_to_expr(&call(
+        "Coefficient",
+        vec![mp, var, degree],
+      )) {
+        Ok(l) => l,
+        Err(e) => return Some(Err(e)),
+      };
+      let is_monic = matches!(&lead, Expr::Integer(1 | -1));
+      return Some(Ok(bool_expr(is_monic)));
+    }
+    "ColorQ" if args.len() == 1 => {
+      let is_color = match &args[0] {
+        Expr::FunctionCall { name, .. } => matches!(
+          name.as_str(),
+          "RGBColor"
+            | "Hue"
+            | "GrayLevel"
+            | "CMYKColor"
+            | "XYZColor"
+            | "LABColor"
+            | "LCHColor"
+            | "LUVColor"
+            | "Opacity"
+        ),
+        _ => false,
+      };
+      return Some(Ok(bool_expr(is_color)));
+    }
+    "BooleanQ" if args.len() == 1 => {
+      return Some(Ok(match &args[0] {
+        Expr::Identifier(name) if name == "True" || name == "False" => {
+          bool_expr(true)
+        }
+        _ => bool_expr(false),
+      }));
+    }
+    // SymbolQ is not a standard Wolfram built-in (it's from GeneralUtilities package),
+    // so return unevaluated to match Wolfram behavior
+    // "SymbolQ" if args.len() == 1 => { ... }
+    "Boole" if args.len() == 1 => {
+      return Some(Ok(match &args[0] {
+        Expr::Identifier(name) if name == "True" => Expr::Integer(1),
+        Expr::Identifier(name) if name == "False" => Expr::Integer(0),
+        _ => unevaluated("Boole", args),
+      }));
+    }
+    "DigitQ" if args.len() == 1 => {
+      return Some(Ok(match &args[0] {
+        Expr::String(s) => {
+          if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+            bool_expr(true)
+          } else {
+            bool_expr(false)
+          }
+        }
+        _ => bool_expr(false),
+      }));
+    }
+    "LetterQ" if args.len() == 1 => {
+      return Some(Ok(match &args[0] {
+        Expr::String(s) => {
+          if !s.is_empty() && s.chars().all(char::is_alphabetic) {
+            bool_expr(true)
+          } else {
+            bool_expr(false)
+          }
+        }
+        _ => bool_expr(false),
+      }));
+    }
+    "Precision" if args.len() == 1 => {
+      return Some(crate::functions::math_ast::precision_ast(args));
+    }
+    "Precedence" if args.len() == 1 => {
+      return Some(Ok(Expr::Real(precedence_value(&args[0]))));
+    }
+    "Accuracy" if args.len() == 1 => {
+      return Some(crate::functions::math_ast::accuracy_ast(args));
+    }
+    "O" if args.len() == 1 || args.len() == 2 => {
+      // O[x] -> SeriesData[x, 0, {}, 1, 1, 1]
+      // O[x, x0] -> SeriesData[x, x0, {}, 1, 1, 1]
+      let var = args[0].clone();
+      let center = if args.len() == 2 {
+        args[1].clone()
+      } else {
+        Expr::Integer(0)
+      };
+      let data = vec![
+        var,
+        center,
+        Expr::List(vec![].into()),
+        Expr::Integer(1),
+        Expr::Integer(1),
+        Expr::Integer(1),
+      ];
+      return Some(Ok(call("SeriesData", data)));
+    }
+    "EvenQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::even_q_ast(args));
+    }
+    "LeapYearQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::leap_year_q_ast(args));
+    }
+    "OddQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::odd_q_ast(args));
+    }
+    "PalindromeQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::palindrome_q_ast(args));
+    }
+    "SquareFreeQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::square_free_q_ast(args));
+    }
+    "MandelbrotSetMemberQ" => {
+      return Some(
+        crate::functions::predicate_ast::mandelbrot_set_member_q_ast(args),
+      );
+    }
+    "MandelbrotSetIterationCount" => {
+      return Some(
+        crate::functions::predicate_ast::mandelbrot_set_iteration_count_ast(
+          args,
+        ),
+      );
+    }
+    "PerfectNumberQ" if args.len() == 1 => {
+      if let Expr::Integer(n) = &args[0] {
+        if *n <= 0 {
+          return Some(Ok(bool_expr(false)));
+        }
+        let n_val = *n;
+        // Sum of proper divisors
+        let mut sum: i128 = 1;
+        let mut i: i128 = 2;
+        while i * i <= n_val {
+          if n_val % i == 0 {
+            sum += i;
+            if i != n_val / i {
+              sum += n_val / i;
+            }
+          }
+          i += 1;
+        }
+        if n_val == 1 {
+          sum = 0;
+        }
+        return Some(Ok(bool_expr(sum == n_val)));
+      }
+      // wolframscript reports any non-(positive-integer) argument as not a
+      // perfect number: PerfectNumberQ of a Real, rational, constant, or
+      // symbol is False. A BigInteger is left unevaluated so a genuine large
+      // perfect number is never misreported.
+      if matches!(&args[0], Expr::BigInteger(_)) {
+        return Some(Ok(unevaluated("PerfectNumberQ", args)));
+      }
+      return Some(Ok(bool_expr(false)));
+    }
+    "ListQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::list_q_ast(args));
+    }
+    "StringQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::string_q_ast(args));
+    }
+    // Symbol["name"] - Convert string to symbol identifier
+    "Symbol" if args.len() == 1 => {
+      if let Expr::String(name) = &args[0] {
+        // `Symbol["x"]` yields the symbol `x`; re-evaluate it so that an
+        // existing OwnValue resolves (matching wolframscript, where
+        // `x = 7; Symbol["x"]` returns 7). An unbound symbol evaluates to
+        // itself.
+        // The name is resolved against the contexts open right now, exactly
+        // as it would be had it been read from source.
+        return Some(crate::evaluator::evaluate_expr_to_expr(
+          &Expr::Identifier(crate::evaluator::contexts::resolve(name)),
+        ));
+      }
+      return Some(Ok(unevaluated("Symbol", args)));
+    }
+    // SymbolName[sym] - Get the name of a symbol as a string.
+    // For context-qualified identifiers like `a`b`x`, return only the
+    // trailing segment ("x") — matching wolframscript, where the context
+    // prefix is reported separately by `Context`.
+    "SymbolName" if args.len() == 1 => {
+      if let Expr::Identifier(name) = &args[0] {
+        let leaf = name.rsplit('`').next().unwrap_or(name).to_string();
+        return Some(Ok(Expr::String(leaf)));
+      }
+      return Some(Ok(unevaluated("SymbolName", args)));
+    }
+    // CreateUUID[] — a random RFC 4122 version-4 UUID as a string,
+    // `CreateUUID["prefix"]` the same with `prefix` in front. Used as an
+    // object identity by any package that keeps a symbol-keyed registry.
+    "CreateUUID" if args.is_empty() || args.len() == 1 => {
+      let prefix = match args.first() {
+        None => String::new(),
+        Some(Expr::String(prefix)) => prefix.clone(),
+        Some(_) => {
+          crate::emit_message(&format!(
+            "CreateUUID::string: String expected at position 1 in {}.",
+            expr_to_string(&unevaluated("CreateUUID", args))
+          ));
+          return Some(Ok(unevaluated("CreateUUID", args)));
+        }
+      };
+      let mut bytes = [0u8; 16];
+      crate::with_rng(|rng| rand::RngCore::fill_bytes(rng, &mut bytes));
+      // Version 4, variant 1 — the bits RFC 4122 fixes for random UUIDs.
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      // Written out by hand rather than through `format!` per byte, which
+      // would allocate sixteen throwaway strings for one 32-character result.
+      const HEX: &[u8; 16] = b"0123456789abcdef";
+      let mut hex = String::with_capacity(32);
+      for byte in bytes {
+        hex.push(char::from(HEX[(byte >> 4) as usize]));
+        hex.push(char::from(HEX[(byte & 0x0f) as usize]));
+      }
+      let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+      );
+      return Some(Ok(Expr::String(format!("{prefix}{uuid}"))));
+    }
+    // Unique[] - generate a unique symbol $nnn
+    // Unique[x] - generate a unique symbol x$nnn
+    // Unique["xxx"] - generate a unique symbol xxxnnn
+    // Unique[{x, y, ...}] - generate list of unique symbols
+    "Unique" if args.is_empty() => {
+      let sym_name = crate::functions::scoping::unique_symbol("");
+      // For Unique[], format is $nnn (just $counter)
+      return Some(Ok(Expr::Identifier(sym_name)));
+    }
+    "Unique" if args.len() == 1 => {
+      match &args[0] {
+        Expr::Identifier(name) => {
+          let sym_name = crate::functions::scoping::unique_symbol(name);
+          return Some(Ok(Expr::Identifier(sym_name)));
+        }
+        Expr::String(name) => {
+          // For strings, use sequential numbering without $
+          let sym_name =
+            crate::functions::scoping::unique_symbol_from_string(name);
+          return Some(Ok(Expr::Identifier(sym_name)));
+        }
+        Expr::List(items) => {
+          let mut result = Vec::new();
+          for item in items {
+            match item {
+              Expr::Identifier(name) => {
+                let sym_name = crate::functions::scoping::unique_symbol(name);
+                result.push(Expr::Identifier(sym_name));
+              }
+              Expr::String(name) => {
+                let sym_name =
+                  crate::functions::scoping::unique_symbol_from_string(name);
+                result.push(Expr::Identifier(sym_name));
+              }
+              _ => {
+                return Some(Ok(unevaluated("Unique", args)));
+              }
+            }
+          }
+          return Some(Ok(Expr::List(result.into())));
+        }
+        _ => {
+          crate::emit_message(&format!(
+            "Unique::usym: {} is not a symbol or a valid symbol name.",
+            expr_to_string(&args[0])
+          ));
+          return Some(Ok(unevaluated("Unique", args)));
+        }
+      }
+    }
+    "AtomQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::atom_q_ast(args));
+    }
+    "NumericQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::numeric_q_ast(args));
+    }
+    "ExactNumberQ" if args.len() == 1 => {
+      let is_exact = is_exact_number(&args[0]);
+      return Some(Ok(bool_expr(is_exact)));
+    }
+    "InexactNumberQ" if args.len() == 1 => {
+      let is_inexact = is_inexact_number(&args[0]);
+      return Some(Ok(bool_expr(is_inexact)));
+    }
+    "Positive" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::positive_ast(args));
+    }
+    "Negative" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::negative_ast(args));
+    }
+    "NonPositive" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::non_positive_ast(args));
+    }
+    "NonNegative" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::non_negative_ast(args));
+    }
+    "VectorGreater" | "VectorGreaterEqual" | "VectorLess"
+    | "VectorLessEqual"
+      if args.len() == 1 =>
+    {
+      return Some(vector_order_ast(name, &args[0]));
+    }
+    "PrimeQ" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::predicate_ast::prime_q_ast(args));
+    }
+    "GeometricTest" if args.len() >= 2 => {
+      return crate::functions::geometric_test_ast::geometric_test(args);
+    }
+    "CollinearPoints" if args.len() == 1 => {
+      return crate::functions::geometric_test_ast::collinear_points_ast(args);
+    }
+    "CoplanarPoints" if args.len() == 1 => {
+      return crate::functions::geometric_test_ast::coplanar_points_ast(args);
+    }
+    "ConvexPolyhedronQ" => {
+      return Some(
+        crate::functions::geometric_test_ast::convex_polyhedron_q_ast(args),
+      );
+    }
+    "ConvexPolygonQ" if args.len() == 1 => {
+      return crate::functions::geometric_test_ast::convex_polygon_q_ast(args);
+    }
+    "SimplePolygonQ" if args.len() == 1 => {
+      return crate::functions::geometric_test_ast::simple_polygon_q_ast(args);
+    }
+    "CompositeQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::composite_q_ast(args));
+    }
+    "PrimePowerQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::prime_power_q_ast(args));
+    }
+    "AssociationQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::association_q_ast(args));
+    }
+    "Between" if args.len() == 2 => {
+      use crate::functions::math_ast::try_eval_to_f64;
+      // Normalize arg order: Between[x, range] or Between[range, x] (from operator form)
+      let (x, range_expr) = if matches!(&args[0], Expr::List(_))
+        && !matches!(&args[1], Expr::List(_))
+      {
+        (&args[1], &args[0])
+      } else {
+        (&args[0], &args[1])
+      };
+      // Between[x, {min, max}] or Between[x, {{min1, max1}, {min2, max2}, ...}]
+      if let Expr::List(range) = range_expr {
+        // Check if it's a list of ranges (all elements are lists)
+        let is_list_of_ranges =
+          !range.is_empty() && range.iter().all(|r| matches!(r, Expr::List(_)));
+        if range.len() == 2 && !is_list_of_ranges {
+          // Single range: Between[x, {min, max}]
+          if let (Some(xv), Some(lo), Some(hi)) = (
+            try_eval_to_f64(x),
+            try_eval_to_f64(&range[0]),
+            try_eval_to_f64(&range[1]),
+          ) {
+            return Some(Ok(Expr::Identifier(
+              if lo <= xv && xv <= hi {
+                "True"
+              } else {
+                "False"
+              }
+              .to_string(),
+            )));
+          }
+          // Symbolic: a <= x <= b (chained inequality, like wolframscript).
+          let chained = Expr::Comparison {
+            operands: vec![range[0].clone(), x.clone(), range[1].clone()],
+            operators: vec![ComparisonOp::LessEqual, ComparisonOp::LessEqual],
+          };
+          return Some(crate::evaluator::evaluate_expr_to_expr(&chained));
+        } else if is_list_of_ranges {
+          // Multiple ranges: Between[x, {{min1, max1}, ...}]
+          if let Some(xv) = try_eval_to_f64(x) {
+            let mut all_numeric = true;
+            for r in range {
+              let Expr::List(pair) = r else {
+                all_numeric = false;
+                break;
+              };
+              if pair.len() != 2 {
+                all_numeric = false;
+                break;
+              }
+              let (lo, hi) =
+                (try_eval_to_f64(&pair[0]), try_eval_to_f64(&pair[1]));
+              if let (Some(lo), Some(hi)) = (lo, hi) {
+                if lo <= xv && xv <= hi {
+                  return Some(Ok(bool_expr(true)));
+                }
+              } else {
+                all_numeric = false;
+                break;
+              }
+            }
+            if all_numeric {
+              return Some(Ok(bool_expr(false)));
+            }
+          }
+          // Symbolic disjunction over each {min_i, max_i}.
+          let mut clauses: Vec<Expr> = Vec::with_capacity(range.len());
+          let mut shape_ok = true;
+          for r in range {
+            let Expr::List(pair) = r else {
+              shape_ok = false;
+              break;
+            };
+            if pair.len() != 2 {
+              shape_ok = false;
+              break;
+            }
+            clauses.push(Expr::Comparison {
+              operands: vec![pair[0].clone(), x.clone(), pair[1].clone()],
+              operators: vec![ComparisonOp::LessEqual, ComparisonOp::LessEqual],
+            });
+          }
+          if shape_ok {
+            let disj = call("Or", clauses);
+            return Some(crate::evaluator::evaluate_expr_to_expr(&disj));
+          }
+        }
+      }
+    }
+    "Between" if args.len() == 1 => {
+      // Operator form: Between[{min, max}] returns itself (handled by curried call)
+      if let Expr::List(range) = &args[0]
+        && range.len() == 2
+      {
+        return Some(Ok(unevaluated("Between", args)));
+      }
+    }
+    "MemberQ" if (2..=4).contains(&args.len()) => {
+      return Some(crate::functions::predicate_ast::member_q_ast(args));
+    }
+    "FreeQ" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::predicate_ast::free_q_ast(args));
+    }
+    "MatchQ" if args.len() == 2 => {
+      return Some(crate::functions::predicate_ast::match_q_ast(args));
+    }
+    "Divisible" if args.len() == 2 => {
+      return Some(crate::functions::predicate_ast::divisible_ast(args));
+    }
+    "SubsetQ" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::predicate_ast::subset_q_ast(args));
+    }
+    "DuplicateFreeQ" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::predicate_ast::duplicate_free_q_ast(args));
+    }
+    "PossibleZeroQ" => {
+      if args.len() != 1 {
+        crate::emit_message(&format!(
+          "PossibleZeroQ::argx: PossibleZeroQ called with {} arguments; 1 argument is expected.",
+          args.len()
+        ));
+        return Some(Ok(unevaluated("PossibleZeroQ", args)));
+      }
+      return Some(crate::functions::predicate_ast::possible_zero_q_ast(args));
+    }
+    "OptionQ" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::option_q_ast(args));
+    }
+    "Head" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::head_ast(args));
+    }
+    "Length" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::length_ast(args));
+    }
+    "Depth" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::depth_ast(args));
+    }
+    "LeafCount" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::leaf_count_ast(args));
+    }
+    "ByteCount" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::byte_count_ast(args));
+    }
+    // MaxMemoryUsed[] - peak memory usage of the process
+    "MaxMemoryUsed" if args.is_empty() => {
+      let peak_bytes = crate::functions::memory::max_memory_used();
+      return Some(Ok(Expr::Integer(peak_bytes)));
+    }
+    // MemoryInUse[] - current memory usage of the process
+    "MemoryInUse" if args.is_empty() => {
+      let rss_bytes = crate::functions::memory::memory_in_use();
+      return Some(Ok(Expr::Integer(rss_bytes)));
+    }
+    // MemoryAvailable[] - estimate of free system memory in bytes
+    "MemoryAvailable" if args.is_empty() => {
+      let bytes = crate::functions::memory::memory_available();
+      return Some(Ok(Expr::Integer(bytes)));
+    }
+    // OwnValues[sym]: if `sym` has a stored value (from `sym = value`),
+    // return `{HoldPattern[sym] :> value}`, matching Wolfram. Otherwise {}.
+    "OwnValues" if args.len() == 1 => {
+      if let Expr::Identifier(name) = &args[0] {
+        let value_expr = crate::lookup_env_as_expr(name);
+        if let Some(v) = value_expr {
+          return Some(Ok(Expr::List(
+            vec![Expr::RuleDelayed {
+              pattern: Box::new(call1(
+                "HoldPattern",
+                Expr::Identifier(name.clone()),
+              )),
+              replacement: Box::new(v),
+            }]
+            .into(),
+          )));
+        }
+      }
+      return Some(Ok(Expr::List(vec![].into())));
+    }
+    // Messages[sym] — return all stored MessageName DownValues that
+    // target this symbol. `sym::tag = "text"` is stored as a DownValue
+    // on MessageName itself (`MessageName[sym, "tag"] :> "text"`); pull
+    // out the ones whose first argument is `sym`.
+    "Messages" if args.len() == 1 => {
+      let sym = match &args[0] {
+        Expr::Identifier(s) => s.clone(),
+        _ => return Some(Ok(Expr::List(vec![].into()))),
+      };
+      let func_defs = crate::FUNC_DEFS
+        .with(|m| m.borrow().get("MessageName").cloned().unwrap_or_default());
+      let rules: Vec<Expr> = func_defs
+        .iter()
+        .filter_map(
+          |(params, rule_conds, _defaults, _heads, _blank_types, body)| {
+            // MessageName has exactly two slots: first is the symbol literal
+            // (matched as a SameQ condition with param `_dv0`), second is
+            // the tag string (`_dv1`). Re-derive the literal MessageName
+            // pattern from `body`'s associated structural-pattern conditions.
+            // The simpler path: use the conditions to read the literal sym
+            // value matched in slot 0. If the rule's slot-0 SameQ value
+            // doesn't equal `sym`, skip it.
+            let slot0_literal = rule_conds.iter().find_map(|c| {
+              if let Some(Expr::Comparison {
+                operands,
+                operators,
+              }) = c
+                && operators.len() == 1
+                && matches!(operators[0], ComparisonOp::SameQ)
+                && operands.len() == 2
+                && let Expr::Identifier(name) = &operands[0]
+                && name == &params[0]
+              {
+                Some(operands[1].clone())
+              } else {
+                None
+              }
+            })?;
+            if !matches!(&slot0_literal, Expr::Identifier(s) if s == &sym) {
+              return None;
+            }
+            // Slot 1 is the tag string (or symbol). It's matched the same
+            // way; pull its literal value out of the conditions.
+            let slot1_literal = rule_conds.iter().find_map(|c| {
+              if let Some(Expr::Comparison {
+                operands,
+                operators,
+              }) = c
+                && operators.len() == 1
+                && matches!(operators[0], ComparisonOp::SameQ)
+                && operands.len() == 2
+                && let Expr::Identifier(name) = &operands[0]
+                && name == &params[1]
+              {
+                Some(operands[1].clone())
+              } else {
+                None
+              }
+            })?;
+            Some(Expr::RuleDelayed {
+              pattern: Box::new(call(
+                "HoldPattern",
+                vec![call("MessageName", vec![slot0_literal, slot1_literal])],
+              )),
+              replacement: Box::new(body.clone()),
+            })
+          },
+        )
+        .collect();
+      return Some(Ok(Expr::List(rules.into())));
+    }
+    // NValues[sym] — read the rules registered via `N[sym, …] = value`
+    // (stored in N_VALUES under sym), formatted with HoldPattern wrappers.
+    "NValues" if args.len() == 1 => {
+      let head = match &args[0] {
+        Expr::Identifier(s) => s.clone(),
+        _ => return Some(Ok(Expr::List(vec![].into()))),
+      };
+      let rules: Vec<Expr> = crate::evaluator::assignment::N_VALUES.with(|m| {
+        m.borrow()
+          .get(&head)
+          .map(|entries| {
+            entries
+              .iter()
+              .map(|(lhs, rhs)| Expr::RuleDelayed {
+                pattern: Box::new(call1("HoldPattern", lhs.clone())),
+                replacement: Box::new(rhs.clone()),
+              })
+              .collect()
+          })
+          .unwrap_or_default()
+      });
+      return Some(Ok(Expr::List(rules.into())));
+    }
+    "SubValues" if args.len() == 1 => {
+      let head = match &args[0] {
+        Expr::Identifier(s) => s.clone(),
+        _ => return Some(Ok(Expr::List(vec![].into()))),
+      };
+      let rules: Vec<Expr> =
+        crate::evaluator::assignment::SUB_VALUES.with(|m| {
+          m.borrow()
+            .get(&head)
+            .map(|entries| {
+              entries
+                .iter()
+                .map(|(lhs, rhs)| Expr::RuleDelayed {
+                  pattern: Box::new(call1("HoldPattern", lhs.clone())),
+                  replacement: Box::new(rhs.clone()),
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+        });
+      return Some(Ok(Expr::List(rules.into())));
+    }
+    "FormatValues" if args.len() == 1 => {
+      let head = match &args[0] {
+        Expr::Identifier(s) => s.clone(),
+        _ => return Some(Ok(Expr::List(vec![].into()))),
+      };
+      let rules: Vec<Expr> =
+        crate::evaluator::assignment::FORMAT_VALUES.with(|m| {
+          m.borrow()
+            .get(&head)
+            .map(|entries| {
+              entries
+                .iter()
+                .map(|(form, lhs, rhs)| {
+                  // OutputForm rules use the LHS pattern verbatim;
+                  // box-form rules wrap the LHS in
+                  // `MakeBoxes[lhs, FORM]` (Wolfram's canonical form).
+                  let pattern_inner = if form == "OutputForm" {
+                    lhs.clone()
+                  } else {
+                    call(
+                      "MakeBoxes",
+                      vec![lhs.clone(), Expr::Identifier(form.clone())],
+                    )
+                  };
+                  Expr::RuleDelayed {
+                    pattern: Box::new(call1("HoldPattern", pattern_inner)),
+                    replacement: Box::new(rhs.clone()),
+                  }
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+        });
+      return Some(Ok(Expr::List(rules.into())));
+    }
+    // DefaultValues exposes the built-in identity elements used by
+    // Optional/OneIdentity pattern matching: Plus → 0, Times → 1, and
+    // Power's second slot → 1. Anything else with no stored definition
+    // returns {}.
+    "DefaultValues" if args.len() == 1 => {
+      let rule = |pat: Expr, val: Expr| Expr::RuleDelayed {
+        pattern: Box::new(call1("HoldPattern", pat)),
+        replacement: Box::new(val),
+      };
+      let default_of = |sym: &str, extra: Vec<Expr>| {
+        let mut default_args = vec![Expr::Identifier(sym.to_string())];
+        default_args.extend(extra);
+        call("Default", default_args)
+      };
+      if let Expr::Identifier(sym) = &args[0] {
+        // Built-in defaults: Plus → 0, Times → 1, Power slot 2 → 1.
+        let mut values: Vec<Expr> = match sym.as_str() {
+          "Plus" => vec![rule(default_of("Plus", vec![]), Expr::Integer(0))],
+          "Times" => vec![rule(default_of("Times", vec![]), Expr::Integer(1))],
+          "Power" => vec![rule(
+            default_of("Power", vec![Expr::Integer(2)]),
+            Expr::Integer(1),
+          )],
+          _ => vec![],
+        };
+        // User-installed defaults: `Default[sym, n] = v` is stored as a
+        // DownValue on `Default` itself. Walk FUNC_DEFS["Default"] and pull
+        // the entries whose first slot literally equals `sym`.
+        let func_defs = crate::FUNC_DEFS
+          .with(|m| m.borrow().get("Default").cloned().unwrap_or_default());
+        let slot_literal_for =
+          |conds: &[Option<Expr>], param: &str| -> Option<Expr> {
+            conds.iter().find_map(|c| {
+              if let Some(Expr::Comparison {
+                operands,
+                operators,
+              }) = c
+                && operators.len() == 1
+                && matches!(operators[0], ComparisonOp::SameQ)
+                && operands.len() == 2
+                && let Expr::Identifier(name) = &operands[0]
+                && name == param
+              {
+                Some(operands[1].clone())
+              } else {
+                None
+              }
+            })
+          };
+        for (params, conds, _defaults, _heads, _blank_types, body) in &func_defs
+        {
+          // Default's first slot is the symbol literal (matched as SameQ).
+          let Some(slot0) = slot_literal_for(conds, &params[0]) else {
+            continue;
+          };
+          if !matches!(&slot0, Expr::Identifier(s) if s == sym) {
+            continue;
+          }
+          // Reconstruct the pattern as Default[sym] / Default[sym, n] /
+          // Default[sym, n, m] depending on how many slots were captured.
+          let mut pat_args = vec![slot0];
+          for p in params.iter().skip(1) {
+            if let Some(lit) = slot_literal_for(conds, p) {
+              pat_args.push(lit);
+            }
+          }
+          let pattern = call("Default", pat_args);
+          values.push(rule(pattern, body.clone()));
+        }
+        return Some(Ok(Expr::List(values.into())));
+      }
+      return Some(Ok(Expr::List(vec![].into())));
+    }
+    "DownValues" if args.len() == 1 => {
+      if let Expr::Identifier(sym) = &args[0] {
+        let func_defs = crate::FUNC_DEFS
+          .with(|m| m.borrow().get(sym).cloned().unwrap_or_default());
+        // Memoized literal-argument values (stored in MEMO_VALUES, not
+        // FUNC_DEFS) are reconstructed here as HoldPattern[f[args]] :> value
+        // rules so DownValues still reports them.
+        let memo_rules: Vec<Expr> = crate::MEMO_VALUES.with(|m| {
+          m.borrow()
+            .get(sym)
+            .map(|cache| {
+              cache
+                .values()
+                .map(|(arg_exprs, value)| Expr::RuleDelayed {
+                  pattern: Box::new(Expr::FunctionCall {
+                    name: "HoldPattern".to_string(),
+                    args: vec![Expr::FunctionCall {
+                      name: sym.clone(),
+                      args: arg_exprs.clone().into(),
+                    }]
+                    .into(),
+                  }),
+                  replacement: Box::new(value.clone()),
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+        });
+        if func_defs.is_empty() && memo_rules.is_empty() {
+          return Some(Ok(Expr::List(vec![].into())));
+        }
+        // TagSet/TagSetDelayed definitions are also stored in FUNC_DEFS so
+        // the usual dispatch picks them up, but they belong to UpValues,
+        // not DownValues of the outer head. Collect (params, heads) pairs
+        // for every UPVALUES entry whose outer_func matches this symbol,
+        // then filter those entries out below.
+        let upvalue_keys: std::collections::HashSet<(
+          Vec<String>,
+          Vec<Option<String>>,
+        )> = crate::UPVALUES.with(|m| {
+          let defs = m.borrow();
+          let mut keys = std::collections::HashSet::new();
+          for entries in defs.values() {
+            for (outer, params, _, _, heads, _, _, _) in entries {
+              if outer == sym {
+                keys.insert((params.clone(), heads.clone()));
+              }
+            }
+          }
+          keys
+        });
+        let rules: Vec<Expr> = func_defs
+          .iter()
+          .filter(|(params, _, _, heads, _, _)| {
+            !upvalue_keys.contains(&(params.clone(), heads.clone()))
+          })
+          .map(|(params, conds, _defaults, heads, blank_types, body)| {
+            // List-pattern params (`_lp{i}`) are lowered to a single param with
+            // a synthetic condition; reconstruct the surface `{…}` pattern,
+            // un-substitute the `Part[_lp, i]` element accessors in the body,
+            // and re-attach any `/;` guard.
+            let (pattern_args, display_body) =
+              crate::evaluator::assignment::reconstruct_list_downvalue(
+                params,
+                conds,
+                heads,
+                blank_types,
+                body,
+              )
+              .unwrap_or_else(|| {
+                let args: Vec<Expr> = (0..params.len())
+                  .map(|i| {
+                    // Check if this param has a literal-match condition (SameQ)
+                    if let Some(Some(Expr::Comparison {
+                      operands,
+                      operators,
+                    })) = conds.get(i)
+                      && operators
+                        .iter()
+                        .any(|op| matches!(op, ComparisonOp::SameQ))
+                      && let Some(literal_val) = operands.get(1)
+                    {
+                      return literal_val.clone();
+                    }
+                    crate::evaluator::assignment::downvalue_param_pattern(
+                      params,
+                      conds,
+                      heads,
+                      blank_types,
+                      i,
+                    )
+                  })
+                  .collect();
+                // A rule's `/;` guard has no parameter slot of its own; put
+                // it back on the body so the rule prints — and replays
+                // through `DownValues[f] = …` — as it was written. The
+                // list-pattern reconstruction above does this itself, having
+                // to un-substitute the guard's element accessors first.
+                let guarded =
+                  crate::evaluator::assignment::attach_trailing_guards(
+                    params,
+                    conds,
+                    body.clone(),
+                  );
+                (args, guarded)
+              });
+            Expr::RuleDelayed {
+              pattern: Box::new(Expr::FunctionCall {
+                name: "HoldPattern".to_string(),
+                args: vec![Expr::FunctionCall {
+                  name: sym.clone(),
+                  args: pattern_args.into(),
+                }]
+                .into(),
+              }),
+              replacement: Box::new(display_body),
+            }
+          })
+          .collect();
+        let mut rules = rules;
+        rules.extend(memo_rules);
+        return Some(Ok(Expr::List(rules.into())));
+      }
+      return Some(Ok(Expr::List(vec![].into())));
+    }
+    // `Language`ExtendedFullDefinition[sym]` gathers every kind of
+    // definition attached to `sym` into one inert expression, which
+    // assigning back to another symbol installs there. Copying a symbol's
+    // whole behaviour onto a new one — `Language`ExtendedFullDefinition[b] =
+    // Language`ExtendedFullDefinition[a] /. a -> b` — is how object systems
+    // written in the Wolfram Language derive a type from a parent type.
+    "Language`ExtendedFullDefinition" if args.len() == 1 => {
+      let Expr::Identifier(sym) = &args[0] else {
+        return Some(Ok(unevaluated(name, args)));
+      };
+      let mut sections: Vec<Expr> = Vec::new();
+      for head in DEFINITION_SECTIONS {
+        // Most section heads hold their argument, but `Options` does not:
+        // handed a symbol that owns a value it would report the options of
+        // that value (`Options[3]`). `Unevaluated` keeps the symbol itself
+        // as the subject, which is what a definition listing is about.
+        let subject = Expr::Identifier(sym.clone());
+        let subject = if crate::evaluator::core_eval::holds_argument_at(head, 0)
+        {
+          subject
+        } else {
+          call1("Unevaluated", subject)
+        };
+        let value = match crate::evaluator::evaluate_expr_to_expr(&call1(
+          head, subject,
+        )) {
+          Ok(value) => value,
+          Err(e) => return Some(Err(e)),
+        };
+        sections.push(Expr::Rule {
+          pattern: Box::new(Expr::Identifier((*head).to_string())),
+          replacement: Box::new(value),
+        });
+      }
+      return Some(Ok(call1(
+        "Language`DefinitionList",
+        Expr::Rule {
+          pattern: Box::new(call1("HoldForm", Expr::Identifier(sym.clone()))),
+          replacement: Box::new(Expr::List(sections.into())),
+        },
+      )));
+    }
+    "UpValues" if args.len() == 1 => {
+      if let Expr::Identifier(sym) = &args[0] {
+        let up_defs = crate::UPVALUES
+          .with(|m| m.borrow().get(sym).cloned().unwrap_or_default());
+        if up_defs.is_empty() {
+          return Some(Ok(Expr::List(vec![].into())));
+        }
+        // Return a list of RuleDelayed expressions using the original LHS and body
+        let rules: Vec<Expr> = up_defs
+          .iter()
+          .map(
+            |(
+              _outer_func,
+              _params,
+              _conds,
+              _defaults,
+              _heads,
+              _body,
+              orig_lhs,
+              orig_body,
+            )| {
+              Expr::RuleDelayed {
+                pattern: Box::new(call1("HoldPattern", orig_lhs.clone())),
+                replacement: Box::new(orig_body.clone()),
+              }
+            },
+          )
+          .collect();
+        return Some(Ok(Expr::List(rules.into())));
+      }
+      return Some(Ok(Expr::List(vec![].into())));
+    }
+    // FullForm - returns full form representation (unevaluated)
+    "FullForm" if args.len() == 1 => {
+      return Some(crate::functions::predicate_ast::full_form_ast(&args[0]));
+    }
+    "CForm" if args.len() == 1 => {
+      return Some(Ok(unevaluated("CForm", args)));
+    }
+    "TeXForm" if args.len() == 1 => {
+      return Some(Ok(unevaluated("TeXForm", args)));
+    }
+    // The converter behind `TeXForm`, which returns the TeX as a string:
+    // `Convert`TeX`ExpressionToTeX[x^2]` is `"x^2"`.
+    "Convert`TeX`ExpressionToTeX" if args.len() == 1 => {
+      return Some(Ok(Expr::String(
+        crate::functions::string_ast::expr_to_tex(&args[0]),
+      )));
+    }
+    "FortranForm" if args.len() == 1 => {
+      return Some(Ok(unevaluated("FortranForm", args)));
+    }
+    // Attributes[symbol] - returns the attributes of a built-in symbol
+    "Attributes" if args.len() == 1 => {
+      // Attributes is Listable: a list of symbols gives one attribute list per
+      // symbol (it holds its argument, so the list is threaded here rather
+      // than by the generic Listable machinery).
+      if let Expr::List(symbols) = &args[0] {
+        let per_symbol: Option<Vec<Expr>> = symbols
+          .iter()
+          .map(|sym| {
+            dispatch_predicate_functions(
+              "Attributes",
+              std::slice::from_ref(sym),
+            )
+            .and_then(std::result::Result::ok)
+          })
+          .collect();
+        if let Some(lists) = per_symbol {
+          return Some(Ok(Expr::List(lists.into())));
+        }
+        return Some(Ok(unevaluated("Attributes", args)));
+      }
+      let sym_name = match &args[0] {
+        Expr::Identifier(name) => name.as_str(),
+        Expr::Constant(name) => name.as_str(),
+        Expr::String(name) => name.as_str(),
+        _ => {
+          return Some(Ok(unevaluated("Attributes", args)));
+        }
+      };
+      // Check user-defined attributes first, then combine with built-in
+      let user_attrs =
+        crate::FUNC_ATTRS.with(|m| m.borrow().get(sym_name).cloned());
+      let builtin = get_builtin_attributes(sym_name);
+      let removed = crate::FUNC_ATTRS_REMOVED
+        .with(|m| m.borrow().get(sym_name).cloned())
+        .unwrap_or_default();
+      let mut all_attrs = builtin;
+      all_attrs.remove(removed.to_u32());
+      if let Some(user) = user_attrs {
+        all_attrs.add(user.to_u32());
+      }
+      return Some(Ok(Expr::List(
+        all_attrs
+          .to_vec()
+          .iter()
+          .map(|a| Expr::Identifier(a.to_string()))
+          .collect(),
+      )));
+    }
+    // Context[] - return current context
+    // Context[symbol] - return context of a symbol
+    "Context" if args.is_empty() => {
+      return Some(Ok(Expr::String(crate::current_context())));
+    }
+    "Context" if args.len() == 1 => {
+      let (sym_name, from_string) = match &args[0] {
+        Expr::Identifier(name) => (name.clone(), false),
+        Expr::String(name) => (name.clone(), true),
+        // `Context` is HoldFirst, so anything else arrives unevaluated and
+        // is simply not a symbol.
+        other => {
+          crate::emit_message_to_stdout(&format!(
+            "Context::ssle: Symbol or string expected at position 1 in \
+             Context[{}].",
+            expr_to_output(other)
+          ));
+          return Some(Ok(unevaluated("Context", args)));
+        }
+      };
+      // Context-qualified symbols (e.g. `b` `c`) carry their context in
+      // the name itself: everything up to and including the final
+      // backtick. `b` `c` → `"b` "`, `Foo` `Bar` `x` → `"Foo` `Bar` "`.
+      if let Some(last) = sym_name.rfind('`') {
+        return Some(Ok(Expr::String(sym_name[..=last].to_string())));
+      }
+      // Built-in symbols are in System` context
+      let builtin = get_builtin_attributes(&sym_name);
+      if !builtin.is_empty() {
+        return Some(Ok(Expr::String("System`".to_string())));
+      }
+      // A name given as a string resolves like one that was read: it names
+      // whichever symbol `$ContextPath` makes visible.
+      if from_string {
+        let resolved = crate::evaluator::contexts::resolve(&sym_name);
+        if resolved != sym_name {
+          return Some(Ok(Expr::String(
+            crate::evaluator::contexts::context_of(&resolved),
+          )));
+        }
+        let exists = crate::ENV.with(|e| e.borrow().contains_key(&sym_name))
+          || crate::FUNC_DEFS.with(|m| m.borrow().contains_key(&sym_name))
+          || crate::FUNC_ATTRS.with(|m| m.borrow().contains_key(&sym_name));
+        if !exists {
+          crate::emit_message_to_stdout(&format!(
+            "Context::notfound: Symbol {sym_name} not found."
+          ));
+          return Some(Ok(unevaluated("Context", args)));
+        }
+      }
+      // User-defined symbols are in Global` context
+      return Some(Ok(Expr::String("Global`".to_string())));
+    }
+    // Contexts[] — list known contexts; Contexts["pattern*"] — filter by
+    // glob pattern. Woxi only tracks System` and Global` contexts; any other
+    // pattern matches none.
+    "Contexts" if args.is_empty() => {
+      return Some(Ok(Expr::List(
+        known_contexts().into_iter().map(Expr::String).collect(),
+      )));
+    }
+    "Contexts" if args.len() == 1 => {
+      let pattern = match &args[0] {
+        // A pattern may name a context by its `$ContextAliases` alias, which
+        // stands in for the context's real name here as everywhere else.
+        Expr::String(s) => crate::evaluator::contexts::expand_alias(s),
+        _ => {
+          return Some(Ok(unevaluated("Contexts", args)));
+        }
+      };
+      // Convert glob (* wildcards) to a simple matcher.
+      let glob_match = |name: &str| -> bool {
+        // Split the pattern on '*' and check each literal part appears in
+        // order, anchored to start/end unless the pattern begins/ends with '*'.
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut pos = 0usize;
+        for (i, part) in parts.iter().enumerate() {
+          if part.is_empty() {
+            continue;
+          }
+          if i == 0 {
+            // Must start with this prefix.
+            if !name[pos..].starts_with(part) {
+              return false;
+            }
+            pos += part.len();
+          } else if i == parts.len() - 1 {
+            // Last part must match the remaining end unless pattern ends in '*'.
+            if pattern.ends_with('*') {
+              if !name[pos..].contains(part) {
+                return false;
+              }
+            } else if !name[pos..].ends_with(part) {
+              return false;
+            }
+          } else {
+            match name[pos..].find(part) {
+              Some(idx) => pos += idx + part.len(),
+              None => return false,
+            }
+          }
+        }
+        if pattern.contains('*') {
+          true
+        } else {
+          name == pattern
+        }
+      };
+      let matches: Vec<Expr> = known_contexts()
+        .into_iter()
+        .filter(|n| glob_match(n))
+        .map(Expr::String)
+        .collect();
+      return Some(Ok(Expr::List(matches.into())));
+    }
+    // Options[f] - return stored options for function f
+    // Options[f, opt] - return specific option for function f
+    // A graph carries its annotations as options of its own.
+    "Options"
+      if (args.len() == 1 || args.len() == 2)
+        && matches!(&args[0], Expr::FunctionCall { name, .. }
+          if name == "Graph") =>
+    {
+      return Some(crate::functions::graph::graph_options_ast(args));
+    }
+    "Options" if args.len() == 1 || args.len() == 2 => {
+      // `Options[Unevaluated[f]]` asks about `f` itself even when `f` owns
+      // a value: the wrapper marks the symbol as the subject, so it is
+      // unwrapped rather than evaluated through.
+      let func_arg = match &args[0] {
+        Expr::FunctionCall { name, args: held }
+          if name == "Unevaluated" && held.len() == 1 =>
+        {
+          held[0].clone()
+        }
+        subject => match evaluate_expr_to_expr(subject) {
+          Ok(v) => v,
+          Err(e) => return Some(Err(e)),
+        },
+      };
+      // A rendered graphic carries the options it was drawn with.
+      if let Some(opts) =
+        crate::functions::graphics::graphics_options(&func_arg)
+      {
+        if args.len() == 1 {
+          return Some(Ok(Expr::List(opts.into())));
+        }
+        let opt_arg = match evaluate_expr_to_expr(&args[1]) {
+          Ok(v) => v,
+          Err(e) => return Some(Err(e)),
+        };
+        let Expr::Identifier(opt_name) = &opt_arg else {
+          return Some(Ok(Expr::List(vec![].into())));
+        };
+        let named = |rules: Vec<Expr>| -> Vec<Expr> {
+          rules
+            .into_iter()
+            .filter(|rule| match rule {
+              Expr::Rule { pattern, .. }
+              | Expr::RuleDelayed { pattern, .. } => {
+                matches!(pattern.as_ref(), Expr::Identifier(n) if n == opt_name)
+              }
+              _ => false,
+            })
+            .collect()
+        };
+        let mut matching = named(opts);
+        // A graphic only carries the options it was drawn with, so an
+        // option it says nothing about reads as its head's default —
+        // `Options[Graphics[…], ImageSize]` is `{ImageSize -> Automatic}`.
+        if matching.is_empty()
+          && let Some(head) =
+            crate::functions::graphics::graphics_options_head(&func_arg)
+        {
+          matching = named(builtin_default_options(head));
+        }
+        return Some(Ok(Expr::List(matching.into())));
+      }
+      let func_name = match &func_arg {
+        Expr::Identifier(name) => name.clone(),
+        _ => {
+          return Some(Ok(call1("Options", func_arg)));
+        }
+      };
+      let stored =
+        crate::FUNC_OPTIONS.with(|m| m.borrow().get(&func_name).cloned());
+      let opts = stored.unwrap_or_else(|| builtin_default_options(&func_name));
+      if args.len() == 1 {
+        return Some(Ok(Expr::List(opts.into())));
+      }
+      // Options[f, opt] - find the matching option
+      let opt_arg = match evaluate_expr_to_expr(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+      };
+      let opt_name = match &opt_arg {
+        Expr::Identifier(name) => name.clone(),
+        _ => {
+          return Some(Ok(Expr::List(vec![].into())));
+        }
+      };
+      let matching: Vec<Expr> = opts
+        .into_iter()
+        .filter(|rule| match rule {
+          Expr::Rule { pattern, .. } | Expr::RuleDelayed { pattern, .. } => {
+            matches!(pattern.as_ref(), Expr::Identifier(n) if *n == opt_name)
+          }
+          _ => false,
+        })
+        .collect();
+      return Some(Ok(Expr::List(matching.into())));
+    }
+    // OptionValue[name] - look up option value from current OptionsPattern context.
+    // The name can be a Symbol (`OptionValue[m]`) or a String
+    // (`OptionValue["m"]`) — Wolfram looks both up against the same
+    // `Options[f]` rule list.
+    "OptionValue" if args.len() == 1 => {
+      let opt_arg = match evaluate_expr_to_expr(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+      };
+      // Preserve whether the caller used a Symbol or a String — when the
+      // option name is unresolved, wolframscript falls back to the original
+      // form (`OptionValue["b"]` -> "b", `OptionValue[b]` -> b).
+      let opt_arg_was_string = matches!(opt_arg, Expr::String(_));
+      let opt_name = match &opt_arg {
+        Expr::Identifier(name) => name.clone(),
+        Expr::String(name) => name.clone(),
+        _ => {
+          // Non-symbol/non-string argument: inside an OptionsPattern
+          // context, Wolfram returns the evaluated argument itself
+          // (e.g. OptionValue[a+b] -> a+b). Outside any context, leave
+          // OptionValue unevaluated.
+          let in_context =
+            crate::OPTION_VALUE_CONTEXT.with(|ctx| !ctx.borrow().is_empty());
+          if in_context {
+            return Some(Ok(opt_arg));
+          }
+          return Some(Ok(call1("OptionValue", opt_arg)));
+        }
+      };
+      // Look up in the current option value context stack (innermost first).
+      // Also note whether we're inside any OptionsPattern context at all —
+      // when we are, an unresolved name falls back to the bare symbol
+      // (Wolfram behavior); outside any context, OptionValue stays unevaluated.
+      let (result, in_context) = crate::OPTION_VALUE_CONTEXT.with(|ctx| {
+        let stack = ctx.borrow();
+        let in_context = !stack.is_empty();
+        for (_func_name, bindings) in stack.iter().rev() {
+          for (key, val) in bindings {
+            if *key == opt_name {
+              return (Some(val.clone()), in_context);
+            }
+          }
+        }
+        (None, in_context)
+      });
+      match result {
+        // Evaluate the looked-up value: option rules from `:>` (RuleDelayed)
+        // store the RHS held, so `OptionValue[a]` for `a :> Print["x"]`
+        // must trigger the Print at lookup time, matching Wolfram.
+        Some(val) => return Some(evaluate_expr_to_expr(&val)),
+        None if in_context => {
+          // Inside an OptionsPattern context but name isn't bound — return
+          // the original form: OptionValue[b] -> b, OptionValue["b"] -> "b".
+          if opt_arg_was_string {
+            return Some(Ok(Expr::String(opt_name)));
+          }
+          return Some(Ok(Expr::Identifier(opt_name)));
+        }
+        None => {
+          return Some(Ok(call1("OptionValue", opt_arg)));
+        }
+      }
+    }
+    // OptionValue[f, name] / OptionValue[f, opts, name] — the value of an
+    // option for the head `f`, taken from an explicit rule list first and then
+    // from `Options[f]` (a user-set list, else the built-in defaults). A list
+    // of rules may stand in for `f` when there is no head to fall back on, the
+    // name may be a symbol or a string, and a list of names gives a list of
+    // values. A fourth argument wraps each value in that head.
+    //
+    // Not implemented: the `::rep` message for an element of `opts` that is not
+    // a replacement rule. Such elements are ignored, which gives the value
+    // wolframscript gives; only the message is missing.
+    "OptionValue" if (2..=4).contains(&args.len()) => {
+      let mut evaluated = Vec::with_capacity(args.len());
+      for a in args {
+        match evaluate_expr_to_expr(a) {
+          Ok(v) => evaluated.push(v),
+          Err(e) => return Some(Err(e)),
+        }
+      }
+      // A fourth argument is the head each value is wrapped in.
+      let wrapper = if evaluated.len() == 4 {
+        evaluated.pop()
+      } else {
+        None
+      };
+      let name_arg = evaluated.pop().expect("at least two arguments");
+      // What is left is the head and/or an explicit rule list. A list (or a
+      // bare rule) in the first slot is itself the rule list.
+      let mut head: Option<String> = None;
+      let mut explicit: Vec<Expr> = Vec::new();
+      let collect = |e: &Expr, explicit: &mut Vec<Expr>| match e {
+        Expr::List(items) => explicit.extend(items.iter().cloned()),
+        other => explicit.push(other.clone()),
+      };
+      for (i, e) in evaluated.iter().enumerate() {
+        match e {
+          Expr::Identifier(n) if i == 0 => head = Some(n.clone()),
+          other => collect(other, &mut explicit),
+        }
+      }
+
+      // The option defaults of the head, if there is one.
+      let defaults: Vec<Expr> = match &head {
+        Some(name) => crate::FUNC_OPTIONS
+          .with(|m| m.borrow().get(name).cloned())
+          .unwrap_or_else(|| builtin_default_options(name)),
+        None => Vec::new(),
+      };
+      let value_of = |rules: &[Expr], key: &str| -> Option<Expr> {
+        rules.iter().find_map(|rule| match rule {
+          Expr::Rule {
+            pattern,
+            replacement,
+          }
+          | Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } => match pattern.as_ref() {
+            Expr::Identifier(n) if n == key => Some((**replacement).clone()),
+            Expr::String(s) if s == key => Some((**replacement).clone()),
+            _ => None,
+          },
+          _ => None,
+        })
+      };
+      // wolframscript names the whole first argument in the message, and stays
+      // quiet when it is an empty list.
+      let target = crate::syntax::format_expr(
+        evaluated.first().unwrap_or(&name_arg),
+        crate::syntax::ExprForm::Output,
+      );
+      let quiet = matches!(evaluated.first(), Some(Expr::List(items)) if items.is_empty());
+      let resolve = |name: &Expr| -> Result<Expr, InterpreterError> {
+        let key = match name {
+          Expr::Identifier(n) => n.clone(),
+          Expr::String(s) => s.clone(),
+          // A name that is neither a symbol nor a string resolves to itself.
+          other => return Ok(other.clone()),
+        };
+        if let Some(v) =
+          value_of(&explicit, &key).or_else(|| value_of(&defaults, &key))
+        {
+          let v = evaluate_expr_to_expr(&v)?;
+          Ok(match &wrapper {
+            Some(h) => Expr::FunctionCall {
+              name: expr_to_string(h),
+              args: vec![v].into(),
+            },
+            None => v,
+          })
+        } else {
+          if !quiet {
+            crate::emit_message(&format!(
+              "OptionValue::optnf: Option name {key} not found in defaults for {target}."
+            ));
+          }
+          // A missing option gives back the name it was asked for, never
+          // wrapped.
+          Ok(name.clone())
+        }
+      };
+      return Some(match &name_arg {
+        Expr::List(names) => {
+          let mut out = Vec::with_capacity(names.len());
+          for name in names {
+            match resolve(name) {
+              Ok(v) => out.push(v),
+              Err(e) => return Some(Err(e)),
+            }
+          }
+          Ok(Expr::List(out.into()))
+        }
+        single => resolve(single),
+      });
+    }
+    // Construct - creates function call f[a][b] etc.
+    "Construct" if !args.is_empty() => {
+      return Some(crate::functions::predicate_ast::construct_ast(args));
+    }
+    // NameQ["name"] - check if a symbol with that name exists
+    "NameQ" if args.len() == 1 => {
+      if let Expr::String(name) = &args[0] {
+        // Check if the symbol has been defined (OwnValues, DownValues, or is built-in)
+        let has_own = crate::ENV.with(|e| e.borrow().contains_key(name));
+        let has_down = crate::FUNC_DEFS.with(|m| m.borrow().contains_key(name));
+        let has_builtin_attrs = !get_builtin_attributes(name).is_empty();
+        if has_own || has_down || has_builtin_attrs {
+          return Some(Ok(bool_expr(true)));
+        }
+        return Some(Ok(bool_expr(false)));
+      }
+      return Some(Ok(unevaluated("NameQ", args)));
+    }
+    // Share[expr] - memory optimization, returns 0 (no-op in Woxi)
+    "Share" => {
+      return Some(Ok(Expr::Integer(0)));
+    }
+    // Operator forms: EqualTo[y][x] → x == y, etc.
+    "EqualTo" if args.len() == 1 => {
+      return Some(Ok(Expr::Function {
+        body: Box::new(Expr::Comparison {
+          operands: vec![Expr::Slot(1), args[0].clone()],
+          operators: vec![ComparisonOp::Equal],
+        }),
+      }));
+    }
+    "UnequalTo" if args.len() == 1 => {
+      return Some(Ok(Expr::Function {
+        body: Box::new(Expr::Comparison {
+          operands: vec![Expr::Slot(1), args[0].clone()],
+          operators: vec![ComparisonOp::NotEqual],
+        }),
+      }));
+    }
+    "GreaterThan" if args.len() == 1 => {
+      return Some(Ok(Expr::Function {
+        body: Box::new(Expr::Comparison {
+          operands: vec![Expr::Slot(1), args[0].clone()],
+          operators: vec![ComparisonOp::Greater],
+        }),
+      }));
+    }
+    "LessThan" if args.len() == 1 => {
+      return Some(Ok(Expr::Function {
+        body: Box::new(Expr::Comparison {
+          operands: vec![Expr::Slot(1), args[0].clone()],
+          operators: vec![ComparisonOp::Less],
+        }),
+      }));
+    }
+    "GreaterEqualThan" if args.len() == 1 => {
+      return Some(Ok(Expr::Function {
+        body: Box::new(Expr::Comparison {
+          operands: vec![Expr::Slot(1), args[0].clone()],
+          operators: vec![ComparisonOp::GreaterEqual],
+        }),
+      }));
+    }
+    "LessEqualThan" if args.len() == 1 => {
+      return Some(Ok(Expr::Function {
+        body: Box::new(Expr::Comparison {
+          operands: vec![Expr::Slot(1), args[0].clone()],
+          operators: vec![ComparisonOp::LessEqual],
+        }),
+      }));
+    }
+    _ => {}
+  }
+  None
+}
+
+/// Helper to create a Rule expression: name -> value
+/// VectorGreater[{v1, …, vn}] and friends: the chained element-wise
+/// comparison v1 ▷ v2 ▷ … ▷ vn (with the default non-negative-orthant cone),
+/// reduced with And. Returns False as soon as any element comparison is
+/// definitively False (mismatched lengths count as False); stays unevaluated
+/// when some comparison is symbolic and none is False.
+fn vector_order_ast(name: &str, arg: &Expr) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(call1(name, arg.clone()));
+  let op = match name {
+    "VectorGreater" => "Greater",
+    "VectorGreaterEqual" => "GreaterEqual",
+    "VectorLess" => "Less",
+    _ => "LessEqual",
+  };
+  let Expr::List(vecs) = arg else {
+    return unevaluated();
+  };
+  if vecs.len() < 2 {
+    return unevaluated();
+  }
+  let mut any_false = false;
+  let mut any_symbolic = false;
+  // Compare a single scalar pair, recording whether it is False or symbolic.
+  let compare = |a: &Expr,
+                 b: &Expr,
+                 af: &mut bool,
+                 sym: &mut bool|
+   -> Result<(), InterpreterError> {
+    match crate::evaluator::evaluate_function_call_ast(
+      op,
+      &[a.clone(), b.clone()],
+    )? {
+      Expr::Identifier(ref s) if s == "True" => {}
+      Expr::Identifier(ref s) if s == "False" => *af = true,
+      _ => *sym = true,
+    }
+    Ok(())
+  };
+  for window in vecs.windows(2) {
+    match (&window[0], &window[1]) {
+      // Two vectors: compare element-wise (mismatched lengths are False).
+      (Expr::List(u), Expr::List(v)) => {
+        if u.len() != v.len() {
+          any_false = true;
+          continue;
+        }
+        for (a, b) in u.iter().zip(v.iter()) {
+          compare(a, b, &mut any_false, &mut any_symbolic)?;
+        }
+      }
+      // A mix of a vector and a scalar is not a valid comparison.
+      (Expr::List(_), _) | (_, Expr::List(_)) => return unevaluated(),
+      // Two scalars: a chained scalar comparison.
+      (a, b) => compare(a, b, &mut any_false, &mut any_symbolic)?,
+    }
+  }
+  if any_false {
+    Ok(bool_expr(false))
+  } else if any_symbolic {
+    unevaluated()
+  } else {
+    Ok(bool_expr(true))
+  }
+}
+
+fn make_rule(name: &str, value: Expr) -> Expr {
+  Expr::Rule {
+    pattern: Box::new(Expr::Identifier(name.to_string())),
+    replacement: Box::new(value),
+  }
+}
+
+/// Precedence of a symbol or expression — matches Wolfram's `Precedence`.
+/// Returns the parsing precedence: built-in operators get specific values,
+/// unknown symbols default to 670., non-symbol expressions get 1000.
+fn precedence_value(expr: &Expr) -> f64 {
+  let name = match expr {
+    Expr::Identifier(s) | Expr::Constant(s) => s.as_str(),
+    Expr::FunctionCall { name, args } if args.is_empty() => name.as_str(),
+    _ => return 1000.0,
+  };
+  match name {
+    "CompoundExpression" => 10.0,
+    "Put" | "PutAppend" => 30.0,
+    "Set" | "SetDelayed" | "UpSet" | "UpSetDelayed" | "TagSet"
+    | "TagSetDelayed" | "TagUnset" | "Unset" => 40.0,
+    "Because" => 50.0,
+    "Therefore" => 60.0,
+    "Postfix" => 70.0,
+    "Colon" => 80.0,
+    "Function" => 90.0,
+    "AddTo" | "SubtractFrom" | "TimesBy" | "DivideBy" => 100.0,
+    "ReplaceAll" | "ReplaceRepeated" => 110.0,
+    "Rule" | "RuleDelayed" => 120.0,
+    "StringExpression" => 135.0,
+    "Condition" => 140.0,
+    "Pattern" => 150.0,
+    "Alternatives" => 160.0,
+    "Implies" => 200.0,
+    "Equivalent" => 205.0,
+    "Or" | "Nor" | "Xor" | "Nand" | "And" => 215.0,
+    "Not" => 230.0,
+    "Equal" | "Unequal" | "SameQ" | "UnsameQ" | "Less" | "Greater"
+    | "LessEqual" | "GreaterEqual" | "Inequality" => 290.0,
+    "Span" => 305.0,
+    "Plus" | "Subtract" => 310.0,
+    "PlusMinus" | "MinusPlus" => 315.0,
+    "Sum" | "Limit" => 320.0,
+    "Integrate" => 325.0,
+    "Product" => 380.0,
+    "Union" => 390.0,
+    "Intersection" => 395.0,
+    "Times" | "Divide" => 400.0,
+    "Cross" => 410.0,
+    "CenterDot" => 420.0,
+    "CircleTimes" => 430.0,
+    "SmallCircle" => 440.0,
+    "Backslash" => 460.0,
+    "Diamond" => 470.0,
+    "Wedge" => 480.0,
+    "Dot" => 490.0,
+    "NonCommutativeMultiply" => 510.0,
+    "Minus" => 480.0,
+    "D" => 550.0,
+    "Power" => 590.0,
+    "Apply" => 620.0,
+    "Map" | "MapAll" => 620.0,
+    "Factorial" | "Factorial2" => 610.0,
+    "Conjugate" | "Transpose" => 625.0,
+    "Repeated" | "RepeatedNull" => 635.0,
+    "RightComposition" => 648.0,
+    "Composition" => 650.0,
+    "Prefix" => 640.0,
+    "StringJoin" => 600.0,
+    "MessageName" => 740.0,
+    "Blank" | "BlankSequence" | "BlankNullSequence" => 730.0,
+    "Increment" | "Decrement" | "PreIncrement" | "PreDecrement" => 660.0,
+    "Optional" => 680.0,
+    "PatternTest" => 680.0,
+    // Unknown symbols default to 670
+    _ => 670.0,
+  }
+}
+
+/// Helper to create a RuleDelayed expression: name :> value
+fn make_rule_delayed(name: &str, value: Expr) -> Expr {
+  Expr::RuleDelayed {
+    pattern: Box::new(Expr::Identifier(name.to_string())),
+    replacement: Box::new(value),
+  }
+}
+
+/// Return built-in default options for known functions.
+pub fn builtin_default_options(func_name: &str) -> Vec<Expr> {
+  let id = |s: &str| Expr::Identifier(s.to_string());
+  let real = |f: f64| Expr::Real(f);
+  let list = |v: Vec<Expr>| Expr::List(v.into());
+  let func_slot1 = |body: Expr| Expr::Function {
+    body: Box::new(body),
+  };
+  match func_name {
+    "Plot" => vec![
+      make_rule("AlignmentPoint", id("Center")),
+      make_rule("AspectRatio", pow(id("GoldenRatio"), Expr::Integer(-1))),
+      make_rule("Axes", id("True")),
+      make_rule("AxesLabel", id("None")),
+      make_rule("AxesOrigin", id("Automatic")),
+      make_rule("AxesStyle", list(vec![])),
+      make_rule("Background", id("None")),
+      make_rule("BaselinePosition", id("Automatic")),
+      make_rule("BaseStyle", list(vec![])),
+      make_rule("ClippingStyle", id("None")),
+      make_rule("ColorFunction", id("Automatic")),
+      make_rule("ColorFunctionScaling", id("True")),
+      make_rule("ColorOutput", id("Automatic")),
+      make_rule("ContentSelectable", id("Automatic")),
+      make_rule("CoordinatesToolOptions", id("Automatic")),
+      make_rule_delayed("DisplayFunction", id("$DisplayFunction")),
+      make_rule("Epilog", list(vec![])),
+      make_rule("Evaluated", id("Automatic")),
+      make_rule("EvaluationMonitor", id("None")),
+      make_rule("Exclusions", id("Automatic")),
+      make_rule("ExclusionsStyle", id("None")),
+      make_rule("Filling", id("None")),
+      make_rule("FillingStyle", id("Automatic")),
+      make_rule_delayed("FormatType", id("TraditionalForm")),
+      make_rule("Frame", id("False")),
+      make_rule("FrameLabel", id("None")),
+      make_rule("FrameStyle", list(vec![])),
+      make_rule("FrameTicks", id("Automatic")),
+      make_rule("FrameTicksStyle", list(vec![])),
+      make_rule("GridLines", id("None")),
+      make_rule("GridLinesStyle", list(vec![])),
+      make_rule("ImageMargins", real(0.)),
+      make_rule("ImagePadding", id("All")),
+      make_rule("ImageSize", id("Automatic")),
+      make_rule("ImageSizeRaw", id("Automatic")),
+      make_rule("IntervalMarkers", id("Automatic")),
+      make_rule("IntervalMarkersStyle", id("Automatic")),
+      make_rule("LabelingSize", id("Automatic")),
+      make_rule("LabelStyle", list(vec![])),
+      make_rule("MaxRecursion", id("Automatic")),
+      make_rule("Mesh", id("None")),
+      make_rule("MeshFunctions", list(vec![func_slot1(Expr::Slot(1))])),
+      make_rule("MeshShading", id("None")),
+      make_rule("MeshStyle", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+      make_rule_delayed("PerformanceGoal", id("$PerformanceGoal")),
+      make_rule("PlotHighlighting", id("Automatic")),
+      make_rule_delayed("PlotInteractivity", id("$PlotInteractivity")),
+      make_rule("PlotLabel", id("None")),
+      make_rule("PlotLabels", id("None")),
+      make_rule("PlotLayout", id("Automatic")),
+      make_rule("PlotLegends", id("None")),
+      make_rule("PlotPoints", id("Automatic")),
+      make_rule("PlotRange", list(vec![id("Full"), id("Automatic")])),
+      make_rule("PlotRangeClipping", id("True")),
+      make_rule("PlotRangePadding", id("Automatic")),
+      make_rule("PlotRegion", id("Automatic")),
+      make_rule("PlotStyle", id("Automatic")),
+      make_rule_delayed("PlotTheme", id("$PlotTheme")),
+      make_rule("PreserveImageOptions", id("Automatic")),
+      make_rule("Prolog", list(vec![])),
+      make_rule("RegionFunction", func_slot1(id("True"))),
+      make_rule("RotateLabel", id("True")),
+      make_rule("ScalingFunctions", id("None")),
+      make_rule("TargetUnits", id("Automatic")),
+      make_rule("Ticks", id("Automatic")),
+      make_rule("TicksStyle", list(vec![])),
+      make_rule("WorkingPrecision", id("MachinePrecision")),
+    ],
+    // Traversal functions that default Heads -> False — matches
+    // wolframscript's built-in defaults so `Options[Level]`,
+    // `Definition[Level]`, etc. report `{Heads -> False}` instead of `{}`.
+    "Level" | "Map" | "Cases" | "Count" | "MapIndexed" | "Scan" | "FreeQ"
+    | "MemberQ" | "DeleteCases" | "Replace" => {
+      vec![make_rule("Heads", id("False"))]
+    }
+    // Same shape, but Position defaults Heads -> True.
+    "Position" => vec![make_rule("Heads", id("True"))],
+    // The graphics option defaults. A `Graphics[…]` expression only carries
+    // the options it was actually drawn with, so `Options[g, opt]` falls
+    // back to these for the rest.
+    "Graphics" => vec![
+      make_rule("AlignmentPoint", id("Center")),
+      make_rule("AspectRatio", id("Automatic")),
+      make_rule("Axes", id("False")),
+      make_rule("AxesLabel", id("None")),
+      make_rule("AxesOrigin", id("Automatic")),
+      make_rule("AxesStyle", list(vec![])),
+      make_rule("Background", id("None")),
+      make_rule("BaselinePosition", id("Automatic")),
+      make_rule("BaseStyle", list(vec![])),
+      make_rule("ColorOutput", id("Automatic")),
+      make_rule("ContentSelectable", id("Automatic")),
+      make_rule("CoordinatesToolOptions", id("Automatic")),
+      make_rule_delayed("DisplayFunction", id("$DisplayFunction")),
+      make_rule("Epilog", list(vec![])),
+      make_rule_delayed("FormatType", id("TraditionalForm")),
+      make_rule("Frame", id("False")),
+      make_rule("FrameLabel", id("None")),
+      make_rule("FrameStyle", list(vec![])),
+      make_rule("FrameTicks", id("Automatic")),
+      make_rule("FrameTicksStyle", list(vec![])),
+      make_rule("GridLines", id("None")),
+      make_rule("GridLinesStyle", list(vec![])),
+      make_rule("ImageMargins", real(0.0)),
+      make_rule("ImagePadding", id("All")),
+      make_rule("ImageSize", id("Automatic")),
+      make_rule("ImageSizeRaw", id("Automatic")),
+      make_rule("LabelStyle", list(vec![])),
+      make_rule("Method", id("Automatic")),
+      make_rule_delayed("PlotInteractivity", id("$PlotInteractivity")),
+      make_rule("PlotLabel", id("None")),
+      make_rule("PlotRange", id("All")),
+      make_rule("PlotRangeClipping", id("False")),
+      make_rule("PlotRangePadding", id("Automatic")),
+      make_rule("PlotRegion", id("Automatic")),
+      make_rule("PreserveImageOptions", id("Automatic")),
+      make_rule("Prolog", list(vec![])),
+      make_rule("RotateLabel", id("True")),
+      make_rule("Ticks", id("Automatic")),
+      make_rule("TicksStyle", list(vec![])),
+    ],
+    "Graphics3D" => vec![
+      make_rule("AlignmentPoint", id("Center")),
+      make_rule("AspectRatio", id("Automatic")),
+      make_rule("AutomaticImageSize", id("False")),
+      make_rule("Axes", id("False")),
+      make_rule("AxesEdge", id("Automatic")),
+      make_rule("AxesLabel", id("None")),
+      make_rule("AxesOrigin", id("Automatic")),
+      make_rule("AxesStyle", list(vec![])),
+      make_rule("Background", id("None")),
+      make_rule("BaselinePosition", id("Automatic")),
+      make_rule("BaseStyle", list(vec![])),
+      make_rule("Boxed", id("True")),
+      make_rule("BoxRatios", id("Automatic")),
+      make_rule("BoxStyle", list(vec![])),
+      make_rule("ClipPlanes", id("None")),
+      make_rule("ClipPlanesStyle", id("Automatic")),
+      make_rule("ColorOutput", id("Automatic")),
+      make_rule("ContentSelectable", id("Automatic")),
+      make_rule("ControllerLinking", id("False")),
+      make_rule("ControllerMethod", id("Automatic")),
+      make_rule("ControllerPath", id("Automatic")),
+      make_rule("CoordinatesToolOptions", id("Automatic")),
+      make_rule_delayed("DisplayFunction", id("$DisplayFunction")),
+      make_rule("Epilog", list(vec![])),
+      make_rule("FaceGrids", id("None")),
+      make_rule("FaceGridsStyle", list(vec![])),
+      make_rule_delayed("FormatType", id("TraditionalForm")),
+      make_rule("ImageMargins", real(0.0)),
+      make_rule("ImagePadding", id("All")),
+      make_rule("ImageSize", id("Automatic")),
+      make_rule("ImageSizeRaw", id("Automatic")),
+      make_rule("LabelStyle", list(vec![])),
+      make_rule("Lighting", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+      make_rule_delayed("PlotInteractivity", id("$PlotInteractivity")),
+      make_rule("PlotLabel", id("None")),
+      make_rule("PlotRange", id("All")),
+      make_rule("PlotRangePadding", id("Automatic")),
+      make_rule("PlotRegion", id("Automatic")),
+      make_rule("PreserveImageOptions", id("Automatic")),
+      make_rule("Prolog", list(vec![])),
+      make_rule("RotationAction", Expr::String("Fit".to_string())),
+      make_rule("SphericalRegion", id("Automatic")),
+      make_rule("Ticks", id("Automatic")),
+      make_rule("TicksStyle", list(vec![])),
+      make_rule("TouchscreenAutoZoom", id("False")),
+      make_rule("ViewAngle", id("Automatic")),
+      make_rule("ViewCenter", id("Automatic")),
+      make_rule("ViewMatrix", id("Automatic")),
+      make_rule("ViewPoint", list(vec![real(1.3), real(-2.4), real(2.0)])),
+      make_rule("ViewProjection", id("Automatic")),
+      make_rule("ViewRange", id("All")),
+      make_rule("ViewVector", id("Automatic")),
+      make_rule(
+        "ViewVertical",
+        list(vec![Expr::Integer(0), Expr::Integer(0), Expr::Integer(1)]),
+      ),
+    ],
+    // Polynomial-manipulation defaults (matching wolframscript).
+    "Expand" | "ExpandAll" => vec![
+      make_rule("Modulus", Expr::Integer(0)),
+      make_rule("Trig", id("False")),
+    ],
+    // Integrate's options. `Assumptions :> $Assumptions` is delayed so the
+    // option's reported `Definition[Integrate]` line uses `:=` (see
+    // `is_builtin_options_delayed`).
+    "Integrate" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("GenerateConditions", id("Automatic")),
+      make_rule("GeneratedParameters", id("None")),
+      make_rule("PrincipalValue", id("False")),
+    ],
+    // The remaining option lists of the core symbolic and numeric functions,
+    // each transcribed from wolframscript. Options carrying a `$…` global are
+    // delayed there, so they are delayed here too.
+    "D" => vec![make_rule("NonConstants", list(vec![]))],
+    "Root" => vec![make_rule("ExactRootIsolation", id("False"))],
+    "Total" => vec![
+      make_rule("AllowedHeads", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+    ],
+    "StringSplit" | "StringReplace" => vec![
+      make_rule("IgnoreCase", id("False")),
+      make_rule("MetaCharacters", id("None")),
+    ],
+    "StringCases" => vec![
+      make_rule("IgnoreCase", id("False")),
+      make_rule("MetaCharacters", id("None")),
+      make_rule("Overlaps", id("False")),
+    ],
+    "Refine" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("TimeConstraint", Expr::Integer(30)),
+    ],
+    "Series" => vec![
+      make_rule("Analytic", id("True")),
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("SeriesTermGoal", id("Automatic")),
+    ],
+    "Nearest" => vec![
+      make_rule("DistanceFunction", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+      make_rule("WorkingPrecision", id("Automatic")),
+    ],
+    "Fit" => vec![
+      make_rule("FitRegularization", id("None")),
+      make_rule("NormFunction", id("Automatic")),
+      make_rule("WorkingPrecision", id("Automatic")),
+    ],
+    "Interpolation" => vec![
+      make_rule("InterpolationOrder", Expr::Integer(3)),
+      make_rule("Method", id("Automatic")),
+      make_rule("PeriodicInterpolation", id("False")),
+    ],
+    "RSolve" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("GeneratedParameters", id("C")),
+      make_rule("Method", id("Automatic")),
+    ],
+    "Factor" => vec![
+      make_rule("Extension", id("None")),
+      make_rule("GaussianIntegers", id("False")),
+      make_rule("Modulus", Expr::Integer(0)),
+      make_rule("Trig", id("False")),
+    ],
+    "NSolve" => vec![
+      make_rule("MaxRoots", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+      make_rule("RandomSeeding", Expr::Integer(1234)),
+      make_rule("VerifySolutions", id("Automatic")),
+      make_rule("WorkingPrecision", id("Automatic")),
+    ],
+    "DSolve" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("DiscreteVariables", list(vec![])),
+      make_rule("GeneratedParameters", id("C")),
+      make_rule("IncludeSingularSolutions", id("False")),
+      make_rule("Method", id("Automatic")),
+    ],
+    // Simplify and FullSimplify differ only in their time budget.
+    "Simplify" | "FullSimplify" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("ComplexityFunction", id("Automatic")),
+      make_rule("ExcludedForms", list(vec![])),
+      make_rule(
+        "TimeConstraint",
+        if func_name == "Simplify" {
+          Expr::Integer(300)
+        } else {
+          id("Infinity")
+        },
+      ),
+      make_rule("TransformationFunctions", id("Automatic")),
+      make_rule("Trig", id("True")),
+    ],
+    "Limit" => vec![
+      make_rule("Analytic", id("False")),
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("Direction", id("Reals")),
+      make_rule("GenerateConditions", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+      make_rule_delayed("PerformanceGoal", id("$PerformanceGoal")),
+    ],
+    "Sum" | "Product" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("GenerateConditions", id("False")),
+      make_rule("GeneratedParameters", id("None")),
+      make_rule("Method", id("Automatic")),
+      make_rule("Regularization", id("None")),
+      make_rule("VerifyConvergence", id("True")),
+    ],
+    "Reduce" => vec![
+      make_rule("Backsubstitution", id("False")),
+      make_rule("Cubics", id("False")),
+      make_rule("GeneratedParameters", id("C")),
+      make_rule("Method", id("Automatic")),
+      make_rule("Modulus", Expr::Integer(0)),
+      make_rule("Quartics", id("False")),
+      make_rule("WorkingPrecision", id("Infinity")),
+    ],
+    "NIntegrate" => vec![
+      make_rule("AccuracyGoal", id("Infinity")),
+      make_rule("Compiled", id("Automatic")),
+      make_rule("EvaluationMonitor", id("None")),
+      make_rule("Exclusions", id("None")),
+      make_rule("MaxPoints", id("Automatic")),
+      make_rule("MaxRecursion", id("Automatic")),
+      make_rule("Method", id("Automatic")),
+      make_rule("MinRecursion", Expr::Integer(0)),
+      make_rule("PrecisionGoal", id("Automatic")),
+      make_rule("WorkingPrecision", id("MachinePrecision")),
+    ],
+    "FindRoot" => vec![
+      make_rule("AccuracyGoal", id("Automatic")),
+      make_rule("Compiled", id("Automatic")),
+      make_rule("DampingFactor", Expr::Integer(1)),
+      make_rule("Evaluated", id("True")),
+      make_rule("EvaluationMonitor", id("None")),
+      make_rule("Jacobian", id("Automatic")),
+      make_rule("MaxIterations", Expr::Integer(100)),
+      make_rule("Method", id("Automatic")),
+      make_rule("PrecisionGoal", id("Automatic")),
+      make_rule("StepMonitor", id("None")),
+      make_rule("WorkingPrecision", id("MachinePrecision")),
+    ],
+    "Solve" => vec![
+      make_rule_delayed("Assumptions", id("$Assumptions")),
+      make_rule("Cubics", id("Automatic")),
+      make_rule("GeneratedParameters", id("C")),
+      make_rule("InverseFunctions", id("Automatic")),
+      make_rule("MaxExtraConditions", Expr::Integer(0)),
+      make_rule("MaxRoots", id("Infinity")),
+      make_rule("Method", id("Automatic")),
+      make_rule("Modulus", Expr::Integer(0)),
+      make_rule("Quartics", id("Automatic")),
+      make_rule("VerifySolutions", id("Automatic")),
+      make_rule("WorkingPrecision", id("Infinity")),
+    ],
+    _ => vec![],
+  }
+}
+
+/// Every context this session knows about: the two a fresh session starts
+/// with plus every context a `Begin`/`BeginPackage` (or a qualified symbol
+/// name) has since created. wolframscript also lists the contexts of the
+/// Wolfram Language's own implementation, which Woxi has no equivalent for.
+fn known_contexts() -> Vec<String> {
+  // A context exists once it holds a symbol: wolframscript does not list a
+  // package context whose file defined nothing, even though `BeginPackage`
+  // put it on `$Packages`.
+  let mut contexts: Vec<String> = vec!["Global`".to_string()];
+  contexts.extend(
+    crate::evaluator::contexts::known_symbols()
+      .into_iter()
+      .map(|(context, _)| context),
+  );
+  // wolframscript orders contexts case-insensitively with the backticks
+  // ignored, so `GIS`GeoSettingsDump`` precedes `Global`` and `Global``
+  // precedes `System``.
+  contexts.sort_by_key(|c| {
+    crate::evaluator::contexts::name_sort_key(&c.replace('`', ""))
+  });
+  contexts.dedup();
+  contexts
+}
+
+/// The kinds of definition `Language`ExtendedFullDefinition` carries, in the
+/// order they are installed: values first, then the option and message
+/// tables, and attributes last so a copied `Protected` cannot lock the
+/// symbol before the rest arrives.
+pub(crate) const DEFINITION_SECTIONS: &[&str] = &[
+  "OwnValues",
+  "DownValues",
+  "SubValues",
+  "UpValues",
+  "DefaultValues",
+  "Options",
+  "Messages",
+  "Attributes",
+];

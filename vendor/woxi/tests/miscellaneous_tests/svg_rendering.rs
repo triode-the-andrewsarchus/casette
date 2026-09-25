@@ -1,0 +1,4253 @@
+use woxi::evaluator::dispatch::complex_and_special::expr_to_box_form;
+use woxi::functions::graphics::{
+  box_has_fraction, box_string_to_svg, box_string_visible_len, boxes_to_svg,
+  estimate_box_display_width, estimate_display_width, expr_to_svg_markup,
+  layout_box, layout_to_svg, row_to_svg,
+};
+use woxi::syntax::{BinaryOperator, ComparisonOp, Expr, UnaryOperator};
+
+mod tests {
+  use super::*;
+
+  // ── Power base parenthesization ──
+
+  #[test]
+  fn test_svg_power_additive_base_parens() {
+    // (x + y)^2 should render with parentheses around the base
+    let expr = Expr::FunctionCall {
+      name: "Power".to_string(),
+      args: vec![
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![
+            Expr::Identifier("x".to_string()),
+            Expr::Identifier("y".to_string()),
+          ]
+          .into(),
+        },
+        Expr::Integer(2),
+      ]
+      .into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert!(
+      markup.starts_with("(x + y)"),
+      "Power base should have parentheses: got '{markup}'"
+    );
+    assert!(
+      markup.contains("(x + y)<tspan"),
+      "Expected (x + y) before superscript: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_power_simple_base_no_parens() {
+    // x^2 should NOT have parentheses
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: Box::new(Expr::Identifier("x".to_string())),
+      right: Box::new(Expr::Integer(2)),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert!(
+      markup.starts_with("x<tspan"),
+      "Simple base should not have parentheses: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_power_binary_plus_base_parens() {
+    // BinaryOp form: (x + y)^3
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: Box::new(Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Identifier("y".to_string())),
+      }),
+      right: Box::new(Expr::Integer(3)),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert!(
+      markup.starts_with("(x + y)"),
+      "BinaryOp Plus base should have parentheses: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_power_binary_minus_base_parens() {
+    // (x - y)^2
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: Box::new(Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Identifier("y".to_string())),
+      }),
+      right: Box::new(Expr::Integer(2)),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert!(
+      markup.starts_with("(x - y)"),
+      "BinaryOp Minus base should have parentheses: got '{markup}'"
+    );
+  }
+
+  // ── PaddedForm[BaseForm[…]] grid cells ──
+
+  fn padded_base_form_expr(value: i128, spec: i128, zero_pad: bool) -> Expr {
+    let mut args = vec![
+      Expr::FunctionCall {
+        name: "BaseForm".to_string(),
+        args: vec![Expr::Integer(value), Expr::Integer(2)].into(),
+      },
+      Expr::Integer(spec),
+    ];
+    if zero_pad {
+      args.push(Expr::Rule {
+        pattern: Box::new(Expr::Identifier("NumberPadding".to_string())),
+        replacement: Box::new(Expr::List(
+          vec![Expr::String("0".to_string()), Expr::String(String::new())]
+            .into(),
+        )),
+      });
+    }
+    Expr::FunctionCall {
+      name: "PaddedForm".to_string(),
+      args: args.into(),
+    }
+  }
+
+  #[test]
+  fn test_svg_padded_base_form_zero_padded() {
+    // PaddedForm[BaseForm[8, 2], 8, NumberPadding -> {"0", ""}] — binary
+    // digits zero-padded to the n+1 field, with the subscript base.
+    let markup = expr_to_svg_markup(&padded_base_form_expr(8, 8, true));
+    assert_eq!(
+      markup,
+      "000001000<tspan baseline-shift=\"sub\" font-size=\"70%\">2</tspan>"
+    );
+    // Width: 9 digit columns + the subscript base at 70%.
+    let width = estimate_display_width(&padded_base_form_expr(8, 8, true));
+    assert!(
+      (width - 9.7).abs() < 1e-9,
+      "expected width 9.7, got {width}"
+    );
+  }
+
+  #[test]
+  fn test_svg_padded_base_form_default_space_padding_trimmed() {
+    // Without NumberPadding the pad is spaces, which the grid drops (cells
+    // are aligned by position, not by literal spaces).
+    let markup = expr_to_svg_markup(&padded_base_form_expr(8, 8, false));
+    assert_eq!(
+      markup,
+      "1000<tspan baseline-shift=\"sub\" font-size=\"70%\">2</tspan>"
+    );
+  }
+
+  #[test]
+  fn test_svg_padded_base_form_table_pipeline() {
+    // End-to-end: the wrapper distributes over TableForm cells and every
+    // cell comes out zero-padded.
+    let svg = woxi::interpret(
+      r#"ExportString[PaddedForm[BaseForm[TableForm[{{8, 49}, {123, 5}}], 2], 8,
+        NumberPadding -> {"0", ""}], "SVG"]"#,
+    )
+    .expect("interpret should succeed");
+    for cell in ["000001000", "000110001", "001111011", "000000101"] {
+      assert!(
+        svg.contains(&format!(
+          "{cell}<tspan baseline-shift=\"sub\" font-size=\"70%\">2</tspan>"
+        )),
+        "zero-padded cell {cell} missing from SVG"
+      );
+    }
+  }
+
+  // ── Implicit multiplication (no * symbol) ──
+
+  #[test]
+  fn test_svg_times_number_identifier_space() {
+    // Times[10, x] → "10 x" (space separator, matching Wolfram Language)
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![Expr::Integer(10), Expr::Identifier("x".to_string())].into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert_eq!(
+      markup, "10 x",
+      "Number*identifier should use space: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_times_identifiers_space() {
+    // Times[x, y] → "x y" (space, no *)
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![
+        Expr::Identifier("x".to_string()),
+        Expr::Identifier("y".to_string()),
+      ]
+      .into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert_eq!(
+      markup, "x y",
+      "Identifier*identifier should use space: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_times_additive_juxtaposition() {
+    // Times[9, Plus[2, x], Plus[x, y]] → "9(2 + x)(x + y)"
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![
+        Expr::Integer(9),
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![Expr::Integer(2), Expr::Identifier("x".to_string())]
+            .into(),
+        },
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![
+            Expr::Identifier("x".to_string()),
+            Expr::Identifier("y".to_string()),
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert_eq!(
+      markup, "9(2 + x)(x + y)",
+      "Times with additive operands should use juxtaposition: got '{markup}'"
+    );
+    assert!(!markup.contains('*'), "SVG should not contain *");
+  }
+
+  #[test]
+  fn test_svg_binary_times_no_star() {
+    // BinaryOp: x * y → "x y"
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left: Box::new(Expr::Identifier("x".to_string())),
+      right: Box::new(Expr::Identifier("y".to_string())),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert_eq!(
+      markup, "x y",
+      "BinaryOp Times should use space: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_binary_times_number_identifier() {
+    // BinaryOp: 10 * x → "10 x"
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left: Box::new(Expr::Integer(10)),
+      right: Box::new(Expr::Identifier("x".to_string())),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert_eq!(
+      markup, "10 x",
+      "BinaryOp Times number*id should use space: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_times_neg_one_no_star() {
+    // Times[-1, x, Plus[a, b]] → "-x(a + b)"
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![
+        Expr::Integer(-1),
+        Expr::Identifier("x".to_string()),
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![
+            Expr::Identifier("a".to_string()),
+            Expr::Identifier("b".to_string()),
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    assert_eq!(
+      markup, "-x(a + b)",
+      "Times[-1,...] should use implicit mult: got '{markup}'"
+    );
+    assert!(!markup.contains('*'), "SVG should not contain *");
+  }
+
+  // ── Width estimation ──
+
+  #[test]
+  fn test_width_power_additive_base_includes_parens() {
+    // (x + y)^2: width should include 2 chars for parentheses
+    let base = Expr::FunctionCall {
+      name: "Plus".to_string(),
+      args: vec![
+        Expr::Identifier("x".to_string()),
+        Expr::Identifier("y".to_string()),
+      ]
+      .into(),
+    };
+    let base_w = estimate_display_width(&base);
+
+    let expr = Expr::FunctionCall {
+      name: "Power".to_string(),
+      args: vec![base, Expr::Integer(2)].into(),
+    };
+    let total_w = estimate_display_width(&expr);
+    // Total should be base_w + 2.0 (parens) + 1.0 * 0.7 (exponent)
+    let expected = base_w + 2.0 + 1.0 * 0.7;
+    assert!(
+      (total_w - expected).abs() < 0.01,
+      "Power width should include parens: got {total_w}, expected {expected}"
+    );
+  }
+
+  #[test]
+  fn test_width_power_simple_base_no_parens() {
+    // x^2: no parentheses needed
+    let base = Expr::Identifier("x".to_string());
+    let base_w = estimate_display_width(&base);
+
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: Box::new(base),
+      right: Box::new(Expr::Integer(2)),
+    };
+    let total_w = estimate_display_width(&expr);
+    let expected = base_w + 1.0 * 0.7;
+    assert!(
+      (total_w - expected).abs() < 0.01,
+      "Simple Power width should not include parens: got {total_w}, expected {expected}"
+    );
+  }
+
+  #[test]
+  fn test_width_times_additive_operands() {
+    // Times[9, Plus[2, x], Plus[x, y]]:
+    // markup is "9(2 + x)(x + y)" — no separators between adjacent parens
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![
+        Expr::Integer(9),
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![Expr::Integer(2), Expr::Identifier("x".to_string())]
+            .into(),
+        },
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![
+            Expr::Identifier("x".to_string()),
+            Expr::Identifier("y".to_string()),
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    };
+    let w = estimate_display_width(&expr);
+    // "9(2 + x)(x + y)" = 15 chars
+    // factors: 1 + (5+2) + (5+2) = 15, seps: 0+0 = 0, total = 15
+    assert!(
+      (w - 15.0).abs() < 0.01,
+      "Times width for 9(2 + x)(x + y) should be 15: got {w}"
+    );
+  }
+
+  #[test]
+  fn test_width_binary_times_additive_includes_parens() {
+    // BinaryOp: (x + y)(a + b)
+    let expr = Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left: Box::new(Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Identifier("y".to_string())),
+      }),
+      right: Box::new(Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left: Box::new(Expr::Identifier("a".to_string())),
+        right: Box::new(Expr::Identifier("b".to_string())),
+      }),
+    };
+    let w = estimate_display_width(&expr);
+    // "(x + y)(a + b)" = 14 chars
+    // Each side: base=5 + parens=2 = 7, sep=0, total = 14
+    assert!(
+      (w - 14.0).abs() < 0.01,
+      "BinaryOp Times (x+y)(a+b) width should be 14: got {w}"
+    );
+  }
+
+  #[test]
+  fn test_width_times_neg_one_additive_includes_parens() {
+    // Times[-1, Plus[x, y]]: rendered as -(x + y)
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![
+        Expr::Integer(-1),
+        Expr::FunctionCall {
+          name: "Plus".to_string(),
+          args: vec![
+            Expr::Identifier("x".to_string()),
+            Expr::Identifier("y".to_string()),
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    };
+    let w = estimate_display_width(&expr);
+    // -(x + y): '-' = 1, '(' = 1, 'x + y' = 5, ')' = 1 → total = 8
+    assert!(
+      w >= 8.0,
+      "Times[-1, Plus] width should include parens: got {w}"
+    );
+  }
+
+  #[test]
+  fn test_width_times_number_identifier() {
+    // Times[10, x] → "10 x" (space separator)
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![Expr::Integer(10), Expr::Identifier("x".to_string())].into(),
+    };
+    let w = estimate_display_width(&expr);
+    // "10 x" = 4 chars: factors = 2+1 = 3, sep = 1
+    assert!(
+      (w - 4.0).abs() < 0.01,
+      "Times[10, x] width should be 4: got {w}"
+    );
+  }
+
+  // ── Regression tests for the specific user-reported expressions ──
+
+  #[test]
+  fn test_svg_full_expression_power_plus_times() {
+    // (x + y)^2 + 9(2 + x)(x + y)
+    // = Plus[Power[Plus[x, y], 2], Times[9, Plus[2, x], Plus[x, y]]]
+    let expr = Expr::FunctionCall {
+      name: "Plus".to_string(),
+      args: vec![
+        Expr::FunctionCall {
+          name: "Power".to_string(),
+          args: vec![
+            Expr::FunctionCall {
+              name: "Plus".to_string(),
+              args: vec![
+                Expr::Identifier("x".to_string()),
+                Expr::Identifier("y".to_string()),
+              ]
+              .into(),
+            },
+            Expr::Integer(2),
+          ]
+          .into(),
+        },
+        Expr::FunctionCall {
+          name: "Times".to_string(),
+          args: vec![
+            Expr::Integer(9),
+            Expr::FunctionCall {
+              name: "Plus".to_string(),
+              args: vec![Expr::Integer(2), Expr::Identifier("x".to_string())]
+                .into(),
+            },
+            Expr::FunctionCall {
+              name: "Plus".to_string(),
+              args: vec![
+                Expr::Identifier("x".to_string()),
+                Expr::Identifier("y".to_string()),
+              ]
+              .into(),
+            },
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    // Should contain parens around Power base and no * anywhere
+    assert!(
+      markup.contains("(x + y)<tspan"),
+      "Full expression should have parens around Power base: got '{markup}'"
+    );
+    assert!(
+      !markup.contains('*'),
+      "SVG markup should not contain * symbol: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_product_of_powers() {
+    // (x + y)^3 * (18 + 10x + y)^3
+    // = Times[Power[Plus[x, y], 3], Power[Plus[18, Times[10, x], y], 3]]
+    let expr = Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: vec![
+        Expr::FunctionCall {
+          name: "Power".to_string(),
+          args: vec![
+            Expr::FunctionCall {
+              name: "Plus".to_string(),
+              args: vec![
+                Expr::Identifier("x".to_string()),
+                Expr::Identifier("y".to_string()),
+              ]
+              .into(),
+            },
+            Expr::Integer(3),
+          ]
+          .into(),
+        },
+        Expr::FunctionCall {
+          name: "Power".to_string(),
+          args: vec![
+            Expr::FunctionCall {
+              name: "Plus".to_string(),
+              args: vec![
+                Expr::Integer(18),
+                Expr::FunctionCall {
+                  name: "Times".to_string(),
+                  args: vec![
+                    Expr::Integer(10),
+                    Expr::Identifier("x".to_string()),
+                  ]
+                  .into(),
+                },
+                Expr::Identifier("y".to_string()),
+              ]
+              .into(),
+            },
+            Expr::Integer(3),
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    };
+    let markup = expr_to_svg_markup(&expr);
+    // Both Power bases should have parentheses, no * anywhere
+    assert!(
+      markup.contains("(x + y)<tspan"),
+      "First Power should have parens: got '{markup}'"
+    );
+    assert!(
+      markup.contains("(18 + 10 x + y)<tspan"),
+      "Second Power should have parens: got '{markup}'"
+    );
+    assert!(
+      !markup.contains('*'),
+      "SVG markup should not contain * symbol: got '{markup}'"
+    );
+  }
+
+  // ── Digit grouping in graphics ──
+
+  #[test]
+  fn test_svg_digit_grouping_small_number_no_grouping() {
+    // 4-digit numbers should NOT be grouped
+    let markup = expr_to_svg_markup(&Expr::Integer(1234));
+    assert_eq!(markup, "1234");
+  }
+
+  #[test]
+  fn test_svg_digit_grouping_5_digits() {
+    // 5-digit numbers should be grouped: 12 345
+    let markup = expr_to_svg_markup(&Expr::Integer(12345));
+    assert!(
+      markup.contains("12<tspan dx=\"0.3ch\">345</tspan>"),
+      "5-digit number should be grouped: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_digit_grouping_large_number() {
+    // 13-digit number: 2 000 000 000 000
+    let markup = expr_to_svg_markup(&Expr::Integer(2000000000000));
+    assert!(
+      markup.contains(
+        "2<tspan dx=\"0.3ch\">000</tspan><tspan dx=\"0.3ch\">000</tspan>\
+         <tspan dx=\"0.3ch\">000</tspan><tspan dx=\"0.3ch\">000</tspan>"
+      ),
+      "Large number should have grouped digits: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_digit_grouping_negative_number() {
+    // Negative numbers: sign preserved, digits grouped
+    let markup = expr_to_svg_markup(&Expr::Integer(-12345678));
+    assert!(
+      markup.contains(
+        "−12<tspan dx=\"0.3ch\">345</tspan><tspan dx=\"0.3ch\">678</tspan>"
+      ),
+      "Negative number should be grouped with minus sign: got '{markup}'"
+    );
+  }
+
+  #[test]
+  fn test_svg_digit_grouping_width_accounts_for_gaps() {
+    // Width of a 13-digit number should include extra space for 4 separators
+    let w = estimate_display_width(&Expr::Integer(2000000000000));
+    // 13 chars + 4 * 0.3 = 14.2
+    assert!(
+      (w - 14.2).abs() < 0.01,
+      "Width should account for digit group gaps: got {w}"
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // Box representation tests: ensure expr_to_box_form produces the
+  // correct intermediate box structure AND that boxes_to_svg on the
+  // resulting boxes produces the same SVG as the direct expr_to_svg_markup.
+  // ══════════════════════════════════════════════════════════════════════
+
+  mod box_representation {
+    use super::*;
+    use woxi::syntax::expr_to_output;
+
+    /// Format a box expression to its string representation for comparison.
+    fn box_str(expr: &Expr) -> String {
+      expr_to_output(expr)
+    }
+
+    /// Assert that the box-based width estimation is reasonable.
+    /// The box pipeline may differ slightly from the direct pipeline
+    /// (e.g. different separator spacing, no parenthesization in boxes),
+    /// so we allow a wider tolerance.
+    fn assert_width_reasonable(expr: &Expr) {
+      let boxes = expr_to_box_form(expr);
+      let box_w = estimate_box_display_width(&boxes);
+      assert!(box_w > 0.0, "Box width should be positive, got {box_w}");
+    }
+
+    // ── Power base parenthesization (boxes) ──
+
+    #[test]
+    fn box_power_additive_base_parens() {
+      let expr = Expr::FunctionCall {
+        name: "Power".to_string(),
+        args: vec![
+          Expr::FunctionCall {
+            name: "Plus".to_string(),
+            args: vec![
+              Expr::Identifier("x".to_string()),
+              Expr::Identifier("y".to_string()),
+            ]
+            .into(),
+          },
+          Expr::Integer(2),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert!(
+        matches!(&boxes, Expr::FunctionCall { name, .. } if name == "SuperscriptBox"),
+        "Power should become SuperscriptBox: got {}",
+        box_str(&boxes)
+      );
+    }
+
+    #[test]
+    fn box_power_simple_base() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Integer(2)),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "SuperscriptBox[x, 2]",);
+    }
+
+    // Regression for https://github.com/ad-si/Woxi/issues/179 (playground/SVG
+    // path): `1 + -n x` must fold to `1 - n x` in box form even when the
+    // coefficient overflows i128 and is a BigInteger. The box-form Plus
+    // renderer previously handled only `Expr::Integer` coefficients, so the
+    // typeset (SVG) output showed `1 + -n x`.
+    #[test]
+    fn box_plus_negative_bigint_coefficient_folds_to_minus() {
+      use num_bigint::BigInt;
+      // 2^129 = 680564733841876926926749214863536422912 overflows i128.
+      let big = BigInt::from(2).pow(129);
+      let expr = Expr::FunctionCall {
+        name: "Plus".to_string(),
+        args: vec![
+          Expr::Integer(1),
+          Expr::FunctionCall {
+            name: "Times".to_string(),
+            args: vec![
+              Expr::BigInteger(-big.clone()),
+              Expr::Identifier("x".to_string()),
+            ]
+            .into(),
+          },
+        ]
+        .into(),
+      };
+      let s = box_str(&expr_to_box_form(&expr));
+      // The positive coefficient is present, negated out of the term.
+      assert!(
+        s.contains(&big.to_string()),
+        "box form should contain the coefficient: {s}"
+      );
+      // No negative BigInteger literal remains (the sign was folded).
+      assert!(
+        !s.contains(&format!("-{big}")),
+        "coefficient should be negated, not left negative: {s}"
+      );
+      // The term is joined with `-`, never `+`.
+      assert!(
+        !s.contains(", +,"),
+        "big negative term must fold to subtraction, not `+`: {s}"
+      );
+    }
+
+    #[test]
+    fn box_power_binary_plus_base() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: Box::new(Expr::BinaryOp {
+          op: BinaryOperator::Plus,
+          left: Box::new(Expr::Identifier("x".to_string())),
+          right: Box::new(Expr::Identifier("y".to_string())),
+        }),
+        right: Box::new(Expr::Integer(3)),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let s = box_str(&boxes);
+      assert!(
+        s.starts_with("SuperscriptBox[RowBox["),
+        "Should be SuperscriptBox[RowBox[...],...]: got {s}"
+      );
+    }
+
+    #[test]
+    fn box_power_binary_minus_base() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: Box::new(Expr::BinaryOp {
+          op: BinaryOperator::Minus,
+          left: Box::new(Expr::Identifier("x".to_string())),
+          right: Box::new(Expr::Identifier("y".to_string())),
+        }),
+        right: Box::new(Expr::Integer(2)),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert!(
+        matches!(&boxes, Expr::FunctionCall { name, .. } if name == "SuperscriptBox"),
+        "Should produce SuperscriptBox: got {}",
+        box_str(&boxes)
+      );
+    }
+
+    // ── Implicit multiplication (boxes) ──
+
+    #[test]
+    fn box_times_number_identifier() {
+      let expr = Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: vec![Expr::Integer(10), Expr::Identifier("x".to_string())].into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "RowBox[{10,  , x}]");
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "10 x");
+    }
+
+    #[test]
+    fn box_times_identifiers() {
+      let expr = Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: vec![
+          Expr::Identifier("x".to_string()),
+          Expr::Identifier("y".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "x y");
+    }
+
+    #[test]
+    fn box_times_additive_juxtaposition() {
+      let expr = Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: vec![
+          Expr::Integer(9),
+          Expr::FunctionCall {
+            name: "Plus".to_string(),
+            args: vec![Expr::Integer(2), Expr::Identifier("x".to_string())]
+              .into(),
+          },
+          Expr::FunctionCall {
+            name: "Plus".to_string(),
+            args: vec![
+              Expr::Identifier("x".to_string()),
+              Expr::Identifier("y".to_string()),
+            ]
+            .into(),
+          },
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert!(
+        matches!(&boxes, Expr::FunctionCall { name, .. } if name == "RowBox"),
+        "Times should become RowBox: got {}",
+        box_str(&boxes)
+      );
+    }
+
+    #[test]
+    fn box_binary_times() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Identifier("y".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "x y");
+    }
+
+    #[test]
+    fn box_binary_times_number_identifier() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left: Box::new(Expr::Integer(10)),
+        right: Box::new(Expr::Identifier("x".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "10 x");
+    }
+
+    #[test]
+    fn box_times_neg_one() {
+      let expr = Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: vec![
+          Expr::Integer(-1),
+          Expr::Identifier("x".to_string()),
+          Expr::FunctionCall {
+            name: "Plus".to_string(),
+            args: vec![
+              Expr::Identifier("a".to_string()),
+              Expr::Identifier("b".to_string()),
+            ]
+            .into(),
+          },
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert!(
+        matches!(&boxes, Expr::FunctionCall { name, .. } if name == "RowBox"),
+        "Times[-1,...] should become RowBox: got {}",
+        box_str(&boxes)
+      );
+    }
+
+    // ── Fraction / Rational (boxes) ──
+
+    #[test]
+    fn box_rational() {
+      let expr = Expr::FunctionCall {
+        name: "Rational".to_string(),
+        args: vec![Expr::Integer(2), Expr::Integer(3)].into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "FractionBox[2, 3]");
+    }
+
+    #[test]
+    fn box_divide() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left: Box::new(Expr::Identifier("a".to_string())),
+        right: Box::new(Expr::Identifier("b".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "FractionBox[a, b]");
+    }
+
+    #[test]
+    fn box_has_fraction_true() {
+      let expr = Expr::FunctionCall {
+        name: "Rational".to_string(),
+        args: vec![Expr::Integer(2), Expr::Integer(3)].into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert!(
+        box_has_fraction(&boxes),
+        "FractionBox should detect fraction"
+      );
+    }
+
+    #[test]
+    fn box_has_fraction_false() {
+      let expr = Expr::Identifier("x".to_string());
+      let boxes = expr_to_box_form(&expr);
+      assert!(
+        !box_has_fraction(&boxes),
+        "Simple identifier should not have fraction"
+      );
+    }
+
+    // ── Sqrt (boxes) ──
+
+    #[test]
+    fn box_sqrt() {
+      let expr = Expr::FunctionCall {
+        name: "Power".to_string(),
+        args: vec![
+          Expr::Identifier("x".to_string()),
+          Expr::FunctionCall {
+            name: "Rational".to_string(),
+            args: vec![Expr::Integer(1), Expr::Integer(2)].into(),
+          },
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "SqrtBox[x]");
+    }
+
+    // ── Subscript / Subsuperscript (boxes) ──
+
+    #[test]
+    fn box_subscript() {
+      let expr = Expr::FunctionCall {
+        name: "Subscript".to_string(),
+        args: vec![Expr::Identifier("x".to_string()), Expr::Integer(0)].into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "SubscriptBox[x, 0]");
+    }
+
+    #[test]
+    fn box_subsuperscript() {
+      let expr = Expr::FunctionCall {
+        name: "Power".to_string(),
+        args: vec![
+          Expr::FunctionCall {
+            name: "Subscript".to_string(),
+            args: vec![
+              Expr::Identifier("a".to_string()),
+              Expr::Identifier("b".to_string()),
+            ]
+            .into(),
+          },
+          Expr::Identifier("c".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "SubsuperscriptBox[a, b, c]");
+    }
+
+    // ── List / FunctionCall (boxes) ──
+
+    #[test]
+    fn box_list() {
+      let expr = Expr::List(
+        vec![Expr::Integer(1), Expr::Integer(2), Expr::Integer(3)].into(),
+      );
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "RowBox[{{, RowBox[{1, ,, 2, ,, 3}], }}]");
+    }
+
+    #[test]
+    fn box_function_call() {
+      let expr = Expr::FunctionCall {
+        name: "f".to_string(),
+        args: vec![
+          Expr::Identifier("x".to_string()),
+          Expr::Identifier("y".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      assert_eq!(box_str(&boxes), "RowBox[{f, [, RowBox[{x, ,, y}], ]}]");
+    }
+
+    // ── Digit grouping via boxes ──
+
+    #[test]
+    fn box_digit_grouping_small() {
+      let expr = Expr::Integer(1234);
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(
+        svg, "1234",
+        "4-digit number should not be grouped via boxes"
+      );
+    }
+
+    #[test]
+    fn box_digit_grouping_5_digits() {
+      let expr = Expr::Integer(12345);
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert!(!svg.is_empty(), "Box SVG for 12345 should produce output");
+    }
+
+    // ── UnaryOp (boxes) ──
+
+    #[test]
+    fn box_unary_minus() {
+      let expr = Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand: Box::new(Expr::Identifier("x".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "-x", "UnaryMinus box SVG");
+    }
+
+    #[test]
+    fn box_unary_not() {
+      let expr = Expr::UnaryOp {
+        op: UnaryOperator::Not,
+        operand: Box::new(Expr::Identifier("p".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "!p");
+    }
+
+    // ── Comparison (boxes) ──
+
+    #[test]
+    fn box_comparison() {
+      let expr = Expr::Comparison {
+        operands: vec![
+          Expr::Identifier("a".to_string()),
+          Expr::Identifier("b".to_string()),
+        ],
+        operators: vec![ComparisonOp::Less],
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "a&lt;b", "Comparison box SVG");
+    }
+
+    // ── BinaryOp variants (boxes) ──
+
+    #[test]
+    fn box_binary_plus() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Identifier("y".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "x+y");
+    }
+
+    #[test]
+    fn box_binary_minus() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Identifier("y".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "x-y");
+    }
+
+    #[test]
+    fn box_binary_and() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::And,
+        left: Box::new(Expr::Identifier("p".to_string())),
+        right: Box::new(Expr::Identifier("q".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "p&amp;&amp;q");
+    }
+
+    #[test]
+    fn box_binary_or() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Or,
+        left: Box::new(Expr::Identifier("p".to_string())),
+        right: Box::new(Expr::Identifier("q".to_string())),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let svg = boxes_to_svg(&boxes);
+      assert_eq!(svg, "p||q");
+    }
+
+    // ── Full expression regression (boxes) ──
+
+    #[test]
+    fn box_full_expression_power_plus_times() {
+      // Plus[Power[Plus[x, y], 2], Times[9, Plus[2, x], Plus[x, y]]]
+      let expr = Expr::FunctionCall {
+        name: "Plus".to_string(),
+        args: vec![
+          Expr::FunctionCall {
+            name: "Power".to_string(),
+            args: vec![
+              Expr::FunctionCall {
+                name: "Plus".to_string(),
+                args: vec![
+                  Expr::Identifier("x".to_string()),
+                  Expr::Identifier("y".to_string()),
+                ]
+                .into(),
+              },
+              Expr::Integer(2),
+            ]
+            .into(),
+          },
+          Expr::FunctionCall {
+            name: "Times".to_string(),
+            args: vec![
+              Expr::Integer(9),
+              Expr::FunctionCall {
+                name: "Plus".to_string(),
+                args: vec![Expr::Integer(2), Expr::Identifier("x".to_string())]
+                  .into(),
+              },
+              Expr::FunctionCall {
+                name: "Plus".to_string(),
+                args: vec![
+                  Expr::Identifier("x".to_string()),
+                  Expr::Identifier("y".to_string()),
+                ]
+                .into(),
+              },
+            ]
+            .into(),
+          },
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      // Top level should be RowBox (Plus)
+      assert!(
+        matches!(&boxes, Expr::FunctionCall { name, .. } if name == "RowBox"),
+        "Plus should become RowBox: got {boxes:?}"
+      );
+      let svg = boxes_to_svg(&boxes);
+      // Should contain a SuperscriptBox rendering (superscript tspan)
+      assert!(
+        svg.contains("baseline-shift=\"super\""),
+        "Full expression box SVG should have superscript: got '{svg}'"
+      );
+      // Should not contain * symbol
+      assert!(
+        !svg.contains('*'),
+        "Box SVG should not contain * symbol: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn box_product_of_powers() {
+      // Times[Power[Plus[x, y], 3], Power[Plus[18, Times[10, x], y], 3]]
+      let expr = Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: vec![
+          Expr::FunctionCall {
+            name: "Power".to_string(),
+            args: vec![
+              Expr::FunctionCall {
+                name: "Plus".to_string(),
+                args: vec![
+                  Expr::Identifier("x".to_string()),
+                  Expr::Identifier("y".to_string()),
+                ]
+                .into(),
+              },
+              Expr::Integer(3),
+            ]
+            .into(),
+          },
+          Expr::FunctionCall {
+            name: "Power".to_string(),
+            args: vec![
+              Expr::FunctionCall {
+                name: "Plus".to_string(),
+                args: vec![
+                  Expr::Integer(18),
+                  Expr::FunctionCall {
+                    name: "Times".to_string(),
+                    args: vec![
+                      Expr::Integer(10),
+                      Expr::Identifier("x".to_string()),
+                    ]
+                    .into(),
+                  },
+                  Expr::Identifier("y".to_string()),
+                ]
+                .into(),
+              },
+              Expr::Integer(3),
+            ]
+            .into(),
+          },
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      // Should be a RowBox containing SuperscriptBox elements
+      assert!(
+        matches!(&boxes, Expr::FunctionCall { name, .. } if name == "RowBox"),
+        "Product of powers should be RowBox: got {boxes:?}"
+      );
+      let svg = boxes_to_svg(&boxes);
+      // Should contain superscripts
+      assert!(
+        svg.contains("baseline-shift=\"super\""),
+        "Product of powers box SVG should have superscripts: got '{svg}'"
+      );
+    }
+
+    // ── Width estimation parity ──
+
+    #[test]
+    fn box_width_power_additive_base() {
+      let expr = Expr::FunctionCall {
+        name: "Power".to_string(),
+        args: vec![
+          Expr::FunctionCall {
+            name: "Plus".to_string(),
+            args: vec![
+              Expr::Identifier("x".to_string()),
+              Expr::Identifier("y".to_string()),
+            ]
+            .into(),
+          },
+          Expr::Integer(2),
+        ]
+        .into(),
+      };
+      assert_width_reasonable(&expr);
+    }
+
+    #[test]
+    fn box_width_power_simple_base() {
+      let expr = Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: Box::new(Expr::Identifier("x".to_string())),
+        right: Box::new(Expr::Integer(2)),
+      };
+      assert_width_reasonable(&expr);
+    }
+
+    #[test]
+    fn box_width_times_number_identifier() {
+      let expr = Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: vec![Expr::Integer(10), Expr::Identifier("x".to_string())].into(),
+      };
+      assert_width_reasonable(&expr);
+    }
+
+    #[test]
+    fn box_width_rational() {
+      let expr = Expr::FunctionCall {
+        name: "Rational".to_string(),
+        args: vec![Expr::Integer(2), Expr::Integer(3)].into(),
+      };
+      assert_width_reasonable(&expr);
+    }
+
+    #[test]
+    fn box_width_list() {
+      let expr = Expr::List(
+        vec![Expr::Integer(1), Expr::Integer(2), Expr::Integer(3)].into(),
+      );
+      assert_width_reasonable(&expr);
+    }
+
+    #[test]
+    fn box_width_function_call() {
+      let expr = Expr::FunctionCall {
+        name: "f".to_string(),
+        args: vec![
+          Expr::Identifier("x".to_string()),
+          Expr::Identifier("y".to_string()),
+        ]
+        .into(),
+      };
+      assert_width_reasonable(&expr);
+    }
+
+    #[test]
+    fn box_width_large_integer() {
+      let expr = Expr::Integer(2000000000000);
+      assert_width_reasonable(&expr);
+    }
+
+    // ── DisplayForm (boxes) ──
+
+    #[test]
+    fn box_display_form_renders_inner_boxes() {
+      // DisplayForm[SuperscriptBox["x", "2"]] should render the inner boxes to SVG
+      let expr = Expr::FunctionCall {
+        name: "DisplayForm".to_string(),
+        args: vec![Expr::FunctionCall {
+          name: "SuperscriptBox".to_string(),
+          args: vec![
+            Expr::String("x".to_string()),
+            Expr::String("2".to_string()),
+          ]
+          .into(),
+        }]
+        .into(),
+      };
+      // In the box pipeline, DisplayForm passes its content directly as boxes
+      // (handled in generate_output_svg). Here we test the box extraction directly.
+      if let Expr::FunctionCall { name, args } = &expr
+        && name == "DisplayForm"
+        && args.len() == 1
+      {
+        let svg = boxes_to_svg(&args[0]);
+        assert!(
+          svg.contains('x') && svg.contains("baseline-shift=\"super\""),
+          "DisplayForm inner boxes should render as superscript SVG: got '{svg}'"
+        );
+      }
+    }
+
+    #[test]
+    fn box_display_form_subscript_renders() {
+      let inner = Expr::FunctionCall {
+        name: "SubscriptBox".to_string(),
+        args: vec![
+          Expr::String("a".to_string()),
+          Expr::String("i".to_string()),
+        ]
+        .into(),
+      };
+      let svg = boxes_to_svg(&inner);
+      assert!(
+        svg.contains('a') && svg.contains("baseline-shift=\"sub\""),
+        "SubscriptBox should render with subscript: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn box_display_form_row_of_subscripts() {
+      // RowBox[{SubscriptBox["a", "1"], SubscriptBox["b", "2"]}]
+      let inner = Expr::FunctionCall {
+        name: "RowBox".to_string(),
+        args: vec![Expr::List(
+          vec![
+            Expr::FunctionCall {
+              name: "SubscriptBox".to_string(),
+              args: vec![
+                Expr::String("a".to_string()),
+                Expr::String("1".to_string()),
+              ]
+              .into(),
+            },
+            Expr::FunctionCall {
+              name: "SubscriptBox".to_string(),
+              args: vec![
+                Expr::String("b".to_string()),
+                Expr::String("2".to_string()),
+              ]
+              .into(),
+            },
+          ]
+          .into(),
+        )]
+        .into(),
+      };
+      let svg = boxes_to_svg(&inner);
+      assert!(
+        svg.contains('a') && svg.contains('b'),
+        "RowBox of SubscriptBoxes should render both: got '{svg}'"
+      );
+      // Should have two subscript tspans
+      let sub_count = svg.matches("baseline-shift=\"sub\"").count();
+      assert_eq!(sub_count, 2, "Should have 2 subscripts, got {sub_count}");
+    }
+
+    #[test]
+    fn style_box_font_color_renders_red() {
+      // StyleBox["red text", Rule[FontColor, RGBColor[1, 0, 0]]]
+      let inner = Expr::FunctionCall {
+        name: "StyleBox".to_string(),
+        args: vec![
+          Expr::String("red text".to_string()),
+          Expr::Rule {
+            pattern: Box::new(Expr::Identifier("FontColor".to_string())),
+            replacement: Box::new(Expr::FunctionCall {
+              name: "RGBColor".to_string(),
+              args: vec![Expr::Real(1.0), Expr::Real(0.0), Expr::Real(0.0)]
+                .into(),
+            }),
+          },
+        ]
+        .into(),
+      };
+      let layout = layout_box(&inner, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains("rgb(255,0,0)"),
+        "StyleBox with FontColor->Red should render red: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn rule_arrow_renders_as_unicode_not_private_use() {
+      // Regression: `x -> 0.5` rendered in the playground/Studio SVG used the
+      // Wolfram FrontEnd private-use codepoint U+F522, which has no glyph in
+      // normal fonts and showed as a missing-glyph box. It must render as the
+      // public Unicode arrow `→` (U+2192) instead.
+      let inner = Expr::Rule {
+        pattern: Box::new(Expr::Identifier("x".to_string())),
+        replacement: Box::new(Expr::Real(0.5)),
+      };
+      let boxes = expr_to_box_form(&inner);
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains('\u{2192}'),
+        "Rule should render with Unicode → (U+2192): got '{svg}'"
+      );
+      assert!(
+        !svg.contains('\u{f522}'),
+        "Rule SVG must not contain private-use U+F522: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn rule_delayed_arrow_renders_as_unicode_not_private_use() {
+      // Same regression as `rule_arrow_renders_as_unicode_not_private_use`, for
+      // RuleDelayed (U+F51F → U+29F4 `⧴`).
+      let inner = Expr::RuleDelayed {
+        pattern: Box::new(Expr::Identifier("x".to_string())),
+        replacement: Box::new(Expr::Integer(1)),
+      };
+      let boxes = expr_to_box_form(&inner);
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains('\u{29f4}'),
+        "RuleDelayed should render with Unicode ⧴ (U+29F4): got '{svg}'"
+      );
+      assert!(
+        !svg.contains('\u{f51f}'),
+        "RuleDelayed SVG must not contain private-use U+F51F: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn string_atom_with_embedded_newline_renders_one_line_per_row() {
+      // Regression: a Demonstration's Manipulate label built with
+      // `ToString[1/3, FormatType -> TraditionalForm]` embeds
+      // wolframscript's stacked-fraction OutputForm text ("1\n-\n3")
+      // straight into a plain string. Laid out through the generic
+      // (non-Graphics) text/box renderer, that string used to become one
+      // `<text>` element carrying the raw newlines — SVG collapses those
+      // to whitespace, running every line together instead of stacking
+      // them like the Graphics `Text[]` renderer already does.
+      let boxes = Expr::String("1\n-\n3".to_string());
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      let text_count = svg.matches("<text").count();
+      assert_eq!(
+        text_count, 3,
+        "expected one <text> element per line, got '{svg}'"
+      );
+      assert!(
+        !svg.contains('\n'),
+        "SVG must not embed a literal newline inside a <text> element: got '{svg}'"
+      );
+      for line in ["1", "-", "3"] {
+        assert!(
+          svg.contains(&format!(">{line}</text>")),
+          "missing line '{line}': got '{svg}'"
+        );
+      }
+    }
+
+    #[test]
+    fn row_of_string_with_embedded_newline_renders_as_tspans() {
+      // Regression: the same "1\n-\n3" stacked-fraction text, when it is a
+      // `Row[…]` item — how a Demonstration's Manipulate builds its plot
+      // label out of `ToString[…, FormatType -> TraditionalForm]` pieces —
+      // went through a different renderer (`row_to_svg`) that dropped the
+      // embedded newlines into a single `<text>` element untouched.
+      let row_args =
+        vec![Expr::List(vec![Expr::String("1\n-\n3".to_string())].into())];
+      let svg = row_to_svg(&row_args).expect("Row of one string renders");
+      // Formatting newlines between elements (`<svg ...>\n<text ...`) are
+      // fine; only a literal newline inside the `<text>...</text>` content
+      // itself would be the bug (SVG collapses it to whitespace).
+      let text_content = svg
+        .split_once("central\">")
+        .and_then(|(_, rest)| rest.split_once("</text>"))
+        .map(|(content, _)| content)
+        .expect("a <text> element with the expected attributes");
+      assert!(
+        !text_content.contains('\n'),
+        "SVG must not embed a literal newline inside a <text> element: got '{svg}'"
+      );
+      assert_eq!(
+        svg.matches("<tspan").count(),
+        2,
+        "expected 2 continuation lines as <tspan>: got '{svg}'"
+      );
+      for line in ["1", "-", "3"] {
+        assert!(
+          svg.contains(&format!(">{line}<")),
+          "missing line '{line}': got '{svg}'"
+        );
+      }
+    }
+
+    #[test]
+    fn style_box_font_size_renders_larger() {
+      // StyleBox["big", Rule[FontSize, 24]]
+      let inner = Expr::FunctionCall {
+        name: "StyleBox".to_string(),
+        args: vec![
+          Expr::String("big".to_string()),
+          Expr::Rule {
+            pattern: Box::new(Expr::Identifier("FontSize".to_string())),
+            replacement: Box::new(Expr::Integer(24)),
+          },
+        ]
+        .into(),
+      };
+      let layout = layout_box(&inner, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains("font-size=\"24.0\""),
+        "StyleBox with FontSize->24 should render at size 24: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn style_box_font_color_in_text_svg() {
+      // Test boxes_to_svg path for StyleBox with FontColor
+      let inner = Expr::FunctionCall {
+        name: "StyleBox".to_string(),
+        args: vec![
+          Expr::String("colored".to_string()),
+          Expr::Rule {
+            pattern: Box::new(Expr::Identifier("FontColor".to_string())),
+            replacement: Box::new(Expr::FunctionCall {
+              name: "RGBColor".to_string(),
+              args: vec![Expr::Real(0.0), Expr::Real(0.0), Expr::Real(1.0)]
+                .into(),
+            }),
+          },
+        ]
+        .into(),
+      };
+      let svg = boxes_to_svg(&inner);
+      assert!(
+        svg.contains("fill=\"rgb(0,0,255)\""),
+        "StyleBox text SVG should include fill color: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn text_atom_width_matches_monospace_advance() {
+      // Regression: the per-character width estimate for typeset text atoms must
+      // match the advance of the monospace font the hosts actually render with
+      // (Atkinson Hyperlegible Mono, 632/1000 em). With the old 0.6 estimate the
+      // atom was measured narrower than it draws, so a following atom — e.g. the
+      // `[` after a function name like `MusicPitch` — overlapped the name.
+      let font_size = 14.0;
+      let name = "MusicPitch";
+      let layout = layout_box(&Expr::Identifier(name.to_string()), font_size);
+      let expected = name.chars().count() as f64 * font_size * 0.632;
+      assert!(
+        (layout.width - expected).abs() < 0.01,
+        "text atom width {} should equal {} (0.632 em/char)",
+        layout.width,
+        expected
+      );
+
+      // In a RowBox the opening `[` must sit clear of the name, not on top of it:
+      // its glyph's left edge must be at least the name's true rendered width.
+      let row = Expr::FunctionCall {
+        name: "RowBox".to_string(),
+        args: vec![Expr::List(
+          vec![
+            Expr::String(name.to_string()),
+            Expr::String("[".to_string()),
+          ]
+          .into(),
+        )]
+        .into(),
+      };
+      let row_layout = layout_box(&row, font_size);
+      assert!(
+        row_layout.width >= expected + font_size * 0.632 - 0.01,
+        "RowBox width {} must fit the name plus a full `[` advance ({})",
+        row_layout.width,
+        expected + font_size * 0.632
+      );
+    }
+
+    // ── Hyperlink rendering ──
+
+    #[test]
+    fn hyperlink_two_args_renders_clickable_anchor() {
+      // Hyperlink["Woxi", "https://woxi.ad-si.com"] should render as an
+      // SVG <a href="..."> wrapping a blue label, with an underline.
+      let expr = Expr::FunctionCall {
+        name: "Hyperlink".to_string(),
+        args: vec![
+          Expr::String("Woxi".to_string()),
+          Expr::String("https://woxi.ad-si.com".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains("<a href=\"https://woxi.ad-si.com\""),
+        "expected SVG anchor with href: got '{svg}'"
+      );
+      assert!(
+        svg.contains("target=\"_blank\""),
+        "expected target=_blank on hyperlink: got '{svg}'"
+      );
+      assert!(
+        svg.contains("rel=\"noopener\""),
+        "expected rel=noopener on hyperlink: got '{svg}'"
+      );
+      assert!(
+        svg.contains("#1a73e8"),
+        "expected link-blue color #1a73e8: got '{svg}'"
+      );
+      assert!(
+        svg.contains(">Woxi<"),
+        "expected unquoted label text 'Woxi' between tags: got '{svg}'"
+      );
+      assert!(
+        svg.contains("<line"),
+        "expected underline <line> below the label: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn hyperlink_single_arg_uses_uri_as_label() {
+      // Hyperlink["https://woxi.ad-si.com"] should display the URI as
+      // both the visible text and the href.
+      let expr = Expr::FunctionCall {
+        name: "Hyperlink".to_string(),
+        args: vec![Expr::String("https://woxi.ad-si.com".to_string())].into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains("href=\"https://woxi.ad-si.com\""),
+        "expected href with URI: got '{svg}'"
+      );
+      assert!(
+        svg.contains(">https://woxi.ad-si.com<"),
+        "expected URI text between tags: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn hyperlink_box_form_is_template_box() {
+      // expr_to_box_form should produce TemplateBox[..., "HyperlinkURL"]
+      // matching wolframscript's MakeBoxes structure.
+      let expr = Expr::FunctionCall {
+        name: "Hyperlink".to_string(),
+        args: vec![
+          Expr::String("Woxi".to_string()),
+          Expr::String("https://woxi.ad-si.com".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      if let Expr::FunctionCall { name, args } = &boxes {
+        assert_eq!(name, "TemplateBox");
+        assert_eq!(args.len(), 2);
+        assert!(
+          matches!(&args[1], Expr::String(s) if s == "HyperlinkURL"),
+          "second arg should be \"HyperlinkURL\": got {:?}",
+          args[1]
+        );
+      } else {
+        panic!("expected TemplateBox, got {boxes:?}");
+      }
+    }
+
+    #[test]
+    fn hyperlink_with_non_string_uri_falls_back_to_function_call() {
+      // Hyperlink[label, expr] with a non-string URI should fall through
+      // to the generic function-call rendering (no anchor in SVG).
+      let expr = Expr::FunctionCall {
+        name: "Hyperlink".to_string(),
+        args: vec![
+          Expr::String("label".to_string()),
+          Expr::Identifier("someVar".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        !svg.contains("<a href"),
+        "expected no anchor for non-string URI: got '{svg}'"
+      );
+    }
+
+    #[test]
+    fn hyperlink_html_in_uri_is_escaped() {
+      // A URI containing characters that need XML escaping should be
+      // properly escaped in the href to avoid breaking the SVG.
+      let expr = Expr::FunctionCall {
+        name: "Hyperlink".to_string(),
+        args: vec![
+          Expr::String("link".to_string()),
+          Expr::String("https://example.com/?q=a&b=<c>".to_string()),
+        ]
+        .into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let layout = layout_box(&boxes, 14.0);
+      let svg = layout_to_svg(&layout, "currentColor");
+      assert!(
+        svg.contains("&amp;b=&lt;c&gt;"),
+        "expected XML-escaped href: got '{svg}'"
+      );
+    }
+
+    // ── Number-display forms (ScientificForm / EngineeringForm / NumberForm) ──
+    //
+    // These render in the Playground/Studio as 2D `mantissa × 10^exp` notation
+    // rather than as a literal `ScientificForm[…]` function call. The exponent
+    // must appear as a raised superscript (smaller font, higher up) and none of
+    // the box-wrapper head names may leak into the drawn text.
+
+    fn render_form_svg(name: &str, value: f64) -> String {
+      let expr = Expr::FunctionCall {
+        name: name.to_string(),
+        args: vec![Expr::Real(value)].into(),
+      };
+      let boxes = expr_to_box_form(&expr);
+      let layout = layout_box(&boxes, 14.0);
+      layout_to_svg(&layout, "currentColor")
+    }
+
+    #[test]
+    fn scientific_form_renders_2d_superscript() {
+      let svg = render_form_svg("ScientificForm", 12345.6);
+      // Mantissa, the × separator, the base 10, and the exponent all appear.
+      assert!(svg.contains(">1.23456<"), "mantissa missing: {svg}");
+      assert!(svg.contains(">10<"), "base 10 missing: {svg}");
+      assert!(svg.contains(">4<"), "exponent missing: {svg}");
+      // The exponent is rendered at a smaller font than the body (superscript).
+      assert!(
+        svg.contains("font-size=\"9.8\""),
+        "exponent should use the smaller superscript font: {svg}"
+      );
+      // No box-wrapper machinery leaks into the rendered text.
+      assert!(
+        !svg.contains("ScientificForm") && !svg.contains("InterpretationBox"),
+        "form should render graphically, not as literal box text: {svg}"
+      );
+    }
+
+    #[test]
+    fn engineering_form_renders_2d_superscript() {
+      let svg = render_form_svg("EngineeringForm", 12345.6);
+      // Exponent forced to a multiple of 3 → mantissa 12.3456, exponent 3.
+      assert!(svg.contains(">12.3456<"), "mantissa missing: {svg}");
+      assert!(svg.contains(">3<"), "engineering exponent missing: {svg}");
+      assert!(
+        svg.contains("font-size=\"9.8\""),
+        "exponent should use the smaller superscript font: {svg}"
+      );
+      assert!(
+        !svg.contains("EngineeringForm") && !svg.contains("InterpretationBox"),
+        "form should render graphically, not as literal box text: {svg}"
+      );
+    }
+
+    #[test]
+    fn number_form_above_threshold_renders_scientific() {
+      // |x| >= 10^6 switches NumberForm to 2D scientific notation.
+      let svg = render_form_svg("NumberForm", 1234567.8);
+      assert!(svg.contains(">1.23457<"), "mantissa missing: {svg}");
+      assert!(svg.contains(">6<"), "exponent missing: {svg}");
+      assert!(
+        svg.contains("font-size=\"9.8\""),
+        "exponent should use the smaller superscript font: {svg}"
+      );
+      assert!(
+        !svg.contains("NumberForm") && !svg.contains("InterpretationBox"),
+        "form should render graphically, not as literal box text: {svg}"
+      );
+    }
+
+    #[test]
+    fn number_form_in_range_renders_plain_number() {
+      // An in-range real renders as a plain number, with no × 10^exp factor and
+      // no superscript font.
+      let svg = render_form_svg("NumberForm", 12345.6);
+      assert!(svg.contains(">12345.6<"), "plain number missing: {svg}");
+      assert!(
+        !svg.contains("font-size=\"9.8\""),
+        "in-range NumberForm should have no superscript: {svg}"
+      );
+      assert!(
+        !svg.contains("NumberForm") && !svg.contains("InterpretationBox"),
+        "form should render graphically, not as literal box text: {svg}"
+      );
+    }
+
+    #[test]
+    fn scientific_form_list_renders_braced_2d_row() {
+      // A list argument threads element-wise: each element is drawn in 2D
+      // scientific notation inside a braced, comma-separated row — not as a
+      // literal `ScientificForm[{…}]` function call.
+      let expr = Expr::FunctionCall {
+        name: "ScientificForm".to_string(),
+        args: vec![Expr::List(
+          vec![
+            Expr::Real(123450000.0),
+            Expr::Real(0.00012345),
+            Expr::Real(123.45),
+          ]
+          .into(),
+        )]
+        .into(),
+      };
+      let svg = layout_to_svg(
+        &layout_box(&expr_to_box_form(&expr), 14.0),
+        "currentColor",
+      );
+      // Braces, the per-element mantissa, and the three exponents are all drawn.
+      assert!(
+        svg.contains(">{<") && svg.contains(">}<"),
+        "braces missing: {svg}"
+      );
+      assert!(svg.contains(">1.2345<"), "mantissa missing: {svg}");
+      assert!(svg.contains(">8<"), "exponent 8 missing: {svg}");
+      assert!(svg.contains(">-4<"), "exponent -4 missing: {svg}");
+      assert!(svg.contains(">2<"), "exponent 2 missing: {svg}");
+      assert!(
+        svg.contains("font-size=\"9.8\""),
+        "exponents should use the smaller superscript font: {svg}"
+      );
+      assert!(
+        !svg.contains("ScientificForm") && !svg.contains("InterpretationBox"),
+        "list form should render graphically, not as literal box text: {svg}"
+      );
+    }
+
+    // ── Inline box-notation strings (PlotLegends / label formatting) ──
+
+    // The Wolfram front-end emits subscripts/superscripts in label strings as
+    // "linear syntax" box notation: `\!\(\*SubscriptBox[\(base\),\(sub\)]\)`.
+    // After string-literal parsing these escapes become private-use marker
+    // codepoints, so the tests below feed the marker form a label string would
+    // actually contain at render time (via `interpret`-produced SVG) as well as
+    // the literal-escape form fed directly to `box_string_to_svg`.
+
+    #[test]
+    fn box_string_subscript_renders_tspan() {
+      let svg =
+        box_string_to_svg("C\\!\\(\\*SubscriptBox[\\(\\),\\(2\\)]\\)=9");
+      assert_eq!(
+        svg,
+        "C<tspan baseline-shift=\"sub\" font-size=\"70%\">2</tspan>=9"
+      );
+    }
+
+    #[test]
+    fn box_string_superscript_renders_tspan() {
+      let svg =
+        box_string_to_svg("GeV\\!\\(\\*SuperscriptBox[\\(\\),\\(-3\\)]\\)");
+      assert_eq!(
+        svg,
+        "GeV<tspan baseline-shift=\"super\" font-size=\"70%\">-3</tspan>"
+      );
+    }
+
+    #[test]
+    fn box_string_sqrtbox_renders_radical() {
+      let svg = box_string_to_svg("v=\\!\\(\\*SqrtBox[\\(s\\)]\\)");
+      assert_eq!(
+        svg,
+        "v=\u{221A}<tspan text-decoration=\"overline\">s</tspan>"
+      );
+    }
+
+    #[test]
+    fn box_string_subsuperscript_trims_arg_whitespace() {
+      // Whitespace after commas in the linear syntax is insignificant.
+      let svg = box_string_to_svg(
+        "x\\!\\(\\*SubsuperscriptBox[\\(\\), \\(i\\), \\(2\\)]\\)",
+      );
+      assert_eq!(
+        svg,
+        "x<tspan baseline-shift=\"sub\" font-size=\"70%\">i</tspan>\
+         <tspan baseline-shift=\"super\" font-size=\"70%\">2</tspan>"
+      );
+    }
+
+    #[test]
+    fn box_string_plain_text_is_html_escaped() {
+      // A label without any box notation is a safe drop-in for svg_escape.
+      assert_eq!(box_string_to_svg("a < b & c"), "a &lt; b &amp; c");
+    }
+
+    #[test]
+    fn box_string_visible_len_ignores_box_scaffolding() {
+      // Visible length counts "C", "2", "=9.78 GeV", "-3" = 13 chars — not the
+      // dozens of bytes of `\!\(\*SubscriptBox…\)` scaffolding.
+      let label = "C\\!\\(\\*SubscriptBox[\\(\\),\\(2\\)]\\)=9.78 GeV\
+                   \\!\\(\\*SuperscriptBox[\\(\\),\\(-3\\)]\\)";
+      assert_eq!(box_string_visible_len(label), "C2=9.78 GeV-3".len());
+    }
+
+    #[test]
+    fn list_line_plot_legend_renders_formatted_box_notation() {
+      // End-to-end: the formatting survives string-literal parsing (which turns
+      // the escapes into private-use markers) and reaches the legend renderer.
+      let code = r#"ExportString[ListLinePlot[{{1,2,3}},
+        PlotLegends -> {"C\!\(\*SubscriptBox[\(\),\(2\)]\)=9.78 GeV\!\(\*SuperscriptBox[\(\),\(-3\)]\)"}],
+        "SVG"]"#;
+      let svg = woxi::interpret(code).expect("interpret should succeed");
+      assert!(
+        svg.contains(
+          "C<tspan baseline-shift=\"sub\" font-size=\"70%\">2</tspan>"
+        ),
+        "subscript not rendered in legend: {svg}"
+      );
+      assert!(
+        svg.contains(
+          "GeV<tspan baseline-shift=\"super\" font-size=\"70%\">-3</tspan>"
+        ),
+        "superscript not rendered in legend: {svg}"
+      );
+      // The raw box scaffolding must not leak into the output text.
+      assert!(
+        !svg.contains("SubscriptBox") && !svg.contains("SuperscriptBox"),
+        "raw box head leaked into SVG: {svg}"
+      );
+    }
+
+    #[test]
+    fn list_line_plot_renders_plot_label() {
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3}}, PlotLabel -> "MyTitle"], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.contains(">MyTitle</text>"),
+        "PlotLabel not rendered: {svg}"
+      );
+    }
+
+    #[test]
+    fn list_line_plot_renders_frame_label() {
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3}},
+          Frame -> True, FrameLabel -> {"XAxis", "YAxis"}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(svg.contains(">XAxis</text>"), "x FrameLabel missing: {svg}");
+      assert!(svg.contains(">YAxis</text>"), "y FrameLabel missing: {svg}");
+      // The y label is rotated on the left frame edge.
+      assert!(
+        svg.contains("rotate(-90"),
+        "y label should be rotated: {svg}"
+      );
+    }
+
+    #[test]
+    fn list_line_plot_frame_label_renders_box_notation() {
+      // FrameLabel with a SqrtBox renders as a radical, not raw box text.
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3}},
+          Frame -> True, FrameLabel -> {"\!\(\*SqrtBox[\(s\)]\) [GeV]", "y"}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.contains("\u{221A}<tspan text-decoration=\"overline\">s</tspan>"),
+        "SqrtBox not rendered in FrameLabel: {svg}"
+      );
+      assert!(!svg.contains("SqrtBox"), "raw SqrtBox leaked: {svg}");
+    }
+
+    #[test]
+    fn list_line_plot_frame_label_four_element_form() {
+      // `{{left, right}, {bottom, top}}` labels all four frame edges.
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3}}, Frame -> True,
+          FrameLabel -> {{"Lft", "Rgt"}, {"Btm", "Top"}}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(svg.contains(">Btm</text>"), "bottom label missing: {svg}");
+      assert!(svg.contains(">Top</text>"), "top label missing: {svg}");
+      // Left is rotated -90, right is rotated +90.
+      assert!(
+        svg.contains("rotate(-90") && svg.contains(">Lft</text>"),
+        "left label missing/not rotated: {svg}"
+      );
+      assert!(
+        svg.contains("rotate(90") && svg.contains(">Rgt</text>"),
+        "right label missing/not rotated: {svg}"
+      );
+    }
+
+    #[test]
+    fn list_line_plot_four_element_frame_label_coexists_with_plot_label() {
+      // A top FrameLabel and a PlotLabel must both appear (stacked, not
+      // overwriting each other).
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3}}, Frame -> True,
+          FrameLabel -> {{"l", "r"}, {"b", "TopEdge"}},
+          PlotLabel -> "TheTitle"], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.contains(">TopEdge</text>"),
+        "top frame label missing: {svg}"
+      );
+      assert!(
+        svg.contains(">TheTitle</text>"),
+        "plot label missing: {svg}"
+      );
+    }
+
+    #[test]
+    fn dashed_legend_swatch_matches_chart_dash_scale() {
+      // The legend swatch's stroke-dasharray must use the same scale as the
+      // on-chart dashed line. `Dashed` is an absolute 4 pixels on, 4 off
+      // (wolframscript's own SVG export says `4,4` at every image size), and
+      // the plot draws at RESOLUTION_SCALE = 10 units per pixel, so both the
+      // curve and its swatch read "40.0,40.0".
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3},{3,2,1}},
+          PlotStyle -> {Black, Dashed}, PlotLegends -> {"A", "B"}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert_eq!(
+        svg.matches("stroke-dasharray=\"40.0,40.0\"").count(),
+        2,
+        "the curve and its legend swatch must share one dash scale: {svg}"
+      );
+    }
+
+    #[test]
+    fn dashed_line_is_a_single_dasharray_polyline() {
+      // A dashed series must render as ONE <polyline stroke-dasharray> spanning
+      // all data points — not one tiny <polyline> per dash segment.
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3,4,5,6}}, Joined -> True,
+          PlotStyle -> Dashed], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      let dash_polylines = svg.matches("stroke-dasharray=").count();
+      assert_eq!(
+        dash_polylines, 1,
+        "dashed series should be a single dasharray polyline, found {dash_polylines}: {svg}"
+      );
+      // That single polyline must carry the whole data path (>= 6 vertices).
+      let line = svg
+        .lines()
+        .find(|l| l.contains("stroke-dasharray="))
+        .unwrap();
+      let pts = line
+        .split("points=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+      assert!(
+        pts.split_whitespace().count() >= 6,
+        "dashed polyline should span all data points: {pts:?}"
+      );
+    }
+
+    /// A point (non-joined) `ListPlot` draws its grid lines too — the
+    /// scatter renderer used to ignore `GridLines` entirely.
+    #[test]
+    fn scatter_list_plot_draws_grid_lines() {
+      let plain = woxi::interpret(
+        r#"ExportString[ListPlot[{{0., 0.}, {1., 1.}}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      let gridded = woxi::interpret(
+        r#"ExportString[ListPlot[{{0., 0.}, {1., 1.}},
+          GridLines -> {{0.5}, None}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      let count = |svg: &str| {
+        svg
+          .lines()
+          .filter(|l| l.contains("opacity=\"0.5\"") && l.contains("<polyline"))
+          .count()
+      };
+      assert_eq!(
+        count(&gridded),
+        count(&plain) + 1,
+        "GridLines -> {{{{0.5}}, None}} should add exactly one grid line"
+      );
+    }
+
+    /// `GridLinesStyle` styles every grid line that has no directive of its
+    /// own, for both the line and the scatter renderer.
+    #[test]
+    fn grid_lines_style_applies_to_plot_grid() {
+      for code in [
+        r#"ExportString[ListPlot[{{0., 0.}, {1., 1.}},
+           GridLines -> {{0.5}, None},
+           GridLinesStyle -> Directive[Red, Dashed]], "SVG"]"#,
+        r#"ExportString[Plot[x, {x, 0, 1}, GridLines -> {{0.5}, None},
+           GridLinesStyle -> Directive[Red, Dashed]], "SVG"]"#,
+      ] {
+        let svg = woxi::interpret(code).expect("interpret should succeed");
+        assert!(
+          svg.contains("stroke=\"rgb(255,0,0)\"")
+            && svg.contains("stroke-dasharray="),
+          "grid line not styled red/dashed: {code}"
+        );
+      }
+      // A per-line directive still wins over the plot-wide default.
+      let svg = woxi::interpret(
+        r#"ExportString[ListPlot[{{0., 0.}, {1., 1.}},
+          GridLines -> {{{0.5, Blue}}, None},
+          GridLinesStyle -> Directive[Red, Dashed]], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.contains("stroke=\"#0000FF\"")
+          && !svg.contains("stroke=\"rgb(255,0,0)\""),
+        "per-line style should override GridLinesStyle: {svg}"
+      );
+    }
+
+    /// `Axes -> False` hides the axes of a `ListPlot`, which the scatter
+    /// renderer used to draw regardless.
+    #[test]
+    fn list_plot_honours_axes_option() {
+      let with_axes = woxi::interpret(
+        r#"ExportString[ListPlot[{{-1., -1.}, {1., 1.}}, Axes -> True], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      let without = woxi::interpret(
+        r#"ExportString[ListPlot[{{-1., -1.}, {1., 1.}}, Axes -> False], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        with_axes.contains("<text"),
+        "axes should carry tick labels: {with_axes}"
+      );
+      assert!(
+        !without.contains("<text"),
+        "Axes -> False should drop the axes and their labels: {without}"
+      );
+      // The data points survive either way.
+      assert!(without.contains("<circle"), "points dropped: {without}");
+    }
+
+    #[test]
+    fn grid_lines_are_solid_single_polylines() {
+      // Each grid line must be ONE solid polyline (WL grid lines are solid by
+      // default), not one tiny <polyline> per dash.
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3,4}}, GridLines -> Automatic], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      let grid_lines: Vec<&str> = svg
+        .lines()
+        .filter(|l| l.contains("opacity=\"0.5\"") && l.contains("<polyline"))
+        .collect();
+      assert!(
+        (1..=30).contains(&grid_lines.len()),
+        "expected a handful of consolidated grid polylines, found {}",
+        grid_lines.len()
+      );
+      // Grid lines must be solid (no dash) and render behind the data series
+      // (plotters draws the joined series line as stroke="#5E81B5").
+      assert!(
+        grid_lines.iter().all(|l| !l.contains("stroke-dasharray")),
+        "grid lines should be solid by default: {svg}"
+      );
+      assert!(
+        svg.find("opacity=\"0.5\"") < svg.find("#5E81B5"),
+        "grid lines should render behind the data series: {svg}"
+      );
+    }
+
+    #[test]
+    fn graphics_grid_lines_render_with_style() {
+      // Graphics[..., GridLines -> Automatic, GridLinesStyle -> ...] must draw
+      // grid lines (it previously ignored both options).
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[Circle[], Frame -> True, GridLines -> Automatic,
+          GridLinesStyle -> Directive[Orange, Dashed]], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // Orange dashed grid lines spanning the plot, behind the circle.
+      assert!(
+        svg.contains("stroke=\"rgb(255,128,0)\"")
+          && svg.contains("stroke-dasharray="),
+        "grid lines not styled orange/dashed: {svg}"
+      );
+      assert!(
+        svg.find("rgb(255,128,0)") < svg.find("<ellipse"),
+        "grid lines should render behind the circle: {svg}"
+      );
+    }
+
+    #[test]
+    fn graphics_grid_lines_explicit_positions() {
+      // GridLines -> {xvals, yvals} draws lines at the specified coordinates.
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[Circle[], Frame -> True,
+          GridLines -> {{0, 0.5}, {-0.5}}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // Full-span grid lines: vertical lines run y=0..360, horizontals x=0..360
+      // (frame ticks only span ~5px, so they don't match).
+      let verticals = svg
+        .lines()
+        .filter(|l| l.contains("y1=\"0\"") && l.contains("y2=\"360.00\""))
+        .count();
+      let horizontals = svg
+        .lines()
+        .filter(|l| l.contains("x1=\"0\"") && l.contains("x2=\"360.00\""))
+        .count();
+      assert_eq!(verticals, 2, "expected 2 vertical grid lines: {svg}");
+      assert_eq!(horizontals, 1, "expected 1 horizontal grid line: {svg}");
+      // x=0 maps to the horizontal center (180 of 360).
+      assert!(
+        svg
+          .contains("<line x1=\"180.00\" y1=\"0\" x2=\"180.00\" y2=\"360.00\""),
+        "vertical grid line at x=0 missing: {svg}"
+      );
+    }
+
+    #[test]
+    fn graphics_grid_lines_per_line_style() {
+      // A {pos, style} entry overrides the style for just that line.
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[Circle[], Frame -> True,
+          GridLines -> {{{0.5, Directive[Red, Dashed]}}, Automatic}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // The single x line is red + dashed; the y lines use the default gray.
+      assert!(
+        svg.contains("stroke=\"rgb(255,0,0)\"")
+          && svg.contains("stroke-dasharray="),
+        "per-line red dashed style not applied: {svg}"
+      );
+      assert!(
+        svg.contains("stroke=\"rgb(204,204,204)\""),
+        "automatic y grid lines should use the default gray: {svg}"
+      );
+    }
+
+    #[test]
+    fn graphics_grid_lines_default_solid_gray() {
+      // Without GridLinesStyle, Graphics grid lines are solid light gray.
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[Circle[], Frame -> True,
+          GridLines -> Automatic], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      let grid: Vec<&str> = svg
+        .lines()
+        .filter(|l| l.contains("stroke=\"rgb(204,204,204)\""))
+        .collect();
+      assert!(!grid.is_empty(), "expected light-gray grid lines: {svg}");
+      assert!(
+        grid.iter().all(|l| !l.contains("stroke-dasharray")),
+        "default grid lines should be solid: {svg}"
+      );
+    }
+
+    #[test]
+    fn plot_grid_lines_styled_per_line() {
+      // Plot must honor per-line GridLines styles: dashed, thick, and colored
+      // lines at explicit positions on each axis.
+      let svg = woxi::interpret(
+        r#"ExportString[Plot[Cos[x], {x, 0, 10}, GridLines -> {
+          {{Pi, Dashed}, {2 Pi, Thick}},
+          {{-1, Orange}, -.5, .5, {1, Orange}}
+        }], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // x = Pi → a single dashed grid line.
+      assert_eq!(
+        svg.matches("stroke-dasharray=").count(),
+        1,
+        "expected exactly one dashed grid line at x=Pi: {svg}"
+      );
+      // x = 2 Pi → a Thick (stroke-width 20 = 2px) grid line.
+      assert!(
+        svg.contains("stroke-width=\"20\""),
+        "expected a thick grid line at x=2 Pi: {svg}"
+      );
+      // y = -1 and y = 1 → two Orange (#FF8000) grid lines. plotters emits
+      // colors as uppercase hex.
+      assert_eq!(
+        svg.to_uppercase().matches("#FF8000").count(),
+        2,
+        "expected two orange grid lines at y=-1 and y=1: {svg}"
+      );
+    }
+
+    #[test]
+    fn plot_grid_lines_explicit_positions_one_axis() {
+      // `{xspec, Automatic}` draws explicit x lines and automatic y lines.
+      let svg = woxi::interpret(
+        r#"ExportString[Plot[Cos[x], {x, 0, 10},
+          GridLines -> {{2, 4, 6, 8}, None}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // Four vertical default-gray solid grid lines, no horizontal ones.
+      let verticals = svg
+        .lines()
+        .filter(|l| {
+          l.contains("opacity=\"0.5\"")
+            && l.contains("<polyline")
+            && !l.contains("stroke-dasharray")
+        })
+        .count();
+      assert_eq!(verticals, 4, "expected 4 explicit x grid lines: {svg}");
+    }
+
+    #[test]
+    fn frame_true_draws_thin_four_sided_border() {
+      // Frame -> True draws a single closed rectangle (5 points) at 1px
+      // (stroke-width = RESOLUTION_SCALE = 10 in viewBox units).
+      let svg = woxi::interpret(
+        r#"ExportString[ListLinePlot[{{1,2,3}}, Frame -> True], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // Find the thick frame polyline and confirm it is a closed 5-point rect.
+      let frame = svg
+        .lines()
+        .find(|l| l.contains("stroke-width=\"10\"") && l.contains("points="))
+        .unwrap_or_else(|| {
+          panic!("no frame polyline at stroke-width 10: {svg}")
+        });
+      let pts = frame
+        .split("points=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+      let coords: Vec<&str> = pts.split_whitespace().collect();
+      assert_eq!(
+        coords.len(),
+        5,
+        "frame should be a closed 4-sided rectangle (5 points): {pts:?}"
+      );
+      assert_eq!(
+        coords.first(),
+        coords.last(),
+        "frame rectangle should be closed: {pts:?}"
+      );
+    }
+
+    // ── Haloing ──
+
+    #[test]
+    fn haloing_draws_white_halo_behind_line() {
+      // Haloing[] wraps the line in a wider white outline drawn *before*
+      // (behind) the line itself.
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[{Haloing[], Blue, Line[{{0,0},{1,1},{2,0}}]}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      // The default halo is white.
+      let halo_at = svg
+        .find("stroke=\"rgb(255,255,255)\"")
+        .expect("expected a white halo polyline");
+      let line_at = svg
+        .find("stroke=\"rgb(0,0,255)\"")
+        .expect("expected the blue line polyline");
+      assert!(
+        halo_at < line_at,
+        "halo must be drawn behind (before) the line: {svg}"
+      );
+      // The halo stroke must be wider than the line stroke.
+      let width_of = |needle: &str| -> f64 {
+        let seg = &svg[svg.find(needle).unwrap()..];
+        seg
+          .split("stroke-width=\"")
+          .nth(1)
+          .and_then(|s| s.split('"').next())
+          .and_then(|s| s.parse::<f64>().ok())
+          .unwrap()
+      };
+      assert!(
+        width_of("stroke=\"rgb(255,255,255)\"")
+          > width_of("stroke=\"rgb(0,0,255)\""),
+        "halo stroke should be wider than the line: {svg}"
+      );
+    }
+
+    #[test]
+    fn haloing_accepts_color_and_radius() {
+      // Haloing[Yellow, 4] gives a yellow halo of pixel radius 4 behind points.
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[{Haloing[Yellow, 4], Red, PointSize[0.05], Point[{0,0}]}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.contains("fill=\"rgb(255,255,0)\""),
+        "expected a yellow halo circle: {svg}"
+      );
+      // The halo circle (drawn first) must precede the red point.
+      let halo_at = svg.find("fill=\"rgb(255,255,0)\"").unwrap();
+      let point_at = svg.find("fill=\"rgb(255,0,0)\"").unwrap();
+      assert!(halo_at < point_at, "halo must be behind the point: {svg}");
+    }
+
+    #[test]
+    fn haloing_none_disables_the_halo() {
+      // A subsequent Haloing[None] clears any active halo directive.
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[{Haloing[], Haloing[None], Blue, Line[{{0,0},{1,1}}]}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        !svg.contains("stroke=\"rgb(255,255,255)\""),
+        "Haloing[None] should remove the halo: {svg}"
+      );
+    }
+
+    #[test]
+    fn haloing_stays_symbolic_as_a_directive() {
+      // Outside a Graphics context, Haloing is an inert directive symbol.
+      let out =
+        woxi::interpret("Haloing[Red]").expect("interpret should succeed");
+      assert_eq!(out, "Haloing[RGBColor[1, 0, 0]]");
+    }
+  }
+
+  // ── LightDarkSwitched / ThemeColor / SystemColor ──
+  //
+  // All three stay symbolic in kernel evaluation (matching wolframscript) and
+  // are resolved to concrete colors by Woxi's renderer based on the current
+  // light/dark mode. Each test sets the mode explicitly: the flag is
+  // thread-local and every #[test] runs on its own thread, so tests can't
+  // interfere with each other.
+  mod light_dark_theme_colors {
+    fn graphics_fill(code: &str) -> String {
+      let svg = woxi::interpret(&format!(
+        r#"ExportString[Graphics[{{{code}, Disk[]}}], "SVG"]"#
+      ))
+      .expect("interpret should succeed");
+      let start = svg.find("fill=\"").expect("disk should have a fill") + 6;
+      let end = start + svg[start..].find('"').unwrap();
+      svg[start..end].to_string()
+    }
+
+    #[test]
+    fn light_dark_switched_stays_symbolic() {
+      let out = woxi::interpret("LightDarkSwitched[Red, Blue]")
+        .expect("interpret should succeed");
+      assert_eq!(
+        out,
+        "LightDarkSwitched[RGBColor[1, 0, 0], RGBColor[0, 0, 1]]"
+      );
+    }
+
+    #[test]
+    fn system_color_stays_symbolic() {
+      let out = woxi::interpret(r#"SystemColor["Window"]"#)
+        .expect("interpret should succeed");
+      assert_eq!(out, "SystemColor[Window]");
+    }
+
+    #[test]
+    fn theme_color_stays_symbolic() {
+      let out = woxi::interpret(r#"ThemeColor["Accent1"]"#)
+        .expect("interpret should succeed");
+      assert_eq!(out, "ThemeColor[Accent1]");
+    }
+
+    #[test]
+    fn color_q_is_false_for_switched_colors() {
+      for code in [
+        "ColorQ[LightDarkSwitched[Red, Blue]]",
+        r#"ColorQ[SystemColor["Window"]]"#,
+        r#"ColorQ[ThemeColor["Accent1"]]"#,
+      ] {
+        let out = woxi::interpret(code).expect("interpret should succeed");
+        assert_eq!(out, "False", "{code}");
+      }
+    }
+
+    #[test]
+    fn light_dark_switched_picks_light_variant_in_light_mode() {
+      woxi::set_dark_mode(false);
+      assert_eq!(
+        graphics_fill("LightDarkSwitched[Red, Blue]"),
+        "rgb(255,0,0)"
+      );
+    }
+
+    #[test]
+    fn light_dark_switched_picks_dark_variant_in_dark_mode() {
+      woxi::set_dark_mode(true);
+      assert_eq!(
+        graphics_fill("LightDarkSwitched[Red, Blue]"),
+        "rgb(0,0,255)"
+      );
+    }
+
+    #[test]
+    fn light_dark_switched_derives_automatic_dark_variant() {
+      // The automatic variant flips HSL lightness: white becomes black.
+      woxi::set_dark_mode(true);
+      assert_eq!(graphics_fill("LightDarkSwitched[White]"), "rgb(0,0,0)");
+      // Navy (lightness 0.25) flips to a light blue (lightness 0.75).
+      assert_eq!(
+        graphics_fill("LightDarkSwitched[RGBColor[0, 0, 0.5], Automatic]"),
+        "rgb(128,128,255)"
+      );
+    }
+
+    #[test]
+    fn light_dark_switched_derives_automatic_light_variant() {
+      woxi::set_dark_mode(false);
+      assert_eq!(
+        graphics_fill("LightDarkSwitched[Automatic, White]"),
+        "rgb(0,0,0)"
+      );
+    }
+
+    #[test]
+    fn theme_color_resolves_per_mode_in_graphics() {
+      woxi::set_dark_mode(false);
+      assert_eq!(graphics_fill(r#"ThemeColor["Accent1"]"#), "rgb(94,129,181)");
+      woxi::set_dark_mode(true);
+      assert_eq!(
+        graphics_fill(r#"ThemeColor["Accent1"]"#),
+        "rgb(122,155,201)"
+      );
+      woxi::set_dark_mode(false);
+    }
+
+    #[test]
+    fn system_color_resolves_per_mode_in_graphics() {
+      woxi::set_dark_mode(false);
+      assert_eq!(
+        graphics_fill(r#"SystemColor["Highlight"]"#),
+        "rgb(56,117,215)"
+      );
+      woxi::set_dark_mode(true);
+      assert_eq!(
+        graphics_fill(r#"SystemColor["Highlight"]"#),
+        "rgb(77,141,224)"
+      );
+      woxi::set_dark_mode(false);
+    }
+
+    #[test]
+    fn unknown_theme_color_name_is_ignored_as_directive() {
+      // An unrecognized name can't be resolved, so the disk keeps the
+      // default black fill instead of picking up a bogus color.
+      woxi::set_dark_mode(false);
+      assert_eq!(graphics_fill(r#"ThemeColor["NoSuchName"]"#), "rgb(0,0,0)");
+    }
+
+    #[test]
+    fn switched_colors_work_in_edge_form() {
+      woxi::set_dark_mode(false);
+      let svg = woxi::interpret(
+        r#"ExportString[Graphics[{EdgeForm[LightDarkSwitched[Red, Blue]], Disk[]}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.contains("stroke=\"rgb(255,0,0)\""),
+        "EdgeForm should resolve the switched color: {svg}"
+      );
+    }
+  }
+
+  // ── Triangle primitive rendering ──
+  //
+  // Triangle[] evaluates to Triangle[{{0,0},{1,0},{0,1}}] and renders as a
+  // filled polygon, exactly like Polygon with the same points.
+  mod triangle {
+    fn svg_of(code: &str) -> String {
+      woxi::interpret(&format!(r#"ExportString[{code}, "SVG"]"#))
+        .expect("interpret should succeed")
+    }
+
+    #[test]
+    fn default_triangle_renders_as_polygon() {
+      let svg = svg_of("Graphics[Triangle[]]");
+      assert!(
+        svg.contains("<polygon"),
+        "Triangle[] should produce a polygon element: {svg}"
+      );
+    }
+
+    #[test]
+    fn explicit_triangle_matches_equivalent_polygon() {
+      let tri = svg_of("Graphics[Triangle[{{0, 0}, {1, 0}, {0, 1}}]]");
+      let poly = svg_of("Graphics[Polygon[{{0, 0}, {1, 0}, {0, 1}}]]");
+      assert_eq!(tri, poly);
+    }
+
+    #[test]
+    fn triangle_respects_color_directives() {
+      woxi::set_dark_mode(false);
+      let svg =
+        svg_of("Graphics[{LightDarkSwitched[Brown, Orange], Triangle[]}]");
+      assert!(
+        svg.contains("fill=\"rgb(153,102,51)\""),
+        "Triangle should pick up the resolved Brown fill: {svg}"
+      );
+    }
+
+    #[test]
+    fn triangle_in_graphics_complex_resolves_indices() {
+      let complex = svg_of(
+        "Graphics[GraphicsComplex[{{0, 0}, {1, 0}, {0, 1}}, Triangle[{1, 2, 3}]]]",
+      );
+      let direct = svg_of("Graphics[Triangle[{{0, 0}, {1, 0}, {0, 1}}]]");
+      assert_eq!(complex, direct);
+    }
+
+    // ── Graphics objects: Parallelogram, HalfPlane, InfinitePlane,
+    //    JoinedCurve, Torus, FilledTorus, BSplineSurface, Raster3D ──
+
+    #[test]
+    fn parallelogram_renders_as_polygon() {
+      let svg = svg_of("Graphics[Parallelogram[{0, 0}, {{2, 0}, {1, 1}}]]");
+      assert!(svg.contains("<polygon"), "expected a polygon: {svg}");
+    }
+
+    #[test]
+    fn half_plane_renders_clipped_fill() {
+      let svg = svg_of("Graphics[{Blue, HalfPlane[{{0, 0}, {1, 0}}, {0, 1}]}]");
+      assert!(
+        svg.contains("<polygon") && svg.contains("fill=\"rgb(0,0,255)\""),
+        "expected a blue fill polygon: {svg}"
+      );
+    }
+
+    #[test]
+    fn infinite_plane_renders_full_fill() {
+      let svg =
+        svg_of("Graphics[{Red, InfinitePlane[{{0, 0}, {1, 0}, {0, 1}}]}]");
+      assert!(
+        svg.contains("<polygon") && svg.contains("fill=\"rgb(255,0,0)\""),
+        "expected a red fill polygon: {svg}"
+      );
+    }
+
+    #[test]
+    fn joined_curve_renders_components() {
+      let svg = svg_of(
+        "Graphics[JoinedCurve[{Line[{{0, 0}, {1, 1}}], \
+         BezierCurve[{{1, 1}, {2, 0}, {3, 1}}]}]]",
+      );
+      assert!(svg.contains("<polyline"), "expected the line part: {svg}");
+      assert!(svg.contains("<path"), "expected the bezier part: {svg}");
+    }
+
+    #[test]
+    fn torus_renders_in_graphics3d() {
+      let svg = svg_of("Graphics3D[Torus[]]");
+      assert!(
+        svg.matches("<polygon").count() > 100,
+        "expected a tessellated torus surface: {svg}"
+      );
+      let filled = svg_of("Graphics3D[FilledTorus[{0, 0, 0}, {1, 2}]]");
+      assert!(
+        filled.matches("<polygon").count() > 100,
+        "expected a tessellated filled torus surface"
+      );
+    }
+
+    #[test]
+    fn bspline_surface_renders_in_graphics3d() {
+      let svg = svg_of(
+        "Graphics3D[BSplineSurface[Table[{i, j, Sin[i j]}, {i, 5}, {j, 5}]]]",
+      );
+      assert!(
+        svg.matches("<polygon").count() > 100,
+        "expected a tessellated spline surface"
+      );
+    }
+
+    #[test]
+    fn styled_layout_keeps_its_layout_when_exported() {
+      // `Style[Row[…], …]` shows the row, styled — not the source of the
+      // call. A Demonstration captions its plot this way, and the caption
+      // used to export as the literal text `Row[{9, " leaves", …}]`.
+      let svg = svg_of(
+        "Labeled[Graphics[{Circle[]}], \
+         Style[Row[{9, \" leaves\"}], FontSize -> 16, Blue], Bottom]",
+      );
+      assert!(
+        !svg.contains(">Row<"),
+        "the caption must not export as source: {svg}"
+      );
+      assert!(svg.contains(" leaves"), "expected the row's text: {svg}");
+      assert!(
+        svg.contains("font-size=\"16\"") && svg.contains("rgb(0,0,255)"),
+        "the caption keeps the size and colour it asks for: {svg}"
+      );
+      // A styled picture is still the picture.
+      let styled = svg_of("Style[Graphics[{Disk[]}], Blue]");
+      assert!(styled.contains("<ellipse"), "expected the disk: {styled}");
+    }
+
+    /// `Style[expr, "Label", 12]` names a stylesheet style *and* overrides
+    /// its font size. Both used to be appended, emitting `font-size` twice
+    /// on one element — not valid SVG, and which size won was left to the
+    /// renderer. The later directive is the one Wolfram applies.
+    #[test]
+    fn explicit_size_overrides_a_named_style() {
+      let svg = svg_of(
+        "Graphics[{Point[{0, 0}]}, PlotLabel -> Style[\"area\", \"Label\", 12]]",
+      );
+      let label = svg
+        .lines()
+        .find(|l| l.contains(">area<"))
+        .unwrap_or_else(|| panic!("expected the label: {svg}"));
+      assert_eq!(
+        label.matches("font-size=").count(),
+        // One on the <text> element, one on the styled <tspan> — never two
+        // on the same element.
+        2,
+        "each element carries a single font-size: {label}"
+      );
+      assert!(
+        label.contains("<tspan font-size=\"12\">area</tspan>"),
+        "the explicit size wins over the named style's: {label}"
+      );
+    }
+
+    #[test]
+    fn styled_grid_still_colours_its_frame() {
+      // The directives of a styled `Grid` reach its frame and dividers, not
+      // only its cells, so unwrapping `Style` must leave that path alone.
+      let svg = svg_of(
+        "Style[Grid[{{a, b}, {c, d}}, Frame -> True, Dividers -> All], Red]",
+      );
+      assert!(
+        svg.contains("stroke=\"rgb(255,0,0)\""),
+        "frame lines stay red: {svg}"
+      );
+    }
+
+    #[test]
+    fn bspline_curve_renders_in_graphics3d() {
+      // `BSplineCurve[{p1, …}]` draws the spline over its control points.
+      // Every control point sits on `z = 0`, so the drawn curve does too:
+      // a rendered curve is one made of line segments, not nothing.
+      let svg = svg_of(
+        "Graphics3D[BSplineCurve[{{0, 0, 0}, {1, 2, 0}, {2, 0, 0}, \
+         {3, 2, 0}}]]",
+      );
+      assert!(
+        svg.matches("<line").count() > 20,
+        "expected a sampled spline curve: {svg}"
+      );
+    }
+
+    #[test]
+    fn bspline_curve_closes_on_spline_closed() {
+      // `SplineClosed -> True` wraps the leading control points onto the
+      // end, so the curve comes back to where it started: a closed ring
+      // spans its control points in both directions, an open spline over
+      // the same points stops short of the wrap.
+      let open = svg_of(
+        "Graphics3D[BSplineCurve[Table[{Sin[t], Cos[t], 0}, \
+         {t, 0, 6.0, 0.5}]]]",
+      );
+      let closed = svg_of(
+        "Graphics3D[BSplineCurve[Table[{Sin[t], Cos[t], 0}, \
+         {t, 0, 6.0, 0.5}], SplineClosed -> True]]",
+      );
+      assert!(open.contains("<line"), "expected an open spline: {open}");
+      assert!(
+        closed.matches("<line").count() > open.matches("<line").count(),
+        "a closed spline runs further than the open one"
+      );
+    }
+
+    #[test]
+    fn tube_follows_a_bspline_curve() {
+      // `Tube[BSplineCurve[…], r]` is how a Demonstration gives a knot its
+      // thickness: the tube runs along the spline, so it tessellates into
+      // a surface rather than being dropped for want of a point list.
+      let svg = svg_of(
+        "Graphics3D[Tube[BSplineCurve[{{0, 0, 0}, {1, 2, 0}, {2, 0, 1}, \
+         {3, 2, 0}}], 0.2]]",
+      );
+      assert!(
+        svg.matches("<polygon").count() > 100,
+        "expected a tessellated tube around the spline: {svg}"
+      );
+    }
+
+    #[test]
+    fn parametric_plot3d_plot_style_tube_draws_a_tube() {
+      // `PlotStyle -> {colour, Tube[r]}` asks for the curve itself to be
+      // drawn as a tube of radius `r`. The colour still applies; only the
+      // `Tube` directive changes the shape.
+      let tube = svg_of(
+        "ParametricPlot3D[{Cos[t], Sin[t], t/5}, {t, 0, 6.2}, \
+         PlotStyle -> {Red, Tube[0.2]}]",
+      );
+      assert!(
+        tube.matches("<polygon").count() > 100,
+        "expected a tessellated tube: {tube}"
+      );
+      assert!(
+        tube.contains("fill=\"rgb(2"),
+        "the tube keeps the PlotStyle colour: {tube}"
+      );
+      // Without the directive the same curve is still a plain line.
+      let line = svg_of(
+        "ParametricPlot3D[{Cos[t], Sin[t], t/5}, {t, 0, 6.2}, \
+         PlotStyle -> Red]",
+      );
+      assert!(
+        !line.contains("<polygon"),
+        "a curve without Tube stays a line: {line}"
+      );
+    }
+
+    #[test]
+    fn graphics3d_draws_its_plot_label() {
+      // A 3-D picture carries a `PlotLabel` above it, exactly as a 2-D one
+      // does — the canvas grows by the label strip rather than the drawing
+      // area shrinking.
+      let plain = svg_of("Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}]");
+      let labelled = svg_of(
+        "Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}, \
+         PlotLabel -> \"Torus Knot\"]",
+      );
+      assert!(
+        labelled.contains("Torus Knot"),
+        "expected the plot label: {labelled}"
+      );
+      assert!(
+        !plain.contains("<text"),
+        "an unlabelled picture gains no text: {plain}"
+      );
+      assert!(
+        labelled.contains("height=\"386\""),
+        "the canvas grows by the label strip: {labelled}"
+      );
+      // `PlotLabel -> None` is how a picture asks to stay untitled.
+      let none =
+        svg_of("Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}, PlotLabel -> None]");
+      assert!(!none.contains("<text"), "PlotLabel -> None draws nothing");
+    }
+
+    #[test]
+    fn plot3d_heads_draw_their_plot_label() {
+      // The label reaches every 3-D plot head, not only `Graphics3D`.
+      for code in [
+        "Plot3D[x + y, {x, 0, 1}, {y, 0, 1}, PlotLabel -> \"surface\"]",
+        "ParametricPlot3D[{Cos[t], Sin[t], t}, {t, 0, 6}, \
+         PlotLabel -> \"surface\"]",
+        "ListPointPlot3D[{{1, 2, 3}, {2, 1, 0}}, PlotLabel -> \"surface\"]",
+        "ListLinePlot3D[{{{1, 2, 3}, {2, 1, 0}}}, PlotLabel -> \"surface\"]",
+      ] {
+        let svg = svg_of(code);
+        assert!(
+          svg.contains("surface"),
+          "expected a label for {code}: {svg}"
+        );
+      }
+    }
+
+    #[test]
+    fn graphics3d_plot_label_typesets_its_expression() {
+      // The label is typeset like any other, so a `Style[Row[…]]` shows the
+      // row's text at the size and colour it asks for.
+      let svg = svg_of(
+        "Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}, \
+         PlotLabel -> Style[Row[{\"Lotus \", \"Kolam\"}], FontSize -> 18, \
+         Blue]]",
+      );
+      assert!(
+        svg.contains("Lotus Kolam"),
+        "expected the row's text, not its source: {svg}"
+      );
+      assert!(
+        svg.contains("font-size=\"18\"") && svg.contains("rgb(0,0,255)"),
+        "expected the label's own size and colour: {svg}"
+      );
+    }
+
+    #[test]
+    fn graphics3d_axes_carry_ticks_and_labels() {
+      // `Show[Graphics3D[…], Axes -> True, AxesLabel -> {…}]`: a
+      // Demonstration frames a 3D scene this way, and the axes, their tick
+      // labels and the axis labels all have to be drawn.
+      let svg = svg_of(
+        "Graphics3D[{Line[{{0, 0, 0}, {1, 10, 5}}]}, Axes -> True, \
+         AxesLabel -> {\"across\", \"t (s)\", \"up\"}]",
+      );
+      for label in ["across", "t (s)", "up"] {
+        assert!(svg.contains(label), "expected the {label} label: {svg}");
+      }
+      // Without `Axes -> True` there is only the wireframe box.
+      let plain = svg_of("Graphics3D[{Line[{{0, 0, 0}, {1, 10, 5}}]}]");
+      assert!(!plain.contains("<text"), "expected no axes: {plain}");
+    }
+
+    #[test]
+    fn graphics3d_axes_label_typesets_inline_boxes() {
+      // An axis label written in the FrontEnd carries its typesetting as
+      // linear syntax inside the string; it must draw as the superscript
+      // it stands for, not as the box source.
+      let svg = svg_of(
+        "Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}, Axes -> True, \
+         AxesLabel -> {\"m/\\!\\(\\*SuperscriptBox[\\(s\\), \\(2\\)]\\)\", \
+         None, None}]",
+      );
+      assert!(
+        svg.contains("m/s<tspan baseline-shift=\"super\""),
+        "expected a typeset exponent: {svg}"
+      );
+      assert!(
+        !svg.contains("SuperscriptBox"),
+        "the box source must not be drawn: {svg}"
+      );
+    }
+
+    #[test]
+    fn graphics3d_plot_range_frames_each_axis() {
+      // `PlotRange -> {{x0, x1}, {y0, y1}, {z0, z1}}` pins the displayed
+      // region, so the ticks span the range asked for rather than the
+      // extent of the contents.
+      let svg = svg_of(
+        "Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}, Axes -> True, \
+         PlotRange -> {{-7, 7}, {0, 25}, {-20, 20}}]",
+      );
+      for tick in [">-5<", ">20<", ">-20<"] {
+        assert!(svg.contains(tick), "expected a {tick} tick: {svg}");
+      }
+      // The contents alone would never reach those values.
+      let fitted = svg_of(
+        "Graphics3D[{Line[{{0, 0, 0}, {1, 1, 1}}]}, \
+         Axes -> True]",
+      );
+      assert!(
+        !fitted.contains(">20<"),
+        "expected a fitted frame: {fitted}"
+      );
+    }
+
+    /// Width and height of everything drawn, in SVG user units, taken
+    /// from the coordinates of the rendered polygons.
+    fn ink_extent(svg: &str) -> (f64, f64) {
+      let (mut x0, mut x1, mut y0, mut y1) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+      );
+      for chunk in svg.split("points=\"").skip(1) {
+        let points = chunk.split('"').next().unwrap_or("");
+        for pair in points.split_whitespace() {
+          let Some((x, y)) = pair.split_once(',') else {
+            continue;
+          };
+          let (Ok(x), Ok(y)) = (x.parse::<f64>(), y.parse::<f64>()) else {
+            continue;
+          };
+          x0 = x0.min(x);
+          x1 = x1.max(x);
+          y0 = y0.min(y);
+          y1 = y1.max(y);
+        }
+      }
+      assert!(x0.is_finite(), "nothing was drawn: {svg}");
+      (x1 - x0, y1 - y0)
+    }
+
+    #[test]
+    fn spherical_region_scales_by_the_enclosing_sphere() {
+      // `SphericalRegion -> True` fits the sphere that encloses the
+      // contents instead of their projected outline. A sphere is its own
+      // enclosing sphere, so it keeps its size either way.
+      let with = ink_extent(&svg_of(
+        "Graphics3D[Sphere[{0, 0, 0}, 1], SphericalRegion -> True, \
+         Boxed -> False, ImageSize -> 200]",
+      ));
+      let without = ink_extent(&svg_of(
+        "Graphics3D[Sphere[{0, 0, 0}, 1], Boxed -> False, ImageSize -> 200]",
+      ));
+      assert!(
+        (with.0 - without.0).abs() < 1.0,
+        "a sphere must not shrink: {with:?} vs {without:?}"
+      );
+
+      // A flat square, seen face on, fills the frame without the option
+      // and shrinks to its circumradius (a factor of √2) with it.
+      let flat = "Graphics3D[Polygon[{{-1, -1, 0}, {1, -1, 0}, {1, 1, 0}, \
+                  {-1, 1, 0}}], Boxed -> False, ImageSize -> 200, \
+                  ViewPoint -> {0, 0, 3}";
+      let with =
+        ink_extent(&svg_of(&format!("{flat}, SphericalRegion -> True]")));
+      let without = ink_extent(&svg_of(&format!("{flat}]")));
+      let ratio = with.0 / without.0;
+      assert!(
+        (ratio - 1.0 / 2f64.sqrt()).abs() < 0.02,
+        "expected a 1/√2 shrink, got {ratio}: {with:?} vs {without:?}"
+      );
+    }
+
+    #[test]
+    fn spherical_region_holds_the_scale_across_views() {
+      // The point of the option: an animated or rotated scene keeps one
+      // scale, so the picture no longer breathes as the contents move.
+      // A long cuboid seen end on is foreshortened, and with the option
+      // it is drawn shorter rather than re-fitted to the frame.
+      let bar = "Graphics3D[Cuboid[{-2, -0.3, -0.3}, {2, 0.3, 0.3}], \
+                 Boxed -> False, ImageSize -> 200";
+      let front = ink_extent(&svg_of(&format!(
+        "{bar}, SphericalRegion -> True, ViewPoint -> {{0, -3, 0}}]"
+      )));
+      let oblique = ink_extent(&svg_of(&format!(
+        "{bar}, SphericalRegion -> True, ViewPoint -> {{-3, -3, 3}}]"
+      )));
+      assert!(
+        oblique.0 < front.0 * 0.9,
+        "the foreshortened view must draw shorter: {oblique:?} vs {front:?}"
+      );
+
+      // Without the option both views are re-fitted to the same width.
+      let front =
+        ink_extent(&svg_of(&format!("{bar}, ViewPoint -> {{0, -3, 0}}]")));
+      let oblique =
+        ink_extent(&svg_of(&format!("{bar}, ViewPoint -> {{-3, -3, 3}}]")));
+      assert!(
+        (oblique.0 - front.0).abs() < 2.0,
+        "both views must fill the frame: {oblique:?} vs {front:?}"
+      );
+    }
+
+    #[test]
+    fn raster3d_renders_voxels() {
+      let svg =
+        svg_of("Graphics3D[Raster3D[{{{0, 1}, {1, 0}}, {{1, 0}, {0, 1}}}]]");
+      // 8 voxel cuboids, 12 triangles each.
+      assert_eq!(svg.matches("<polygon").count(), 96);
+      // Voxels with value 0 are black, voxels with value 1 are white; both
+      // shades must appear (modulated by lighting, so just check some
+      // polygons exist with distinct fills).
+      assert!(svg.contains("<polygon"), "expected voxel polygons: {svg}");
+    }
+  }
+
+  // ── TraditionalForm typesetting ──────────────────────────────────────
+  //
+  // These verify the 2D box tree produced for `TraditionalForm` math so held
+  // expressions render in conventional notation (∑/∫/∏ operators, invisible
+  // HoldForm, π/∞/ⅇ glyphs, `sin(x)`, stacked fractions, radicals, bracketed
+  // matrices) rather than as literal `Sum[…]`/`Integrate[…]` function calls.
+  mod traditional_form_boxes {
+    use woxi::evaluator::dispatch::complex_and_special::expr_to_box_form_traditional;
+    use woxi::interpret_with_stdout;
+    use woxi::syntax::string_to_expr;
+
+    /// TraditionalForm box tree of `code`, as a debug string for substring
+    /// assertions.
+    fn tf(code: &str) -> String {
+      let expr = string_to_expr(code).expect("parse");
+      format!("{:?}", expr_to_box_form_traditional(&expr))
+    }
+
+    /// Typeset SVG the Playground/Studio produce for `code`.
+    fn tf_svg(code: &str) -> String {
+      interpret_with_stdout(code)
+        .expect("eval")
+        .output_svg
+        .expect("output_svg")
+    }
+
+    // `HoldForm` leaves a `TagBox` naming it — the same mark wolframscript
+    // keeps — but the tag draws nothing of its own, so the typeset output
+    // is the held expression and only that.
+    #[test]
+    fn hold_form_tags_its_content_and_draws_nothing() {
+      let boxes = tf("HoldForm[a + b]");
+      assert!(
+        boxes.contains("TagBox") && boxes.contains("HoldForm"),
+        "expected a HoldForm TagBox: {boxes}"
+      );
+      let svg = tf_svg("TraditionalForm[HoldForm[a + b]]");
+      assert!(!svg.contains("HoldForm"), "HoldForm should not draw: {svg}");
+      assert!(svg.contains('a') && svg.contains('b'), "{svg}");
+    }
+
+    #[test]
+    fn constants_map_to_glyphs() {
+      // Go through the full parser (bare `string_to_expr("Infinity")` would hit
+      // an f64 fast-path and yield a Real, not the symbol).
+      let svg = tf_svg("TraditionalForm @ HoldForm[Pi + Infinity + Exp[x]]");
+      assert!(svg.contains('\u{03C0}'), "Pi → π: {svg}");
+      assert!(svg.contains('\u{221E}'), "Infinity → ∞: {svg}");
+      // `Exp`'s base glyph is `\[ExponentialE]` (U+2147, "ⅇ") — a
+      // Letterlike Symbols codepoint most non-Mathematica fonts (this
+      // renderer's included) have no glyph for, so it typesets as an
+      // italicized plain "e" instead of the raw codepoint.
+      assert!(
+        !svg.contains('\u{2147}'),
+        "must not contain the raw U+2147 glyph: {svg}"
+      );
+      assert!(
+        svg.contains(">e<"),
+        "Exp base → italicized plain \"e\": {svg}"
+      );
+    }
+
+    #[test]
+    fn equal_renders_as_single_equals() {
+      let boxes = tf("a == b");
+      assert!(boxes.contains("\"=\""), "== → = : {boxes}");
+      assert!(!boxes.contains("\"==\""), "no literal == : {boxes}");
+    }
+
+    #[test]
+    fn known_function_lowercased_with_parens() {
+      let boxes = tf("Sin[x]");
+      assert!(boxes.contains("\"sin\""), "Sin → sin: {boxes}");
+      assert!(boxes.contains("\"(\""), "uses parentheses: {boxes}");
+    }
+
+    #[test]
+    fn trig_power_sits_on_the_name() {
+      // Sin[x]^2 → sin²(x): the exponent goes on the function name.
+      let boxes = tf("Sin[x]^2");
+      let sup = boxes.find("SuperscriptBox").expect("has superscript");
+      let sin = boxes.find("\"sin\"").expect("has sin");
+      assert!(sup < sin, "exponent precedes the name: {boxes}");
+    }
+
+    #[test]
+    fn negative_power_sets_as_a_fraction() {
+      // TraditionalForm puts a negative exponent under a fraction bar:
+      // `1/x` parses as `Power[x, -1]` and must not set as `x⁻¹`.
+      let boxes = tf("1/x");
+      assert!(boxes.contains("FractionBox"), "1/x is a fraction: {boxes}");
+      assert!(!boxes.contains("SuperscriptBox"), "no `x⁻¹`: {boxes}");
+      // The exponent's magnitude stays on the denominator.
+      let boxes = tf("x^-2");
+      assert!(boxes.contains("FractionBox"), "x⁻² is a fraction: {boxes}");
+      assert!(boxes.contains("\"2\""), "denominator keeps `²`: {boxes}");
+      assert!(!boxes.contains("\"-\""), "no minus in the script: {boxes}");
+      // Composite bases keep their own rendering under the bar — the trig
+      // exponent still sits on the function name (`1/cos³(x)`).
+      let boxes = tf("Cos[x]^-3");
+      assert!(boxes.contains("FractionBox"), "reciprocal power: {boxes}");
+      assert!(boxes.contains("\"cos\""), "cos under the bar: {boxes}");
+    }
+
+    #[test]
+    fn positive_power_stays_a_superscript() {
+      // The fraction rule must not swallow ordinary exponents.
+      let boxes = tf("x^2");
+      assert!(boxes.contains("SuperscriptBox"), "x² is a script: {boxes}");
+      assert!(!boxes.contains("FractionBox"), "not a fraction: {boxes}");
+    }
+
+    #[test]
+    fn derivative_sets_as_prime_marks() {
+      // `f'` is held as `Derivative[1][f]`, and no front end shows that head:
+      // orders 1–3 typeset as prime marks on the function name.
+      for (code, primes) in [("r'", 1), ("f''", 2), ("g'''", 3)] {
+        let boxes = tf(code);
+        assert!(
+          boxes.contains(&"\u{2032}".repeat(primes)),
+          "{code} carries {primes} prime(s): {boxes}"
+        );
+        assert!(
+          !boxes.contains("Derivative"),
+          "{code} hides the Derivative head: {boxes}"
+        );
+      }
+    }
+
+    #[test]
+    fn applied_derivative_keeps_its_argument() {
+      // `f''[x]` → `f″(x)`: the primes stay on the name, the argument
+      // follows in round brackets like any other call.
+      let boxes = tf("f''[x]");
+      assert!(boxes.contains("\u{2032}\u{2032}"), "two primes: {boxes}");
+      assert!(boxes.contains("\"x\""), "argument kept: {boxes}");
+      assert!(!boxes.contains("Derivative"), "head hidden: {boxes}");
+    }
+
+    /// StandardForm — what an evaluated cell shows in Woxi Studio — hides
+    /// the `Derivative` head too. Every derivative of an undefined function
+    /// in *Introduction to Calculus* (`D[f[g[x]], x]` → `f′[g[x]] g′[x]`)
+    /// used to read as `Derivative[1][f][g[x]]` there.
+    #[test]
+    fn standard_form_derivative_sets_as_prime_marks() {
+      let boxes = |code: &str| {
+        format!(
+          "{:?}",
+          woxi::evaluator::dispatch::complex_and_special::expr_to_box_form(
+            &woxi::interpret_to_expr(code).expect("eval")
+          )
+        )
+      };
+      let one = boxes("D[f[x], x]");
+      assert!(one.contains('\u{2032}'), "one prime mark: {one}");
+      assert!(one.contains("\"[\""), "square brackets: {one}");
+      assert!(!one.contains("Derivative"), "head hidden: {one}");
+
+      let two = boxes("f''[x]");
+      assert!(two.contains("\u{2032}\u{2032}"), "two prime marks: {two}");
+
+      // Past three the order is spelled out, as is the multivariate order.
+      let fourth = boxes("Derivative[4][f][x]");
+      assert!(fourth.contains("\"4\""), "order shown: {fourth}");
+      assert!(!fourth.contains('\u{2032}'), "no prime marks: {fourth}");
+      let partial = boxes("D[f[x, y], x]");
+      assert!(!partial.contains("Derivative"), "head hidden: {partial}");
+      assert!(partial.contains("\"0\""), "each order shown: {partial}");
+    }
+
+    #[test]
+    fn high_order_derivative_uses_a_parenthesised_order() {
+      // Past three, the marks stop being countable and Wolfram spells the
+      // order out: `f⁽⁴⁾`.
+      let boxes = tf("Derivative[4][f]");
+      assert!(boxes.contains("\"4\""), "order shown: {boxes}");
+      assert!(!boxes.contains('\u{2032}'), "no prime marks: {boxes}");
+      assert!(!boxes.contains("Derivative"), "head hidden: {boxes}");
+    }
+
+    #[test]
+    fn multivariate_derivative_lists_its_orders() {
+      // `Derivative[1, 0][f][x, y]` → `f⁽¹’⁰⁾(x, y)`.
+      let boxes = tf("Derivative[1, 0][f][x, y]");
+      assert!(boxes.contains("\"1\"") && boxes.contains("\"0\""));
+      assert!(
+        boxes.contains("\"x\"") && boxes.contains("\"y\""),
+        "arguments kept: {boxes}"
+      );
+      assert!(!boxes.contains("Derivative"), "head hidden: {boxes}");
+    }
+
+    #[test]
+    fn typeset_svg_shows_a_logarithmic_derivative() {
+      // The shape a Wolfram Demonstration labels a polar curve with: the
+      // logarithmic derivative `r′/r` over a fraction bar, and the curve's
+      // own equation as a reciprocal power. Both go through the typeset
+      // SVG the Studio draws into a Manipulate cell.
+      let svg = tf_svg("TraditionalForm[r'/r == Tan[t/3]]");
+      assert!(svg.contains('\u{2032}'), "prime drawn: {svg}");
+      assert!(!svg.contains(">Derivative<"), "head hidden: {svg}");
+      // `1/Cos[t/3]^3` evaluates to `Sec[t/3]^3`, as in Wolfram.
+      let svg = tf_svg("TraditionalForm[r == 1/Cos[t/3]^3]");
+      assert!(svg.contains(">sec<"), "sec drawn: {svg}");
+      assert!(!svg.contains(">-3<"), "no negative exponent: {svg}");
+    }
+
+    #[test]
+    fn symbolic_derivative_order_falls_back_to_the_head() {
+      // An order that is not a literal count has no prime rendering, so the
+      // generic `head(args)` form stands in rather than a wrong script.
+      let boxes = tf("Derivative[n][f]");
+      assert!(boxes.contains("Derivative"), "head shown: {boxes}");
+    }
+
+    #[test]
+    fn unknown_function_uses_parentheses() {
+      // Preserves the MakeBoxes contract: F[x] → RowBox[{F, (, x, )}].
+      let boxes = tf("F[x]");
+      assert!(boxes.contains("\"F\""), "head kept: {boxes}");
+      assert!(
+        boxes.contains("\"(\"") && boxes.contains("\")\""),
+        "parens: {boxes}"
+      );
+      assert!(!boxes.contains("\"[\""), "no square brackets: {boxes}");
+    }
+
+    #[test]
+    fn sum_becomes_underoverscript_operator() {
+      let boxes = tf("Sum[1/n^2, {n, 1, Infinity}]");
+      assert!(
+        boxes.contains("UnderoverscriptBox"),
+        "Sum uses a large operator with limits: {boxes}"
+      );
+      assert!(boxes.contains('\u{2211}'), "∑ glyph present: {boxes}");
+      assert!(!boxes.contains("\"Sum\""), "no literal Sum head: {boxes}");
+    }
+
+    #[test]
+    fn product_becomes_large_operator() {
+      let boxes = tf("Product[k, {k, 1, Infinity}]");
+      assert!(boxes.contains('\u{220F}'), "∏ glyph present: {boxes}");
+    }
+
+    #[test]
+    fn integrate_uses_integral_sign_and_differential() {
+      let boxes = tf("Integrate[Exp[-x^2], {x, 0, Infinity}]");
+      assert!(boxes.contains('\u{222B}'), "∫ present: {boxes}");
+      assert!(
+        boxes.contains('\u{2146}'),
+        "ⅆ differential present: {boxes}"
+      );
+      assert!(
+        boxes.contains("SubsuperscriptBox"),
+        "integral carries limits: {boxes}"
+      );
+    }
+
+    #[test]
+    fn derivative_renders_as_leibniz_fraction() {
+      let boxes = tf("D[f[x], {x, 2}]");
+      assert!(boxes.contains("FractionBox"), "∂/∂ fraction: {boxes}");
+      assert!(boxes.contains('\u{2202}'), "∂ glyph present: {boxes}");
+    }
+
+    // The order of a higher-order derivative belongs in the display, both
+    // when it is a literal and when it is a symbol: `∂ⁿ/∂xⁿ`.
+    #[test]
+    fn derivative_order_appears_in_the_fraction() {
+      let boxes = tf("D[f, {x, 3}]");
+      assert!(boxes.contains("\"3\""), "the order 3 is shown: {boxes}");
+      let boxes = tf("D[f, {x, n}]");
+      assert!(boxes.contains("\"n\""), "a symbolic order too: {boxes}");
+    }
+
+    // Dt is the *total* derivative, so it is set with ⅆ rather than ∂ —
+    // Rodrigues's formulas read `ⅆⁿ/ⅆxⁿ (x²-1)ⁿ`.
+    #[test]
+    fn total_derivative_uses_the_differential_d() {
+      let boxes = tf("Dt[(x^2 - 1)^n, {x, n}]");
+      assert!(boxes.contains("FractionBox"), "ⅆ/ⅆ fraction: {boxes}");
+      assert!(boxes.contains('\u{2146}'), "ⅆ glyph present: {boxes}");
+      assert!(!boxes.contains('\u{2202}'), "not the partial ∂: {boxes}");
+      assert!(!boxes.contains("\"Dt\""), "no literal Dt head: {boxes}");
+    }
+
+    // Classical special functions carry their order as a subscript and
+    // any further index as a superscript.
+    #[test]
+    fn special_functions_use_indexed_notation() {
+      for (code, letter) in [
+        ("BesselJ[n, x]", "J"),
+        ("SphericalBesselJ[n, x]", "j"),
+        ("LegendreP[n, x]", "P"),
+        ("LaguerreL[n, x]", "L"),
+        ("HermiteH[n, x]", "H"),
+        ("ChebyshevT[n, x]", "T"),
+        ("ChebyshevU[n, x]", "U"),
+      ] {
+        let boxes = tf(code);
+        assert!(
+          boxes.contains("SubscriptBox"),
+          "{code} takes a subscript order: {boxes}"
+        );
+        assert!(
+          boxes.contains(&format!("\"{letter}\"")),
+          "{code} is written with {letter}: {boxes}"
+        );
+      }
+    }
+
+    #[test]
+    fn special_function_degree_becomes_a_superscript() {
+      // Pₙᵐ(x), Lₙᵐ(x), Cₙᵐ(x) — the second index rides above the first.
+      for code in [
+        "LegendreP[n, m, x]",
+        "LaguerreL[n, m, x]",
+        "GegenbauerC[n, m, x]",
+      ] {
+        let boxes = tf(code);
+        assert!(
+          boxes.contains("SubsuperscriptBox"),
+          "{code} needs both scripts: {boxes}"
+        );
+      }
+      // JacobiP has two of them, written as a parenthesised pair.
+      let boxes = tf("JacobiP[n, a, b, x]");
+      assert!(boxes.contains("SubsuperscriptBox"), "{boxes}");
+      assert!(
+        boxes.contains("\"a\"") && boxes.contains("\"b\""),
+        "{boxes}"
+      );
+      // The Hankel families carry a fixed superscript from their name.
+      assert!(tf("SphericalHankelH1[n, x]").contains("\"(1)\""));
+      assert!(tf("HankelH2[n, x]").contains("\"(2)\""));
+    }
+
+    #[test]
+    fn factorial_is_written_postfix() {
+      let boxes = tf("n!");
+      assert!(boxes.contains("\"!\""), "postfix bang: {boxes}");
+      assert!(!boxes.contains("Factorial"), "no head name: {boxes}");
+      // A compound argument keeps its parentheses: (n+1)!
+      let boxes = tf("(n + 1)!");
+      assert!(boxes.contains("\"(\""), "argument parenthesised: {boxes}");
+    }
+
+    // `Row[{…}]` is a display wrapper: it concatenates its parts, so the
+    // implicit product `Row[{2, x, t}]` sets as `2xt`.
+    #[test]
+    fn row_concatenates_its_parts() {
+      let boxes = tf("Row[{2, x, t}]");
+      assert!(!boxes.contains("\"Row\""), "no head name: {boxes}");
+      for part in ["\"2\"", "\"x\"", "\"t\""] {
+        assert!(boxes.contains(part), "{part} kept: {boxes}");
+      }
+      // With a separator argument the separator goes between the parts.
+      let boxes = tf("Row[{a, b}, \" + \"]");
+      let sep = boxes.find(" + ").expect("separator kept");
+      let a = boxes.find("\"a\"").expect("first part");
+      let b = boxes.find("\"b\"").expect("second part");
+      assert!(a < sep && sep < b, "separator sits between: {boxes}");
+    }
+
+    #[test]
+    fn determinant_uses_bars_and_grid() {
+      let boxes = tf("Det[{{a, b}, {c, d}}]");
+      assert!(
+        boxes.contains("GridBox"),
+        "matrix laid out as a grid: {boxes}"
+      );
+      assert!(boxes.contains("\"|\""), "determinant bars: {boxes}");
+    }
+
+    #[test]
+    fn leading_unary_minus_has_no_zero_artifact() {
+      // The parser stores `-x^2` as `0 - x^2`; the display must drop the 0.
+      let boxes = tf("-x^2");
+      assert!(boxes.starts_with("FunctionCall") || boxes.contains("\"-\""));
+      assert!(!boxes.contains("\"0\""), "no spurious 0 term: {boxes}");
+    }
+
+    #[test]
+    fn negative_power_base_is_parenthesized() {
+      // (-1)^n must keep its parentheses.
+      let boxes = tf("(-1)^n");
+      let sup = boxes.find("SuperscriptBox").expect("superscript");
+      let paren = boxes.find("\"(\"").expect("open paren");
+      assert!(paren > sup, "parens wrap the base: {boxes}");
+    }
+
+    #[test]
+    fn symbol_used_as_head_is_not_glyph_mapped() {
+      // `E[x, y, z]` is a field, not Euler's number — keep the head as `E`.
+      let boxes = tf("Div[E[x, y, z], {x, y, z}]");
+      assert!(boxes.contains("\"E\""), "E head preserved: {boxes}");
+      assert!(!boxes.contains('\u{2147}'), "not turned into ⅇ: {boxes}");
+    }
+
+    #[test]
+    fn vector_operators_use_nabla() {
+      assert!(tf("Grad[f[x], {x}]").contains('\u{2207}'), "Grad → ∇");
+      assert!(
+        tf("Laplacian[f[x], {x}]").contains('\u{2207}'),
+        "Laplacian → ∇²"
+      );
+    }
+
+    #[test]
+    fn end_to_end_svg_carries_operator_glyphs() {
+      let svg = tf_svg(
+        "TraditionalForm @ HoldForm[Sum[1/n^2, {n, 1, Infinity}] == Pi^2/6]",
+      );
+      assert!(svg.contains('\u{2211}'), "∑ rendered: {svg}");
+      assert!(svg.contains('\u{03C0}'), "π rendered: {svg}");
+      assert!(svg.contains('\u{221E}'), "∞ rendered: {svg}");
+      assert!(!svg.contains("HoldForm"), "HoldForm invisible: {svg}");
+      assert!(!svg.contains("Sum["), "no literal Sum call: {svg}");
+    }
+
+    #[test]
+    fn end_to_end_svg_draws_stretchy_determinant_bars() {
+      let svg = tf_svg(
+        "TraditionalForm @ HoldForm[Det[{{a, b, c}, {d, e, f}, {g, h, i}}]]",
+      );
+      // Bars stretch into vertical <line>s spanning the grid.
+      assert!(svg.contains("<line"), "stretchy bars drawn as lines: {svg}");
+      assert!(
+        svg.contains(">a<") && svg.contains(">i<"),
+        "cells present: {svg}"
+      );
+    }
+  }
+
+  // ── TagBox / FormBox pass-through ────────────────────────────────────
+  //
+  // An evaluated TraditionalForm[…] expression is a 3-argument
+  // TagBox[FormBox[boxes, TraditionalForm], TraditionalForm,
+  // Editable -> True]. The layout / SVG / width functions must all
+  // delegate to the wrapped boxes instead of dumping the wrapper as text.
+  mod tag_and_form_box_passthrough {
+    use super::*;
+
+    /// TagBox[FormBox["x", TraditionalForm], TraditionalForm,
+    /// Editable -> True] — the wrapper an evaluated TraditionalForm carries.
+    fn wrapped_atom() -> Expr {
+      Expr::FunctionCall {
+        name: "TagBox".to_string(),
+        args: vec![
+          Expr::FunctionCall {
+            name: "FormBox".to_string(),
+            args: vec![
+              Expr::String("x".to_string()),
+              Expr::Identifier("TraditionalForm".to_string()),
+            ]
+            .into(),
+          },
+          Expr::Identifier("TraditionalForm".to_string()),
+          Expr::Rule {
+            pattern: Box::new(Expr::Identifier("Editable".to_string())),
+            replacement: Box::new(Expr::Identifier("True".to_string())),
+          },
+        ]
+        .into(),
+      }
+    }
+
+    #[test]
+    fn layout_box_unwraps_three_arg_tagbox_and_formbox() {
+      let wrapped = layout_box(&wrapped_atom(), 14.0);
+      let bare = layout_box(&Expr::String("x".to_string()), 14.0);
+      assert_eq!(
+        wrapped.elements, bare.elements,
+        "wrapper must be invisible in the layout"
+      );
+      assert_eq!(wrapped.width, bare.width);
+    }
+
+    #[test]
+    fn boxes_to_svg_unwraps_three_arg_tagbox_and_formbox() {
+      let svg = boxes_to_svg(&wrapped_atom());
+      assert_eq!(svg, "x", "wrapper must be invisible in the SVG: {svg}");
+    }
+
+    #[test]
+    fn estimate_width_unwraps_three_arg_tagbox_and_formbox() {
+      let w = estimate_box_display_width(&wrapped_atom());
+      assert_eq!(w, 1.0, "width is that of the wrapped content");
+    }
+  }
+
+  // ── Layered graph plots, framed array plots and aligned grids ──
+  //
+  // The shape a Demonstrations panel is built from: several pictures and
+  // their captions arranged in one `Grid`, inside a `Pane`.
+  mod demonstration_panel {
+    /// The rendered SVG of `expr`, with the embedded font payload removed.
+    fn svg_of(expr: &str) -> String {
+      let code = format!("ExportString[{expr}, \"SVG\"]");
+      let svg = woxi::interpret(&code).expect("interpret should succeed");
+      assert!(svg.starts_with("<svg"), "expected an SVG for {expr}: {svg}");
+      match (svg.find("<defs>"), svg.find("</defs>")) {
+        (Some(a), Some(b)) => format!("{}{}", &svg[..a], &svg[b + 7..]),
+        _ => svg,
+      }
+    }
+
+    /// Every vertex-dot centre in `svg`, in document order.
+    fn circle_centres(svg: &str) -> Vec<(f64, f64)> {
+      svg
+        .split("<ellipse ")
+        .skip(1)
+        .filter_map(|tag| {
+          let attr = |name: &str| -> Option<f64> {
+            let at = tag.find(&format!("{name}=\""))? + name.len() + 2;
+            tag[at..].split('"').next()?.parse().ok()
+          };
+          Some((attr("cx")?, attr("cy")?))
+        })
+        .collect()
+    }
+
+    /// A path graph laid out in layers with the roots on the left is a
+    /// straight horizontal line of vertices: every vertex is its own
+    /// layer, so they share a y and step evenly along x. The circular
+    /// embedding this used to fall back to put them on a ring instead.
+    #[test]
+    fn layered_graph_plot_lays_a_chain_out_in_a_line() {
+      let svg =
+        svg_of(r#"LayeredGraphPlot[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 5}, Left]"#);
+      let centres = circle_centres(&svg);
+      assert_eq!(centres.len(), 5, "one vertex circle each: {svg}");
+      let y0 = centres[0].1;
+      assert!(
+        centres.iter().all(|(_, y)| (y - y0).abs() < 1.0),
+        "a chain lies on one row: {centres:?}"
+      );
+      let mut xs: Vec<f64> = centres.iter().map(|(x, _)| *x).collect();
+      xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+      let step = xs[1] - xs[0];
+      assert!(step > 1.0, "vertices are spread apart: {xs:?}");
+      for pair in xs.windows(2) {
+        assert!(
+          (pair[1] - pair[0] - step).abs() < 1.0,
+          "layers are evenly spaced: {xs:?}"
+        );
+      }
+    }
+
+    /// Roots go on the edge the second argument names, and the layers grow
+    /// away from it: `Top` stacks the chain vertically instead.
+    #[test]
+    fn layered_graph_plot_honours_the_root_position() {
+      let svg = svg_of(r#"LayeredGraphPlot[{1 -> 2, 2 -> 3, 3 -> 4}, Top]"#);
+      let centres = circle_centres(&svg);
+      assert_eq!(centres.len(), 4);
+      let x0 = centres[0].0;
+      assert!(
+        centres.iter().all(|(x, _)| (x - x0).abs() < 1.0),
+        "with the roots on top the chain runs down one column: {centres:?}"
+      );
+    }
+
+    /// A branch gets a layer of its own: the two vertices that share a
+    /// parent sit at the same distance from the root but on different rows.
+    #[test]
+    fn layered_graph_plot_splits_a_branch_across_rows() {
+      let svg = svg_of(r#"LayeredGraphPlot[{1 -> 2, 2 -> 3, 2 -> 4}, Left]"#);
+      let centres = circle_centres(&svg);
+      assert_eq!(centres.len(), 4);
+      let mut by_x = centres.clone();
+      by_x.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+      // The two children share the last layer, so they share an x and
+      // straddle the row their parent sits on.
+      let (last_x, prev_x) = (by_x[3].0, by_x[1].0);
+      assert!((by_x[2].0 - last_x).abs() < 1.0, "one layer: {by_x:?}");
+      assert!(prev_x < last_x, "the branch is further from the root");
+      assert!(
+        (by_x[2].1 - by_x[3].1).abs() > 1.0,
+        "the two children are on different rows: {by_x:?}"
+      );
+    }
+
+    /// `DirectedEdges -> False` draws the edges as plain lines. The arrow
+    /// heads are filled polygons, so their absence is the test.
+    #[test]
+    fn directed_edges_false_drops_the_arrow_heads() {
+      let arrows = svg_of(r#"LayeredGraphPlot[{1 -> 2, 2 -> 3}, Left]"#);
+      assert!(arrows.contains("<polygon"), "arrow heads by default");
+      let plain = svg_of(
+        r#"LayeredGraphPlot[{1 -> 2, 2 -> 3}, Left, DirectedEdges -> False]"#,
+      );
+      assert!(
+        !plain.contains("<polygon"),
+        "DirectedEdges -> False leaves only lines: {plain}"
+      );
+      assert!(plain.contains("<polyline"), "the edges are still drawn");
+    }
+
+    /// `Method -> "CircularEmbedding"` names the embedding the same way
+    /// `GraphLayout` does, so a plot that would otherwise be packed as
+    /// separate clusters gets every vertex on one ring instead.
+    #[test]
+    fn graph_plot_method_asks_for_the_circular_embedding() {
+      let packed = svg_of(r#"GraphPlot[{1 -> 2, 3 -> 4, 5 -> 6}]"#);
+      let ring = svg_of(
+        r#"GraphPlot[{1 -> 2, 3 -> 4, 5 -> 6},
+           Method -> "CircularEmbedding"]"#,
+      );
+      let on_a_circle = |svg: &str| {
+        let centres = circle_centres(svg);
+        assert_eq!(centres.len(), 6, "one vertex circle each: {svg}");
+        let cx = centres.iter().map(|(x, _)| x).sum::<f64>() / 6.0;
+        let cy = centres.iter().map(|(_, y)| y).sum::<f64>() / 6.0;
+        let radii: Vec<f64> = centres
+          .iter()
+          .map(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+          .collect();
+        let r0 = radii[0];
+        radii.iter().all(|r| (r - r0).abs() < 1.0)
+      };
+      assert!(
+        on_a_circle(&ring),
+        "the named embedding puts every vertex on one ring: {ring}"
+      );
+      assert!(
+        !on_a_circle(&packed),
+        "without it the components are packed into a grid: {packed}"
+      );
+    }
+
+    /// An explicit `GraphLayout` outranks `Method`, as it does in Wolfram.
+    #[test]
+    fn graph_layout_wins_over_method() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3, 3 -> 4}, Method -> "CircularEmbedding",
+           GraphLayout -> "LayeredDigraphEmbedding"]"#,
+      );
+      let centres = circle_centres(&svg);
+      assert_eq!(centres.len(), 4);
+      let x0 = centres[0].0;
+      assert!(
+        centres.iter().all(|(x, _)| (x - x0).abs() < 1.0),
+        "the layered embedding stacks the chain in one column: {centres:?}"
+      );
+    }
+
+    /// `EdgeShapeFunction -> f` draws every edge with `f[{pt, …}, edge]`
+    /// instead of the built-in arrow. A Demonstration uses this to grey out
+    /// the edges it is not highlighting.
+    #[test]
+    fn edge_shape_function_replaces_the_drawn_edge() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           EdgeShapeFunction -> ({Blue, Dashed, Line[#1]} &)]"#,
+      );
+      assert!(
+        !svg.contains("<polygon"),
+        "the arrow heads are gone once the shape is ours: {svg}"
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(0,0,255)""#).count(),
+        2,
+        "both edges are drawn blue: {svg}"
+      );
+      assert_eq!(
+        svg.matches("stroke-dasharray").count(),
+        2,
+        "both edges are dashed: {svg}"
+      );
+    }
+
+    /// `EdgeRenderingFunction` is `GraphPlot`'s older name for the same
+    /// option, predating `Graph` and `EdgeShapeFunction` — Demonstrations
+    /// authored before `Graph` existed still use it, and it was previously
+    /// silently ignored, always drawing the default grey arrows.
+    #[test]
+    fn edge_rendering_function_replaces_the_drawn_edge() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           EdgeRenderingFunction -> ({Blue, Dashed, Line[#1]} &)]"#,
+      );
+      assert!(
+        !svg.contains("<polygon"),
+        "the arrow heads are gone once the shape is ours: {svg}"
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(0,0,255)""#).count(),
+        2,
+        "both edges are drawn blue: {svg}"
+      );
+      assert_eq!(
+        svg.matches("stroke-dasharray").count(),
+        2,
+        "both edges are dashed: {svg}"
+      );
+    }
+
+    /// The second argument is the edge itself, as a `DirectedEdge` — which
+    /// is what a test like `MemberQ[…, #2]` in a Demonstration matches on.
+    #[test]
+    fn edge_shape_function_is_given_the_edge_as_a_directed_edge() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           EdgeShapeFunction -> (If[MemberQ[{DirectedEdge[1, 2]}, #2],
+             {Blue, Line[#1]}, {Red, Line[#1]}] &)]"#,
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(0,0,255)""#).count(),
+        1,
+        "only the named edge is blue: {svg}"
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(255,0,0)""#).count(),
+        1,
+        "the other one is not: {svg}"
+      );
+      // A plain `{1, 2}` pair is a different expression from the edge, so
+      // the same test against a list of pairs matches nothing.
+      let none = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           EdgeShapeFunction -> (If[MemberQ[{{1, 2}}, #2],
+             {Blue, Line[#1]}, {Red, Line[#1]}] &)]"#,
+      );
+      assert_eq!(
+        none.matches(r#"stroke="rgb(0,0,255)""#).count(),
+        0,
+        "a pair is not an edge: {none}"
+      );
+    }
+
+    /// An undirected graph hands its edges over as `UndirectedEdge`.
+    #[test]
+    fn edge_shape_function_is_given_undirected_edges_undirected() {
+      let svg = svg_of(
+        r#"GraphPlot[{UndirectedEdge[1, 2], UndirectedEdge[2, 3]},
+           EdgeShapeFunction -> (If[Head[#2] === UndirectedEdge,
+             {Blue, Line[#1]}, {Red, Line[#1]}] &)]"#,
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(0,0,255)""#).count(),
+        2,
+        "both edges arrive undirected: {svg}"
+      );
+    }
+
+    /// Directives the shape function sets are scoped to its own edge and
+    /// do not bleed into the next one.
+    #[test]
+    fn edge_shape_function_directives_do_not_bleed_between_edges() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           EdgeShapeFunction -> (If[#2 === DirectedEdge[1, 2],
+             {Blue, Dashed, Line[#1]}, Line[#1]] &)]"#,
+      );
+      assert_eq!(
+        svg.matches("stroke-dasharray").count(),
+        1,
+        "only the edge that asked for it is dashed: {svg}"
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(0,0,255)""#).count(),
+        1,
+        "and only that one is blue: {svg}"
+      );
+    }
+
+    /// A self-loop is handed to the shape function too, as the arc it is
+    /// drawn along rather than as a two-point segment.
+    #[test]
+    fn edge_shape_function_covers_self_loops() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 1, 1 -> 2},
+           EdgeShapeFunction -> ({Blue, Line[#1]} &)]"#,
+      );
+      let widest = svg
+        .split("<polyline points=\"")
+        .skip(1)
+        .map(|tag| tag.split('"').next().unwrap_or("").split(' ').count())
+        .max()
+        .unwrap_or(0);
+      assert!(widest > 2, "the loop arrives as a many-point arc: {svg}");
+      assert!(
+        !svg.contains("<polygon"),
+        "the loop's arrow head is replaced along with the rest: {svg}"
+      );
+    }
+
+    /// `EdgeShapeFunction -> None` leaves the vertices without any edges.
+    #[test]
+    fn edge_shape_function_none_draws_no_edges() {
+      let svg =
+        svg_of(r#"GraphPlot[{1 -> 2, 2 -> 3}, EdgeShapeFunction -> None]"#);
+      assert!(
+        !svg.contains("<polyline") && !svg.contains("<polygon"),
+        "no edge is drawn: {svg}"
+      );
+      assert_eq!(circle_centres(&svg).len(), 3, "the vertices stay: {svg}");
+    }
+
+    /// The rule form names the edges it applies to; the rest keep the
+    /// default arrow.
+    #[test]
+    fn edge_shape_function_rules_apply_per_edge() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           EdgeShapeFunction -> {DirectedEdge[1, 2] -> ({Red, Line[#1]} &)}]"#,
+      );
+      assert_eq!(
+        svg.matches(r#"stroke="rgb(255,0,0)""#).count(),
+        1,
+        "the named edge takes the rule: {svg}"
+      );
+      assert_eq!(
+        svg.matches("<polygon").count(),
+        1,
+        "the other one keeps its arrow head: {svg}"
+      );
+    }
+
+    /// A named shape says how to draw the edge without a function of its
+    /// own: `"Line"` drops the arrow head, `"Arrow"` puts one back.
+    #[test]
+    fn edge_shape_function_accepts_a_shape_name() {
+      let plain =
+        svg_of(r#"GraphPlot[{1 -> 2, 2 -> 3}, EdgeShapeFunction -> "Line"]"#);
+      assert!(
+        !plain.contains("<polygon"),
+        r#""Line" draws the edges without arrow heads: {plain}"#
+      );
+      let arrows = svg_of(
+        r#"GraphPlot[{UndirectedEdge[1, 2]}, EdgeShapeFunction -> "Arrow"]"#,
+      );
+      assert!(
+        arrows.contains("<polygon"),
+        r#""Arrow" draws one even on an undirected edge: {arrows}"#
+      );
+    }
+
+    /// `VertexRenderingFunction -> f` draws every vertex with
+    /// `f[{x, y}, name]` instead of the built-in disk. A Demonstration
+    /// uses this to swap the plain node for a coloured point.
+    #[test]
+    fn vertex_rendering_function_replaces_the_drawn_vertex() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           VertexRenderingFunction -> ({Red, Rectangle[# - 0.05, # + 0.05]} &)]"#,
+      );
+      assert!(
+        circle_centres(&svg).is_empty(),
+        "the default disks are gone once the shape is ours: {svg}"
+      );
+      assert_eq!(
+        svg.matches("<rect").count(),
+        3,
+        "each of the three vertices is drawn by the function: {svg}"
+      );
+      assert_eq!(
+        svg.matches(r#"fill="rgb(255,0,0)""#).count(),
+        3,
+        "and each takes the colour the function set: {svg}"
+      );
+    }
+
+    /// The first argument is the vertex's own coordinate, so the drawn
+    /// shapes land where the default disks would have.
+    #[test]
+    fn vertex_rendering_function_is_given_the_vertex_coordinate() {
+      let plain = svg_of(r#"GraphPlot[{1 -> 2, 2 -> 3}]"#);
+      let drawn = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           VertexRenderingFunction -> (Disk[#, 0.05] &)]"#,
+      );
+      let defaults = circle_centres(&plain);
+      let points = circle_centres(&drawn);
+      assert_eq!(points.len(), defaults.len(), "{drawn}");
+      for (p, d) in points.iter().zip(&defaults) {
+        assert!(
+          (p.0 - d.0).abs() < 3.0 && (p.1 - d.1).abs() < 3.0,
+          "the function draws at the vertex's own position: {points:?} vs {defaults:?}"
+        );
+      }
+    }
+
+    /// The second argument is the vertex name, which is what a
+    /// Demonstration labels its nodes with.
+    #[test]
+    fn vertex_rendering_function_is_given_the_vertex_name() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           VertexRenderingFunction -> (Text[#2, #] &)]"#,
+      );
+      for name in ["1", "2", "3"] {
+        assert!(
+          svg.contains(&format!(">{name}<")),
+          "every vertex is labelled with its own name: {svg}"
+        );
+      }
+    }
+
+    /// Directives the rendering function sets are scoped to its own
+    /// vertex and do not bleed into the next one.
+    #[test]
+    fn vertex_rendering_function_directives_do_not_bleed_between_vertices() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3},
+           VertexRenderingFunction -> (If[#2 === 1,
+             {Red, Disk[#, 0.05]}, Disk[#, 0.05]] &)]"#,
+      );
+      assert_eq!(
+        svg.matches(r#"fill="rgb(255,0,0)""#).count(),
+        1,
+        "only the vertex that asked for it is red: {svg}"
+      );
+    }
+
+    /// `VertexRenderingFunction -> None` leaves the edges without any
+    /// vertices drawn on their ends.
+    #[test]
+    fn vertex_rendering_function_none_draws_no_vertices() {
+      let svg = svg_of(
+        r#"GraphPlot[{1 -> 2, 2 -> 3}, VertexRenderingFunction -> None]"#,
+      );
+      assert!(circle_centres(&svg).is_empty(), "no vertex is drawn: {svg}");
+      assert!(svg.contains("<polyline"), "the edges stay: {svg}");
+    }
+
+    /// A graph plot is sized by its `ImageSize`, so a Demonstration can ask
+    /// for a wide, short strip.
+    #[test]
+    fn graph_plot_honours_image_size() {
+      let svg = svg_of(
+        r#"LayeredGraphPlot[{1 -> 2, 2 -> 3}, Left, ImageSize -> {200, 50}]"#,
+      );
+      assert!(
+        svg.starts_with(r#"<svg width="200""#),
+        "ImageSize -> {{200, 50}} sets the width: {}",
+        &svg[..80.min(svg.len())]
+      );
+      let default = svg_of(r#"LayeredGraphPlot[{1 -> 2, 2 -> 3}, Left]"#);
+      assert!(
+        default.starts_with(r#"<svg width="360""#),
+        "without one the Wolfram default still applies: {}",
+        &default[..80.min(default.len())]
+      );
+    }
+
+    /// `ArrayPlot` sits in a frame, so it takes a `FrameLabel` on any of
+    /// the four edges. Left and right labels run along their edge.
+    #[test]
+    fn array_plot_draws_its_frame_labels() {
+      let svg = svg_of(
+        r#"ArrayPlot[{{0, 1}, {1, 0}},
+           FrameLabel -> {{"lft", "rgt"}, {"btm", "top"}}]"#,
+      );
+      for label in ["lft", "rgt", "btm", "top"] {
+        assert!(svg.contains(label), "{label} should be drawn: {svg}");
+      }
+      assert!(
+        svg.contains("rotate(-90") && svg.contains("rotate(90"),
+        "the side labels are rotated onto their edges: {svg}"
+      );
+    }
+
+    /// Only the labelled edges take room: an unlabelled array plot keeps
+    /// its size exactly.
+    #[test]
+    fn array_plot_without_frame_labels_is_unpadded() {
+      let plain = svg_of(r#"ArrayPlot[{{0, 1}, {1, 0}}]"#);
+      let labelled = svg_of(
+        r#"ArrayPlot[{{0, 1}, {1, 0}}, FrameLabel -> {{"", ""}, {"", "top"}}]"#,
+      );
+      let width = |svg: &str| -> u32 {
+        svg
+          .split("width=\"")
+          .nth(1)
+          .unwrap()
+          .split('"')
+          .next()
+          .unwrap()
+          .parse()
+          .unwrap()
+      };
+      let height = |svg: &str| -> u32 {
+        svg
+          .split("height=\"")
+          .nth(1)
+          .unwrap()
+          .split('"')
+          .next()
+          .unwrap()
+          .parse()
+          .unwrap()
+      };
+      assert_eq!(width(&plain), width(&labelled), "a top label adds no width");
+      assert!(
+        height(&labelled) > height(&plain),
+        "a top label adds height: {} vs {}",
+        height(&labelled),
+        height(&plain)
+      );
+    }
+
+    /// A `Grid` whose rows hold different things still lines its columns
+    /// up: the caption under a picture is centred on that picture, not
+    /// packed against the left edge.
+    #[test]
+    fn grid_columns_line_up_across_mixed_rows() {
+      let svg = svg_of(
+        r#"Grid[{{Graphics[{Disk[]}], Graphics[{Disk[]}]},
+                 {Text["aa"], Text["bb"]}}]"#,
+      );
+      // Each cell is a nested <svg x=… width=…>; a cell is centred in its
+      // column, so it is the centres that have to agree.
+      let centres: Vec<f64> = svg
+        .split("<svg x=\"")
+        .skip(1)
+        .filter_map(|t| {
+          let x: f64 = t.split('"').next()?.parse().ok()?;
+          let w: f64 = t
+            .split("width=\"")
+            .nth(1)?
+            .split('"')
+            .next()?
+            .parse()
+            .ok()?;
+          Some(x + w / 2.0)
+        })
+        .collect();
+      assert_eq!(centres.len(), 4, "four cells: {svg}");
+      assert!(
+        (centres[0] - centres[2]).abs() < 1.0,
+        "the caption is centred on the picture above it: {centres:?}"
+      );
+      assert!(
+        (centres[1] - centres[3]).abs() < 1.0,
+        "and so is the second column's: {centres:?}"
+      );
+    }
+
+    /// A layout that holds pictures is one picture: the notebook hosts
+    /// (Playground, Woxi Studio) get the whole panel composed, not just
+    /// the last plot that happened to be drawn while evaluating it.
+    #[test]
+    fn a_pane_of_a_grid_of_plots_renders_as_one_graphic() {
+      let result = woxi::interpret_with_stdout(
+        r#"Pane[Grid[{{ArrayPlot[{{0, 1}, {1, 0}}], ArrayPlot[{{1, 0}, {0, 1}}]},
+                      {Text["left"], Text["right"]}}], {500, 375}]"#,
+      )
+      .expect("interpret should succeed");
+      let svg = result.graphics.expect("the panel is a graphic");
+      assert!(svg.starts_with("<svg"), "composed SVG: {svg}");
+      for label in ["left", "right"] {
+        assert!(svg.contains(label), "{label} is part of the panel");
+      }
+      assert!(
+        svg.matches("<svg x=").count() >= 4,
+        "every cell of the grid is placed: {svg}"
+      );
+    }
+
+    /// A layout of plain text is left to the text renderer — composing it
+    /// as a picture would be a regression, not an improvement.
+    #[test]
+    fn a_pane_without_pictures_is_not_composed() {
+      let result = woxi::interpret_with_stdout(
+        r#"Pane[Grid[{{1, 2}, {3, 4}}], {200, 100}]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        result.graphics.is_none(),
+        "a text-only layout composes no picture: {:?}",
+        result.graphics
+      );
+    }
+
+    /// `Pane[content, {width, height}]` reserves a fixed box in the
+    /// FrontEnd; content taller than it is clipped there rather than drawn
+    /// past it — there is no scrollbar in a static rendering. Without this,
+    /// a Demonstration-style fixed-size Pane around a tall Column (the
+    /// shape of many Manipulate bodies) left the overflow bleeding out
+    /// below the composed picture as a stray sliver of raw source text
+    /// instead of being cut off.
+    #[test]
+    fn a_pane_with_overflowing_content_is_clipped_to_its_declared_size() {
+      let result = woxi::interpret_with_stdout(
+        r#"Pane[Column[Table[Panel[Text[Style[n, 30]]], {n, 12}]], {120, 60}]"#,
+      )
+      .expect("interpret should succeed");
+      let svg = result.graphics.expect("the column is a graphic");
+      assert!(
+        svg.starts_with("<svg width=\"120\" height=\"60\""),
+        "clipped to the declared box: {svg}"
+      );
+    }
+
+    /// The same fixed-size clip applies to a plain `Export`/`ExportString`
+    /// (not only the Woxi Studio/Playground live-render path above) — both
+    /// go through the same picture composer.
+    #[test]
+    fn export_string_clips_an_overflowing_fixed_size_pane() {
+      let svg = woxi::interpret(
+        r#"ExportString[Pane[Column[Table[Panel[Text[Style[n, 30]]], {n, 12}]], {120, 60}], "SVG"]"#,
+      )
+      .expect("interpret should succeed");
+      assert!(
+        svg.starts_with("<svg width=\"120\" height=\"60\""),
+        "clipped to the declared box: {svg}"
+      );
+    }
+
+    /// Content that already fits inside the declared box is left alone —
+    /// a `Pane` around a small picture keeps its natural (smaller) canvas
+    /// rather than being padded out to the declared size.
+    #[test]
+    fn a_pane_with_content_that_already_fits_is_not_padded_out() {
+      let result = woxi::interpret_with_stdout(
+        r#"Pane[Column[{Panel[Text[Style[1, 20]]]}], {500, 500}]"#,
+      )
+      .expect("interpret should succeed");
+      let svg = result.graphics.expect("the column is a graphic");
+      assert!(
+        !svg.starts_with("<svg width=\"500\" height=\"500\""),
+        "small content keeps its natural canvas, unpadded: {svg}"
+      );
+    }
+  }
+
+  // ── Display-only wrappers in text markup ──
+  //
+  // Tooltip shows its first argument (the tip only appears on hover in the
+  // Wolfram FrontEnd), and a curried call renders as head[args] with display
+  // wrappers in the head resolved — so a Demonstrations-style column title
+  // like HoldForm[TranslationTransform][Tooltip[{"px", "py"}, "Translation"]]
+  // typesets as TranslationTransform[{px, py}].
+  mod display_wrapper_markup {
+    use super::*;
+
+    fn tooltip(content: Expr, tip: &str) -> Expr {
+      Expr::FunctionCall {
+        name: "Tooltip".to_string(),
+        args: vec![content, Expr::String(tip.to_string())].into(),
+      }
+    }
+
+    #[test]
+    fn tooltip_renders_first_argument_only() {
+      let expr = tooltip(Expr::Identifier("x".to_string()), "hidden tip");
+      assert_eq!(expr_to_svg_markup(&expr), "x");
+      assert_eq!(estimate_display_width(&expr), 1.0);
+    }
+
+    #[test]
+    fn curried_holdform_head_renders_as_application() {
+      // HoldForm[TranslationTransform][Tooltip[{"px", "py"}, "Translation"]]
+      let expr = Expr::CurriedCall {
+        func: Box::new(Expr::FunctionCall {
+          name: "HoldForm".to_string(),
+          args: vec![Expr::Identifier("TranslationTransform".to_string())]
+            .into(),
+        }),
+        args: vec![tooltip(
+          Expr::List(
+            vec![
+              Expr::String("px".to_string()),
+              Expr::String("py".to_string()),
+            ]
+            .into(),
+          ),
+          "Translation",
+        )],
+      };
+      assert_eq!(expr_to_svg_markup(&expr), "TranslationTransform[{px, py}]");
+      assert_eq!(
+        estimate_display_width(&expr),
+        "TranslationTransform[{px, py}]".len() as f64
+      );
+    }
+  }
+}

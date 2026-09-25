@@ -1,0 +1,18809 @@
+use super::*;
+
+mod polynomial_q {
+  use super::*;
+
+  #[test]
+  fn basic_polynomial() {
+    assert_eq!(interpret("PolynomialQ[x^2 + 1, x]").unwrap(), "True");
+    assert_eq!(
+      interpret("PolynomialQ[3*x^3 + 2*x + 1, x]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn constant_is_polynomial() {
+    assert_eq!(interpret("PolynomialQ[5, x]").unwrap(), "True");
+  }
+
+  #[test]
+  fn variable_is_polynomial() {
+    assert_eq!(interpret("PolynomialQ[x, x]").unwrap(), "True");
+  }
+
+  #[test]
+  fn non_polynomial() {
+    assert_eq!(interpret("PolynomialQ[Sin[x], x]").unwrap(), "False");
+    assert_eq!(interpret("PolynomialQ[1/x, x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn multivariate() {
+    assert_eq!(interpret("PolynomialQ[x^2 + y, x]").unwrap(), "True");
+  }
+
+  #[test]
+  fn multivariate_list_of_vars() {
+    // PolynomialQ with a list of variables
+    assert_eq!(interpret("PolynomialQ[x + y^2, {x, y}]").unwrap(), "True");
+    assert_eq!(
+      interpret("PolynomialQ[x^2 + 2*x*y + y^2, {x, y}]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PolynomialQ[Sin[x] + y, {x, y}]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn subexpression_as_variable() {
+    // f[a] treated as an atomic variable — f[a] + f[a]^2 is a polynomial in f[a]
+    assert_eq!(
+      interpret("PolynomialQ[f[a] + f[a]^2, f[a]]").unwrap(),
+      "True"
+    );
+    // Subexpression inside a list of variables
+    assert_eq!(
+      interpret("PolynomialQ[f[a] + g[b]^2, {f[a], g[b]}]").unwrap(),
+      "True"
+    );
+    // Not a polynomial: 1/f[a] has negative power of f[a]
+    assert_eq!(interpret("PolynomialQ[1/f[a], f[a]]").unwrap(), "False");
+  }
+}
+
+mod exponent {
+  use super::*;
+
+  #[test]
+  fn basic_exponent() {
+    assert_eq!(interpret("Exponent[x^3 + x, x]").unwrap(), "3");
+    assert_eq!(interpret("Exponent[x^2 + 3*x + 2, x]").unwrap(), "2");
+  }
+
+  // A bare number in the form slot is not a variable that ever appears, so
+  // Exponent is 0 — it must not raise an error. (Integers, reals, rationals,
+  // and 0 all behave the same.)
+  #[test]
+  fn number_form_gives_zero() {
+    assert_eq!(interpret("Exponent[x^2, 5]").unwrap(), "0");
+    assert_eq!(interpret("Exponent[x^2 + 3 x, 5]").unwrap(), "0");
+    assert_eq!(interpret("Exponent[x^2, 2.5]").unwrap(), "0");
+    assert_eq!(interpret("Exponent[x^2, 1/2]").unwrap(), "0");
+    assert_eq!(interpret("Exponent[x^2, 0]").unwrap(), "0");
+  }
+
+  // A compound form (a sum, a product, or a function application) is treated
+  // as an atomic unit: Exponent reports the highest power of that whole
+  // subexpression, without expanding it.
+  #[test]
+  fn compound_form_as_unit() {
+    assert_eq!(interpret("Exponent[(x + 1)^2, x + 1]").unwrap(), "2");
+    assert_eq!(interpret("Exponent[(x + 1)^2 y, x + 1]").unwrap(), "2");
+    assert_eq!(interpret("Exponent[(x + 1)^2 + 1, x + 1]").unwrap(), "2");
+    assert_eq!(interpret("Exponent[Sin[x]^3, Sin[x]]").unwrap(), "3");
+    assert_eq!(
+      interpret("Exponent[Sin[x]^2 + Sin[x], Sin[x]]").unwrap(),
+      "2"
+    );
+    // A form that never appears gives 0.
+    assert_eq!(interpret("Exponent[x^2 y, 2 x]").unwrap(), "0");
+  }
+
+  #[test]
+  fn bigint_coefficient_is_constant() {
+    // Regression: is_constant_wrt did not recognize BigInteger, so a term with
+    // a coefficient beyond i128 was treated as variable-dependent. Exponent
+    // returned the coefficient (or stayed unevaluated) instead of the degree.
+    assert_eq!(
+      interpret(
+        "Exponent[100000000000000000000000000000000000000000 x^2 + 5 x + 7, x]"
+      )
+      .unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("Exponent[100000000000000000000000000000000000000000, x]")
+        .unwrap(),
+      "0"
+    );
+  }
+
+  // Exponent reduces a SeriesData to its polynomial first, so it reports the
+  // series truncation degree (and Min reports the lowest order).
+  #[test]
+  fn from_series_data() {
+    assert_eq!(
+      interpret("Exponent[Series[Exp[x], {x, 0, 5}], x]").unwrap(),
+      "5"
+    );
+    assert_eq!(
+      interpret("Exponent[Series[Sin[x], {x, 0, 7}], x]").unwrap(),
+      "7"
+    );
+    // Sin starts at x^1, so Min gives 1.
+    assert_eq!(
+      interpret("Exponent[Series[Sin[x], {x, 0, 7}], x, Min]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("Exponent[SeriesData[x, 0, {1, 2, 3}, 0, 3, 1], x]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn constant_exponent() {
+    assert_eq!(interpret("Exponent[5, x]").unwrap(), "0");
+  }
+
+  #[test]
+  fn linear_exponent() {
+    assert_eq!(interpret("Exponent[3*x + 1, x]").unwrap(), "1");
+  }
+
+  #[test]
+  fn rational_exponent() {
+    assert_eq!(interpret("Exponent[b*x^(3/2), x]").unwrap(), "3/2");
+    assert_eq!(interpret("Exponent[x^(1/2) + x^(5/2), x]").unwrap(), "5/2");
+    assert_eq!(interpret("Exponent[x^(1/3) + x^(2/3), x]").unwrap(), "2/3");
+  }
+
+  #[test]
+  fn rational_exponent_min() {
+    assert_eq!(
+      interpret("Exponent[x^(1/2) + x^(5/2), x, Min]").unwrap(),
+      "1/2"
+    );
+  }
+
+  #[test]
+  fn exponent_list() {
+    assert_eq!(interpret("Exponent[-4x, x, List]").unwrap(), "{1}");
+    assert_eq!(
+      interpret("Exponent[x^3 + 2x^2 - 5x + 1, x, List]").unwrap(),
+      "{0, 1, 2, 3}"
+    );
+    assert_eq!(interpret("Exponent[x^2 + 1, x, List]").unwrap(), "{0, 2}");
+    assert_eq!(interpret("Exponent[5, x, List]").unwrap(), "{0}");
+  }
+
+  #[test]
+  fn exponent_list_in_map() {
+    assert_eq!(
+      interpret(
+        "u = -4x; Map[Function[Coefficient[u,x,#]*x^#], Exponent[u,x,List]]"
+      )
+      .unwrap(),
+      "{-4*x}"
+    );
+  }
+
+  // Symbolic exponents should produce a Max[...] expression rather than
+  // staying unevaluated. Regression for mathics algebra.py:1320.
+  #[test]
+  fn symbolic_exponent_yields_max() {
+    assert_eq!(
+      interpret("Exponent[x^(n + 1) + Sqrt[x] + 1, x]").unwrap(),
+      "Max[1/2, 1 + n]"
+    );
+    assert_eq!(interpret("Exponent[x^n + x^2, x]").unwrap(), "Max[2, n]");
+  }
+}
+
+mod coefficient {
+  use super::*;
+
+  #[test]
+  fn quadratic_coefficients() {
+    assert_eq!(interpret("Coefficient[x^2 + 3*x + 2, x, 2]").unwrap(), "1");
+    assert_eq!(interpret("Coefficient[x^2 + 3*x + 2, x, 1]").unwrap(), "3");
+    assert_eq!(interpret("Coefficient[x^2 + 3*x + 2, x, 0]").unwrap(), "2");
+  }
+
+  // A bare number in the form slot is not a valid variable: emit
+  // Coefficient::ivar and stay unevaluated, rather than treating the number
+  // as an absent monomial and returning 0.
+  #[test]
+  fn number_form_emits_ivar() {
+    for (input, call, bad) in [
+      ("Coefficient[x^2, 5]", "Coefficient[x^2, 5]", "5"),
+      ("Coefficient[x^2, 2.5]", "Coefficient[x^2, 2.5]", "2.5"),
+      ("Coefficient[x^2, 0]", "Coefficient[x^2, 0]", "0"),
+      ("Coefficient[x^2, 5, 2]", "Coefficient[x^2, 5, 2]", "5"),
+    ] {
+      clear_state();
+      assert_eq!(interpret(input).unwrap(), call, "for {input}");
+      let expected =
+        format!("Coefficient::ivar: {bad} is not a valid variable.");
+      let msgs = woxi::get_captured_messages_raw();
+      assert!(
+        msgs.iter().any(|m| m.contains(&expected)),
+        "expected {expected:?} for {input}, got {msgs:?}"
+      );
+    }
+  }
+
+  // A rational form is also invalid; only the unevaluated result is checked
+  // here because wolframscript renders the message in 2D.
+  #[test]
+  fn rational_form_unevaluated() {
+    assert_eq!(
+      interpret("Coefficient[x^2, 1/2]").unwrap(),
+      "Coefficient[x^2, 1/2]"
+    );
+  }
+
+  // Symbolic monomial forms (a power, a product, a sum) remain valid.
+  #[test]
+  fn symbolic_form_unaffected() {
+    assert_eq!(interpret("Coefficient[x^2, x^2]").unwrap(), "1");
+    assert_eq!(interpret("Coefficient[3 x y, x y]").unwrap(), "3");
+    assert_eq!(interpret("Coefficient[x^2, 2 y]").unwrap(), "0");
+    assert_eq!(interpret("Coefficient[x^2, x + 1]").unwrap(), "0");
+  }
+
+  // CoefficientList shares the ivar rule: a bare number in the variable slot
+  // emits CoefficientList::ivar and stays unevaluated.
+  #[test]
+  fn coefficient_list_number_form_emits_ivar() {
+    for (input, call, bad) in [
+      ("CoefficientList[x^2, 5]", "CoefficientList[x^2, 5]", "5"),
+      ("CoefficientList[x^2, 0]", "CoefficientList[x^2, 0]", "0"),
+      (
+        "CoefficientList[x^2, 2.5]",
+        "CoefficientList[x^2, 2.5]",
+        "2.5",
+      ),
+    ] {
+      clear_state();
+      assert_eq!(interpret(input).unwrap(), call, "for {input}");
+      let expected =
+        format!("CoefficientList::ivar: {bad} is not a valid variable.");
+      let msgs = woxi::get_captured_messages_raw();
+      assert!(
+        msgs.iter().any(|m| m.contains(&expected)),
+        "expected {expected:?} for {input}, got {msgs:?}"
+      );
+    }
+  }
+
+  // A rational is also invalid; only the result is checked because
+  // wolframscript renders the message in 2D.
+  #[test]
+  fn coefficient_list_rational_form_unevaluated() {
+    assert_eq!(
+      interpret("CoefficientList[x^2, 1/2]").unwrap(),
+      "CoefficientList[x^2, 1/2]"
+    );
+  }
+
+  // A genuine variable is unaffected.
+  #[test]
+  fn coefficient_list_symbol_unaffected() {
+    assert_eq!(
+      interpret("CoefficientList[1 + 2 x + 3 x^2, x]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  // Coefficient extracts from a SeriesData by reducing it to its polynomial
+  // first (Normal): the x^k coefficient, or 0 past the truncation order.
+  #[test]
+  fn from_series_data() {
+    assert_eq!(
+      interpret("Coefficient[Series[Exp[x], {x, 0, 5}], x, 3]").unwrap(),
+      "1/6"
+    );
+    assert_eq!(
+      interpret("Coefficient[Series[Sin[x], {x, 0, 7}], x, 5]").unwrap(),
+      "1/120"
+    );
+    assert_eq!(
+      interpret("Coefficient[Series[1/(1 - x), {x, 0, 5}], x, 0]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret(
+        "Coefficient[SeriesData[x, 0, {1, 1, 1/2, 1/6}, 0, 4, 1], x, 2]"
+      )
+      .unwrap(),
+      "1/2"
+    );
+    // Past the truncation order the coefficient is 0.
+    assert_eq!(
+      interpret("Coefficient[Series[Exp[x], {x, 0, 5}], x, 10]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn default_power_is_one() {
+    assert_eq!(interpret("Coefficient[x^2 + 3*x + 2, x]").unwrap(), "3");
+  }
+
+  #[test]
+  fn symbolic_coefficients() {
+    assert_eq!(
+      interpret("Coefficient[a*x^2 + b*x + c, x, 2]").unwrap(),
+      "a"
+    );
+    assert_eq!(
+      interpret("Coefficient[a*x^2 + b*x + c, x, 1]").unwrap(),
+      "b"
+    );
+    assert_eq!(
+      interpret("Coefficient[a*x^2 + b*x + c, x, 0]").unwrap(),
+      "c"
+    );
+  }
+
+  #[test]
+  fn zero_coefficient() {
+    assert_eq!(interpret("Coefficient[x^2 + 1, x, 1]").unwrap(), "0");
+  }
+
+  #[test]
+  fn bigint_coefficient_extraction() {
+    // Regression: Coefficient returned 0 (or a mis-attributed power) when the
+    // coefficient exceeded i128, because term_var_power_and_coeff did not
+    // recognize BigInteger as a constant factor.
+    assert_eq!(
+      interpret(
+        "Coefficient[88888888888888888888888888888888888888888 x^3 + 5 x^2, x, 3]"
+      )
+      .unwrap(),
+      "88888888888888888888888888888888888888888"
+    );
+    // The central binomial coefficient of (1 + x)^200 is a 60-digit BigInteger.
+    assert_eq!(
+      interpret("Coefficient[Expand[(1 + x)^200], x, 100]").unwrap(),
+      interpret("Binomial[200, 100]").unwrap()
+    );
+  }
+
+  #[test]
+  fn monomial_second_argument() {
+    // Coefficient[expr, x^n] should mean "coefficient of x^n" — the
+    // same result as Coefficient[expr, x, n].
+    assert_eq!(interpret("Coefficient[(x + 1)^5, x^3]").unwrap(), "10");
+    assert_eq!(interpret("Coefficient[3 x^2 + 5 x, x^2]").unwrap(), "3");
+    assert_eq!(interpret("Coefficient[(x + y)^4, x^2]").unwrap(), "6*y^2");
+  }
+
+  #[test]
+  fn multivariate_monomial_second_argument() {
+    // Coefficient[expr, x^a * y^b] extracts the coefficient of that
+    // exact monomial across multiple variables.
+    assert_eq!(
+      interpret("Coefficient[(x + y)^4, (x^2) * (y^2)]").unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("Coefficient[(x + 3 y)^5, x * y^4]").unwrap(),
+      "405"
+    );
+  }
+
+  #[test]
+  fn non_polynomial_factor() {
+    // x*Cos[x+3] is linear in x; Cos[x+3] is the coefficient
+    assert_eq!(
+      interpret("Coefficient[x*Cos[x + 3] + 6*y, x]").unwrap(),
+      "Cos[3 + x]"
+    );
+  }
+
+  // `Coefficient[expr, var, 0]` where expr doesn't mention var should
+  // return expr unchanged — wolframscript preserves the user's form, so we
+  // skip the pre-expand step. Regression for mathics algebra.py:1316.
+  #[test]
+  fn degree_zero_in_unmentioned_variable_preserves_form() {
+    assert_eq!(
+      interpret("Coefficient[(x + 2)^3 + (x + 3)^2, y, 0]").unwrap(),
+      "(2 + x)^3 + (3 + x)^2"
+    );
+  }
+
+  #[test]
+  fn rational_expression_coefficient() {
+    // Coefficient[(x+2)/(y-3) + (x+3)/(y-2), x] extracts coefficients of x.
+    // Matches wolframscript.
+    assert_eq!(
+      interpret("Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]").unwrap(),
+      "(-3 + y)^(-1) + (-2 + y)^(-1)"
+    );
+  }
+
+  // Wolfram's `Coefficient[expr, form]` does *literal* factor-multiset
+  // matching on `form`. The form's numeric coefficient is just another
+  // factor that has to appear as-is in a term — `6*x` does not contain
+  // `2*x` as a literal factor (6 ≠ 2), so the coefficient is 0, not 3.
+  #[test]
+  fn composite_form_with_numeric_factor() {
+    assert_eq!(interpret("Coefficient[6*x, 2*x]").unwrap(), "0");
+    assert_eq!(interpret("Coefficient[2*x, 2*x]").unwrap(), "1");
+    assert_eq!(interpret("Coefficient[a*(2*x), 2*x]").unwrap(), "a");
+    assert_eq!(interpret("Coefficient[2*x*y + 4*x, 2*x]").unwrap(), "y");
+    assert_eq!(interpret("Coefficient[2*x*y + 2*x, 2*x]").unwrap(), "1 + y");
+    assert_eq!(interpret("Coefficient[6*x + 2*x*y, 2*x]").unwrap(), "y");
+  }
+
+  // Sign matters in literal factor matching: `-2` and `2` are distinct
+  // factors, so `-2 x` does not contribute to `Coefficient[..., 2 x]`.
+  #[test]
+  fn composite_form_negative_numeric() {
+    assert_eq!(interpret("Coefficient[-2*x*y + 2*x, 2*x]").unwrap(), "1");
+    assert_eq!(interpret("Coefficient[2*x*y - 2*x, 2*x]").unwrap(), "y");
+    assert_eq!(interpret("Coefficient[-2*x*y - 2*x, 2*x]").unwrap(), "0");
+  }
+
+  // 3-arg form with composite second argument: for n = 1 it reduces to
+  // the 2-arg form. Matches wolframscript.
+  #[test]
+  fn composite_form_three_arg_power_one() {
+    assert_eq!(interpret("Coefficient[2*a*x + b*y, 2*x, 1]").unwrap(), "a");
+  }
+}
+
+mod expand {
+  use super::*;
+
+  #[test]
+  fn simple_product() {
+    assert_eq!(
+      interpret("Expand[(x + 1)*(x + 2)]").unwrap(),
+      "2 + 3*x + x^2"
+    );
+  }
+
+  #[test]
+  fn square() {
+    assert_eq!(interpret("Expand[(x + 1)^2]").unwrap(), "1 + 2*x + x^2");
+  }
+
+  #[test]
+  fn cube() {
+    assert_eq!(
+      interpret("Expand[(x + 1)^3]").unwrap(),
+      "1 + 3*x + 3*x^2 + x^3"
+    );
+  }
+
+  #[test]
+  fn distribute() {
+    assert_eq!(interpret("Expand[x*(x + 1)]").unwrap(), "x + x^2");
+  }
+
+  #[test]
+  fn already_expanded() {
+    assert_eq!(interpret("Expand[x^2 + 3*x + 2]").unwrap(), "2 + 3*x + x^2");
+  }
+
+  // Regression: a positive unit-numerator rational coefficient renders as a
+  // division (`x/4`), not `x*1/4`, even when Expand leaves the rational as the
+  // trailing factor of the Times. `|n| > 1` keeps the `(n*X)/d` form.
+  #[test]
+  fn unit_rational_coefficient_display() {
+    assert_eq!(interpret("Expand[x/4]").unwrap(), "x/4");
+    assert_eq!(interpret("Expand[Pi/4]").unwrap(), "Pi/4");
+    assert_eq!(interpret("Expand[Pi/3]").unwrap(), "Pi/3");
+    assert_eq!(interpret("Expand[2 x/4]").unwrap(), "x/2");
+    assert_eq!(interpret("Expand[3 Pi/4]").unwrap(), "(3*Pi)/4");
+  }
+
+  #[test]
+  fn constant() {
+    assert_eq!(interpret("Expand[5]").unwrap(), "5");
+  }
+
+  // Regression (issue #766): terms whose rational coefficients are spelled
+  // differently still share one bucket, so they cancel instead of piling up
+  // as `1 - 1 + x - x`. A rational factor is part of the coefficient, not of
+  // the monomial's variable part.
+  #[test]
+  fn rational_coefficients_cancel() {
+    assert_eq!(interpret("Expand[1 + x - 2*(1/2 + x/2)]").unwrap(), "0");
+    assert_eq!(
+      interpret("Expand[(1 + x + x^2 - x^3) - 2*(1/2 + x/2 + x^2/2 - x^3/2)]")
+        .unwrap(),
+      "0"
+    );
+    assert_eq!(interpret("Expand[(1 + x) - 3*(1/3 + x/3)]").unwrap(), "0");
+    assert_eq!(interpret("Expand[(y + 1)*x/2 - x/2]").unwrap(), "(x*y)/2");
+    assert_eq!(
+      interpret("Expand[(49*(16 + 2*x))/26 - (19*(20 + 3*x))/13]").unwrap(),
+      "12/13 - (8*x)/13"
+    );
+  }
+
+  #[test]
+  fn difference_of_squares() {
+    assert_eq!(interpret("Expand[(x + 2)*(x - 2)]").unwrap(), "-4 + x^2");
+  }
+
+  #[test]
+  fn multivariate_two_vars() {
+    assert_eq!(interpret("Expand[(x + y)^2]").unwrap(), "x^2 + 2*x*y + y^2");
+  }
+
+  #[test]
+  fn multivariate_four_vars() {
+    assert_eq!(
+      interpret("Expand[(a + b)*(c + d)]").unwrap(),
+      "a*c + b*c + a*d + b*d"
+    );
+  }
+
+  #[test]
+  fn multivariate_with_constant() {
+    assert_eq!(
+      interpret("Expand[(x + y + 1)^2]").unwrap(),
+      "1 + 2*x + x^2 + 2*y + 2*x*y + y^2"
+    );
+  }
+
+  #[test]
+  fn expand_inside_equal() {
+    assert_eq!(
+      interpret("Expand[(x - 1)*(x^2 + 1) == 0]").unwrap(),
+      "-1 + x - x^2 + x^3 == 0"
+    );
+  }
+
+  #[test]
+  fn expand_inside_comparison() {
+    assert_eq!(
+      interpret("Expand[(a + b)^2 == (c + d)^2]").unwrap(),
+      "a^2 + 2*a*b + b^2 == c^2 + 2*c*d + d^2"
+    );
+  }
+
+  #[test]
+  fn expand_inside_inequality() {
+    assert_eq!(
+      interpret("Expand[(x + 1)^2 > x]").unwrap(),
+      "1 + 2*x + x^2 > x"
+    );
+  }
+
+  #[test]
+  fn inequality_numeric_evaluation() {
+    assert_eq!(
+      interpret("Inequality[1, Less, 3, Less, 5]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("Inequality[1, Less, 0, Less, 5]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Inequality[1, Less, x, Less, 5] /. x -> 3").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("Inequality[1, Less, x, Less, 5] /. x -> 0").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Inequality[1, LessEqual, 1, LessEqual, 5]").unwrap(),
+      "True"
+    );
+  }
+}
+
+mod simplify {
+  use super::*;
+
+  #[test]
+  fn combine_like_terms() {
+    assert_eq!(interpret("Simplify[x + x]").unwrap(), "2*x");
+  }
+
+  // Simplify prefers the square-free factored form when its FullForm node
+  // count wins: -2*x*(-1 + x^2) is 8 nodes vs 9 for 2*x - 2*x^3 and for
+  // -2*(-x + x^3). The count follows Wolfram's FullForm (Times/Plus
+  // chains flat, -x as Times[-1, x]), not the display tree
+  // (differential fuzzer, seed 1785246333519574598;
+  // all wolframscript-verified).
+  #[test]
+  fn square_free_factored_form_wins_on_node_count() {
+    assert_eq!(
+      interpret("Simplify[2*x - 2*x^3]").unwrap(),
+      "-2*x*(-1 + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[3*x - 3*x^3]").unwrap(),
+      "-3*x*(-1 + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[6*x - 6*x^3]").unwrap(),
+      "-6*x*(-1 + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[3*x^2 - 3*x^4]").unwrap(),
+      "-3*x^2*(-1 + x^2)"
+    );
+    // The content-only extraction stays when it is cheaper …
+    assert_eq!(interpret("Simplify[2*x + 2*x^3]").unwrap(), "2*(x + x^3)");
+    // … the plain sum stays when everything else is more complex …
+    assert_eq!(interpret("Simplify[x - x^3]").unwrap(), "x - x^3");
+    assert_eq!(interpret("Simplify[3 - 3*x]").unwrap(), "3 - 3*x");
+    assert_eq!(interpret("Simplify[9 - 9*x]").unwrap(), "9 - 9*x");
+    // … and the fully factored linear split still wins where it should.
+    assert_eq!(interpret("Simplify[2*x - 2*x^2]").unwrap(), "-2*(-1 + x)*x");
+    assert_eq!(interpret("Simplify[-2*x - 2]").unwrap(), "-2*(1 + x)");
+    assert_eq!(interpret("Simplify[100 - 100*x]").unwrap(), "-100*(-1 + x)");
+  }
+
+  // A rational function whose numerator and denominator share a
+  // polynomial factor cancels it, and the surviving denominator is
+  // displayed expanded (differential fuzzer, seed 1785246333519574598;
+  // wolframscript-verified).
+  #[test]
+  fn rational_function_cancels_shared_factor() {
+    assert_eq!(
+      interpret("Simplify[(1 + 4*x + 3*x^2)/(2*x - 2*x^3)]").unwrap(),
+      "(1 + 3*x)/(2*x - 2*x^2)"
+    );
+  }
+
+  // Quotient displays around sign normalization and factored
+  // denominators, all wolframscript-verified (differential fuzzer, seed
+  // 1785246333519574598 follow-up):
+  // - an already-canonical quotient is a fixed point, keeping even a
+  //   factored denominator verbatim;
+  // - a negative-content numerator flips both parts, the rebuilt
+  //   denominator showing expanded when its leading coefficient ends up
+  //   negative and in x^k-split form when positive;
+  // - integer content never extracts from a denominator divisible by x
+  //   ((1+3x)/(2*(-x+x^2)) is not a Wolfram display).
+  #[test]
+  fn quotient_sign_normalization_displays() {
+    assert_eq!(
+      interpret("Simplify[(1 + 3*x)/(2*(-1 + x)*x)]").unwrap(),
+      "(1 + 3*x)/(2*(-1 + x)*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(2 + x)/((-1 + x)*x)]").unwrap(),
+      "(2 + x)/((-1 + x)*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(1 + 3*x)/(2*x - 2*x^2)]").unwrap(),
+      "(1 + 3*x)/(2*x - 2*x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[(1 + 3*x)/(2*x^2 - 2*x)]").unwrap(),
+      "(1 + 3*x)/(-2*x + 2*x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-1 - 3*x)/(2*x^2 - 2*x)]").unwrap(),
+      "(1 + 3*x)/(2*x - 2*x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-1 - 3*x)/(2*(-1 + x)*x)]").unwrap(),
+      "(1 + 3*x)/(2*x - 2*x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-1 - 3*x)/(2*x - 2*x^2)]").unwrap(),
+      "(1 + 3*x)/(2*(-1 + x)*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(5*x)/((1 - x)*(2 + x))]").unwrap(),
+      "(-5*x)/(-2 + x + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[(1 + x)/((1 - x)*(2 + x))]").unwrap(),
+      "-((1 + x)/(-2 + x + x^2))"
+    );
+    assert_eq!(
+      interpret("Simplify[1/(x^2*(-3 + 5*x))]").unwrap(),
+      "1/(x^2*(-3 + 5*x))"
+    );
+  }
+
+  // On a SimplifyCount tie the sign-only -(…) pull beats the numeric
+  // content extraction (both count 16), while a strict win keeps the
+  // extraction; wolframscript-verified (differential fuzzer, seed
+  // 5520550946540289960).
+  #[test]
+  fn sign_pull_beats_extraction_on_tie() {
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(1 + 5 x)]").unwrap(),
+      "-((2 + 4*x)/(1 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Simplify[(-3 - 6 x)/(1 + 5 x)]").unwrap(),
+      "-((3 + 6*x)/(1 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Simplify[(-4 - 8 x)/(1 + 5 x)]").unwrap(),
+      "-((4 + 8*x)/(1 + 5*x))"
+    );
+    // Strict count wins keep the extraction.
+    assert_eq!(
+      interpret("Simplify[(-5 - 10 x)/(1 + 7 x)]").unwrap(),
+      "(-5*(1 + 2*x))/(1 + 7*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-10 - 20 x)/(1 + 5 x)]").unwrap(),
+      "(-10*(1 + 2*x))/(1 + 5*x)"
+    );
+    // Positive content and mixed signs stay plain.
+    assert_eq!(
+      interpret("Simplify[(2 + 4 x)/(1 + 5 x)]").unwrap(),
+      "(2 + 4*x)/(1 + 5*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 + 4 x)/(1 + 5 x)]").unwrap(),
+      "(-2 + 4*x)/(1 + 5*x)"
+    );
+  }
+
+  // A monomial denominator with a coefficient displays the pull as a
+  // rational prefactor; a coefficient-free monomial splits termwise
+  // (wolframscript-verified).
+  #[test]
+  fn mono_denominator_pull_prefactor() {
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(5 x)]").unwrap(),
+      "-1/5*(2 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[(-1 - 4 x)/(5 x)]").unwrap(),
+      "-1/5*(1 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(5 x^2)]").unwrap(),
+      "-1/5*(2 + 4*x)/x^2"
+    );
+    assert_eq!(interpret("Simplify[(-2 - 4 x)/x]").unwrap(), "-4 - 2/x");
+  }
+
+  // Sums of c·x^e monomials with negative exponents: ALL-NEGATIVE
+  // content never split-extracts; the recombined quotient over the
+  // common x^k competes instead — full content out on unit cofactors,
+  // sign and denominator lcm only otherwise. Positive content keeps the
+  // split-extract with a strict-win, has-constant gate; all
+  // wolframscript-verified.
+  #[test]
+  fn reciprocal_sum_recombination() {
+    assert_eq!(interpret("Simplify[-4 - 2/x]").unwrap(), "-4 - 2/x");
+    assert_eq!(interpret("Simplify[-4 - 2/x^2]").unwrap(), "-4 - 2/x^2");
+    assert_eq!(interpret("Simplify[-2 - 2/x]").unwrap(), "(-2*(1 + x))/x");
+    assert_eq!(
+      interpret("Simplify[-2 - 2/x - 2 x]").unwrap(),
+      "(-2*(1 + x + x^2))/x"
+    );
+    assert_eq!(
+      interpret("Simplify[-2/5 - 2/(5 x)]").unwrap(),
+      "(-2*(1 + x))/(5*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[-4/5 - 2/(5 x)]").unwrap(),
+      "-1/5*(2 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[-4/3 - 2/(3 x)]").unwrap(),
+      "-1/3*(2 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[-4/5 - 2/(5 x^2)]").unwrap(),
+      "-4/5 - 2/(5*x^2)"
+    );
+    // InputForm of a Plus term whose negative coefficient sits on the *right*
+    // factor of a Times (as Expand/Simplify can leave it, e.g.
+    // Times[x^(-2), Rational[-2, 5]]) must still fold to a subtraction, not
+    // render `+ -2/(5*x^2)`. Regression for the ToString[_, InputForm] path.
+    assert_eq!(
+      interpret("ToString[Expand[-4/5 - 2/(5 x^2)], InputForm]").unwrap(),
+      "-4/5 - 2/(5*x^2)"
+    );
+    assert_eq!(
+      interpret("ToString[Simplify[-4/5 - 2/(5 x^2)], InputForm]").unwrap(),
+      "-4/5 - 2/(5*x^2)"
+    );
+    // Positive/mixed content split-extracts on a strict win with a
+    // constant term present.
+    assert_eq!(
+      interpret("Simplify[-2 + 2/x + 2 x]").unwrap(),
+      "2*(-1 + x^(-1) + x)"
+    );
+    assert_eq!(
+      interpret("Simplify[-4 + 2/x + 2 x]").unwrap(),
+      "2*(-2 + x^(-1) + x)"
+    );
+    assert_eq!(
+      interpret("Simplify[4 + 2/x + 2 x]").unwrap(),
+      "2*(2 + x^(-1) + x)"
+    );
+    // Ties and constant-free sums keep their form.
+    assert_eq!(interpret("Simplify[4 + 2/x]").unwrap(), "4 + 2/x");
+    assert_eq!(interpret("Simplify[-2 + 2/x]").unwrap(), "-2 + 2/x");
+    assert_eq!(interpret("Simplify[2 - 2/x]").unwrap(), "2 - 2/x");
+    assert_eq!(interpret("Simplify[2/x + 2 x]").unwrap(), "2/x + 2*x");
+    assert_eq!(interpret("Simplify[-4 + 6/x]").unwrap(), "-4 + 6/x");
+    assert_eq!(
+      interpret("Simplify[-4/5 + 6/(5 x)]").unwrap(),
+      "-4/5 + 6/(5*x)"
+    );
+  }
+
+  // Simplify minimizes a Boolean expression when that reduces the leaf count
+  // (idempotence/complementarity/absorption), but keeps Xor/Implies whose DNF
+  // expansion is larger — matching wolframscript's cost model.
+  #[test]
+  fn boolean_minimization() {
+    assert_eq!(interpret("Simplify[a && a]").unwrap(), "a");
+    assert_eq!(interpret("Simplify[a || a]").unwrap(), "a");
+    assert_eq!(interpret("Simplify[a && ! a]").unwrap(), "False");
+    assert_eq!(interpret("Simplify[a || ! a]").unwrap(), "True");
+    assert_eq!(interpret("Simplify[a && b && a]").unwrap(), "a && b");
+    assert_eq!(interpret("Simplify[(a || b) && (a || ! b)]").unwrap(), "a");
+    assert_eq!(interpret("Simplify[a || (a && b)]").unwrap(), "a");
+    // Xor and Implies stay because minimizing them enlarges the expression.
+    assert_eq!(interpret("Simplify[Xor[a, b]]").unwrap(), "Xor[a, b]");
+    assert_eq!(
+      interpret("Simplify[Implies[a, b]]").unwrap(),
+      "Implies[a, b]"
+    );
+    // Non-reducible Boolean expressions and arithmetic are unchanged.
+    assert_eq!(interpret("Simplify[a && b]").unwrap(), "a && b");
+    assert_eq!(interpret("Simplify[a + a]").unwrap(), "2*a");
+  }
+
+  // An And/Or of repeated comparison predicates (opaque to BooleanMinimize)
+  // collapses to the single predicate when every operand is identical.
+  #[test]
+  fn boolean_predicate_idempotence() {
+    assert_eq!(interpret("Simplify[a > 2 && a > 2]").unwrap(), "a > 2");
+    assert_eq!(interpret("Simplify[a > 2 || a > 2]").unwrap(), "a > 2");
+    assert_eq!(interpret("Simplify[a == 1 && a == 1]").unwrap(), "a == 1");
+    assert_eq!(
+      interpret("Simplify[a > 2 && a > 2 && a > 2]").unwrap(),
+      "a > 2"
+    );
+  }
+
+  // Simplify pulls a -1 out in front of a quotient when the univariate
+  // numerator's highest-degree coefficient is negative, or when the
+  // denominator is entirely nonpositive; two flips cancel. All
+  // wolframscript-verified (differential fuzzer, seeds
+  // 1783520505113402110 and 1783530056735545937).
+  #[test]
+  fn quotient_minus_extraction() {
+    assert_eq!(
+      interpret(
+        "Simplify[Divide[Plus[-2, Times[-3, x]], Plus[0, Times[4, x], \
+         Times[3, Power[x, 2]]]]]"
+      )
+      .unwrap(),
+      "-((2 + 3*x)/(4*x + 3*x^2))"
+    );
+    assert_eq!(
+      interpret("Simplify[(1 - 5 x - 3 x^2 - x^3)/(-1 - 2 x + 4 x^2)]")
+        .unwrap(),
+      "-((-1 + 5*x + 3*x^2 + x^3)/(-1 - 2*x + 4*x^2))"
+    );
+    assert_eq!(
+      interpret("Simplify[(2 + 3 x)/(-4 x - 3 x^2)]").unwrap(),
+      "-((2 + 3*x)/(4*x + 3*x^2))"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 - 3 x)/(-4 x - 3 x^2)]").unwrap(),
+      "(2 + 3*x)/(4*x + 3*x^2)"
+    );
+    // Multivariate and non-polynomial numerators keep their form.
+    assert_eq!(
+      interpret("Simplify[(-b + d*y)/(a - c*y)]").unwrap(),
+      "(-b + d*y)/(a - c*y)"
+    );
+    // Converse power reduction: (1 - Cos[2 x])/2 collapses to the power form.
+    assert_eq!(interpret("Simplify[(1 - Cos[2*x])/2]").unwrap(), "Sin[x]^2");
+    assert_eq!(interpret("Simplify[(1 + Cos[2*x])/2]").unwrap(), "Cos[x]^2");
+    assert_eq!(
+      interpret("Simplify[a (1 - Cos[2*x])/2]").unwrap(),
+      "a*Sin[x]^2"
+    );
+  }
+
+  // Univariate polynomial quotients follow the SimplifyCount candidate
+  // selection (plain / content-extracted / minus-pulled / termwise-split
+  // / flipped). Differential fuzzer, seed 1783631489573774000; all
+  // wolframscript-verified.
+  #[test]
+  fn quotient_candidate_selection() {
+    // fuzzer divergence #1: flip wins strictly
+    assert_eq!(
+      interpret(
+        "Simplify[Divide[Plus[-5, Times[-1, x], Times[2, Power[x, 2]]], \
+         Plus[3, Times[-5, x], Times[5, Power[x, 2]], Times[-4, Power[x, \
+         3]]]]]"
+      )
+      .unwrap(),
+      "(5 + x - 2*x^2)/(-3 + 5*x - 5*x^2 + 4*x^3)"
+    );
+    // fuzzer divergence #3: flip costs more, input form kept verbatim
+    assert_eq!(
+      interpret("Simplify[(2 + 2 x - 5 x^2)/(1 - 2 x)]").unwrap(),
+      "(2 + 2*x - 5*x^2)/(1 - 2*x)"
+    );
+    // fuzzer divergence #5: numerator content extraction over a monomial
+    assert_eq!(
+      interpret("Simplify[(2 - 2 x + 2 x^2)/(5 x)]").unwrap(),
+      "(2*(1 - x + x^2))/(5*x)"
+    );
+    // flip ties keep the plain form unless its first term is negative
+    assert_eq!(
+      interpret("Simplify[(2 + 3 x)/(1 - x)]").unwrap(),
+      "(2 + 3*x)/(1 - x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 + 3 x)/(1 - 2 x)]").unwrap(),
+      "(2 - 3*x)/(-1 + 2*x)"
+    );
+    // a flipped denominator displays its content extracted
+    assert_eq!(
+      interpret("Simplify[(2 - x)/(5 - 5 x)]").unwrap(),
+      "(-2 + x)/(5*(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Simplify[(5 - 4 x - 3 x^2)/(5 - 5 x)]").unwrap(),
+      "(5 - 4*x - 3*x^2)/(5 - 5*x)"
+    );
+    // termwise split over monomial denominators when it costs less
+    assert_eq!(
+      interpret("Simplify[(6 - 4 x)/(5 x)]").unwrap(),
+      "-4/5 + 6/(5*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(2 + 2 x - 5 x^2)/(5 x)]").unwrap(),
+      "2/5 + 2/(5*x) - x"
+    );
+    assert_eq!(
+      interpret("Simplify[(5 + 3 x)/(5 x)]").unwrap(),
+      "3/5 + x^(-1)"
+    );
+    // …but not when the quotient (or a factored numerator) is cheaper
+    assert_eq!(
+      interpret("Simplify[(6 - 4 x)/(5 x^2)]").unwrap(),
+      "(6 - 4*x)/(5*x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[(1 + 2 n + n^2)/n^2]").unwrap(),
+      "(1 + n)^2/n^2"
+    );
+    // the pure sign normalization -a…/-b… → a…/b…
+    assert_eq!(
+      interpret("Simplify[(-2 + 2 x - 2 x^2)/(-1 + 2 x)]").unwrap(),
+      "(2 - 2*x + 2*x^2)/(1 - 2*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 + 2 x - 2 x^2)/(-5 + 5 x)]").unwrap(),
+      "(2 - 2*x + 2*x^2)/(5 - 5*x)"
+    );
+    // split results keep their form (no content re-extraction without a
+    // constant term / strict SimplifyCount win)
+    assert_eq!(
+      interpret("Simplify[-4/5 + 6/(5*x)]").unwrap(),
+      "-4/5 + 6/(5*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(2 - 2 x + 2 x^2)/x]").unwrap(),
+      "2*(-1 + x^(-1) + x)"
+    );
+  }
+
+  // All-negative sums over reciprocal powers recombine over the common
+  // x^(-k): with UNIT cofactors the full content comes out, otherwise
+  // only the sign and denominator lcm — and the candidate loses when it
+  // costs more than the split form (wolframscript-verified; differential
+  // fuzzer, seed 1784234939556239488).
+  #[test]
+  fn negative_reciprocal_sum_recombines() {
+    assert_eq!(interpret("Simplify[-2 - 2/x]").unwrap(), "(-2*(1 + x))/x");
+    assert_eq!(
+      interpret("Simplify[-2 - 2/x - 2 x]").unwrap(),
+      "(-2*(1 + x + x^2))/x"
+    );
+    assert_eq!(
+      interpret("Simplify[-2/5 - 2/(5 x)]").unwrap(),
+      "(-2*(1 + x))/(5*x)"
+    );
+    // Non-unit cofactors only pull the sign and the denominator lcm —
+    // and the Together candidate's raw denominator-product combine
+    // ((-10 - 20*x)/(25*x)) must reduce its shared integer content
+    // before the quotient selection displays it.
+    assert_eq!(
+      interpret("Simplify[-4/5 - 2/(5 x)]").unwrap(),
+      "-1/5*(2 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[1/2 + 1/(2 x)]").unwrap(),
+      "(1 + x)/(2*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(3 x)]").unwrap(),
+      "-1/3*(2 + 4*x)/x"
+    );
+    // The recombined quotient loses when it counts higher than the sum.
+    assert_eq!(interpret("Simplify[-4 - 2/x]").unwrap(), "-4 - 2/x");
+    assert_eq!(interpret("Simplify[-4 - 2/x^2]").unwrap(), "-4 - 2/x^2");
+    assert_eq!(
+      interpret("Simplify[-4/5 - 2/(5 x^2)]").unwrap(),
+      "-4/5 - 2/(5*x^2)"
+    );
+    // Mixed-sign sums with a positive content still split-extract —
+    // three-term sums parse the raw Divide[c, x] term shape.
+    assert_eq!(
+      interpret("Simplify[-2 + 2/x + 2 x]").unwrap(),
+      "2*(-1 + x^(-1) + x)"
+    );
+    assert_eq!(
+      interpret("Simplify[4 + 2/x + 2 x]").unwrap(),
+      "2*(2 + x^(-1) + x)"
+    );
+    assert_eq!(interpret("Simplify[4 + 2/x]").unwrap(), "4 + 2/x");
+  }
+
+  // Sums of radicals pull out their integer content (the content goes
+  // negative only when EVERY term is negative). Differential fuzzer,
+  // seed 1783537668073123846; wolframscript-verified.
+  #[test]
+  fn radical_sum_content_extraction() {
+    assert_eq!(
+      interpret(
+        "Simplify[Plus[Times[Times[-1, Sqrt[9]], Times[4, Sqrt[5]]], \
+         Times[Sqrt[19], Sqrt[9]]]]"
+      )
+      .unwrap(),
+      "3*(-4*Sqrt[5] + Sqrt[19])"
+    );
+    assert_eq!(
+      interpret("Simplify[Plus[9, Times[Sqrt[19], 9]]]").unwrap(),
+      "9*(1 + Sqrt[19])"
+    );
+    assert_eq!(
+      interpret("Simplify[-2 - 2*Sqrt[2]]").unwrap(),
+      "-2*(1 + Sqrt[2])"
+    );
+    assert_eq!(
+      interpret("Simplify[-9 + 9*Sqrt[19]]").unwrap(),
+      "9*(-1 + Sqrt[19])"
+    );
+    assert_eq!(
+      interpret("Simplify[(3/2) + (3/2)*Sqrt[2]]").unwrap(),
+      "(3*(1 + Sqrt[2]))/2"
+    );
+    // Content 1 stays untouched.
+    assert_eq!(
+      interpret("Simplify[Sqrt[2] + Sqrt[3]]").unwrap(),
+      "Sqrt[2] + Sqrt[3]"
+    );
+  }
+
+  // A mixed-sign numerator with a negative leading coefficient only
+  // pulls the minus out when the denominator is already in canonical
+  // positive-leading form (differential fuzzer, seed
+  // 1783537668073123846).
+  #[test]
+  fn no_flip_when_denominator_leading_negative() {
+    assert_eq!(
+      interpret("Simplify[(5 - 4 x - 3 x^2)/(5 - 5 x)]").unwrap(),
+      "(5 - 4*x - 3*x^2)/(5 - 5*x)"
+    );
+  }
+
+  // Standalone polynomials factor (2*x*(-1+2*x), canonical factor order),
+  // and quotient NUMERATORS factor too — but a quotient's DENOMINATOR
+  // stays expanded unless it collapses to a power of a single factor.
+  #[test]
+  fn factoring_respects_quotient_denominators() {
+    assert_eq!(
+      interpret("Simplify[4 x^2 - 2 x]").unwrap(),
+      "2*x*(-1 + 2*x)"
+    );
+    assert_eq!(interpret("Simplify[x^2 + x]").unwrap(), "x*(1 + x)");
+    assert_eq!(
+      interpret("Simplify[1/(4 x + 3 x^2)]").unwrap(),
+      "(4*x + 3*x^2)^(-1)"
+    );
+    assert_eq!(
+      interpret(
+        "Simplify[Divide[1, Plus[0, Times[2, x], Times[3, Power[x, 2]]]]]"
+      )
+      .unwrap(),
+      "(2*x + 3*x^2)^(-1)"
+    );
+    assert_eq!(
+      interpret("Simplify[(4 x^2 - 2 x)/(2 + 3 x)]").unwrap(),
+      "(2*x*(-1 + 2*x))/(2 + 3*x)"
+    );
+    assert_eq!(interpret("Simplify[(x^2 + x)/3]").unwrap(), "(x*(1 + x))/3");
+    // A denominator that IS a perfect power still factors.
+    assert_eq!(
+      interpret("Simplify[x^2/(1 - 3 x + 3 x^2 - x^3)]").unwrap(),
+      "-(x^2/(-1 + x)^3)"
+    );
+  }
+
+  // wolframscript's Simplify flips p/q → (-p)/(-q) only when the
+  // denominator's leading sign is negative AND the numerator is constant
+  // or itself negative-signed (found by the differential fuzzer).
+  #[test]
+  fn quotient_sign_flip_is_conditional() {
+    assert_eq!(
+      interpret("Simplify[(-1 - 5 x - 5 x^2)/(-5 + 2 x - 5 x^2 - 2 x^3)]")
+        .unwrap(),
+      "(1 + 5*x + 5*x^2)/(5 - 2*x + 5*x^2 + 2*x^3)"
+    );
+    assert_eq!(interpret("Simplify[3/(1 - x)]").unwrap(), "-3/(-1 + x)");
+    assert_eq!(
+      interpret("Simplify[(2 - x)/(1 - x)]").unwrap(),
+      "(-2 + x)/(-1 + x)"
+    );
+    assert_eq!(interpret("Simplify[-x/(1 - x)]").unwrap(), "x/(-1 + x)");
+    // Positive-leading numerators keep the quotient untouched.
+    assert_eq!(
+      interpret("Simplify[(1 + x)/(1 - x)]").unwrap(),
+      "(1 + x)/(1 - x)"
+    );
+    assert_eq!(interpret("Simplify[x/(1 - x)]").unwrap(), "x/(1 - x)");
+    assert_eq!(interpret("Simplify[1/(1 - x)]").unwrap(), "(1 - x)^(-1)");
+  }
+
+  // Numeric-content factoring follows the digit-weighted complexity with
+  // a negative-count tie-break (found by the differential fuzzer:
+  // Simplify[3 - 3x] over-factored to -3*(-1 + x)).
+  #[test]
+  fn numeric_content_factoring_threshold() {
+    for (input, expected) in [
+      // One-digit contents with a sign flip stay unfactored...
+      ("Simplify[3 - 3*x]", "3 - 3*x"),
+      ("Simplify[9 - 9*x]", "9 - 9*x"),
+      // ... two-digit contents factor (fewer total digits win)
+      ("Simplify[10 - 10*x]", "-10*(-1 + x)"),
+      ("Simplify[100 - 100*x]", "-100*(-1 + x)"),
+      // Sign-preserving ties prefer the factored form
+      ("Simplify[2*x + 2]", "2*(1 + x)"),
+      ("Simplify[3*x - 3*y]", "3*(x - y)"),
+      // ... including when factoring REDUCES the negatives
+      ("Simplify[-2*x - 2]", "-2*(1 + x)"),
+      // Strictly fewer leaves always factors
+      ("Simplify[2*x + 2*y]", "2*(x + y)"),
+      ("Simplify[10*x + 10*y]", "10*(x + y)"),
+      // No gain, no factoring
+      ("Simplify[6*x + 9]", "9 + 6*x"),
+      ("Simplify[4 - 4*x^2]", "4 - 4*x^2"),
+      ("Simplify[-x - y]", "-x - y"),
+      ("Simplify[x^2 - 2*x + 1]", "(-1 + x)^2"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  // A standalone `c*Log[n]` (positive integers) folds to `Log[n^c]` when that
+  // is simpler under wolframscript's digit-aware complexity measure. Large
+  // powers (many digits) and symbolic bases/coefficients stay factored.
+  #[test]
+  fn folds_standalone_integer_log() {
+    assert_eq!(interpret("Simplify[2*Log[2]]").unwrap(), "Log[4]");
+    assert_eq!(interpret("Simplify[2*Log[3]]").unwrap(), "Log[9]");
+    assert_eq!(interpret("Simplify[3*Log[3]]").unwrap(), "Log[27]");
+    assert_eq!(interpret("Simplify[2*Log[100]]").unwrap(), "Log[10000]");
+    // Right at the digit-count threshold for base 2: 2^13 folds, 2^14 does not.
+    assert_eq!(interpret("Simplify[13*Log[2]]").unwrap(), "Log[8192]");
+    assert_eq!(interpret("Simplify[14*Log[2]]").unwrap(), "14*Log[2]");
+    // A large power stays factored (Log[1048576] is more complex).
+    assert_eq!(interpret("Simplify[20*Log[2]]").unwrap(), "20*Log[2]");
+    // 3^7 = 2187 has too many digits to be worth folding.
+    assert_eq!(interpret("Simplify[7*Log[3]]").unwrap(), "7*Log[3]");
+    // A symbolic base or coefficient is never folded.
+    assert_eq!(interpret("Simplify[2*Log[x]]").unwrap(), "2*Log[x]");
+    assert_eq!(interpret("Simplify[a*Log[2]]").unwrap(), "a*Log[2]");
+    // A single Log is left as-is.
+    assert_eq!(interpret("Simplify[Log[2]]").unwrap(), "Log[2]");
+  }
+
+  // Integer-base logs in a sum merge into a single Log, choosing between the
+  // fully-merged `Log[prod n^c]` and the coefficient-GCD-factored `g*Log[…]`
+  // forms by wolframscript's digit-aware complexity measure.
+  #[test]
+  fn merges_integer_logs_in_sum() {
+    // Basic products and quotients.
+    assert_eq!(interpret("Simplify[Log[2] + Log[3]]").unwrap(), "Log[6]");
+    assert_eq!(interpret("Simplify[Log[6] - Log[2]]").unwrap(), "Log[3]");
+    assert_eq!(
+      interpret("Simplify[Log[2] + Log[3] + Log[5]]").unwrap(),
+      "Log[30]"
+    );
+    // Coefficients: fully merged when the product stays small.
+    assert_eq!(
+      interpret("Simplify[3*Log[2] + 2*Log[3]]").unwrap(),
+      "Log[72]"
+    );
+    assert_eq!(
+      interpret("Simplify[5*Log[2] - Log[6]]").unwrap(),
+      "Log[16/3]"
+    );
+    // Large shared coefficient: GCD-factored form wins over the huge product.
+    assert_eq!(
+      interpret("Simplify[20*Log[2] + 20*Log[3]]").unwrap(),
+      "20*Log[6]"
+    );
+    assert_eq!(
+      interpret("Simplify[4*Log[2] + 4*Log[3]]").unwrap(),
+      "4*Log[6]"
+    );
+    // Right at the threshold between fully-merged and GCD-factored.
+    assert_eq!(
+      interpret("Simplify[3*Log[2] + 3*Log[3]]").unwrap(),
+      "Log[216]"
+    );
+    // A negative result flips to `-Log[...]`.
+    assert_eq!(interpret("Simplify[Log[2] - Log[3]]").unwrap(), "-Log[3/2]");
+    assert_eq!(interpret("Simplify[-2*Log[2]]").unwrap(), "-Log[4]");
+    // Logs cancel to zero.
+    assert_eq!(interpret("Simplify[2*Log[2] - 2*Log[2]]").unwrap(), "0");
+    // Non-log terms are kept alongside the merged Log.
+    assert_eq!(interpret("Simplify[2*Log[2] + 1]").unwrap(), "1 + Log[4]");
+    assert_eq!(interpret("Simplify[x + 2*Log[2]]").unwrap(), "x + Log[4]");
+    // Symbolic bases/coefficients are never merged (would need a > 0 etc.).
+    assert_eq!(
+      interpret("Simplify[Log[a] + Log[b]]").unwrap(),
+      "Log[a] + Log[b]"
+    );
+    assert_eq!(
+      interpret("Simplify[a*Log[2] + b*Log[3]]").unwrap(),
+      "a*Log[2] + b*Log[3]"
+    );
+  }
+
+  // Simplify must keep the canonical radical form for a numeric base:
+  // `2*Sqrt[2]` (= 2^1 * 2^(1/2)) stays factored rather than merging into the
+  // less-standard `2^(3/2)`. Symbolic bases still merge (`x*Sqrt[x]`).
+  #[test]
+  fn keeps_numeric_radical_factored() {
+    assert_eq!(interpret("Simplify[2*Sqrt[2]]").unwrap(), "2*Sqrt[2]");
+    assert_eq!(interpret("Simplify[3*Sqrt[3]]").unwrap(), "3*Sqrt[3]");
+    assert_eq!(interpret("Simplify[5*5^(1/2)]").unwrap(), "5*Sqrt[5]");
+    assert_eq!(interpret("Simplify[2*2^(1/3)]").unwrap(), "2*2^(1/3)");
+    // A bare radical power extracts its integer factor.
+    assert_eq!(interpret("Simplify[2^(3/2)]").unwrap(), "2*Sqrt[2]");
+    assert_eq!(interpret("Simplify[Sqrt[8]]").unwrap(), "2*Sqrt[2]");
+  }
+
+  #[test]
+  fn symbolic_radical_still_merges() {
+    assert_eq!(interpret("Simplify[x*Sqrt[x]]").unwrap(), "x^(3/2)");
+  }
+
+  #[test]
+  fn combine_like_terms_implicit_coefficient() {
+    // `x + 2 x` should collapse to `3*x` without needing Simplify.
+    assert_eq!(interpret("x + 2 x").unwrap(), "3*x");
+  }
+
+  #[test]
+  fn distribute_sign_over_parens() {
+    // `a - (5 + a + 2 b) + 3 a q` — the negated parenthesis is distributed
+    // and like terms collapse, leaving `-5 - 2*b + 3*a*q`.
+    assert_eq!(
+      interpret("a - (5+ a+ 2 b) + 3 a q").unwrap(),
+      "-5 - 2*b + 3*a*q"
+    );
+  }
+
+  #[test]
+  fn pythagorean_identity_not_auto_simplified() {
+    // Sin[1]^2 + Cos[1]^2 - 1 is not collapsed to 0 without Simplify —
+    // the expression remains symbolic with a literal -1 (matches wolframscript).
+    assert_eq!(
+      interpret("1/(Sin[1]^2+Cos[1]^2-1)").unwrap(),
+      "(-1 + Cos[1]^2 + Sin[1]^2)^(-1)"
+    );
+  }
+
+  #[test]
+  fn combine_powers() {
+    assert_eq!(interpret("Simplify[x*x]").unwrap(), "x^2");
+  }
+
+  #[test]
+  fn cancel_division() {
+    assert_eq!(interpret("Simplify[(x^2 - 1)/(x - 1)]").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn trivial() {
+    assert_eq!(interpret("Simplify[5]").unwrap(), "5");
+    assert_eq!(interpret("Simplify[x]").unwrap(), "x");
+  }
+
+  /// Regression test for issue #93: Simplify must handle canonical
+  /// Times[Power[]] form identically to Divide form
+  #[test]
+  fn simplify_canonical_division_form() {
+    assert_eq!(interpret("Simplify[(x^2 - 1)/(x - 1)]").unwrap(), "1 + x");
+    assert_eq!(
+      interpret("Simplify[(x^2 - 1) * (x - 1)^-1]").unwrap(),
+      "1 + x"
+    );
+  }
+
+  #[test]
+  fn simplify_combines_conjugate_partial_fractions() {
+    // Sum of complex-conjugate partial fractions must combine and factor the
+    // resulting denominator: 1/2*(1/(1-I x)+1/(1+I x)) -> 1/(1+x^2).
+    assert_eq!(
+      interpret("Simplify[1/2 * (1/(1 - I x) + 1/(1 + I x))]").unwrap(),
+      "(1 + x^2)^(-1)"
+    );
+    assert_eq!(
+      interpret("Simplify[1/(1 - I x) + 1/(1 + I x)]").unwrap(),
+      "2/(1 + x^2)"
+    );
+  }
+
+  #[test]
+  fn simplify_scalar_times_sum_of_fractions() {
+    // `k * (sum of fractions)` must distribute and combine for any scalar k
+    // (numeric, rational, or symbolic), not stay as an uncombined product.
+    assert_eq!(
+      interpret("Simplify[3 (1/(a - I x) + 1/(a + I x))]").unwrap(),
+      "(6*a)/(a^2 + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[1/2 (1/(a - I x) + 1/(a + I x))]").unwrap(),
+      "a/(a^2 + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[c (1/(a - I x) + 1/(a + I x))]").unwrap(),
+      "(2*a*c)/(a^2 + x^2)"
+    );
+  }
+
+  #[test]
+  fn simplify_complex_conjugate_difference_sign() {
+    // Together produces the correct `-2 I x` numerator; the Factor sign bug
+    // used to flip it to `+2 I x` during Simplify.
+    assert_eq!(
+      interpret("Simplify[1/(1 + I x) - 1/(1 - I x)]").unwrap(),
+      "((-2*I)*x)/(1 + x^2)"
+    );
+  }
+
+  #[test]
+  fn simplify_rational_equality_proves_true() {
+    // Equation simplification must combine rational functions over a common
+    // denominator, not just Expand: both sides reduce to 1/(1+x^2).
+    assert_eq!(
+      interpret("Simplify[1/2 * (1/(1 - I x) + 1/(1 + I x)) == 1/(1 + x*x)]")
+        .unwrap(),
+      "True"
+    );
+    // A genuinely-unequal pair stays an unevaluated comparison.
+    assert_eq!(
+      interpret("Simplify[1/(1 + x) == 1/(1 + x^2)]").unwrap(),
+      "(1 + x)^(-1) == (1 + x^2)^(-1)"
+    );
+  }
+
+  #[test]
+  fn pythagorean_identity() {
+    assert_eq!(interpret("Simplify[Sin[x]^2 + Cos[x]^2]").unwrap(), "1");
+  }
+
+  #[test]
+  fn pythagorean_with_coefficient() {
+    assert_eq!(interpret("Simplify[2*Sin[x]^2 + 2*Cos[x]^2]").unwrap(), "2");
+  }
+
+  #[test]
+  fn pythagorean_with_extra_terms() {
+    assert_eq!(interpret("Simplify[Sin[y]^2 + Cos[y]^2 + 1]").unwrap(), "2");
+  }
+
+  // The hyperbolic Pythagorean identity Cosh[x]^2 - Sinh[x]^2 = 1.
+  #[test]
+  fn hyperbolic_pythagorean_identity() {
+    assert_eq!(interpret("Simplify[Cosh[x]^2 - Sinh[x]^2]").unwrap(), "1");
+    assert_eq!(
+      interpret("FullSimplify[Cosh[x]^2 - Sinh[x]^2]").unwrap(),
+      "1"
+    );
+    // Sinh^2 - Cosh^2 = -1 (the Cosh coefficient wins).
+    assert_eq!(interpret("Simplify[Sinh[x]^2 - Cosh[x]^2]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn hyperbolic_pythagorean_with_coefficient() {
+    assert_eq!(
+      interpret("Simplify[3 Cosh[x]^2 - 3 Sinh[x]^2]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("Simplify[2 Cosh[x]^2 - 2 Sinh[x]^2 + 5]").unwrap(),
+      "7"
+    );
+  }
+
+  #[test]
+  fn pythagorean_induced_singularity() {
+    // Simplify[1/(Sin[1]^2 + Cos[1]^2 - 1)] cancels to 1/0 → ComplexInfinity.
+    // Regression for mathics test_structure.py:37 (test_numericq) ensuring
+    // Simplify collapses exposed `0^(-1)` rather than leaving it raw.
+    assert_eq!(
+      interpret("Simplify[1/(Sin[1]^2 + Cos[1]^2 - 1)]").unwrap(),
+      "ComplexInfinity"
+    );
+  }
+
+  #[test]
+  fn combine_like_denominator_fractions() {
+    assert_eq!(interpret("Simplify[a/x + b/x]").unwrap(), "(a + b)/x");
+  }
+
+  #[test]
+  fn combine_like_denominator_with_extra() {
+    assert_eq!(
+      interpret("Simplify[a/x + b/x + c/y]").unwrap(),
+      "(a + b)/x + c/y"
+    );
+  }
+
+  #[test]
+  fn combine_fractions_different_denominators() {
+    assert_eq!(
+      interpret(
+        "Simplify[k*q/(2*a^4*(1 + s)^(3/2)) + k*q*(1 + s)^(9/4)/(2*a^4)]"
+      )
+      .unwrap(),
+      "(k*q*(1 + (1 + s)^(15/4)))/(2*a^4*(1 + s)^(3/2))"
+    );
+  }
+
+  #[test]
+  fn trig_polynomial_power_reduction() {
+    // Simplify[D[Sin[x]^10, {x, 4}]] should use double-angle forms
+    assert_eq!(
+      interpret("Simplify[D[Sin[x]^10, {x, 4}]]").unwrap(),
+      "10*(141 + 238*Cos[2*x] + 125*Cos[4*x])*Sin[x]^6"
+    );
+  }
+
+  #[test]
+  fn trig_polynomial_simple() {
+    assert_eq!(
+      interpret("Simplify[3*Cos[x]^2*Sin[x]^2 + Sin[x]^4]").unwrap(),
+      "(2 + Cos[2*x])*Sin[x]^2"
+    );
+  }
+
+  // A sum that combines into a single fraction must simplify to the same
+  // form as the already-combined spelling of the same value: the sum used to
+  // stop at `(12 - 8x)/13` (displayed `-((-12 + 8x)/13)`) while the quotient
+  // reached the content-extracted `(-4*(-3 + 2x))/13`.
+  #[test]
+  fn sum_and_quotient_spellings_agree() {
+    for spelling in [
+      "Simplify[12/13 - (8*x)/13]",
+      "Simplify[(12 - 8*x)/13]",
+      "Simplify[(24 - 16*x)/26]",
+      "Simplify[24/26 - (16*x)/26]",
+    ] {
+      assert_eq!(interpret(spelling).unwrap(), "(-4*(-3 + 2*x))/13");
+    }
+    assert_eq!(interpret("Simplify[3/2 + x/2]").unwrap(), "(3 + x)/2");
+    assert_eq!(interpret("Simplify[(3 + x)/2]").unwrap(), "(3 + x)/2");
+  }
+
+  #[test]
+  fn trig_polynomial_cos_dominant() {
+    assert_eq!(
+      interpret("Simplify[2*Cos[x]^4 - Cos[x]^2*Sin[x]^2]").unwrap(),
+      "(Cos[x]^2*(1 + 3*Cos[2*x]))/2"
+    );
+  }
+
+  #[test]
+  fn equation_algebraically_equal() {
+    // x^2 - y^2 == (x+y)(x-y) is always True
+    assert_eq!(
+      interpret("Simplify[x^2 - y^2 == (x + y)(x - y)]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn equation_expansion_equal() {
+    assert_eq!(
+      interpret("Simplify[(a + b)^2 == a^2 + 2 a b + b^2]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn equation_constant_difference_false() {
+    // x^2 == x^2 + 1 is always False
+    assert_eq!(interpret("Simplify[x^2 == x^2 + 1]").unwrap(), "False");
+  }
+
+  #[test]
+  fn equation_symbolic_stays_unevaluated() {
+    assert_eq!(interpret("Simplify[x == y]").unwrap(), "x == y");
+  }
+
+  // Simplify applies FactorSquareFree to polynomial sums, not Factor:
+  // square-free polynomials stay expanded even when the fully factored
+  // form has fewer leaves (wolframscript-verified; found by the
+  // differential fuzzer, seed 8250707).
+  #[test]
+  fn square_free_polynomials_stay_expanded() {
+    assert_eq!(
+      interpret("Simplify[-3 - 5 x + 2 x^2]").unwrap(),
+      "-3 - 5*x + 2*x^2"
+    );
+    assert_eq!(
+      interpret("Simplify[2 + 3 x + x^2]").unwrap(),
+      "2 + 3*x + x^2"
+    );
+    assert_eq!(interpret("Simplify[x^2 - 1]").unwrap(), "-1 + x^2");
+  }
+
+  #[test]
+  fn square_free_factorization_is_applied() {
+    assert_eq!(
+      interpret("Simplify[x^3 + 4 x^2 + 5 x + 2]").unwrap(),
+      "(1 + x)^2*(2 + x)"
+    );
+    // FactorSquareFree keeps the square-free base whole: (-1+x^2)^2,
+    // not (-1+x)^2*(1+x)^2.
+    assert_eq!(
+      interpret("Simplify[x^4 - 2 x^2 + 1]").unwrap(),
+      "(-1 + x^2)^2"
+    );
+    assert_eq!(interpret("Simplify[x + x^2]").unwrap(), "x*(1 + x)");
+    assert_eq!(interpret("Simplify[2 x + 2 x^2]").unwrap(), "2*x*(1 + x)");
+  }
+}
+
+mod factor {
+  use super::*;
+
+  #[test]
+  fn quadratic() {
+    assert_eq!(
+      interpret("Factor[x^2 + 3*x + 2]").unwrap(),
+      "(1 + x)*(2 + x)"
+    );
+  }
+
+  // General square-free factorization via Zassenhaus (mod-p Berlekamp +
+  // Hensel lifting); found by the differential fuzzer, which produced a
+  // product of two cubics that the cyclotomic/Kronecker paths missed.
+  #[test]
+  fn zassenhaus_products() {
+    assert_eq!(
+      interpret(
+        "Factor[Times[Plus[3, Times[-3, x], Power[x, 2], Power[x, 3]], Plus[2, Times[-2, x], Times[-4, Power[x, 2]], Times[-3, Power[x, 3]]]]]"
+      )
+      .unwrap(),
+      "-((3 - 3*x + x^2 + x^3)*(-2 + 2*x + 4*x^2 + 3*x^3))"
+    );
+    // Quartic times quadratic, both irreducible
+    assert_eq!(
+      interpret("Factor[(x^2 + 3)*(x^4 + x + 7)]").unwrap(),
+      "(3 + x^2)*(7 + x + x^4)"
+    );
+    // Non-monic factors
+    assert_eq!(
+      interpret("Factor[(2*x^2 + 3*x + 4)*(3*x^2 + x + 5)]").unwrap(),
+      "(4 + 3*x + 2*x^2)*(5 + x + 3*x^2)"
+    );
+    // Irreducible sextics and quartics stay whole
+    assert_eq!(
+      interpret("Factor[x^6 + 7*x^5 + 9*x^4 - 7*x^3 - 20*x^2 - 5*x + 12]")
+        .unwrap(),
+      "12 - 5*x - 20*x^2 - 7*x^3 + 9*x^4 + 7*x^5 + x^6"
+    );
+    assert_eq!(
+      interpret("Factor[x^4 + x^3 + x^2 + x + 73]").unwrap(),
+      "73 + x + x^2 + x^3 + x^4"
+    );
+  }
+
+  // Coefficients in the thousands push the Landau–Mignotte lift target
+  // past what the modulus cap used to allow, so these gave up and reported
+  // the sextic as irreducible. They are the minimal-polynomial candidates
+  // of square roots taken inside a cubic field, where each splits into a
+  // conjugate pair of cubics.
+  #[test]
+  fn large_coefficient_sextics() {
+    assert_eq!(
+      interpret("Factor[5184 x^6 - 153 x^4 + 130 x^2 - 9]").unwrap(),
+      "(3 + 2*x - 21*x^2 + 72*x^3)*(-3 + 2*x + 21*x^2 + 72*x^3)"
+    );
+    assert_eq!(
+      interpret("Factor[5184 x^6 - 18729 x^4 + 23992 x^2 - 8464]").unwrap(),
+      "(-92 + 260*x - 237*x^2 + 72*x^3)*(92 + 260*x + 237*x^2 + 72*x^3)"
+    );
+  }
+
+  // A bare monomial factor sorts against sum factors by the canonical
+  // Times rule (found by the differential fuzzer: the x used to trail).
+  #[test]
+  fn monomial_factor_position() {
+    for (input, expected) in [
+      ("Factor[x^3 + x^2 - x]", "x*(-1 + x + x^2)"),
+      ("Factor[x^5 + x^4 - x^3]", "x^3*(-1 + x + x^2)"),
+      // ... while the two-term negative-constant exception keeps the sum
+      // first, and sums keep their construction order among themselves
+      ("Factor[x^4 - x]", "(-1 + x)*x*(1 + x + x^2)"),
+      ("Factor[x^3 - 2*x^2 + x]", "(-1 + x)^2*x"),
+      ("Factor[x*y + y^2]", "y*(x + y)"),
+      ("Factor[x*y - y^2]", "(x - y)*y"),
+      (
+        "FactorList[x^3 + x^2 - x]",
+        "{{1, 1}, {x, 1}, {-1 + x + x^2, 1}}",
+      ),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn modulus_option_factors_over_gf_p() {
+    for (input, expected) in [
+      (
+        "Factor[x^5 + x + 1, Modulus -> 2]",
+        "(1 + x + x^2)*(1 + x^2 + x^3)",
+      ),
+      (
+        "Factor[x^8 + x^4 + 1, Modulus -> 3]",
+        "(1 + x)^2*(2 + x)^2*(1 + x^2)^2",
+      ),
+      (
+        "Factor[x^4 - 1, Modulus -> 5]",
+        "(1 + x)*(2 + x)*(3 + x)*(4 + x)",
+      ),
+      // A non-unit leading coefficient stays as a constant prefactor
+      ("Factor[2*x^4 + 2, Modulus -> 5]", "2*(2 + x^2)*(3 + x^2)"),
+      ("Factor[x^2 + x, Modulus -> 2]", "x*(1 + x)"),
+      // Equal-degree factors order by coefficients at the first differing
+      // monomial from the top (needs the sum-vs-sum Times ordering rule)
+      (
+        "Factor[x^9 + x, Modulus -> 3]",
+        "x*(2 + x^2 + x^4)*(2 + 2*x^2 + x^4)",
+      ),
+      // Repeated factors (including the derivative == 0 path f = g(x^p))
+      ("Factor[(x + 1)^4, Modulus -> 2]", "(1 + x)^4"),
+      ("Factor[x^6 + 1, Modulus -> 2]", "(1 + x)^2*(1 + x + x^2)^2"),
+      ("Factor[x^2, Modulus -> 2]", "x^2"),
+      // Constants reduce mod p
+      ("Factor[5, Modulus -> 3]", "2"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn difference_of_squares() {
+    assert_eq!(interpret("Factor[x^2 - 4]").unwrap(), "(-2 + x)*(2 + x)");
+  }
+
+  #[test]
+  fn with_common_factor() {
+    assert_eq!(
+      interpret("Factor[2*x^2 + 6*x + 4]").unwrap(),
+      "2*(1 + x)*(2 + x)"
+    );
+  }
+
+  #[test]
+  fn irreducible() {
+    assert_eq!(interpret("Factor[x^2 + 1]").unwrap(), "1 + x^2");
+  }
+
+  // Regression: non-monic quadratics with rational (non-integer) roots must
+  // factor via the rational-root theorem, ordering factors by leading
+  // coefficient like wolframscript.
+  #[test]
+  fn non_monic_quadratic_rational_roots() {
+    assert_eq!(
+      interpret("Factor[6*x^2 + 11*x + 3]").unwrap(),
+      "(3 + 2*x)*(1 + 3*x)"
+    );
+    assert_eq!(
+      interpret("Factor[4*x^2 - 9]").unwrap(),
+      "(-3 + 2*x)*(3 + 2*x)"
+    );
+    assert_eq!(
+      interpret("Factor[6*x^2 - x - 2]").unwrap(),
+      "(1 + 2*x)*(-2 + 3*x)"
+    );
+    assert_eq!(
+      interpret("Factor[10*x^2 + 11*x + 3]").unwrap(),
+      "(1 + 2*x)*(3 + 5*x)"
+    );
+    assert_eq!(
+      interpret("Factor[12*x^2 + 7*x + 1]").unwrap(),
+      "(1 + 3*x)*(1 + 4*x)"
+    );
+  }
+
+  // Regression: a non-monic cubic that splits into three linear factors.
+  #[test]
+  fn non_monic_cubic_rational_roots() {
+    assert_eq!(
+      interpret("Factor[6*x^3 + 11*x^2 + 6*x + 1]").unwrap(),
+      "(1 + x)*(1 + 2*x)*(1 + 3*x)"
+    );
+  }
+
+  // Regression: numeric content on top of a non-monic factorization.
+  #[test]
+  fn non_monic_with_numeric_content() {
+    assert_eq!(
+      interpret("Factor[12*x^2 + 22*x + 6]").unwrap(),
+      "2*(3 + 2*x)*(1 + 3*x)"
+    );
+  }
+
+  // Regression: a leading minus over a multi-factor product is wrapped by
+  // wolframscript as -((..)*(..)) and -(1 + x)^2, while a single irreducible
+  // factor is returned expanded.
+  #[test]
+  fn negative_leading_sign_factorizations() {
+    assert_eq!(
+      interpret("Factor[-x^2 - 5*x - 6]").unwrap(),
+      "-((2 + x)*(3 + x))"
+    );
+    assert_eq!(interpret("Factor[-(x + 1)^2]").unwrap(), "-(1 + x)^2");
+    assert_eq!(interpret("Factor[-x - 2]").unwrap(), "-2 - x");
+    assert_eq!(interpret("Factor[-x^2 - 1]").unwrap(), "-1 - x^2");
+    assert_eq!(
+      interpret("Factor[-6*x^2 - 11*x - 3]").unwrap(),
+      "-((3 + 2*x)*(1 + 3*x))"
+    );
+  }
+
+  #[test]
+  fn cubic() {
+    assert_eq!(
+      interpret("Factor[x^3 - 1]").unwrap(),
+      "(-1 + x)*(1 + x + x^2)"
+    );
+  }
+
+  #[test]
+  fn linear() {
+    assert_eq!(interpret("Factor[2*x + 4]").unwrap(), "2*(2 + x)");
+  }
+
+  #[test]
+  fn cyclotomic_x6_minus_1() {
+    assert_eq!(
+      interpret("Factor[x^6 - 1]").unwrap(),
+      "(-1 + x)*(1 + x)*(1 - x + x^2)*(1 + x + x^2)"
+    );
+  }
+
+  #[test]
+  fn cyclotomic_x12_minus_1() {
+    assert_eq!(
+      interpret("Factor[x^12 - 1]").unwrap(),
+      "(-1 + x)*(1 + x)*(1 + x^2)*(1 - x + x^2)*(1 + x + x^2)*(1 - x^2 + x^4)"
+    );
+  }
+
+  #[test]
+  fn cyclotomic_x100_minus_1() {
+    assert_eq!(
+      interpret("Factor[x^100 - 1]").unwrap(),
+      "(-1 + x)*(1 + x)*(1 + x^2)*(1 - x + x^2 - x^3 + x^4)*(1 + x + x^2 + x^3 + x^4)*(1 - x^2 + x^4 - x^6 + x^8)*(1 - x^5 + x^10 - x^15 + x^20)*(1 + x^5 + x^10 + x^15 + x^20)*(1 - x^10 + x^20 - x^30 + x^40)"
+    );
+  }
+
+  #[test]
+  fn irreducible_x4_plus_1() {
+    assert_eq!(interpret("Factor[x^4 + 1]").unwrap(), "1 + x^4");
+  }
+
+  #[test]
+  fn cyclotomic_x4_minus_1() {
+    assert_eq!(
+      interpret("Factor[x^4 - 1]").unwrap(),
+      "(-1 + x)*(1 + x)*(1 + x^2)"
+    );
+  }
+
+  #[test]
+  fn repeated_root_squared() {
+    assert_eq!(interpret("Factor[x^2 + 2*x + 1]").unwrap(), "(1 + x)^2");
+  }
+
+  #[test]
+  fn repeated_root_cubed() {
+    assert_eq!(
+      interpret("Factor[x^3 + 3*x^2 + 3*x + 1]").unwrap(),
+      "(1 + x)^3"
+    );
+  }
+
+  #[test]
+  fn factor_threads_over_list() {
+    // Factor is Listable — threads over list arguments.
+    assert_eq!(
+      interpret("Factor[{x + x^2, 2 x + 2 y + 2}]").unwrap(),
+      "{x*(1 + x), 2*(1 + x + y)}"
+    );
+  }
+
+  #[test]
+  fn factor_threads_over_equation() {
+    // Factor on an equation factors each side separately, matching
+    // wolframscript. Regression for mathics algebra.py:1393.
+    assert_eq!(
+      interpret("x^2 - x == 0 // Factor").unwrap(),
+      "(-1 + x)*x == 0"
+    );
+  }
+
+  #[test]
+  fn factor_orders_sum_factors_by_ascending_degree() {
+    // wolframscript lists sum factors ascending by degree, also inside a
+    // negated product (wolframscript-verified; found by the differential
+    // fuzzer, seed 8250707).
+    assert_eq!(
+      interpret("Factor[(-5 + 2 x - x^2 - x^3)*(-4 - 2 x + 5 x^2 + 3 x^3)]")
+        .unwrap(),
+      "-((1 + x)*(-4 + 2*x + 3*x^2)*(5 - 2*x + x^2 + x^3))"
+    );
+  }
+}
+
+mod factor_multivariate {
+  use super::*;
+
+  #[test]
+  fn bivariate_perfect_square() {
+    assert_eq!(interpret("Factor[x^2 + 2*x*y + y^2]").unwrap(), "(x + y)^2");
+  }
+
+  #[test]
+  fn bivariate_difference_of_squares() {
+    assert_eq!(interpret("Factor[x^2 - y^2]").unwrap(), "(x - y)*(x + y)");
+  }
+
+  #[test]
+  fn common_variable_factor() {
+    assert_eq!(interpret("Factor[x^2*y + x*y^2]").unwrap(), "x*y*(x + y)");
+  }
+
+  #[test]
+  fn negative_monomial_keeps_sign() {
+    // A single monomial has no nontrivial factorization; the multivariate
+    // content-extraction used to drop the leading sign (`-2 a x` → `2 a x`).
+    assert_eq!(interpret("Factor[-2 a x]").unwrap(), "-2*a*x");
+    assert_eq!(interpret("Factor[-6 x y]").unwrap(), "-6*x*y");
+  }
+
+  #[test]
+  fn imaginary_monomial_keeps_sign() {
+    // The imaginary unit parses as a symbol, so `-2 I x` was a two-"variable"
+    // monomial that hit the same sign-dropping bug, yielding `(2 I) x`.
+    assert_eq!(interpret("Factor[-2 I x]").unwrap(), "(-2*I)*x");
+    assert_eq!(interpret("Factor[-I x]").unwrap(), "-I*x");
+    assert_eq!(interpret("Factor[-3 I x^2]").unwrap(), "(-3*I)*x^2");
+  }
+
+  #[test]
+  fn laurent_product_keeps_denominator() {
+    // Expanding `a (1/b + 1/c)` yields the Laurent form `a/b + a/c`, which the
+    // polynomial factorer mishandled by dropping `1/(b c)` and returning the
+    // wrong value `a (b + c)`. Together first, then factor num/den.
+    assert_eq!(
+      interpret("Factor[a (1/b + 1/c)]").unwrap(),
+      "(a*(b + c))/(b*c)"
+    );
+    // Simplify keeps the leaf-smaller uncombined form (matching wolframscript);
+    // the point is that it no longer returns the *wrong* value `a (b + c)`.
+    assert_eq!(
+      interpret("Simplify[a (1/b + 1/c)]").unwrap(),
+      "a*(b^(-1) + c^(-1))"
+    );
+  }
+
+  #[test]
+  fn perfect_cube() {
+    assert_eq!(
+      interpret("Factor[x^3 + 3*x^2*y + 3*x*y^2 + y^3]").unwrap(),
+      "(x + y)^3"
+    );
+  }
+
+  #[test]
+  fn target_expression() {
+    assert_eq!(
+      interpret("Factor[Expand[Expand[(x + y)^2 + 9(2 + x)(x + y)]^3]]")
+        .unwrap(),
+      "(x + y)^3*(18 + 10*x + y)^3"
+    );
+  }
+
+  #[test]
+  fn irreducible_sum_of_squares() {
+    assert_eq!(interpret("Factor[x^2 + y^2]").unwrap(), "x^2 + y^2");
+  }
+
+  #[test]
+  fn with_numeric_gcd() {
+    assert_eq!(
+      interpret("Factor[6*x^2 + 12*x*y + 6*y^2]").unwrap(),
+      "6*(x + y)^2"
+    );
+  }
+
+  // Factor's internal grouping previously used a single-variable-first
+  // sort that doesn't match Wolfram's canonical Times order, so e.g.
+  // `Factor[x*a == x*b + x*c]` would emit `x*(b + c)` instead of
+  // `(b + c)*x`. The result now flows through `times_ast` so factors are
+  // canonically ordered.
+  #[test]
+  fn equation_canonical_factor_order() {
+    assert_eq!(
+      interpret("Factor[x a == x b + x c]").unwrap(),
+      "a*x == (b + c)*x"
+    );
+  }
+
+  // Regression: Factor[x^10 - y^10] used to time out (Kronecker
+  // substitution produced a degree-110 sparse polynomial that
+  // factor_integer_poly tried every cyclotomic divisor against). The
+  // homogeneous-binomial fast path emits the cyclotomic decomposition
+  // directly.
+  #[test]
+  fn x10_minus_y10_homogeneous() {
+    assert_eq!(
+      interpret("Factor[x^10 - y^10]").unwrap(),
+      "(x - y)*(x + y)*(x^4 - x^3*y + x^2*y^2 - x*y^3 + y^4)*(x^4 + x^3*y + x^2*y^2 + x*y^3 + y^4)"
+    );
+  }
+
+  #[test]
+  fn x6_minus_y6_homogeneous() {
+    assert_eq!(
+      interpret("Factor[x^6 - y^6]").unwrap(),
+      "(x - y)*(x + y)*(x^2 - x*y + y^2)*(x^2 + x*y + y^2)"
+    );
+  }
+
+  #[test]
+  fn x4_minus_y4_homogeneous() {
+    assert_eq!(
+      interpret("Factor[x^4 - y^4]").unwrap(),
+      "(x - y)*(x + y)*(x^2 + y^2)"
+    );
+  }
+
+  #[test]
+  fn x8_minus_y8_homogeneous() {
+    assert_eq!(
+      interpret("Factor[x^8 - y^8]").unwrap(),
+      "(x - y)*(x + y)*(x^2 + y^2)*(x^4 + y^4)"
+    );
+  }
+
+  #[test]
+  fn x12_minus_y12_homogeneous() {
+    assert_eq!(
+      interpret("Factor[x^12 - y^12]").unwrap(),
+      "(x - y)*(x + y)*(x^2 + y^2)*(x^2 - x*y + y^2)*(x^2 + x*y + y^2)*(x^4 - x^2*y^2 + y^4)"
+    );
+  }
+
+  // x^n + y^n should still factor for composite n (e.g. n = 6).
+  #[test]
+  fn x6_plus_y6_homogeneous() {
+    assert_eq!(
+      interpret("Factor[x^6 + y^6]").unwrap(),
+      "(x^2 + y^2)*(x^4 - x^2*y^2 + y^4)"
+    );
+  }
+
+  // Regression: the multivariate content extraction dropped the sign of the
+  // integer content, yielding `4*(-x^2 + x*y - y^2)` instead of the
+  // wolframscript form `-4*(x^2 - x*y + y^2)`. The content carries the sign
+  // of the highest total-degree term (FactorTerms rule), and for |content|
+  // > 1 the negative integer stays a standalone factor instead of being
+  // absorbed into a polynomial factor.
+  #[test]
+  fn negative_integer_content_keeps_sign() {
+    assert_eq!(
+      interpret("Factor[-4*y^2 + 4*x*y - 4*x^2]").unwrap(),
+      "-4*(x^2 - x*y + y^2)"
+    );
+    assert_eq!(
+      interpret("Factor[4*y^2 - 4*x*y + 4*x^2]").unwrap(),
+      "4*(x^2 - x*y + y^2)"
+    );
+    assert_eq!(
+      interpret("Factor[-4*y^2 + 4*x*y + 4*x^2]").unwrap(),
+      "4*(x^2 + x*y - y^2)"
+    );
+  }
+}
+
+mod factor_list {
+  use super::*;
+
+  #[test]
+  fn cubic() {
+    assert_eq!(
+      interpret("FactorList[x^3 - 1]").unwrap(),
+      "{{1, 1}, {-1 + x, 1}, {1 + x + x^2, 1}}"
+    );
+  }
+
+  #[test]
+  fn with_numeric_coefficient() {
+    assert_eq!(
+      interpret("FactorList[2*x^2 + 4*x + 2]").unwrap(),
+      "{{2, 1}, {1 + x, 2}}"
+    );
+  }
+
+  /// wolframscript normalises every factor to a positive leading
+  /// coefficient and moves the sign into the unit entry. A factor whose
+  /// numeric content is ±1 — `Factor[-(1 + x)]` is the bare sum `-1 - x` —
+  /// used to keep the sign, giving `{{1, 1}, {-1 - x, 1}}`. Found by the
+  /// differential fuzzer.
+  #[test]
+  fn unit_content_moves_into_the_unit_entry() {
+    assert_eq!(
+      interpret("FactorList[-(1 + x)]").unwrap(),
+      "{{-1, 1}, {1 + x, 1}}"
+    );
+    assert_eq!(
+      interpret("FactorList[1 - x]").unwrap(),
+      "{{-1, 1}, {-1 + x, 1}}"
+    );
+    assert_eq!(
+      interpret("FactorList[2 - x]").unwrap(),
+      "{{-1, 1}, {-2 + x, 1}}"
+    );
+    assert_eq!(
+      interpret("FactorList[-x - y]").unwrap(),
+      "{{-1, 1}, {x + y, 1}}"
+    );
+    assert_eq!(
+      interpret("FactorList[-x^2 - x - 1]").unwrap(),
+      "{{-1, 1}, {1 + x + x^2, 1}}"
+    );
+    assert_eq!(
+      interpret("FactorList[-1/2 - x/2]").unwrap(),
+      "{{-1, 1}, {2, -1}, {1 + x, 1}}"
+    );
+  }
+
+  /// An even exponent absorbs the sign, so only odd multiplicities flip
+  /// the unit: `-(1 + x)^2` keeps its `-1`, `(-(1 + x))^2` has none.
+  #[test]
+  fn even_exponents_absorb_the_sign() {
+    assert_eq!(
+      interpret("FactorList[-(1 + x)^2]").unwrap(),
+      "{{-1, 1}, {1 + x, 2}}"
+    );
+    assert_eq!(
+      interpret("FactorList[(-(1 + x))^2]").unwrap(),
+      "{{1, 1}, {1 + x, 2}}"
+    );
+    assert_eq!(
+      interpret("FactorList[-(1 + x)^3]").unwrap(),
+      "{{-1, 1}, {1 + x, 3}}"
+    );
+  }
+
+  /// A denominator factor is normalised too, and its negative exponent is
+  /// odd, so it flips the unit as well.
+  #[test]
+  fn denominator_factors_are_normalised() {
+    assert_eq!(
+      interpret("FactorList[-(1 + x)/(2 + x)]").unwrap(),
+      "{{-1, 1}, {1 + x, 1}, {2 + x, -1}}"
+    );
+    assert_eq!(
+      interpret("FactorList[(1 + x)/(-2 - x)]").unwrap(),
+      "{{-1, 1}, {1 + x, 1}, {2 + x, -1}}"
+    );
+  }
+
+  #[test]
+  fn modulus_option_factors_over_gf_p() {
+    for (input, expected) in [
+      (
+        "FactorList[x^8 + x^4 + 1, Modulus -> 3]",
+        "{{1, 1}, {1 + x, 2}, {2 + x, 2}, {1 + x^2, 2}}",
+      ),
+      (
+        "FactorList[x^5 + x + 1, Modulus -> 2]",
+        "{{1, 1}, {1 + x + x^2, 1}, {1 + x^2 + x^3, 1}}",
+      ),
+      (
+        "FactorList[2*x^4 + 2, Modulus -> 5]",
+        "{{2, 1}, {2 + x^2, 1}, {3 + x^2, 1}}",
+      ),
+      ("FactorList[5, Modulus -> 3]", "{{2, 1}}"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn irreducible() {
+    assert_eq!(
+      interpret("FactorList[x^2 + 1]").unwrap(),
+      "{{1, 1}, {1 + x^2, 1}}"
+    );
+  }
+
+  #[test]
+  fn constant() {
+    assert_eq!(interpret("FactorList[6]").unwrap(), "{{6, 1}}");
+  }
+
+  #[test]
+  fn quartic() {
+    assert_eq!(
+      interpret("FactorList[x^4 - 1]").unwrap(),
+      "{{1, 1}, {-1 + x, 1}, {1 + x, 1}, {1 + x^2, 1}}"
+    );
+  }
+
+  #[test]
+  fn repeated_root() {
+    assert_eq!(
+      interpret("FactorList[x^3 + 3*x^2 + 3*x + 1]").unwrap(),
+      "{{1, 1}, {1 + x, 3}}"
+    );
+  }
+
+  #[test]
+  fn quadratic() {
+    assert_eq!(
+      interpret("FactorList[x^2 + 3*x + 2]").unwrap(),
+      "{{1, 1}, {1 + x, 1}, {2 + x, 1}}"
+    );
+  }
+
+  #[test]
+  fn rational_number() {
+    // A rational splits into numerator/denominator entries (kept whole, not
+    // prime-factored): {p, 1} then {q, -1}.
+    assert_eq!(interpret("FactorList[3/4]").unwrap(), "{{3, 1}, {4, -1}}");
+    assert_eq!(interpret("FactorList[6/35]").unwrap(), "{{6, 1}, {35, -1}}");
+    // A unit numerator is elided.
+    assert_eq!(interpret("FactorList[1/2]").unwrap(), "{{2, -1}}");
+    // The sign rides on the numerator.
+    assert_eq!(interpret("FactorList[-3/4]").unwrap(), "{{-3, 1}, {4, -1}}");
+    assert_eq!(interpret("FactorList[-1/2]").unwrap(), "{{-1, 1}, {2, -1}}");
+  }
+
+  #[test]
+  fn negative_integer_constant() {
+    assert_eq!(interpret("FactorList[-6]").unwrap(), "{{-6, 1}}");
+    assert_eq!(interpret("FactorList[-1]").unwrap(), "{{-1, 1}}");
+  }
+
+  #[test]
+  fn rational_function() {
+    // Denominator factors carry negative exponents and come after the
+    // numerator factors.
+    assert_eq!(
+      interpret("FactorList[(x^2 - 1)/(x + 2)]").unwrap(),
+      "{{1, 1}, {-1 + x, 1}, {1 + x, 1}, {2 + x, -1}}"
+    );
+    // The rational content becomes the leading {q, -1} entry.
+    assert_eq!(
+      interpret("FactorList[(x^2 - 1)/2]").unwrap(),
+      "{{2, -1}, {-1 + x, 1}, {1 + x, 1}}"
+    );
+    // Numerator content + numerator/denominator polynomial factors.
+    assert_eq!(
+      interpret("FactorList[6*(x - 1)/(x + 2)]").unwrap(),
+      "{{6, 1}, {-1 + x, 1}, {2 + x, -1}}"
+    );
+    // A pure reciprocal polynomial: all factors in the denominator.
+    assert_eq!(
+      interpret("FactorList[2/(x^2 - 1)]").unwrap(),
+      "{{2, 1}, {-1 + x, -1}, {1 + x, -1}}"
+    );
+  }
+}
+
+mod cancel {
+  use super::*;
+
+  // A function call that appears only on one side of the quotient is a
+  // coefficient for the polynomial engine, exactly like a plain symbol
+  // (wolframscript-verified).
+  #[test]
+  fn cancel_with_call_coefficients() {
+    assert_eq!(
+      interpret("Cancel[(-1 + f[a] + z - 2 f[a] z + f[a] z^2)/((-1 + z) z)]")
+        .unwrap(),
+      "(1 - f[a] + z*f[a])/z"
+    );
+    assert_eq!(
+      interpret("Cancel[(-1 + s[1] + z - 2 s[1] z + s[1] z^2)/((-1 + z) z)]")
+        .unwrap(),
+      "(1 - s[1] + z*s[1])/z"
+    );
+  }
+
+  #[test]
+  fn cancel_simple() {
+    assert_eq!(interpret("Cancel[(x^2 - 1)/(x - 1)]").unwrap(), "1 + x");
+  }
+
+  // Cancel keeps quotient numerators EXPANDED, pulling out only their
+  // numeric content — unlike Simplify, which factors them. A bare
+  // negative-constant denominator absorbs its sign into the numerator.
+  // (differential fuzzer, seed 1783537668073123846; wolframscript-verified)
+  #[test]
+  fn cancel_keeps_numerator_expanded() {
+    assert_eq!(
+      interpret(
+        "Cancel[Divide[Plus[0, Times[4, x], Times[2, Power[x, 2]]], \
+         Plus[-3, Times[-4, x], Times[2, Power[x, 2]]]]]"
+      )
+      .unwrap(),
+      "(2*(2*x + x^2))/(-3 - 4*x + 2*x^2)"
+    );
+    assert_eq!(
+      interpret("Cancel[(4 x^2 - 2 x)/(2 + 3 x)]").unwrap(),
+      "(2*(-x + 2*x^2))/(2 + 3*x)"
+    );
+    assert_eq!(
+      interpret("Cancel[Divide[Plus[0, x, Power[x, 2]], -3]]").unwrap(),
+      "(-x - x^2)/3"
+    );
+    assert_eq!(
+      interpret("Cancel[(x^2 + x)/(3 + x)]").unwrap(),
+      "(x + x^2)/(3 + x)"
+    );
+    // The perfect-power denominator collapse is kept.
+    assert_eq!(
+      interpret("Cancel[x^2/(1 - 3 x + 3 x^2 - x^3)]").unwrap(),
+      "-(x^2/(-1 + x)^3)"
+    );
+  }
+
+  #[test]
+  fn cancel_cubic() {
+    assert_eq!(interpret("Cancel[(x^3 - x)/(x^2 - 1)]").unwrap(), "x");
+  }
+
+  /// A quotient whose "variables" are opaque subexpressions — an applied
+  /// function, a part extraction, a transcendental call — cancels the same
+  /// way it would with plain symbols in their place. The polynomial gcd
+  /// only knows how to take a symbol as a variable, so these are
+  /// abstracted into stand-in symbols first and put back afterwards
+  /// (`opaque_atoms`); without that, such a quotient came back untouched.
+  #[test]
+  fn cancel_over_opaque_subexpressions() {
+    for (code, expected) in [
+      ("Cancel[(f[1]*f[2] - f[2]^2)/(f[1] - f[2])]", "f[2]"),
+      ("Cancel[(q[[1]]^2 - 1)/(q[[1]] - 1)]", "1 + q[[1]]"),
+      ("Cancel[(Log[x]^2 - 1)/(Log[x] - 1)]", "1 + Log[x]"),
+      ("Simplify[(f[1]*f[2] - f[2]^2)/(f[1] - f[2])]", "f[2]"),
+      ("Simplify[(Log[x]^2 - 1)/(Log[x] - 1)]", "1 + Log[x]"),
+      ("Simplify[Sin[x]/(2*Sin[x])]", "1/2"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn cancel_symbolic_common_factor() {
+    assert_eq!(interpret("Cancel[(a*b)/(a*c)]").unwrap(), "b/c");
+  }
+
+  #[test]
+  fn cancel_symbolic_powers() {
+    assert_eq!(interpret("Cancel[(a^2*b)/(a*b^2)]").unwrap(), "a/b");
+  }
+
+  #[test]
+  fn cancel_numeric_content() {
+    assert_eq!(interpret("Cancel[(2*x)/(4*x)]").unwrap(), "1/2");
+  }
+
+  #[test]
+  fn cancel_mixed_symbolic_and_poly() {
+    assert_eq!(interpret("Cancel[(a*b*x)/(a*c*x^2)]").unwrap(), "b/(c*x)");
+  }
+
+  #[test]
+  fn cancel_quadratic() {
+    assert_eq!(
+      interpret("Cancel[(x^2 + 2*x + 1)/(x + 1)]").unwrap(),
+      "1 + x"
+    );
+  }
+
+  /// Regression test for issue #93: Cancel must handle canonical
+  /// Times[Power[]] form identically to Divide form
+  #[test]
+  fn cancel_canonical_times_power_form() {
+    // Both forms must produce the same result
+    assert_eq!(interpret("Cancel[(x^2 - 1)/(x - 1)]").unwrap(), "1 + x");
+    assert_eq!(
+      interpret("Cancel[(x^2 - 1) * (x - 1)^-1]").unwrap(),
+      "1 + x"
+    );
+  }
+
+  // Cancel keeps an all-negative numerator inline where Simplify would
+  // pull -(...) out front (differential fuzzer, seed 8887;
+  // wolframscript-verified).
+  #[test]
+  fn cancel_keeps_negative_content_numerator() {
+    assert_eq!(
+      interpret("Cancel[(-5 - 2 x - 4 x^2)/(3 + 2 x^2 + 5 x^3)]").unwrap(),
+      "(-5 - 2*x - 4*x^2)/(3 + 2*x^2 + 5*x^3)"
+    );
+    // Simplify's minus-extraction on the same input is unchanged.
+    assert_eq!(
+      interpret("Simplify[(-5 - 2 x - 4 x^2)/(3 + 2 x^2 + 5 x^3)]").unwrap(),
+      "-((5 + 2*x + 4*x^2)/(3 + 2*x^2 + 5*x^3))"
+    );
+  }
+
+  // A flipped denominator leaves its integer content behind as a plain
+  // numeric factor, raised to the factor's power; a unit-monomial
+  // numerator hoists it into a rational prefactor
+  // (wolframscript-verified).
+  #[test]
+  fn cancel_flipped_denominator_content_forms() {
+    assert_eq!(interpret("Cancel[x/(2 - 2 x)]").unwrap(), "-1/2*x/(-1 + x)");
+    assert_eq!(
+      interpret("Cancel[(x/2)/(1 - x)]").unwrap(),
+      "-1/2*x/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Cancel[(x y)/(2 - 2 x)]").unwrap(),
+      "-1/2*(x*y)/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Cancel[(3 - 5 x)/(2 - 2 x)]").unwrap(),
+      "(-3 + 5*x)/(2*(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Cancel[(3 - 5 x)/(4 - 6 x)]").unwrap(),
+      "(-3 + 5*x)/(2*(-2 + 3*x))"
+    );
+    assert_eq!(
+      interpret("Cancel[(5 x)/(2 - 2 x)]").unwrap(),
+      "(-5*x)/(2*(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Cancel[(5 x)/(1 - 5 x)]").unwrap(),
+      "(-5*x)/(-1 + 5*x)"
+    );
+    // Content leaves a power as content^exp; even powers keep the sign.
+    assert_eq!(
+      interpret("Cancel[x/(2 - 2 x)^2]").unwrap(),
+      "x/(4*(-1 + x)^2)"
+    );
+    assert_eq!(
+      interpret("Cancel[x/(2 - 2 x)^3]").unwrap(),
+      "-1/8*x/(-1 + x)^3"
+    );
+  }
+
+  // Shared integer content cancels; the numerator keeps its sign as long
+  // as the denominator's leading coefficient is already positive
+  // (wolframscript-verified).
+  #[test]
+  fn integer_content_cancels_without_sign_flip() {
+    assert_eq!(
+      interpret("Cancel[(2 - 4 x)/(2 + 2 x)]").unwrap(),
+      "(1 - 2*x)/(1 + x)"
+    );
+    assert_eq!(
+      interpret("Cancel[(2 - 4 x)/(-2 + 2 x)]").unwrap(),
+      "(1 - 2*x)/(-1 + x)"
+    );
+    assert_eq!(interpret("Cancel[(2 - 4 x)/2]").unwrap(), "1 - 2*x");
+  }
+
+  // wolframscript's Cancel canonicalizes the quotient so the denominator's
+  // leading (highest-degree) coefficient is positive, the numerator
+  // absorbing the sign; bare reciprocals are exempt.
+  #[test]
+  fn quotient_denominator_sign_canonicalization() {
+    assert_eq!(
+      interpret("Cancel[(-4 - 3 x^2)/(4 + x - 4 x^2)]").unwrap(),
+      "(4 + 3*x^2)/(-4 - x + 4*x^2)"
+    );
+    assert_eq!(
+      interpret("Cancel[(2 - 4 x)/(2 - 2 x)]").unwrap(),
+      "(-1 + 2*x)/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Cancel[(1 + x)/(1 - x)]").unwrap(),
+      "(-1 - x)/(-1 + x)"
+    );
+    assert_eq!(interpret("Cancel[x/(1 - x)]").unwrap(), "-(x/(-1 + x))");
+    assert_eq!(interpret("Cancel[2/(2 - 2 x)]").unwrap(), "(1 - x)^(-1)");
+    assert_eq!(interpret("Cancel[1/(1 - x)]").unwrap(), "(1 - x)^(-1)");
+  }
+
+  // Regression (diff-fuzz seed 1783624199336595105): a reciprocal whose
+  // numerator cancels to 1 over a denominator carrying integer content
+  // keeps the content as a rational coefficient — 1/(2*(-1+2*x)), never
+  // (2*(-1+2*x))^(-1) — and a bare -1 numerator folds into a sum
+  // denominator: -1/(1+x) → (-1-x)^(-1). All wolframscript-verified.
+  #[test]
+  fn unit_numerator_reciprocal_forms() {
+    // Integer content stays a rational coefficient, not inside the power.
+    assert_eq!(
+      interpret("Cancel[-1/(2 - 4 x)]").unwrap(),
+      "1/(2*(-1 + 2*x))"
+    );
+    assert_eq!(
+      interpret("Cancel[-1/(3 - 6 x)]").unwrap(),
+      "1/(3*(-1 + 2*x))"
+    );
+    // A bare -1 numerator folds into a sum denominator.
+    assert_eq!(interpret("Cancel[-1/(1 + x)]").unwrap(), "(-1 - x)^(-1)");
+    assert_eq!(interpret("Cancel[-1/(2 + x)]").unwrap(), "(-2 - x)^(-1)");
+    assert_eq!(interpret("Cancel[-1/(x + y)]").unwrap(), "(-x - y)^(-1)");
+    assert_eq!(interpret("Cancel[-1/(-1 + x)]").unwrap(), "(1 - x)^(-1)");
+    assert_eq!(interpret("Together[-1/(1 + x)]").unwrap(), "(-1 - x)^(-1)");
+    // Boundaries: a product denominator keeps its rational coefficient, a
+    // non-unit numerator is untouched, and Simplify does NOT fold.
+    assert_eq!(interpret("Cancel[-1/(2 + 2 x)]").unwrap(), "-1/2*1/(1 + x)");
+    assert_eq!(interpret("Cancel[-2/(1 + x)]").unwrap(), "-2/(1 + x)");
+    assert_eq!(interpret("Simplify[-1/(1 + x)]").unwrap(), "-(1 + x)^(-1)");
+  }
+
+  // A unit numerator has nothing to cancel: the fraction returns unchanged,
+  // keeping factored denominators factored and expanded ones expanded
+  // (differential fuzzer, seed 7037214829039037119; all
+  // wolframscript-verified).
+  #[test]
+  fn unit_numerator_returns_input_unchanged() {
+    assert_eq!(interpret("Cancel[1/(2 + 2 x)]").unwrap(), "(2 + 2*x)^(-1)");
+    assert_eq!(interpret("Cancel[1/(2 - 2 x)]").unwrap(), "(2 - 2*x)^(-1)");
+    assert_eq!(interpret("Cancel[1/(x^2 - x)]").unwrap(), "(-x + x^2)^(-1)");
+    assert_eq!(
+      interpret("Cancel[1/((x - 1) (x + 1))]").unwrap(),
+      "1/((-1 + x)*(1 + x))"
+    );
+    assert_eq!(interpret("Cancel[1/(x (x + 1))]").unwrap(), "1/(x*(1 + x))");
+    // A nested fraction bypasses the unit-numerator shortcut (and stays
+    // in wolframscript's uncombined display).
+    assert_eq!(
+      interpret("Cancel[1/(x + 1/x)]").unwrap(),
+      "(x^(-1) + x)^(-1)"
+    );
+  }
+
+  // With a non-unit numerator the result denominator presents with its
+  // content hoisted, and an untouched factored input keeps its shape
+  // (wolframscript-verified).
+  #[test]
+  fn denominator_content_hoisted() {
+    assert_eq!(
+      interpret("Cancel[(x + 1)/(4 x + 5 x^2)]").unwrap(),
+      "(1 + x)/(x*(4 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Cancel[2/(4 x + 5 x^2)]").unwrap(),
+      "2/(x*(4 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Cancel[(x + 2)/(x^2 - x)]").unwrap(),
+      "(2 + x)/((-1 + x)*x)"
+    );
+    assert_eq!(
+      interpret("Cancel[(x + 1)/(x^2 + x^4)]").unwrap(),
+      "(1 + x)/(x^2*(1 + x^2))"
+    );
+    assert_eq!(
+      interpret("Cancel[(x + 1)/((x - 1) (x + 2))]").unwrap(),
+      "(1 + x)/((-1 + x)*(2 + x))"
+    );
+    assert_eq!(
+      interpret("Cancel[x/(4 x^2 + 4 x^3)]").unwrap(),
+      "1/(4*x*(1 + x))"
+    );
+    // A single-Plus (or power-of-one) denominator keeps cancel's own sign
+    // normalization instead of preserving the input shape.
+    assert_eq!(
+      interpret("Cancel[2/(1 - 2 x)^2]").unwrap(),
+      "2/(-1 + 2*x)^2"
+    );
+  }
+}
+
+mod expand_modulus {
+  use super::*;
+
+  #[test]
+  fn modulus_3() {
+    assert_eq!(
+      interpret("Expand[(1 + a)^12, Modulus -> 3]").unwrap(),
+      "1 + a^3 + a^9 + a^12"
+    );
+  }
+
+  #[test]
+  fn modulus_4() {
+    assert_eq!(
+      interpret("Expand[(1 + a)^12, Modulus -> 4]").unwrap(),
+      "1 + 2*a^2 + 3*a^4 + 3*a^8 + 2*a^10 + a^12"
+    );
+  }
+
+  #[test]
+  fn modulus_simple() {
+    assert_eq!(
+      interpret("Expand[(1 + a)^3, Modulus -> 3]").unwrap(),
+      "1 + a^3"
+    );
+  }
+
+  #[test]
+  fn trig_sin_sum() {
+    assert_eq!(
+      interpret("Expand[Sin[x + y], Trig -> True]").unwrap(),
+      "Cos[y]*Sin[x] + Cos[x]*Sin[y]"
+    );
+  }
+
+  #[test]
+  fn trig_tanh_sum() {
+    assert_eq!(
+      interpret("Expand[Tanh[x + y], Trig -> True]").unwrap(),
+      "(Cosh[y]*Sinh[x])/(Cosh[x]*Cosh[y] + Sinh[x]*Sinh[y]) + (Cosh[x]*Sinh[y])/(Cosh[x]*Cosh[y] + Sinh[x]*Sinh[y])"
+    );
+  }
+}
+
+mod expand_all {
+  use super::*;
+
+  #[test]
+  fn expand_all_basic() {
+    assert_eq!(
+      interpret("ExpandAll[x*(x + 1)^2]").unwrap(),
+      "x + 2*x^2 + x^3"
+    );
+  }
+
+  #[test]
+  fn expand_all_expands_denominator() {
+    // ExpandAll expands both the numerator and the denominator. Regression
+    // for mathics algebra.py:1229.
+    assert_eq!(
+      interpret("ExpandAll[(a + b) ^ 2 / (c + d)^2]").unwrap(),
+      "a^2/(c^2 + 2*c*d + d^2) + (2*a*b)/(c^2 + 2*c*d + d^2) \
+       + b^2/(c^2 + 2*c*d + d^2)"
+    );
+  }
+
+  #[test]
+  fn expand_all_with_modulus_reduces_denominator() {
+    // ExpandAll now accepts a Modulus option (like Expand) and applies the
+    // reduction to coefficients in both numerator and denominator
+    // subexpressions. Here `3*x^2*y` and `3*x*y^2` drop out of `(x+y)^3`
+    // mod 3, leaving just `x^3 + y^3`. wolframscript keeps the resulting
+    // fraction together (rather than distributing each numerator term over
+    // the denominator) when a Modulus is supplied.
+    assert_eq!(
+      interpret("ExpandAll[(1 + a) ^ 6 / (x + y)^3, Modulus -> 3]").unwrap(),
+      "(1 + 2*a^3 + a^6)/(x^3 + y^3)"
+    );
+  }
+}
+
+mod collect_tests {
+  use super::*;
+
+  #[test]
+  fn collect_basic() {
+    assert_eq!(interpret("Collect[x*y + x*z, x]").unwrap(), "x*(y + z)");
+  }
+
+  // Collecting with respect to a bare number is a no-op: the expression is
+  // returned unchanged, rather than staying unevaluated.
+  #[test]
+  fn collect_by_number_returns_expression() {
+    assert_eq!(interpret("Collect[x^2, 5]").unwrap(), "x^2");
+    assert_eq!(interpret("Collect[a x + b x, 5]").unwrap(), "a*x + b*x");
+    assert_eq!(interpret("Collect[x^2, 2.5]").unwrap(), "x^2");
+    assert_eq!(interpret("Collect[x^2 + x, 0]").unwrap(), "x + x^2");
+  }
+
+  #[test]
+  fn collect_constant_after_collect_variable() {
+    // A bare-symbol constant term that sorts after the collect variable must
+    // be placed last, matching wolframscript's canonical order, e.g.
+    // `Collect[x^3 + y + x, x]` → `x + x^3 + y` (not `y + x + x^3`).
+    assert_eq!(interpret("Collect[x^3 + y + x, x]").unwrap(), "x + x^3 + y");
+    assert_eq!(
+      interpret("Collect[x^2 + 2 x^2 + y, x]").unwrap(),
+      "3*x^2 + y"
+    );
+    assert_eq!(
+      interpret("Collect[x^3 + y + x^2, x]").unwrap(),
+      "x^2 + x^3 + y"
+    );
+    // A constant that sorts before the collect variable still leads.
+    assert_eq!(interpret("Collect[z + x + x^2, x]").unwrap(), "x + x^2 + z");
+    assert_eq!(interpret("Collect[x^2 + a, x]").unwrap(), "a + x^2");
+  }
+
+  #[test]
+  fn collect_compound_target_function() {
+    // Collect accepts a compound target like q[x] as the variable.
+    assert_eq!(
+      interpret("Collect[q[x] + q[x] q[y], q[x]]").unwrap(),
+      "q[x]*(1 + q[y])"
+    );
+  }
+
+  #[test]
+  fn collect_compound_target_with_constant() {
+    // When the compound target only appears linearly with no other copies,
+    // Collect returns the sum unchanged (with canonical term ordering).
+    assert_eq!(
+      interpret("Collect[q[0, x] q[0, y] + 1, q[0, x]]").unwrap(),
+      "1 + q[0, x]*q[0, y]"
+    );
+  }
+
+  #[test]
+  fn collect_symbolic_coefficients() {
+    // Coefficients with variables before the collect variable go first
+    assert_eq!(
+      interpret("Collect[a*x^2 + b*x + c*x^2 + d*x, x]").unwrap(),
+      "(b + d)*x + (a + c)*x^2"
+    );
+  }
+
+  #[test]
+  fn collect_mixed_coefficients() {
+    // Coefficient (2+y) has y > x alphabetically, so x goes first
+    assert_eq!(
+      interpret("Collect[x*y + 2*x + 3*y + 6, x]").unwrap(),
+      "6 + 3*y + x*(2 + y)"
+    );
+  }
+
+  #[test]
+  fn collect_with_constant_term() {
+    assert_eq!(
+      interpret("Collect[a*x^2 + b*x^2 + c*x + d*x + e, x]").unwrap(),
+      "e + (c + d)*x + (a + b)*x^2"
+    );
+  }
+
+  #[test]
+  fn collect_product_coefficient_canonical_ordering() {
+    // When the coefficient is a product (not a sum), factors should be
+    // flattened and sorted in canonical order (alphabetical).
+    assert_eq!(
+      interpret("Collect[a x^2 + b x^2 y + c x y, x]").unwrap(),
+      "c*x*y + x^2*(a + b*y)"
+    );
+  }
+
+  // The collected terms are ordered with Wolfram's canonical Plus order, which
+  // compares the constant term against the whole var-term expression rather
+  // than by a "does the constant sort after the variable" shortcut. When the
+  // x-term carries a non-trivial (Plus) coefficient the constant leads, but
+  // against bare powers it trails. Verified against wolframscript.
+  #[test]
+  fn collect_constant_placement_canonical() {
+    // Constant y leads because it sorts before x*(y + z).
+    assert_eq!(
+      interpret("Collect[x y + x z + y, x]").unwrap(),
+      "y + x*(y + z)"
+    );
+    // Constant y trails because it sorts after the bare powers x and x^3.
+    assert_eq!(interpret("Collect[x + x^3 + y, x]").unwrap(), "x + x^3 + y");
+    // Constant z trails a single product term x*y.
+    assert_eq!(interpret("Collect[x y + z, x]").unwrap(), "x*y + z");
+    // Numeric constant leads a symbolic-coefficient term.
+    assert_eq!(interpret("Collect[a x + b, x]").unwrap(), "b + a*x");
+    // Constant w leads a grouped-coefficient term.
+    assert_eq!(
+      interpret("Collect[x a + x b + w, x]").unwrap(),
+      "w + (a + b)*x"
+    );
+  }
+
+  #[test]
+  fn collect_with_head() {
+    assert_eq!(
+      interpret("Collect[a x + b x + c, x, h]").unwrap(),
+      "x*h[a + b] + h[c]"
+    );
+  }
+
+  #[test]
+  fn collect_two_variables_shared_factor_ascending_powers() {
+    // Regression: when collecting by {x, y} and every grouped term shares
+    // the y factor, terms should be ordered by ascending power of x and
+    // each term's Plus coefficient should appear *before* the monomial
+    // factors (Plus * x^k * y), matching wolframscript exactly.
+    assert_eq!(
+      interpret(
+        "Collect[a^2 y + 2 a b y + b^2 y + 2 a x y + 2 b x y + x^2 y + c^2 x^2 y + 2 c d x^2 y + d^2 x^2 y, {x, y}]"
+      )
+      .unwrap(),
+      "(a^2 + 2*a*b + b^2)*y + (2*a + 2*b)*x*y + (1 + c^2 + 2*c*d + d^2)*x^2*y"
+    );
+  }
+}
+
+mod together {
+  use super::*;
+
+  #[test]
+  fn together_basic() {
+    assert_eq!(interpret("Together[1/x + 1/y]").unwrap(), "(x + y)/(x*y)");
+  }
+
+  // A *symbolic* negative exponent is a denominator too — `E^(-t)` is
+  // `1/E^t` — so it takes part in the common denominator, and exponents
+  // that are rational multiples of the same symbol combine by LCM rather
+  // than by product (`E^(-t) + E^(-2*t)` needs `E^(2*t)`, not `E^(3*t)`).
+  // All wolframscript-verified.
+  #[test]
+  fn together_symbolic_negative_exponents() {
+    assert_eq!(
+      interpret("Together[E^(-t) + E^t]").unwrap(),
+      "(1 + E^(2*t))/E^t"
+    );
+    assert_eq!(
+      interpret("Together[1/(2*E^t) + E^t/2]").unwrap(),
+      "(1 + E^(2*t))/(2*E^t)"
+    );
+    assert_eq!(
+      interpret("Together[E^(-t) + E^(-2*t)]").unwrap(),
+      "(1 + E^t)/E^(2*t)"
+    );
+    assert_eq!(
+      interpret("Together[E^(-t/2) + E^(t/2)]").unwrap(),
+      "(1 + E^t)/E^(t/2)"
+    );
+    assert_eq!(interpret("Together[x^(-t) + 1]").unwrap(), "(1 + x^t)/x^t");
+    assert_eq!(
+      interpret("Together[2^(-t) + 3]").unwrap(),
+      "(1 + 3*2^t)/2^t"
+    );
+    assert_eq!(
+      interpret("Together[E^(-2*t)*C[1] + E^(3*t)*C[2]]").unwrap(),
+      "(C[1] + E^(5*t)*C[2])/E^(2*t)"
+    );
+  }
+
+  // A denominator whose symbolic exponent is Times[Rational, symbol] (not
+  // a bare symbol) exercises split_exponent_coefficient's Times[Rational,
+  // ...] branch — a match-arm guard there once used the unstable
+  // `if_let_guard` feature and failed to build on current stable rustc.
+  #[test]
+  fn together_symbolic_rational_coefficient_exponent() {
+    assert_eq!(
+      interpret("Together[E^(-3*t/2) + E^(t/2)]").unwrap(),
+      "(1 + E^(2*t))/E^((3*t)/2)"
+    );
+    assert_eq!(
+      interpret("Together[x^(-3*t/2) + x^(t/2)]").unwrap(),
+      "(1 + x^(2*t))/x^((3*t)/2)"
+    );
+  }
+
+  // The exponent-coefficient split that powers the above also has to
+  // recognize a `Rational[n, d]` head reaching it directly (not just a
+  // `-t/2`-shaped literal the parser turns into one internally), since
+  // `evaluate_expr_to_expr` can canonicalize an exponent into that exact
+  // shape before `split_exponent_coefficient` inspects it.
+  #[test]
+  fn together_rational_head_exponent_coefficient() {
+    assert_eq!(
+      interpret("Together[x^(Rational[-1, 2]*t) + x^(Rational[3, 2]*t)]")
+        .unwrap(),
+      "(1 + x^(2*t))/x^(t/2)"
+    );
+    assert_eq!(
+      interpret("Together[x^(-t/2) + x^(3*t/2)]").unwrap(),
+      "(1 + x^(2*t))/x^(t/2)"
+    );
+  }
+
+  // Together divides out the polynomial GCD even when the denominator is
+  // held in factored/content-extracted form, where string-level factor
+  // matching can't see the shared factor ((1+x) divides -1+x^2). A
+  // quotient with nothing to cancel keeps its factored form. All
+  // wolframscript-verified (differential fuzzer, seed
+  // 1785246333519574598).
+  #[test]
+  fn together_cancels_gcd_behind_factored_denominator() {
+    assert_eq!(
+      interpret("Together[((1 + x)*(1 + 3*x))/(2*x - 2*x^3)]").unwrap(),
+      "(-1 - 3*x)/(2*(-1 + x)*x)"
+    );
+    assert_eq!(
+      interpret("Together[(1 + 4*x + 3*x^2)/(2*x - 2*x^3)]").unwrap(),
+      "(-1 - 3*x)/(2*(-1 + x)*x)"
+    );
+    // No shared polynomial factor: the factored quotient stays put.
+    assert_eq!(
+      interpret("Together[(5*x*(1 + x))/((1 - x)*(2 + x))]").unwrap(),
+      "(-5*x*(1 + x))/((-1 + x)*(2 + x))"
+    );
+  }
+
+  // A negative numeric factor produced by denominator factoring flips
+  // out of the quotient: sum numerators negate termwise with the content
+  // staying in the denominator; monomial/unit numerators get a rational
+  // prefactor with the content leaving it. Found by the differential
+  // fuzzer; all outputs verified against wolframscript 15.0.
+  #[test]
+  fn together_negative_denominator_content() {
+    assert_eq!(
+      interpret("Together[(3 - 5*x)/(2 - 2*x)]").unwrap(),
+      "(-3 + 5*x)/(2*(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(3 - 5*x)/(4 - 2*x)]").unwrap(),
+      "(-3 + 5*x)/(2*(-2 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(-5*x + 3*x^2 - x^3)/(-4 - 2*x - 2*x^2)]").unwrap(),
+      "(5*x - 3*x^2 + x^3)/(2*(2 + x + x^2))"
+    );
+    assert_eq!(
+      interpret("Together[1/(2 - 2*x)]").unwrap(),
+      "-1/2*1/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[x/(6 - 3*x)]").unwrap(),
+      "-1/3*x/(-2 + x)"
+    );
+  }
+
+  // Arguments that evaluate to plain numbers stay those numbers.
+  // Together[1/3 + I/3] previously spun the complex scalar through an
+  // infinite Together/Cancel/Factor recursion (stack overflow); Simplify
+  // of any product with a complex-rational coefficient crashed the same
+  // way. All expected outputs verified against wolframscript 15.0.
+  #[test]
+  fn together_numeric_scalars() {
+    assert_eq!(interpret("Together[1/3 + I/3]").unwrap(), "1/3 + I/3");
+    assert_eq!(
+      interpret("Together[2*(1/3 + I/3)]").unwrap(),
+      "2/3 + (2*I)/3"
+    );
+    assert_eq!(interpret("Together[6/4]").unwrap(), "3/2");
+    // Constant expressions that are not number atoms still combine
+    assert_eq!(interpret("Together[1 - E^(-2)]").unwrap(), "(-1 + E^2)/E^2");
+  }
+
+  // Regression: these overflowed the stack via the numeric-fraction
+  // Cancel/Factor cycle before the pure-number guards existed.
+  #[test]
+  fn simplify_complex_rational_coefficient_terminates() {
+    assert!(interpret("Simplify[Sqrt[2]*(1/3 + I/3)]").is_ok());
+    assert!(interpret("FullSimplify[Sqrt[2]*(1/3 + I/3)]").is_ok());
+    assert!(interpret("Simplify[(Sqrt[11]*(-4/11 + (4*I)/11))/4]").is_ok());
+  }
+
+  // A negative NUMERIC denominator factor flips too, and denominator
+  // content hoists out through sums and powers. Differential fuzzer,
+  // seed 1783631489573774000; all wolframscript-verified.
+  #[test]
+  fn denominator_numeric_content_flip_and_hoist() {
+    // fuzzer divergence #2
+    assert_eq!(
+      interpret(
+        "Together[Divide[Plus[-2, Times[-5, x], Times[-5, Power[x, 2]], \
+         Times[-5, Power[x, 3]]], Plus[-5, Times[-5, x]]]]"
+      )
+      .unwrap(),
+      "(2 + 5*x + 5*x^2 + 5*x^3)/(5*(1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(2 + x)/(-5 - 5 x)]").unwrap(),
+      "(-2 - x)/(5*(1 + x))"
+    );
+    // a sign-free monomial numerator folds the sign into the coefficient
+    assert_eq!(
+      interpret("Together[x/(-5 - 5 x)]").unwrap(),
+      "-1/5*x/(1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[1/(2 - 2 x)]").unwrap(),
+      "-1/2*1/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[(2 x)/(-5 - 5 x)]").unwrap(),
+      "(-2*x)/(5*(1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[3/(-5 - 5 x)]").unwrap(),
+      "-3/(5*(1 + x))"
+    );
+    // positive-content hoist without a flip, incl. powers + multivariate
+    assert_eq!(interpret("Together[x/(5 + 5 x)]").unwrap(), "x/(5*(1 + x))");
+    assert_eq!(interpret("Cancel[x/(5 + 5 x)]").unwrap(), "x/(5*(1 + x))");
+    assert_eq!(
+      interpret("Together[1/(2 - 2 x)^2]").unwrap(),
+      "1/(4*(-1 + x)^2)"
+    );
+    assert_eq!(
+      interpret("Cancel[(2 + x*y)/(4 + 4 x*y)]").unwrap(),
+      "(2 + x*y)/(4*(1 + x*y))"
+    );
+    assert_eq!(interpret("Cancel[x/(-5 - 5 x)]").unwrap(), "-1/5*x/(1 + x)");
+    assert_eq!(
+      interpret("Cancel[(2 + x)/(-5 - 5 x)]").unwrap(),
+      "(-2 - x)/(5*(1 + x))"
+    );
+    // shared numeric content between numerator and denominator cancels
+    assert_eq!(interpret("Together[(4 + 2 x)/6]").unwrap(), "(2 + x)/3");
+    assert_eq!(
+      interpret("Together[(4 + 2 x)/(6 x)]").unwrap(),
+      "(2 + x)/(3*x)"
+    );
+  }
+
+  // Together pulls the signed numeric content (FactorTerms sign rule)
+  // out of a quotient's sum numerator. wolframscript-verified.
+  #[test]
+  fn numerator_signed_content_extraction() {
+    assert_eq!(
+      interpret("Together[(3 - 3 x)/(5 x)]").unwrap(),
+      "(-3*(-1 + x))/(5*x)"
+    );
+    assert_eq!(
+      interpret("Together[(6 - 4 x)/(5 x^2)]").unwrap(),
+      "(-2*(-3 + 2*x))/(5*x^2)"
+    );
+    assert_eq!(
+      interpret("Together[(2 - 2 x + 2 x^2)/(1 - 2 x)]").unwrap(),
+      "(-2*(1 - x + x^2))/(-1 + 2*x)"
+    );
+    // |content| == 1 stays untouched
+    assert_eq!(
+      interpret("Together[(1 + x - x^2)/(5 x)]").unwrap(),
+      "(1 + x - x^2)/(5*x)"
+    );
+  }
+
+  // wolframscript canonicalizes every variable-bearing sum factor of the
+  // denominator to a positive sign (univariate: leading coefficient;
+  // multivariate: first non-numeric canonical term), the numerator
+  // absorbing the accumulated sign. Bare reciprocals stay untouched.
+  #[test]
+  fn denominator_sign_canonicalization() {
+    assert_eq!(
+      interpret("Together[(-5 + 3 x + 5 x^2)/(-1 - x)]").unwrap(),
+      "(5 - 3*x - 5*x^2)/(1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[1/(2 - x) + 1/(1 + x)]").unwrap(),
+      "-3/((-2 + x)*(1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[x/((1 - x)*(2 + x))]").unwrap(),
+      "-(x/((-1 + x)*(2 + x)))"
+    );
+    assert_eq!(
+      interpret("Together[1/((1 - x)*(2 - x))]").unwrap(),
+      "1/((-2 + x)*(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[1/(1 - x) + 1/(1 - x)^2]").unwrap(),
+      "(2 - x)/(-1 + x)^2"
+    );
+    assert_eq!(interpret("Together[1/(1 - x)]").unwrap(), "(1 - x)^(-1)");
+    assert_eq!(interpret("Together[2/(1 - x)]").unwrap(), "-2/(-1 + x)");
+  }
+
+  // Multivariate denominators flip on the sign of the first non-numeric
+  // canonical term, not the highest-degree term (wolframscript-verified:
+  // b - a*c and a*c - d both stay, d - a*c flips).
+  #[test]
+  fn multivariate_denominator_sign_uses_first_symbolic_term() {
+    assert_eq!(interpret("Together[x/(b - a*c)]").unwrap(), "x/(b - a*c)");
+    assert_eq!(interpret("Together[x/(a*c - d)]").unwrap(), "x/(a*c - d)");
+    assert_eq!(
+      interpret("Together[x/(d - a*c)]").unwrap(),
+      "-(x/(a*c - d))"
+    );
+    assert_eq!(
+      interpret("Together[(1 + a)/(y - x)]").unwrap(),
+      "(-1 - a)/(x - y)"
+    );
+    assert_eq!(
+      interpret("Together[(1 + a)/(3 - c*y)]").unwrap(),
+      "(-1 - a)/(-3 + c*y)"
+    );
+    assert_eq!(interpret("Together[x/(a - c*y)]").unwrap(), "x/(a - c*y)");
+    // Complex-coefficient sums never flip.
+    assert_eq!(
+      interpret("Simplify[1/(1 - I x) + 1/(1 + I x)]").unwrap(),
+      "2/(1 + x^2)"
+    );
+    // Slot-bearing quotients keep the form Solve constructed.
+    assert_eq!(
+      interpret("Solve[(a*x + b)/(c*x + d) == y, x]").unwrap(),
+      "{{x -> (-b + d*y)/(a - c*y)}}"
+    );
+  }
+
+  // Together cancels a common polynomial factor between numerator and a bare
+  // (unfactored) polynomial denominator, like wolframscript: (x^2+x)/(x^2-1)
+  // shares (x+1), reducing to x/(x-1).
+  #[test]
+  fn together_cancels_polynomial_gcd() {
+    assert_eq!(
+      interpret("Together[(x^2 + x)/(x^2 - 1)]").unwrap(),
+      "x/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[x^2/(x^2 - 1) + x/(x^2 - 1)]").unwrap(),
+      "x/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[(x^2 - 4)/(x^2 - x - 2)]").unwrap(),
+      "(2 + x)/(1 + x)"
+    );
+    // No common factor: the fraction is left combined but uncancelled.
+    assert_eq!(
+      interpret("Together[(2 x)/(x^2 - 1)]").unwrap(),
+      "(2*x)/(-1 + x^2)"
+    );
+    // Factored denominators keep their factored form (no spurious expansion).
+    assert_eq!(
+      interpret("Together[1/(x - 1) + 1/(x + 1)]").unwrap(),
+      "(2*x)/((-1 + x)*(1 + x))"
+    );
+  }
+
+  #[test]
+  fn together_symbolic_fractions() {
+    assert_eq!(
+      interpret("Together[a/b + c/d]").unwrap(),
+      "(b*c + a*d)/(b*d)"
+    );
+  }
+
+  #[test]
+  fn together_scalar_times_sum_of_fractions() {
+    // A sum of fractions wrapped in a scalar product must still be combined;
+    // preprocessing previously left `Times[scalar, Plus[...]]` uncombined.
+    assert_eq!(interpret("Together[x (1/x + 1/y)]").unwrap(), "(x + y)/y");
+    assert_eq!(
+      interpret("Together[3 (1/(a - I x) + 1/(a + I x))]").unwrap(),
+      "(6*a)/(a^2 + x^2)"
+    );
+  }
+
+  #[test]
+  fn together_subtracted_fractions() {
+    assert_eq!(
+      interpret("Together[1/(x-1) - 1/(x+1)]").unwrap(),
+      "2/((-1 + x)*(1 + x))"
+    );
+  }
+
+  #[test]
+  fn together_added_fractions_with_binomial_denominators() {
+    assert_eq!(
+      interpret("Together[1/(x-1) + 1/(x+1)]").unwrap(),
+      "(2*x)/((-1 + x)*(1 + x))"
+    );
+  }
+
+  // Together cancels the numerator/denominator GCD when the fraction reduces
+  // to a polynomial.
+  #[test]
+  fn together_cancels_to_polynomial() {
+    assert_eq!(interpret("Together[(x^2 - 1)/(x - 1)]").unwrap(), "1 + x");
+    assert_eq!(
+      interpret("Together[(x^3 - 1)/(x - 1)]").unwrap(),
+      "1 + x + x^2"
+    );
+    assert_eq!(
+      interpret("Together[(x^2 + 2 x + 1)/(x + 1)]").unwrap(),
+      "1 + x"
+    );
+    // Two variables.
+    assert_eq!(interpret("Together[(x^2 - y^2)/(x - y)]").unwrap(), "x + y");
+  }
+
+  // When the reduced polynomial carries numeric content, it is factored out
+  // (FactorTerms behavior), matching wolframscript.
+  #[test]
+  fn together_factors_numeric_content_after_cancel() {
+    assert_eq!(
+      interpret("Together[(6 x^2 - 6)/(3 x - 3)]").unwrap(),
+      "2*(1 + x)"
+    );
+    assert_eq!(interpret("Together[(2 x + 2)/(x + 1)]").unwrap(), "2");
+  }
+
+  // A flipped denominator sends the sign into the numerator's integer
+  // coefficient when it has one; numeric denominator content stays put
+  // (differential fuzzer, seed 8887; all wolframscript-verified).
+  #[test]
+  fn together_monomial_coefficient_absorbs_flip() {
+    assert_eq!(
+      interpret("Together[(5 x)/(1 - 5 x)]").unwrap(),
+      "(-5*x)/(-1 + 5*x)"
+    );
+    assert_eq!(
+      interpret("Together[(2 x)/(1 - 2 x)]").unwrap(),
+      "(-2*x)/(-1 + 2*x)"
+    );
+    assert_eq!(
+      interpret("Together[(5 x)/(6 - 3 x)]").unwrap(),
+      "(-5*x)/(3*(-2 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(3 x)/(2 - 2 x)]").unwrap(),
+      "(-3*x)/(2*(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(5 x y)/(1 - 5 x)]").unwrap(),
+      "(-5*x*y)/(-1 + 5*x)"
+    );
+    assert_eq!(
+      interpret("Together[(5 x^2)/(1 - 5 x)]").unwrap(),
+      "(-5*x^2)/(-1 + 5*x)"
+    );
+    // A negative coefficient flips to positive the same way.
+    assert_eq!(
+      interpret("Together[(-5 x)/(1 - 5 x)]").unwrap(),
+      "(5*x)/(-1 + 5*x)"
+    );
+  }
+
+  // A unit monomial can't absorb the flip: numeric denominator content
+  // hoists into a rational prefactor, and a content-free denominator
+  // keeps the outer minus (wolframscript-verified).
+  #[test]
+  fn together_unit_monomial_flip_forms() {
+    assert_eq!(
+      interpret("Together[(x/2)/(1 - x)]").unwrap(),
+      "-1/2*x/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Together[x/(6 - 3 x)]").unwrap(),
+      "-1/3*x/(-2 + x)"
+    );
+    assert_eq!(
+      interpret("Together[(x y)/(1 - x)]").unwrap(),
+      "-((x*y)/(-1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[x/((1 - x) (2 + x))]").unwrap(),
+      "-(x/((-1 + x)*(2 + x)))"
+    );
+  }
+
+  // A single fraction whose numerator shares no factor with the
+  // denominator is not recombined — the factored denominator survives
+  // (wolframscript-verified).
+  #[test]
+  fn together_keeps_factored_denominator_without_cancellation() {
+    assert_eq!(
+      interpret("Together[(5 x)/((1 - x) (2 + x))]").unwrap(),
+      "(-5*x)/((-1 + x)*(2 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(x/2)/((1 - x) (2 + x))]").unwrap(),
+      "-1/2*x/((-1 + x)*(2 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(5 (1 + x))/((1 - x) (2 + x))]").unwrap(),
+      "(-5*(1 + x))/((-1 + x)*(2 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(5 x (1 + x))/((1 - x) (2 + x))]").unwrap(),
+      "(-5*x*(1 + x))/((-1 + x)*(2 + x))"
+    );
+    // A genuinely shared factor still folds and cancels.
+    assert_eq!(interpret("Together[x (x + y)/(x y)]").unwrap(), "(x + y)/y");
+  }
+
+  // Integer denominators combine by their integer LCM, not by product,
+  // and a nested purely numeric denominator folds to a single number
+  // (wolframscript-verified).
+  #[test]
+  fn together_integer_denominator_lcm() {
+    assert_eq!(interpret("Together[a/2 + b/6]").unwrap(), "(3*a + b)/6");
+    assert_eq!(interpret("Together[a/2 + b/12]").unwrap(), "(6*a + b)/12");
+    assert_eq!(interpret("Together[x/4 + y/6]").unwrap(), "(3*x + 2*y)/12");
+    assert_eq!(interpret("Together[x/2 + y/3]").unwrap(), "(3*x + 2*y)/6");
+    assert_eq!(interpret("Together[(a + b/6)/2]").unwrap(), "(6*a + b)/12");
+    // Rationalized radicals keep their fractional missing factors: the
+    // integer fast path must not swallow 2^(1/2)
+    // (regression: Simplify[(3/2) + (3/2)*Sqrt[2]] came out 9/2).
+    assert_eq!(
+      interpret("Together[1/2 + Sqrt[2]/2]").unwrap(),
+      "(1 + Sqrt[2])/2"
+    );
+    assert_eq!(
+      interpret("Together[x/2 + Sqrt[2]/2]").unwrap(),
+      "(Sqrt[2] + x)/2"
+    );
+    assert_eq!(
+      interpret("Together[1/2 + 1/Sqrt[2]]").unwrap(),
+      "(1 + Sqrt[2])/2"
+    );
+  }
+
+  // Together pulls the numeric content out of a plain (fraction-free) sum,
+  // like FactorTerms (wolframscript-verified).
+  #[test]
+  fn bare_sum_numeric_content() {
+    assert_eq!(
+      interpret("Together[2 - 4 x - 4 x^2]").unwrap(),
+      "-2*(-1 + 2*x + 2*x^2)"
+    );
+    assert_eq!(interpret("Together[3 + 3 x^3]").unwrap(), "3*(1 + x^3)");
+    assert_eq!(interpret("Together[2 + 3 x]").unwrap(), "2 + 3*x");
+    assert_eq!(
+      interpret("Together[2 Sin[x] + 4 Sin[y]]").unwrap(),
+      "2*(Sin[x] + 2*Sin[y])"
+    );
+  }
+
+  // Over a pure integer denominator the numerator's numeric content is
+  // factored out (wolframscript-verified).
+  #[test]
+  fn integer_denominator_numerator_content() {
+    assert_eq!(
+      interpret("Together[3/2 - (3 x)/2]").unwrap(),
+      "(-3*(-1 + x))/2"
+    );
+    assert_eq!(
+      interpret("Together[2/3 + (4 x)/3]").unwrap(),
+      "(2*(1 + 2*x))/3"
+    );
+    assert_eq!(interpret("Together[x/2 + 3/2]").unwrap(), "(3 + x)/2");
+    assert_eq!(interpret("Together[x/2 + 1/2]").unwrap(), "(1 + x)/2");
+  }
+
+  // Integer factors of the common denominator fold into one number
+  // (wolframscript-verified).
+  #[test]
+  fn integer_denominator_factors_fold() {
+    assert_eq!(interpret("Together[x/2 + y/3]").unwrap(), "(3*x + 2*y)/6");
+    assert_eq!(
+      interpret("Together[x/2 + y/(3 z)]").unwrap(),
+      "(2*y + 3*x*z)/(6*z)"
+    );
+  }
+
+  // Content cancellation in a fraction keeps term signs as they fall —
+  // no leading-sign extraction (wolframscript-verified).
+  #[test]
+  fn fraction_content_cancellation_no_sign_flip() {
+    assert_eq!(
+      interpret("Together[(2 - 4 x)/(2 + 2 x)]").unwrap(),
+      "(1 - 2*x)/(1 + x)"
+    );
+  }
+
+  // The result denominator presents with its content hoisted: the largest
+  // common monomial and the positive integer content move in front of the
+  // primitive polynomial (differential-fuzzer regression, seed
+  // 12223212876560045487; all wolframscript-verified).
+  #[test]
+  fn denominator_content_hoisted() {
+    assert_eq!(
+      interpret("Together[1/(x + x^2 + 4 x^3)]").unwrap(),
+      "1/(x*(1 + x + 4*x^2))"
+    );
+    assert_eq!(
+      interpret("Together[(-3 + x + 2 x^2)/(-3 x + 4 x^2 + 4 x^3)]").unwrap(),
+      "(-1 + x)/(x*(-1 + 2*x))"
+    );
+    assert_eq!(interpret("Together[1/(2 + 2 x)]").unwrap(), "1/(2*(1 + x))");
+    assert_eq!(
+      interpret("Together[1/(x^2 + x^4)]").unwrap(),
+      "1/(x^2*(1 + x^2))"
+    );
+    assert_eq!(
+      interpret("Together[1/(x^2 y + x y^2)]").unwrap(),
+      "1/(x*y*(x + y))"
+    );
+    assert_eq!(
+      interpret("Together[1/(6 x + 4 x^2)]").unwrap(),
+      "1/(2*x*(3 + 2*x))"
+    );
+    assert_eq!(
+      interpret("Together[1/(x^2 - x)]").unwrap(),
+      "1/((-1 + x)*x)"
+    );
+    assert_eq!(
+      interpret("Together[1/(-2 x - 2 x^2)]").unwrap(),
+      "-1/2*1/(x*(1 + x))"
+    );
+    // A content-free polynomial denominator keeps the ^(-1) display.
+    assert_eq!(
+      interpret("Together[1/(1 + x + x^2)]").unwrap(),
+      "(1 + x + x^2)^(-1)"
+    );
+    // A factored denominator stays factored, primitive factors untouched.
+    assert_eq!(
+      interpret("Together[1/((x - 1) (x + 1))]").unwrap(),
+      "1/((-1 + x)*(1 + x))"
+    );
+  }
+
+  // A unit-negative numerator coefficient distributes into a single sum
+  // factor instead of staying a scalar prefactor; larger coefficients
+  // stay factored and multi-sum numerators keep their prefactor
+  // (wolframscript-verified; differential fuzzer, seed
+  // 1067626979549797460).
+  #[test]
+  fn unit_negative_numerator_distributes() {
+    assert_eq!(
+      interpret("Together[(2 + 5 x)/(-2 x)]").unwrap(),
+      "(-2 - 5*x)/(2*x)"
+    );
+    assert_eq!(
+      interpret("Together[(2 + 5 x)/(-x)]").unwrap(),
+      "(-2 - 5*x)/x"
+    );
+    assert_eq!(
+      interpret("Together[(2 + 5 x)/(-6 x)]").unwrap(),
+      "(-2 - 5*x)/(6*x)"
+    );
+    assert_eq!(
+      interpret("Together[(2 + 5 x)/(-2 x^2)]").unwrap(),
+      "(-2 - 5*x)/(2*x^2)"
+    );
+    assert_eq!(
+      interpret("Together[(2 + 5 x)/(-2 x y)]").unwrap(),
+      "(-2 - 5*x)/(2*x*y)"
+    );
+    assert_eq!(
+      interpret("Together[(x/2 + 1)/(-2 x)]").unwrap(),
+      "(-2 - x)/(4*x)"
+    );
+    assert_eq!(
+      interpret("Cancel[(2 + 5 x)/(-2 x)]").unwrap(),
+      "(-2 - 5*x)/(2*x)"
+    );
+    // Two flips cancel back to positive content.
+    assert_eq!(
+      interpret("Together[(-2 - 5 x)/(-2 x)]").unwrap(),
+      "(2 + 5*x)/(2*x)"
+    );
+    // A coefficient larger than 1 stays factored on the numerator.
+    assert_eq!(
+      interpret("Together[(3 (2 + 5 x))/(-2 x)]").unwrap(),
+      "(-3*(2 + 5*x))/(2*x)"
+    );
+    assert_eq!(
+      interpret("Together[(2 + 5 x)/(4 x/3)]").unwrap(),
+      "(3*(2 + 5*x))/(4*x)"
+    );
+    // Several sum factors keep the scalar prefactor.
+    assert_eq!(
+      interpret("Together[((1 + x) (2 + x))/(-2 x)]").unwrap(),
+      "-1/2*((1 + x)*(2 + x))/x"
+    );
+    // A monomial numerator keeps the scalar prefactor too.
+    assert_eq!(
+      interpret("Together[x/(-2 - 4 x)]").unwrap(),
+      "-1/2*x/(1 + 2*x)"
+    );
+  }
+
+  // The polynomial GCD cancellation sees through the numeric-content
+  // wrapper on a denominator: x/(4*(x^2 + x^3)) — the canonical form of
+  // x/(4 x^2 + 4 x^3) — still cancels the shared x
+  // (wolframscript-verified).
+  #[test]
+  fn cancellation_through_numeric_content() {
+    assert_eq!(
+      interpret("Together[x/(4 x^2 + 4 x^3)]").unwrap(),
+      "1/(4*x*(1 + x))"
+    );
+    assert_eq!(
+      interpret("Together[(x + x^2)/(4 x^2 + 4 x^3)]").unwrap(),
+      "1/(4*x)"
+    );
+  }
+}
+
+mod apart {
+  use super::*;
+
+  #[test]
+  fn apart_basic() {
+    assert_eq!(
+      interpret("Apart[1/(x^2 - 1)]").unwrap(),
+      "1/(2*(-1 + x)) - 1/(2*(1 + x))"
+    );
+  }
+
+  // Denominators with rational (non-integer) roots decompose through the
+  // general linear-system path (differential fuzzer, seed
+  // 10107924694092248000; all wolframscript-verified).
+  #[test]
+  fn apart_rational_roots() {
+    assert_eq!(
+      interpret("Apart[(5 + 3 x)/(-1 - 2 x + 3 x^2)]").unwrap(),
+      "2/(-1 + x) - 3/(1 + 3*x)"
+    );
+    assert_eq!(
+      interpret("Apart[1/(x + 3 x^2)]").unwrap(),
+      "x^(-1) - 3/(1 + 3*x)"
+    );
+    assert_eq!(
+      interpret("Apart[1/((2 x - 1) (x + 2))]").unwrap(),
+      "-1/5*1/(2 + x) + 2/(5*(-1 + 2*x))"
+    );
+  }
+
+  #[test]
+  fn apart_x2_plus_1_over_x3_minus_x() {
+    assert_eq!(
+      interpret("Apart[(x^2 + 1)/(x^3 - x)]").unwrap(),
+      "(-1 + x)^(-1) - x^(-1) + (1 + x)^(-1)"
+    );
+  }
+
+  // Polynomial division with a NON-integer leading quotient still
+  // decomposes (the shrunk differential-fuzzer reproducers, seed
+  // 1783520505113402110; all wolframscript-verified).
+  #[test]
+  fn apart_rational_quotient() {
+    assert_eq!(
+      interpret("Apart[Divide[Plus[2, Times[-4, x]], Plus[2, Times[-5, x]]]]")
+        .unwrap(),
+      "4/5 - 2/(5*(-2 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Apart[Divide[Plus[2, Times[-1, x]], Plus[0, Times[-3, x]]]]")
+        .unwrap(),
+      "1/3 - 2/(3*x)"
+    );
+    assert_eq!(
+      interpret("Apart[(x^3 + 2)/(2 x + 1)]").unwrap(),
+      "1/8 - x/4 + x^2/2 + 15/(8*(1 + 2*x))"
+    );
+    assert_eq!(
+      interpret("Apart[(3 x^2 + 2 x + 1)/(x^2 + x)]").unwrap(),
+      "3 + x^(-1) - 2/(1 + x)"
+    );
+  }
+
+  // A reciprocal-of-a-sum term orders against a monomial by the base
+  // polynomial: lower degree first, then coefficients from the LEADING
+  // term down (differential-fuzzer regression, seed 1783672988021454491:
+  // the 87/(4*(-5 + 2*x)) term must trail (5*x)/2, not lead it).
+  #[test]
+  fn apart_reciprocal_term_order() {
+    assert_eq!(
+      interpret(
+        "Apart[Divide[Plus[-3, Times[5, x], Times[-5, Power[x, 2]]], \
+         Plus[5, Times[-2, x]]]]"
+      )
+      .unwrap(),
+      "15/4 + (5*x)/2 + 87/(4*(-5 + 2*x))"
+    );
+    // wolframscript-verified sum orderings around reciprocal bases.
+    assert_eq!(interpret("x + 1/(-5+2 x)").unwrap(), "x + (-5 + 2*x)^(-1)");
+    assert_eq!(interpret("x + 1/(-1+x)").unwrap(), "(-1 + x)^(-1) + x");
+    assert_eq!(interpret("x + 1/(1-2 x)").unwrap(), "(1 - 2*x)^(-1) + x");
+    assert_eq!(interpret("x + 1/(1-x)").unwrap(), "(1 - x)^(-1) + x");
+    assert_eq!(interpret("x + 1/(1+x)").unwrap(), "x + (1 + x)^(-1)");
+    assert_eq!(interpret("x + 1/(1+x^2)").unwrap(), "x + (1 + x^2)^(-1)");
+    assert_eq!(
+      interpret("1/(-1+x) + 1/(-5+2 x)").unwrap(),
+      "(-1 + x)^(-1) + (-5 + 2*x)^(-1)"
+    );
+    assert_eq!(
+      interpret("1/(1+2 x) + 1/(2+x)").unwrap(),
+      "(2 + x)^(-1) + (1 + 2*x)^(-1)"
+    );
+    assert_eq!(
+      interpret("1/(3-x) + 1/(-3+x)").unwrap(),
+      "(3 - x)^(-1) + (-3 + x)^(-1)"
+    );
+  }
+
+  // Apart returns ordinary evaluated expressions: a variable-free
+  // argument passes through, and single-fraction results take their
+  // canonical evaluated form (not a hand-built Divide tree).
+  #[test]
+  fn apart_result_is_canonical() {
+    assert_eq!(interpret("Apart[Divide[1, 2]]").unwrap(), "1/2");
+    assert_eq!(interpret("Apart[1/(-3 x)]").unwrap(), "-1/3*1/x");
+    assert_eq!(
+      interpret("Apart[(x^2 + 1)/(x - 1)]").unwrap(),
+      "1 + 2/(-1 + x) + x"
+    );
+  }
+
+  // Reciprocal-of-sum terms order by base polynomial, constant term
+  // first — a bare-x base counts as constant 0 (wolframscript-verified).
+  #[test]
+  fn sum_reciprocal_term_order() {
+    assert_eq!(interpret("x + 1/(-1 + x)").unwrap(), "(-1 + x)^(-1) + x");
+    assert_eq!(interpret("x + 2/(-1 + x)").unwrap(), "2/(-1 + x) + x");
+    assert_eq!(interpret("x + 1/(1 + x)").unwrap(), "x + (1 + x)^(-1)");
+    assert_eq!(interpret("x^2 + 2/(-1 + x)").unwrap(), "2/(-1 + x) + x^2");
+    assert_eq!(
+      interpret("1/x + 1/(-1 + x)").unwrap(),
+      "(-1 + x)^(-1) + x^(-1)"
+    );
+    assert_eq!(
+      interpret("1/x + 1/(1 + x)").unwrap(),
+      "x^(-1) + (1 + x)^(-1)"
+    );
+  }
+
+  // Named constants (Pi, E, …) order exactly like symbols in the
+  // reciprocal-of-sum rule, and base polynomials may carry rational
+  // coefficients (differential fuzzer, seed 1785246333519574598:
+  // Pi - 59/(9/2 + Pi) put Pi last). All wolframscript-verified.
+  #[test]
+  fn sum_reciprocal_term_order_constants_and_rationals() {
+    assert_eq!(interpret("Pi + 1/(1 + Pi)").unwrap(), "Pi + (1 + Pi)^(-1)");
+    assert_eq!(interpret("E + 1/(1 + E)").unwrap(), "E + (1 + E)^(-1)");
+    assert_eq!(
+      interpret("Pi + 1/(-1 + Pi)").unwrap(),
+      "(-1 + Pi)^(-1) + Pi"
+    );
+    assert_eq!(
+      interpret("Pi + 1/(1 - 2 Pi)").unwrap(),
+      "(1 - 2*Pi)^(-1) + Pi"
+    );
+    assert_eq!(interpret("Pi + 2/(-1 + Pi)").unwrap(), "2/(-1 + Pi) + Pi");
+    assert_eq!(
+      interpret("Pi^2 + 1/(1 + Pi)").unwrap(),
+      "Pi^2 + (1 + Pi)^(-1)"
+    );
+    assert_eq!(
+      interpret("Pi + 1/(1 + Pi^2)").unwrap(),
+      "Pi + (1 + Pi^2)^(-1)"
+    );
+    // Mixed variables fall back to the general rules unchanged.
+    assert_eq!(interpret("Pi + 1/(1 + x)").unwrap(), "Pi + (1 + x)^(-1)");
+    assert_eq!(interpret("x + 1/(1 + Pi)").unwrap(), "(1 + Pi)^(-1) + x");
+    // Rational coefficients in the base compare by value.
+    assert_eq!(
+      interpret("Pi + 1/(9/2 + Pi)").unwrap(),
+      "Pi + (9/2 + Pi)^(-1)"
+    );
+    assert_eq!(interpret("x + 1/(9/2 + x)").unwrap(), "x + (9/2 + x)^(-1)");
+    assert_eq!(
+      interpret("x + 1/(-1/2 + x)").unwrap(),
+      "(-1/2 + x)^(-1) + x"
+    );
+    assert_eq!(interpret("x + 1/(1/2 - x)").unwrap(), "(1/2 - x)^(-1) + x");
+    assert_eq!(
+      interpret("x + 1/(3/2 + 2 x)").unwrap(),
+      "x + (3/2 + 2*x)^(-1)"
+    );
+    assert_eq!(
+      interpret("x^2 + 2/(-1/2 + x)").unwrap(),
+      "2/(-1/2 + x) + x^2"
+    );
+    // The full fuzzer case.
+    assert_eq!(
+      interpret("Pi + Divide[Plus[14, -73], Plus[Pi, Divide[9, 2]]]").unwrap(),
+      "Pi - 59/(9/2 + Pi)"
+    );
+  }
+
+  #[test]
+  fn apart_two_linear_factors() {
+    assert_eq!(
+      interpret("Apart[1/((x - 1)*(x - 2))]").unwrap(),
+      "(-2 + x)^(-1) - (-1 + x)^(-1)"
+    );
+  }
+
+  #[test]
+  fn apart_three_linear_factors() {
+    assert_eq!(
+      interpret("Apart[1/((x-1)*(x-2)*(x-3))]").unwrap(),
+      "1/(2*(-3 + x)) - (-2 + x)^(-1) + 1/(2*(-1 + x))"
+    );
+  }
+
+  // Multi-term numerators over irreducible factors hoist their signed
+  // integer content ((6+3x) → 3*(2+x)); the denominator's content is
+  // divided out against the numerator's, and negative numerators render
+  // without an outer -( ) wrap. All wolframscript-verified (differential
+  // fuzzer, seed 1783515124284605000).
+  #[test]
+  fn apart_numerator_content_hoist() {
+    assert_eq!(
+      interpret("Apart[(3 + 5 x + 4 x^2)/(3 x - x^2 + x^3)]").unwrap(),
+      "x^(-1) + (3*(2 + x))/(3 - x + x^2)"
+    );
+    assert_eq!(
+      interpret("Apart[(6 - 3 x)/(3 - x + x^2)]").unwrap(),
+      "(-3*(-2 + x))/(3 - x + x^2)"
+    );
+    assert_eq!(
+      interpret("Apart[(6 + 3 x)/(3 - x + x^2)^2]").unwrap(),
+      "(3*(2 + x))/(3 - x + x^2)^2"
+    );
+    // Content-1 numerators stay expanded.
+    assert_eq!(
+      interpret("Apart[(1 + 2 x)/(3 - x + x^2)]").unwrap(),
+      "(1 + 2*x)/(3 - x + x^2)"
+    );
+    assert_eq!(
+      interpret("Apart[(2 + 4 x + 6 x^2 + 3 x^3)/((3 - x + x^2)*(1 + x^2))]")
+        .unwrap(),
+      "(-9 - 2*x)/(5*(1 + x^2)) + (37 + 17*x)/(5*(3 - x + x^2))"
+    );
+  }
+
+  #[test]
+  fn apart_irreducible_quotient_canonicalization() {
+    // Denominator sign and integer content fold into the numerator.
+    assert_eq!(
+      interpret("Apart[(2 + 4 x)/(-3 + x - x^2)]").unwrap(),
+      "(-2*(1 + 2*x))/(3 - x + x^2)"
+    );
+    // A -1 content distributes back into the sum.
+    assert_eq!(
+      interpret("Apart[(1 + 2 x)/(-3 + x - x^2)]").unwrap(),
+      "(-1 - 2*x)/(3 - x + x^2)"
+    );
+    // Shared content cancels; leftover denominator content stays factored.
+    assert_eq!(
+      interpret("Apart[(2 + 4 x)/(2 + 2 x^2)]").unwrap(),
+      "(1 + 2*x)/(1 + x^2)"
+    );
+    assert_eq!(
+      interpret("Apart[(3 + 6 x)/(2 + 2 x^2)]").unwrap(),
+      "(3*(1 + 2*x))/(2*(1 + x^2))"
+    );
+    assert_eq!(
+      interpret("Apart[(6 + 3 x)/(6 - 2 x + 2 x^2)]").unwrap(),
+      "(3*(2 + x))/(2*(3 - x + x^2))"
+    );
+    // Polynomial-division remainders normalize the same way.
+    assert_eq!(
+      interpret("Apart[(2 x + 4 x^2)/(3 - x + x^2)]").unwrap(),
+      "4 + (6*(-2 + x))/(3 - x + x^2)"
+    );
+  }
+
+  #[test]
+  fn apart_unit_numerator_and_constant_denominator() {
+    // ±1 numerators over an unscaled irreducible denominator render as
+    // (den)^(-1); a scaled one keeps the 1/(2*(...)) shape.
+    assert_eq!(
+      interpret("Apart[2/(-2 - 2 x - 4 x^2)]").unwrap(),
+      "-(1 + x + 2*x^2)^(-1)"
+    );
+    assert_eq!(
+      interpret("Apart[1/(2 + 2 x^2)]").unwrap(),
+      "1/(2*(1 + x^2))"
+    );
+    // Constant denominators split termwise — and no spurious leading 0.
+    assert_eq!(interpret("Apart[(4 + 2 x)/5]").unwrap(), "4/5 + (2*x)/5");
+    assert_eq!(
+      interpret("Apart[(6 x^2 + 4 x + 2)/3]").unwrap(),
+      "2/3 + (4*x)/3 + 2*x^2"
+    );
+  }
+
+  #[test]
+  fn apart_negative_numerator_display() {
+    // Negative numerators render -n/d, not -(n/d) — and never "+ -n/d"
+    // inside a sum.
+    assert_eq!(interpret("Apart[2/(-x^2)]").unwrap(), "-2/x^2");
+    assert_eq!(interpret("Apart[1/(-x^2)]").unwrap(), "-x^(-2)");
+    assert_eq!(interpret("Apart[3/(-2 x^2)]").unwrap(), "-3/(2*x^2)");
+    assert_eq!(
+      interpret("Apart[(2 + 3 x)/(-x^2)]").unwrap(),
+      "-2/x^2 - 3/x"
+    );
+    assert_eq!(interpret("Apart[1/(-(1+x)^2)]").unwrap(), "-(1 + x)^(-2)");
+    assert_eq!(
+      interpret("Apart[(4 + 6 x)/((1 + x)*(2 + x))]").unwrap(),
+      "-2/(1 + x) + 8/(2 + x)"
+    );
+  }
+
+  #[test]
+  fn apart_on_non_rational_is_noop() {
+    // Apart on an expression without a denominator should return it unchanged.
+    assert_eq!(
+      interpret("Apart[Sin[1 / (x ^ 2 - y ^ 2)]]").unwrap(),
+      "Sin[(x^2 - y^2)^(-1)]"
+    );
+  }
+
+  #[test]
+  fn apart_on_equation_is_noop() {
+    // Apart on a non-numeric expression without a denominator returns it
+    // unchanged. Wolframscript -code prints OutputForm, which strips the
+    // quotes around held strings inside comparisons (e.g. `a == A`).
+    assert_eq!(interpret("Apart[a == \"A\"]").unwrap(), "a == A");
+  }
+
+  // A factor whose residue is zero must not produce a spurious `0/(...)`
+  // term: (x + 1)/(x^2 + x) = (x + 1)/(x (x + 1)) = 1/x.
+  #[test]
+  fn apart_drops_zero_residue_term() {
+    assert_eq!(interpret("Apart[(x + 1)/(x^2 + x)]").unwrap(), "x^(-1)");
+  }
+
+  // A removable factor (the numerator cancels one root) leaves only the
+  // surviving partial fraction: (x - 3)/((x - 3)(x + 1)) = 1/(x + 1).
+  #[test]
+  fn apart_cancelling_factor() {
+    assert_eq!(
+      interpret("Apart[(x - 3)/(x^2 - 2 x - 3)]").unwrap(),
+      "(1 + x)^(-1)"
+    );
+  }
+
+  #[test]
+  fn apart_numerator_x_over_two_factors() {
+    assert_eq!(
+      interpret("Apart[x/((x - 1) (x - 2))]").unwrap(),
+      "2/(-2 + x) - (-1 + x)^(-1)"
+    );
+  }
+
+  // A constant polynomial part is spliced in as a flat sum (no spurious
+  // parentheses around the partial-fraction part).
+  #[test]
+  fn apart_with_constant_quotient_is_flat() {
+    assert_eq!(
+      interpret("Apart[(x^2 + 1)/(x^2 - 1)]").unwrap(),
+      "1 + (-1 + x)^(-1) - (1 + x)^(-1)"
+    );
+  }
+
+  // Repeated (squared) denominator factors: each root of multiplicity m
+  // contributes terms 1/(x-r), …, 1/(x-r)^m, highest power first.
+  #[test]
+  fn apart_squared_factor() {
+    assert_eq!(
+      interpret("Apart[1/(x^2 (x + 1))]").unwrap(),
+      "x^(-2) - x^(-1) + (1 + x)^(-1)"
+    );
+  }
+
+  #[test]
+  fn apart_repeated_linear_factor_only() {
+    assert_eq!(interpret("Apart[1/(x + 2)^2]").unwrap(), "(2 + x)^(-2)");
+    assert_eq!(interpret("Apart[3/(x + 2)^2]").unwrap(), "3/(2 + x)^2");
+    assert_eq!(
+      interpret("Apart[(2 x + 5)/(x + 2)^2]").unwrap(),
+      "(2 + x)^(-2) + 2/(2 + x)"
+    );
+  }
+
+  // Irreducible quadratic factors: constant numerators over the linear
+  // factors and linear numerators `B x + C` over the quadratics, matching
+  // wolframscript's canonical output exactly.
+  #[test]
+  fn apart_irreducible_quadratic_factors() {
+    // Two distinct quadratics; numerators collapse to constants by symmetry.
+    assert_eq!(
+      interpret("Apart[1/((x^2 + 1)(x^2 + 4))]").unwrap(),
+      "1/(3*(1 + x^2)) - 1/(3*(4 + x^2))"
+    );
+    // Coefficient 1 renders with the `^(-1)` reciprocal form.
+    assert_eq!(
+      interpret("Apart[1/((x^2 + 1)(x^2 + 2))]").unwrap(),
+      "(1 + x^2)^(-1) - (2 + x^2)^(-1)"
+    );
+    // Linear numerator over the quadratic factor; linear factor term first.
+    assert_eq!(
+      interpret("Apart[1/((x + 1)(x^2 + 1))]").unwrap(),
+      "1/(2*(1 + x)) + (1 - x)/(2*(1 + x^2))"
+    );
+    assert_eq!(
+      interpret("Apart[(x + 1)/((x^2 + 1)(x - 1))]").unwrap(),
+      "(-1 + x)^(-1) - x/(1 + x^2)"
+    );
+    // Numerator with an x term over each quadratic.
+    assert_eq!(
+      interpret("Apart[x/((x^2 + 1)(x^2 + 4))]").unwrap(),
+      "x/(3*(1 + x^2)) - x/(3*(4 + x^2))"
+    );
+    // Quadratic with a middle term, plus a linear factor.
+    assert_eq!(
+      interpret("Apart[(2 x + 1)/((x^2 + x + 1)(x - 5))]").unwrap(),
+      "11/(31*(-5 + x)) + (-4 - 11*x)/(31*(1 + x + x^2))"
+    );
+    // The quartic factors into two conjugate quadratics automatically.
+    assert_eq!(
+      interpret("Apart[1/(x^4 + x^2 + 1)]").unwrap(),
+      "(1 - x)/(2*(1 - x + x^2)) + (1 + x)/(2*(1 + x + x^2))"
+    );
+    // Repeated quadratic factor times a linear factor (powers k = 1, 2).
+    assert_eq!(
+      interpret("Apart[1/((x^2 + 1)^2 (x - 1))]").unwrap(),
+      "1/(4*(-1 + x)) + (-1 - x)/(2*(1 + x^2)^2) + (-1 - x)/(4*(1 + x^2))"
+    );
+    // Mixed linear + quadratic.
+    assert_eq!(
+      interpret("Apart[1/(x (x^2 + 1))]").unwrap(),
+      "x^(-1) - x/(1 + x^2)"
+    );
+  }
+
+  #[test]
+  fn apart_squared_factor_with_simple_factor() {
+    assert_eq!(
+      interpret("Apart[1/((x - 1)^2 (x + 1))]").unwrap(),
+      "1/(2*(-1 + x)^2) - 1/(4*(-1 + x)) + 1/(4*(1 + x))"
+    );
+  }
+
+  #[test]
+  fn apart_cubic_repeated_factor() {
+    assert_eq!(
+      interpret("Apart[1/((x - 1)^3 (x + 2))]").unwrap(),
+      "1/(3*(-1 + x)^3) - 1/(9*(-1 + x)^2) + 1/(27*(-1 + x)) - 1/(27*(2 + x))"
+    );
+  }
+
+  #[test]
+  fn apart_pure_power_denominator() {
+    assert_eq!(interpret("Apart[1/x^3]").unwrap(), "x^(-3)");
+    assert_eq!(interpret("Apart[5/(x - 1)^2]").unwrap(), "5/(-1 + x)^2");
+  }
+
+  #[test]
+  fn apart_two_repeated_factors() {
+    assert_eq!(
+      interpret("Apart[1/(x^2 (x + 1)^2)]").unwrap(),
+      "x^(-2) - 2/x + (1 + x)^(-2) + 2/(1 + x)"
+    );
+  }
+}
+
+mod switch {
+  use super::*;
+
+  #[test]
+  fn basic_match() {
+    assert_eq!(interpret("Switch[2, 1, a, 2, b, 3, c]").unwrap(), "b");
+  }
+
+  #[test]
+  fn first_match() {
+    assert_eq!(interpret("Switch[1, 1, a, 2, b, 3, c]").unwrap(), "a");
+  }
+
+  #[test]
+  fn no_match_returns_unevaluated() {
+    assert_eq!(
+      interpret("Switch[4, 1, a, 2, b, 3, c]").unwrap(),
+      "Switch[4, 1, a, 2, b, 3, c]"
+    );
+  }
+
+  #[test]
+  fn symbolic_target_no_match_returns_unevaluated() {
+    assert_eq!(
+      interpret("Switch[p, a, 1, b, 2]").unwrap(),
+      "Switch[p, a, 1, b, 2]"
+    );
+  }
+
+  #[test]
+  fn wildcard_match() {
+    assert_eq!(interpret("Switch[4, 1, a, _, c]").unwrap(), "c");
+  }
+
+  #[test]
+  fn evaluated_expression() {
+    assert_eq!(interpret("Switch[1 + 1, 1, a, 2, b, 3, c]").unwrap(), "b");
+  }
+
+  #[test]
+  fn head_constrained_blank() {
+    // _Head pattern matches expressions with matching head
+    assert_eq!(
+      interpret("Switch[C[1], _C, matched, _, other]").unwrap(),
+      "matched"
+    );
+  }
+
+  #[test]
+  fn head_constrained_blank_no_match() {
+    // _Head pattern doesn't match different head
+    assert_eq!(
+      interpret("Switch[D[1], _C, matched, _, other]").unwrap(),
+      "other"
+    );
+  }
+
+  #[test]
+  fn head_constrained_blank_integer() {
+    assert_eq!(
+      interpret("Switch[42, _Integer, num, _String, str]").unwrap(),
+      "num"
+    );
+  }
+
+  #[test]
+  fn named_pattern() {
+    // x_ matches anything — Switch does NOT bind pattern variables
+    assert_eq!(interpret("Switch[42, x_, x + 1]").unwrap(), "1 + x");
+  }
+}
+
+mod piecewise {
+  use super::*;
+
+  #[test]
+  fn first_true() {
+    assert_eq!(interpret("Piecewise[{{1, True}}]").unwrap(), "1");
+  }
+
+  #[test]
+  fn second_true() {
+    assert_eq!(
+      interpret("Piecewise[{{1, False}, {2, True}}]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn default_value() {
+    assert_eq!(
+      interpret("Piecewise[{{1, False}, {2, False}}, 42]").unwrap(),
+      "42"
+    );
+  }
+
+  #[test]
+  fn no_match_default_zero() {
+    assert_eq!(interpret("Piecewise[{{1, False}}]").unwrap(), "0");
+  }
+
+  #[test]
+  fn with_conditions() {
+    clear_state();
+    assert_eq!(
+      interpret("x = 5; Piecewise[{{1, x < 0}, {2, x >= 0}}]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn prefix_apply() {
+    // Piecewise @ {{...}} should work the same as Piecewise[{{...}}]
+    assert_eq!(
+      interpret("Piecewise @ {{1, True}, {2, False}}").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("Piecewise @ {{1, False}, {2, True}}").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn prefix_apply_with_conditions() {
+    clear_state();
+    assert_eq!(
+      interpret("x = 3; Piecewise @ {{1, x < 0}, {2, x >= 0}}").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn with_chained_inequality() {
+    clear_state();
+    assert_eq!(
+      interpret("x = 0.5; Piecewise[{{1, 0 <= x < 1}, {2, 1 <= x < 2}}]")
+        .unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("x = 1.5; Piecewise[{{1, 0 <= x < 1}, {2, 1 <= x < 2}}]")
+        .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn via_table_prefix_apply() {
+    assert_eq!(
+      interpret("With[{l = {1, 2, 1}}, Piecewise @ Table[{(-1)^i, Accumulate[Prepend[l, 0]][[i]] <= t < Accumulate[Prepend[l, 0]][[i + 1]]}, {i, 1, Length[l]}] /. t -> 0.5]").unwrap(),
+      "-1"
+    );
+    assert_eq!(
+      interpret("With[{l = {1, 2, 1}}, Piecewise @ Table[{(-1)^i, Accumulate[Prepend[l, 0]][[i]] <= t < Accumulate[Prepend[l, 0]][[i + 1]]}, {i, 1, Length[l]}] /. t -> 1.5]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn variable_holding_pairs_evaluates_to_inner_value() {
+    // Regression: `Piecewise[x]` where `x` is bound to a literal list of
+    // pairs erroneously errored out because the head check ran before the
+    // arg was evaluated. With the eval-the-arg-first change, the variable
+    // resolves to its bound List first.
+    assert_eq!(
+      interpret("x = {{1, True}, {2, False}}; Piecewise[x]").unwrap(),
+      "1"
+    );
+  }
+}
+
+mod match_q {
+  use super::*;
+
+  #[test]
+  fn head_matching() {
+    assert_eq!(interpret("MatchQ[{1, 2, 3}, _List]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[42, _Integer]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[3.14, _Real]").unwrap(), "True");
+    assert_eq!(interpret(r#"MatchQ["hello", _String]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn head_mismatch() {
+    assert_eq!(interpret("MatchQ[1, _String]").unwrap(), "False");
+    assert_eq!(interpret("MatchQ[1, _List]").unwrap(), "False");
+    assert_eq!(interpret(r#"MatchQ["x", _Integer]"#).unwrap(), "False");
+  }
+
+  #[test]
+  fn blank_matches_anything() {
+    assert_eq!(interpret("MatchQ[42, _]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[{1, 2}, _]").unwrap(), "True");
+    assert_eq!(interpret(r#"MatchQ["x", _]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn literal_matching() {
+    assert_eq!(interpret("MatchQ[42, 42]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[42, 43]").unwrap(), "False");
+    assert_eq!(interpret("MatchQ[x, x]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[x, y]").unwrap(), "False");
+  }
+
+  #[test]
+  fn operator_form() {
+    assert_eq!(interpret("MatchQ[_Integer][123]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[_String][123]").unwrap(), "False");
+  }
+
+  #[test]
+  fn repeated_pattern_variable_must_match() {
+    // Regression: matches_pattern_ast ignored Pattern names, so both `a_`
+    // positions in {a_, b_, a_} would match independently.
+    assert_eq!(
+      interpret("MatchQ[{1, 2, 3}, {a_, b_, a_}]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("MatchQ[{1, 2, 1}, {a_, b_, a_}]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn repeated_pattern_variable_in_function_args() {
+    // Pattern variable `x_` used twice must match the same value
+    assert_eq!(interpret("MatchQ[f[1, 1], f[x_, x_]]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[f[1, 2], f[x_, x_]]").unwrap(), "False");
+  }
+}
+
+mod replace_all_after_operators {
+  use super::*;
+
+  #[test]
+  fn replace_all_after_plus() {
+    assert_eq!(interpret("x + y /. x -> 1").unwrap(), "1 + y");
+  }
+
+  #[test]
+  fn replace_all_after_times() {
+    assert_eq!(interpret("x * y /. x -> 2").unwrap(), "2*y");
+  }
+
+  #[test]
+  fn replace_all_after_power() {
+    assert_eq!(interpret("x^2 + y /. x -> 3").unwrap(), "9 + y");
+  }
+
+  #[test]
+  fn replace_all_multiple_operators() {
+    assert_eq!(interpret("x + y + z /. {x -> 1, y -> 2}").unwrap(), "3 + z");
+  }
+
+  #[test]
+  fn replace_all_times_multiple_vars() {
+    assert_eq!(interpret("x * y * z /. {x -> 2, y -> 3}").unwrap(), "6*z");
+  }
+
+  #[test]
+  fn replace_all_with_implicit_times() {
+    assert_eq!(interpret("2 x + 3 y /. {x -> 1, y -> 2}").unwrap(), "8");
+  }
+
+  #[test]
+  fn replace_repeated_after_plus() {
+    assert_eq!(interpret("x + y //. x -> 1").unwrap(), "1 + y");
+  }
+
+  #[test]
+  fn replace_repeated_after_times() {
+    assert_eq!(interpret("x * y //. x -> 2").unwrap(), "2*y");
+  }
+
+  #[test]
+  fn replace_all_after_comparison() {
+    assert_eq!(interpret("x > y /. x -> 3").unwrap(), "3 > y");
+  }
+
+  #[test]
+  fn replace_all_all_vars_replaced() {
+    assert_eq!(interpret("x + y /. {x -> 10, y -> 20}").unwrap(), "30");
+  }
+
+  #[test]
+  fn replace_all_list_of_rules_simultaneous() {
+    // Rules should be applied simultaneously, not sequentially
+    // 2->1 and 1->0 should NOT chain (2 becomes 1, not 0)
+    assert_eq!(
+      interpret("{1,1,2,2,2,2} /. {2 -> 1, 1 -> 0}").unwrap(),
+      "{0, 0, 1, 1, 1, 1}"
+    );
+  }
+
+  #[test]
+  fn replace_all_list_of_rules_first_match_wins() {
+    // x->y should match, then y->z should NOT apply to the result
+    assert_eq!(interpret("x /. {x -> y, y -> z}").unwrap(), "y");
+  }
+
+  #[test]
+  fn replace_all_list_of_rules_no_match() {
+    // No rule matches, original expression returned
+    assert_eq!(
+      interpret("{3, 4, 5} /. {1 -> a, 2 -> b}").unwrap(),
+      "{3, 4, 5}"
+    );
+  }
+
+  #[test]
+  fn replace_all_list_of_rules_partial_match() {
+    // Only some elements match
+    assert_eq!(
+      interpret("{a, b, c} /. {a -> x, b -> y}").unwrap(),
+      "{x, y, c}"
+    );
+  }
+
+  #[test]
+  fn replace_all_list_of_rules_swap() {
+    // Swap a and b simultaneously
+    assert_eq!(
+      interpret("{a, b, a, b} /. {a -> b, b -> a}").unwrap(),
+      "{b, a, b, a}"
+    );
+  }
+}
+
+mod replace_all_expression_rhs {
+  use super::*;
+
+  #[test]
+  fn rule_delayed_with_division() {
+    assert_eq!(
+      interpret("{0, 0, 1, 1, 1, 1} /. {any_Integer :> any / 2}").unwrap(),
+      "{0, 0, 1/2, 1/2, 1/2, 1/2}"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_with_addition() {
+    assert_eq!(
+      interpret("{1, 2, 3} /. {x_ :> x + 10}").unwrap(),
+      "{11, 12, 13}"
+    );
+  }
+
+  #[test]
+  fn rule_with_expression_rhs() {
+    assert_eq!(
+      interpret("{1, 2, 3} /. x_Integer -> x + 10").unwrap(),
+      "{11, 12, 13}"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_with_power() {
+    assert_eq!(interpret("5 /. x_Integer :> x^2").unwrap(), "25");
+  }
+}
+
+// A rule targeting an operator symbol rewrites the operator of a held infix
+// expression, e.g. `Hold[a + b] /. Plus -> Times` → `Hold[a*b]`.
+mod replace_all_held_operator_head {
+  use super::*;
+
+  #[test]
+  fn plus_to_times() {
+    assert_eq!(
+      interpret("Hold[1 + 2] /. Plus -> Times").unwrap(),
+      "Hold[1*2]"
+    );
+    assert_eq!(
+      interpret("Hold[a + b + c] /. Plus -> Times").unwrap(),
+      "Hold[a*b*c]"
+    );
+  }
+
+  #[test]
+  fn times_and_power_and_and() {
+    assert_eq!(
+      interpret("Hold[a*b] /. Times -> Plus").unwrap(),
+      "Hold[a + b]"
+    );
+    assert_eq!(
+      interpret("Hold[x^2] /. Power -> f").unwrap(),
+      "Hold[f[x, 2]]"
+    );
+    assert_eq!(
+      interpret("Hold[a && b] /. And -> Or").unwrap(),
+      "Hold[a || b]"
+    );
+  }
+
+  #[test]
+  fn to_list_and_arbitrary_head() {
+    // Replacing with List yields an actual list, not List[...].
+    assert_eq!(
+      interpret("Hold[1 + 2] /. Plus -> List").unwrap(),
+      "Hold[{1, 2}]"
+    );
+    assert_eq!(
+      interpret("Hold[a + b] /. Plus -> f").unwrap(),
+      "Hold[f[a, b]]"
+    );
+  }
+
+  // Operand replacement (not the head) still returns the infix form.
+  #[test]
+  fn operand_replacement_unaffected() {
+    assert_eq!(interpret("Hold[a + b] /. a -> z").unwrap(), "Hold[z + b]");
+  }
+}
+
+mod replace_all_head_constraint {
+  use super::*;
+
+  #[test]
+  fn integer_head_matches() {
+    assert_eq!(
+      interpret("{0, 0, 1, 1, 1, 1} /. {any_Integer :> any / 2}").unwrap(),
+      "{0, 0, 1/2, 1/2, 1/2, 1/2}"
+    );
+  }
+
+  #[test]
+  fn integer_head_skips_non_integers() {
+    assert_eq!(
+      interpret(r#"{1, 2.5, "hello", x} /. a_Integer :> a + 100"#).unwrap(),
+      "{101, 2.5, hello, x}"
+    );
+  }
+
+  #[test]
+  fn string_head_matches() {
+    assert_eq!(
+      interpret(r#"{1, "hi", "bye"} /. s_String :> StringLength[s]"#).unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn real_head_matches() {
+    assert_eq!(
+      interpret("{1, 2.5, 3.0} /. x_Real :> x * 10").unwrap(),
+      "{1, 25., 30.}"
+    );
+  }
+
+  #[test]
+  fn head_no_match_returns_unchanged() {
+    assert_eq!(
+      interpret(r#""hello" /. x_Integer :> x^2"#).unwrap(),
+      "hello"
+    );
+  }
+
+  #[test]
+  fn multiple_head_rules() {
+    assert_eq!(
+      interpret("{1, 2.5, 3} /. {a_Integer :> a + 100, b_Real :> b * 10}")
+        .unwrap(),
+      "{101, 25., 103}"
+    );
+  }
+}
+
+mod replace_all_conditional_multi_rules {
+  use super::*;
+
+  #[test]
+  fn conditional_pattern_single_rule() {
+    assert_eq!(interpret("27 /. n_ /; OddQ[n] :> 3 n + 1").unwrap(), "82");
+  }
+
+  #[test]
+  fn conditional_pattern_multi_rules_scalar() {
+    // Multi-rule ReplaceAll with conditional patterns on a scalar
+    assert_eq!(
+      interpret("6 /. {n_ /; EvenQ[n] :> n/2, n_ /; OddQ[n] :> 3 n + 1}")
+        .unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn conditional_pattern_multi_rules_list() {
+    assert_eq!(
+      interpret("{27, 6} /. {n_ /; EvenQ[n] :> n/2, n_ /; OddQ[n] :> 3 n + 1}")
+        .unwrap(),
+      "{82, 3}"
+    );
+  }
+
+  #[test]
+  fn nested_list_multi_rules() {
+    // Multi-rule ReplaceAll should recurse into nested lists
+    assert_eq!(
+      interpret("{C[1], {X, 4, Y, C[1]}} /. {X -> a, Y -> b}").unwrap(),
+      "{C[1], {a, 4, b, C[1]}}"
+    );
+  }
+
+  #[test]
+  fn nested_list_swap() {
+    assert_eq!(
+      interpret("{{a, b}, {c, d}} /. {a -> 1, d -> 4}").unwrap(),
+      "{{1, b}, {c, 4}}"
+    );
+  }
+
+  // Regression: `expr /. rules-tree` should recurse into *every* level of
+  // List in the rules argument, not just when each top-level element is a
+  // flat rule list. Matches wolframscript's tree-of-rule-lists semantics.
+  #[test]
+  fn nested_rule_tree_three_levels() {
+    assert_eq!(
+      interpret("{a, b} /. {{{a->x, b->y}, {a->w, b->z}}, {a->u, b->v}}")
+        .unwrap(),
+      "{{{x, y}, {w, z}}, {u, v}}"
+    );
+  }
+
+  #[test]
+  fn nested_rule_tree_two_levels() {
+    assert_eq!(
+      interpret("{a, b} /. {{a->x, b->y}, {a->w, b->z}}").unwrap(),
+      "{{x, y}, {w, z}}"
+    );
+  }
+}
+
+mod replace_all_variable_rhs {
+  use super::*;
+
+  #[test]
+  fn variable_holding_rules() {
+    clear_state();
+    assert_eq!(
+      interpret("r = {x -> 1, y -> 2}; {x, y, z} /. r").unwrap(),
+      "{1, 2, z}"
+    );
+  }
+
+  #[test]
+  fn variable_holding_conditional_rules() {
+    clear_state();
+    assert_eq!(
+      interpret("r = {x_ /; EvenQ[x] :> x/2}; Map[# /. r &, {4, 7}]").unwrap(),
+      "{2, 7}"
+    );
+  }
+
+  #[test]
+  fn variable_in_anonymous_function() {
+    clear_state();
+    assert_eq!(
+      interpret("r = {a -> b, b -> c}; Nest[# /. r &, a, 2]").unwrap(),
+      "c"
+    );
+  }
+}
+
+mod replace_repeated {
+  use super::*;
+
+  #[test]
+  fn replace_repeated_applies_multiple_times() {
+    assert_eq!(interpret("f[f[f[f[2]]]] //. f[2] -> 2").unwrap(), "2");
+  }
+
+  #[test]
+  fn replace_repeated_simple() {
+    assert_eq!(interpret("f[f[2]] //. f[2] -> 2").unwrap(), "2");
+  }
+}
+
+mod replace_repeated_operator_form {
+  use super::*;
+
+  #[test]
+  fn operator_form_works() {
+    // ReplaceRepeated[rule][expr] should work like expr //. rule
+    let result =
+      interpret("ReplaceRepeated[f[2] -> 2][f[f[f[f[2]]]]]").unwrap();
+    assert_eq!(result, "2");
+  }
+
+  #[test]
+  fn infix_form_works() {
+    let result = interpret("f[f[f[2]]] //. f[2] -> 2").unwrap();
+    assert_eq!(result, "2");
+  }
+}
+
+mod symbolic_equal {
+  use super::*;
+
+  #[test]
+  fn numeric_equal() {
+    assert_eq!(interpret("1 == 1").unwrap(), "True");
+    assert_eq!(interpret("1 == 2").unwrap(), "False");
+  }
+
+  #[test]
+  fn identical_symbols() {
+    assert_eq!(interpret("x == x").unwrap(), "True");
+  }
+
+  #[test]
+  fn reciprocal_product_equal() {
+    // Power[Times[...], -1] should distribute and match 1/(...) form
+    assert_eq!(interpret("1/(a*b) == (a*b)^-1").unwrap(), "True");
+    assert_eq!(interpret("1/(x*y) == (x*y)^-1").unwrap(), "True");
+    assert_eq!(
+      interpret("1/(Sqrt[x]*(a + b*x)) == (Sqrt[x]*(a + b*x))^-1").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn different_symbols_stay_symbolic() {
+    assert_eq!(interpret("x == y").unwrap(), "x == y");
+  }
+
+  #[test]
+  fn symbolic_expression_vs_number() {
+    assert_eq!(interpret("x + 1 == 0").unwrap(), "1 + x == 0");
+  }
+
+  #[test]
+  fn same_q_always_evaluates() {
+    assert_eq!(interpret("x === x").unwrap(), "True");
+    assert_eq!(interpret("x === y").unwrap(), "False");
+  }
+
+  #[test]
+  fn unequal_symbolic() {
+    assert_eq!(interpret("x != x").unwrap(), "False");
+    assert_eq!(interpret("x != y").unwrap(), "x != y");
+  }
+
+  #[test]
+  fn unsame_q_always_evaluates() {
+    assert_eq!(interpret("x =!= x").unwrap(), "False");
+    assert_eq!(interpret("x =!= y").unwrap(), "True");
+  }
+
+  // SameQ/UnsameQ compare deeply nested expressions without overflowing the
+  // stack. Regression: comparing Nest[f, x, 5000] used to crash with a
+  // stack overflow because the formatter (expr_to_string) was not stack-safe.
+  #[test]
+  fn same_q_deeply_nested_no_overflow() {
+    // Depth 600 is comfortably past the old ~500-deep stack-overflow point
+    // while staying cheap enough to run under the parallel test harness.
+    assert_eq!(
+      interpret("UnsameQ[Nest[f, x, 600], Nest[f, x, 601]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("SameQ[Nest[f, x, 600], Nest[f, x, 600]]").unwrap(),
+      "True"
+    );
+  }
+
+  // Rendering a deeply nested result — the plain script-mode display, FullForm,
+  // and a ReplaceAll result — must not overflow the stack. Regression: the SVG
+  // typesetting pre-pass and expr_to_input_form recursed unbounded.
+  #[test]
+  fn deeply_nested_render_no_overflow() {
+    assert_eq!(interpret("Nest[f, x, 3]").unwrap(), "f[f[f[x]]]");
+    // Depth 600 result renders as f[f[...f[x]...]]: each level is "f[" + "]"
+    // (3 chars) plus the single "x".
+    let out = interpret("Nest[f, x, 600]").unwrap();
+    assert_eq!(out.len(), 600 * 3 + 1);
+    assert!(out.starts_with("f[f[f["));
+    // FullForm of a deep expression renders without overflow.
+    let ff = interpret("FullForm[Nest[f, x, 600]]").unwrap();
+    assert!(ff.contains("f[f["));
+    // Stripping the outer f via ReplaceAll then rendering the result.
+    let stripped =
+      interpret("ReplaceAll[Nest[f, x, 600], f[a_] -> a]").unwrap();
+    assert_eq!(stripped.len(), 599 * 3 + 1);
+  }
+}
+
+mod solve {
+  use super::*;
+
+  #[test]
+  fn linear_equation() {
+    assert_eq!(interpret("Solve[x - 5 == 0, x]").unwrap(), "{{x -> 5}}");
+    assert_eq!(interpret("Solve[2*x + 6 == 0, x]").unwrap(), "{{x -> -3}}");
+    assert_eq!(interpret("Solve[3*x + 9 == 0, x]").unwrap(), "{{x -> -3}}");
+  }
+
+  // A vector equation threads element-wise over equal-length lists, so a
+  // line–line intersection written as `r1 + t e1 == r2 + u e2` is solved
+  // as the two scalar equations. Regression test for the
+  // `intersection2lines` helper in Demonstration notebooks.
+  #[test]
+  fn vector_equation_threads_over_lists() {
+    assert_eq!(
+      interpret("Solve[{1 + 2 t, 3 - t} == {4 + u, 5 u}, {t, u}]").unwrap(),
+      "{{t -> 18/11, u -> 3/11}}"
+    );
+    assert_eq!(
+      interpret(
+        "First[({0, 0} + t {1, 1}) /. \
+         Solve[{0, 0} + t {1, 1} == {0, 2} + u {1, -1}, {t, u}]]"
+      )
+      .unwrap(),
+      "{1, 1}"
+    );
+  }
+
+  // Threading also applies to list equations inside an equation list, and
+  // to the one-argument form's variable auto-detection.
+  #[test]
+  fn vector_equation_inside_equation_list() {
+    assert_eq!(
+      interpret("Solve[{{x, y} == {2, 4}, x + y == 6}, {x, y}]").unwrap(),
+      "{{x -> 2, y -> 4}}"
+    );
+    assert_eq!(
+      interpret("Solve[{x, y} == {1, 2}]").unwrap(),
+      "{{x -> 1, y -> 2}}"
+    );
+  }
+
+  // A two-variable system whose coefficients are opaque — here an
+  // unevaluated `{}[[1]]`/`{}[[2]]` Part-on-empty-list, but a `f[1]` or a
+  // `q[[1]]` behaves the same — is solved for the unknowns with those
+  // coefficients carried along, exactly as it would be with plain symbols
+  // in their place: `{{x -> {}[[1]], y -> {}[[2]]}}`. Three things had to
+  // hold for that:
+  //
+  //   * a `Part` counts as constant with respect to a variable
+  //     (`is_constant_wrt`), or the linear-system path refuses the system;
+  //   * `Simplify` can cancel a quotient whose "variables" are opaque
+  //     subexpressions, or the answer comes back as the uncancelled
+  //     quotients Gaussian elimination produced;
+  //   * the elimination fallback must not recurse into itself — it used to
+  //     re-spell the equation list as a conjunction and retry `Solve`,
+  //     whose own And-to-List pre-pass folded it straight back into the
+  //     identical equation list, hanging and eventually crashing.
+  //
+  // Found via a random Wolfram Demonstrations Project notebook
+  // (independently constructed here, not copied from it) whose Manipulate
+  // solved an equivalent two-equation system for two draggable points'
+  // coordinates.
+  #[test]
+  fn multi_var_system_with_opaque_coefficients_is_solved() {
+    for coefficients in ["{}[[1]], {}[[2]]", "q[[1]], q[[2]]", "f[1], f[2]"] {
+      let (a, b) = coefficients.split_once(", ").unwrap();
+      assert_eq!(
+        interpret(&format!(
+          "Solve[{{(-1 + y)*(-1 + {a}) == (-1 + x)*(-1 + {b}), \
+           (1 + y)*(1 + {a}) == (1 + x)*(1 + {b})}}, {{x, y}}]"
+        ))
+        .unwrap(),
+        format!("{{{{x -> {a}, y -> {b}}}}}"),
+        "coefficients {coefficients}"
+      );
+    }
+  }
+
+  // Generalized variables: an applied function `y[x]` is a valid unknown and
+  // is solved for as a whole, matching wolframscript.
+  #[test]
+  fn generalized_variable_linear() {
+    assert_eq!(
+      interpret("Solve[y[x] + 2 == 5, y[x]]").unwrap(),
+      "{{y[x] -> 3}}"
+    );
+    assert_eq!(
+      interpret("Solve[2 y[x] == x, y[x]]").unwrap(),
+      "{{y[x] -> x/2}}"
+    );
+  }
+
+  #[test]
+  fn generalized_variable_quadratic() {
+    assert_eq!(
+      interpret("Solve[y[x]^2 == 4, y[x]]").unwrap(),
+      "{{y[x] -> -2}, {y[x] -> 2}}"
+    );
+    assert_eq!(
+      interpret("Solve[a[t]^2 == 9, a[t]]").unwrap(),
+      "{{a[t] -> -3}, {a[t] -> 3}}"
+    );
+  }
+
+  #[test]
+  fn generalized_variable_system() {
+    assert_eq!(
+      interpret("Solve[{y[x] + z[x] == 1, y[x] - z[x] == 3}, {y[x], z[x]}]")
+        .unwrap(),
+      "{{y[x] -> 2, z[x] -> -1}}"
+    );
+  }
+
+  // A Laurent equation (negative powers only) must not overflow / panic when
+  // computing the polynomial degree; x^-2 == -1 solves to x = +/-I.
+  #[test]
+  fn negative_power_equation() {
+    assert_eq!(
+      interpret("Solve[x^-2 + 1 == 0, x]").unwrap(),
+      "{{x -> -I}, {x -> I}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_integer_roots() {
+    assert_eq!(
+      interpret("Solve[x^2 + 3x - 10 == 0, x]").unwrap(),
+      "{{x -> -5}, {x -> 2}}"
+    );
+  }
+
+  // A list of equations with a bare-symbol variable is a valid system:
+  // Solve[{x == 1, x == 2}, x] behaves like Solve[..., {x}], not a
+  // Solve::naqs error. Previously it fell through to the single-equation
+  // path and stayed unevaluated with a bogus message.
+  #[test]
+  fn list_equations_with_bare_variable() {
+    // Inconsistent system → no solutions.
+    assert_eq!(interpret("Solve[{x == 1, x == 2}, x]").unwrap(), "{}");
+    // Redundant consistent system → the solution.
+    assert_eq!(
+      interpret("Solve[{x == 1, x == 1}, x]").unwrap(),
+      "{{x -> 1}}"
+    );
+    // A single equation in a list still enumerates its roots.
+    assert_eq!(
+      interpret("Solve[{x^2 == 1}, x]").unwrap(),
+      "{{x -> -1}, {x -> 1}}"
+    );
+    // An inequality constraint alongside the equation is honored.
+    assert_eq!(
+      interpret("Solve[{x^2 == 1, x > 0}, x]").unwrap(),
+      "{{x -> 1}}"
+    );
+    // The And form is flattened to the same list system.
+    assert_eq!(interpret("Solve[x == 1 && x == 2, x]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn one_argument_auto_detects_variable() {
+    // Single-variable: the variable is inferred from the equation.
+    assert_eq!(interpret("Solve[2 x == 6]").unwrap(), "{{x -> 3}}");
+    assert_eq!(
+      interpret("Solve[x^2 - 5 x + 6 == 0]").unwrap(),
+      "{{x -> 2}, {x -> 3}}"
+    );
+    // Determined system: solve for all variables.
+    assert_eq!(
+      interpret("Solve[{x + y == 3, x - y == 1}]").unwrap(),
+      "{{x -> 2, y -> 1}}"
+    );
+    // A trivially-true condition yields the empty solution {{}}.
+    assert_eq!(interpret("Solve[x == x]").unwrap(), "{{}}");
+  }
+
+  #[test]
+  fn one_argument_underdetermined_solves_for_last_variables() {
+    // An underdetermined system is solved for its last variables (in
+    // canonical order), the earlier ones staying free parameters. No
+    // `svars` message: no variables were asked for.
+    assert_eq!(interpret("Solve[x + y == 3]").unwrap(), "{{y -> 3 - x}}");
+    assert!(woxi::get_captured_messages_raw().is_empty());
+    assert_eq!(
+      interpret("Solve[{x + y == 2, x - y == z}]").unwrap(),
+      "{{y -> 2 - x, z -> -2 + 2*x}}"
+    );
+    assert_eq!(
+      interpret("Solve[{y + z == 1, y + z + x == 2}]").unwrap(),
+      "{{x -> 1, z -> 1 - y}}"
+    );
+    // Nonlinear: a clean linear unknown first, then the lowest degree,
+    // then the later variable.
+    assert_eq!(
+      interpret("Solve[x + y^2 == 2]").unwrap(),
+      "{{x -> 2 - y^2}}"
+    );
+    assert_eq!(interpret("Solve[a*x + b == 0]").unwrap(), "{{b -> -(a*x)}}");
+    assert_eq!(interpret("Solve[x*y == 1]").unwrap(), "{{y -> x^(-1)}}");
+    assert_eq!(
+      interpret("Solve[x^2 - y^3 == 1]").unwrap(),
+      "{{x -> -Sqrt[1 + y^3]}, {x -> Sqrt[1 + y^3]}}"
+    );
+    // Rules come out in canonical variable order, not appearance order.
+    assert_eq!(
+      interpret("Solve[{y == 1, x == 2}]").unwrap(),
+      "{{x -> 2, y -> 1}}"
+    );
+    // A conjunction counts as several equations.
+    assert_eq!(
+      interpret("Solve[x^2 + y^2 == 1 && x == y]").unwrap(),
+      "{{x -> -(1/Sqrt[2]), y -> -(1/Sqrt[2])}, {x -> 1/Sqrt[2], y -> 1/Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn explicit_underdetermined_solves_for_last_variables() {
+    // With an explicit variable list the same choice is made, and `svars`
+    // reports that some of the requested variables stay free.
+    assert_eq!(
+      interpret("Solve[x + y == 2, {x, y}]").unwrap(),
+      "{{y -> 2 - x}}"
+    );
+    assert_eq!(
+      woxi::get_captured_messages_raw(),
+      vec![
+        "Solve::svars: Equations may not give solutions for all \"solve\" variables."
+      ]
+    );
+    assert_eq!(
+      interpret("Quiet[Solve[x + 2*y == 3, {x, y}]]").unwrap(),
+      "{{y -> 3/2 - x/2}}"
+    );
+    assert_eq!(
+      interpret("Quiet[Solve[x + 2*y == 3, {y, x}]]").unwrap(),
+      "{{x -> 3 - 2*y}}"
+    );
+    assert_eq!(
+      interpret("Quiet[Solve[a*x + b*y + c*z == d, {x, y, z}]]").unwrap(),
+      "{{z -> d/c - (a*x)/c - (b*y)/c}}"
+    );
+    assert_eq!(
+      interpret(
+        "Quiet[Solve[{2 x + y + 2*z == 2, x - y + 3 z == 1}, {x, y, z}]]"
+      )
+      .unwrap(),
+      "{{y -> 4/5 - (4*x)/5, z -> 3/5 - (3*x)/5}}"
+    );
+    assert_eq!(
+      interpret("Quiet[Solve[x^2 + y^2 == 1, {x, y}]]").unwrap(),
+      "{{y -> -Sqrt[1 - x^2]}, {y -> Sqrt[1 - x^2]}}"
+    );
+    // A requested variable no equation mentions is never the one solved for.
+    assert_eq!(
+      interpret("Quiet[Solve[x^2 == 4, {x, z}]]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+  }
+
+  #[test]
+  fn nsolve_underdetermined_linear_solves_for_first_variables() {
+    // NSolve, unlike Solve, solves a linear underdetermined system for its
+    // first variables and reports no `svars`.
+    assert_eq!(
+      interpret("NSolve[{x + y + z == 2, x - y == 1}, {x, y, z}]").unwrap(),
+      "{{x -> 1.5 - 0.5*z, y -> 0.5 - 0.5*z}}"
+    );
+    assert!(woxi::get_captured_messages_raw().is_empty());
+    assert_eq!(
+      interpret("NSolve[x + y == 2, Reals]").unwrap(),
+      "{{x -> 2. - 1.*y}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_symmetric() {
+    assert_eq!(
+      interpret("Solve[x^2 - 4 == 0, x]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_with_leading_coeff() {
+    assert_eq!(
+      interpret("Solve[2*x^2 - 8 == 0, x]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_repeated_root() {
+    assert_eq!(
+      interpret("Solve[x^2 + 2*x + 1 == 0, x]").unwrap(),
+      "{{x -> -1}, {x -> -1}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_complex_roots() {
+    assert_eq!(
+      interpret("Solve[x^2 + 1 == 0, x]").unwrap(),
+      "{{x -> -I}, {x -> I}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_irrational_roots() {
+    assert_eq!(
+      interpret("Solve[x^2 - 5 == 0, x]").unwrap(),
+      "{{x -> -Sqrt[5]}, {x -> Sqrt[5]}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_golden_ratio() {
+    assert_eq!(
+      interpret("Solve[x^2 + x - 1 == 0, x]").unwrap(),
+      "{{x -> (-1 - Sqrt[5])/2}, {x -> (-1 + Sqrt[5])/2}}"
+    );
+  }
+
+  #[test]
+  fn denominator_of_rational_function_roots() {
+    // Solve[Denominator[f[x]] == 0, x] for f[x] = 4x/(x^2 + 3x + 5).
+    // Matches wolframscript; mathics docstring displays as "-3/2 +/- I/2 Sqrt[11]".
+    assert_eq!(
+      interpret(
+        "f[x_] := 4 x / (x^2 + 3 x + 5); Solve[Denominator[f[x]] == 0, x]"
+      )
+      .unwrap(),
+      "{{x -> (-3 - I*Sqrt[11])/2}, {x -> (-3 + I*Sqrt[11])/2}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_general() {
+    assert_eq!(
+      interpret("Solve[x^2 - 2*x - 3 == 0, x]").unwrap(),
+      "{{x -> -1}, {x -> 3}}"
+    );
+  }
+
+  #[test]
+  fn trivial_x_equals_zero() {
+    assert_eq!(interpret("Solve[x == 0, x]").unwrap(), "{{x -> 0}}");
+  }
+
+  #[test]
+  fn tautology() {
+    assert_eq!(interpret("Solve[x == x, x]").unwrap(), "{{}}");
+  }
+
+  #[test]
+  fn contradiction() {
+    assert_eq!(interpret("Solve[2 == 3, x]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn rational_solution() {
+    assert_eq!(interpret("Solve[2*x - 1 == 0, x]").unwrap(), "{{x -> 1/2}}");
+  }
+
+  #[test]
+  fn constant_variable_rejected() {
+    assert_eq!(
+      interpret("Solve[x + E == 0, E]").unwrap(),
+      "Solve[E + x == 0, E]"
+    );
+  }
+
+  #[test]
+  fn fractional_power_equation() {
+    // Physics: find extrema of E-field on axis of ring charge
+    // Common constant factors (2*k*q) are factored out before the quadratic formula
+    assert_eq!(
+      interpret(
+        "Solve[(2*k*q*(a^2 + x^2)^(3/2) - 6*k*q*x^2*(a^2 + x^2)^(1/2))/(a^2 + x^2)^3 == 0, x]"
+      )
+      .unwrap(),
+      "{{x -> -(a/Sqrt[2])}, {x -> a/Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn symbolic_quadratic_simple() {
+    assert_eq!(
+      interpret("Solve[a^2 - 2*x^2 == 0, x]").unwrap(),
+      "{{x -> -(a/Sqrt[2])}, {x -> a/Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn symbolic_quadratic_general() {
+    assert_eq!(
+      interpret("Solve[a*x^2 + b*x + c == 0, x]").unwrap(),
+      "{{x -> (-b - Sqrt[b^2 - 4*a*c])/(2*a)}, {x -> (-b + Sqrt[b^2 - 4*a*c])/(2*a)}}"
+    );
+  }
+
+  #[test]
+  fn quartic_factor_based() {
+    assert_eq!(
+      interpret("Solve[x^4 - x == 0, x]").unwrap(),
+      "{{x -> 0}, {x -> 1}, {x -> -(-1)^(1/3)}, {x -> (-1)^(2/3)}}"
+    );
+  }
+
+  #[test]
+  fn cubic_factor_based() {
+    assert_eq!(
+      interpret("Solve[x^3 - 1 == 0, x]").unwrap(),
+      "{{x -> 1}, {x -> -(-1)^(1/3)}, {x -> (-1)^(2/3)}}"
+    );
+  }
+
+  #[test]
+  fn cubic_integer_roots_sorted() {
+    // Solutions must be sorted ascending, matching Wolfram Language
+    assert_eq!(
+      interpret("Solve[x^3 - 6 x^2 + 11 x - 6 == 0, x]").unwrap(),
+      "{{x -> 1}, {x -> 2}, {x -> 3}}"
+    );
+  }
+
+  #[test]
+  fn quartic_integer_roots_sorted() {
+    // Solutions must be sorted ascending, matching Wolfram Language
+    assert_eq!(
+      interpret("Solve[x^4 - 10 x^2 + 9 == 0, x]").unwrap(),
+      "{{x -> -3}, {x -> -1}, {x -> 1}, {x -> 3}}"
+    );
+  }
+
+  #[test]
+  fn cyclotomic_phi3() {
+    assert_eq!(
+      interpret("Solve[x^2 + x + 1 == 0, x]").unwrap(),
+      "{{x -> -(-1)^(1/3)}, {x -> (-1)^(2/3)}}"
+    );
+  }
+
+  #[test]
+  fn cyclotomic_phi6() {
+    assert_eq!(
+      interpret("Solve[x^2 - x + 1 == 0, x]").unwrap(),
+      "{{x -> (-1)^(1/3)}, {x -> -(-1)^(2/3)}}"
+    );
+  }
+
+  #[test]
+  fn nonlinear_system() {
+    assert_eq!(
+      interpret("Solve[{3 x ^ 2 - 3 y == 0, 3 y ^ 2 - 3 x == 0}, {x, y}]")
+        .unwrap(),
+      "{{x -> 0, y -> 0}, {x -> 1, y -> 1}, {x -> -(-1)^(1/3), y -> (-1)^(2/3)}, {x -> (-1)^(2/3), y -> -(-1)^(1/3)}}"
+    );
+  }
+
+  // Two conics are intersected by dividing one equation into the other,
+  // which for two circles leaves the line through their intersections.
+  #[test]
+  fn two_circles_meeting_twice() {
+    assert_eq!(
+      interpret("Solve[{x^2 + y^2 == 1, (x - 1)^2 + (y - 1)^2 == 1}, {x, y}]")
+        .unwrap(),
+      "{{x -> 0, y -> 1}, {x -> 1, y -> 0}}"
+    );
+    // The conjunction spelling of the same system.
+    assert_eq!(
+      interpret("Solve[x^2 + y^2 == 1 && (x - 1)^2 + (y - 1)^2 == 1, {x, y}]")
+        .unwrap(),
+      "{{x -> 0, y -> 1}, {x -> 1, y -> 0}}"
+    );
+  }
+
+  // Both intersections share an x coordinate, so eliminating y leaves a
+  // squared factor rather than two separate roots.
+  #[test]
+  fn two_circles_meeting_above_each_other() {
+    assert_eq!(
+      interpret("Solve[{(x + 1)^2 + y^2 == 2, (x - 1)^2 + y^2 == 2}, {x, y}]")
+        .unwrap(),
+      "{{x -> 0, y -> -1}, {x -> 0, y -> 1}}"
+    );
+    assert_eq!(
+      interpret("Solve[{x^2 + y^2 == 4, (x - 3)^2 + y^2 == 4}, {x, y}]")
+        .unwrap(),
+      "{{x -> 3/2, y -> -1/2*Sqrt[7]}, {x -> 3/2, y -> Sqrt[7]/2}}"
+    );
+  }
+
+  // Touching circles meet in one point, reported once: a system whose
+  // variables have to be eliminated against each other gives the plain
+  // intersection points, however tangential the meeting.
+  #[test]
+  fn two_circles_touching() {
+    assert_eq!(
+      interpret("Solve[{x^2 + y^2 == 1, (x - 2)^2 + y^2 == 1}, {x, y}]")
+        .unwrap(),
+      "{{x -> 1, y -> 0}}"
+    );
+    // Same for a circle touching a line, and for a triple root that only
+    // reaches the second variable through a substitution.
+    assert_eq!(
+      interpret("Solve[{x^2 + y^2 == 1, x == 1}, {x, y}]").unwrap(),
+      "{{x -> 1, y -> 0}}"
+    );
+    assert_eq!(
+      interpret("Solve[{x^3 == 0, y == x}, {x, y}]").unwrap(),
+      "{{x -> 0, y -> 0}}"
+    );
+  }
+
+  // A system that falls apart into separate one-variable problems keeps
+  // each root's multiplicity, one factor per group — wolframscript-verified.
+  #[test]
+  fn uncoupled_system_keeps_root_multiplicities() {
+    assert_eq!(
+      interpret("Solve[{x^2 == 0, y == 1}, {x, y}]").unwrap(),
+      "{{x -> 0, y -> 1}, {x -> 0, y -> 1}}"
+    );
+    assert_eq!(
+      interpret("Solve[{x^2 == 0, y^2 == 0}, {x, y}]").unwrap(),
+      "{{x -> 0, y -> 0}, {x -> 0, y -> 0}, {x -> 0, y -> 0}, \
+       {x -> 0, y -> 0}}"
+    );
+    // Redundant equations in the same unknown count the smallest
+    // multiplicity, not their product.
+    assert_eq!(
+      interpret("Solve[{x^2 == 0, x^3 == 0, y == 1}, {x, y}]").unwrap(),
+      "{{x -> 0, y -> 1}, {x -> 0, y -> 1}}"
+    );
+    // Mixed: `y` stands on its own and counts twice, `x` and `z` are tied
+    // together and count once.
+    assert_eq!(
+      interpret("Solve[{x^2 == 0, y^2 == 0, z == x}, {x, y, z}]").unwrap(),
+      "{{x -> 0, y -> 0, z -> 0}, {x -> 0, y -> 0, z -> 0}}"
+    );
+  }
+
+  // Each equation is a product of two lines (a reducible, degenerate
+  // "conic"), so eliminating one variable divides through by the other
+  // equation's leading coefficient in that variable — which vanishes along
+  // one of those lines. That used to inflate the multiplicity reported for
+  // the corner solutions sitting on the vanishing branch, duplicating them
+  // even though every one of the four intersections here is transversal
+  // (a two-species competition model's population Manipulate hits exactly
+  // this shape when solving for equilibria: two logistic-growth factors
+  // each split into a trivial and a nontrivial branch).
+  #[test]
+  fn factored_conics_meet_transversally_without_duplicates() {
+    assert_eq!(
+      interpret(
+        "Solve[{p*(1 - p/100 - 3/500*q) == 0, \
+         q*(1 - q/100 - 1/200*p) == 0}, {p, q}]"
+      )
+      .unwrap(),
+      "{{p -> 0, q -> 0}, {p -> 0, q -> 100}, {p -> 400/7, q -> 500/7}, \
+       {p -> 100, q -> 0}}"
+    );
+    // The same system with inexact coefficients, as a slider-driven
+    // Manipulate would hand Solve, must not duplicate either. (The
+    // near-zero noise in the last pair's `q` is a pre-existing
+    // floating-point elimination artifact, unrelated to the duplication
+    // this test targets.)
+    assert_eq!(
+      interpret(
+        "Solve[{0.5*p*(1 - p/100 - 0.6*q/100) == 0, \
+         0.5*q*(1 - q/100 - 0.5*p/100) == 0}, {p, q}, Reals]"
+      )
+      .unwrap(),
+      "{{p -> 0., q -> 0.}, {p -> 0., q -> 100.}, \
+       {p -> 57.14285714285711, q -> 71.42857142857149}, \
+       {p -> 100.00000000000004, q -> -9.473903143467998*^-14}}"
+    );
+  }
+
+  // Circles too far apart to meet still meet over the complex numbers.
+  #[test]
+  fn two_circles_meeting_nowhere_real() {
+    assert_eq!(
+      interpret("Solve[{x^2 + y^2 == 1, (x - 5)^2 + y^2 == 1}, {x, y}]")
+        .unwrap(),
+      "{{x -> 5/2, y -> (-1/2*I)*Sqrt[21]}, {x -> 5/2, y -> I/2*Sqrt[21]}}"
+    );
+  }
+
+  // Inexact coefficients are what a Demonstration computing intersections
+  // from a slider position hands the solver.
+  #[test]
+  fn two_circles_with_inexact_coefficients() {
+    assert_eq!(
+      interpret("Solve[{x^2 + y^2 == 1., x^2 + (y - 1.)^2 == 0.49}, {x, y}]")
+        .unwrap(),
+      "{{x -> -0.6557247898318318, y -> 0.755}, \
+       {x -> 0.6557247898318318, y -> 0.755}}"
+    );
+    // Two equal circles whose intersections sit above each other: the
+    // squared factor this leaves is what a floating-point elimination has
+    // to get through without turning a double root into a complex pair.
+    assert_eq!(
+      interpret(
+        "Solve[{(x - 2.)^2 + y^2 == 2., (x - 4.)^2 + y^2 == 2.}, {x, y}]"
+      )
+      .unwrap(),
+      "{{x -> 3., y -> -1.}, {x -> 3., y -> 1.}}"
+    );
+  }
+
+  // A sphere cut by two planes, which needs two eliminations in a row.
+  #[test]
+  fn nonlinear_system_in_three_variables() {
+    assert_eq!(
+      interpret(
+        "Solve[{x + y + z == 6, x^2 + y^2 + z^2 == 14, x - y == 1}, \
+         {x, y, z}]"
+      )
+      .unwrap(),
+      "{{x -> 2, y -> 1, z -> 3}, {x -> 3, y -> 2, z -> 1}}"
+    );
+  }
+
+  // Two parabolas touching: the tangency is still one point.
+  #[test]
+  fn parabolas_touching() {
+    assert_eq!(
+      interpret("Solve[{y == x^2, y == 2 x^2}, {x, y}]").unwrap(),
+      "{{x -> 0, y -> 0}}"
+    );
+  }
+
+  // Regression: a multi-equation system combined with an inequality (as an
+  // And expression, not a list) used to fall through to Solve's
+  // non-identifier-target branch and return unevaluated, because only the
+  // single-variable path recognized "equation && inequality". The equality
+  // system is solved first and the inequality then filters the result.
+  #[test]
+  fn system_with_trailing_inequality() {
+    assert_eq!(
+      interpret("Solve[x + y == 3 && x - y == 1 && x > 0, {x, y}]").unwrap(),
+      "{{x -> 2, y -> 1}}"
+    );
+    // The inequality rules out every solution of the equality system.
+    assert_eq!(
+      interpret("Solve[x + y == 3 && x - y == 1 && x > 5, {x, y}]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn linear_system_with_and_in_list() {
+    // Solve[{eq1 && eq2}, {x, y}] should behave like
+    // Solve[{eq1, eq2}, {x, y}] — the conjunction inside the list is
+    // flattened into individual equations.
+    assert_eq!(
+      interpret(
+        "{x, y} /. Solve[{2 x + y == 12 && x + 4 y == 34}, {x, y}] // First"
+      )
+      .unwrap(),
+      "{2, 8}"
+    );
+  }
+
+  #[test]
+  fn underdetermined_quadratic_cubic() {
+    // Single equation with two variables: solve for lowest-degree variable
+    assert_eq!(
+      interpret("Solve[x^2 - y^3 == 1, {x, y}]").unwrap(),
+      "{{x -> -Sqrt[1 + y^3]}, {x -> Sqrt[1 + y^3]}}"
+    );
+  }
+
+  #[test]
+  fn underdetermined_quintic_quadratic() {
+    // Prefers y (degree 2) over x (degree 5)
+    assert_eq!(
+      interpret("Solve[x^5 - y^2 == 1, {x, y}]").unwrap(),
+      "{{y -> -Sqrt[-1 + x^5]}, {y -> Sqrt[-1 + x^5]}}"
+    );
+  }
+
+  /// Equations between equal-length lists thread componentwise:
+  /// `{xx, yy} == {a, b}` contributes `xx == a` and `yy == b`.
+  /// (Regression: the vector equation was silently dropped, so
+  /// parametric-intersection systems like the parabolic-mirror
+  /// Demonstration solved only the scalar equations.)
+  #[test]
+  fn solve_threads_list_equations() {
+    assert_eq!(
+      interpret("Solve[{xx, yy} == {1, 2}, {xx, yy}]").unwrap(),
+      "{{xx -> 1, yy -> 2}}"
+    );
+    assert_eq!(
+      interpret(
+        "Solve[{yy^2 == 20 xx, {xx, yy} == t*{0.6, 0.8} + {5, 0}}, \
+         {t, xx, yy}]"
+      )
+      .unwrap(),
+      "{{t -> -6.249999999999999, xx -> 1.2499999999999998, yy -> -5.}, \
+       {t -> 24.999999999999996, xx -> 19.999999999999996, yy -> 20.}}"
+    );
+    // Threading composes with And-of-equations flattening.
+    assert_eq!(
+      interpret("Solve[{x, y} == {1, 2} && x + z == 3, {x, y, z}]").unwrap(),
+      "{{x -> 1, y -> 2, z -> 2}}"
+    );
+  }
+
+  /// A scalar side of a list equation broadcasts over the list, so
+  /// `{e1, e2} == 0` stands for `e1 == 0 && e2 == 0`. `Solve[Table[…] == 0]`
+  /// (the Roots-of-the-Bernoulli-Polynomials Demonstration) relies on it,
+  /// including in the one-argument form that auto-detects the variable.
+  #[test]
+  fn solve_broadcasts_scalar_across_list_equation() {
+    assert_eq!(
+      interpret("Solve[{x^2 - 1} == 0, x]").unwrap(),
+      "{{x -> -1}, {x -> 1}}"
+    );
+    // One-argument form: the variable comes from the threaded equations.
+    assert_eq!(
+      interpret("Solve[{x^2 - 1} == 0]").unwrap(),
+      "{{x -> -1}, {x -> 1}}"
+    );
+    // Several elements make a system, one equation per element.
+    assert_eq!(
+      interpret("Solve[{x - 1, y - 2} == 0, {x, y}]").unwrap(),
+      "{{x -> 1, y -> 2}}"
+    );
+    // The scalar can sit on the left just as well.
+    assert_eq!(interpret("Solve[0 == {x - 3}, x]").unwrap(), "{{x -> 3}}");
+    // Table[…] == 0 is the Demonstration's shape: a one-element list of a
+    // numericized polynomial, solved without naming the variable.
+    assert_eq!(
+      interpret("Solve[N[Table[BernoulliB[n, z], {n, 3, 3}] == 0]]").unwrap(),
+      "{{z -> 0.}, {z -> 0.5}, {z -> 1.}}"
+    );
+  }
+
+  #[test]
+  fn solve_pure_cubic_symbolic() {
+    assert_eq!(
+      interpret("Solve[y^3 == a, y]").unwrap(),
+      "{{y -> a^(1/3)}, {y -> -((-1)^(1/3)*a^(1/3))}, {y -> (-1)^(2/3)*a^(1/3)}}"
+    );
+  }
+
+  #[test]
+  fn solve_pure_quintic_symbolic() {
+    assert_eq!(
+      interpret("Solve[y^5 == a, y]").unwrap(),
+      "{{y -> a^(1/5)}, {y -> -((-1)^(1/5)*a^(1/5))}, {y -> (-1)^(2/5)*a^(1/5)}, {y -> -((-1)^(3/5)*a^(1/5))}, {y -> (-1)^(4/5)*a^(1/5)}}"
+    );
+  }
+
+  // Regression: a negative leading coefficient (e.g. the `c - x^2` factors of
+  // x^4 - 4) must still yield simplified, correctly ordered roots — not
+  // `-(-Sqrt[2])` / `I*(-Sqrt[2])` and not a flipped order.
+  #[test]
+  fn solve_negative_leading_coefficient() {
+    // Irrational real roots.
+    assert_eq!(
+      interpret("Solve[2 - x^2 == 0, x]").unwrap(),
+      "{{x -> -Sqrt[2]}, {x -> Sqrt[2]}}"
+    );
+    assert_eq!(
+      interpret("Solve[3 - x^2 == 0, x]").unwrap(),
+      "{{x -> -Sqrt[3]}, {x -> Sqrt[3]}}"
+    );
+    // Complex roots stay simplified.
+    assert_eq!(
+      interpret("Solve[-2 - x^2 == 0, x]").unwrap(),
+      "{{x -> -I*Sqrt[2]}, {x -> I*Sqrt[2]}}"
+    );
+    // Perfect-square discriminant: smaller (more negative) root first.
+    assert_eq!(
+      interpret("Solve[6 - x - x^2 == 0, x]").unwrap(),
+      "{{x -> -3}, {x -> 2}}"
+    );
+    // The audit case: real-domain roots of a biquadratic factor product.
+    assert_eq!(
+      interpret("SolveValues[(x^2 + 2)*(x^2 - 2) == 0, x, Reals]").unwrap(),
+      "{-Sqrt[2], Sqrt[2]}"
+    );
+  }
+
+  // Regression: the negated reciprocal root of x^2 == 1/2 was left as a raw
+  // `UnaryOp[Minus, …]` wrapper that printed as `-2^(-1/2)`; wolframscript
+  // shows `-(1/Sqrt[2])`. Both roots must share the canonical reciprocal form.
+  #[test]
+  fn solve_negated_reciprocal_root() {
+    assert_eq!(
+      interpret("Solve[x^2 == 1/2, x]").unwrap(),
+      "{{x -> -(1/Sqrt[2])}, {x -> 1/Sqrt[2]}}"
+    );
+    assert_eq!(
+      interpret("Solve[2 x^2 == 1, x]").unwrap(),
+      "{{x -> -(1/Sqrt[2])}, {x -> 1/Sqrt[2]}}"
+    );
+    assert_eq!(
+      interpret("Solve[3 x^2 == 1, x]").unwrap(),
+      "{{x -> -(1/Sqrt[3])}, {x -> 1/Sqrt[3]}}"
+    );
+    // The same reciprocal form must survive through a two-variable system.
+    assert_eq!(
+      interpret("Solve[x^2 + y^2 == 1 && x == y, {x, y}]").unwrap(),
+      "{{x -> -(1/Sqrt[2]), y -> -(1/Sqrt[2])}, \
+       {x -> 1/Sqrt[2], y -> 1/Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn solve_sqrt_equation() {
+    assert_eq!(interpret("Solve[Sqrt[x] == 3, x]").unwrap(), "{{x -> 9}}");
+  }
+
+  #[test]
+  fn solve_sqrt_nested() {
+    assert_eq!(
+      interpret("Solve[Sqrt[x + 1] == 4, x]").unwrap(),
+      "{{x -> 15}}"
+    );
+  }
+
+  // A root of the unknown on both sides is squared away, and the roots that
+  // only solve the squared equation are dropped again.
+  #[test]
+  fn solve_sqrt_equation_with_unknown_on_both_sides() {
+    assert_eq!(
+      interpret("Solve[Sqrt[x] == x, x]").unwrap(),
+      "{{x -> 0}, {x -> 1}}"
+    );
+    // Squaring turns this into x^2 - 2 x - 3 == 0, whose root -1 solves the
+    // squared equation and not this one.
+    assert_eq!(
+      interpret("Solve[Sqrt[2 x + 3] == x, x]").unwrap(),
+      "{{x -> 3}}"
+    );
+    assert_eq!(
+      interpret("Solve[x + Sqrt[x] == 6, x]").unwrap(),
+      "{{x -> 4}}"
+    );
+    assert_eq!(
+      interpret("Solve[Sqrt[1 - x^2] == 1 - x, x]").unwrap(),
+      "{{x -> 0}, {x -> 1}}"
+    );
+    assert_eq!(
+      interpret("Solve[Sqrt[1 - x^2] == x + 1, x]").unwrap(),
+      "{{x -> -1}, {x -> 0}}"
+    );
+    assert_eq!(
+      interpret("Solve[Sqrt[4 - x^2] == x - 2, x]").unwrap(),
+      "{{x -> 2}}"
+    );
+  }
+
+  // Two roots take two squarings, one after the other.
+  #[test]
+  fn solve_equation_with_two_square_roots() {
+    assert_eq!(
+      interpret("Solve[Sqrt[x + 5] - Sqrt[x] == 1, x]").unwrap(),
+      "{{x -> 4}}"
+    );
+    assert_eq!(
+      interpret("Solve[Sqrt[x] == Sqrt[3 x - 2], x]").unwrap(),
+      "{{x -> 1}}"
+    );
+  }
+
+  // `Sqrt` is the principal root, so it never equals a negative number —
+  // squaring the equation away must not invent the root that would.
+  #[test]
+  fn solve_sqrt_equal_to_a_negative_number() {
+    assert_eq!(interpret("Solve[Sqrt[x] == -1, x]").unwrap(), "{}");
+    assert_eq!(interpret("Solve[Sqrt[x - 3] == -2, x]").unwrap(), "{}");
+  }
+
+  // Abs[f(x)] == c → f == c ∪ f == -c.
+  #[test]
+  fn solve_abs_basic() {
+    assert_eq!(
+      interpret("Solve[Abs[x] == 3, x]").unwrap(),
+      "{{x -> -3}, {x -> 3}}"
+    );
+    assert_eq!(interpret("Solve[Abs[x] == 0, x]").unwrap(), "{{x -> 0}}");
+    assert_eq!(interpret("Solve[Abs[x] == -1, x]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn solve_abs_shifted_and_scaled() {
+    assert_eq!(
+      interpret("Solve[Abs[x - 2] == 5, x]").unwrap(),
+      "{{x -> -3}, {x -> 7}}"
+    );
+    assert_eq!(
+      interpret("Solve[Abs[2 x] == 4, x]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+    assert_eq!(
+      interpret("Solve[3 Abs[x] == 12, x]").unwrap(),
+      "{{x -> -4}, {x -> 4}}"
+    );
+  }
+
+  #[test]
+  fn solve_abs_symbolic_rhs() {
+    assert_eq!(
+      interpret("Solve[Abs[x] == a, x]").unwrap(),
+      "{{x -> -a}, {x -> a}}"
+    );
+  }
+
+  // Inverting `Abs` splits the equation into a positive and a negative branch,
+  // and over the complexes that loses the rest of the circle — wolframscript
+  // says so with `Solve::ifun`, tagged with whichever solver was called.
+  #[test]
+  fn solve_abs_reports_inverse_function_use() {
+    assert_eq!(
+      interpret("Solve[Abs[x] == 2, x]; $MessageList").unwrap(),
+      "{HoldForm[MessageName[Solve, ifun]]}"
+    );
+    assert_eq!(
+      interpret("SolveValues[Abs[x] == 2, x]; $MessageList").unwrap(),
+      "{HoldForm[MessageName[SolveValues, ifun]]}"
+    );
+    assert_eq!(
+      interpret("NSolve[Abs[x] == 2, x]; $MessageList").unwrap(),
+      "{HoldForm[MessageName[NSolve, ifun]]}"
+    );
+    assert_eq!(
+      interpret("NSolveValues[Abs[x] == 2, x]; $MessageList").unwrap(),
+      "{HoldForm[MessageName[NSolveValues, ifun]]}"
+    );
+  }
+
+  // Nothing is lost when the branches are the whole answer: a `Reals` domain
+  // rules out the circle, a constraint narrows the split to one side, and a
+  // right-hand side of zero or a negative number never splits at all.
+  #[test]
+  fn solve_abs_reports_nothing_when_no_solutions_are_lost() {
+    for code in [
+      "Solve[Abs[x] == 2, x, Reals]",
+      "SolveValues[Abs[x] == 2, x, Reals]",
+      "Solve[{Abs[x] == 2, x > 0}, x]",
+      "Solve[Abs[x] == 2 && x > 0, x]",
+      "Solve[Abs[x] == 0, x]",
+      "Solve[Abs[x] == -1, x]",
+    ] {
+      assert_eq!(
+        interpret(&format!("{code}; $MessageList")).unwrap(),
+        "{}",
+        "{code} should raise no message"
+      );
+    }
+    // `Complexes` is the default domain, so it does report.
+    assert_eq!(
+      interpret("Solve[Abs[x] == 2, x, Complexes]; $MessageList").unwrap(),
+      "{HoldForm[MessageName[Solve, ifun]]}"
+    );
+  }
+
+  // A constraint list is the same system as the conjunction, and used to leak
+  // an unreduced `ToRules[Reduce[...]]` whenever the equation was one the
+  // multi-variable elimination could not take apart on its own.
+  #[test]
+  fn solve_constraint_list_matches_the_conjunction() {
+    for (constraints, expected) in [
+      ("{Abs[x] == 2, x > 0}", "{{x -> 2}}"),
+      ("{Abs[x] == 2, x < 0}", "{{x -> -2}}"),
+      ("{Sin[x] == 0, 0 < x < 7}", "{{x -> Pi}, {x -> 2*Pi}}"),
+      ("{x^2 == 4, x > 0}", "{{x -> 2}}"),
+    ] {
+      let listed = interpret(&format!("Solve[{constraints}, x]")).unwrap();
+      assert_eq!(listed, expected);
+      let conjunction =
+        constraints.trim_matches(['{', '}']).replace(", ", "&&");
+      assert_eq!(
+        interpret(&format!("Solve[{conjunction}, x]")).unwrap(),
+        expected
+      );
+    }
+  }
+
+  // `Solve[eqns, dom]`/`NSolve[eqns, dom]` (a domain — Reals/Integers/…, no
+  // explicit variable list) auto-detects the unknowns from `eqns`, exactly
+  // as the bare one-argument form does; it must not treat the domain name
+  // itself as the sole variable. This is how the Wolfram Demonstrations
+  // Project idiom `NSolve[{eqn1, eqn2, 0 < x < 1, 0 < y < 1}, Reals]`
+  // restricts a system to its real solutions without spelling the unknowns
+  // out a second time.
+  #[test]
+  fn solve_domain_only_form_auto_detects_variables() {
+    // Rounded: wolframscript's numerical root is off in the last digits
+    // (`0.6180339887498907`).
+    assert_eq!(
+      interpret(
+        "Round[{x, y} /. NSolve[{x^2 + y == 1, x + y^2 == 1, 0 < x < 1, \
+         0 < y < 1}, Reals], 10^-9]"
+      )
+      .unwrap(),
+      "{{618033989/1000000000, 618033989/1000000000}}"
+    );
+    assert_eq!(
+      interpret("NSolve[{x^2 - 4 == 0, x > 0}, Reals]").unwrap(),
+      "{{x -> 2.}}"
+    );
+    // The symbolic form takes the same path through `solve_core`.
+    assert_eq!(
+      interpret("Solve[{x^2 - 4 == 0, x > 0}, Reals]").unwrap(),
+      "{{x -> 2}}"
+    );
+    // A domain name is a protected Wolfram symbol and can never be an
+    // ordinary equation variable, so the ordinary `Solve[eqns, x]` form
+    // (ordinary variable, no domain) is unaffected by this auto-detection.
+    assert_eq!(
+      interpret("Solve[x^2 - 4 == 0, x]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+  }
+
+  // Regression for review findings on the domain-only form above: an
+  // underdetermined system must not fall through to solving for the domain
+  // name itself — it is solved for its last variables like `Solve[eqns]` —
+  // and a domain name occurring inside the equations (via
+  // `Element[x, Reals]`) must never be picked up as a spurious extra
+  // variable.
+  #[test]
+  fn solve_domain_only_form_underdetermined() {
+    assert_eq!(
+      interpret("Solve[x + y == 2, Reals]").unwrap(),
+      "{{y -> 2 - x}}"
+    );
+    assert_eq!(
+      interpret("Solve[{x + y == 3, Element[x, Reals]}, Reals]").unwrap(),
+      "{{y -> 3 - x}}"
+    );
+  }
+
+  // Regression: `NSolve[eqns, Reals]` (domain-only, no explicit variable
+  // list) must still drop the complex roots of a polynomial with no radical
+  // form, exactly as the explicit `NSolve[eqns, x, Reals]` form does — the
+  // real-root filter must not miss the domain because it moved from the
+  // third argument to the second.
+  #[test]
+  fn nsolve_domain_only_form_filters_to_real_roots() {
+    assert_eq!(
+      interpret("NSolve[x^5 - x - 1 == 0, Reals]").unwrap(),
+      interpret("NSolve[x^5 - x - 1 == 0, x, Reals]").unwrap()
+    );
+    assert_eq!(
+      interpret("NSolve[x^5 - x - 1 == 0, Reals]").unwrap(),
+      "{{x -> 1.1673039782614187}}"
+    );
+  }
+
+  #[test]
+  fn solve_log_equation() {
+    assert_eq!(interpret("Solve[Log[x] == 2, x]").unwrap(), "{{x -> E^2}}");
+  }
+
+  #[test]
+  fn solve_exp_equation() {
+    // Matches wolframscript: returns the full complex solution with
+    // ConditionalExpression, covering all integer branches.
+    assert_eq!(
+      interpret("Solve[Exp[x] == 1, x]").unwrap(),
+      "{{x -> ConditionalExpression[(2*I)*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+
+  #[test]
+  fn solve_general_base_exponential() {
+    // b^x == val for a concrete base > 1 gets the full 2*Pi*I/Log[b] periodic
+    // branches (previously only the principal Log[val]/Log[b] was returned).
+    assert_eq!(
+      interpret("Solve[2^x == 8, x]").unwrap(),
+      "{{x -> ConditionalExpression[((2*I)*Pi*C[1])/Log[2] + Log[8]/Log[2], \
+       Element[C[1], Integers]]}}"
+    );
+    assert_eq!(
+      interpret("Solve[10^x == 1000, x]").unwrap(),
+      "{{x -> ConditionalExpression[((2*I)*Pi*C[1])/Log[10] + \
+       Log[1000]/Log[10], Element[C[1], Integers]]}}"
+    );
+    // val == 1 drops the principal Log term.
+    assert_eq!(
+      interpret("Solve[2^x == 1, x]").unwrap(),
+      "{{x -> ConditionalExpression[((2*I)*Pi*C[1])/Log[2], \
+       Element[C[1], Integers]]}}"
+    );
+    // A symbolic base has no periodic branches, matching wolframscript.
+    assert_eq!(
+      interpret("Solve[a^x == b, x]").unwrap(),
+      "{{x -> Log[b]/Log[a]}}"
+    );
+  }
+
+  #[test]
+  fn solve_log_with_linear_inner() {
+    // Matches wolframscript's preferred form: (-1 + E^3)/2 over
+    // -((1 - E^3)/2).
+    assert_eq!(
+      interpret("Solve[Log[2*x + 1] == 3, x]").unwrap(),
+      "{{x -> (-1 + E^3)/2}}"
+    );
+  }
+
+  // wolframscript's `Solve` orders solutions lexicographically by
+  // (real, imag) — `-I` and `I` slot between `0` and `1` because they
+  // share real part 0. (`Root` uses a different rule that floats every
+  // real to the head of the whole list.)
+  #[test]
+  fn solve_orders_complex_roots_by_real_part() {
+    assert_eq!(
+      interpret("Solve[x^5 == x, x]").unwrap(),
+      "{{x -> -1}, {x -> 0}, {x -> -I}, {x -> I}, {x -> 1}}"
+    );
+  }
+
+  #[test]
+  fn solve_orders_pure_complex_roots() {
+    // `x^4 == 1`: real ±1 split around the unit-circle complex pair.
+    assert_eq!(
+      interpret("Solve[x^4 == 1, x]").unwrap(),
+      "{{x -> -1}, {x -> -I}, {x -> I}, {x -> 1}}"
+    );
+  }
+
+  // A root of x is reported once per multiplicity. Regression: factoring
+  // out x^k contributed a single `x -> 0` no matter how many powers were
+  // pulled out, so `x^3 - 4 x^2 == 0` came back with two solutions.
+  #[test]
+  fn repeated_zero_root_keeps_its_multiplicity() {
+    assert_eq!(
+      interpret("Solve[x^3 - 4 x^2 == 0, x]").unwrap(),
+      "{{x -> 0}, {x -> 0}, {x -> 4}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^4 - 2 x^3 == 0, x]").unwrap(),
+      "{{x -> 0}, {x -> 0}, {x -> 0}, {x -> 2}}"
+    );
+    // An inexact coefficient anywhere makes the whole solution set inexact,
+    // so the repeated root is reported as `0.`.
+    assert_eq!(
+      interpret("Solve[x^3 - 4. x^2 == 0, x]").unwrap(),
+      "{{x -> 0.}, {x -> 0.}, {x -> 4.}}"
+    );
+  }
+
+  // With machine-precision coefficients wolframscript answers numerically
+  // instead of returning `Root[…]` objects or radical forms. Regression:
+  // these cubics used to come back unevaluated.
+  #[test]
+  fn machine_precision_polynomial_solves_numerically() {
+    // Every root satisfies the equation, and there are three of them.
+    assert_eq!(
+      interpret(
+        "sol = Solve[x^3 + 1.5 x^2 - 3.2 x + 4.7 == 0, x]; Length[sol]"
+      )
+      .unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(
+        "sol = Solve[x^3 + 1.5 x^2 - 3.2 x + 4.7 == 0, x]; \
+         Chop[(x^3 + 1.5 x^2 - 3.2 x + 4.7) /. sol, 10^-9]"
+      )
+      .unwrap(),
+      "{0, 0, 0}"
+    );
+    // One real root and a conjugate pair, ordered by ascending real part
+    // and then ascending imaginary part.
+    assert_eq!(
+      interpret(
+        "Round[x /. Solve[x^3 + 1.5 x^2 - 3.2 x + 4.7 == 0, x], 1/10^6]"
+      )
+      .unwrap(),
+      "{-19079/6250, 2426/3125 - (120997*I)/125000, \
+       2426/3125 + (120997*I)/125000}"
+    );
+    // A degree-5 polynomial has no radical form at all, so this is the
+    // only route to an answer.
+    assert_eq!(
+      interpret("Round[x /. Solve[x^5 + 1.5 x - 1. == 0, x], 1/10^6]").unwrap(),
+      "{-912087/1000000 - (402027*I)/500000, \
+       -912087/1000000 + (402027*I)/500000, \
+       151741/250000 - (215059*I)/250000, \
+       151741/250000 + (215059*I)/250000, 305123/500000}"
+    );
+  }
+
+  // A pure power with an inexact coefficient is numeric too: `x^3 == 8.`
+  // must not keep the exact `-2 (-1)^(1/3)` radical forms.
+  #[test]
+  fn machine_precision_pure_power_solves_numerically() {
+    assert_eq!(
+      interpret("Solve[x^3 == 8., x]").unwrap(),
+      "{{x -> -1. - 1.7320508075688772*I}, \
+       {x -> -1. + 1.7320508075688772*I}, {x -> 2.}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^4 == 16., x]").unwrap(),
+      "{{x -> -2.}, {x -> 0. - 2.*I}, {x -> 0. + 2.*I}, {x -> 2.}}"
+    );
+    // The exact equation keeps its radical solutions.
+    assert_eq!(
+      interpret("Solve[x^3 == 8, x]").unwrap(),
+      "{{x -> 2}, {x -> -2*(-1)^(1/3)}, {x -> 2*(-1)^(2/3)}}"
+    );
+  }
+}
+
+mod rsolve {
+  use super::*;
+
+  #[test]
+  fn constant_coeff_second_order() {
+    assert_eq!(
+      interpret("RSolve[{a[n + 2] == a[n], a[0] == 1, a[1] == 4}, a, n]")
+        .unwrap(),
+      "{{a -> Function[{n}, (5 - 3*(-1)^n)/2]}}"
+    );
+  }
+
+  // Repeated characteristic root with initial conditions: the basis is
+  // r^n, n r^n, so the linear system uses n^mult * r^n columns.
+  #[test]
+  fn repeated_root_double_two() {
+    assert_eq!(
+      interpret(
+        "RSolve[{a[n] == 4 a[n-1] - 4 a[n-2], a[1] == 2, a[2] == 8}, a[n], n]"
+      )
+      .unwrap(),
+      "{{a[n] -> 2^n*n}}"
+    );
+  }
+
+  #[test]
+  fn repeated_root_double_three() {
+    assert_eq!(
+      interpret(
+        "RSolve[{a[n] == 6 a[n-1] - 9 a[n-2], a[1] == 3, a[2] == 18}, a[n], n]"
+      )
+      .unwrap(),
+      "{{a[n] -> 3^n*n}}"
+    );
+  }
+
+  // Repeated root r = 1 (1^n = 1) yields a polynomial in n.
+  #[test]
+  fn repeated_root_unity_linear() {
+    assert_eq!(
+      interpret(
+        "RSolve[{a[n] == 2 a[n-1] - a[n-2], a[0] == 1, a[1] == 3}, a[n], n]"
+      )
+      .unwrap(),
+      "{{a[n] -> 1 + 2*n}}"
+    );
+    assert_eq!(
+      interpret(
+        "RSolve[{a[n] == 2 a[n-1] - a[n-2], a[1] == 1, a[2] == 2}, a[n], n]"
+      )
+      .unwrap(),
+      "{{a[n] -> n}}"
+    );
+  }
+
+  // First-order arithmetic progression a[n] == a[n-1] + d (constant step d).
+  // General solution d*n + C[1]; with one initial condition, the specific
+  // value v + d*(n - k0).
+  #[test]
+  fn arithmetic_progression_general() {
+    assert_eq!(
+      interpret("RSolve[a[n] == a[n-1] + 1, a[n], n]").unwrap(),
+      "{{a[n] -> n + C[1]}}"
+    );
+    assert_eq!(
+      interpret("RSolve[a[n] == a[n-1] + 2, a[n], n]").unwrap(),
+      "{{a[n] -> 2*n + C[1]}}"
+    );
+    assert_eq!(
+      interpret("RSolve[a[n] == a[n-1] - 1, a[n], n]").unwrap(),
+      "{{a[n] -> -n + C[1]}}"
+    );
+    // Symbolic step, and the forward-shift spelling a[n+1] == a[n] + 3.
+    assert_eq!(
+      interpret("RSolve[a[n] == a[n-1] + k, a[n], n]").unwrap(),
+      "{{a[n] -> k*n + C[1]}}"
+    );
+    assert_eq!(
+      interpret("RSolve[a[n+1] == a[n] + 3, a[n], n]").unwrap(),
+      "{{a[n] -> 3*n + C[1]}}"
+    );
+  }
+
+  #[test]
+  fn arithmetic_progression_with_initial_condition() {
+    assert_eq!(
+      interpret("RSolve[{a[n] == a[n-1] + 1, a[0] == 0}, a[n], n]").unwrap(),
+      "{{a[n] -> n}}"
+    );
+    assert_eq!(
+      interpret("RSolve[{a[n] == a[n-1] + 2, a[1] == 3}, a[n], n]").unwrap(),
+      "{{a[n] -> 1 + 2*n}}"
+    );
+    assert_eq!(
+      interpret("RSolve[{a[n] == a[n-1] + 5, a[2] == 10}, a[n], n]").unwrap(),
+      "{{a[n] -> 5*n}}"
+    );
+    assert_eq!(
+      interpret("RSolve[{a[n] == a[n-1] + d, a[0] == c}, a[n], n]").unwrap(),
+      "{{a[n] -> c + d*n}}"
+    );
+  }
+
+  // Equations may be joined with `&&` instead of a list; the conjunction is
+  // flattened and solved identically, matching wolframscript.
+  #[test]
+  fn conditions_joined_with_and() {
+    assert_eq!(
+      interpret("RSolve[a[n] == a[n-1] + 1 && a[1] == 1, a[n], n]").unwrap(),
+      "{{a[n] -> n}}"
+    );
+    assert_eq!(
+      interpret("RSolve[a[n] == 2 a[n-1] && a[0] == 1, a[n], n]").unwrap(),
+      "{{a[n] -> 2^n}}"
+    );
+    // Three conjuncts: recurrence plus two initial conditions.
+    assert_eq!(
+      interpret(
+        "RSolve[a[n] == 4 a[n-1] - 4 a[n-2] && a[1] == 2 && a[2] == 8, a[n], n]"
+      )
+      .unwrap(),
+      "{{a[n] -> 2^n*n}}"
+    );
+    // RSolveValue accepts the conjunction form too (it delegates to RSolve).
+    assert_eq!(
+      interpret("RSolveValue[a[n] == 2 a[n-1] && a[0] == 1, a[n], n]").unwrap(),
+      "2^n"
+    );
+  }
+
+  // An index-dependent forcing term (a[n-1] + n) or a coefficient other than 1
+  // (3 a[n-1] + 1) is not an arithmetic progression and stays unevaluated,
+  // matching the deeper cases Woxi does not yet close-form.
+  #[test]
+  fn non_arithmetic_forcing_stays_unevaluated() {
+    assert_eq!(
+      interpret("RSolve[a[n] == a[n-1] + n, a[n], n]").unwrap(),
+      "RSolve[a[n] == n + a[-1 + n], a[n], n]"
+    );
+    assert_eq!(
+      interpret("RSolve[a[n] == 3 a[n-1] + 1, a[n], n]").unwrap(),
+      "RSolve[a[n] == 1 + 3*a[-1 + n], a[n], n]"
+    );
+  }
+}
+
+mod full_simplify {
+  use super::*;
+
+  #[test]
+  fn algebraic_factoring() {
+    assert_eq!(
+      interpret("FullSimplify[x^2 + 2*x + 1]").unwrap(),
+      "(1 + x)^2"
+    );
+  }
+
+  #[test]
+  fn trig_identity() {
+    assert_eq!(interpret("FullSimplify[Sin[x]^2 + Cos[x]^2]").unwrap(), "1");
+  }
+
+  // Denesting nested radicals: Sqrt[a + b Sqrt[c]] -> Sqrt[d] +/- Sqrt[e]
+  // when a^2 - b^2 c is a perfect square.
+  #[test]
+  fn denest_two_surds() {
+    assert_eq!(
+      interpret("FullSimplify[Sqrt[5 + 2 Sqrt[6]]]").unwrap(),
+      "Sqrt[2] + Sqrt[3]"
+    );
+  }
+
+  #[test]
+  fn denest_integer_plus_surd() {
+    assert_eq!(
+      interpret("FullSimplify[Sqrt[3 + 2 Sqrt[2]]]").unwrap(),
+      "1 + Sqrt[2]"
+    );
+  }
+
+  #[test]
+  fn denest_with_coefficient_four() {
+    assert_eq!(
+      interpret("FullSimplify[Sqrt[7 + 4 Sqrt[3]]]").unwrap(),
+      "2 + Sqrt[3]"
+    );
+  }
+
+  #[test]
+  fn denest_minus_sign() {
+    assert_eq!(
+      interpret("FullSimplify[Sqrt[7 - 2 Sqrt[10]]]").unwrap(),
+      "-Sqrt[2] + Sqrt[5]"
+    );
+  }
+
+  #[test]
+  fn denest_sum_combines() {
+    assert_eq!(
+      interpret("FullSimplify[Sqrt[5 + 2 Sqrt[6]] + Sqrt[5 - 2 Sqrt[6]]]")
+        .unwrap(),
+      "2*Sqrt[3]"
+    );
+  }
+
+  // Non-denestable radical (a^2 - b^2 c not a perfect square) stays nested.
+  #[test]
+  fn non_denestable_stays_nested() {
+    assert_eq!(
+      interpret("FullSimplify[Sqrt[5 + 2 Sqrt[5]]]").unwrap(),
+      "Sqrt[5 + 2*Sqrt[5]]"
+    );
+  }
+
+  // Plain Simplify must NOT denest (only FullSimplify does).
+  #[test]
+  fn simplify_does_not_denest() {
+    assert_eq!(
+      interpret("Simplify[Sqrt[3 + 2 Sqrt[2]]]").unwrap(),
+      "Sqrt[3 + 2*Sqrt[2]]"
+    );
+  }
+
+  // Gamma[a]/Gamma[b], a - b = k a positive integer: the rising-factorial
+  // product. Leaf-count gated, so k <= 3 reduces but k = 4 keeps the ratio.
+  #[test]
+  fn gamma_ratio_rising_factorial() {
+    assert_eq!(
+      interpret("FullSimplify[Gamma[n + 1]/Gamma[n]]").unwrap(),
+      "n"
+    );
+    assert_eq!(
+      interpret("FullSimplify[Gamma[n + 2]/Gamma[n]]").unwrap(),
+      "n*(1 + n)"
+    );
+    assert_eq!(
+      interpret("FullSimplify[Gamma[n + 3]/Gamma[n]]").unwrap(),
+      "n*(1 + n)*(2 + n)"
+    );
+    // a - b = 1 with a shifted denominator.
+    assert_eq!(
+      interpret("FullSimplify[Gamma[2 n]/Gamma[2 n - 1]]").unwrap(),
+      "-1 + 2*n"
+    );
+    assert_eq!(
+      interpret("FullSimplify[Gamma[x + 3]/Gamma[x + 1]]").unwrap(),
+      "(1 + x)*(2 + x)"
+    );
+  }
+
+  // Factorial ratios reduce like Gamma ratios (n! = Gamma[n+1]): n!/(n-k)! ->
+  // rising-factorial product for small k.
+  #[test]
+  fn factorial_ratio_rising_factorial() {
+    assert_eq!(interpret("FullSimplify[n! / (n - 1)!]").unwrap(), "n");
+    assert_eq!(
+      interpret("FullSimplify[n! / (n - 2)!]").unwrap(),
+      "(-1 + n)*n"
+    );
+    assert_eq!(interpret("FullSimplify[(n + 1)! / n!]").unwrap(), "1 + n");
+    assert_eq!(
+      interpret("FullSimplify[(n + 2)! / n!]").unwrap(),
+      "(1 + n)*(2 + n)"
+    );
+    // k = 3 with an all-binomial product (longer than the ratio) still
+    // reduces, matching wolframscript.
+    assert_eq!(
+      interpret("FullSimplify[(n + 3)! / n!]").unwrap(),
+      "(1 + n)*(2 + n)*(3 + n)"
+    );
+    // k = 4: left unevaluated.
+    assert_eq!(
+      interpret("FullSimplify[n! / (n - 4)!]").unwrap(),
+      "n!/(-4 + n)!"
+    );
+  }
+
+  // z Gamma[z] -> Gamma[z+1] (the Gamma recurrence), but only when the result
+  // is no more complex than the input (matching wolframscript's LeafCount
+  // comparison).
+  #[test]
+  fn gamma_factor_absorption() {
+    assert_eq!(
+      interpret("FullSimplify[x Gamma[x]]").unwrap(),
+      "Gamma[1 + x]"
+    );
+    assert_eq!(
+      interpret("FullSimplify[n Gamma[n]]").unwrap(),
+      "Gamma[1 + n]"
+    );
+    assert_eq!(
+      interpret("FullSimplify[(x + 1) Gamma[x + 1]]").unwrap(),
+      "Gamma[2 + x]"
+    );
+    assert_eq!(
+      interpret("FullSimplify[Sin[x] Gamma[Sin[x]]]").unwrap(),
+      "Gamma[1 + Sin[x]]"
+    );
+    // A numeric coefficient makes the absorbed form longer, so it is kept.
+    assert_eq!(
+      interpret("FullSimplify[2 x Gamma[x]]").unwrap(),
+      "2*x*Gamma[x]"
+    );
+    // No matching factor: unchanged.
+    assert_eq!(interpret("FullSimplify[x Gamma[y]]").unwrap(), "x*Gamma[y]");
+  }
+
+  #[test]
+  fn gamma_ratio_not_reduced() {
+    // k = 4: the product is longer than the ratio, so the ratio is kept.
+    assert_eq!(
+      interpret("FullSimplify[Gamma[n + 4]/Gamma[n]]").unwrap(),
+      "Gamma[4 + n]/Gamma[n]"
+    );
+    // Non-integer difference, different symbols, and plain Simplify: unchanged.
+    assert_eq!(
+      interpret("FullSimplify[Gamma[n + 1/2]/Gamma[n]]").unwrap(),
+      "Gamma[1/2 + n]/Gamma[n]"
+    );
+    assert_eq!(
+      interpret("Simplify[Gamma[n + 1]/Gamma[n]]").unwrap(),
+      "Gamma[1 + n]/Gamma[n]"
+    );
+  }
+
+  // ArcSin[u] + ArcCos[u] -> Pi/2 (and the ArcSec/ArcCsc pair). A
+  // FullSimplify-only identity, applied only to a bare two-term sum.
+  #[test]
+  fn complementary_inverse_trig() {
+    assert_eq!(
+      interpret("FullSimplify[ArcSin[x] + ArcCos[x]]").unwrap(),
+      "Pi/2"
+    );
+    assert_eq!(
+      interpret("FullSimplify[ArcSec[x] + ArcCsc[x]]").unwrap(),
+      "Pi/2"
+    );
+    assert_eq!(
+      interpret("FullSimplify[ArcSin[2 x] + ArcCos[2 x]]").unwrap(),
+      "Pi/2"
+    );
+    assert_eq!(
+      interpret("FullSimplify[2 ArcSin[x] + 2 ArcCos[x]]").unwrap(),
+      "Pi"
+    );
+  }
+
+  // Must NOT reduce: ArcTan + ArcCot is +-Pi/2 by sign; an extra term blocks
+  // it; and plain Simplify never applies it.
+  #[test]
+  fn complementary_inverse_trig_no_false_positive() {
+    assert_eq!(
+      interpret("FullSimplify[ArcTan[x] + ArcCot[x]]").unwrap(),
+      "ArcCot[x] + ArcTan[x]"
+    );
+    assert_eq!(
+      interpret("FullSimplify[ArcSin[x] + ArcCos[x] + z]").unwrap(),
+      "z + ArcCos[x] + ArcSin[x]"
+    );
+    assert_eq!(
+      interpret("Simplify[ArcSin[x] + ArcCos[x]]").unwrap(),
+      "ArcCos[x] + ArcSin[x]"
+    );
+  }
+
+  #[test]
+  fn trig_ratio_cot() {
+    assert_eq!(interpret("Simplify[Cos[x]/Sin[x]]").unwrap(), "Cot[x]");
+  }
+
+  #[test]
+  fn trig_ratio_tan() {
+    assert_eq!(interpret("Simplify[Sin[x]/Cos[x]]").unwrap(), "Tan[x]");
+  }
+
+  #[test]
+  fn trig_ratio_with_arg() {
+    assert_eq!(
+      interpret("Simplify[Sin[2*x]/Cos[2*x]]").unwrap(),
+      "Tan[2*x]"
+    );
+  }
+
+  #[test]
+  fn trig_with_symbolic_coefficients() {
+    assert_eq!(
+      interpret(
+        "FullSimplify[{a^2*((-1 + Sin[theta])^2 + Cos[theta]^2), a^2*((1 + Sin[theta])^2 + Cos[theta]^2)}]"
+      )
+      .unwrap(),
+      "{-2*a^2*(-1 + Sin[theta]), 2*a^2*(1 + Sin[theta])}"
+    );
+  }
+
+  #[test]
+  fn numeric_factoring() {
+    assert_eq!(interpret("FullSimplify[3*x + 6]").unwrap(), "3*(2 + x)");
+  }
+
+  #[test]
+  fn trivial() {
+    assert_eq!(interpret("FullSimplify[5]").unwrap(), "5");
+    assert_eq!(interpret("FullSimplify[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn combine_like_denominator_fractions() {
+    assert_eq!(interpret("FullSimplify[a/x + b/x]").unwrap(), "(a + b)/x");
+  }
+
+  #[test]
+  fn abs_quotient() {
+    // Abs[a]/Abs[b] → Abs[a/b] with expansion
+    assert_eq!(
+      interpret("FullSimplify[Abs[1 + x^3]/Abs[x]]").unwrap(),
+      "Abs[x^(-1) + x^2]"
+    );
+  }
+
+  #[test]
+  fn abs_product() {
+    // Abs[a]*Abs[b] → Abs[a*b]
+    assert_eq!(
+      interpret("FullSimplify[Abs[x]*Abs[y]]").unwrap(),
+      "Abs[x*y]"
+    );
+  }
+
+  #[test]
+  fn combine_fractions_different_denominators() {
+    assert_eq!(
+      interpret(
+        "FullSimplify[k*q/(2*a^4*(1 + s)^(3/2)) + k*q*(1 + s)^(9/4)/(2*a^4)]"
+      )
+      .unwrap(),
+      "(k*q*(1 + (1 + s)^(15/4)))/(2*a^4*(1 + s)^(3/2))"
+    );
+  }
+
+  // Regression: FullSimplify should partially factor sums whose terms split
+  // into variable-disjoint groups. `1 + c^2 + 2 c d + d^2` has a constant
+  // `1` plus a group connected by c,d that factors to `(c+d)^2`.
+  #[test]
+  fn partial_factor_disjoint_groups() {
+    assert_eq!(
+      interpret("FullSimplify[1 + c^2 + 2 c d + d^2]").unwrap(),
+      "1 + (c + d)^2"
+    );
+  }
+
+  // Regression: FullSimplify should recursively re-simplify inside a factored
+  // product. After pulling `y` out of the sum, the remaining polynomial in x
+  // should be collected by x with each coefficient factored in turn.
+  #[test]
+  fn nested_factor_after_common_factor() {
+    assert_eq!(
+      interpret(
+        "FullSimplify[(a^2 + 2 a b + b^2) y + (2 a + 2 b) x y + (1 + c^2 + 2 c d + d^2) x^2 y]"
+      )
+      .unwrap(),
+      "((a + b)^2 + 2*(a + b)*x + (1 + (c + d)^2)*x^2)*y"
+    );
+  }
+
+  // Regression: FullSimplify should collect a multi-variable polynomial by a
+  // chosen variable and factor each collected coefficient.
+  #[test]
+  fn collect_and_factor_coefficients() {
+    assert_eq!(
+      interpret(
+        "FullSimplify[a^2 + 2 a b + b^2 + 2 a x + 2 b x + x^2 + c^2 x^2 + 2 c d x^2 + d^2 x^2]"
+      )
+      .unwrap(),
+      "(a + b)^2 + 2*(a + b)*x + (1 + (c + d)^2)*x^2"
+    );
+  }
+
+  // A sum of exponentials regroups as `E^(k_min u)` times a polynomial in
+  // `E^(g u)` when that is cheaper by the same count Simplify uses
+  // elsewhere — the shape an inverse Laplace transform's residue sum has.
+  // All wolframscript-verified.
+  #[test]
+  fn collect_a_sum_of_exponentials() {
+    assert_eq!(
+      interpret("Simplify[1/2 E^(-t) - E^(-2 t) + 1/2 E^(-3 t)]").unwrap(),
+      "(-1 + E^t)^2/(2*E^(3*t))"
+    );
+    assert_eq!(
+      interpret("Simplify[E^(-t) - E^(-2 t)]").unwrap(),
+      "(-1 + E^t)/E^(2*t)"
+    );
+    // Half-integer rates: the polynomial is in `E^(t/2)`.
+    assert_eq!(
+      interpret("Simplify[E^(t/2) - E^(-t/2)]").unwrap(),
+      "(-1 + E^t)/E^(t/2)"
+    );
+    // A tie goes to the regrouped form, as with the Factor candidate.
+    assert_eq!(
+      interpret("Simplify[E^x + E^(2 x)]").unwrap(),
+      "E^x*(1 + E^x)"
+    );
+    assert_eq!(
+      interpret("Simplify[Exp[a] + Exp[2 a] + Exp[3 a]]").unwrap(),
+      "E^a*(1 + E^a + E^(2*a))"
+    );
+    // Coefficients that aren't constants come along unchanged.
+    assert_eq!(
+      interpret("Simplify[Sin[t] E^(-t) + E^(-2 t)]").unwrap(),
+      "(1 + E^t*Sin[t])/E^(2*t)"
+    );
+    assert_eq!(
+      interpret("Simplify[1/5 - Cos[2 t]/(5 E^t) - Sin[2 t]/(10 E^t)]")
+        .unwrap(),
+      "(2*E^t - 2*Cos[2*t] - Sin[2*t])/(10*E^t)"
+    );
+    // Regrouping that costs more is rejected: both of these stay sums.
+    assert_eq!(
+      interpret("Simplify[-1 + t + E^(-t)]").unwrap(),
+      "-1 + E^(-t) + t"
+    );
+    assert_eq!(interpret("Simplify[E^t + E^(-t)]").unwrap(), "E^(-t) + E^t");
+  }
+
+  #[test]
+  fn simplify_conditional_expression_passthrough() {
+    // Simplify[ConditionalExpression[1, a > 0]] leaves the conditional
+    // intact — matches wolframscript. (Mathics returns Undefined, a
+    // different design choice.)
+    assert_eq!(
+      interpret("Simplify[ConditionalExpression[1, a > 0]]").unwrap(),
+      "ConditionalExpression[1, a > 0]"
+    );
+  }
+}
+
+mod simplify_assumptions {
+  use super::*;
+
+  #[test]
+  fn simplify_with_assumptions_option() {
+    assert_eq!(
+      interpret("Simplify[x + x, Assumptions -> x > 0]").unwrap(),
+      "2*x"
+    );
+  }
+
+  #[test]
+  fn full_simplify_with_assumptions_option() {
+    assert_eq!(
+      interpret("FullSimplify[x + x, Assumptions -> x > 0]").unwrap(),
+      "2*x"
+    );
+  }
+
+  // Regression: Simplify should accept a direct assumption (not only
+  // `Assumptions -> val`), and `Assuming[...]` should propagate to a nested
+  // `Simplify[...]` call via `$Assumptions`.
+  #[test]
+  fn simplify_with_direct_assumption() {
+    assert_eq!(interpret("Simplify[Sqrt[x^2], x > 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn simplify_power_one_half_with_assumption() {
+    // (x^2)^(1/2) is the unevaluated Power form of Sqrt[x^2].
+    assert_eq!(interpret("Simplify[(x^2)^(1/2), x > 0]").unwrap(), "x");
+  }
+
+  // Trigonometric functions at integer multiples of Pi, under an integer
+  // assumption: Sin[k Pi] = 0, Tan[k Pi] = 0, Cos[k Pi] = (-1)^k. The
+  // coefficient may be any ordering/arity (n Pi, Pi n, 2 Pi n, (2n+1) Pi).
+  #[test]
+  fn simplify_trig_at_integer_multiples_of_pi() {
+    assert_eq!(
+      interpret("Simplify[Sin[Pi n], Element[n, Integers]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("Simplify[Sin[2 Pi n], Element[n, Integers]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("Simplify[Tan[Pi n], Element[n, Integers]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("Simplify[Cos[Pi n], Element[n, Integers]]").unwrap(),
+      "(-1)^n"
+    );
+    assert_eq!(
+      interpret("Simplify[Cos[2 Pi n], Element[n, Integers]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("Simplify[Cos[(2 n + 1) Pi], Element[n, Integers]]").unwrap(),
+      "-1"
+    );
+  }
+
+  // (-1)^k collapses to ±1 when the parity of the integer exponent is known.
+  #[test]
+  fn simplify_neg_one_integer_power() {
+    assert_eq!(
+      interpret("Simplify[(-1)^(2 n), Element[n, Integers]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("Simplify[(-1)^(2 n + 1), Element[n, Integers]]").unwrap(),
+      "-1"
+    );
+    // Parity unknown: stays symbolic.
+    assert_eq!(
+      interpret("Simplify[(-1)^n, Element[n, Integers]]").unwrap(),
+      "(-1)^n"
+    );
+  }
+
+  #[test]
+  fn assuming_propagates_to_simplify() {
+    assert_eq!(
+      interpret("Assuming[x > 0, Simplify[Sqrt[x^2]]]").unwrap(),
+      "x"
+    );
+  }
+
+  // Refinement under an active Assuming must re-combine additive terms, so the
+  // refined `x + x` collapses to `2 x` — matching the explicit-assumption form
+  // Simplify[expr, x > 0].
+  #[test]
+  fn assuming_recombines_refined_sum() {
+    assert_eq!(
+      interpret("Assuming[x > 0, Simplify[Sqrt[x^2] + Abs[x]]]").unwrap(),
+      "2*x"
+    );
+    assert_eq!(
+      interpret("Assuming[x > 0, Simplify[2 Sqrt[x^2] + 3 Abs[x]]]").unwrap(),
+      "5*x"
+    );
+    assert_eq!(
+      interpret("Assuming[x < 0, Simplify[Sqrt[x^2] + Abs[x]]]").unwrap(),
+      "-2*x"
+    );
+  }
+
+  #[test]
+  fn assuming_combines_with_inner_simplify_assumption() {
+    // Outer Assuming and inner direct assumption should combine via And.
+    assert_eq!(
+      interpret("Assuming[x > 0, Simplify[Sqrt[x^2] + Sqrt[y^2], y > 0]]")
+        .unwrap(),
+      "x + y"
+    );
+  }
+
+  #[test]
+  fn assuming_propagates_to_simplify_multi_var() {
+    assert_eq!(
+      interpret("Assuming[x > 0 && y > 0, Simplify[Sqrt[x^2] + Sqrt[y^2]]]")
+        .unwrap(),
+      "x + y"
+    );
+  }
+
+  // Regression (mathics test_assumptions.py:22): `Assuming[var == value,
+  // Integrate[...]]` substitutes `var → value` in the Integrate body
+  // before evaluating, so the definite integral specialises to the
+  // concrete numeric result.
+  #[test]
+  fn assuming_eq_one_integrate_x_n() {
+    assert_eq!(
+      interpret("Assuming[n == 1, Integrate[x^n, {x, 0, 1}]]").unwrap(),
+      "1/2"
+    );
+  }
+
+  #[test]
+  fn assuming_eq_two_integrate_x_n() {
+    assert_eq!(
+      interpret("Assuming[n == 2, Integrate[x^n, {x, 0, 1}]]").unwrap(),
+      "1/3"
+    );
+  }
+
+  // Substitution must only kick in when the body has an Integrate /
+  // Sum / Product / Limit subexpression. A bare `x^n` keeps its
+  // symbolic form (matching wolframscript).
+  #[test]
+  fn assuming_eq_does_not_substitute_into_bare_power() {
+    assert_eq!(interpret("Assuming[n == 1, x^n]").unwrap(), "x^n");
+  }
+
+  // Under an inequality assumption `n > 0`, the lower-limit boundary term
+  // `0^(1 + n)` resolves to 0 (Re[1 + n] > 0), so the symbolic power integral
+  // simplifies to `1/(1 + n)` — matching wolframscript. Both the `Assuming`
+  // wrapper and the `Assumptions ->` option must honour this.
+  #[test]
+  fn assuming_positive_integrate_x_n() {
+    assert_eq!(
+      interpret("Assuming[n > 0, Integrate[x^n, {x, 0, 1}]]").unwrap(),
+      "(1 + n)^(-1)"
+    );
+  }
+
+  #[test]
+  fn integrate_x_n_assumptions_option_positive() {
+    assert_eq!(
+      interpret("Integrate[x^n, {x, 0, 1}, Assumptions -> n > 0]").unwrap(),
+      "(1 + n)^(-1)"
+    );
+  }
+
+  #[test]
+  fn assuming_positive_integrate_x_a_upper_two() {
+    assert_eq!(
+      interpret("Assuming[a > 0, Integrate[x^a, {x, 0, 2}]]").unwrap(),
+      "2^(1 + a)/(1 + a)"
+    );
+  }
+}
+
+// Regression: Simplify should collapse nested continued-fraction-like
+// expressions by combining inner fractions, not leave them in the
+// `1 + (1 + x^(-1))^(-1)` form.
+mod simplify_continued_fractions {
+  use super::*;
+
+  #[test]
+  fn single_level_nested_inverse() {
+    // 1/(1 + 1/x) → x/(1 + x)
+    assert_eq!(interpret("Simplify[1/(1 + 1/x)]").unwrap(), "x/(1 + x)");
+  }
+
+  #[test]
+  fn plus_with_single_level_nested_inverse() {
+    // 1 + 1/(1 + 1/x) → 1 + x/(1 + x)
+    assert_eq!(
+      interpret("Simplify[1 + 1/(1 + 1/x)]").unwrap(),
+      "1 + x/(1 + x)"
+    );
+  }
+
+  #[test]
+  fn two_level_nested_inverse() {
+    // 1/(1 + 1/(1 + 1/x)) → (1 + x)/(1 + 2 x)
+    assert_eq!(
+      interpret("Simplify[1/(1 + 1/(1 + 1/x))]").unwrap(),
+      "(1 + x)/(1 + 2*x)"
+    );
+  }
+
+  #[test]
+  fn plus_with_two_level_nested_inverse() {
+    // 1 + 1/(1 + 1/(1 + 1/x)) → (2 + 3 x)/(1 + 2 x)
+    assert_eq!(
+      interpret("Simplify[1 + 1/(1 + 1/(1 + 1/x))]").unwrap(),
+      "(2 + 3*x)/(1 + 2*x)"
+    );
+  }
+
+  #[test]
+  fn nested_inverse_with_symbolic_coefficients() {
+    // a / (b + c/d) → a d / (c + b d)
+    assert_eq!(
+      interpret("Simplify[a/(b + c/d)]").unwrap(),
+      "(a*d)/(c + b*d)"
+    );
+  }
+
+  #[test]
+  fn together_continued_fraction() {
+    // Same input — Together alone should also combine fully.
+    assert_eq!(
+      interpret("Together[1 + 1/(1 + 1/(1 + 1/x))]").unwrap(),
+      "(2 + 3*x)/(1 + 2*x)"
+    );
+  }
+}
+
+mod roots {
+  use super::*;
+
+  #[test]
+  fn roots_linear() {
+    assert_eq!(interpret("Roots[x == 5, x]").unwrap(), "x == 5");
+  }
+
+  #[test]
+  fn roots_quadratic_integer() {
+    let result = interpret("Roots[x^2 - 4 == 0, x]").unwrap();
+    assert_eq!(result, "x == 2 || x == -2");
+  }
+
+  #[test]
+  fn roots_quadratic_symbolic() {
+    let result = interpret("Roots[a*x^2 + b*x + c == 0, x]").unwrap();
+    assert!(result.contains("||"), "Should have two roots: {result}");
+    assert!(result.contains("Sqrt"), "Should have Sqrt: {result}");
+  }
+
+  #[test]
+  fn roots_no_solution() {
+    // x^2 + 1 == 0 has complex roots
+    let result = interpret("Roots[x^2 + 1 == 0, x]").unwrap();
+    assert!(
+      result.contains("||"),
+      "Should return complex roots: {result}"
+    );
+  }
+
+  #[test]
+  fn roots_quadratic_repeated() {
+    // Double root: x == 1 repeated twice (matching Wolfram behavior)
+    let result = interpret("Roots[x^2 - 2*x + 1 == 0, x]").unwrap();
+    assert_eq!(result, "x == 1 || x == 1");
+  }
+
+  // For a general polynomial (roots that are not negatives of each other),
+  // wolframscript lists the roots in ascending order, matching Solve.
+  #[test]
+  fn roots_general_ascending() {
+    assert_eq!(
+      interpret("Roots[x^2 - 5*x + 6 == 0, x]").unwrap(),
+      "x == 2 || x == 3"
+    );
+    assert_eq!(
+      interpret("Roots[x^2 + x - 6 == 0, x]").unwrap(),
+      "x == -3 || x == 2"
+    );
+    assert_eq!(
+      interpret("Roots[x^3 - 6*x^2 + 11*x - 6 == 0, x]").unwrap(),
+      "x == 1 || x == 2 || x == 3"
+    );
+    assert_eq!(
+      interpret("Roots[x^4 - 5*x^2 + 4 == 0, x]").unwrap(),
+      "x == -2 || x == -1 || x == 1 || x == 2"
+    );
+  }
+
+  // A pure quadratic x^2 == c has roots ±r summing to zero; wolframscript
+  // lists the principal `+` root first (3 || -3, Sqrt[2] || -Sqrt[2], I || -I).
+  #[test]
+  fn roots_pure_quadratic_positive_first() {
+    assert_eq!(
+      interpret("Roots[x^2 - 9 == 0, x]").unwrap(),
+      "x == 3 || x == -3"
+    );
+    assert_eq!(
+      interpret("Roots[x^2 - 2 == 0, x]").unwrap(),
+      "x == Sqrt[2] || x == -Sqrt[2]"
+    );
+    assert_eq!(
+      interpret("Roots[x^2 + 1 == 0, x]").unwrap(),
+      "x == I || x == -I"
+    );
+  }
+
+  // Complex conjugate roots from a quadratic with a linear term keep Solve's
+  // order (the `1 - 2 I` branch first).
+  #[test]
+  fn roots_complex_conjugates() {
+    assert_eq!(
+      interpret("Roots[x^2 - 2*x + 5 == 0, x]").unwrap(),
+      "x == 1 - 2*I || x == 1 + 2*I"
+    );
+  }
+}
+
+mod nroots {
+  use super::*;
+
+  // Helper to extract numeric value (Re or Im) from a "k.kkk" or "k.kkk*I" or
+  // "k.kkk + k.kkk*I" string. Returns (re, im).
+  fn parse_root(s: &str) -> (f64, f64) {
+    let s = s.trim();
+    if let Some(stripped) = s.strip_suffix("*I") {
+      if let Some(idx) = stripped.rfind(" + ") {
+        return (
+          stripped[..idx].parse().unwrap(),
+          stripped[idx + 3..].parse().unwrap(),
+        );
+      } else if let Some(idx) = stripped.rfind(" - ") {
+        return (
+          stripped[..idx].parse().unwrap(),
+          -stripped[idx + 3..].parse::<f64>().unwrap(),
+        );
+      }
+      return (0.0, stripped.parse().unwrap());
+    }
+    (s.parse().unwrap(), 0.0)
+  }
+
+  #[test]
+  fn nroots_linear() {
+    assert_eq!(interpret("NRoots[x - 2 == 0, x]").unwrap(), "x == 2.");
+  }
+
+  #[test]
+  fn nroots_quadratic_real() {
+    // x^2 - 2 == 0 → ±Sqrt[2]
+    assert_eq!(
+      interpret("NRoots[x^2 - 2 == 0, x]").unwrap(),
+      "x == -1.4142135623730951 || x == 1.4142135623730951"
+    );
+  }
+
+  #[test]
+  fn nroots_quadratic_imag() {
+    // x^2 + 1 == 0 → ±I
+    assert_eq!(
+      interpret("NRoots[x^2 + 1 == 0, x]").unwrap(),
+      "x == 0. - 1.*I || x == 0. + 1.*I"
+    );
+  }
+
+  #[test]
+  fn nroots_cubic_audit_case() {
+    // Audit case: 1 + 2x + 3x^2 + 4x^3 = 0
+    let result = interpret("NRoots[1 + 2*x + 3*x^2 + 4*x^3 == 0, x]").unwrap();
+    let parts: Vec<&str> = result.split(" || ").collect();
+    assert_eq!(parts.len(), 3);
+    let roots: Vec<(f64, f64)> = parts
+      .iter()
+      .map(|p| {
+        let s = p.strip_prefix("x == ").unwrap();
+        parse_root(s)
+      })
+      .collect();
+    // Real root then two complex conjugates, sorted by (re, im).
+    let expected = [
+      (-0.605829586188268_f64, 0.0_f64),
+      (-0.07208520690586598, -0.6383267351483765),
+      (-0.07208520690586598, 0.6383267351483765),
+    ];
+    for (i, (er, ei)) in expected.iter().enumerate() {
+      assert!((roots[i].0 - er).abs() < 1e-9, "Re mismatch at {i}");
+      assert!((roots[i].1 - ei).abs() < 1e-9, "Im mismatch at {i}");
+    }
+  }
+
+  #[test]
+  fn nroots_cubic_unity() {
+    // x^3 - 1 == 0: complex roots first (real -0.5), then real root 1.
+    let result = interpret("NRoots[x^3 - 1 == 0, x]").unwrap();
+    let parts: Vec<&str> = result.split(" || ").collect();
+    assert_eq!(parts.len(), 3);
+    let roots: Vec<(f64, f64)> = parts
+      .iter()
+      .map(|p| {
+        let s = p.strip_prefix("x == ").unwrap();
+        parse_root(s)
+      })
+      .collect();
+    let expected = [
+      (-0.5, -0.8660254037844386),
+      (-0.5, 0.8660254037844386),
+      (1.0, 0.0),
+    ];
+    for (i, (er, ei)) in expected.iter().enumerate() {
+      assert!((roots[i].0 - er).abs() < 1e-9, "Re mismatch at {i}");
+      assert!((roots[i].1 - ei).abs() < 1e-9, "Im mismatch at {i}");
+    }
+  }
+}
+
+mod eliminate {
+  use super::*;
+
+  #[test]
+  fn eliminate_single_variable_linear() {
+    // Eliminate y from {x == 2 + y, y == z}
+    let result = interpret("Eliminate[{x == 2 + y, y == z}, y]").unwrap();
+    assert_eq!(result, "2 + z == x");
+  }
+
+  #[test]
+  fn eliminate_single_from_two_linear() {
+    // Eliminate a from {x == a + b, y == a - b}
+    let result = interpret("Eliminate[{x == a + b, y == a - b}, a]").unwrap();
+    assert_eq!(result, "x - y == 2*b");
+  }
+
+  // Solving an equation with a fractional coefficient for the eliminated
+  // variable simplifies the quotient (t = 2*x), instead of leaving a nested
+  // fraction like -(x/-1/2).
+  #[test]
+  fn eliminate_fractional_coefficient() {
+    let result = interpret("Eliminate[{x == t/2, y == t}, t]").unwrap();
+    assert_eq!(result, "y == 2*x");
+  }
+
+  #[test]
+  fn eliminate_to_constant() {
+    // Eliminate y from {x + y == 3, x - y == 1}
+    let result = interpret("Eliminate[{x + y == 3, x - y == 1}, y]").unwrap();
+    assert_eq!(result, "x == 2");
+  }
+
+  // Wolfram keeps the eliminated equation as a primitive polynomial rather
+  // than solving for the variable: 2 x == 3, not x == 3/2. Content that
+  // divides evenly still collapses (3 x == 6 -> x == 2).
+  #[test]
+  fn eliminate_keeps_primitive_polynomial() {
+    assert_eq!(
+      interpret("Eliminate[{x + y == 1, x - y == 2}, y]").unwrap(),
+      "2*x == 3"
+    );
+    assert_eq!(
+      interpret("Eliminate[{5 x + y == 2, y == 0}, y]").unwrap(),
+      "5*x == 2"
+    );
+    assert_eq!(
+      interpret("Eliminate[{2 x + y == 5, x - y == 1}, y]").unwrap(),
+      "x == 2"
+    );
+  }
+
+  #[test]
+  fn eliminate_with_product() {
+    // Eliminate x from {a == x + y, b == x*y}
+    let result = interpret("Eliminate[{a == x + y, b == x*y}, x]").unwrap();
+    assert_eq!(result, "-b + a*y - y^2 == 0");
+  }
+
+  #[test]
+  fn eliminate_variable_not_found() {
+    // If variable doesn't appear, equation is returned unchanged
+    let result = interpret("Eliminate[{x == 2}, y]").unwrap();
+    assert_eq!(result, "x == 2");
+  }
+
+  #[test]
+  fn eliminate_single_equation() {
+    // With a single equation and the variable in it, eliminating gives True
+    let result = interpret("Eliminate[{x == 2}, x]").unwrap();
+    assert_eq!(result, "True");
+  }
+}
+
+mod to_rules {
+  use super::*;
+
+  #[test]
+  fn to_rules_single_equation() {
+    // x == 5 → {x -> 5}
+    assert_eq!(interpret("ToRules[x == 5]").unwrap(), "{x -> 5}");
+  }
+
+  #[test]
+  fn to_rules_or_conditions() {
+    // x == -2 || x == 2 → Sequence[{x -> -2}, {x -> 2}] (displays as "{x -> -2}{x -> 2}")
+    assert_eq!(
+      interpret("ToRules[x == -2 || x == 2]").unwrap(),
+      "{x -> -2}{x -> 2}"
+    );
+  }
+
+  #[test]
+  fn to_rules_from_roots() {
+    // Convert Roots output to Solve-style rules
+    assert_eq!(
+      interpret("ToRules[Roots[x^2 - 4 == 0, x]]").unwrap(),
+      "{x -> 2}{x -> -2}"
+    );
+  }
+
+  #[test]
+  fn to_rules_and_conditions() {
+    // x == 1 && y == 2 → {x -> 1, y -> 2}
+    assert_eq!(
+      interpret("ToRules[x == 1 && y == 2]").unwrap(),
+      "{x -> 1, y -> 2}"
+    );
+  }
+
+  #[test]
+  fn to_rules_true() {
+    assert_eq!(interpret("ToRules[True]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn to_rules_false() {
+    // ToRules[False] returns Sequence[] (empty, matches Wolfram behavior)
+    // When wrapped in ToString[(ToRules[False]), InputForm] → "InputForm"
+    assert_eq!(interpret("ToRules[False]").unwrap(), "");
+  }
+}
+
+mod reduce {
+  use super::*;
+
+  // ── Trivial cases ──
+
+  #[test]
+  fn reduce_true() {
+    assert_eq!(interpret("Reduce[True, x]").unwrap(), "True");
+  }
+
+  /// A statement the target variable does not appear in is still *reduced* —
+  /// over its own variables. The second argument only says which variables to
+  /// eliminate last, so `Reduce[a^2 < 4, x]` solves for `a` all the same.
+  /// Verified against wolframscript.
+  #[test]
+  fn target_independent_parameter_condition_is_reduced() {
+    assert_eq!(interpret("Reduce[a > 0, x]").unwrap(), "a > 0");
+    assert_eq!(
+      interpret("Reduce[a^2 < 4, x]").unwrap(),
+      "Inequality[-2, Less, a, Less, 2]"
+    );
+    assert_eq!(interpret("Reduce[a^2 > 4, x]").unwrap(), "a < -2 || a > 2");
+    assert_eq!(
+      interpret("Reduce[a^2 == 4, x]").unwrap(),
+      "a == -2 || a == 2"
+    );
+    assert_eq!(interpret("Reduce[b^3 < 8, x]").unwrap(), "b < 2");
+  }
+
+  /// Independent conjuncts reduce independently and the ones the target does
+  /// not appear in come first, the order wolframscript eliminates them in.
+  /// Conjuncts sharing a variable still reduce together.
+  #[test]
+  fn independent_conjuncts_reduce_separately_and_lead() {
+    assert_eq!(
+      interpret("Reduce[x > 1 && a^2 < 4, x]").unwrap(),
+      "Inequality[-2, Less, a, Less, 2] && x > 1"
+    );
+    assert_eq!(
+      interpret("Reduce[x > 1 && a^2 < 4 && b^2 < 9, x]").unwrap(),
+      "Inequality[-2, Less, a, Less, 2] && Inequality[-3, Less, b, Less, 3] \
+       && x > 1"
+    );
+    assert_eq!(
+      interpret("Reduce[a^2 < 4 || x > 1, x]").unwrap(),
+      "Inequality[-2, Less, a, Less, 2] || x > 1"
+    );
+    // `a^2 < 4` and `a > 0` share `a`, so they are one constraint.
+    assert_eq!(
+      interpret("Reduce[a^2 < 4 && a > 0, x]").unwrap(),
+      "Inequality[0, Less, a, Less, 2]"
+    );
+  }
+
+  /// `Reduce[expr]` names no variables, so every variable of the statement
+  /// is eliminated. Verified against wolframscript.
+  #[test]
+  fn one_argument_reduces_over_every_variable() {
+    assert_eq!(
+      interpret("Reduce[a^2 < 4]").unwrap(),
+      "Inequality[-2, Less, a, Less, 2]"
+    );
+    assert_eq!(
+      interpret("Reduce[a^2 < 4 && x > 1]").unwrap(),
+      "Inequality[-2, Less, a, Less, 2] && x > 1"
+    );
+  }
+
+  // A linear equation with a symbolic leading coefficient must include the
+  // degenerate case where that coefficient vanishes. Expected strings verified
+  // against wolframscript.
+  #[test]
+  fn linear_parametric_coefficient() {
+    assert_eq!(
+      interpret("Reduce[a x == b, x]").unwrap(),
+      "(b == 0 && a == 0) || (a != 0 && x == b/a)"
+    );
+    // A nonzero numeric constant drops the degenerate branch.
+    assert_eq!(
+      interpret("Reduce[a x == 5, x]").unwrap(),
+      "a != 0 && x == 5/a"
+    );
+    // A zero constant makes the whole line a solution when the coefficient is 0.
+    assert_eq!(
+      interpret("Reduce[a x == 0, x]").unwrap(),
+      "a == 0 || x == 0"
+    );
+    // A shifted constant term.
+    assert_eq!(
+      interpret("Reduce[a x + c == 0, x]").unwrap(),
+      "(c == 0 && a == 0) || (a != 0 && x == -(c/a))"
+    );
+  }
+
+  // A numeric factor (or sign) on the coefficient collapses in the condition
+  // (2 a == 0 -> a == 0) but is kept in the solution value.
+  #[test]
+  fn linear_parametric_numeric_factor() {
+    assert_eq!(
+      interpret("Reduce[2 a x == b, x]").unwrap(),
+      "(b == 0 && a == 0) || (a != 0 && x == b/(2*a))"
+    );
+    assert_eq!(
+      interpret("Reduce[-a x == b, x]").unwrap(),
+      "(b == 0 && a == 0) || (a != 0 && x == -(b/a))"
+    );
+  }
+
+  // A plain numeric coefficient keeps the single-solution form (no degenerate
+  // branch) — the parametric path must not fire here.
+  #[test]
+  fn linear_numeric_coefficient_unchanged() {
+    assert_eq!(interpret("Reduce[2 x == 6, x]").unwrap(), "x == 3");
+    assert_eq!(interpret("Reduce[x == y, x]").unwrap(), "x == y");
+  }
+
+  // Reduce of a trig equation over a bounded interval gives the concrete
+  // in-range roots as a disjunction (or a single equation / False).
+  #[test]
+  fn trig_bounded_sin_zero() {
+    assert_eq!(
+      interpret("Reduce[Sin[x] == 0 && 0 < x < 2 Pi, x]").unwrap(),
+      "x == Pi"
+    );
+  }
+
+  #[test]
+  fn trig_bounded_cos_half() {
+    assert_eq!(
+      interpret("Reduce[Cos[x] == 1/2 && 0 < x < 2 Pi, x]").unwrap(),
+      "x == Pi/3 || x == (5*Pi)/3"
+    );
+  }
+
+  #[test]
+  fn trig_bounded_tan_one() {
+    assert_eq!(
+      interpret("Reduce[Tan[x] == 1 && 0 < x < 2 Pi, x]").unwrap(),
+      "x == Pi/4 || x == (5*Pi)/4"
+    );
+  }
+
+  #[test]
+  fn trig_bounded_no_solution() {
+    assert_eq!(
+      interpret("Reduce[Cos[x] == 5 && 0 < x < 2 Pi, x]").unwrap(),
+      "False"
+    );
+  }
+
+  // Without a bounding constraint the general periodic family is kept.
+  #[test]
+  fn trig_unbounded_keeps_family() {
+    assert_eq!(
+      interpret("Reduce[Cos[x] == 1/2, x]").unwrap(),
+      "x == ConditionalExpression[-1/3*Pi + 2*Pi*C[1], \
+       Element[C[1], Integers]] || x == ConditionalExpression[Pi/3 + \
+       2*Pi*C[1], Element[C[1], Integers]]"
+    );
+  }
+
+  #[test]
+  fn reduce_exists_quadratic_linear_audit_case() {
+    // Audit case: find conditions on `a` such that some (x, y) satisfies
+    // x² + a·y² ≤ 1 ∧ x − y ≥ 2. Lagrange max of (x − y) over the
+    // ellipse-or-strip is `sqrt(1 + 1/a)` for a > 0 and unbounded for
+    // a ≤ 0, so the system is satisfiable iff `a <= 1/3`.
+    assert_eq!(
+      interpret("Reduce[Exists[{x, y}, x^2 + a*y^2 <= 1 && x - y >= 2], a]")
+        .unwrap(),
+      "a <= 1/3"
+    );
+  }
+
+  #[test]
+  fn reduce_exists_quadratic_linear_unit_circle_lower_bound() {
+    // Same shape but tighter linear bound: x − y ≥ 1 (instead of 2).
+    // 1/a ≥ 1²/1 - 1 = 0, so a > 0 always works and a ≤ 0 trivially
+    // works as well — the system is satisfiable for every real `a`.
+    assert_eq!(
+      interpret("Reduce[Exists[{x, y}, x^2 + a*y^2 <= 1 && x - y >= 1], a]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn reduce_false() {
+    assert_eq!(interpret("Reduce[False, x]").unwrap(), "False");
+  }
+
+  // A chained two-sided numeric bound reduces to the canonical Inequality
+  // form, just like the equivalent And-of-inequalities.
+  #[test]
+  fn reduce_chained_inequality_numeric() {
+    assert_eq!(
+      interpret("Reduce[0 < x < 5, x]").unwrap(),
+      "Inequality[0, Less, x, Less, 5]"
+    );
+    assert_eq!(
+      interpret("Reduce[1 <= x <= 3, x]").unwrap(),
+      "Inequality[1, LessEqual, x, LessEqual, 3]"
+    );
+    // Mixed strictness parses as an Inequality[...] and must also reduce.
+    assert_eq!(
+      interpret("Reduce[0 < x <= 10, x]").unwrap(),
+      "Inequality[0, Less, x, LessEqual, 10]"
+    );
+    assert_eq!(
+      interpret("Reduce[-2 <= x < 7, x]").unwrap(),
+      "Inequality[-2, LessEqual, x, Less, 7]"
+    );
+  }
+
+  #[test]
+  fn reduce_chained_inequality_empty() {
+    // An impossible two-sided bound reduces to False.
+    assert_eq!(interpret("Reduce[5 < x < 1, x]").unwrap(), "False");
+  }
+
+  // Reduce[Abs[f] op c, x, Reals] splits the absolute value into the
+  // corresponding real intervals (previously these returned False/garbage).
+  #[test]
+  fn reduce_abs_inequality_reals() {
+    assert_eq!(
+      interpret("Reduce[Abs[x] < 3, x, Reals]").unwrap(),
+      "Inequality[-3, Less, x, Less, 3]"
+    );
+    assert_eq!(
+      interpret("Reduce[Abs[x] <= 3, x, Reals]").unwrap(),
+      "Inequality[-3, LessEqual, x, LessEqual, 3]"
+    );
+    assert_eq!(
+      interpret("Reduce[Abs[x] > 2, x, Reals]").unwrap(),
+      "x < -2 || x > 2"
+    );
+    assert_eq!(
+      interpret("Reduce[Abs[x] >= 2, x, Reals]").unwrap(),
+      "x <= -2 || x >= 2"
+    );
+    // Shifted argument: -1 < x < 3.
+    assert_eq!(
+      interpret("Reduce[Abs[x - 1] < 2, x, Reals]").unwrap(),
+      "Inequality[-1, Less, x, Less, 3]"
+    );
+    // A constant coefficient (Abs[2 x] evaluates to 2 Abs[x]) divides through.
+    assert_eq!(
+      interpret("Reduce[Abs[2 x] < 6, x, Reals]").unwrap(),
+      "Inequality[-3, Less, x, Less, 3]"
+    );
+    // The bound flips with a negative coefficient.
+    assert_eq!(
+      interpret("Reduce[-2 Abs[x] > -6, x, Reals]").unwrap(),
+      "Inequality[-3, Less, x, Less, 3]"
+    );
+    // Quadratic argument is solved on the bare polynomial.
+    assert_eq!(
+      interpret("Reduce[Abs[x^2 - 1] < 3, x, Reals]").unwrap(),
+      "Inequality[-2, Less, x, Less, 2]"
+    );
+  }
+
+  #[test]
+  fn reduce_abs_inequality_boundary_reals() {
+    // c <= 0 boundaries.
+    assert_eq!(interpret("Reduce[Abs[x] < 0, x, Reals]").unwrap(), "False");
+    assert_eq!(
+      interpret("Reduce[Abs[x] <= 0, x, Reals]").unwrap(),
+      "x == 0"
+    );
+    assert_eq!(
+      interpret("Reduce[Abs[x] > 0, x, Reals]").unwrap(),
+      "x < 0 || x > 0"
+    );
+    assert_eq!(interpret("Reduce[Abs[x] >= 0, x, Reals]").unwrap(), "True");
+    assert_eq!(interpret("Reduce[Abs[x] > -1, x, Reals]").unwrap(), "True");
+  }
+
+  #[test]
+  fn reduce_abs_not_equal_reals() {
+    assert_eq!(
+      interpret("Reduce[Abs[x] != 2, x, Reals]").unwrap(),
+      "x < -2 || Inequality[-2, Less, x, Less, 2] || x > 2"
+    );
+    assert_eq!(
+      interpret("Reduce[Abs[x] != 0, x, Reals]").unwrap(),
+      "x < 0 || x > 0"
+    );
+    // c < 0: every real satisfies it.
+    assert_eq!(interpret("Reduce[Abs[x] != -1, x, Reals]").unwrap(), "True");
+  }
+
+  // Reduce[..., Modulus -> n] enumerates solutions in Z/nZ.
+  #[test]
+  fn reduce_modulus_one_var_quadratic() {
+    assert_eq!(
+      interpret("Reduce[x^2 == 1, x, Modulus -> 5]").unwrap(),
+      "x == 1 || x == 4"
+    );
+  }
+
+  #[test]
+  fn reduce_modulus_one_var_quadratic_mod4() {
+    assert_eq!(
+      interpret("Reduce[x^2 == 1, x, Modulus -> 4]").unwrap(),
+      "x == 1 || x == 3"
+    );
+  }
+
+  // Two-variable polynomial mod 4 (the audit case).
+  #[test]
+  fn reduce_modulus_two_vars() {
+    assert_eq!(
+      interpret("Reduce[x^5 == y^4 + x*y + 1, {x, y}, Modulus -> 4]").unwrap(),
+      "(x == 1 && y == 0) || (x == 1 && y == 3) || (x == 2 && y == 1) || \
+       (x == 2 && y == 3) || (x == 3 && y == 2) || (x == 3 && y == 3)"
+    );
+  }
+
+  // No solutions returns False.
+  #[test]
+  fn reduce_modulus_no_solutions() {
+    assert_eq!(
+      interpret("Reduce[x^2 == 2, x, Modulus -> 4]").unwrap(),
+      "False"
+    );
+  }
+
+  // ── Linear equations ──
+
+  #[test]
+  fn linear_equation() {
+    assert_eq!(interpret("Reduce[2*x + 3 == 7, x]").unwrap(), "x == 2");
+  }
+
+  #[test]
+  fn linear_equation_negative() {
+    assert_eq!(interpret("Reduce[x - 5 == 0, x]").unwrap(), "x == 5");
+  }
+
+  #[test]
+  fn trivial_equation() {
+    assert_eq!(interpret("Reduce[x == 5, x]").unwrap(), "x == 5");
+  }
+
+  // ── Quadratic equations ──
+
+  #[test]
+  fn quadratic_integer_roots() {
+    assert_eq!(
+      interpret("Reduce[x^2 - 4 == 0, x]").unwrap(),
+      "x == -2 || x == 2"
+    );
+  }
+
+  #[test]
+  fn quadratic_two_roots() {
+    assert_eq!(
+      interpret("Reduce[x^2 + x - 6 == 0, x]").unwrap(),
+      "x == -3 || x == 2"
+    );
+  }
+
+  #[test]
+  fn quadratic_repeated_root() {
+    assert_eq!(
+      interpret("Reduce[x^2 + 2*x + 1 == 0, x]").unwrap(),
+      "x == -1"
+    );
+  }
+
+  #[test]
+  fn quadratic_irrational_roots() {
+    assert_eq!(
+      interpret("Reduce[x^2 - 3 == 0, x]").unwrap(),
+      "x == -Sqrt[3] || x == Sqrt[3]"
+    );
+  }
+
+  #[test]
+  fn quadratic_complex_roots() {
+    assert_eq!(
+      interpret("Reduce[x^2 + 1 == 0, x]").unwrap(),
+      "x == -I || x == I"
+    );
+  }
+
+  // ── Higher degree equations (via factoring) ──
+
+  #[test]
+  fn cubic_equation() {
+    assert_eq!(
+      interpret("Reduce[x^3 - 3*x^2 + 2*x == 0, x]").unwrap(),
+      "x == 0 || x == 1 || x == 2"
+    );
+  }
+
+  #[test]
+  fn cubic_factored() {
+    assert_eq!(
+      interpret("Reduce[(x - 1)*(x - 2)*(x - 3) == 0, x]").unwrap(),
+      "x == 1 || x == 2 || x == 3"
+    );
+  }
+
+  #[test]
+  fn quartic_factored() {
+    assert_eq!(
+      interpret("Reduce[x*(x - 1)*(x - 2)*(x - 3) == 0, x]").unwrap(),
+      "x == 0 || x == 1 || x == 2 || x == 3"
+    );
+  }
+
+  // ── Domain filtering ──
+
+  #[test]
+  fn complex_roots_over_reals() {
+    assert_eq!(
+      interpret("Reduce[x^2 + 1 == 0, x, Reals]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn complex_roots_over_integers() {
+    assert_eq!(
+      interpret("Reduce[x^2 + 1 == 0, x, Integers]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn real_roots_over_reals() {
+    assert_eq!(
+      interpret("Reduce[x^2 - 1 == 0, x, Reals]").unwrap(),
+      "x == -1 || x == 1"
+    );
+  }
+
+  // ── Or (disjunction) ──
+
+  #[test]
+  fn reduce_or() {
+    assert_eq!(
+      interpret("Reduce[x == 1 || x == 2, x]").unwrap(),
+      "x == 1 || x == 2"
+    );
+  }
+
+  // ── Simple inequalities ──
+
+  #[test]
+  fn simple_inequality_gt() {
+    assert_eq!(interpret("Reduce[x > 0, x]").unwrap(), "x > 0");
+  }
+
+  // ── Quadratic inequalities ──
+
+  #[test]
+  fn quadratic_inequality_less() {
+    assert_eq!(
+      interpret("Reduce[x^2 < 4, x]").unwrap(),
+      "Inequality[-2, Less, x, Less, 2]"
+    );
+  }
+
+  #[test]
+  fn quadratic_inequality_greater() {
+    assert_eq!(
+      interpret("Reduce[x^2 - 1 > 0, x]").unwrap(),
+      "x < -1 || x > 1"
+    );
+  }
+
+  #[test]
+  fn quadratic_inequality_geq() {
+    assert_eq!(
+      interpret("Reduce[x^2 - 1 >= 0, x]").unwrap(),
+      "x <= -1 || x >= 1"
+    );
+  }
+
+  #[test]
+  fn factored_inequality_less() {
+    assert_eq!(
+      interpret("Reduce[(x - 1)*(x + 2) < 0, x]").unwrap(),
+      "Inequality[-2, Less, x, Less, 1]"
+    );
+  }
+
+  #[test]
+  fn factored_inequality_leq() {
+    assert_eq!(
+      interpret("Reduce[(x - 1)*(x + 2) <= 0, x]").unwrap(),
+      "Inequality[-2, LessEqual, x, LessEqual, 1]"
+    );
+  }
+
+  #[test]
+  fn factored_inequality_greater() {
+    assert_eq!(
+      interpret("Reduce[(x - 1)*(x + 2) > 0, x]").unwrap(),
+      "x < -2 || x > 1"
+    );
+  }
+
+  // ── Always true / always false inequalities ──
+
+  #[test]
+  fn always_true_inequality() {
+    assert_eq!(
+      interpret("Reduce[x^2 + 1 > 0, x]").unwrap(),
+      "Element[x, Reals]"
+    );
+  }
+
+  #[test]
+  fn always_true_with_reals_domain() {
+    assert_eq!(interpret("Reduce[x^2 + 1 > 0, x, Reals]").unwrap(), "True");
+  }
+
+  #[test]
+  fn always_false_inequality() {
+    assert_eq!(interpret("Reduce[x^2 + 1 < 0, x]").unwrap(), "False");
+  }
+
+  // ── And (conjunction) ──
+
+  #[test]
+  fn equation_with_inequality_constraint() {
+    assert_eq!(interpret("Reduce[x^2 == 9 && x > 0, x]").unwrap(), "x == 3");
+  }
+
+  #[test]
+  fn combined_inequalities() {
+    assert_eq!(
+      interpret("Reduce[x > 0 && x < 5 && x > 3, x]").unwrap(),
+      "Inequality[3, Less, x, Less, 5]"
+    );
+  }
+
+  #[test]
+  fn combined_two_bounds() {
+    assert_eq!(
+      interpret("Reduce[x > 2 && x < 10, x]").unwrap(),
+      "Inequality[2, Less, x, Less, 10]"
+    );
+  }
+
+  #[test]
+  fn mixed_equation_inequality() {
+    assert_eq!(
+      interpret("Reduce[x^2 <= 4 && x > 0, x]").unwrap(),
+      "Inequality[0, Less, x, LessEqual, 2]"
+    );
+  }
+
+  // Over the integers, a bounded two-sided interval enumerates the contained
+  // integers (respecting strict vs non-strict bounds); without a domain it
+  // stays an Inequality.
+  #[test]
+  fn integers_bounded_interval_strict() {
+    assert_eq!(
+      interpret("Reduce[x > 2 && x < 5, x, Integers]").unwrap(),
+      "x == 3 || x == 4"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_interval_inclusive() {
+    assert_eq!(
+      interpret("Reduce[0 <= x <= 3, x, Integers]").unwrap(),
+      "x == 0 || x == 1 || x == 2 || x == 3"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_interval_mixed_strictness() {
+    assert_eq!(
+      interpret("Reduce[1 < x <= 4, x, Integers]").unwrap(),
+      "x == 2 || x == 3 || x == 4"
+    );
+    assert_eq!(
+      interpret("Reduce[x >= 2 && x < 6, x, Integers]").unwrap(),
+      "x == 2 || x == 3 || x == 4 || x == 5"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_interval_empty() {
+    assert_eq!(
+      interpret("Reduce[2 < x < 3, x, Integers]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_interval_single() {
+    assert_eq!(
+      interpret("Reduce[2 <= x <= 2, x, Integers]").unwrap(),
+      "x == 2"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_interval_no_domain_stays_inequality() {
+    // Without the Integers domain the interval form is retained.
+    assert_eq!(
+      interpret("Reduce[x > 2 && x < 5, x]").unwrap(),
+      "Inequality[2, Less, x, Less, 5]"
+    );
+  }
+
+  // A single one-sided bound over the integers is tightened to the nearest
+  // admissible integer and paired with the domain-membership conjunct, matching
+  // wolframscript: Reduce[x > 2, x, Integers] -> Element[x, Integers] && x >= 3.
+  #[test]
+  fn integers_one_sided_strict_lower() {
+    assert_eq!(
+      interpret("Reduce[x > 2, x, Integers]").unwrap(),
+      "Element[x, Integers] && x >= 3"
+    );
+  }
+
+  #[test]
+  fn integers_one_sided_inclusive_lower() {
+    assert_eq!(
+      interpret("Reduce[x >= 2, x, Integers]").unwrap(),
+      "Element[x, Integers] && x >= 2"
+    );
+  }
+
+  #[test]
+  fn integers_one_sided_strict_upper() {
+    assert_eq!(
+      interpret("Reduce[x < 5, x, Integers]").unwrap(),
+      "Element[x, Integers] && x <= 4"
+    );
+  }
+
+  #[test]
+  fn integers_one_sided_inclusive_upper() {
+    assert_eq!(
+      interpret("Reduce[x <= 5, x, Integers]").unwrap(),
+      "Element[x, Integers] && x <= 5"
+    );
+  }
+
+  #[test]
+  fn integers_one_sided_negative_bound() {
+    assert_eq!(
+      interpret("Reduce[x < -3, x, Integers]").unwrap(),
+      "Element[x, Integers] && x <= -4"
+    );
+  }
+
+  // A non-integer rational bound is rounded inward to the nearest integer; an
+  // integer coefficient on the variable is divided out first.
+  #[test]
+  fn integers_one_sided_rational_bound() {
+    assert_eq!(
+      interpret("Reduce[x > 5/2, x, Integers]").unwrap(),
+      "Element[x, Integers] && x >= 3"
+    );
+    assert_eq!(
+      interpret("Reduce[2 x > 5, x, Integers]").unwrap(),
+      "Element[x, Integers] && x >= 3"
+    );
+  }
+
+  // Over the integers, a bounded interval carrying an extra `Mod[x, n] == k`
+  // constraint enumerates the interval and keeps the congruent integers,
+  // matching wolframscript:
+  //   Reduce[Mod[x,3]==1 && 0<=x<=10, x, Integers]
+  //     -> x == 1 || x == 4 || x == 7 || x == 10.
+  #[test]
+  fn integers_bounded_with_mod_constraint() {
+    assert_eq!(
+      interpret("Reduce[Mod[x, 3] == 1 && 0 <= x <= 10, x, Integers]").unwrap(),
+      "x == 1 || x == 4 || x == 7 || x == 10"
+    );
+    assert_eq!(
+      interpret("Reduce[Mod[x, 2] == 0 && 1 <= x <= 8, x, Integers]").unwrap(),
+      "x == 2 || x == 4 || x == 6 || x == 8"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_with_mod_constraint_strict() {
+    assert_eq!(
+      interpret("Reduce[Mod[x, 3] == 1 && 0 < x < 10, x, Integers]").unwrap(),
+      "x == 1 || x == 4 || x == 7"
+    );
+    assert_eq!(
+      interpret("Reduce[Mod[x, 3] == 1 && 0 < x < 3, x, Integers]").unwrap(),
+      "x == 1"
+    );
+  }
+
+  // The bound may be written with the variable on the right (`10 >= x >= 0`).
+  #[test]
+  fn integers_bounded_with_mod_reversed_chain() {
+    assert_eq!(
+      interpret("Reduce[10 >= x >= 0 && Mod[x, 4] == 2, x, Integers]").unwrap(),
+      "x == 2 || x == 6 || x == 10"
+    );
+  }
+
+  // An empty residue class within the range collapses to False.
+  #[test]
+  fn integers_bounded_with_mod_constraint_empty() {
+    assert_eq!(
+      interpret("Reduce[Mod[x, 5] == 0 && 1 <= x <= 4, x, Integers]").unwrap(),
+      "False"
+    );
+  }
+
+  // Excluded values (`x != v`) are filtered out of the enumerated interval,
+  // matching wolframscript:
+  //   Reduce[1<=x<=4 && x!=2, x, Integers] -> x == 1 || x == 3 || x == 4.
+  #[test]
+  fn integers_bounded_with_unequal_constraints() {
+    assert_eq!(
+      interpret("Reduce[1 <= x <= 4 && x != 2, x, Integers]").unwrap(),
+      "x == 1 || x == 3 || x == 4"
+    );
+    assert_eq!(
+      interpret("Reduce[1 <= x <= 10 && x != 3 && x != 7, x, Integers]")
+        .unwrap(),
+      "x == 1 || x == 2 || x == 4 || x == 5 || x == 6 || x == 8 || x == 9 || x == 10"
+    );
+  }
+
+  // Without the Integers domain a one-sided bound is left as the bare
+  // comparison.
+  #[test]
+  fn integers_one_sided_no_domain_stays_comparison() {
+    assert_eq!(interpret("Reduce[x > 2, x]").unwrap(), "x > 2");
+  }
+
+  // ── Reduce InputForm: chained inequalities use Inequality[] head ──
+
+  #[test]
+  fn reduce_quadratic_inequality_input_form() {
+    assert_eq!(
+      interpret("ToString[Reduce[x^2 < 4, x], InputForm]").unwrap(),
+      "Inequality[-2, Less, x, Less, 2]"
+    );
+  }
+
+  #[test]
+  fn reduce_factored_inequality_input_form() {
+    assert_eq!(
+      interpret("ToString[Reduce[(x - 1)*(x + 2) < 0, x], InputForm]").unwrap(),
+      "Inequality[-2, Less, x, Less, 1]"
+    );
+  }
+
+  #[test]
+  fn reduce_factored_inequality_leq_input_form() {
+    assert_eq!(
+      interpret("ToString[Reduce[(x - 1)*(x + 2) <= 0, x], InputForm]")
+        .unwrap(),
+      "Inequality[-2, LessEqual, x, LessEqual, 1]"
+    );
+  }
+
+  #[test]
+  fn reduce_combined_inequalities_input_form() {
+    assert_eq!(
+      interpret("ToString[Reduce[x > 0 && x < 5 && x > 3, x], InputForm]")
+        .unwrap(),
+      "Inequality[3, Less, x, Less, 5]"
+    );
+  }
+
+  #[test]
+  fn reduce_two_bounds_input_form() {
+    assert_eq!(
+      interpret("ToString[Reduce[x > 2 && x < 10, x], InputForm]").unwrap(),
+      "Inequality[2, Less, x, Less, 10]"
+    );
+  }
+
+  // ── And of a higher-degree inequality with a linear constraint ──
+  // The cubic factor reduces to a disjunction (`-1<x<0 || x>1`); the And must
+  // distribute over that Or and intersect each branch with the linear bound.
+  // Regression: the compound-bound Or-branch used to be wrapped in an
+  // unevaluated Reduce[...] and silently dropped, so the whole result collapsed
+  // to just the linear constraint.
+
+  #[test]
+  fn reduce_cubic_and_upper_bound() {
+    assert_eq!(
+      interpret("ToString[Reduce[x^3 - x > 0 && x < 1/2, x], InputForm]")
+        .unwrap(),
+      "Inequality[-1, Less, x, Less, 0]"
+    );
+  }
+
+  #[test]
+  fn reduce_cubic_and_lower_bound_selects_branch() {
+    assert_eq!(
+      interpret("Reduce[x^3 - x > 0 && x > 0, x]").unwrap(),
+      "x > 1"
+    );
+  }
+
+  #[test]
+  fn reduce_cubic_and_inclusive_bound() {
+    assert_eq!(
+      interpret("ToString[Reduce[x^3 - x >= 0 && x <= 1/2, x], InputForm]")
+        .unwrap(),
+      "Inequality[-1, LessEqual, x, LessEqual, 0]"
+    );
+  }
+
+  #[test]
+  fn reduce_quartic_and_lower_bound() {
+    assert_eq!(
+      interpret("ToString[Reduce[x^4 - 5 x^2 + 4 < 0 && x > 0, x], InputForm]")
+        .unwrap(),
+      "Inequality[1, Less, x, Less, 2]"
+    );
+  }
+
+  // ── Multi-variable systems ──
+
+  #[test]
+  fn two_variable_linear_system() {
+    assert_eq!(
+      interpret("Reduce[x + y == 5 && x - y == 1, {x, y}]").unwrap(),
+      "x == 3 && y == 2"
+    );
+  }
+
+  #[test]
+  fn two_variable_list_input() {
+    assert_eq!(
+      interpret("Reduce[{x + y == 5, x - y == 1}, {x, y}]").unwrap(),
+      "x == 3 && y == 2"
+    );
+  }
+
+  // A single equation compared as equal-length lists threads into the
+  // conjunction of componentwise equations, matching how Solve already
+  // handles `{a, b} == {c, d}`.
+  #[test]
+  fn vector_equation_threads_into_scalar_equations() {
+    assert_eq!(
+      interpret("Reduce[{x, y} == {1, 2}, {x, y}]").unwrap(),
+      "x == 1 && y == 2"
+    );
+  }
+
+  #[test]
+  fn vector_equation_threads_and_solves() {
+    assert_eq!(
+      interpret("Reduce[{x + y, x - y} == {5, 1}, {x, y}]").unwrap(),
+      "x == 3 && y == 2"
+    );
+  }
+
+  // ── Linear Diophantine equations over Integers ──
+  //
+  // A single linear equation with more unknowns than equations is
+  // underdetermined: expressing one variable directly in terms of the others
+  // (as the general elimination path does for unrestricted domains) only
+  // yields integer values for every integer assignment to the free variables
+  // when every coefficient divides evenly, which isn't true in general. Over
+  // Integers, Reduce must instead parametrize the full solution lattice with
+  // fresh integer parameters `C[1], C[2], ...`.
+
+  #[test]
+  fn diophantine_homogeneous_two_var() {
+    // 2x == 4y has general solution x = 2t, y = t for integer t — not
+    // y == x/2, which is non-integral for odd x.
+    assert_eq!(
+      interpret("Reduce[2 x == 4 y, {x, y}, Integers]").unwrap(),
+      "Element[C[1], Integers] && x == 2*C[1] && y == C[1]"
+    );
+  }
+
+  #[test]
+  fn diophantine_coprime_coefficients() {
+    assert_eq!(
+      interpret("Reduce[3 x + 5 y == 1, {x, y}, Integers]").unwrap(),
+      "Element[C[1], Integers] && x == 2 + 5*C[1] && y == -1 - 3*C[1]"
+    );
+  }
+
+  // Two parameters share one membership conjunct, and the lattice basis is
+  // reported in Hermite normal form: echelon by variable, positive pivots.
+  #[test]
+  fn diophantine_three_variables() {
+    assert_eq!(
+      interpret("Reduce[2 x + 3 y == 5 z, {x, y, z}, Integers]").unwrap(),
+      "Element[C[1] | C[2], Integers] && x == C[1] && y == C[1] + 5*C[2] && z == C[1] + 3*C[2]"
+    );
+  }
+
+  // The particular solution is reduced against the lattice, so each pivot
+  // coordinate is the smallest non-negative member of its residue class.
+  #[test]
+  fn diophantine_offset_is_reduced() {
+    assert_eq!(
+      interpret("Reduce[3 x + 5 y == 7, {x, y}, Integers]").unwrap(),
+      "Element[C[1], Integers] && x == 4 + 5*C[1] && y == -1 - 3*C[1]"
+    );
+    assert_eq!(
+      interpret("Reduce[6 x + 4 y == 10, {x, y}, Integers]").unwrap(),
+      "Element[C[1], Integers] && x == 1 + 2*C[1] && y == 1 - 3*C[1]"
+    );
+  }
+
+  // A variable the equation never mentions is left as itself, under its own
+  // membership conjunct, rather than being given a parameter.
+  #[test]
+  fn diophantine_untouched_variable_stays_itself() {
+    assert_eq!(
+      interpret("Reduce[2 x == 4, {x, y}, Integers]").unwrap(),
+      "Element[y, Integers] && x == 2"
+    );
+    assert_eq!(
+      interpret("Reduce[2 x + 3 y == 5 z, {x, y, z, w}, Integers]").unwrap(),
+      "Element[w, Integers] && Element[C[1] | C[2], Integers] \
+       && x == C[1] && y == C[1] + 5*C[2] && z == C[1] + 3*C[2]"
+    );
+  }
+
+  #[test]
+  fn diophantine_no_solution_when_gcd_does_not_divide_target() {
+    // gcd(2, 4) = 2 does not divide 5, so no integer x, y satisfy this.
+    assert_eq!(
+      interpret("Reduce[2 x + 4 y == 5, {x, y}, Integers]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn diophantine_unrestricted_domain_still_solves_directly() {
+    // Without the Integers domain, expressing y directly in terms of x is
+    // correct — only the integer-parametrized form is required over Integers.
+    assert_eq!(interpret("Reduce[2 x == 4 y, {x, y}]").unwrap(), "y == x/2");
+  }
+
+  // ── Multi-variable nonlinear ──
+
+  #[test]
+  fn reduce_two_var_nonlinear() {
+    assert_eq!(
+      interpret("Reduce[x^2 - y^3 == 1, {x, y}]").unwrap(),
+      "y == (-1 + x^2)^(1/3) || y == -((-1)^(1/3)*(-1 + x^2)^(1/3)) || y == (-1)^(2/3)*(-1 + x^2)^(1/3)"
+    );
+  }
+
+  #[test]
+  fn reduce_two_var_solve_for_lower_degree() {
+    assert_eq!(
+      interpret("Reduce[x^5 - y^2 == 1, {x, y}]").unwrap(),
+      "y == -Sqrt[-1 + x^5] || y == Sqrt[-1 + x^5]"
+    );
+  }
+
+  // ── Cubic with expanded polynomial ──
+
+  #[test]
+  fn cubic_expanded() {
+    assert_eq!(
+      interpret("Reduce[x^3 - 6 x^2 + 11 x - 6 == 0, x]").unwrap(),
+      "x == 1 || x == 2 || x == 3"
+    );
+  }
+
+  // Higher-degree polynomial inequalities use a root sign chart. Previously
+  // these returned False (the numeric test point collapsed to the 0.0 fallback).
+  #[test]
+  fn cubic_and_quartic_inequalities() {
+    assert_eq!(
+      interpret("Reduce[x^3 - x > 0, x]").unwrap(),
+      "Inequality[-1, Less, x, Less, 0] || x > 1"
+    );
+    assert_eq!(
+      interpret("Reduce[x^3 - x < 0, x]").unwrap(),
+      "x < -1 || Inequality[0, Less, x, Less, 1]"
+    );
+    assert_eq!(interpret("Reduce[x^3 > 8, x]").unwrap(), "x > 2");
+    assert_eq!(
+      interpret("Reduce[x^4 - 1 > 0, x]").unwrap(),
+      "x < -1 || x > 1"
+    );
+    assert_eq!(
+      interpret("Reduce[(x - 1) (x - 2) (x - 3) > 0, x]").unwrap(),
+      "Inequality[1, Less, x, Less, 2] || x > 3"
+    );
+  }
+
+  // Inclusive comparisons include the boundary roots.
+  #[test]
+  fn higher_degree_inclusive_inequalities() {
+    assert_eq!(
+      interpret("Reduce[x^3 - x >= 0, x]").unwrap(),
+      "Inequality[-1, LessEqual, x, LessEqual, 0] || x >= 1"
+    );
+    assert_eq!(
+      interpret("Reduce[x^3 - x <= 0, x]").unwrap(),
+      "x <= -1 || Inequality[0, LessEqual, x, LessEqual, 1]"
+    );
+    assert_eq!(interpret("Reduce[x^3 >= 8, x]").unwrap(), "x >= 2");
+    assert_eq!(
+      interpret("Reduce[x^4 - 1 >= 0, x]").unwrap(),
+      "x <= -1 || x >= 1"
+    );
+    // A double root with no satisfied neighbourhood is an isolated point.
+    assert_eq!(interpret("Reduce[(x - 1)^2 <= 0, x]").unwrap(), "x == 1");
+  }
+
+  #[test]
+  fn quadratic_ineq_with_sign_constraint_negative() {
+    // x^2 > 4 && x < 0  →  x < -2
+    assert_eq!(interpret("Reduce[x^2 > 4 && x < 0, x]").unwrap(), "x < -2");
+  }
+
+  #[test]
+  fn quadratic_ineq_with_sign_constraint_positive() {
+    // x^2 > 4 && x > 0  →  x > 2
+    assert_eq!(interpret("Reduce[x^2 > 4 && x > 0, x]").unwrap(), "x > 2");
+  }
+
+  #[test]
+  fn quadratic_ineq_with_range_constraint() {
+    // x^2 > 4 && x > 0 && x < 10  →  2 < x < 10
+    assert_eq!(
+      interpret("Reduce[x^2 > 4 && x > 0 && x < 10, x]").unwrap(),
+      "Inequality[2, Less, x, Less, 10]"
+    );
+  }
+
+  // ── Inverse trig (degrees) ──
+
+  #[test]
+  fn arc_cos_degrees_greater_than_60() {
+    // arccos(x) > 60° iff -1 <= x < cos(60°) = 1/2.
+    assert_eq!(
+      interpret("Reduce[ArcCosDegrees[x] > 60, x]").unwrap(),
+      "Inequality[-1, LessEqual, x, Less, 1/2]"
+    );
+  }
+
+  #[test]
+  fn arc_sin_degrees_greater_than_60() {
+    // arcsin(x) > 60° iff sin(60°) = Sqrt[3]/2 < x <= 1.
+    assert_eq!(
+      interpret("Reduce[ArcSinDegrees[x] > 60, x]").unwrap(),
+      "Inequality[Sqrt[3]/2, Less, x, LessEqual, 1]"
+    );
+  }
+
+  #[test]
+  fn arc_tan_degrees_greater_than_60() {
+    // arctan(x) > 60° iff x > tan(60°) = Sqrt[3].
+    assert_eq!(
+      interpret("Reduce[ArcTanDegrees[x] > 60, x]").unwrap(),
+      "x > Sqrt[3]"
+    );
+  }
+
+  #[test]
+  fn arc_cot_degrees_greater_than_60() {
+    // arccot(x) > 60° iff 0 <= x < cot(60°) = 1/Sqrt[3].
+    assert_eq!(
+      interpret("Reduce[ArcCotDegrees[x] > 60, x]").unwrap(),
+      "Inequality[0, LessEqual, x, Less, 1/Sqrt[3]]"
+    );
+  }
+
+  #[test]
+  fn arc_csc_degrees_greater_than_60() {
+    // arccsc(x) > 60° iff 1 <= x < csc(60°) = 2/Sqrt[3].
+    assert_eq!(
+      interpret("Reduce[ArcCscDegrees[x] > 60, x]").unwrap(),
+      "Inequality[1, LessEqual, x, Less, 2/Sqrt[3]]"
+    );
+  }
+
+  #[test]
+  fn arc_sec_degrees_greater_than_60() {
+    // arcsec(x) > 60° iff x > 2 || x <= -1.
+    assert_eq!(
+      interpret("Reduce[ArcSecDegrees[x] > 60, x]").unwrap(),
+      "x > 2 || x <= -1"
+    );
+  }
+}
+
+mod nsolve {
+  use super::*;
+
+  #[test]
+  fn linear_equation() {
+    assert_eq!(interpret("NSolve[x - 5 == 0, x]").unwrap(), "{{x -> 5.}}");
+  }
+
+  #[test]
+  fn quadratic_integer_roots() {
+    assert_eq!(
+      interpret("NSolve[x^2 - 4 == 0, x]").unwrap(),
+      "{{x -> -2.}, {x -> 2.}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_irrational_roots() {
+    assert_eq!(
+      interpret("NSolve[x^2 + x - 1 == 0, x]").unwrap(),
+      "{{x -> -1.618033988749895}, {x -> 0.6180339887498948}}"
+    );
+  }
+
+  // A multi-variable polynomial system lists the eliminated variable's roots
+  // descending (the larger intersection first), unlike the ascending
+  // single-variable order. Ground truth: the kernel-saved definitions of the
+  // Freese-dissection Demonstration notebook, whose `p8 = sol[[2]]` is the
+  // smaller root {-0.16669911088252198, -0.8090169943749475}.
+  #[test]
+  fn system_solutions_larger_root_first() {
+    assert_eq!(
+      interpret(
+        "NSolve[y == -0.8090169943749475 && \
+         (x - 0.7694208842938133)^2 + (y - (-0.25))^2 == \
+         1.090330521158122^2, {x, y}]"
+      )
+      .unwrap(),
+      "{{x -> 1.7055408794701485, y -> -0.8090169943749475}, \
+       {x -> -0.16669911088252198, y -> -0.8090169943749475}}"
+    );
+  }
+
+  // Regression: solving a parametrized-line/plane intersection for a system
+  // of coordinate equations plus a bound on the line parameter (a common
+  // pattern for clipping a segment to a face) used to return unevaluated
+  // rather than the numeric rules, because the multi-equation-plus-
+  // inequality path only existed for a single variable.
+  #[test]
+  fn system_with_parameter_bound() {
+    assert_eq!(
+      interpret(
+        "NSolve[z == -1. + 2.*t && x == -1. && y == -1. && z == 0. && \
+         0. < t < 1., {t, x, y, z}]"
+      )
+      .unwrap(),
+      "{{t -> 0.5, x -> -1., y -> -1., z -> 0.}}"
+    );
+    // Out of bounds for t: no solution survives the filter.
+    assert_eq!(
+      interpret(
+        "NSolve[z == -1. + 2.*t && x == -1. && y == -1. && z == 5. && \
+         0. < t < 1., {t, x, y, z}]"
+      )
+      .unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn quadratic_complex_roots() {
+    assert_eq!(
+      interpret("NSolve[x^2 + 1 == 0, x]").unwrap(),
+      "{{x -> 0. - 1.*I}, {x -> 0. + 1.*I}}"
+    );
+  }
+
+  #[test]
+  fn cubic_roots() {
+    assert_eq!(
+      interpret("NSolve[x^3 - 3*x^2 + 2*x == 0, x]").unwrap(),
+      "{{x -> 0.}, {x -> 1.}, {x -> 2.}}"
+    );
+  }
+
+  // The "Sliding the Roots of Cubics" Demonstration feeds slider values
+  // straight into the coefficients, so the cubic usually has machine reals.
+  // Regression: such a cubic used to leave NSolve unevaluated, and a
+  // repeated root at the origin was reported only once.
+  #[test]
+  fn cubic_with_machine_real_coefficients() {
+    assert_eq!(
+      interpret(
+        "Round[{Re[x], Im[x]} /. \
+         NSolve[x^3 + 1.5 x^2 - 3.2 x + 4.7 == 0, x], 1/10^6]"
+      )
+      .unwrap(),
+      "{{-19079/6250, 0}, {2426/3125, -120997/125000}, \
+       {2426/3125, 120997/125000}}"
+    );
+    assert_eq!(
+      interpret("NSolve[x^3 - 4. x^2 == 0, x]").unwrap(),
+      "{{x -> 0.}, {x -> 0.}, {x -> 4.}}"
+    );
+  }
+
+  #[test]
+  fn roots_ordered_by_real_then_imaginary_part() {
+    // Regression: roots must be ordered by ascending real part, then ascending
+    // imaginary part (matching wolframscript) rather than inheriting symbolic
+    // Solve's order. Previously the real cube root sorted first.
+    assert_eq!(
+      interpret("NSolve[x^3 - 2 == 0, x]").unwrap(),
+      "{{x -> -0.6299605249474366 - 1.0911236359717214*I}, \
+       {x -> -0.6299605249474366 + 1.0911236359717214*I}, \
+       {x -> 1.2599210498948732}}"
+    );
+    // Real root between two complex pairs stays correctly placed.
+    assert_eq!(
+      interpret("NSolve[x^4 - 1 == 0, x]").unwrap(),
+      "{{x -> -1.}, {x -> 0. - 1.*I}, {x -> 0. + 1.*I}, {x -> 1.}}"
+    );
+  }
+
+  #[test]
+  fn with_user_defined_function() {
+    assert_eq!(
+      interpret("f[x_] := x^2 + x + 1; NSolve[f[b] - 2 == 0, b]").unwrap(),
+      "{{b -> -1.618033988749895}, {b -> 0.6180339887498948}}"
+    );
+  }
+
+  #[test]
+  fn rational_solution() {
+    assert_eq!(
+      interpret("NSolve[2*x - 1 == 0, x]").unwrap(),
+      "{{x -> 0.5}}"
+    );
+  }
+
+  #[test]
+  fn cube_roots_of_unity_fully_numericized() {
+    // Regression: Solve returns the complex roots of x^3 == 1 as radical
+    // forms (1, -(-1)^(1/3), (-1)^(2/3)). NSolve previously left the
+    // Times[-1, Power[-1, 1/3]] root symbolic; every root must numericize.
+    // No symbolic Power may leak into the result.
+    assert_eq!(
+      interpret("FreeQ[NSolve[x^3 == 1, x], Power]").unwrap(),
+      "True"
+    );
+    // Rounding away the last-digit float noise exposes the exact structure
+    // and ordering (ascending real part, then imaginary), matching
+    // wolframscript.
+    assert_eq!(
+      interpret("Round[x /. NSolve[x^3 == 1, x], 1/1000]").unwrap(),
+      "{-1/2 - (433*I)/500, -1/2 + (433*I)/500, 1}"
+    );
+  }
+
+  // NSolve accepts an optional domain as its third argument, matching Solve.
+  // Reals keeps only the real roots; Complexes keeps all; Integers/Rationals
+  // keep only integer/rational roots. Verified against wolframscript.
+  #[test]
+  fn domain_argument() {
+    assert_eq!(
+      interpret("NSolve[x^2 == 2, x, Reals]").unwrap(),
+      "{{x -> -1.4142135623730951}, {x -> 1.4142135623730951}}"
+    );
+    // A purely-complex root set is empty over the reals.
+    assert_eq!(interpret("NSolve[x^2 + 1 == 0, x, Reals]").unwrap(), "{}");
+    // Reals drops the complex conjugate pair of a cubic, keeping the real root.
+    assert_eq!(
+      interpret("NSolve[x^3 - 1 == 0, x, Reals]").unwrap(),
+      "{{x -> 1.}}"
+    );
+    // Integers/Rationals reject irrational roots.
+    assert_eq!(interpret("NSolve[x^2 == 2, x, Integers]").unwrap(), "{}");
+    assert_eq!(interpret("NSolve[x^2 == 2, x, Rationals]").unwrap(), "{}");
+    // Rational and integer roots survive their respective domains.
+    assert_eq!(
+      interpret("NSolve[x^2 - 4 == 0, x, Rationals]").unwrap(),
+      "{{x -> -2.}, {x -> 2.}}"
+    );
+    // Multi-variable linear system over the reals.
+    assert_eq!(
+      interpret("NSolve[{x + y == 3, x - y == 1}, {x, y}, Reals]").unwrap(),
+      "{{x -> 2., y -> 1.}}"
+    );
+  }
+
+  // A rational equation (one side divided by an expression that contains
+  // the variable) inside a multi-variable system must not be mistaken for
+  // a constant. The variable-power/coefficient extractor reports a factor
+  // it cannot decompose, like `(1 + z)^-1`, with a sentinel power of -1;
+  // multiplying that by a genuine `z^1` factor elsewhere in the same term
+  // summed the powers to 0 (1 + -1) and disguised the still-z-dependent
+  // `(1 + z)^-1` as a constant coefficient. The symbolic linear solver then
+  // built a bogus augmented matrix and reported the (solvable) system as
+  // inconsistent instead of falling back to the general solver.
+  #[test]
+  fn solve_system_with_rational_equation() {
+    assert_eq!(
+      interpret("Solve[{z/(1 + z) == 1/2, y == 3}, {z, y}]").unwrap(),
+      "{{z -> 1, y -> 3}}"
+    );
+    assert_eq!(
+      interpret("NSolve[{z/(1 + z) == 0.5, y == 3}, {z, y}]").unwrap(),
+      "{{z -> 1., y -> 3.}}"
+    );
+    // The same collision can chain across more than two variables.
+    assert_eq!(
+      interpret(
+        "NSolve[{z/(1 + z) == 0.5, y == z + 1, w == y + 1}, {z, y, w}]"
+      )
+      .unwrap(),
+      "{{z -> 1., y -> 2., w -> 3.}}"
+    );
+  }
+
+  // A polynomial with no radical solution falls back to numeric roots, which
+  // previously arrived unfiltered — the Reals domain must still drop the
+  // complex roots. Verified against wolframscript.
+  #[test]
+  fn domain_reals_numeric_roots() {
+    // Quintic x^5 - x - 1: one real root, four complex.
+    assert_eq!(
+      interpret("NSolve[x^5 - x - 1 == 0, x, Reals]").unwrap(),
+      "{{x -> 1.1673039782614187}}"
+    );
+    // Quartic x^4 - 1: real roots +/-1, complex +/-I dropped.
+    assert_eq!(
+      interpret("NSolve[x^4 - 1 == 0, x, Reals]").unwrap(),
+      "{{x -> -1.}, {x -> 1.}}"
+    );
+    // The default (Complexes) domain still returns every root.
+    assert_eq!(
+      interpret("Length[NSolve[x^5 - x - 1 == 0, x]]").unwrap(),
+      "5"
+    );
+  }
+
+  // A bare polynomial in place of an equation means `poly == 0`. Previously
+  // this fell through to Solve and only produced a Solve::naqs message.
+  #[test]
+  fn bare_polynomial_means_equal_zero() {
+    assert_eq!(
+      interpret("NSolve[x^2 - 1, x]").unwrap(),
+      interpret("NSolve[x^2 - 1 == 0, x]").unwrap()
+    );
+    assert_eq!(
+      interpret("NSolve[x^3 - 2 x + 1, x]").unwrap(),
+      interpret("NSolve[x^3 - 2 x + 1 == 0, x]").unwrap()
+    );
+    // No message is emitted for the accepted form.
+    assert_eq!(interpret("NSolve[x^2 - 1, x]; $MessageList").unwrap(), "{}");
+    // A list of bare polynomials is a system of equations.
+    assert_eq!(
+      interpret("NSolve[{x + y - 3, x - y - 1}, {x, y}]").unwrap(),
+      "{{x -> 2., y -> 1.}}"
+    );
+    // Mixed lists keep the parts that already are equations.
+    assert_eq!(
+      interpret("NSolve[{x + y - 3, x - y == 1}, {x, y}]").unwrap(),
+      "{{x -> 2., y -> 1.}}"
+    );
+  }
+
+  // The optional third argument may be a working precision rather than a
+  // domain; it must not be mistaken for one.
+  #[test]
+  fn precision_third_argument() {
+    for spec in ["MachinePrecision", "20"] {
+      assert_eq!(
+        interpret(&format!("NSolve[x^2 - 2 == 0, x, {spec}]")).unwrap(),
+        interpret("NSolve[x^2 - 2 == 0, x]").unwrap()
+      );
+      // The complex roots survive — a precision is not a `Reals` domain.
+      assert_eq!(
+        interpret(&format!("Length[NSolve[x^2 + 1 == 0, x, {spec}]]")).unwrap(),
+        "2"
+      );
+    }
+  }
+
+  // Every numeric root finder ends in the same polish-and-pair step, so
+  // NSolve, NRoots and N[Root[…]] report identical digits and conjugate pairs
+  // come out exactly mirrored.
+  #[test]
+  fn conjugate_pairs_are_exact_mirrors() {
+    // Sum of all roots equals -a[n-1]/a[n] exactly when the pairs mirror.
+    assert_eq!(
+      interpret("Im[Total[x /. NSolve[x^10 - 3 x + 1 == 0, x]]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret(
+        "(x /. NSolve[x^10 - 3 x + 1 == 0, x]) == \
+         (x /. NSolve[x^10 - 3 x + 1, x])"
+      )
+      .unwrap(),
+      "True"
+    );
+    // NRoots agrees digit for digit with NSolve.
+    assert_eq!(
+      interpret(
+        "(x /. NSolve[x^10 - 3 x + 1 == 0, x]) == \
+         (x /. {ToRules[NRoots[x^10 - 3 x + 1 == 0, x]]})"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+}
+
+// NSolveValues is the numeric analogue of SolveValues: it returns the variable
+// values from NSolve rather than the {var -> value} rules. Verified against
+// wolframscript.
+mod nsolve_values {
+  use super::*;
+
+  #[test]
+  fn single_variable() {
+    assert_eq!(
+      interpret("NSolveValues[x^2 == 2, x]").unwrap(),
+      "{-1.4142135623730951, 1.414213562373095}"
+    );
+    assert_eq!(interpret("NSolveValues[2 x - 1 == 0, x]").unwrap(), "{0.5}");
+  }
+
+  #[test]
+  fn reals_domain() {
+    // Quintic: only the real root survives.
+    assert_eq!(
+      interpret("NSolveValues[x^5 - x - 1 == 0, x, Reals]").unwrap(),
+      "{1.1673039782614187}"
+    );
+    assert_eq!(
+      interpret("NSolveValues[x^4 - 1 == 0, x, Reals]").unwrap(),
+      "{-1., 1.}"
+    );
+    assert_eq!(
+      interpret("NSolveValues[x^2 + 1 == 0, x, Reals]").unwrap(),
+      "{}"
+    );
+    // The default (Complexes) domain returns every root.
+    assert_eq!(
+      interpret("Length[NSolveValues[x^5 - x - 1 == 0, x]]").unwrap(),
+      "5"
+    );
+  }
+
+  // A list of variables yields a value-list per solution, in variable order.
+  #[test]
+  fn multiple_variables() {
+    assert_eq!(
+      interpret("NSolveValues[{x + y == 3, x - y == 1}, {x, y}]").unwrap(),
+      "{{2., 1.}}"
+    );
+  }
+}
+
+// SolveValues follows the shape of its variable specification: a bare symbol
+// gives a flat list of values, a list of variables gives one value-list per
+// solution. All values verified against wolframscript.
+mod solve_values_shape {
+  use super::*;
+
+  #[test]
+  fn a_bare_symbol_gives_a_flat_list() {
+    assert_eq!(interpret("SolveValues[x^2 == 1, x]").unwrap(), "{-1, 1}");
+    assert_eq!(interpret("SolveValues[a x == b, x]").unwrap(), "{b/a}");
+    assert_eq!(interpret("SolveValues[x^2 == -1, x]").unwrap(), "{-I, I}");
+    assert_eq!(
+      interpret("SolveValues[x^2 + a x + 1 == 0, x]").unwrap(),
+      "{(-a - Sqrt[-4 + a^2])/2, (-a + Sqrt[-4 + a^2])/2}"
+    );
+  }
+
+  // Even a one-element variable list nests the result.
+  #[test]
+  fn a_variable_list_gives_one_tuple_per_solution() {
+    assert_eq!(
+      interpret("SolveValues[x^2 == 1, {x}]").unwrap(),
+      "{{-1}, {1}}"
+    );
+    assert_eq!(interpret("SolveValues[{x == 1}, {x}]").unwrap(), "{{1}}");
+  }
+
+  #[test]
+  fn systems_of_equations() {
+    assert_eq!(
+      interpret("SolveValues[{x + y == 2, x - y == 0}, {x, y}]").unwrap(),
+      "{{1, 1}}"
+    );
+    // Values come out in the order the variables are named.
+    assert_eq!(
+      interpret("SolveValues[{x + y == 2, x - y == 0}, {y, x}]").unwrap(),
+      "{{1, 1}}"
+    );
+    assert_eq!(
+      interpret("SolveValues[{x^2 + y^2 == 1, y == x}, {x, y}]").unwrap(),
+      "{{-(1/Sqrt[2]), -(1/Sqrt[2])}, {1/Sqrt[2], 1/Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn a_domain_still_filters() {
+    assert_eq!(
+      interpret("SolveValues[x^2 == 1, x, Reals]").unwrap(),
+      "{-1, 1}"
+    );
+  }
+}
+
+// Solve[eqns, vars, Rationals] keeps only rational-valued solutions; an
+// irrational algebraic root such as Sqrt[2] is filtered out. Verified against
+// wolframscript.
+mod solve_rationals_domain {
+  use super::*;
+
+  #[test]
+  fn irrational_roots_filtered() {
+    assert_eq!(interpret("Solve[x^2 == 2, x, Rationals]").unwrap(), "{}");
+    assert_eq!(interpret("Solve[x^2 == -1, x, Rationals]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn rational_roots_kept() {
+    assert_eq!(
+      interpret("Solve[x^2 == 4, x, Rationals]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+    assert_eq!(
+      interpret("Solve[2 x == 3, x, Rationals]").unwrap(),
+      "{{x -> 3/2}}"
+    );
+  }
+}
+
+// LinearProgramming[c, m, b] minimizes c.x subject to the constraints from
+// m and b (bare b entries mean >=; {value, sign} pairs select >=/==/<=) and
+// x >= 0. The exact two-phase simplex returns the same vertex wolframscript
+// reports. All expected values verified against wolframscript.
+mod linear_programming {
+  use super::*;
+
+  #[test]
+  fn default_ge_constraints() {
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 3}]").unwrap(),
+      "{3/5, 6/5}"
+    );
+    // A bare b vector means every constraint is >=.
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 0}, {0, 1}}, {1, 1}]").unwrap(),
+      "{1, 1}"
+    );
+  }
+
+  #[test]
+  fn mixed_constraint_signs() {
+    // {value, sign}: sign 1 => >=, 0 => ==, -1 => <=.
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {{3, -1}, {3, 1}}]"
+      )
+      .unwrap(),
+      "{1, 0}"
+    );
+    assert_eq!(
+      interpret("LinearProgramming[{2, 3}, {{1, 1}}, {{10, 0}}]").unwrap(),
+      "{10, 0}"
+    );
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{-2, -3}, {{1, 1}, {2, 1}}, {{4, -1}, {6, -1}}]"
+      )
+      .unwrap(),
+      "{0, 4}"
+    );
+  }
+
+  #[test]
+  fn multiple_optima_matches_wolfram_vertex() {
+    // Objective 18 is attained at several vertices; Dantzig pivoting lands on
+    // the same one wolframscript reports.
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{3, 2, 1}, {{1, 1, 1}, {2, 1, 0}}, {10, 8}]"
+      )
+      .unwrap(),
+      "{4, 0, 6}"
+    );
+  }
+
+  #[test]
+  fn fractional_costs_and_larger_system() {
+    assert_eq!(
+      interpret("LinearProgramming[{1/2, 1/3}, {{1, 1}}, {{6, 1}}]").unwrap(),
+      "{0, 6}"
+    );
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{5, 4, 3}, {{2, 3, 1}, {4, 1, 2}, {3, 4, 2}}, \
+         {{5, 1}, {11, 1}, {8, 1}}]"
+      )
+      .unwrap(),
+      "{11/4, 0, 0}"
+    );
+  }
+
+  #[test]
+  fn unbounded_returns_indeterminate() {
+    assert_eq!(
+      interpret("LinearProgramming[{-1, 0}, {{1, -1}}, {{0, 1}}]").unwrap(),
+      "{Indeterminate, Indeterminate}"
+    );
+  }
+
+  #[test]
+  fn infeasible_stays_unevaluated() {
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 1}}, {{-5, -1}}]").unwrap(),
+      "LinearProgramming[{1, 1}, {{1, 1}}, {{-5, -1}}]"
+    );
+  }
+
+  // A fourth argument replaces the default x >= 0 bounds: a scalar lower bound
+  // for every variable, or a vector of them.
+  #[test]
+  fn scalar_and_vector_lower_bounds() {
+    // Restating the default changes nothing.
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {0, 0}]")
+        .unwrap(),
+      "{1, 1}"
+    );
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, 0]")
+        .unwrap(),
+      "{1, 1}"
+    );
+    // Raising the floor to 1 leaves the same optimum feasible.
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {1, 1}]")
+        .unwrap(),
+      "{1, 1}"
+    );
+    // Lowering it does not pull the optimum below the constraints.
+    assert_eq!(
+      interpret("LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, -5]")
+        .unwrap(),
+      "{1, 1}"
+    );
+    // A scalar -Infinity makes every variable free below.
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, -Infinity]"
+      )
+      .unwrap(),
+      "{1, 1}"
+    );
+    // Exact rationals survive the substitution.
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{3, 2}, {{1, 1}, {1, -1}}, {{4, 1}, {1, 1}}, \
+         {{0, Infinity}, {0, Infinity}}]"
+      )
+      .unwrap(),
+      "{5/2, 3/2}"
+    );
+  }
+
+  // A matrix of {lower, upper} pairs bounds each variable on both sides, and an
+  // entry may be Infinity or -Infinity.
+  #[test]
+  fn lower_and_upper_bound_pairs() {
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{1, -1}, {{1, 1}}, {{2, 0}}, {{-5, 5}, {-5, 5}}]"
+      )
+      .unwrap(),
+      "{-3, 5}"
+    );
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{-1, -1}, {{1, 1}}, {{2, -1}}, {{0, 1}, {0, 1}}]"
+      )
+      .unwrap(),
+      "{1, 1}"
+    );
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {{2, 3}, {2, 3}}]"
+      )
+      .unwrap(),
+      "{2, 2}"
+    );
+    // An upper bound can bind on its own while the variable is free below.
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{-1, 0}, {{1, 0}}, {{1, -1}}, \
+         {{-Infinity, Infinity}, {0, 0}}]"
+      )
+      .unwrap(),
+      "{1, 0}"
+    );
+    assert_eq!(
+      interpret(
+        "LinearProgramming[{-1, -2, -3}, {{1, 1, 1}}, {{6, -1}}, \
+         {{0, 2}, {0, 2}, {0, 2}}]"
+      )
+      .unwrap(),
+      "{2, 2, 2}"
+    );
+  }
+
+  // Bounds that leave nothing feasible report lpsnf like any other infeasible
+  // problem.
+  #[test]
+  fn contradictory_bounds_are_infeasible() {
+    use woxi::interpret_with_stdout;
+    let r = interpret_with_stdout(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {{5, 0}, {5, 0}}]",
+    )
+    .unwrap();
+    assert_eq!(
+      r.result,
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {{5, 0}, {5, 0}}]"
+    );
+    assert!(
+      r.warnings.iter().any(|w| w
+        == "LinearProgramming::lpsnf: No solution can be found that satisfies \
+            the constraints."),
+      "expected lpsnf message, got {:?}",
+      r.warnings
+    );
+    // Requiring x + y >= 2 with both variables at most 0 cannot be met.
+    let r = interpret_with_stdout(
+      "LinearProgramming[{1, 1}, {{1, 1}}, {{2, 1}}, \
+       {{-Infinity, 0}, {-Infinity, 0}}]",
+    )
+    .unwrap();
+    assert!(
+      r.warnings
+        .iter()
+        .any(|w| w.contains("LinearProgramming::lpsnf")),
+      "expected lpsnf message, got {:?}",
+      r.warnings
+    );
+  }
+
+  // Each way of malforming the bounds has its own message.
+  #[test]
+  fn invalid_bounds_emit_messages() {
+    use woxi::interpret_with_stdout;
+    let check = |code: &str, expected: &str| {
+      let r = interpret_with_stdout(code).unwrap();
+      assert!(
+        r.warnings.iter().any(|w| w.contains(expected)),
+        "expected {:?} for {}, got {:?}",
+        expected,
+        code,
+        r.warnings
+      );
+    };
+    // Neither a scalar, a vector, nor a matrix with two columns.
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {{0, 5}, 2}]",
+      "LinearProgramming::lprank012: {{0, 5}, 2} must be a scalar, a vector \
+       or a matrix with 2 columns.",
+    );
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, \
+       {{0, 5, 1}, {0, 5, 1}}]",
+      "LinearProgramming::lprank012:",
+    );
+    // The right shape but the wrong number of variables.
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {0}]",
+      "LinearProgramming::lpdim: Invalid input: the dimensions of the input \
+       vectors or matrices must match.",
+    );
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, \
+       {{0, 5}, {0, 5}, {0, 5}}]",
+      "LinearProgramming::lpdim:",
+    );
+    // An entry that is not a real number or an infinity.
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {x, 0}]",
+      "LinearProgramming::lpbd: The input that specifies lower/upper bounds \
+       contains elements that are not real numbers, Infinity or -Infinity.",
+    );
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, {{x, 5}, {0, 5}}]",
+      "LinearProgramming::lpbd:",
+    );
+    // A scalar Infinity sets both bounds at Infinity.
+    check(
+      "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3, 4}, Infinity]",
+      "LinearProgramming::lpsbnn: Found lower bound and upper bound both set \
+       at Infinity.",
+    );
+  }
+
+  // Mismatched objective, matrix and right-hand-side sizes now report lpdim
+  // instead of quietly staying unevaluated.
+  #[test]
+  fn mismatched_dimensions_emit_lpdim() {
+    use woxi::interpret_with_stdout;
+    let r =
+      interpret_with_stdout("LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3}]")
+        .unwrap();
+    assert_eq!(r.result, "LinearProgramming[{1, 1}, {{1, 2}, {3, 1}}, {3}]");
+    assert!(
+      r.warnings.iter().any(|w| w
+        == "LinearProgramming::lpdim: Invalid input: the dimensions of the \
+            input vectors or matrices must match."),
+      "expected lpdim message, got {:?}",
+      r.warnings
+    );
+    let r = interpret_with_stdout(
+      "LinearProgramming[{1, 1}, {{1, 2, 3}, {3, 1, 2}}, {3, 4}]",
+    )
+    .unwrap();
+    assert!(
+      r.warnings
+        .iter()
+        .any(|w| w.contains("LinearProgramming::lpdim")),
+      "expected lpdim message, got {:?}",
+      r.warnings
+    );
+  }
+}
+
+mod find_root {
+  use super::*;
+
+  #[test]
+  fn polynomial_root() {
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, 1}]").unwrap(),
+      "{x -> 1.4142135623730951}"
+    );
+  }
+
+  #[test]
+  fn polynomial_root_negative_start() {
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, -1}]").unwrap(),
+      "{x -> -1.4142135623730951}"
+    );
+  }
+
+  #[test]
+  fn equation_form() {
+    assert_eq!(
+      interpret("FindRoot[Cos[x] == x, {x, 0}]").unwrap(),
+      "{x -> 0.7390851332151607}"
+    );
+  }
+
+  #[test]
+  fn transcendental() {
+    assert_eq!(
+      interpret("FindRoot[Sin[x] + Exp[x], {x, 0}]").unwrap(),
+      "{x -> -0.5885327439818611}"
+    );
+  }
+
+  #[test]
+  fn cubic() {
+    assert_eq!(
+      interpret("FindRoot[x^3 - x - 1, {x, 1}]").unwrap(),
+      "{x -> 1.324717957244746}"
+    );
+  }
+
+  #[test]
+  fn exponential() {
+    assert_eq!(
+      interpret("FindRoot[Exp[x] - 2, {x, 0}]").unwrap(),
+      "{x -> 0.6931471805599453}"
+    );
+  }
+
+  #[test]
+  fn multivariate_through_downvalues() {
+    // Regression: the equations of a multivariate FindRoot expand through
+    // user-defined downvalues before the Jacobian is built. Previously
+    // `r[s, t]` stayed opaque, the symbolic derivative could not be
+    // evaluated numerically, and the call emitted FindRoot::nlnum and
+    // returned unevaluated (the Doyle-spirals Demonstration hit this).
+    assert_eq!(
+      interpret(
+        "r[s_, t_] := s^2 - t - 2; \
+         FindRoot[{r[s, t] == 0, s - t == 1}, {{s, 1.5}, {t, 0}}]"
+      )
+      .unwrap(),
+      "{s -> 1.618033988749895, t -> 0.6180339887498949}"
+    );
+  }
+
+  // Regression: the documented multivariate calling convention —
+  // `FindRoot[{eqns}, {x, x0}, {y, y0}, ...]`, each variable spec its own
+  // trailing argument — was not recognised as multivariate at all. Only the
+  // single-list form `{{x, x0}, {y, y0}}` was detected, so this call fell
+  // through to the single-variable path, which built a "function" out of
+  // the whole two-equation list and failed with FindRoot::nlnum ("not a
+  // number") on evaluating it.
+  #[test]
+  fn multivariate_separate_trailing_specs() {
+    assert_eq!(
+      interpret("FindRoot[{x + y == 3, x - y == 1}, {x, 0}, {y, 0}]").unwrap(),
+      "{x -> 2., y -> 1.}"
+    );
+    // Must agree with the equivalent single-list form.
+    assert_eq!(
+      interpret("FindRoot[{x + y == 3, x - y == 1}, {x, 0}, {y, 0}]").unwrap(),
+      interpret("FindRoot[{x + y == 3, x - y == 1}, {{x, 0}, {y, 0}}]")
+        .unwrap()
+    );
+  }
+
+  // Regression: collocation methods for boundary-value problems name one
+  // unknown per grid point as an indexed variable (`u[1]`, `u[2]`, ...)
+  // rather than a plain symbol — real Wolfram accepts any FindRoot variable
+  // that isn't a bare symbol, not just plain identifiers. The multivariate
+  // spec detection previously required every variable to be
+  // `Expr::Identifier`, so this form errored with "second argument must be
+  // {var, x0} or {var, x0, x1}" (the Laplace-equation-on-a-square
+  // Demonstration hits this).
+  #[test]
+  fn multivariate_indexed_variables() {
+    assert_eq!(
+      interpret(
+        "FindRoot[{u[1] + u[2] == 3, u[1] - u[2] == 1}, \
+         {{u[1], 0}, {u[2], 0}}]"
+      )
+      .unwrap(),
+      "{u[1] -> 2., u[2] -> 1.}"
+    );
+  }
+
+  // Regression: time-dependent families in Demonstrations name one unknown
+  // per grid point *and* time as a curried indexed variable (`T[0][t]`,
+  // `T[1][t]`, ...) rather than a single-level `u[1]`. `is_findroot_var_expr`
+  // only recognized a symbol applied once to literal indices, so a curried
+  // chain like `T[0][t]` (`Expr::CurriedCall`) fell through to "variable
+  // must be a symbol" (the Multicomponent Distillation Column Demonstration
+  // hits this).
+  #[test]
+  fn multivariate_curried_indexed_variables() {
+    assert_eq!(
+      interpret(
+        "FindRoot[{T[0][t] + T[1][t] == 3, T[0][t] - T[1][t] == 1}, \
+         {T[0][t], 0}, {T[1][t], 0}]"
+      )
+      .unwrap(),
+      "{T[0][t] -> 2., T[1][t] -> 1.}"
+    );
+  }
+
+  // Regression: `T[0, 1]` (one call, two arguments) and `T[0][1]` (a curried
+  // chain of single-argument calls) are structurally distinct expressions in
+  // Wolfram, so a search variable written in one notation must not rename
+  // occurrences of the other. Flattening a curried chain into one index
+  // sequence made both key as `("T", [0, 1])`, and this call silently solved
+  // for variables that never appear in the equations. The index key is
+  // level-aware, so the mismatch is now what it should be: the residual never
+  // reduces to a number, and FindRoot reports `nlnum` and stays unevaluated.
+  #[test]
+  fn curried_and_multiarg_variables_do_not_collide() {
+    assert_eq!(
+      interpret(
+        "FindRoot[{T[0][1] + T[1][1] == 3, T[0][1] - T[1][1] == 1}, \
+         {T[0, 1], 0}, {T[1, 1], 0}]"
+      )
+      .unwrap(),
+      "FindRoot[{T[0][1] + T[1][1] == 3, T[0][1] - T[1][1] == 1}, \
+       {T[0, 1], 0}, {T[1, 1], 0}]"
+    );
+  }
+
+  // Regression: FindRoot is HoldAll, so equations and a spec list built
+  // separately and passed by name (`sys = {...}; initguess = {{x, x0},
+  // ...}; FindRoot[sys, initguess]` — the idiom collocation methods use to
+  // build a long spec list programmatically) reached find_root_ast as bare
+  // unevaluated identifiers rather than literal lists, so neither the
+  // equations nor the variable specs were ever recognised.
+  #[test]
+  fn equations_and_spec_passed_by_name() {
+    assert_eq!(
+      interpret(
+        "eqns = {x^2 - 2 == 0}; spec = {{x, 1}}; \
+         FindRoot[eqns, spec]"
+      )
+      .unwrap(),
+      "{x -> 1.4142135623730951}"
+    );
+    // A literal spec written directly at the call site must still work
+    // (and must not have its variable name resolved against some unrelated
+    // stray global value).
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2 == 0, {x, 1}]").unwrap(),
+      "{x -> 1.4142135623730951}"
+    );
+  }
+
+  #[test]
+  fn trivial() {
+    assert_eq!(interpret("FindRoot[x, {x, 5}]").unwrap(), "{x -> 0.}");
+  }
+
+  #[test]
+  fn non_smooth_function_falls_back_to_numeric_derivative() {
+    // Differentiating a non-smooth function leaves `Derivative[1, 0][Max][…]`
+    // standing, so the symbolic derivative never reduces to a number. That is
+    // no worse than having no symbolic derivative at all: the iteration falls
+    // back to a difference quotient and still converges. Regression: the
+    // unusable derivative propagated its error out of the Newton loop, so the
+    // call emitted FindRoot::nlnum and returned unevaluated.
+    assert_eq!(
+      interpret("FindRoot[Max[x, 2 x] - 6, {x, 1}]").unwrap(),
+      "{x -> 3.}"
+    );
+  }
+
+  #[test]
+  fn non_smooth_function_reports_no_internal_messages() {
+    use woxi::interpret_with_stdout;
+    // The failed symbolic-derivative attempt is internal bookkeeping —
+    // differentiating a user function at an already-substituted point makes
+    // `D` complain about a numeric "variable". None of that reaches the user
+    // (wolframscript reports nothing either).
+    let result = interpret_with_stdout(
+      "netthrust[v_] := Max[Map[# v &, {1, 2}]] - 6; \
+       FindRoot[netthrust[u], {u, 1}]",
+    )
+    .unwrap();
+    assert_eq!(result.result, "{u -> 3.}");
+    assert!(
+      result.warnings.is_empty(),
+      "unexpected messages: {:?}",
+      result.warnings
+    );
+  }
+
+  #[test]
+  fn piecewise_guarded_interpolation() {
+    use woxi::interpret_with_stdout;
+    // The shape a Demonstration uses to solve for a vehicle's top speed: a
+    // tabulated curve wrapped in a `Piecewise` range guard, maximised over a
+    // set of gear ratios, minus a drag term. Neither the `Piecewise` nor the
+    // `Max` survives symbolic differentiation, so the whole solve rides on the
+    // numeric-derivative fallback.
+    let result = interpret_with_stdout(
+      "torque = Interpolation[{{0, 0}, {50, 100}, {100, 60}, {150, 0}}, \
+                              InterpolationOrder -> 1]; \
+       gear[w_] := Piecewise[{{torque[w], 0 <= w <= 150}}, 0]; \
+       thrust[v_] := Max[Map[gear[# v] &, {1, 2}]] - v^2/40; \
+       FindRoot[thrust[v], {v, 60}]",
+    )
+    .unwrap();
+    assert_eq!(result.result, "{v -> 60.52450587883597}");
+    assert!(
+      result.warnings.is_empty(),
+      "unexpected messages: {:?}",
+      result.warnings
+    );
+  }
+
+  #[test]
+  fn quadratic_larger_start() {
+    assert_eq!(
+      interpret("FindRoot[x^2 - 10^5 x + 1 == 0, {x, 10^6}]").unwrap(),
+      "{x -> 99999.99999000001}"
+    );
+  }
+
+  #[test]
+  fn bessel_j_root() {
+    // FindRoot should work with BesselJ using numerical derivatives
+    let result = interpret("FindRoot[BesselJ[0,x], {x,10.5}]").unwrap();
+    assert!(
+      result.starts_with("{x -> 18.07106396"),
+      "Expected root near 18.071..., got: {result}"
+    );
+  }
+
+  #[test]
+  fn undefined_function_returns_unevaluated() {
+    // Matches wolframscript: if the function can't be evaluated numerically
+    // (e.g. f[x] undefined), FindRoot emits FindRoot::nlnum and returns
+    // the expression unevaluated rather than erroring out.
+    assert_eq!(
+      interpret("FindRoot[f[x] == 0, {x, 0}]").unwrap(),
+      "FindRoot[f[x] == 0, {x, 0}]"
+    );
+  }
+  #[test]
+  fn find_root_complex_starting_point() {
+    // Complex starting points must drive Newton iteration in C, not abort
+    // with "starting point must be numeric". For x^2+x+1 starting at -I
+    // the iteration converges to the lower root -1/2 - sqrt(3)/2 i.
+    let result = interpret("FindRoot[x^2 + x + 1, {x, -I}]").unwrap();
+    // wolframscript yields {x -> -0.5 - 0.8660254037844386*I};
+    // accept any complex value within a small tolerance of that root.
+    assert!(
+      result.contains("-0.5") && result.contains("0.866"),
+      "Expected complex root near -0.5 - 0.866*I, got: {result}"
+    );
+  }
+
+  // A badly scaled function sends the first plain Newton step far past the
+  // root; damping walks it back instead of running out of iterations somewhere
+  // meaningless. Before this, FindRoot returned 268.87944117144235 for the
+  // first of these — not a root at all — with no warning.
+  #[test]
+  fn badly_scaled_exponential_converges() {
+    assert_eq!(
+      interpret("FindRoot[Exp[x] - 1000, {x, 1}]").unwrap(),
+      "{x -> 6.907755278982137}"
+    );
+    assert_eq!(
+      interpret("FindRoot[Exp[x] - 10^6, {x, 1}]").unwrap(),
+      "{x -> 13.815510557964274}"
+    );
+    assert_eq!(
+      interpret("FindRoot[Sinh[x] - 100, {x, 0}]").unwrap(),
+      "{x -> 5.298342365610589}"
+    );
+  }
+
+  // MaxIterations caps the Newton steps, reports FindRoot::cvmit and hands back
+  // the point reached. The values are the plain Newton iterates from x0 = 1.
+  #[test]
+  fn max_iterations_caps_the_iteration() {
+    use woxi::interpret_with_stdout;
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 1]").unwrap(),
+      "{x -> 1.5}"
+    );
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 2]").unwrap(),
+      "{x -> 1.4166666666666667}"
+    );
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 3]").unwrap(),
+      "{x -> 1.4142156862745099}"
+    );
+    assert_eq!(
+      interpret("FindRoot[Cos[x] == x, {x, 1}, MaxIterations -> 2]").unwrap(),
+      "{x -> 0.7391128909113617}"
+    );
+    let r =
+      interpret_with_stdout("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 2]")
+        .unwrap();
+    assert!(
+      r.warnings.iter().any(|w| w
+        == "FindRoot::cvmit: Failed to converge to the requested accuracy or \
+            precision within 2 iterations."),
+      "expected cvmit message, got {:?}",
+      r.warnings
+    );
+    // A budget large enough to converge says nothing.
+    let r =
+      interpret_with_stdout("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 50]")
+        .unwrap();
+    assert_eq!(r.result, "{x -> 1.4142135623730951}");
+    assert!(
+      r.warnings.is_empty(),
+      "expected no messages, got {:?}",
+      r.warnings
+    );
+    // Infinity and Automatic are both accepted.
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> Infinity]")
+        .unwrap(),
+      "{x -> 1.4142135623730951}"
+    );
+    assert_eq!(
+      interpret("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> Automatic]")
+        .unwrap(),
+      "{x -> 1.4142135623730951}"
+    );
+  }
+
+  #[test]
+  fn max_iterations_rejects_non_positive() {
+    use woxi::interpret_with_stdout;
+    let r =
+      interpret_with_stdout("FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 0]")
+        .unwrap();
+    assert_eq!(r.result, "FindRoot[x^2 - 2, {x, 1}, MaxIterations -> 0]");
+    assert!(
+      r.warnings.iter().any(|w| w
+        == "FindRoot::ioppfa: The value of the option MaxIterations -> 0 \
+            should be a positive integer, Infinity or Automatic."),
+      "expected ioppfa message, got {:?}",
+      r.warnings
+    );
+  }
+
+  // A vanishing derivative reports the singular Jacobian and hands back the
+  // point it stalled at, rather than aborting the whole evaluation as it used
+  // to ("FindRoot: derivative is zero, cannot converge").
+  #[test]
+  fn singular_derivative_reports_jsing() {
+    use woxi::interpret_with_stdout;
+    let r = interpret_with_stdout("FindRoot[x^2 + 1, {x, 1}]").unwrap();
+    assert_eq!(r.result, "{x -> 0.}");
+    assert!(
+      r.warnings.iter().any(|w| w
+        == "FindRoot::jsing: Encountered a singular Jacobian at the point \
+            {x} = {0.}. Try perturbing the initial point(s)."),
+      "expected jsing message, got {:?}",
+      r.warnings
+    );
+  }
+
+  // Regression: FindRoot is HoldAll (so the search variable isn't looked up
+  // as an OwnValue before the iteration starts), so its equation argument
+  // arrives unevaluated — still containing a raw `D[f[x], x]`. Substituting
+  // a numeric trial value straight into that raw form used to land the
+  // number inside D's variable slot (`D[f[3.], 3.]`) and fail with
+  // `D::ivar`, so every derivative-based FindRoot (the standard
+  // "extremum of f" idiom, `FindRoot[D[f[x], x] == 0, {x, x0}]`) errored
+  // out. The objective is now evaluated once — with the variable still
+  // free — before any substitution, exactly like the already-correct
+  // multivariate path.
+  #[test]
+  fn derivative_equation_evaluates_before_substitution() {
+    assert_eq!(
+      interpret("FindRoot[D[Sin[x], x] == 0, {x, 1}]").unwrap(),
+      "{x -> 1.5707963267948966}"
+    );
+  }
+
+  #[test]
+  fn derivative_equation_no_ivar_message() {
+    use woxi::interpret_with_stdout;
+    let r =
+      interpret_with_stdout("FindRoot[D[Sin[x], x] == 0, {x, 1}]").unwrap();
+    assert!(
+      r.warnings.iter().all(|w| !w.contains("D::ivar")),
+      "the derivative must resolve before substitution, not after: {:?}",
+      r.warnings
+    );
+  }
+
+  // The same pattern with a special function (the Demonstrations idiom this
+  // was found from: locating a Bessel function's stationary points via
+  // `FindRoot[D[BesselJ[m, r], r] == 0, {r, BesselJZero[n, k]}]`). The
+  // result is a genuine root of `BesselJ`'s derivative — cross-checked here
+  // via `D[BesselJ[0, r], r] == -BesselJ[1, r]`, so its root is exactly
+  // `BesselJZero[1, 1]`.
+  #[test]
+  fn derivative_of_special_function_equation() {
+    assert_eq!(
+      interpret("FindRoot[D[BesselJ[0, r], r] == 0, {r, 3}]").unwrap(),
+      "{r -> 3.831705970207513}"
+    );
+    assert_eq!(
+      interpret("N[BesselJZero[1, 1]]").unwrap(),
+      "3.8317059702075125"
+    );
+  }
+
+  // Regression: a multivariate FindRoot on a genuinely *linear* system
+  // (a Jacobian that doesn't depend on x) should converge in essentially
+  // one Newton step. When the equations come from a numerically
+  // ill-conditioned matrix — a Chebyshev spectral-collocation
+  // differentiation matrix is a classic example, and PDE-solving
+  // Demonstrations commonly build one to discretize a Laplacian — the
+  // achievable residual can plateau well above the loop's tolerance
+  // purely from f64 rounding in the linear solve. The Newton loop used
+  // to burn through all `MaxIterations -> 100` iterations chasing that
+  // unreachable tolerance every single time, each iteration paying for a
+  // fresh equation/Jacobian evaluation — turning a solve that should
+  // finish in a handful of steps into the dominant cost of the whole
+  // computation. Tracking the best iterate seen and stopping as soon as
+  // the residual stops improving fixes this without weakening genuinely
+  // (even slowly) converging cases.
+  #[test]
+  fn ill_conditioned_linear_system_does_not_exhaust_max_iterations() {
+    // A Chebyshev differentiation matrix (Trefethen's standard formula)
+    // for a small spectral grid, applied twice (`Dm . Dm`) to get a
+    // second-derivative operator, then combined via a Kronecker sum into
+    // a 2D discrete Laplacian. Dirichlet boundary points get a trivial
+    // `u == 0` equation; interior points get the Laplacian row dotted
+    // against the full unknown vector, equal to zero except at one
+    // source point — a standard finite-difference/spectral Poisson setup.
+    let code = "\
+      n = 16; \
+      Dm = Table[ \
+        Which[ \
+          i == 0 && j == 0, (2 n^2 + 1)/6., \
+          i == n && j == n, -(2 n^2 + 1)/6., \
+          i == j, -N[Cos[i Pi/n]]/(2 (1 - Cos[i Pi/n]^2)), \
+          True, (If[i == 0 || i == n, 2., 1.]/If[j == 0 || j == n, 2., 1.]) * \
+            (-1)^(i + j)/(N[Cos[i Pi/n]] - N[Cos[j Pi/n]]) \
+        ], \
+        {i, 0, n}, {j, 0, n} \
+      ]; \
+      Dm2 = Dm . Dm; \
+      Lap = KroneckerProduct[Dm2, IdentityMatrix[n + 1]] + \
+        KroneckerProduct[IdentityMatrix[n + 1], Dm2]; \
+      m = (n + 1)^2; \
+      U = Array[u, m]; \
+      idx[p_, q_] := p*(n + 1) + q + 1; \
+      eqns = Flatten[Table[ \
+        If[p == 0 || p == n || q == 0 || q == n, \
+          u[idx[p, q]] == 0, \
+          Lap[[idx[p, q]]] . U == If[p == 8 && q == 8, 1., 0.]], \
+        {p, 0, n}, {q, 0, n}]]; \
+      guess = Table[{u[i], 0.}, {i, 1, m}]; \
+      sol = FindRoot[eqns, guess]; \
+      Length[sol]";
+    let start = std::time::Instant::now();
+    let result = interpret(code).unwrap();
+    assert!(
+      start.elapsed().as_secs() < 15,
+      "FindRoot on an ill-conditioned but linear system must stop once \
+       the residual stops improving, not chase every MaxIterations step"
+    );
+    assert_eq!(result, "289");
+  }
+}
+
+mod replace {
+  use super::*;
+
+  #[test]
+  fn simple_match() {
+    assert_eq!(interpret("Replace[x, x -> 2]").unwrap(), "2");
+  }
+
+  #[test]
+  fn operator_form() {
+    // Replace[rules][expr] is the curried form — expr goes first when
+    // flattened (unlike Map/Apply, where the list comes first).
+    assert_eq!(interpret("Replace[{x_ -> x + 1}][10]").unwrap(), "11");
+    assert_eq!(interpret("Replace[{x_ -> x^2}][y]").unwrap(), "y^2");
+  }
+
+  #[test]
+  fn operator_form_replace_all() {
+    assert_eq!(
+      interpret("ReplaceAll[{x -> 1, y -> 2}][x + y]").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn with_rule_list() {
+    assert_eq!(interpret("Replace[x, {x -> 2}]").unwrap(), "2");
+  }
+
+  #[test]
+  fn no_subexpression_match() {
+    assert_eq!(interpret("Replace[1 + x, {x -> 2}]").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn multiple_rule_sets() {
+    assert_eq!(
+      interpret("Replace[x, {{x -> 1}, {x -> 2}}]").unwrap(),
+      "{1, 2}"
+    );
+  }
+
+  #[test]
+  fn first_matching_rule() {
+    assert_eq!(interpret("Replace[x, {x -> 10, y -> 20}]").unwrap(), "10");
+  }
+
+  #[test]
+  fn pattern_match() {
+    assert_eq!(interpret("Replace[42, n_Integer -> n + 1]").unwrap(), "43");
+  }
+
+  #[test]
+  fn negative_levelspec_leaves() {
+    // {-1} matches all atoms (Depth = 1).
+    assert_eq!(
+      interpret("Replace[f[1, g[2, h[3]]], _Integer -> 0, {-1}]").unwrap(),
+      "f[0, g[0, h[0]]]"
+    );
+  }
+
+  #[test]
+  fn negative_levelspec_leaves_in_list() {
+    assert_eq!(
+      interpret("Replace[{1, {2, {3, 4}}}, _Integer -> 0, {-1}]").unwrap(),
+      "{0, {0, {0, 0}}}"
+    );
+  }
+
+  #[test]
+  fn negative_levelspec_subtree_depth_two() {
+    // {-2} matches subtrees with Depth = 2 (e.g. h[3] in this expression).
+    assert_eq!(
+      interpret("Replace[f[1, g[2, h[3]]], h[_] -> X, {-2}]").unwrap(),
+      "f[1, g[2, X]]"
+    );
+  }
+
+  #[test]
+  fn negative_levelspec_no_match_at_wrong_depth() {
+    // {-3} of f[1,g[2,h[3]]] only matches the subtree g[2,h[3]] (Depth = 3).
+    assert_eq!(
+      interpret("Replace[f[1, g[2, h[3]]], _ -> X, {-3}]").unwrap(),
+      "f[1, X]"
+    );
+  }
+}
+
+mod distribute {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret("Distribute[f[a + b, c]]").unwrap(),
+      "f[a, c] + f[b, c]"
+    );
+  }
+
+  #[test]
+  fn both_sums() {
+    assert_eq!(
+      interpret("Distribute[f[a + b, c + d]]").unwrap(),
+      "f[a, c] + f[a, d] + f[b, c] + f[b, d]"
+    );
+  }
+
+  #[test]
+  fn times_over_plus() {
+    assert_eq!(
+      interpret("Distribute[(a + b)(c + d)]").unwrap(),
+      "a*c + b*c + a*d + b*d"
+    );
+  }
+
+  #[test]
+  fn three_terms() {
+    assert_eq!(
+      interpret("Distribute[f[a + b + c, d]]").unwrap(),
+      "f[a, d] + f[b, d] + f[c, d]"
+    );
+  }
+
+  #[test]
+  fn three_args() {
+    let result = interpret("Distribute[f[a + b, c + d, e + g]]").unwrap();
+    assert!(result.contains("f[a, c, e]"));
+    assert!(result.contains("f[b, d, g]"));
+  }
+
+  #[test]
+  fn no_distribution_needed() {
+    assert_eq!(interpret("Distribute[f[a, b]]").unwrap(), "f[a, b]");
+  }
+
+  #[test]
+  fn with_head_restriction() {
+    assert_eq!(
+      interpret("Distribute[(a + b)(c + d), Plus, Times]").unwrap(),
+      "a*c + b*c + a*d + b*d"
+    );
+  }
+
+  #[test]
+  fn atom_input() {
+    assert_eq!(interpret("Distribute[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn distribute_over_list() {
+    assert_eq!(
+      interpret("Distribute[f[{a, b}, {c, d}], List]").unwrap(),
+      "{f[a, c], f[a, d], f[b, c], f[b, d]}"
+    );
+  }
+
+  #[test]
+  fn distribute_nested_lists() {
+    assert_eq!(
+      interpret("Distribute[{{1, 2}, {3, 4}}, List]").unwrap(),
+      "{{1, 3}, {1, 4}, {2, 3}, {2, 4}}"
+    );
+  }
+
+  #[test]
+  fn distribute_over_alternatives() {
+    assert_eq!(
+      interpret("Distribute[f[a | b, c | d], Alternatives]").unwrap(),
+      "f[a, c] | f[a, d] | f[b, c] | f[b, d]"
+    );
+  }
+
+  #[test]
+  fn distribute_over_alternatives_single_side() {
+    assert_eq!(
+      interpret("Distribute[f[a | b, c], Alternatives]").unwrap(),
+      "f[a, c] | f[b, c]"
+    );
+  }
+
+  #[test]
+  fn distribute_over_alternatives_chain() {
+    assert_eq!(
+      interpret("Distribute[f[a | b | e, c | d], Alternatives]").unwrap(),
+      "f[a, c] | f[a, d] | f[b, c] | f[b, d] | f[e, c] | f[e, d]"
+    );
+  }
+}
+
+mod polynomial_remainder {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret("PolynomialRemainder[x^3 + 2x + 1, x^2 + 1, x]").unwrap(),
+      "1 + x"
+    );
+  }
+
+  #[test]
+  fn exact_division() {
+    assert_eq!(
+      interpret("PolynomialRemainder[x (x^2 + 1), x^2 + 1, x]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn symbolic_coefficients() {
+    assert_eq!(
+      interpret("PolynomialRemainder[a x^2 + b x + c, x + 1, x]").unwrap(),
+      "a - b + c"
+    );
+  }
+
+  #[test]
+  fn lower_degree_dividend() {
+    assert_eq!(
+      interpret("PolynomialRemainder[x + 1, x^2, x]").unwrap(),
+      "1 + x"
+    );
+  }
+
+  #[test]
+  fn quotient_basic() {
+    assert_eq!(
+      interpret("PolynomialQuotient[x^3 + 2x + 1, x^2 + 1, x]").unwrap(),
+      "x"
+    );
+  }
+
+  #[test]
+  fn quotient_and_remainder_consistency() {
+    // p = q * quotient + remainder
+    let q =
+      interpret("PolynomialQuotient[x^4 + 3x^2 + x, x^2 + 1, x]").unwrap();
+    let r =
+      interpret("PolynomialRemainder[x^4 + 3x^2 + x, x^2 + 1, x]").unwrap();
+    // q should be x^2 + 2, r should be x - 2
+    assert_eq!(q, "2 + x^2");
+    assert_eq!(r, "-2 + x");
+  }
+
+  // The Modulus option performs the division over the field GF(p).
+  #[test]
+  fn modulus_option() {
+    // Over GF(2), (x^2-1)/(x-1) = x+1 exactly.
+    assert_eq!(
+      interpret("PolynomialQuotient[x^2 - 1, x - 1, x, Modulus -> 2]").unwrap(),
+      "1 + x"
+    );
+    assert_eq!(
+      interpret("PolynomialRemainder[x^2 + 1, x + 1, x, Modulus -> 2]")
+        .unwrap(),
+      "0"
+    );
+    // (x^3+1)/(x+1) = x^2 - x + 1 == x^2 + x + 1 over GF(2).
+    assert_eq!(
+      interpret("PolynomialQuotient[x^3 + 1, x + 1, x, Modulus -> 2]").unwrap(),
+      "1 + x + x^2"
+    );
+    // A nonzero modular remainder.
+    assert_eq!(
+      interpret("PolynomialRemainder[x^3 + x + 1, x^2 + 1, x, Modulus -> 2]")
+        .unwrap(),
+      "1"
+    );
+    // Over GF(5): (x^2+3x+2)/(x+1) = x+2.
+    assert_eq!(
+      interpret("PolynomialQuotient[x^2 + 3x + 2, x + 1, x, Modulus -> 5]")
+        .unwrap(),
+      "2 + x"
+    );
+    // PolynomialQuotientRemainder returns the {quotient, remainder} pair.
+    assert_eq!(
+      interpret("PolynomialQuotientRemainder[x^2 - 1, x - 1, x, Modulus -> 2]")
+        .unwrap(),
+      "{1 + x, 0}"
+    );
+  }
+}
+
+mod polynomial_lcm {
+  use super::*;
+
+  // PolynomialLCM[a, b] = (a / gcd) * b, displayed as an unexpanded product
+  // matching Wolfram's factored form rather than the expanded polynomial.
+  #[test]
+  fn factored_two_factors() {
+    assert_eq!(
+      interpret("PolynomialLCM[x^2 - 1, x - 1]").unwrap(),
+      "(-1 + x)*(1 + x)"
+    );
+  }
+
+  #[test]
+  fn factored_with_repeated_root() {
+    assert_eq!(
+      interpret("PolynomialLCM[x^2 - 1, x^2 + 2 x + 1]").unwrap(),
+      "(-1 + x)*(1 + 2*x + x^2)"
+    );
+  }
+
+  // The modular form keeps the same (a/gcd)*b product presentation, with
+  // both parts reduced mod p (equal factors merge into a power).
+  #[test]
+  fn modulus_option_computes_over_gf_p() {
+    for (input, expected) in [
+      ("PolynomialLCM[x^2 + 1, x + 1, Modulus -> 2]", "(1 + x)^2"),
+      (
+        "PolynomialLCM[x^3 + 1, x^2 + 1, Modulus -> 2]",
+        "(1 + x^2)*(1 + x + x^2)",
+      ),
+      (
+        "PolynomialLCM[x^4 - 1, x^2 + 4*x + 3, Modulus -> 5]",
+        "(3 + x + x^2)*(3 + 4*x + x^2)",
+      ),
+      // Coprime inputs after reduction: the raw product, unnormalized
+      (
+        "PolynomialLCM[2*x^2 + 2, x + 1, Modulus -> 5]",
+        "(1 + x)*(2 + 2*x^2)",
+      ),
+      (
+        "PolynomialLCM[x + 1, 2*x^2 + 2, Modulus -> 5]",
+        "(1 + x)*(2 + 2*x^2)",
+      ),
+      (
+        "PolynomialLCM[x^2 - 1, x^3 - 1, Modulus -> 7]",
+        "(1 + x)*(6 + x^3)",
+      ),
+      // An input vanishing mod p gives the zero polynomial
+      ("PolynomialLCM[5*x + 5, x + 1, Modulus -> 5]", "0"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn factored_distinct_quadratics() {
+    assert_eq!(
+      interpret("PolynomialLCM[x^2 + 3 x + 2, x^2 + 4 x + 3]").unwrap(),
+      "(2 + x)*(3 + 4*x + x^2)"
+    );
+  }
+
+  #[test]
+  fn numeric_coefficients() {
+    assert_eq!(interpret("PolynomialLCM[2 x, 3 x]").unwrap(), "6*x");
+  }
+
+  #[test]
+  fn integer_arguments() {
+    assert_eq!(interpret("PolynomialLCM[6, 4]").unwrap(), "12");
+  }
+
+  // When one polynomial divides the other the quotient is 1, so the LCM is the
+  // multiple itself (a single, expanded factor).
+  #[test]
+  fn divisible_pair_single_factor() {
+    assert_eq!(
+      interpret("PolynomialLCM[x - 1, x^2 - 1]").unwrap(),
+      "-1 + x^2"
+    );
+  }
+
+  #[test]
+  fn three_arguments() {
+    assert_eq!(
+      interpret("PolynomialLCM[x^2 - 1, x - 1, x + 1]").unwrap(),
+      "(-1 + x)*(1 + x)"
+    );
+  }
+}
+
+mod polynomial_extended_gcd {
+  use super::*;
+
+  // PolynomialExtendedGCD[p, q, x] returns {g, {s, t}} with s*p + t*q == g.
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret("PolynomialExtendedGCD[x^2 - 1, x^3 - 1, x]").unwrap(),
+      "{-1 + x, {-x, 1}}"
+    );
+  }
+
+  // With a Modulus the extended GCD is computed over the field GF(p), with a
+  // monic GCD; s*p + t*q == g (mod p).
+  #[test]
+  fn modulus_option() {
+    assert_eq!(
+      interpret("PolynomialExtendedGCD[x^2 - 1, x - 1, x, Modulus -> 2]")
+        .unwrap(),
+      "{1 + x, {0, 1}}"
+    );
+    assert_eq!(
+      interpret("PolynomialExtendedGCD[x^3 + x, x^2 + 1, x, Modulus -> 2]")
+        .unwrap(),
+      "{1 + x^2, {0, 1}}"
+    );
+    assert_eq!(
+      interpret("PolynomialExtendedGCD[x^2 + 1, x + 2, x, Modulus -> 5]")
+        .unwrap(),
+      "{2 + x, {0, 1}}"
+    );
+    // Nontrivial Bezout coefficients over GF(3).
+    assert_eq!(
+      interpret("PolynomialExtendedGCD[x^4 - 1, x^2 + x, x, Modulus -> 3]")
+        .unwrap(),
+      "{1 + x, {2, 1 + 2*x + x^2}}"
+    );
+  }
+}
+
+mod polynomial_reduce {
+  use super::*;
+
+  #[test]
+  fn single_divisor() {
+    // x^2 + 1 = (x - 1)(x + 1) + 2.
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 + 1, {x + 1}, x]").unwrap(),
+      "{{-1 + x}, 2}"
+    );
+  }
+
+  #[test]
+  fn two_divisors_exact() {
+    // x^3 + 2x + 1 = x(x^2 + 1) + 1(x + 1).
+    assert_eq!(
+      interpret("PolynomialReduce[x^3 + 2 x + 1, {x^2 + 1, x + 1}, x]")
+        .unwrap(),
+      "{{x, 1}, 0}"
+    );
+  }
+
+  #[test]
+  fn geometric_quotient() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^3, {x - 1}, x]").unwrap(),
+      "{{1 + x + x^2}, 1}"
+    );
+  }
+
+  #[test]
+  fn rational_coefficients() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^2, {3 x + 1}, x]").unwrap(),
+      "{{-1/9 + x/3}, 1/9}"
+    );
+  }
+
+  #[test]
+  fn divisor_degree_exceeds_dividend() {
+    // No reduction possible; the whole polynomial is the remainder.
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 + 1, {x^3 + 1}, x]").unwrap(),
+      "{{0}, 1 + x^2}"
+    );
+  }
+
+  #[test]
+  fn constant_dividend() {
+    assert_eq!(
+      interpret("PolynomialReduce[5, {x + 1}, x]").unwrap(),
+      "{{0}, 5}"
+    );
+  }
+
+  #[test]
+  fn variable_as_single_element_list() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 + 1, {x + 1}, {x}]").unwrap(),
+      "{{-1 + x}, 2}"
+    );
+  }
+
+  // Multivariate division (lexicographic order over the given variables).
+  #[test]
+  fn multivariate_single_divisor() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 + y^2, {x - y}, {x, y}]").unwrap(),
+      "{{x + y}, 2*y^2}"
+    );
+    assert_eq!(
+      interpret("PolynomialReduce[x^3 + y^3, {x + y}, {x, y}]").unwrap(),
+      "{{x^2 - x*y + y^2}, 0}"
+    );
+  }
+
+  #[test]
+  fn multivariate_two_divisors() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 + y^2, {x + y, x - y}, {x, y}]").unwrap(),
+      "{{x - y, 0}, 2*y^2}"
+    );
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 y^2, {x^2 - y, x y - 1}, {x, y}]")
+        .unwrap(),
+      "{{y^2, 0}, y^3}"
+    );
+  }
+
+  #[test]
+  fn multivariate_rational_coefficient_quotient() {
+    assert_eq!(
+      interpret("PolynomialReduce[2 x^2, {3 x}, {x, y}]").unwrap(),
+      "{{(2*x)/3}, 0}"
+    );
+  }
+
+  #[test]
+  fn multivariate_nonzero_remainder() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 y + x y^2, {x y - 1}, {x, y}]").unwrap(),
+      "{{x + y}, x + y}"
+    );
+  }
+
+  /// A "variable" need not be a bare identifier — a function application
+  /// like `f[a]` is just as valid an indeterminate to real Mathematica as
+  /// `x`. Regression: the multivariate path required every entry of the
+  /// variable list to be an `Identifier`, so a divisor/dividend written in
+  /// terms of `f[a]`, `g[a]` (a common shape once a derivation replaces a
+  /// derivative with its own function call) never reduced at all.
+  #[test]
+  fn multivariate_function_call_variables() {
+    assert_eq!(
+      interpret(
+        "PolynomialReduce[f[a]*g[a] + g[a]^2 - 1, {f[a] - 1}, {f[a], g[a]}]"
+      )
+      .unwrap(),
+      "{{g[a]}, -1 + g[a] + g[a]^2}"
+    );
+  }
+
+  /// A coefficient that is not one of the given variables — a free
+  /// parameter, or an irrational constant like `Sqrt[3]` — rides along
+  /// symbolically instead of being required to be an exact rational
+  /// number, exactly like the single-variable path above already allows.
+  /// Regression: the multivariate engine's internal polynomial
+  /// representation only stored exact `i128` fractions, so a bare free
+  /// symbol or `Sqrt[3]` anywhere in the input made the whole call stay
+  /// unevaluated — including a symbol that appears only additively (never
+  /// multiplied by one of the target variables), which is the common case
+  /// for a derivation parametrized by an external constant.
+  #[test]
+  fn multivariate_symbolic_coefficient() {
+    assert_eq!(
+      interpret("PolynomialReduce[a*x^2 + x*y - 1, {x - 1}, {x, y}]").unwrap(),
+      "{{a + a*x + y}, -1 + a + y}"
+    );
+    assert_eq!(
+      interpret(
+        "PolynomialReduce[x^2 - x*y/Sqrt[3] + y^2 - k, \
+         {x^2 + y^2 - k}, {x, y}]"
+      )
+      .unwrap(),
+      "{{1}, -((x*y)/Sqrt[3])}"
+    );
+  }
+
+  /// A divisor with rational coefficients divides exactly (issue #766).
+  /// The reduction only terminates once the running remainder collapses to
+  /// the literal 0 — Expand used to leave `1/2 - 1/2 + x/2 - x/2 + …`
+  /// uncombined, so the loop hit its guard and gave up unevaluated.
+  ///
+  /// The clearing factor stays in front of the quotient rather than being
+  /// distributed into it — `2 (1 - x)`, not `2 - 2 x`. Only
+  /// `PolynomialReduce` presents it that way; `PolynomialQuotient` expands.
+  /// Verified against wolframscript.
+  #[test]
+  fn rational_divisor_divides_exactly() {
+    assert_eq!(
+      interpret(
+        "PolynomialReduce[1 - 2 x^3 + x^4, {(1 + x + x^2 - x^3)/2}, x]"
+      )
+      .unwrap(),
+      "{{2*(1 - x)}, 0}"
+    );
+    assert_eq!(
+      interpret(
+        "PolynomialReduce[1 - 2 x^3 + x^4, {(1 + x + x^2 - x^3)/3}, x]"
+      )
+      .unwrap(),
+      "{{3*(1 - x)}, 0}"
+    );
+    // Each divisor carries its own factor: `x + 1` clears nothing.
+    assert_eq!(
+      interpret("PolynomialReduce[x^4, {x^2/2 + x, x + 1}, x]").unwrap(),
+      "{{2*(4 - 2*x + x^2), -8}, 8}"
+    );
+    assert_eq!(
+      interpret("PolynomialQuotientRemainder[x^4, x^2/2 + x, x]").unwrap(),
+      "{8 - 4*x + 2*x^2, -8*x}"
+    );
+  }
+
+  /// A single divisor may be given without the surrounding list.
+  #[test]
+  fn divisor_without_list() {
+    assert_eq!(
+      interpret("PolynomialReduce[x^2 + 1, x + 1, x]").unwrap(),
+      "{{-1 + x}, 2}"
+    );
+    assert_eq!(
+      interpret("PolynomialReduce[1 - 2 x^3 + x^4, (1 + x + x^2 - x^3)/2, x]")
+        .unwrap(),
+      "{{2*(1 - x)}, 0}"
+    );
+  }
+}
+
+mod solve_expression_target {
+  use super::*;
+
+  #[test]
+  fn solve_for_function_call() {
+    assert_eq!(
+      interpret("Solve[f[x + y] == 3, f[x + y]]").unwrap(),
+      "{{f[x + y] -> 3}}"
+    );
+  }
+}
+
+mod solve_with_domain {
+  use super::*;
+
+  #[test]
+  fn reals_no_complex() {
+    assert_eq!(interpret("Solve[x^2 == -1, x, Reals]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn reals_with_solutions() {
+    assert_eq!(
+      interpret("Solve[x^2 == 1, x, Reals]").unwrap(),
+      "{{x -> -1}, {x -> 1}}"
+    );
+  }
+
+  #[test]
+  fn integers_filters_non_integer() {
+    assert_eq!(
+      interpret("Solve[-4 - 4 x + x^4 + x^5 == 0, x, Integers]").unwrap(),
+      "{{x -> -1}}"
+    );
+  }
+
+  #[test]
+  fn integers_no_solutions() {
+    assert_eq!(interpret("Solve[x^4 == 4, x, Integers]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn integers_bounded_linear_two_vars_unique() {
+    assert_eq!(
+      interpret(
+        "Solve[{15 n + 17 m == 200, n >= 0, m >= 0}, {n, m}, Integers]"
+      )
+      .unwrap(),
+      "{{n -> 2, m -> 10}}"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_linear_two_vars_multi() {
+    assert_eq!(
+      interpret("Solve[{x + y == 5, x >= 0, y >= 0}, {x, y}, Integers]")
+        .unwrap(),
+      "{{x -> 0, y -> 5}, {x -> 1, y -> 4}, {x -> 2, y -> 3}, {x -> 3, y -> 2}, {x -> 4, y -> 1}, {x -> 5, y -> 0}}"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_linear_with_upper_bounds() {
+    assert_eq!(
+      interpret(
+        "Solve[{x + y == 10, x >= 0, y >= 0, x <= 5, y <= 5}, {x, y}, Integers]"
+      )
+      .unwrap(),
+      "{{x -> 5, y -> 5}}"
+    );
+  }
+
+  // Strict `>` excludes the boundary integer (x > 0 means x >= 1), unlike the
+  // non-strict `>= 0` case above which includes 0.
+  #[test]
+  fn integers_bounded_strict_lower() {
+    assert_eq!(
+      interpret("Solve[{x + y == 5, x > 0, y > 0}, {x, y}, Integers]").unwrap(),
+      "{{x -> 1, y -> 4}, {x -> 2, y -> 3}, {x -> 3, y -> 2}, {x -> 4, y -> 1}}"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_strict_lower_shifted() {
+    // x > 2 and y > 2 means both >= 3.
+    assert_eq!(
+      interpret("Solve[{x + y == 10, x > 2, y > 2}, {x, y}, Integers]")
+        .unwrap(),
+      "{{x -> 3, y -> 7}, {x -> 4, y -> 6}, {x -> 5, y -> 5}, {x -> 6, y -> 4}, {x -> 7, y -> 3}}"
+    );
+  }
+
+  #[test]
+  fn integers_bounded_mixed_strict_nonstrict() {
+    // x > 0 (>= 1) but y >= 0 (includes 0).
+    assert_eq!(
+      interpret("Solve[{x + y == 5, x > 0, y >= 0}, {x, y}, Integers]")
+        .unwrap(),
+      "{{x -> 1, y -> 4}, {x -> 2, y -> 3}, {x -> 3, y -> 2}, {x -> 4, y -> 1}, {x -> 5, y -> 0}}"
+    );
+  }
+
+  #[test]
+  fn integers_single_variable_interval() {
+    assert_eq!(
+      interpret("Solve[-2 <= s <= 2, s, Integers]").unwrap(),
+      "{{s -> -2}, {s -> -1}, {s -> 0}, {s -> 1}, {s -> 2}}"
+    );
+  }
+
+  #[test]
+  fn integers_affine_congruence_system() {
+    assert_eq!(
+      interpret(
+        "Solve[0 <= x <= 5 && 0 <= y <= 5 && Mod[x + 2 y, 4] == 3, {x, y}, Integers]"
+      )
+      .unwrap(),
+      "{{x -> 1, y -> 1}, {x -> 1, y -> 3}, {x -> 1, y -> 5}, {x -> 3, y -> 0}, {x -> 3, y -> 2}, {x -> 3, y -> 4}, {x -> 5, y -> 1}, {x -> 5, y -> 3}, {x -> 5, y -> 5}}"
+    );
+  }
+
+  #[test]
+  fn integers_unary_congruence_uses_exact_residue_class() {
+    assert_eq!(
+      interpret("Solve[0 <= x <= 20 && Mod[6 x + 4, 10] == 0, x, Integers]")
+        .unwrap(),
+      "{{x -> 1}, {x -> 6}, {x -> 11}, {x -> 16}}"
+    );
+    assert_eq!(
+      interpret("Solve[0 <= x <= 20 && Mod[2 x + 1, 4] == 0, x, Integers]")
+        .unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn integers_boolean_disjunction_and_disequality() {
+    assert_eq!(
+      interpret(
+        "Solve[0 <= x <= 3 && x != 1 && (x == 0 || x >= 2), x, Integers]"
+      )
+      .unwrap(),
+      "{{x -> 0}, {x -> 2}, {x -> 3}}"
+    );
+  }
+
+  #[test]
+  fn integers_derive_bounds_through_equalities() {
+    assert_eq!(
+      interpret(
+        "Solve[r == 0 && g >= 0 && h >= 0 && h <= 8 && m >= 0 && g + h == 4 && 2 m == g && Mod[g + 2 h, 4] == 0 && m != 1, {r, g, h, m}, Integers]"
+      )
+      .unwrap(),
+      "{{r -> 0, g -> 0, h -> 4, m -> 0}, {r -> 0, g -> 4, h -> 0, m -> 2}}"
+    );
+  }
+
+  #[test]
+  fn integers_exact_beyond_binary64() {
+    assert_eq!(
+      interpret(
+        "Solve[9007199254740993 x == 9007199254740993 && 0 <= x <= 2, x, Integers]"
+      )
+      .unwrap(),
+      "{{x -> 1}}"
+    );
+  }
+
+  #[test]
+  fn integers_consume_finite_reduce_disjunction() {
+    assert_eq!(
+      interpret(
+        "Solve[Reduce[-2 <= s <= 2, s, Integers] && -100 <= s <= 100, s, Integers]"
+      )
+      .unwrap(),
+      "{{s -> -2}, {s -> -1}, {s -> 0}, {s -> 1}, {s -> 2}}"
+    );
+  }
+
+  #[test]
+  fn integers_unbounded_affine_is_not_false_empty() {
+    assert_eq!(
+      interpret("Solve[x >= 0, x, Integers]").unwrap(),
+      "Solve[x >= 0, x, Integers]"
+    );
+    assert_eq!(
+      interpret("Head[Solve[0 <= x <= 1000001, x, Integers]]").unwrap(),
+      "Solve"
+    );
+  }
+
+  #[test]
+  fn integers_preserve_trivial_truth_values() {
+    assert_eq!(interpret("Solve[False, x, Integers]").unwrap(), "{}");
+    assert_eq!(interpret("Solve[True, x, Integers]").unwrap(), "{{}}");
+  }
+}
+
+// Modulus -> n solves over the integers modulo n. Without it Solve answered
+// over the rationals and reported those roots as if they were residues:
+// Solve[x^2 == 2, x, Modulus -> 7] gave {{x -> -Sqrt[2]}, {x -> Sqrt[2]}}.
+mod solve_modulus {
+  use super::*;
+
+  #[test]
+  fn quadratic_residues() {
+    assert_eq!(
+      interpret("Solve[x^2 == 2, x, Modulus -> 7]").unwrap(),
+      "{{x -> 3}, {x -> 4}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^2 + 1 == 0, x, Modulus -> 5]").unwrap(),
+      "{{x -> 2}, {x -> 3}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 1, x, Modulus -> 7]").unwrap(),
+      "{{x -> 1}, {x -> 2}, {x -> 4}}"
+    );
+  }
+
+  #[test]
+  fn no_residue_gives_no_solutions() {
+    // 3 is not a quadratic residue mod 7.
+    assert_eq!(interpret("Solve[x^2 == 3, x, Modulus -> 7]").unwrap(), "{}");
+    // Nor is 2 a square mod 4.
+    assert_eq!(interpret("Solve[x^2 == 2, x, Modulus -> 4]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn composite_modulus_and_reduction() {
+    // 2 x == 4 mod 6 has two residues, not the single rational root 2.
+    assert_eq!(
+      interpret("Solve[2 x == 4, x, Modulus -> 6]").unwrap(),
+      "{{x -> 2}, {x -> 5}}"
+    );
+    // A modular inverse rather than a fraction.
+    assert_eq!(
+      interpret("Solve[2 x == 1, x, Modulus -> 5]").unwrap(),
+      "{{x -> 3}}"
+    );
+    // The right-hand side is reduced too.
+    assert_eq!(
+      interpret("Solve[x == 3, x, Modulus -> 2]").unwrap(),
+      "{{x -> 1}}"
+    );
+  }
+
+  #[test]
+  fn modulus_zero_is_the_default() {
+    assert_eq!(
+      interpret("Solve[x^2 == 2, x, Modulus -> 0]").unwrap(),
+      "{{x -> -Sqrt[2]}, {x -> Sqrt[2]}}"
+    );
+  }
+
+  // A system of equations — a `{eq, …}` list or an `eq && …` conjunction —
+  // is enumerated over the residues just like a single equation.
+  #[test]
+  fn multivariate_nonlinear_system() {
+    assert_eq!(
+      interpret("Solve[{x^2 == 2, y == x}, {x, y}, Modulus -> 7]").unwrap(),
+      "{{x -> 3, y -> 3}, {x -> 4, y -> 4}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^2 == 2 && y == x, {x, y}, Modulus -> 7]").unwrap(),
+      "{{x -> 3, y -> 3}, {x -> 4, y -> 4}}"
+    );
+    // No residue pair satisfies both equations.
+    assert_eq!(
+      interpret("Solve[{x^2 == 3, y == x}, {x, y}, Modulus -> 7]").unwrap(),
+      "{}"
+    );
+  }
+}
+
+// MaxRoots keeps only the leading solutions.
+mod solve_max_roots {
+  use super::*;
+
+  #[test]
+  fn truncates_to_the_requested_count() {
+    assert_eq!(
+      interpret("Solve[x^3 == 1, x, MaxRoots -> 1]").unwrap(),
+      "{{x -> 1}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 1, x, MaxRoots -> 2]").unwrap(),
+      "{{x -> 1}, {x -> -(-1)^(1/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^4 == 1, x, MaxRoots -> 3]").unwrap(),
+      "{{x -> -1}, {x -> -I}, {x -> I}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^5 - x - 1 == 0, x, MaxRoots -> 1]").unwrap(),
+      "{{x -> Root[-1 - #1 + #1^5 & , 1, 0]}}"
+    );
+  }
+
+  #[test]
+  fn a_larger_budget_than_there_are_roots() {
+    assert_eq!(
+      interpret("Solve[x^2 == 1, x, MaxRoots -> 5]").unwrap(),
+      "{{x -> -1}, {x -> 1}}"
+    );
+  }
+
+  #[test]
+  fn infinity_and_automatic_keep_everything() {
+    assert_eq!(
+      interpret("Solve[x^2 == 2, x, MaxRoots -> Infinity]").unwrap(),
+      "{{x -> -Sqrt[2]}, {x -> Sqrt[2]}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^2 == 2, x, MaxRoots -> Automatic]").unwrap(),
+      "{{x -> -Sqrt[2]}, {x -> Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn non_positive_count_is_refused() {
+    use woxi::interpret_with_stdout;
+    let r = interpret_with_stdout("Solve[x^3 == 1, x, MaxRoots -> 0]").unwrap();
+    assert_eq!(r.result, "Solve[x^3 == 1, x, MaxRoots -> 0]");
+    assert!(
+      r.warnings.iter().any(|w| w
+        == "Solve::maxrts: The value 0 of the MaxRoots option is not a \
+            positive integer, Infinity or Automatic."),
+      "expected maxrts message, got {:?}",
+      r.warnings
+    );
+    let r =
+      interpret_with_stdout("Solve[x^2 == 2, x, MaxRoots -> 1.5]").unwrap();
+    assert!(
+      r.warnings
+        .iter()
+        .any(|w| w.contains("Solve::maxrts: The value 1.5")),
+      "expected maxrts message, got {:?}",
+      r.warnings
+    );
+  }
+}
+
+// Solving a periodic (trig) equation over a bounded interval specializes the
+// general ConditionalExpression family to the concrete solutions in range.
+mod solve_periodic_bounded {
+  use super::*;
+
+  #[test]
+  fn sin_open_interval() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 0 && 0 < x < 2 Pi, x]").unwrap(),
+      "{{x -> Pi}}"
+    );
+  }
+
+  // A closed interval includes the endpoints, sorted ascending.
+  #[test]
+  fn sin_closed_interval() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 0 && 0 <= x <= 2 Pi, x]").unwrap(),
+      "{{x -> 0}, {x -> Pi}, {x -> 2*Pi}}"
+    );
+  }
+
+  #[test]
+  fn cos_open_interval() {
+    assert_eq!(
+      interpret("Solve[Cos[x] == 0 && 0 < x < 2 Pi, x]").unwrap(),
+      "{{x -> Pi/2}, {x -> (3*Pi)/2}}"
+    );
+  }
+
+  #[test]
+  fn sin_symmetric_interval() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 0 && -Pi < x < Pi, x]").unwrap(),
+      "{{x -> 0}}"
+    );
+  }
+
+  // Without a bounding constraint the general periodic family is kept.
+  #[test]
+  fn unbounded_keeps_general_family() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 0, x]").unwrap(),
+      "{{x -> ConditionalExpression[2*Pi*C[1], Element[C[1], Integers]]}, \
+       {x -> ConditionalExpression[Pi + 2*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+
+  // A non-special right-hand side uses the inverse-trig family, so a bounded
+  // interval still yields concrete solutions.
+  #[test]
+  fn cos_half_bounded() {
+    assert_eq!(
+      interpret("Solve[Cos[x] == 1/2 && 0 < x < 2 Pi, x]").unwrap(),
+      "{{x -> Pi/3}, {x -> (5*Pi)/3}}"
+    );
+  }
+
+  #[test]
+  fn sin_half_bounded() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 1/2 && 0 < x < 2 Pi, x]").unwrap(),
+      "{{x -> Pi/6}, {x -> (5*Pi)/6}}"
+    );
+  }
+
+  // Tan has period Pi, so a 2-Pi interval gives two solutions.
+  #[test]
+  fn tan_one_bounded() {
+    assert_eq!(
+      interpret("Solve[Tan[x] == 1 && 0 < x < 2 Pi, x]").unwrap(),
+      "{{x -> Pi/4}, {x -> (5*Pi)/4}}"
+    );
+  }
+
+  // An exact irrational right-hand side also resolves.
+  #[test]
+  fn sin_sqrt2_over_2_bounded() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == Sqrt[2]/2 && 0 < x < 2 Pi, x]").unwrap(),
+      "{{x -> Pi/4}, {x -> (3*Pi)/4}}"
+    );
+  }
+
+  // The unbounded general family matches wolframscript's two branches.
+  #[test]
+  fn cos_half_unbounded_family() {
+    assert_eq!(
+      interpret("Solve[Cos[x] == 1/2, x]").unwrap(),
+      "{{x -> ConditionalExpression[-1/3*Pi + 2*Pi*C[1], \
+       Element[C[1], Integers]]}, {x -> ConditionalExpression[Pi/3 + 2*Pi*C[1], \
+       Element[C[1], Integers]]}}"
+    );
+  }
+
+  // A |rhs| > 1 for Sin/Cos still solves symbolically via ArcSin/ArcCos (the
+  // inverse is complex-valued), matching wolframscript rather than staying
+  // unevaluated.
+  #[test]
+  fn cos_out_of_range_symbolic() {
+    assert_eq!(
+      interpret("Solve[Cos[x] == 2, x]").unwrap(),
+      "{{x -> ConditionalExpression[-ArcCos[2] + 2*Pi*C[1], \
+       Element[C[1], Integers]]}, {x -> ConditionalExpression[ArcCos[2] + \
+       2*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+
+  #[test]
+  fn cos_out_of_range_rational() {
+    assert_eq!(
+      interpret("Solve[Cos[x] == 3/2, x]").unwrap(),
+      "{{x -> ConditionalExpression[-ArcCos[3/2] + 2*Pi*C[1], \
+       Element[C[1], Integers]]}, {x -> ConditionalExpression[ArcCos[3/2] + \
+       2*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+
+  #[test]
+  fn sin_out_of_range_symbolic() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 3, x]").unwrap(),
+      "{{x -> ConditionalExpression[Pi - ArcSin[3] + 2*Pi*C[1], \
+       Element[C[1], Integers]]}, {x -> ConditionalExpression[ArcSin[3] + \
+       2*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+
+  // For a symbolic ArcSin right-hand side wolframscript lists the
+  // `Pi - ArcSin[c]` branch first; when it simplifies to a multiple of Pi the
+  // pair is in ascending value order instead.
+  #[test]
+  fn sin_symbolic_rhs_branch_order() {
+    assert_eq!(
+      interpret("Solve[Sin[x] == 1/3, x]").unwrap(),
+      "{{x -> ConditionalExpression[Pi - ArcSin[1/3] + 2*Pi*C[1], \
+       Element[C[1], Integers]]}, {x -> ConditionalExpression[ArcSin[1/3] + \
+       2*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+
+  #[test]
+  fn sin_special_rhs_ascending_order() {
+    // Simplifies to Pi/6 and 5*Pi/6 → ascending order.
+    assert_eq!(
+      interpret("Solve[Sin[x] == 1/2, x]").unwrap(),
+      "{{x -> ConditionalExpression[Pi/6 + 2*Pi*C[1], \
+       Element[C[1], Integers]]}, {x -> ConditionalExpression[(5*Pi)/6 + \
+       2*Pi*C[1], Element[C[1], Integers]]}}"
+    );
+  }
+}
+
+mod solve_always {
+  use super::*;
+
+  #[test]
+  fn linear_single_variable() {
+    assert_eq!(
+      interpret("SolveAlways[a*x + b == 0, x]").unwrap(),
+      "{{a -> 0, b -> 0}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_with_offsets() {
+    assert_eq!(
+      interpret("SolveAlways[(a - 2)*x^2 + (b + 1)*x + c == 0, x]").unwrap(),
+      "{{a -> 2, b -> -1, c -> 0}}"
+    );
+  }
+
+  #[test]
+  fn matching_polynomial() {
+    assert_eq!(
+      interpret("SolveAlways[a*x^2 + b*x + c == 3*x^2 - 5*x + 7, x]").unwrap(),
+      "{{a -> 3, b -> -5, c -> 7}}"
+    );
+  }
+
+  #[test]
+  fn trivially_true() {
+    assert_eq!(interpret("SolveAlways[0 == 0, x]").unwrap(), "{{}}");
+  }
+
+  #[test]
+  fn impossible_equation() {
+    assert_eq!(interpret("SolveAlways[x + 1 == 0, x]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn no_parameters() {
+    assert_eq!(
+      interpret("SolveAlways[3*x^2 + 5*x + 7 == 0, x]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn multivariate() {
+    assert_eq!(
+      interpret("SolveAlways[(a - 2)*x + (b + 1)*y + c == 0, {x, y}]").unwrap(),
+      "{{a -> 2, b -> -1, c -> 0}}"
+    );
+  }
+
+  #[test]
+  fn multivariate_all_zero() {
+    assert_eq!(
+      interpret("SolveAlways[a*x + b*y + c == 0, {x, y}]").unwrap(),
+      "{{a -> 0, b -> 0, c -> 0}}"
+    );
+  }
+
+  #[test]
+  fn list_form_single_var() {
+    assert_eq!(
+      interpret("SolveAlways[a*x + b == 0, {x}]").unwrap(),
+      "{{a -> 0, b -> 0}}"
+    );
+  }
+
+  #[test]
+  fn quadratic_cross_terms() {
+    assert_eq!(
+      interpret("SolveAlways[a*x^2 + b*x*y + c*y^2 == 0, {x, y}]").unwrap(),
+      "{{a -> 0, b -> 0, c -> 0}}"
+    );
+  }
+}
+
+mod factor_terms {
+  use super::*;
+
+  #[test]
+  fn basic_integer_gcd() {
+    assert_eq!(
+      interpret("FactorTerms[3 + 6 x + 3 x^2]").unwrap(),
+      "3*(1 + 2*x + x^2)"
+    );
+  }
+
+  #[test]
+  fn factor_from_all_terms() {
+    assert_eq!(
+      interpret("FactorTerms[6 x + 9 x^2]").unwrap(),
+      "3*(2*x + 3*x^2)"
+    );
+  }
+
+  #[test]
+  fn simple_factoring() {
+    assert_eq!(interpret("FactorTerms[5 + 10 x]").unwrap(), "5*(1 + 2*x)");
+  }
+
+  #[test]
+  fn gcd_one_no_change() {
+    assert_eq!(interpret("FactorTerms[x + x^2]").unwrap(), "x + x^2");
+  }
+
+  #[test]
+  fn single_term() {
+    assert_eq!(interpret("FactorTerms[7 x]").unwrap(), "7*x");
+  }
+
+  #[test]
+  fn constant() {
+    assert_eq!(interpret("FactorTerms[42]").unwrap(), "42");
+  }
+
+  #[test]
+  fn zero() {
+    assert_eq!(interpret("FactorTerms[0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn variable_only() {
+    assert_eq!(interpret("FactorTerms[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn negative_gcd() {
+    assert_eq!(
+      interpret("FactorTerms[-6*x - 9*x^2]").unwrap(),
+      "-3*(2*x + 3*x^2)"
+    );
+  }
+
+  #[test]
+  fn negative_gcd_with_constant() {
+    assert_eq!(interpret("FactorTerms[-3 - 6*x]").unwrap(), "-3*(1 + 2*x)");
+  }
+
+  #[test]
+  fn symbolic_coefficients() {
+    assert_eq!(
+      interpret("FactorTerms[2 a + 4 b + 6 c]").unwrap(),
+      "2*(a + 2*b + 3*c)"
+    );
+  }
+
+  #[test]
+  fn no_common_factor() {
+    assert_eq!(interpret("FactorTerms[a + b]").unwrap(), "a + b");
+  }
+
+  #[test]
+  fn rational_coefficients() {
+    assert_eq!(
+      interpret("FactorTerms[2/3 + (4/3)*x]").unwrap(),
+      "(2*(1 + 2*x))/3"
+    );
+  }
+
+  #[test]
+  fn with_variable_argument() {
+    assert_eq!(
+      interpret("FactorTerms[3 + 3 a + 6 a x + 6 x + 12 a x^2 + 12 x^2, x]")
+        .unwrap(),
+      "3*(1 + a)*(1 + 2*x + 4*x^2)"
+    );
+  }
+
+  #[test]
+  fn threads_over_list() {
+    assert_eq!(
+      interpret("FactorTerms[{6 + 12 x, 4 + 8 x}]").unwrap(),
+      "{6*(1 + 2*x), 4*(1 + 2*x)}"
+    );
+  }
+
+  // The content carries the sign of the highest-degree coefficient
+  // (wolframscript-verified).
+  #[test]
+  fn content_sign_from_highest_degree_term() {
+    assert_eq!(
+      interpret("FactorTerms[2 - 4 x - 4 x^2]").unwrap(),
+      "-2*(-1 + 2*x + 2*x^2)"
+    );
+    assert_eq!(interpret("FactorTerms[-2 + 4 x]").unwrap(), "2*(-1 + 2*x)");
+    assert_eq!(
+      interpret("FactorTerms[2 - 4 x + 6 x^2 - 4 x^3]").unwrap(),
+      "-2*(-1 + 2*x - 3*x^2 + 2*x^3)"
+    );
+  }
+
+  #[test]
+  fn content_sign_multivariate() {
+    assert_eq!(
+      interpret("FactorTerms[2 y - 4 x y - 4 x^2 y]").unwrap(),
+      "-2*(-y + 2*x*y + 2*x^2*y)"
+    );
+    assert_eq!(
+      interpret("FactorTerms[-4*y^2 + 4*x*y - 4*x^2]").unwrap(),
+      "-4*(x^2 - x*y + y^2)"
+    );
+  }
+
+  // A -1/d rational content folds its sign into the sum
+  // (wolframscript-verified).
+  #[test]
+  fn unit_rational_content_folds_sign_into_sum() {
+    assert_eq!(
+      interpret("FactorTerms[x/2 - x^2/2]").unwrap(),
+      "(x - x^2)/2"
+    );
+    assert_eq!(
+      interpret("FactorTerms[1/2 - x^2/2]").unwrap(),
+      "(1 - x^2)/2"
+    );
+  }
+
+  #[test]
+  fn negative_rational_content() {
+    assert_eq!(
+      interpret("FactorTerms[3/2 - (3 x)/2]").unwrap(),
+      "(-3*(-1 + x))/2"
+    );
+  }
+
+  // The sign comes from the highest TOTAL-degree term (Sin[x] counts like
+  // a variable); among equal-degree maxima the first in canonical order
+  // wins (wolframscript-verified).
+  #[test]
+  fn content_sign_total_degree_and_ties() {
+    assert_eq!(
+      interpret("FactorTerms[2 - 2 Sin[theta]]").unwrap(),
+      "-2*(-1 + Sin[theta])"
+    );
+    assert_eq!(
+      interpret("FactorTerms[2 Sin[x] - 4 Sin[y]]").unwrap(),
+      "2*(Sin[x] - 2*Sin[y])"
+    );
+    assert_eq!(
+      interpret("FactorTerms[-2 Sin[x] + 4 Sin[y]]").unwrap(),
+      "-2*(Sin[x] - 2*Sin[y])"
+    );
+    assert_eq!(interpret("FactorTerms[2 x - 4 y]").unwrap(), "2*(x - 2*y)");
+    assert_eq!(
+      interpret("FactorTerms[2 x y - 4 x]").unwrap(),
+      "2*(-2*x + x*y)"
+    );
+    assert_eq!(
+      interpret("FactorTerms[2 - 4 Sin[theta]^2]").unwrap(),
+      "-2*(-1 + 2*Sin[theta]^2)"
+    );
+    assert_eq!(
+      interpret("FactorTerms[2 a^2 - 2 a^2 Sin[theta]]").unwrap(),
+      "-2*(-a^2 + a^2*Sin[theta])"
+    );
+  }
+}
+
+mod cyclotomic {
+  use super::*;
+
+  #[test]
+  fn phi_1() {
+    assert_eq!(interpret("Cyclotomic[1, x]").unwrap(), "-1 + x");
+  }
+
+  #[test]
+  fn phi_2() {
+    assert_eq!(interpret("Cyclotomic[2, x]").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn phi_3() {
+    assert_eq!(interpret("Cyclotomic[3, x]").unwrap(), "1 + x + x^2");
+  }
+
+  #[test]
+  fn phi_4() {
+    assert_eq!(interpret("Cyclotomic[4, x]").unwrap(), "1 + x^2");
+  }
+
+  #[test]
+  fn phi_5() {
+    assert_eq!(
+      interpret("Cyclotomic[5, x]").unwrap(),
+      "1 + x + x^2 + x^3 + x^4"
+    );
+  }
+
+  #[test]
+  fn phi_6() {
+    assert_eq!(interpret("Cyclotomic[6, x]").unwrap(), "1 - x + x^2");
+  }
+
+  #[test]
+  fn phi_8() {
+    assert_eq!(interpret("Cyclotomic[8, x]").unwrap(), "1 + x^4");
+  }
+
+  #[test]
+  fn phi_12() {
+    assert_eq!(interpret("Cyclotomic[12, x]").unwrap(), "1 - x^2 + x^4");
+  }
+
+  #[test]
+  fn phi_0() {
+    assert_eq!(interpret("Cyclotomic[0, x]").unwrap(), "1");
+  }
+
+  #[test]
+  fn numeric_evaluation() {
+    assert_eq!(interpret("Cyclotomic[1, 3]").unwrap(), "2");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[Cyclotomic]").unwrap(),
+      "{Listable, Protected}"
+    );
+  }
+}
+
+mod expand_numerator {
+  use super::*;
+
+  #[test]
+  fn basic_square() {
+    assert_eq!(
+      interpret("ExpandNumerator[(1 + x)^2/(1 + y)^2]").unwrap(),
+      "(1 + 2*x + x^2)/(1 + y)^2"
+    );
+  }
+
+  #[test]
+  fn cubic_numerator() {
+    assert_eq!(
+      interpret("ExpandNumerator[(a + b)^3/(c + d)]").unwrap(),
+      "(a^3 + 3*a^2*b + 3*a*b^2 + b^3)/(c + d)"
+    );
+  }
+
+  #[test]
+  fn no_fraction() {
+    assert_eq!(interpret("ExpandNumerator[x + 1]").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[ExpandNumerator]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod expand_denominator {
+  use super::*;
+
+  #[test]
+  fn basic_square() {
+    assert_eq!(
+      interpret("ExpandDenominator[(1 + x)^2/(1 + y)^2]").unwrap(),
+      "(1 + x)^2/(1 + 2*y + y^2)"
+    );
+  }
+
+  #[test]
+  fn cubic_denominator() {
+    assert_eq!(
+      interpret("ExpandDenominator[(a + b)/(c + d)^3]").unwrap(),
+      "(a + b)/(c^3 + 3*c^2*d + 3*c*d^2 + d^3)"
+    );
+  }
+
+  #[test]
+  fn no_denominator() {
+    assert_eq!(interpret("ExpandDenominator[x + 1]").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn simple_fraction() {
+    assert_eq!(
+      interpret("ExpandDenominator[x/(y+z)]").unwrap(),
+      "x/(y + z)"
+    );
+  }
+
+  #[test]
+  fn sum_of_fractions() {
+    assert_eq!(
+      interpret("ExpandDenominator[a/(1+x)^2 + b/(1+y)^2]").unwrap(),
+      "a/(1 + 2*x + x^2) + b/(1 + 2*y + y^2)"
+    );
+  }
+
+  #[test]
+  fn multi_factor_denominator() {
+    // A denominator that's a product of two sums must be fully distributed,
+    // not expanded factor-by-factor. Regression for mathics algebra.py:1288
+    // (ExpandDenominator[(a+b)^2 / ((c+d)^2 (e+f))]).
+    assert_eq!(
+      interpret("ExpandDenominator[(a + b)^2 / ((c + d)^2 (e + f))]").unwrap(),
+      "(a + b)^2/(c^2*e + 2*c*d*e + d^2*e + c^2*f + 2*c*d*f + d^2*f)"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[ExpandDenominator]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod power_expand {
+  use super::*;
+
+  #[test]
+  fn product_power() {
+    assert_eq!(interpret("PowerExpand[(a*b)^s]").unwrap(), "a^s*b^s");
+  }
+
+  #[test]
+  fn product_power_three_factors() {
+    assert_eq!(interpret("PowerExpand[(a*b*c)^s]").unwrap(), "a^s*b^s*c^s");
+  }
+
+  #[test]
+  fn nested_power() {
+    assert_eq!(interpret("PowerExpand[(a^r)^s]").unwrap(), "a^(r*s)");
+  }
+
+  #[test]
+  fn quotient_power() {
+    assert_eq!(interpret("PowerExpand[(x/y)^n]").unwrap(), "x^n/y^n");
+  }
+
+  #[test]
+  fn integer_exponent() {
+    assert_eq!(interpret("PowerExpand[(x*y)^2]").unwrap(), "x^2*y^2");
+  }
+
+  #[test]
+  fn numeric_factor_power() {
+    assert_eq!(interpret("PowerExpand[(2*x)^n]").unwrap(), "2^n*x^n");
+  }
+
+  #[test]
+  fn compound_powers_in_product() {
+    assert_eq!(
+      interpret("PowerExpand[(x^a*y^b)^c]").unwrap(),
+      "x^(a*c)*y^(b*c)"
+    );
+  }
+
+  #[test]
+  fn sqrt_product() {
+    assert_eq!(
+      interpret("PowerExpand[Sqrt[a*b]]").unwrap(),
+      "Sqrt[a]*Sqrt[b]"
+    );
+  }
+
+  #[test]
+  fn sqrt_power_product() {
+    assert_eq!(interpret("PowerExpand[Sqrt[x^2*y^4]]").unwrap(), "x*y^2");
+  }
+
+  #[test]
+  fn sqrt_squared() {
+    assert_eq!(interpret("PowerExpand[Sqrt[x^2]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn fractional_power() {
+    assert_eq!(interpret("PowerExpand[(x^2)^(1/3)]").unwrap(), "x^(2/3)");
+  }
+
+  #[test]
+  fn sqrt_three_factors() {
+    assert_eq!(
+      interpret("PowerExpand[(a*b*c)^(1/2)]").unwrap(),
+      "Sqrt[a]*Sqrt[b]*Sqrt[c]"
+    );
+  }
+
+  #[test]
+  fn half_power_compound() {
+    assert_eq!(
+      interpret("PowerExpand[(x^2*y^3)^(1/2)]").unwrap(),
+      "x*y^(3/2)"
+    );
+  }
+
+  #[test]
+  fn log_product() {
+    assert_eq!(
+      interpret("PowerExpand[Log[a*b]]").unwrap(),
+      "Log[a] + Log[b]"
+    );
+  }
+
+  #[test]
+  fn log_product_three() {
+    assert_eq!(
+      interpret("PowerExpand[Log[a*b*c]]").unwrap(),
+      "Log[a] + Log[b] + Log[c]"
+    );
+  }
+
+  #[test]
+  fn log_power() {
+    assert_eq!(interpret("PowerExpand[Log[a^b]]").unwrap(), "b*Log[a]");
+  }
+
+  #[test]
+  fn log_quotient() {
+    assert_eq!(
+      interpret("PowerExpand[Log[a/b]]").unwrap(),
+      "Log[a] - Log[b]"
+    );
+  }
+
+  #[test]
+  fn log_sqrt() {
+    assert_eq!(interpret("PowerExpand[Log[Sqrt[x]]]").unwrap(), "Log[x]/2");
+  }
+
+  #[test]
+  fn log_e_power() {
+    assert_eq!(interpret("PowerExpand[Log[E^x]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn log_compound_product_powers() {
+    assert_eq!(
+      interpret("PowerExpand[Log[x^2*y^3]]").unwrap(),
+      "2*Log[x] + 3*Log[y]"
+    );
+  }
+
+  #[test]
+  fn log_symbolic_powers() {
+    assert_eq!(
+      interpret("PowerExpand[Log[x^a*y^b*z^c]]").unwrap(),
+      "a*Log[x] + b*Log[y] + c*Log[z]"
+    );
+  }
+
+  #[test]
+  fn exp_log_identity() {
+    assert_eq!(interpret("PowerExpand[Exp[x*Log[y]]]").unwrap(), "y^x");
+  }
+
+  #[test]
+  fn sum_passthrough() {
+    assert_eq!(interpret("PowerExpand[(a+b)^n]").unwrap(), "(a + b)^n");
+  }
+
+  #[test]
+  fn log_sum_passthrough() {
+    assert_eq!(interpret("PowerExpand[Log[a+b]]").unwrap(), "Log[a + b]");
+  }
+
+  #[test]
+  fn atom_passthrough() {
+    assert_eq!(interpret("PowerExpand[x]").unwrap(), "x");
+    assert_eq!(interpret("PowerExpand[5]").unwrap(), "5");
+  }
+
+  #[test]
+  fn additive_passthrough() {
+    assert_eq!(interpret("PowerExpand[x+y]").unwrap(), "x + y");
+  }
+
+  #[test]
+  fn thread_over_list() {
+    assert_eq!(
+      interpret("PowerExpand[{(a*b)^s, Log[a*b], Sqrt[x*y]}]").unwrap(),
+      "{a^s*b^s, Log[a] + Log[b], Sqrt[x]*Sqrt[y]}"
+    );
+  }
+
+  #[test]
+  fn nested_in_function() {
+    assert_eq!(
+      interpret("PowerExpand[Sin[(a*b)^s]]").unwrap(),
+      "Sin[a^s*b^s]"
+    );
+  }
+
+  #[test]
+  fn sum_of_powers() {
+    assert_eq!(
+      interpret("PowerExpand[(x+y)^n + (a*b)^s]").unwrap(),
+      "a^s*b^s + (x + y)^n"
+    );
+  }
+
+  #[test]
+  fn with_assumptions() {
+    // Second argument (Assumptions) is accepted
+    assert_eq!(
+      interpret("PowerExpand[(a*b)^s, Assumptions -> a > 0]").unwrap(),
+      "a^s*b^s"
+    );
+  }
+}
+
+mod resultant {
+  use super::*;
+
+  #[test]
+  fn basic_integer() {
+    assert_eq!(interpret("Resultant[x^2 + 1, x^3 - 1, x]").unwrap(), "2");
+  }
+
+  #[test]
+  fn common_root() {
+    // x^2 - 1 and x^3 - 1 share x=1 as a root
+    assert_eq!(interpret("Resultant[x^2 - 1, x^3 - 1, x]").unwrap(), "0");
+  }
+
+  #[test]
+  fn linear_polynomials() {
+    assert_eq!(interpret("Resultant[2*x + 3, 4*x - 1, x]").unwrap(), "-14");
+  }
+
+  #[test]
+  fn symbolic_linear() {
+    assert_eq!(
+      interpret("Resultant[a*x + b, c*x + d, x]").unwrap(),
+      "-(b*c) + a*d"
+    );
+  }
+
+  #[test]
+  fn symbolic_quadratic_expanded() {
+    assert_eq!(
+      interpret("Expand[Resultant[x^2 + a*x + b, x^2 + c*x + d, x]]").unwrap(),
+      "b^2 - a*b*c + b*c^2 + a^2*d - 2*b*d - a*c*d + d^2"
+    );
+  }
+
+  #[test]
+  fn quadratic_common_root() {
+    // x^2 - 5x + 6 = (x-2)(x-3), x^2 - 3x + 2 = (x-1)(x-2), share x=2
+    assert_eq!(
+      interpret("Resultant[x^2 - 5*x + 6, x^2 - 3*x + 2, x]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn zero_polynomial() {
+    assert_eq!(interpret("Resultant[x, x^2, x]").unwrap(), "0");
+  }
+
+  #[test]
+  fn constant_and_polynomial() {
+    assert_eq!(interpret("Resultant[3, x + 1, x]").unwrap(), "3");
+  }
+
+  #[test]
+  fn symbolic_stays_unevaluated() {
+    assert_eq!(interpret("Resultant[f, g, x]").unwrap(), "1");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[Resultant]").unwrap(),
+      "{Listable, Protected}"
+    );
+  }
+
+  // A Modulus option reduces the resultant's coefficients modulo p.
+  #[test]
+  fn modulus_option() {
+    // Res(x^2-1, x-1) = 0, reduced mod 2.
+    assert_eq!(
+      interpret("Resultant[x^2 - 1, x - 1, x, Modulus -> 2]").unwrap(),
+      "0"
+    );
+    // Res(x^2+1, x+1) = 2, mod 5 stays 2.
+    assert_eq!(
+      interpret("Resultant[x^2 + 1, x + 1, x, Modulus -> 5]").unwrap(),
+      "2"
+    );
+    // Symbolic coefficients: Res(x^2+a, x+b) = a + b^2 (mod 3).
+    assert_eq!(
+      interpret("Resultant[x^2 + a, x + b, x, Modulus -> 3]").unwrap(),
+      "a + b^2"
+    );
+    // A leading coefficient divisible by p: Res over Z is 3, reduced to 1.
+    assert_eq!(
+      interpret("Resultant[2x^2 + 1, x + 1, x, Modulus -> 2]").unwrap(),
+      "1"
+    );
+  }
+}
+
+mod discriminant {
+  use super::*;
+
+  // The Modulus option reduces the discriminant's coefficients modulo p.
+  #[test]
+  fn modulus_option() {
+    // Disc(x^2+b x+c) = b^2 - 4c == b^2 over GF(2).
+    assert_eq!(
+      interpret("Discriminant[x^2 + b x + c, x, Modulus -> 2]").unwrap(),
+      "b^2"
+    );
+    // Disc(x^3+p x+q) = -4 p^3 - 27 q^2 == 2 p^3 over GF(3).
+    assert_eq!(
+      interpret("Discriminant[x^3 + p x + q, x, Modulus -> 3]").unwrap(),
+      "2*p^3"
+    );
+    // Disc(a x^2+b x+c) = b^2 - 4 a c == b^2 + 2 a c over GF(3).
+    assert_eq!(
+      interpret("Discriminant[a x^2 + b x + c, x, Modulus -> 3]").unwrap(),
+      "b^2 + 2*a*c"
+    );
+    // The unmodulated discriminant is unchanged.
+    assert_eq!(
+      interpret("Discriminant[x^2 + b x + c, x]").unwrap(),
+      "b^2 - 4*c"
+    );
+  }
+}
+
+mod factor_square_free {
+  use super::*;
+
+  #[test]
+  fn basic_repeated_factor() {
+    assert_eq!(
+      interpret("FactorSquareFree[x^5 - x^4 - x + 1]").unwrap(),
+      "(-1 + x)^2*(1 + x + x^2 + x^3)"
+    );
+  }
+
+  #[test]
+  fn with_x_factor() {
+    assert_eq!(
+      interpret("FactorSquareFree[x^4 - 2*x^3 + x^2]").unwrap(),
+      "(-1 + x)^2*x^2"
+    );
+  }
+
+  #[test]
+  fn with_integer_content() {
+    assert_eq!(
+      interpret("FactorSquareFree[12*x^3 + 36*x^2 + 36*x + 12]").unwrap(),
+      "12*(1 + x)^3"
+    );
+  }
+
+  #[test]
+  fn square_free_unchanged() {
+    assert_eq!(interpret("FactorSquareFree[x^6 - 1]").unwrap(), "-1 + x^6");
+  }
+
+  // Sum factors sort by degree, then leading coefficient, then termwise on
+  // the nonzero (degree, coefficient) terms ascending — zero coefficients
+  // are skipped (differential-fuzzer regression, seed 1783672988021454491;
+  // all wolframscript-verified).
+  #[test]
+  fn factor_order_matches_wolframscript() {
+    assert_eq!(
+      interpret("FactorSquareFree[(2 - 4 x^2 + x^3)(-2 + x^3)]").unwrap(),
+      "(-2 + x^3)*(2 - 4*x^2 + x^3)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(1 - x^2 + x^3)(1 + x + x^3)]").unwrap(),
+      "(1 + x + x^3)*(1 - x^2 + x^3)"
+    );
+    assert_eq!(
+      interpret(
+        "FactorSquareFree[(2 - 5 x + 2 x^2 + x^3)(-5 - x + 5 x^2 + 5 x^3)]"
+      )
+      .unwrap(),
+      "(2 - 5*x + 2*x^2 + x^3)*(-5 - x + 5*x^2 + 5*x^3)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(-2 + x^4)(2 + x^2)]").unwrap(),
+      "(2 + x^2)*(-2 + x^4)"
+    );
+  }
+
+  // A monomial factor takes its canonical position before the sum, and the
+  // extracted -1 stays outside the product (differential-fuzzer regression,
+  // seed 424242; wolframscript-verified).
+  #[test]
+  fn multivariate_monomial_before_sum() {
+    assert_eq!(
+      interpret("InputForm[FactorSquareFree[5 y - 3 x y^2]]").unwrap(),
+      "InputForm[-(y*(-5 + 3*x*y))]"
+    );
+    assert_eq!(
+      interpret("InputForm[FactorSquareFree[5 x - 3 x^2]]").unwrap(),
+      "InputForm[-(x*(-5 + 3*x))]"
+    );
+    assert_eq!(
+      interpret("InputForm[Factor[5 y - 3 x y]]").unwrap(),
+      "InputForm[-((-5 + 3*x)*y)]"
+    );
+    assert_eq!(
+      interpret("InputForm[Factor[5 x y - 3 x^2 y^2]]").unwrap(),
+      "InputForm[-(x*y*(-5 + 3*x*y))]"
+    );
+    // The homogeneous-binomial fast path extracts the sign the same way.
+    assert_eq!(
+      interpret("InputForm[Factor[-x^2 + y^2]]").unwrap(),
+      "InputForm[-((x - y)*(x + y))]"
+    );
+    assert_eq!(
+      interpret("InputForm[Factor[x^2 - y^2]]").unwrap(),
+      "InputForm[(x - y)*(x + y)]"
+    );
+  }
+
+  // Regression: negative integer content stays a standalone `-4` factor
+  // (matching wolframscript), not `-(4*(...))` or `4*(-...)`.
+  #[test]
+  fn negative_integer_content_keeps_sign() {
+    assert_eq!(
+      interpret("FactorSquareFree[-4*y^2 + 4*x*y - 4*x^2]").unwrap(),
+      "-4*(x^2 - x*y + y^2)"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[FactorSquareFree]").unwrap(),
+      "{Listable, Protected}"
+    );
+  }
+
+  // Multivariate square-free factorization: repeated factors split out,
+  // square-free polynomials stay expanded (wolframscript-verified).
+  #[test]
+  fn multivariate_perfect_square() {
+    assert_eq!(
+      interpret("FactorSquareFree[a^2 + 2 a b + b^2]").unwrap(),
+      "(a + b)^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[-a^2 - 2 a b - b^2]").unwrap(),
+      "-(a + b)^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[2 a^2 + 4 a b + 2 b^2]").unwrap(),
+      "2*(a + b)^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[x^2 y + 2 x y + y]").unwrap(),
+      "(1 + x)^2*y"
+    );
+  }
+
+  #[test]
+  fn multivariate_square_free_unchanged() {
+    assert_eq!(
+      interpret("FactorSquareFree[a^2 + 3 a b + 2 b^2]").unwrap(),
+      "a^2 + 3*a*b + 2*b^2"
+    );
+  }
+
+  // Monomial and sign content is pulled out even when nothing repeats
+  // (wolframscript-verified; found by the differential fuzzer, seed
+  // 90260727) — only coprime SUM factors stay unsplit.
+  #[test]
+  fn multivariate_monomial_content_extracted() {
+    assert_eq!(
+      interpret("FactorSquareFree[x^2 + 2 x y^2]").unwrap(),
+      "x*(x + 2*y^2)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[-x^2 - x y]").unwrap(),
+      "-(x*(x + y))"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[2 x^2 + 4 x y]").unwrap(),
+      "2*x*(x + 2*y)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[-x^2 y + 3 x^2 y^2 - 2 x y^2]").unwrap(),
+      "x*y*(-x - 2*y + 3*x*y)"
+    );
+  }
+
+  #[test]
+  fn keeps_square_free_base_whole() {
+    // (-1+x^2)^2, not (-1+x)^2*(1+x)^2.
+    assert_eq!(
+      interpret("FactorSquareFree[x^4 - 2 x^2 + 1]").unwrap(),
+      "(-1 + x^2)^2"
+    );
+  }
+
+  // Explicit products factor square-free per factor and keep the
+  // structure unexpanded (wolframscript-verified; found by the
+  // differential fuzzer, seed 7726070).
+  #[test]
+  fn product_keeps_factor_structure() {
+    assert_eq!(
+      interpret("FactorSquareFree[(-4 - 5 x)*(-2 - 4 x - 5 x^2)]").unwrap(),
+      "(4 + 5*x)*(2 + 4*x + 5*x^2)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(2 + 2 x - 2 x^2)*(-2 + 2 x)]").unwrap(),
+      "-4*(-1 + x)*(-1 - x + x^2)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(2 x - 2)*(3 x + 6)]").unwrap(),
+      "6*(-1 + x)*(2 + x)"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[3 (2 x - 2)]").unwrap(),
+      "6*(-1 + x)"
+    );
+  }
+
+  #[test]
+  fn product_merges_repeated_factors() {
+    assert_eq!(
+      interpret("FactorSquareFree[(x - 1)*(x - 1)]").unwrap(),
+      "(-1 + x)^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(x - 1)*(1 - x)]").unwrap(),
+      "-(-1 + x)^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(x + 1)*(x - 1)*(x + 1)]").unwrap(),
+      "(-1 + x)*(1 + x)^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(x - 1)^2 (x + 1)^2]").unwrap(),
+      "(-1 + x)^2*(1 + x)^2"
+    );
+  }
+
+  #[test]
+  fn product_factors_each_factor_square_free() {
+    assert_eq!(
+      interpret("FactorSquareFree[(x^2 - 2 x + 1)*(x + 1)]").unwrap(),
+      "(-1 + x)^2*(1 + x)"
+    );
+    // Powers of a non-square-free base multiply exponents; a square-free
+    // base stays whole.
+    assert_eq!(
+      interpret("FactorSquareFree[(x^2 - 2 x + 1)^2]").unwrap(),
+      "(-1 + x)^4"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[(x^2 - 1)^2]").unwrap(),
+      "(-1 + x^2)^2"
+    );
+  }
+
+  #[test]
+  fn product_factor_ordering() {
+    // Equal-degree sums order by leading coefficient (1 before 5),
+    // independent of input order.
+    assert_eq!(
+      interpret(
+        "FactorSquareFree[(5 + x - 5 x^2 - 5 x^3)*(-2 + 5 x - 2 x^2 - x^3)]"
+      )
+      .unwrap(),
+      "(2 - 5*x + 2*x^2 + x^3)*(-5 - x + 5*x^2 + 5*x^3)"
+    );
+    assert_eq!(
+      interpret(
+        "FactorSquareFree[(-2 + 5 x - 2 x^2 - x^3)*(5 + x - 5 x^2 - 5 x^3)]"
+      )
+      .unwrap(),
+      "(2 - 5*x + 2*x^2 + x^3)*(-5 - x + 5*x^2 + 5*x^3)"
+    );
+    // Monomials and non-polynomial factors place per wolframscript.
+    assert_eq!(
+      interpret("FactorSquareFree[x^2 (x - 1)]").unwrap(),
+      "(-1 + x)*x^2"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[Sin[x]*(x^2 - 2 x + 1)]").unwrap(),
+      "(-1 + x)^2*Sin[x]"
+    );
+  }
+
+  // Unit-content square-free sums stay untouched; a -1 content wraps the
+  // whole product (wolframscript-verified).
+  #[test]
+  fn unit_content_conventions() {
+    assert_eq!(interpret("FactorSquareFree[1 - x]").unwrap(), "1 - x");
+    assert_eq!(
+      interpret("FactorSquareFree[-x^3 - x^2]").unwrap(),
+      "-(x^2*(1 + x))"
+    );
+    assert_eq!(
+      interpret("FactorSquareFree[-x^2 + 2 x - 1]").unwrap(),
+      "-(-1 + x)^2"
+    );
+  }
+}
+
+mod factor_terms_list {
+  use super::*;
+
+  #[test]
+  fn common_integer_factor() {
+    assert_eq!(
+      interpret("FactorTermsList[6*x^2 - 12*x + 6]").unwrap(),
+      "{6, 1 - 2*x + x^2}"
+    );
+  }
+
+  #[test]
+  fn no_common_factor() {
+    assert_eq!(
+      interpret("FactorTermsList[x^2 + 2*x + 1]").unwrap(),
+      "{1, 1 + 2*x + x^2}"
+    );
+  }
+
+  #[test]
+  fn negative_leading() {
+    assert_eq!(
+      interpret("FactorTermsList[-3*x^2 + 6*x - 9]").unwrap(),
+      "{-3, 3 - 2*x + x^2}"
+    );
+  }
+
+  #[test]
+  fn constant_input() {
+    assert_eq!(interpret("FactorTermsList[5]").unwrap(), "{5, 1}");
+  }
+
+  #[test]
+  fn no_numeric_content() {
+    assert_eq!(
+      interpret("FactorTermsList[x^3 + x]").unwrap(),
+      "{1, x + x^3}"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[FactorTermsList]").unwrap(),
+      "{Protected}"
+    );
+  }
+
+  // Two-arg form always returns a 3-element list {numeric_content,
+  // non-var-part, var-part}, even when the polynomial coefficients aren't
+  // integers (regression for mathics Factor doctest).
+  #[test]
+  fn two_arg_symbol_independent_of_var() {
+    assert_eq!(interpret("FactorTermsList[f, x]").unwrap(), "{1, f, 1}");
+  }
+
+  #[test]
+  fn two_arg_scaled_symbol_independent_of_var() {
+    assert_eq!(interpret("FactorTermsList[3*f, x]").unwrap(), "{3, f, 1}");
+  }
+
+  #[test]
+  fn two_arg_var_independent_pure_number() {
+    // Pure numeric inputs still collapse to the 2-element form.
+    assert_eq!(interpret("FactorTermsList[4, x]").unwrap(), "{4, 1}");
+  }
+
+  // Rational content, signed by the highest-degree coefficient
+  // (wolframscript-verified).
+  #[test]
+  fn rational_content() {
+    assert_eq!(
+      interpret("FactorTermsList[x/2 - x^2/2]").unwrap(),
+      "{-1/2, -x + x^2}"
+    );
+    assert_eq!(
+      interpret("FactorTermsList[3/2 - (3 x)/2]").unwrap(),
+      "{-3/2, -1 + x}"
+    );
+    assert_eq!(
+      interpret("FactorTermsList[1/2 - x^2/2]").unwrap(),
+      "{-1/2, -1 + x^2}"
+    );
+  }
+
+  #[test]
+  fn rational_content_two_arg() {
+    assert_eq!(
+      interpret("FactorTermsList[x/2 - x^2/2, x]").unwrap(),
+      "{-1/2, 1, -x + x^2}"
+    );
+  }
+
+  #[test]
+  fn negative_unit_content() {
+    assert_eq!(
+      interpret("FactorTermsList[x - x^2]").unwrap(),
+      "{-1, -x + x^2}"
+    );
+  }
+
+  #[test]
+  fn two_arg_var_part_stays_expanded() {
+    assert_eq!(
+      interpret("FactorTermsList[3*(-1 + 2 x)^2*(-1 + y), x]").unwrap(),
+      "{3, -1 + y, 1 - 4*x + 4*x^2}"
+    );
+  }
+}
+
+mod refine {
+  use super::*;
+
+  #[test]
+  fn sqrt_x_squared_positive() {
+    assert_eq!(interpret("Refine[Sqrt[x^2], x > 0]").unwrap(), "x");
+  }
+
+  // Max/Min collapse when the assumption orders their arguments.
+  #[test]
+  fn max_min_ordered() {
+    assert_eq!(interpret("Refine[Max[a, b], a > b]").unwrap(), "a");
+    assert_eq!(interpret("Refine[Max[a, b], a < b]").unwrap(), "b");
+    assert_eq!(interpret("Refine[Max[a, b], a >= b]").unwrap(), "a");
+    assert_eq!(interpret("Refine[Min[a, b], a < b]").unwrap(), "a");
+    assert_eq!(interpret("Refine[Min[a, b], a > b]").unwrap(), "b");
+    // Reversed assumption order is handled symmetrically.
+    assert_eq!(interpret("Refine[Max[a, b], b < a]").unwrap(), "a");
+    // Simplify accepts assumptions the same way.
+    assert_eq!(interpret("Simplify[Max[a, b], a > b]").unwrap(), "a");
+    // x > 0 orders Max[x, 0] (which canonicalises to Max[0, x]).
+    assert_eq!(interpret("Refine[Max[x, 0], x > 0]").unwrap(), "x");
+    assert_eq!(interpret("Refine[Min[x, 0], x > 0]").unwrap(), "0");
+    // No ordering known -> unchanged.
+    assert_eq!(interpret("Refine[Max[a, b], a == b]").unwrap(), "Max[a, b]");
+  }
+
+  // A condition the assumption settles collapses the enclosing head, rather
+  // than being left as Boole[True] / If[True, …]. Values verified against
+  // wolframscript.
+  #[test]
+  fn boole_and_if_collapse() {
+    assert_eq!(interpret("Refine[Boole[x > 0], x > 0]").unwrap(), "1");
+    assert_eq!(interpret("Refine[Boole[x > 0], x < 0]").unwrap(), "0");
+    assert_eq!(interpret("Simplify[Boole[x > 0], x > 0]").unwrap(), "1");
+    assert_eq!(interpret("Refine[If[x > 0, a, b], x > 0]").unwrap(), "a");
+    assert_eq!(interpret("Refine[If[x > 0, a, b], x < 0]").unwrap(), "b");
+    // A stronger assumption still decides it.
+    assert_eq!(interpret("Refine[If[x > 0, a, b], x > 1]").unwrap(), "a");
+  }
+
+  // Boolean combinations fold: settled parts drop out, and the whole
+  // collapses when that settles it.
+  #[test]
+  fn boolean_combinations_fold() {
+    assert_eq!(interpret("Refine[x > 0 && x < 1, x > 2]").unwrap(), "False");
+    assert_eq!(interpret("Refine[x > 0 && x < 3, x > 2]").unwrap(), "x < 3");
+    assert_eq!(interpret("Refine[x > 0 || x < 1, x > 2]").unwrap(), "True");
+    assert_eq!(interpret("Refine[!(x < 1), x > 2]").unwrap(), "True");
+    assert_eq!(
+      interpret("Refine[Boole[x > 0 && x < 1], x > 2]").unwrap(),
+      "0"
+    );
+  }
+
+  // Step functions resolve once the assumption fixes the sign. The boundary
+  // matters: UnitStep[0] is 1, Ramp[0] is 0, HeavisideTheta[0] is not fixed.
+  #[test]
+  fn step_functions_resolve_by_sign() {
+    assert_eq!(interpret("Refine[UnitStep[x], x > 0]").unwrap(), "1");
+    assert_eq!(interpret("Refine[UnitStep[x], x < 0]").unwrap(), "0");
+    assert_eq!(interpret("Refine[UnitStep[x], x >= 0]").unwrap(), "1");
+    // x <= 0 spans both sides of the step, so it stays.
+    assert_eq!(
+      interpret("Refine[UnitStep[x], x <= 0]").unwrap(),
+      "UnitStep[x]"
+    );
+
+    assert_eq!(interpret("Refine[Ramp[x], x > 0]").unwrap(), "x");
+    assert_eq!(interpret("Refine[Ramp[x], x >= 0]").unwrap(), "x");
+    assert_eq!(interpret("Refine[Ramp[x], x < 0]").unwrap(), "0");
+    assert_eq!(interpret("Refine[Ramp[x], x <= 0]").unwrap(), "0");
+
+    assert_eq!(interpret("Refine[HeavisideTheta[x], x > 0]").unwrap(), "1");
+    assert_eq!(interpret("Refine[HeavisideTheta[x], x < 0]").unwrap(), "0");
+    // HeavisideTheta[0] is indeterminate, so x >= 0 settles nothing.
+    assert_eq!(
+      interpret("Refine[HeavisideTheta[x], x >= 0]").unwrap(),
+      "HeavisideTheta[x]"
+    );
+  }
+
+  // Clip is not refined by a sign assumption, matching wolframscript.
+  #[test]
+  fn clip_is_left_alone() {
+    assert_eq!(
+      interpret("Refine[Clip[x, {0, 1}], x > 2]").unwrap(),
+      "Clip[x, {0, 1}]"
+    );
+  }
+
+  // A finite factor with a known sign collapses `factor * Infinity` to the
+  // correctly-signed infinity (matching wolframscript).
+  #[test]
+  fn signed_factor_times_infinity() {
+    assert_eq!(interpret("Refine[a*Infinity, a > 0]").unwrap(), "Infinity");
+    assert_eq!(interpret("Refine[a*Infinity, a < 0]").unwrap(), "-Infinity");
+    assert_eq!(
+      interpret("Refine[a*(-Infinity), a > 0]").unwrap(),
+      "-Infinity"
+    );
+    assert_eq!(
+      interpret("Refine[a*(-Infinity), a < 0]").unwrap(),
+      "Infinity"
+    );
+    // A strict lower bound above zero is also positive.
+    assert_eq!(interpret("Refine[a*Infinity, a > 5]").unwrap(), "Infinity");
+    // A positive numeric coefficient does not change the sign.
+    assert_eq!(
+      interpret("Refine[2 a*Infinity, a > 0]").unwrap(),
+      "Infinity"
+    );
+    // Product of two positive factors stays positive.
+    assert_eq!(
+      interpret("Refine[a b*Infinity, a > 0 && b > 0]").unwrap(),
+      "Infinity"
+    );
+    // Simplify accepts the assumption the same way.
+    assert_eq!(
+      interpret("Simplify[a*Infinity, a > 0]").unwrap(),
+      "Infinity"
+    );
+    // Assuming propagates the assumption to an inner Simplify.
+    assert_eq!(
+      interpret("Assuming[x > 0, Simplify[x*Infinity]]").unwrap(),
+      "Infinity"
+    );
+    // `a >= 0` is not decidable (0 * Infinity is Indeterminate): unchanged.
+    assert_eq!(
+      interpret("Refine[a*Infinity, a >= 0]").unwrap(),
+      "a*Infinity"
+    );
+  }
+
+  #[test]
+  fn sqrt_y_squared_positive() {
+    assert_eq!(interpret("Refine[Sqrt[y^2], y > 0]").unwrap(), "y");
+  }
+
+  #[test]
+  fn abs_x_positive() {
+    assert_eq!(interpret("Refine[Abs[x], x > 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn abs_y_positive() {
+    assert_eq!(interpret("Refine[Abs[y], y > 0]").unwrap(), "y");
+  }
+
+  // Regression: assumption substitution left refined sums uncombined —
+  // Floor[x] and Ceiling[x] both refine to x, giving `x + x` instead of the
+  // combined `2*x`, and `2 Abs[x]` under x < 0 gave the malformed `2*-1*x`.
+  #[test]
+  fn refined_sum_combines_like_terms() {
+    assert_eq!(
+      interpret("Simplify[Floor[x] + Ceiling[x], Element[x, Integers]]")
+        .unwrap(),
+      "2*x"
+    );
+    assert_eq!(
+      interpret("Simplify[2 Floor[x] + Ceiling[x], Element[x, Integers]]")
+        .unwrap(),
+      "3*x"
+    );
+    assert_eq!(
+      interpret("Refine[Floor[x] + Ceiling[x], Element[x, Integers]]").unwrap(),
+      "2*x"
+    );
+    // Numeric Times coefficient folds through the refined -x.
+    assert_eq!(interpret("Refine[Abs[x] + Abs[x], x < 0]").unwrap(), "-2*x");
+  }
+
+  #[test]
+  fn assumptions_option_form() {
+    // Refine[expr, Assumptions -> cond] behaves like Refine[expr, cond].
+    assert_eq!(
+      interpret("Refine[Abs[x], Assumptions -> x > 0]").unwrap(),
+      "x"
+    );
+    assert_eq!(
+      interpret("Refine[Sqrt[x^2], Assumptions -> x > 0]").unwrap(),
+      "x"
+    );
+    assert_eq!(
+      interpret("Refine[Sign[x], Assumptions -> x > 0]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("Refine[Floor[x], Assumptions -> Element[x, Integers]]")
+        .unwrap(),
+      "x"
+    );
+  }
+
+  // 0^k resolves to 0 when the exponent is provably positive (Re[k] > 0).
+  #[test]
+  fn refine_zero_to_positive_power() {
+    assert_eq!(interpret("Refine[0^k, k > 0]").unwrap(), "0");
+    assert_eq!(interpret("Refine[0^(1 + n), n > 0]").unwrap(), "0");
+    assert_eq!(interpret("Simplify[0^(1 + n), n > 0]").unwrap(), "0");
+  }
+
+  // Without a positivity guarantee the power stays unevaluated: `n > 0` does
+  // not force `n - 1 > 0`, and with no assumption `0^(1 + n)` is undetermined.
+  #[test]
+  fn refine_zero_power_undetermined_stays() {
+    assert_eq!(interpret("Refine[0^(1 + n)]").unwrap(), "0^(1 + n)");
+    assert_eq!(interpret("Refine[0^(n - 1), n > 0]").unwrap(), "0^(-1 + n)");
+  }
+
+  #[test]
+  fn sqrt_x_squared_no_assumption() {
+    // Without assumptions, Sqrt[x^2] should stay as Sqrt[x^2]
+    assert_eq!(interpret("Sqrt[x^2]").unwrap(), "Sqrt[x^2]");
+  }
+
+  #[test]
+  fn sqrt_integer_squared() {
+    // Sqrt[4] = 2, Sqrt[9] = 3 (exact integers, no assumptions needed)
+    assert_eq!(interpret("Sqrt[4]").unwrap(), "2");
+    assert_eq!(interpret("Sqrt[9]").unwrap(), "3");
+  }
+
+  #[test]
+  fn sqrt_known_non_negative_squared() {
+    // Sqrt[(positive_constant)^2] should simplify without Refine
+    assert_eq!(interpret("Sqrt[Pi^2]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn refine_nested_expression() {
+    assert_eq!(
+      interpret("Refine[Sqrt[x^2] + Sqrt[y^2], x > 0 && y > 0]").unwrap(),
+      "x + y"
+    );
+  }
+
+  #[test]
+  fn refine_no_simplification_needed() {
+    // Expression that doesn't benefit from assumptions
+    assert_eq!(interpret("Refine[x + 1, x > 0]").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn sqrt_x_squared_x_gt_positive() {
+    // x > 2 implies x > 0, so Sqrt[x^2] → x
+    assert_eq!(interpret("Refine[Sqrt[x^2], x > 2]").unwrap(), "x");
+  }
+
+  #[test]
+  fn sqrt_x_squared_x_ge_positive() {
+    // x >= 5 implies x > 0, so Sqrt[x^2] → x
+    assert_eq!(interpret("Refine[Sqrt[x^2], x >= 5]").unwrap(), "x");
+  }
+
+  #[test]
+  fn sqrt_x_squared_positive_lt_x() {
+    // 3 < x implies x > 0, so Sqrt[x^2] → x
+    assert_eq!(interpret("Refine[Sqrt[x^2], 3 < x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn sqrt_x_squared_positive_le_x() {
+    // 1 <= x implies x > 0, so Sqrt[x^2] → x
+    assert_eq!(interpret("Refine[Sqrt[x^2], 1 <= x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn abs_x_gt_positive() {
+    // x > 7 implies x > 0, so Abs[x] → x
+    assert_eq!(interpret("Refine[Abs[x], x > 7]").unwrap(), "x");
+  }
+
+  // --- Single argument ---
+
+  #[test]
+  fn single_arg_symbol() {
+    assert_eq!(interpret("Refine[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn single_arg_numeric() {
+    assert_eq!(interpret("Refine[Abs[2]]").unwrap(), "2");
+  }
+
+  // --- Negative variable assumptions ---
+
+  #[test]
+  fn abs_x_negative() {
+    assert_eq!(interpret("Refine[Abs[x], x < 0]").unwrap(), "-x");
+  }
+
+  #[test]
+  fn sqrt_x_squared_negative() {
+    assert_eq!(interpret("Refine[Sqrt[x^2], x < 0]").unwrap(), "-x");
+  }
+
+  // --- General (x^n)^(1/m) simplification ---
+
+  #[test]
+  fn cube_root_x_cubed_positive() {
+    assert_eq!(interpret("Refine[(x^3)^(1/3), x >= 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn fifth_root_x_fifth_positive() {
+    assert_eq!(interpret("Refine[(x^5)^(1/5), x >= 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn fourth_root_x_fourth_positive() {
+    assert_eq!(interpret("Refine[(x^4)^(1/4), x >= 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn fourth_root_x_fourth_negative() {
+    // x^4 is always positive, (x^4)^(1/4) = |x| = -x when x < 0
+    assert_eq!(interpret("Refine[(x^4)^(1/4), x < 0]").unwrap(), "-x");
+  }
+
+  #[test]
+  fn sixth_power_cube_root_positive() {
+    // (x^6)^(1/3) = x^2 when x >= 0
+    assert_eq!(interpret("Refine[(x^6)^(1/3), x >= 0]").unwrap(), "x^2");
+  }
+
+  #[test]
+  fn sixth_power_cube_root_negative() {
+    // (x^6)^(1/3) = x^2 when x < 0 (x^6 always positive, result is |x|^2 = x^2)
+    assert_eq!(interpret("Refine[(x^6)^(1/3), x < 0]").unwrap(), "x^2");
+  }
+
+  // --- Sign function ---
+
+  #[test]
+  fn sign_x_positive() {
+    assert_eq!(interpret("Refine[Sign[x], x > 0]").unwrap(), "1");
+  }
+
+  #[test]
+  fn sign_x_negative() {
+    assert_eq!(interpret("Refine[Sign[x], x < 0]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn sign_x_gt_5() {
+    // x > 5 implies positive
+    assert_eq!(interpret("Refine[Sign[x], x > 5]").unwrap(), "1");
+  }
+
+  // --- Arg function ---
+
+  #[test]
+  fn arg_x_positive() {
+    assert_eq!(interpret("Refine[Arg[x], x > 0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arg_x_negative() {
+    assert_eq!(interpret("Refine[Arg[x], x < 0]").unwrap(), "Pi");
+  }
+
+  // --- Re/Im with Element assumptions ---
+
+  #[test]
+  fn re_x_real() {
+    assert_eq!(interpret("Refine[Re[x], Element[x, Reals]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn im_x_real() {
+    assert_eq!(interpret("Refine[Im[x], Element[x, Reals]]").unwrap(), "0");
+  }
+
+  // --- Abs[u]^(even) → u^(even) for real u ---
+
+  #[test]
+  fn abs_squared_real() {
+    assert_eq!(
+      interpret("Refine[Abs[x]^2, Element[x, Reals]]").unwrap(),
+      "x^2"
+    );
+    assert_eq!(
+      interpret("Simplify[Abs[x]^2, Element[x, Reals]]").unwrap(),
+      "x^2"
+    );
+  }
+
+  #[test]
+  fn abs_higher_even_power_real() {
+    assert_eq!(
+      interpret("Refine[Abs[x]^4, Element[x, Reals]]").unwrap(),
+      "x^4"
+    );
+    assert_eq!(
+      interpret("Refine[Abs[x]^6, Element[x, Reals]]").unwrap(),
+      "x^6"
+    );
+  }
+
+  // Odd powers of Abs stay, even with a real assumption.
+  #[test]
+  fn abs_odd_power_real_unchanged() {
+    assert_eq!(
+      interpret("Simplify[Abs[x]^3, Element[x, Reals]]").unwrap(),
+      "Abs[x]^3"
+    );
+  }
+
+  // The Abs argument may itself be a real expression.
+  #[test]
+  fn abs_squared_real_expression() {
+    assert_eq!(
+      interpret("Simplify[Abs[x + 1]^2, Element[x, Reals]]").unwrap(),
+      "(1 + x)^2"
+    );
+    assert_eq!(
+      interpret("Simplify[Abs[2 x]^2, Element[x, Reals]]").unwrap(),
+      "4*x^2"
+    );
+  }
+
+  // Without any real assumption the form is preserved (x may be complex).
+  #[test]
+  fn abs_squared_no_assumption_unchanged() {
+    assert_eq!(interpret("Simplify[Abs[x]^2]").unwrap(), "Abs[x]^2");
+  }
+
+  // --- Floor/Ceiling with Element[x, Integers] ---
+
+  #[test]
+  fn floor_x_integer() {
+    assert_eq!(
+      interpret("Refine[Floor[x], Element[x, Integers]]").unwrap(),
+      "x"
+    );
+  }
+
+  #[test]
+  fn ceiling_x_integer() {
+    assert_eq!(
+      interpret("Refine[Ceiling[x], Element[x, Integers]]").unwrap(),
+      "x"
+    );
+  }
+
+  // --- Inequality simplification under assumptions ---
+
+  #[test]
+  fn x_gt_0_given_x_gt_1() {
+    assert_eq!(interpret("Refine[x > 0, x > 1]").unwrap(), "True");
+  }
+
+  #[test]
+  fn x_lt_0_given_x_gt_1() {
+    assert_eq!(interpret("Refine[x < 0, x > 1]").unwrap(), "False");
+  }
+
+  #[test]
+  fn x_geq_0_given_x_gt_0() {
+    assert_eq!(interpret("Refine[x >= 0, x > 0]").unwrap(), "True");
+  }
+
+  #[test]
+  fn same_inequality() {
+    assert_eq!(interpret("Refine[x > 0, x > 0]").unwrap(), "True");
+  }
+
+  // --- Compound assumptions ---
+
+  #[test]
+  fn abs_sum_compound() {
+    assert_eq!(
+      interpret("Refine[Abs[x] + Abs[y], x > 0 && y > 0]").unwrap(),
+      "x + y"
+    );
+  }
+
+  #[test]
+  fn abs_product_positive() {
+    assert_eq!(
+      interpret("Refine[Abs[x*y], x > 0 && y > 0]").unwrap(),
+      "x*y"
+    );
+  }
+
+  // --- Positive var implied by Element and inequality ---
+
+  #[test]
+  fn abs_x_reals_nonneg() {
+    assert_eq!(
+      interpret("Refine[Abs[x], Element[x, Reals] && x >= 0]").unwrap(),
+      "x"
+    );
+  }
+
+  // --- Element with Alternatives pattern ---
+
+  #[test]
+  fn element_alternatives_reals() {
+    assert_eq!(
+      interpret("Refine[Re[a + b I], Element[a | b, Reals]]").unwrap(),
+      "a"
+    );
+  }
+
+  #[test]
+  fn element_alternatives_integers() {
+    assert_eq!(
+      interpret("Refine[Floor[x], Element[x, Integers]]").unwrap(),
+      "x"
+    );
+  }
+
+  // --- Sqrt[x^2] with x ∈ Reals → Abs[x] ---
+
+  #[test]
+  fn sqrt_x_squared_real() {
+    assert_eq!(
+      interpret("Refine[Sqrt[x^2], Element[x, Reals]]").unwrap(),
+      "Abs[x]"
+    );
+  }
+
+  // --- Power rules ---
+
+  #[test]
+  fn power_of_power_bounded_exp() {
+    assert_eq!(interpret("Refine[(a^b)^c, -1 < b < 1]").unwrap(), "a^(b*c)");
+  }
+
+  #[test]
+  fn combine_power_product_positive_bases() {
+    assert_eq!(
+      interpret("Refine[a^p b^p, a > 0 && b > 0]").unwrap(),
+      "(a*b)^p"
+    );
+  }
+
+  // --- Log simplifications ---
+
+  #[test]
+  fn log_negative_var() {
+    assert_eq!(
+      interpret("Refine[Log[x], x < 0]").unwrap(),
+      "I*Pi + Log[-x]"
+    );
+  }
+
+  #[test]
+  fn log_power_bounded_exp() {
+    assert_eq!(
+      interpret("Refine[Log[x^p], -1 < p < 1]").unwrap(),
+      "p*Log[x]"
+    );
+  }
+
+  // Log[E^y] -> y when y is known real (the exponent's principal log).
+  #[test]
+  fn log_exp_real_var() {
+    assert_eq!(
+      interpret("Refine[Log[E^x], Element[x, Reals]]").unwrap(),
+      "x"
+    );
+  }
+
+  #[test]
+  fn log_exp_positive_var() {
+    assert_eq!(interpret("Refine[Log[E^x], x > 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn log_exp_real_linear_exponent() {
+    assert_eq!(
+      interpret("Refine[Log[E^(2 x)], Element[x, Reals]]").unwrap(),
+      "2*x"
+    );
+    assert_eq!(
+      interpret("Refine[Log[Exp[x]], Element[x, Reals]]").unwrap(),
+      "x"
+    );
+  }
+
+  #[test]
+  fn log_exp_unknown_var_unchanged() {
+    // No realness assumption: the 2*Pi*I branch ambiguity remains, so the
+    // logarithm must not be simplified.
+    assert_eq!(interpret("Refine[Log[E^x], True]").unwrap(), "Log[E^x]");
+    assert_eq!(
+      interpret("Refine[Log[E^x], Element[x, Complexes]]").unwrap(),
+      "Log[E^x]"
+    );
+  }
+
+  // --- Conjugate of a real-valued expression ---
+
+  // Conjugate[x] -> x when x is known real (Element[x, Reals], x > 0, ...).
+  #[test]
+  fn conjugate_real_var() {
+    assert_eq!(
+      interpret("Refine[Conjugate[x], Element[x, Reals]]").unwrap(),
+      "x"
+    );
+    assert_eq!(interpret("Refine[Conjugate[x], x > 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn conjugate_real_compound() {
+    assert_eq!(
+      interpret(
+        "Refine[Conjugate[x + y], Element[x, Reals] && Element[y, Reals]]"
+      )
+      .unwrap(),
+      "x + y"
+    );
+    assert_eq!(
+      interpret("Refine[Conjugate[2 x], Element[x, Reals]]").unwrap(),
+      "2*x"
+    );
+    assert_eq!(
+      interpret("Refine[Conjugate[x^2], Element[x, Reals]]").unwrap(),
+      "x^2"
+    );
+  }
+
+  #[test]
+  fn conjugate_unknown_or_imaginary_unchanged() {
+    // No realness assumption: Conjugate stays put.
+    assert_eq!(
+      interpret("Refine[Conjugate[x], Element[x, Complexes]]").unwrap(),
+      "Conjugate[x]"
+    );
+    // I*x with x real is imaginary, so Conjugate flips its sign rather than
+    // vanishing.
+    assert_eq!(
+      interpret("Refine[Conjugate[I x], Element[x, Reals]]").unwrap(),
+      "-I*x"
+    );
+  }
+
+  // --- Sign predicates under assumptions ---
+
+  #[test]
+  fn positive_predicate() {
+    assert_eq!(interpret("Refine[Positive[x], x > 0]").unwrap(), "True");
+    assert_eq!(interpret("Refine[Positive[x], x < 0]").unwrap(), "False");
+    assert_eq!(interpret("Refine[Positive[x], x <= 0]").unwrap(), "False");
+    assert_eq!(interpret("Refine[Positive[x + 1], x > 0]").unwrap(), "True");
+    assert_eq!(interpret("Refine[Positive[2 x], x > 0]").unwrap(), "True");
+  }
+
+  #[test]
+  fn negative_predicate() {
+    assert_eq!(interpret("Refine[Negative[x], x < 0]").unwrap(), "True");
+    assert_eq!(interpret("Refine[Negative[x], x > 0]").unwrap(), "False");
+    assert_eq!(interpret("Refine[Negative[-x], x > 0]").unwrap(), "True");
+  }
+
+  #[test]
+  fn nonnegative_predicate() {
+    assert_eq!(interpret("Refine[NonNegative[x], x >= 0]").unwrap(), "True");
+    assert_eq!(interpret("Refine[NonNegative[x], x < 0]").unwrap(), "False");
+    assert_eq!(
+      interpret("Refine[NonNegative[x^2], Element[x, Reals]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn nonpositive_predicate() {
+    assert_eq!(interpret("Refine[NonPositive[x], x < 0]").unwrap(), "True");
+    assert_eq!(interpret("Refine[NonPositive[x], x <= 0]").unwrap(), "True");
+  }
+
+  // x <= 0 means non-positive, NOT strictly negative: these stay unevaluated
+  // (x could be 0), and Sqrt[x^2] still collapses to -x.
+  #[test]
+  fn nonpositive_assumption_is_not_strict() {
+    assert_eq!(
+      interpret("Refine[Negative[x], x <= 0]").unwrap(),
+      "Negative[x]"
+    );
+    assert_eq!(
+      interpret("Refine[NonNegative[x], x <= 0]").unwrap(),
+      "NonNegative[x]"
+    );
+    assert_eq!(interpret("Refine[Sqrt[x^2], x <= 0]").unwrap(), "-x");
+    assert_eq!(interpret("Refine[Abs[x], x <= 0]").unwrap(), "-x");
+  }
+
+  // --- Trig with integer multiples of Pi ---
+
+  #[test]
+  fn sin_k_pi_integer() {
+    assert_eq!(
+      interpret("Refine[Sin[k Pi], Element[k, Integers]]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn cos_x_plus_k_pi_integer() {
+    assert_eq!(
+      interpret("Refine[Cos[x + k Pi], Element[k, Integers]]").unwrap(),
+      "(-1)^k*Cos[x]"
+    );
+  }
+
+  // --- ArcTan[Tan[x]] ---
+
+  #[test]
+  fn arctan_tan_in_range() {
+    assert_eq!(
+      interpret("Refine[ArcTan[Tan[x]], -Pi/2 < Re[x] < Pi/2]").unwrap(),
+      "x"
+    );
+  }
+
+  // --- Algebraic comparisons ---
+
+  #[test]
+  fn equation_by_substitution() {
+    assert_eq!(
+      interpret("Refine[a^2 - b^2 + 1 == 0, a + b == 0]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn quadratic_form_nonneg() {
+    assert_eq!(
+      interpret("Refine[a^2 - a b + b^2 >= 0, Element[a | b, Reals]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn sign_positive_definite() {
+    assert_eq!(
+      interpret("Refine[Sign[x^2 - x y + y^2 + 1], Element[x | y, Reals]]")
+        .unwrap(),
+      "1"
+    );
+  }
+
+  // --- Element membership ---
+
+  #[test]
+  fn element_real_positive_division() {
+    assert_eq!(
+      interpret(
+        "Refine[Element[(2 x + x^p)/(x Gamma[x + 2]), Reals], x > 0 && p > 0]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn element_integer_floor_power() {
+    assert_eq!(
+      interpret("Refine[Element[2 k^3 Floor[x]^k, Integers], Element[k, Integers] && k > 0 && Element[x, Reals]]").unwrap(),
+      "True"
+    );
+  }
+
+  // --- Floor/Ceiling with compound expressions ---
+
+  #[test]
+  fn floor_integer_linear() {
+    assert_eq!(
+      interpret("Refine[Floor[2 a + 1], Element[a, Integers]]").unwrap(),
+      "1 + 2*a"
+    );
+  }
+
+  #[test]
+  fn ceiling_bounded_var() {
+    assert_eq!(interpret("Refine[Ceiling[x], 2 < x <= 3]").unwrap(), "3");
+  }
+
+  // --- FractionalPart and Mod ---
+
+  #[test]
+  fn fractional_part_negative_with_mod() {
+    assert_eq!(
+      interpret("Refine[FractionalPart[a], a < 0 && Mod[a, 1] == 1/3]")
+        .unwrap(),
+      "-2/3"
+    );
+  }
+
+  #[test]
+  fn mod_from_integer_element() {
+    assert_eq!(
+      interpret("Refine[Mod[a, 4], Element[(a + 3)/4, Integers]]").unwrap(),
+      "1"
+    );
+  }
+
+  // --- Assuming + Refine ---
+
+  #[test]
+  fn assuming_refine_compound_comparison() {
+    assert_eq!(
+      interpret("Assuming[x >= 0 && y < 0, Refine[x - y > 0]]").unwrap(),
+      "True"
+    );
+  }
+
+  // --- Nonnegative variable handling ---
+
+  #[test]
+  fn sqrt_x_squared_nonneg() {
+    assert_eq!(interpret("Refine[Sqrt[x^2], x >= 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn inequality_false_under_sum_of_squares_constraint() {
+    // (x-1)^2 + (y-2)^2 >= 2 when x^2 + y^2 <= 1, so < 3/2 is False
+    assert_eq!(
+      interpret("Refine[(x - 1)^2 + (y - 2)^2 < 3/2, x^2 + y^2 <= 1]").unwrap(),
+      "False"
+    );
+  }
+
+  // Refining a Piecewise re-evaluates it once the assumption resolves a case
+  // condition to True/False, so the Piecewise collapses to a plain value.
+  #[test]
+  fn refine_piecewise_collapses() {
+    // The single case's condition becomes True -> its value.
+    assert_eq!(
+      interpret("Refine[Piecewise[{{x, x > 0}}], x > 0]").unwrap(),
+      "x"
+    );
+    // The only case's condition becomes False -> the default (0).
+    assert_eq!(
+      interpret("Refine[Piecewise[{{x, x > 0}}], x < 0]").unwrap(),
+      "0"
+    );
+    // The first still-possible case wins.
+    assert_eq!(
+      interpret("Refine[Piecewise[{{a, x > 0}, {b, x < 0}}], x > 0]").unwrap(),
+      "a"
+    );
+    // Earlier case falsified; a later literal-True case supplies the value.
+    assert_eq!(
+      interpret("Refine[Piecewise[{{a, x > 0}, {b, True}}], x < 0]").unwrap(),
+      "b"
+    );
+    // A symbolic value is preserved when its condition holds.
+    assert_eq!(
+      interpret("Refine[Piecewise[{{x^2, x > 0}}], x > 0]").unwrap(),
+      "x^2"
+    );
+  }
+}
+
+mod simplify_solve_verification {
+  use super::*;
+
+  #[test]
+  fn simplify_quadratic_formula_substitution() {
+    // Substituting quadratic formula roots back into polynomial should give 0
+    assert_eq!(
+      interpret(
+        "sol = Solve[a x^2 + b x + c == 0, x]; Simplify[a x^2 + b x + c /. sol]"
+      )
+      .unwrap(),
+      "{0, 0}"
+    );
+  }
+
+  #[test]
+  fn simplify_threads_over_list() {
+    assert_eq!(interpret("Simplify[{1 + 1, 2 + 3}]").unwrap(), "{2, 5}");
+  }
+
+  #[test]
+  fn together_fraction_power() {
+    // Together should correctly handle (sum/product)^n terms
+    assert_eq!(
+      interpret("Together[a*(x/a)^2 + x]").unwrap(),
+      "(a*x + x^2)/a"
+    );
+  }
+}
+
+mod expand_fraction_power {
+  use super::*;
+
+  #[test]
+  fn expand_fraction_squared() {
+    // (x+y)^2/z^2 expanded, displaying negative exponents as fractions
+    assert_eq!(
+      interpret("Expand[((x + y)/z)^2]").unwrap(),
+      "x^2/z^2 + (2*x*y)/z^2 + y^2/z^2"
+    );
+  }
+
+  #[test]
+  fn expand_product_power() {
+    assert_eq!(interpret("Expand[(2*a)^2]").unwrap(), "4*a^2");
+  }
+
+  #[test]
+  fn expand_product_power_three() {
+    assert_eq!(interpret("Expand[(3*x)^3]").unwrap(), "27*x^3");
+  }
+
+  #[test]
+  fn expand_high_power_bigint_coefficients() {
+    // Regression: Expand[(1 + x)^200] panicked with i128 overflow once the
+    // binomial coefficients exceeded i128 (~p >= 132), then produced
+    // uncombined/wrong terms. It must promote to BigInteger and stay exact.
+    // 201 distinct powers, and the result equals the binomial sum.
+    assert_eq!(interpret("Length[Expand[(1 + x)^200]]").unwrap(), "201");
+    assert_eq!(
+      interpret(
+        "Expand[(1 + x)^200] - Sum[Binomial[200, k] x^k, {k, 0, 200}] // Expand"
+      )
+      .unwrap(),
+      "0"
+    );
+    // Small integer cases are unchanged.
+    assert_eq!(
+      interpret("Expand[(1 + x)^4]").unwrap(),
+      "1 + 4*x + 6*x^2 + 4*x^3 + x^4"
+    );
+  }
+
+  #[test]
+  fn expand_rational_coefficient_folds_term_numerics() {
+    // Regression: a rational leading coefficient times a binomial power left
+    // each cross-term with an uncombined numeric product (e.g. 15*2 instead
+    // of 30). The per-term numeric fold now matches wolframscript.
+    assert_eq!(
+      interpret("Expand[15 (-1 + x)^2 / 4]").unwrap(),
+      "15/4 - (15*x)/2 + (15*x^2)/4"
+    );
+    assert_eq!(
+      interpret("Expand[15 (-1 + x)^2 / 2]").unwrap(),
+      "15/2 - 15*x + (15*x^2)/2"
+    );
+    // A single foldable cross term collapses cleanly.
+    assert_eq!(interpret("Expand[(x/2 + 1)^2]").unwrap(), "1 + x + x^2/4");
+    assert_eq!(
+      interpret("Expand[6 (x + 1/2)^2]").unwrap(),
+      "3/2 + 6*x + 6*x^2"
+    );
+    // Integer-coefficient and multivariate expansions are unchanged.
+    assert_eq!(
+      interpret("Expand[15 (-1 + x)^2]").unwrap(),
+      "15 - 30*x + 15*x^2"
+    );
+    assert_eq!(
+      interpret("Expand[(a + b + c)^2]").unwrap(),
+      "a^2 + 2*a*b + b^2 + 2*a*c + 2*b*c + c^2"
+    );
+  }
+
+  #[test]
+  fn expand_rational_coefficient_inputform_subtracts() {
+    // Regression: a Plus term with a negative Rational/Real coefficient
+    // (`Times[Rational[-15, 2], x]`) rendered in InputForm as an addition of a
+    // negative coefficient (`+ (-15*x)/2`) instead of a subtraction. The
+    // BinaryOp::Times branch of the Plus InputForm renderer only pulled the
+    // sign out for negative Integer coefficients; now it handles negative
+    // Rational and Real coefficients too, matching wolframscript.
+    assert_eq!(
+      interpret("ToString[Expand[15 (-1 + x)^2 / 4], InputForm]").unwrap(),
+      "15/4 - (15*x)/2 + (15*x^2)/4"
+    );
+    assert_eq!(
+      interpret("ToString[3/4 + (-1/2) x, InputForm]").unwrap(),
+      "3/4 - x/2"
+    );
+    assert_eq!(
+      interpret("ToString[Expand[1.5 (x - 1)], InputForm]").unwrap(),
+      "-1.5 + 1.5*x"
+    );
+  }
+}
+
+mod root {
+  use super::*;
+
+  #[test]
+  fn sqrt_2_first_root() {
+    assert_eq!(interpret("Root[#^2 - 2 &, 1]").unwrap(), "-Sqrt[2]");
+  }
+
+  #[test]
+  fn sqrt_2_second_root() {
+    assert_eq!(interpret("Root[#^2 - 2 &, 2]").unwrap(), "Sqrt[2]");
+  }
+
+  #[test]
+  fn linear() {
+    assert_eq!(interpret("Root[# &, 1]").unwrap(), "0");
+  }
+
+  // A polynomial expression in a single variable is normalized to the pure
+  // function form (variable -> Slot[1]), matching wolframscript.
+  #[test]
+  fn polynomial_expression_form() {
+    // Closed-form (quadratic) roots evaluate.
+    assert_eq!(interpret("Root[x^2 - 2, 2]").unwrap(), "Sqrt[2]");
+    assert_eq!(interpret("Root[x^2 - 2, 1]").unwrap(), "-Sqrt[2]");
+    // The variable name does not matter.
+    assert_eq!(interpret("Root[y^2 - 3, 1]").unwrap(), "-Sqrt[3]");
+    // Higher-degree roots keep the canonical Root[poly &, k, 0] form.
+    assert_eq!(
+      interpret("Root[x^3 - 2, 1]").unwrap(),
+      "Root[-2 + #1^3 & , 1, 0]"
+    );
+    assert_eq!(
+      interpret("Root[x^4 + x + 1, 2]").unwrap(),
+      "Root[1 + #1 + #1^4 & , 2, 0]"
+    );
+    // Two variables are ambiguous, so the call stays unevaluated.
+    assert_eq!(interpret("Root[x^2 + y, 1]").unwrap(), "Root[x^2 + y, 1]");
+  }
+
+  #[test]
+  fn quadratic_integer_roots() {
+    assert_eq!(interpret("Root[#^2 - 3*# + 2 &, 1]").unwrap(), "1");
+    assert_eq!(interpret("Root[#^2 - 3*# + 2 &, 2]").unwrap(), "2");
+  }
+
+  #[test]
+  fn complex_roots() {
+    assert_eq!(interpret("Root[#^2 + 1 &, 1]").unwrap(), "-I");
+    assert_eq!(interpret("Root[#^2 + 1 &, 2]").unwrap(), "I");
+  }
+
+  #[test]
+  fn fourth_roots_of_unity_minus_one() {
+    // x^4 - 1: roots are -1, 1, -I, I
+    assert_eq!(interpret("Root[#^4 - 1 &, 1]").unwrap(), "-1");
+    assert_eq!(interpret("Root[#^4 - 1 &, 2]").unwrap(), "1");
+    assert_eq!(interpret("Root[#^4 - 1 &, 3]").unwrap(), "-I");
+    assert_eq!(interpret("Root[#^4 - 1 &, 4]").unwrap(), "I");
+  }
+
+  #[test]
+  fn cubic_with_real_root() {
+    // x^3 - 1: real root is 1
+    assert_eq!(interpret("Root[#^3 - 1 &, 1]").unwrap(), "1");
+  }
+
+  #[test]
+  fn numerical_value() {
+    let result = interpret("N[Root[#^2 - 2 &, 1]]").unwrap();
+    let val: f64 = result.parse().expect("should be a number");
+    assert!(
+      (val + std::f64::consts::SQRT_2).abs() < 1e-10,
+      "Expected -1.414..., got {val}"
+    );
+  }
+
+  // N of a higher-degree Root (no radical form) numerically finds the k-th
+  // root: real roots first in increasing order.
+  #[test]
+  fn numerical_value_quintic_real_root() {
+    let result = interpret("N[Root[#^5 - # - 1 &, 1]]").unwrap();
+    let val: f64 = result.parse().expect("should be a number");
+    assert!(
+      (val - 1.1673039782614187).abs() < 1e-10,
+      "Expected 1.1673..., got {val}"
+    );
+  }
+
+  // Root also accepts an ordinary polynomial expression in one symbol (not
+  // only a pure function). N[Root[x^3 - 2, 1]] finds the real cube root of 2.
+  #[test]
+  fn numerical_value_expression_form_cube_root() {
+    assert_eq!(
+      interpret("N[Root[x^3 - 2, 1]]").unwrap(),
+      "1.2599210498948732"
+    );
+  }
+
+  #[test]
+  fn numerical_value_expression_form_sqrt_ordering() {
+    // x^2 - 2 → roots -Sqrt[2], Sqrt[2] in increasing order.
+    assert_eq!(
+      interpret("N[Root[x^2 - 2, 1]]").unwrap(),
+      "-1.4142135623730951"
+    );
+    assert_eq!(
+      interpret("N[Root[x^2 - 2, 2]]").unwrap(),
+      "1.4142135623730951"
+    );
+  }
+
+  #[test]
+  fn numerical_value_expression_form_casus_irreducibilis() {
+    // x^3 - x - 1 has one real root; no radical form, so N finds it numerically.
+    assert_eq!(
+      interpret("N[Root[x^3 - x - 1, 1]]").unwrap(),
+      "1.324717957244746"
+    );
+  }
+
+  // A quartic with four real roots is returned in increasing order.
+  #[test]
+  fn numerical_value_quartic_all_real() {
+    assert_eq!(
+      interpret("Table[N[Root[#^4 - 5 #^2 + 4 &, k]], {k, 1, 4}]").unwrap(),
+      "{-2., -1., 1., 2.}"
+    );
+  }
+
+  // Complex roots follow the reals, ordered by increasing real then
+  // imaginary part. Re/Im are checked to avoid last-digit float noise.
+  #[test]
+  fn numerical_value_complex_root() {
+    let re = interpret("Re[N[Root[#^3 - 2 &, 2]]]")
+      .unwrap()
+      .parse::<f64>()
+      .unwrap();
+    let im = interpret("Im[N[Root[#^3 - 2 &, 2]]]")
+      .unwrap()
+      .parse::<f64>()
+      .unwrap();
+    assert!((re - (-0.6299605249474366)).abs() < 1e-10);
+    assert!((im - (-1.0911236359717214)).abs() < 1e-10);
+  }
+
+  #[test]
+  fn out_of_range_error() {
+    assert!(interpret("Root[#^2 - 1 &, 3]").is_err());
+  }
+
+  // `N[Root[…], prec]` — arbitrary-precision evaluation of a root with no
+  // closed radical form (the "casus irreducibilis" cubic case). Digits
+  // beyond machine precision must be correct, not garbage padding: this is
+  // the plastic constant, the real root of x^3 - x - 1.
+  #[test]
+  fn arbitrary_precision_casus_irreducibilis() {
+    assert_eq!(
+      interpret("N[Root[#^3 - # - 1 &, 1], 10]").unwrap(),
+      "1.32471795724474602596090885447809734073`10."
+    );
+    assert_eq!(
+      interpret("N[Root[#^3 - # - 1 &, 1], 30]").unwrap(),
+      "1.324717957244746025960908854478097340734404056901733364534`30."
+    );
+  }
+
+  // A higher precision request keeps agreeing with the machine-precision
+  // value on their shared leading digits.
+  #[test]
+  fn arbitrary_precision_matches_machine_precision_prefix() {
+    let machine = interpret("N[Root[#^3 - # - 1 &, 1]]").unwrap();
+    let arbitrary = interpret("N[Root[#^3 - # - 1 &, 1], 12]").unwrap();
+    let arbitrary_digits = arbitrary.split('`').next().unwrap();
+    assert!(
+      arbitrary_digits.starts_with(&machine[..machine.len() - 3]),
+      "machine={machine} arbitrary={arbitrary}"
+    );
+  }
+
+  // Arbitrary precision agrees with the closed radical form for a
+  // quadratic root, and with the machine-precision digits for a quartic
+  // with an irrational real root.
+  #[test]
+  fn arbitrary_precision_quadratic_and_quartic() {
+    assert_eq!(
+      interpret("N[Root[#^2 - 2 &, 1], 15]").unwrap(),
+      "-1.41421356237309504880168872420969807857`15."
+    );
+    assert_eq!(
+      interpret("N[Root[#^4 - # - 1 &, 1], 15]").unwrap(),
+      "-0.72449195900051561158837228218703656579`15."
+    );
+  }
+}
+
+mod root_sum {
+  use super::*;
+
+  // RootSum is not implemented; the call stays symbolic. Woxi's output
+  // matches wolframscript byte-for-byte, including the formatting of
+  // nested pure functions.
+  #[test]
+  fn irreducible_cyclotomic_stays_symbolic() {
+    assert_eq!(
+      interpret("RootSum[1+#+#^2+#^3+#^4 &, Log[x + #] &]").unwrap(),
+      "RootSum[1 + #1 + #1^2 + #1^3 + #1^4 & , Log[x + #1] & ]"
+    );
+  }
+
+  // For a polynomial f with numeric coefficients and a polynomial form, the
+  // sum over the roots is a symmetric function obtainable from Newton's power
+  // sums — an exact rational that needs no explicit roots (e.g. it works even
+  // for the unsolvable quintic below).
+  #[test]
+  fn sum_of_roots() {
+    // Sum of the roots of x^2 - 2 is 0 (no x term).
+    assert_eq!(interpret("RootSum[#^2 - 2 &, # &]").unwrap(), "0");
+    assert_eq!(interpret("RootSum[#^3 - 2 &, # &]").unwrap(), "0");
+    assert_eq!(interpret("RootSum[#^4 - 1 &, # &]").unwrap(), "0");
+  }
+
+  #[test]
+  fn sum_of_powers_of_roots() {
+    // Roots 1, 2: sum of squares = 5, sum of cubes = 35.
+    assert_eq!(interpret("RootSum[#^2 - 3 # + 2 &, #^2 &]").unwrap(), "5");
+    assert_eq!(interpret("RootSum[#^2 - 5 # + 6 &, #^3 &]").unwrap(), "35");
+    // Sum of squares of the roots of x^2 - 2 is 2 + 2 = 4.
+    assert_eq!(interpret("RootSum[#^2 - 2 &, #^2 &]").unwrap(), "4");
+  }
+
+  #[test]
+  fn unsolvable_cubic_and_quintic_power_sums() {
+    // x^3 - x - 1 (no closed-form roots): sum of squares = e1^2 - 2 e2 = 2.
+    assert_eq!(interpret("RootSum[#^3 - # - 1 &, #^2 &]").unwrap(), "2");
+    assert_eq!(interpret("RootSum[#^3 + # + 1 &, #^2 &]").unwrap(), "-2");
+    // x^5 - x - 1 (unsolvable by radicals): sum of squares = 0.
+    assert_eq!(interpret("RootSum[#^5 - # - 1 &, #^2 &]").unwrap(), "0");
+  }
+
+  #[test]
+  fn non_monic_and_affine_form() {
+    // 2 x^2 - 8 has roots ±2; sum of squares = 8.
+    assert_eq!(interpret("RootSum[2 #^2 - 8 &, #^2 &]").unwrap(), "8");
+    // form 3 #^2 + 1: 3*(sum of squares) + 1*(root count) = 3*4 + 2 = 14.
+    assert_eq!(interpret("RootSum[#^2 - 2 &, 3 #^2 + 1 &]").unwrap(), "14");
+    // Constant form sums to constant * (number of roots).
+    assert_eq!(interpret("RootSum[#^2 - 2 &, 5 &]").unwrap(), "10");
+    // Linear polynomial: single root 3, squared = 9.
+    assert_eq!(interpret("RootSum[# - 3 &, #^2 &]").unwrap(), "9");
+  }
+}
+
+mod polynomial_mod {
+  use super::*;
+
+  #[test]
+  fn basic_cubic() {
+    assert_eq!(
+      interpret("PolynomialMod[x^3 + 2x + 1, 3]").unwrap(),
+      "1 + 2*x + x^3"
+    );
+  }
+
+  #[test]
+  fn all_coefficients_zero() {
+    assert_eq!(interpret("PolynomialMod[6x^2 + 9x + 12, 3]").unwrap(), "0");
+  }
+
+  #[test]
+  fn mod_one() {
+    assert_eq!(interpret("PolynomialMod[x + y + z, 1]").unwrap(), "0");
+  }
+
+  #[test]
+  fn constant_polynomial() {
+    assert_eq!(interpret("PolynomialMod[7, 3]").unwrap(), "1");
+  }
+
+  #[test]
+  fn zero_polynomial() {
+    assert_eq!(interpret("PolynomialMod[0, 5]").unwrap(), "0");
+  }
+
+  #[test]
+  fn with_large_coefficients() {
+    assert_eq!(
+      interpret("PolynomialMod[5x^2 + 3x + 7, 4]").unwrap(),
+      "3 + 3*x + x^2"
+    );
+  }
+
+  #[test]
+  fn multivariate() {
+    assert_eq!(interpret("PolynomialMod[3x + 4y + 5, 3]").unwrap(), "2 + y");
+  }
+
+  #[test]
+  fn symbolic_modulus_unevaluated() {
+    assert_eq!(interpret("PolynomialMod[x^2, m]").unwrap(), "x^2");
+  }
+}
+
+mod interpolating_polynomial {
+  use super::*;
+
+  #[test]
+  fn quadratic_explicit_points() {
+    // Through (1,1),(2,4),(3,9) → x^2
+    assert_eq!(
+      interpret("Expand[InterpolatingPolynomial[{{1,1},{2,4},{3,9}}, x]]")
+        .unwrap(),
+      "x^2"
+    );
+  }
+
+  #[test]
+  fn quadratic_implicit_points() {
+    // {1,4,9} at x=1,2,3 → x^2
+    assert_eq!(
+      interpret("Expand[InterpolatingPolynomial[{1,4,9}, x]]").unwrap(),
+      "x^2"
+    );
+  }
+
+  #[test]
+  fn linear_two_points() {
+    // Through (0,0),(1,1) → x
+    assert_eq!(
+      interpret("InterpolatingPolynomial[{{0,0},{1,1}}, x]").unwrap(),
+      "x"
+    );
+  }
+
+  #[test]
+  fn constant_one_point() {
+    // Single point → constant
+    assert_eq!(
+      interpret("InterpolatingPolynomial[{{5,3}}, x]").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn cubic_values() {
+    // {0,1,8,27} at x=1,2,3,4 should give (x-1)^3
+    let result =
+      interpret("Expand[InterpolatingPolynomial[{0, 1, 8, 27}, x]]").unwrap();
+    assert_eq!(result, "-1 + 3*x - 3*x^2 + x^3");
+  }
+
+  #[test]
+  fn newton_form_structure() {
+    // InterpolatingPolynomial[{{1,1},{2,4},{3,9}}, x]
+    // Newton form: 1 + (x-1)*(1 + 3*(x-2)) = 1 + (x-1)*(1 + 3x - 6) = 1 + (-1+x)*(3*(-1+x) - 2)
+    let _result =
+      interpret("InterpolatingPolynomial[{{1,1},{2,4},{3,9}}, x]").unwrap();
+    // Just verify it evaluates to correct values
+    let at1 =
+      interpret("InterpolatingPolynomial[{{1,1},{2,4},{3,9}}, x] /. x -> 1")
+        .unwrap();
+    let at2 =
+      interpret("InterpolatingPolynomial[{{1,1},{2,4},{3,9}}, x] /. x -> 2")
+        .unwrap();
+    let at3 =
+      interpret("InterpolatingPolynomial[{{1,1},{2,4},{3,9}}, x] /. x -> 3")
+        .unwrap();
+    assert_eq!(at1, "1");
+    assert_eq!(at2, "4");
+    assert_eq!(at3, "9");
+  }
+
+  #[test]
+  fn linear_three_collinear() {
+    // Through (0,0),(1,2),(2,4) → 2x
+    assert_eq!(
+      interpret("Expand[InterpolatingPolynomial[{{0,0},{1,2},{2,4}}, x]]")
+        .unwrap(),
+      "2*x"
+    );
+  }
+
+  #[test]
+  fn non_list_unevaluated() {
+    assert_eq!(
+      interpret("InterpolatingPolynomial[5, x]").unwrap(),
+      "InterpolatingPolynomial[5, x]"
+    );
+  }
+}
+
+// RootReduce[α] reduces an algebraic number to canonical form: rationals stay
+// rational, degree-2 numbers become a simplified radical, and higher-degree
+// numbers become a Root[minpoly &, k, 0] object. All expected values verified
+// against wolframscript.
+mod root_reduce {
+  use super::*;
+
+  #[test]
+  fn rationals_pass_through() {
+    assert_eq!(interpret("RootReduce[3]").unwrap(), "3");
+    assert_eq!(interpret("RootReduce[2/3]").unwrap(), "2/3");
+  }
+
+  #[test]
+  fn quadratics_stay_radical() {
+    assert_eq!(interpret("RootReduce[Sqrt[2]]").unwrap(), "Sqrt[2]");
+    assert_eq!(interpret("RootReduce[1 + Sqrt[2]]").unwrap(), "1 + Sqrt[2]");
+    assert_eq!(
+      interpret("RootReduce[(1 + Sqrt[5])/2]").unwrap(),
+      "(1 + Sqrt[5])/2"
+    );
+    assert_eq!(interpret("RootReduce[Sqrt[2]*Sqrt[3]]").unwrap(), "Sqrt[6]");
+    assert_eq!(interpret("RootReduce[I]").unwrap(), "I");
+  }
+
+  #[test]
+  fn nested_radical_denests() {
+    // Sqrt[3 + 2 Sqrt[2]] = 1 + Sqrt[2]; the annihilating polynomial is
+    // reducible (x^4 - 6 x^2 + 1) so RootReduce must pick the degree-2 factor.
+    assert_eq!(
+      interpret("RootReduce[Sqrt[3 + 2 Sqrt[2]]]").unwrap(),
+      "1 + Sqrt[2]"
+    );
+  }
+
+  #[test]
+  fn higher_degree_becomes_root_object() {
+    assert_eq!(
+      interpret("RootReduce[Sqrt[2] + Sqrt[3]]").unwrap(),
+      "Root[1 - 10*#1^2 + #1^4 & , 4, 0]"
+    );
+    assert_eq!(
+      interpret("RootReduce[2^(1/3) + 2^(2/3)]").unwrap(),
+      "Root[-6 - 6*#1 + #1^3 & , 1, 0]"
+    );
+    // Sqrt[5 + 2 Sqrt[6]] = Sqrt[2] + Sqrt[3] (degree 4).
+    assert_eq!(
+      interpret("RootReduce[Sqrt[5 + 2 Sqrt[6]]]").unwrap(),
+      "Root[1 - 10*#1^2 + #1^4 & , 4, 0]"
+    );
+  }
+
+  #[test]
+  fn existing_root_is_kept() {
+    assert_eq!(
+      interpret("RootReduce[Root[#^3 - 2 &, 1]]").unwrap(),
+      "Root[-2 + #1^3 & , 1, 0]"
+    );
+  }
+
+  #[test]
+  fn non_algebraic_returns_unchanged() {
+    assert_eq!(interpret("RootReduce[x]").unwrap(), "x");
+    assert_eq!(interpret("RootReduce[Pi]").unwrap(), "Pi");
+    assert_eq!(interpret("RootReduce[Sin[1]]").unwrap(), "Sin[1]");
+  }
+
+  // A rational polynomial in one `Root` object is an element of that root's
+  // cubic field, so its minimal polynomial is a cubic too. Composing the
+  // three terms with pairwise resultants instead built a degree-27
+  // annihilating polynomial and then tried to factor it, which took minutes
+  // per number; the field's own multiplication matrix answers directly.
+  #[test]
+  fn polynomial_in_a_root_object_stays_in_its_field() {
+    let alpha = "Root[-32 - 6*#1 + #1^3 &, 1, 0]";
+    assert_eq!(
+      interpret(&format!("RootReduce[1/144 + {alpha}/18 + 5 {alpha}^2/288]"))
+        .unwrap(),
+      "Root[-1 - 14*#1 - 33*#1^2 + 144*#1^3 & , 1, 0]"
+    );
+    // And the square root of such an element, when it happens to live in a
+    // cubic field too, comes back as that cubic rather than as the
+    // reducible sextic the resultant produces.
+    assert_eq!(
+      interpret(&format!(
+        "RootReduce[Sqrt[1/144 + {alpha}/18 + 5 {alpha}^2/288]]"
+      ))
+      .unwrap(),
+      "Root[-1 + 2*#1 - 9*#1^2 + 12*#1^3 & , 1, 0]"
+    );
+  }
+}
+
+mod minimal_polynomial {
+  use super::*;
+
+  #[test]
+  fn integer() {
+    assert_eq!(interpret("MinimalPolynomial[3, x]").unwrap(), "-3 + x");
+  }
+
+  // Sums of radicals over one base live in a single field extension; the
+  // pairwise resultant composition used to return a reducible degree-9
+  // annihilating polynomial for these instead of the cubic minimal
+  // polynomial.
+  #[test]
+  fn same_base_radical_sums() {
+    assert_eq!(
+      interpret("MinimalPolynomial[2^(1/3) + 4^(1/3), x]").unwrap(),
+      "-6 - 6*x + x^3"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[2^(1/3) + 2^(2/3), x]").unwrap(),
+      "-6 - 6*x + x^3"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[1 + 2^(1/3) + 4^(1/3), x]").unwrap(),
+      "-1 - 3*x - 3*x^2 + x^3"
+    );
+  }
+
+  #[test]
+  fn rational() {
+    assert_eq!(interpret("MinimalPolynomial[1/3, x]").unwrap(), "-1 + 3*x");
+  }
+
+  #[test]
+  fn sqrt_2() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[2], x]").unwrap(),
+      "-2 + x^2"
+    );
+  }
+
+  #[test]
+  fn sqrt_3() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[3], x]").unwrap(),
+      "-3 + x^2"
+    );
+  }
+
+  // MinimalPolynomial is Listable: it threads over a list (or matrix) of
+  // algebraic numbers in the first argument.
+  #[test]
+  fn threads_over_list() {
+    assert_eq!(
+      interpret("MinimalPolynomial[{2, 3}, x]").unwrap(),
+      "{-2 + x, -3 + x}"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[{Sqrt[2], Sqrt[3]}, x]").unwrap(),
+      "{-2 + x^2, -3 + x^2}"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[{{2, 0}, {0, 2}}, x]").unwrap(),
+      "{{-2 + x, x}, {x, -2 + x}}"
+    );
+  }
+
+  #[test]
+  fn cube_root_2() {
+    assert_eq!(
+      interpret("MinimalPolynomial[2^(1/3), x]").unwrap(),
+      "-2 + x^3"
+    );
+  }
+
+  #[test]
+  fn golden_ratio() {
+    assert_eq!(
+      interpret("MinimalPolynomial[GoldenRatio, x]").unwrap(),
+      "-1 - x + x^2"
+    );
+  }
+
+  #[test]
+  fn imaginary_unit() {
+    assert_eq!(interpret("MinimalPolynomial[I, x]").unwrap(), "1 + x^2");
+  }
+
+  #[test]
+  fn sum_of_square_roots() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[2] + Sqrt[3], x]").unwrap(),
+      "1 - 10*x^2 + x^4"
+    );
+  }
+
+  #[test]
+  fn scaled_sqrt() {
+    assert_eq!(
+      interpret("MinimalPolynomial[2*Sqrt[3], x]").unwrap(),
+      "-12 + x^2"
+    );
+  }
+
+  #[test]
+  fn one_plus_sqrt_2() {
+    assert_eq!(
+      interpret("MinimalPolynomial[1 + Sqrt[2], x]").unwrap(),
+      "-1 - 2*x + x^2"
+    );
+  }
+
+  // A quotient that stays a Divide BinaryOp (e.g. Cos[Pi/5] → (1+Sqrt[5])/4)
+  // is rewritten as a product a * b^-1, so its minimal polynomial is found.
+  #[test]
+  fn divide_form() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Cos[Pi/5], x]").unwrap(),
+      "-1 - 2*x + 4*x^2"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[Cos[2*Pi/5], x]").unwrap(),
+      "-1 + 2*x + 4*x^2"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[(3 + Sqrt[2])/7, x]").unwrap(),
+      "1 - 6*x + 7*x^2"
+    );
+  }
+
+  // The reciprocal of an algebraic number (e.g. Cos[Pi/4] = Sqrt[2]^-1) has the
+  // coefficient-reversed minimal polynomial of the base.
+  #[test]
+  fn reciprocal_of_algebraic() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Cos[Pi/4], x]").unwrap(),
+      "-1 + 2*x^2"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[1/2^(1/3), x]").unwrap(),
+      "-1 + 2*x^3"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[1/(1 + Sqrt[2]), x]").unwrap(),
+      "-1 + 2*x + x^2"
+    );
+  }
+
+  // A pure-imaginary radical I*Sqrt[n] has the irreducible degree-2 minimal
+  // polynomial x^2 + n. Previously the resultant construction returned the
+  // non-minimal perfect power (x^2 + n)^2 because no real numeric value was
+  // available to pick the irreducible factor.
+  #[test]
+  fn imaginary_square_root() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[-2], x]").unwrap(),
+      "2 + x^2"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[I*Sqrt[3], x]").unwrap(),
+      "3 + x^2"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[-8], x]").unwrap(),
+      "8 + x^2"
+    );
+  }
+
+  // The one-argument form returns the minimal polynomial as a pure function
+  // of #1 (verified against wolframscript), e.g. Sqrt[2] -> -2 + #1^2 &.
+  #[test]
+  fn pure_function_form() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[2]]").unwrap(),
+      "-2 + #1^2 & "
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[GoldenRatio]").unwrap(),
+      "-1 - #1 + #1^2 & "
+    );
+    assert_eq!(interpret("MinimalPolynomial[3]").unwrap(), "-3 + #1 & ");
+    assert_eq!(
+      interpret("MinimalPolynomial[Sqrt[2] + Sqrt[3]]").unwrap(),
+      "1 - 10*#1^2 + #1^4 & "
+    );
+  }
+
+  #[test]
+  fn negative_sqrt() {
+    assert_eq!(
+      interpret("MinimalPolynomial[-Sqrt[2], x]").unwrap(),
+      "-2 + x^2"
+    );
+  }
+}
+
+mod algebraic_integer_q {
+  use super::*;
+
+  // Ordinary integers (including 0 and negatives) are algebraic integers.
+  #[test]
+  fn integers() {
+    assert_eq!(interpret("AlgebraicIntegerQ[5]").unwrap(), "True");
+    assert_eq!(interpret("AlgebraicIntegerQ[0]").unwrap(), "True");
+    assert_eq!(interpret("AlgebraicIntegerQ[-7]").unwrap(), "True");
+  }
+
+  // Non-integer rationals are not algebraic integers.
+  #[test]
+  fn rationals() {
+    assert_eq!(interpret("AlgebraicIntegerQ[1/2]").unwrap(), "False");
+    assert_eq!(interpret("AlgebraicIntegerQ[2/3]").unwrap(), "False");
+  }
+
+  // Radicals and other algebraic numbers with a monic minimal polynomial.
+  #[test]
+  fn algebraic_integers() {
+    assert_eq!(interpret("AlgebraicIntegerQ[Sqrt[2]]").unwrap(), "True");
+    assert_eq!(interpret("AlgebraicIntegerQ[I]").unwrap(), "True");
+    assert_eq!(interpret("AlgebraicIntegerQ[GoldenRatio]").unwrap(), "True");
+    assert_eq!(
+      interpret("AlgebraicIntegerQ[(1 + Sqrt[5])/2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("AlgebraicIntegerQ[Sqrt[2] + Sqrt[3]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("AlgebraicIntegerQ[2^(1/3)]").unwrap(), "True");
+    assert_eq!(interpret("AlgebraicIntegerQ[Sqrt[-3]]").unwrap(), "True");
+  }
+
+  // Algebraic numbers whose minimal polynomial is not monic.
+  #[test]
+  fn non_algebraic_integers() {
+    assert_eq!(interpret("AlgebraicIntegerQ[Sqrt[2]/2]").unwrap(), "False");
+    assert_eq!(interpret("AlgebraicIntegerQ[Sqrt[2]/3]").unwrap(), "False");
+  }
+
+  // Transcendentals, free symbols, and inexact numbers are not algebraic
+  // integers.
+  #[test]
+  fn non_algebraic() {
+    assert_eq!(interpret("AlgebraicIntegerQ[Pi]").unwrap(), "False");
+    assert_eq!(interpret("AlgebraicIntegerQ[x]").unwrap(), "False");
+    assert_eq!(interpret("AlgebraicIntegerQ[3.5]").unwrap(), "False");
+    assert_eq!(interpret("AlgebraicIntegerQ[2.0]").unwrap(), "False");
+  }
+}
+
+mod find_instance {
+  use super::*;
+
+  #[test]
+  fn simple_equation() {
+    assert_eq!(
+      interpret("FindInstance[x^2 == 4, x]").unwrap(),
+      "{{x -> 2}}"
+    );
+  }
+
+  #[test]
+  fn multiple_solutions() {
+    assert_eq!(
+      interpret("FindInstance[x^2 == 4, x, 3]").unwrap(),
+      "{{x -> -2}, {x -> 2}}"
+    );
+  }
+
+  #[test]
+  fn quadratic() {
+    assert_eq!(
+      interpret("FindInstance[x^2 - 5 x + 6 == 0, x]").unwrap(),
+      "{{x -> 3}}"
+    );
+  }
+
+  #[test]
+  fn two_variable_equation() {
+    assert_eq!(
+      interpret("FindInstance[x^2 + y^2 == 1, {x, y}]").unwrap(),
+      "{{x -> -1, y -> 0}}"
+    );
+  }
+
+  #[test]
+  fn integer_domain_inequality() {
+    assert_eq!(
+      interpret("FindInstance[x > 3 && x < 5, x, Integers]").unwrap(),
+      "{{x -> 4}}"
+    );
+  }
+
+  #[test]
+  fn no_solution() {
+    assert_eq!(
+      interpret("FindInstance[x^2 == -1, x, Reals]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn single_var_in_list() {
+    assert_eq!(
+      interpret("FindInstance[x^2 == 9, {x}]").unwrap(),
+      "{{x -> 3}}"
+    );
+  }
+
+  // Three or more variables are searched by walking each one outwards from
+  // zero, so the small instance is the one that turns up first — the same
+  // one wolframscript reports.
+  #[test]
+  fn many_variables_find_the_small_instance() {
+    assert_eq!(
+      interpret(
+        "FindInstance[x^5 + y^5 + z^5 == w^5 && x > 0, {x, y, z, w}, \
+         Integers]"
+      )
+      .unwrap(),
+      "{{x -> 1, y -> 0, z -> 0, w -> 1}}"
+    );
+    assert_eq!(
+      interpret("FindInstance[x^3 + y^3 == z^3 && x > 0, {x, y, z}, Integers]")
+        .unwrap(),
+      "{{x -> 1, y -> 0, z -> 1}}"
+    );
+  }
+
+  #[test]
+  fn unsolved_search_stays_unevaluated() {
+    // When neither Solve nor the bounded search can decide, FindInstance
+    // must NOT claim `{}` (provably empty) — it stays unevaluated. Euler's
+    // sum-of-powers conjecture needs 27^5+84^5+110^5+133^5 == 144^5, far
+    // outside the search radius; returning `{}` caused a spurious
+    // Part::partw in eulers_sum_of_powers_conjecture.wls.
+    assert_eq!(
+      interpret(
+        "FindInstance[x0^5 + x1^5 + x2^5 + x3^5 == y^5 && x0 > 0 && \
+         x1 > 0 && x2 > 0 && x3 > 0, {x0, x1, x2, x3, y}, Integers]"
+      )
+      .unwrap(),
+      "FindInstance[x0^5 + x1^5 + x2^5 + x3^5 == y^5 && x0 > 0 && x1 > 0 \
+       && x2 > 0 && x3 > 0, {x0, x1, x2, x3, y}, Integers]"
+    );
+  }
+}
+
+mod find_sequence_function {
+  use super::*;
+
+  #[test]
+  fn linear_sequence() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 2, 3, 4, 5}, n]").unwrap(),
+      "n"
+    );
+  }
+
+  #[test]
+  fn squares() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 4, 9, 16, 25}, n]").unwrap(),
+      "n^2"
+    );
+  }
+
+  #[test]
+  fn operator_form_applied() {
+    // One-argument operator form: FindSequenceFunction[seq][k] is the k-th term.
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 4, 9, 16, 25}][6]").unwrap(),
+      "36"
+    );
+  }
+
+  #[test]
+  fn operator_form_mapped() {
+    // Operator form composes with Map (`/@`).
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 2, 4, 7, 11}] /@ Range[6]").unwrap(),
+      "{1, 2, 4, 7, 11, 16}"
+    );
+  }
+
+  #[test]
+  fn cubes() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 8, 27, 64, 125}, n]").unwrap(),
+      "n^3"
+    );
+  }
+
+  #[test]
+  fn constant() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{5, 5, 5, 5}, n]").unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn powers_of_2() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{2, 4, 8, 16, 32}, n]").unwrap(),
+      "2^n"
+    );
+  }
+
+  #[test]
+  fn powers_of_3() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{3, 9, 27, 81, 243}, n]").unwrap(),
+      "3^n"
+    );
+  }
+
+  #[test]
+  fn factorial() {
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 2, 6, 24, 120}, n]").unwrap(),
+      "n!"
+    );
+  }
+
+  #[test]
+  fn triangular_numbers() {
+    // (n*(1+n))/2 expanded form
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 3, 6, 10, 15}, n]").unwrap(),
+      "n/2 + n^2/2"
+    );
+  }
+
+  #[test]
+  fn formula_is_correct() {
+    // Verify the found formula gives correct values by substitution
+    assert_eq!(
+      interpret("FindSequenceFunction[{1, 4, 9, 16, 25}, n] /. n -> 6")
+        .unwrap(),
+      "36"
+    );
+  }
+}
+
+mod horner_form {
+  use super::*;
+
+  #[test]
+  fn basic_univariate() {
+    assert_eq!(
+      interpret("HornerForm[11 x^3 - 4 x^2 + 7 x + 2]").unwrap(),
+      "2 + x*(7 + x*(-4 + 11*x))"
+    );
+  }
+
+  #[test]
+  fn explicit_variable() {
+    assert_eq!(
+      interpret("HornerForm[a + b x + c x^2, x]").unwrap(),
+      "a + x*(b + c*x)"
+    );
+  }
+
+  #[test]
+  fn constant() {
+    assert_eq!(interpret("HornerForm[5]").unwrap(), "5");
+  }
+
+  #[test]
+  fn zero() {
+    assert_eq!(interpret("HornerForm[0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn single_variable() {
+    assert_eq!(interpret("HornerForm[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn monomial() {
+    assert_eq!(interpret("HornerForm[x^3]").unwrap(), "x^3");
+  }
+
+  #[test]
+  fn linear_polynomial() {
+    assert_eq!(interpret("HornerForm[x + 2]").unwrap(), "2 + x");
+  }
+
+  #[test]
+  fn non_polynomial() {
+    assert_eq!(interpret("HornerForm[Sin[x]]").unwrap(), "Sin[x]");
+  }
+
+  #[test]
+  fn degree_four() {
+    assert_eq!(
+      interpret("HornerForm[x^4 + 2 x^3 - x + 5]").unwrap(),
+      "5 + x*(-1 + x^2*(2 + x))"
+    );
+  }
+
+  #[test]
+  fn univariate_in_a() {
+    assert_eq!(
+      interpret("HornerForm[a^2 + 3 a + 1]").unwrap(),
+      "1 + a*(3 + a)"
+    );
+  }
+
+  #[test]
+  fn multivariate_explicit_x() {
+    assert_eq!(
+      interpret("HornerForm[x^2 + 2 x y + y^2, x]").unwrap(),
+      "y^2 + x*(x + 2*y)"
+    );
+  }
+
+  #[test]
+  fn multivariate_explicit_y() {
+    assert_eq!(
+      interpret("HornerForm[x^2 + 2 x y + y^2, y]").unwrap(),
+      "x^2 + y*(2*x + y)"
+    );
+  }
+
+  #[test]
+  fn unrelated_variable() {
+    assert_eq!(
+      interpret("HornerForm[3 x^2 + 2 x + 1, y]").unwrap(),
+      "1 + 2*x + 3*x^2"
+    );
+  }
+
+  #[test]
+  fn rational_function() {
+    let result =
+      interpret("HornerForm[(11 x^3 - 4 x^2 + 7 x + 2)/(x^2 - 3 x + 1)]")
+        .unwrap();
+    assert_eq!(result, "(2 + x*(7 + x*(-4 + 11*x)))/(1 + (-3 + x)*x)");
+  }
+
+  #[test]
+  fn all_numeric_coefficients() {
+    assert_eq!(
+      interpret("HornerForm[1 + 2 x + 3 x^2 + 4 x^3]").unwrap(),
+      "1 + x*(2 + x*(3 + 4*x))"
+    );
+  }
+
+  #[test]
+  fn quadratic() {
+    assert_eq!(
+      interpret("HornerForm[x^2 + 5 x + 6]").unwrap(),
+      "6 + x*(5 + x)"
+    );
+  }
+}
+
+mod function_expand {
+  use super::*;
+
+  #[test]
+  fn pochhammer() {
+    assert_eq!(
+      interpret("FunctionExpand[Pochhammer[a, n]]").unwrap(),
+      "Gamma[a + n]/Gamma[a]"
+    );
+  }
+
+  // The incomplete Gamma of a positive integer order is elementary. Wolfram
+  // writes the sum over its common denominator, and Rubi's exponential rules
+  // depend on the expansion happening at all: `Int[x E^x, x]` is
+  // `Simplify[FunctionExpand[Gamma[2, -x]]]`.
+  #[test]
+  fn incomplete_gamma_of_integer_order() {
+    assert_eq!(interpret("FunctionExpand[Gamma[1, z]]").unwrap(), "E^(-z)");
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[2, z]]").unwrap(),
+      "(z + z^2)/(E^z*z)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[3, z]]").unwrap(),
+      "(2*z + 2*z^2 + z^3)/(E^z*z)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[5, z]]").unwrap(),
+      "(24*z + 24*z^2 + 12*z^3 + 4*z^4 + z^5)/(E^z*z)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[2, -x]]").unwrap(),
+      "-((E^x*(-x + x^2))/x)"
+    );
+    assert_eq!(interpret("FunctionExpand[Gamma[2, 3]]").unwrap(), "4/E^3");
+    // A symbolic order has no closed form at all, so it stays put.
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n, z]]").unwrap(),
+      "Gamma[n, z]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[1/3, z]]").unwrap(),
+      "Gamma[1/3, z]"
+    );
+  }
+
+  // Order zero is the exponential integral instead: `Gamma[0, z]` is
+  // `-Ei[-z] - Log[z] + (Log[-z] - Log[-1/z])/2`, where the halved logarithm
+  // difference is the branch-cut correction that makes the identity hold off
+  // the positive real axis — on it the logarithms cancel, leaving the bare
+  // `-ExpIntegralEi`.
+  #[test]
+  fn incomplete_gamma_of_order_zero() {
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[0, z]]").unwrap(),
+      "(-Log[-z^(-1)] + Log[-z])/2 - ExpIntegralEi[-z] - Log[z]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[0, -z]]").unwrap(),
+      "(-Log[z^(-1)] + Log[z])/2 - ExpIntegralEi[z] - Log[-z]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[0, 2]]").unwrap(),
+      "-ExpIntegralEi[-2]"
+    );
+  }
+
+  // Every negative order follows from order zero through the recurrence
+  // `Gamma[a, z] = (Gamma[a + 1, z] - z^a E^-z)/a`, adding one elementary
+  // term per step: `Gamma[-1, z]` is `E^-z/z - Gamma[0, z]`.
+  #[test]
+  fn incomplete_gamma_of_negative_order() {
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[-1, z]]").unwrap(),
+      "1/(E^z*z) + (Log[-z^(-1)] - Log[-z])/2 + ExpIntegralEi[-z] + Log[z]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[-2, z]]").unwrap(),
+      "(1/(E^z*z^2) - 1/(E^z*z) + (-Log[-z^(-1)] + Log[-z])/2 \
+       - ExpIntegralEi[-z] - Log[z])/2"
+    );
+    // Each step is the recurrence applied to the one above it.
+    for order in 1..=4 {
+      assert_eq!(
+        interpret(&format!(
+          "Simplify[FunctionExpand[Gamma[{}, z]] \
+           - (FunctionExpand[Gamma[{}, z]] - z^{} E^-z)/{}]",
+          -order,
+          1 - order,
+          -order,
+          -order
+        ))
+        .unwrap(),
+        "0",
+        "the Gamma[{}, z] expansion should satisfy the recurrence",
+        -order
+      );
+    }
+  }
+
+  // A half-integer order is the complementary error function rather than the
+  // exponential integral — `Gamma[1/2, z]` is `Sqrt[Pi] Erfc[Sqrt[z]]`, which
+  // Wolfram writes out as `Sqrt[Pi] (1 - Erf[Sqrt[z]])` — and the same
+  // recurrence walks from there to every other half-integer.
+  #[test]
+  fn incomplete_gamma_of_half_integer_order() {
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[1/2, z]]").unwrap(),
+      "Sqrt[Pi]*(1 - Erf[Sqrt[z]])"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[3/2, z]]").unwrap(),
+      "Sqrt[z]/E^z + (Sqrt[Pi]*(1 - Erf[Sqrt[z]]))/2"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[-1/2, z]]").unwrap(),
+      "-2*(-(1/(E^z*Sqrt[z])) + Sqrt[Pi]*(1 - Erf[Sqrt[z]]))"
+    );
+    // Every step satisfies the recurrence it was built from.
+    for numerator in [-5, -3, -1, 3, 5, 7] {
+      assert_eq!(
+        interpret(&format!(
+          "Simplify[FunctionExpand[Gamma[{numerator}/2, z]] \
+           - (FunctionExpand[Gamma[{}/2, z]] - z^({numerator}/2) E^-z) \
+           / ({numerator}/2)]",
+          numerator + 2
+        ))
+        .unwrap(),
+        "0",
+        "the Gamma[{numerator}/2, z] expansion should satisfy the recurrence"
+      );
+    }
+  }
+
+  // ExpIntegralE[n, z] is z^(n-1) Gamma[1 - n, z]: an integer or half-integer
+  // order goes on to expand that incomplete Gamma, a symbolic one stops there.
+  #[test]
+  fn generalized_exponential_integral() {
+    assert_eq!(
+      interpret("FunctionExpand[ExpIntegralE[1, z]]").unwrap(),
+      interpret("FunctionExpand[Gamma[0, z]]").unwrap()
+    );
+    assert_eq!(
+      interpret("FunctionExpand[ExpIntegralE[1, 2]]").unwrap(),
+      "-ExpIntegralEi[-2]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[ExpIntegralE[0, z]]").unwrap(),
+      "1/(E^z*z)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[ExpIntegralE[2, z]]").unwrap(),
+      "z*(1/(E^z*z) + (Log[-z^(-1)] - Log[-z])/2 + ExpIntegralEi[-z] + Log[z])"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[ExpIntegralE[1/2, z]]").unwrap(),
+      "(Sqrt[Pi]*(1 - Erf[Sqrt[z]]))/Sqrt[z]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[ExpIntegralE[n, z]]").unwrap(),
+      "z^(-1 + n)*Gamma[1 - n, z]"
+    );
+    // The expansions agree numerically with the function they came from.
+    for order in 1..=4 {
+      assert_eq!(
+        interpret(&format!(
+          "Round[10^12 N[(FunctionExpand[ExpIntegralE[{order}, z]] \
+           /. z -> 13/10) - ExpIntegralE[{order}, 1.3]]]"
+        ))
+        .unwrap(),
+        "0",
+        "the E_{order} expansion should agree with ExpIntegralE"
+      );
+    }
+  }
+
+  #[test]
+  fn beta() {
+    assert_eq!(
+      interpret("FunctionExpand[Beta[a, b]]").unwrap(),
+      "(Gamma[a]*Gamma[b])/Gamma[a + b]"
+    );
+  }
+
+  // Squared-modulus identity: Abs[z]^(2m) → (Re[z]^2 + Im[z]^2)^m. Odd powers
+  // keep the Abs.
+  #[test]
+  fn abs_squared() {
+    assert_eq!(
+      interpret("FunctionExpand[Abs[x]^2]").unwrap(),
+      "Im[x]^2 + Re[x]^2"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Abs[x]^4]").unwrap(),
+      "(Im[x]^2 + Re[x]^2)^2"
+    );
+    assert_eq!(interpret("FunctionExpand[Abs[x]^3]").unwrap(), "Abs[x]^3");
+    assert_eq!(interpret("FunctionExpand[Abs[3]^2]").unwrap(), "9");
+  }
+
+  // Re/Im distribute over a sum, so a composite modulus expands fully.
+  #[test]
+  fn abs_squared_of_sum() {
+    assert_eq!(
+      interpret("FunctionExpand[Abs[x + y]^2]").unwrap(),
+      "(Im[x] + Im[y])^2 + (Re[x] + Re[y])^2"
+    );
+  }
+
+  #[test]
+  fn re_im_distribute_over_plus() {
+    assert_eq!(
+      interpret("FunctionExpand[Re[x + y]]").unwrap(),
+      "Re[x] + Re[y]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Im[a + b + c]]").unwrap(),
+      "Im[a] + Im[b] + Im[c]"
+    );
+  }
+
+  // FactorialPower[x, n] with integer n is the falling factorial
+  // x (x-1) … (x-n+1).
+  #[test]
+  fn factorial_power_integer_n() {
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[x, 3]]").unwrap(),
+      "(-2 + x)*(-1 + x)*x"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[x, 4]]").unwrap(),
+      "(-3 + x)*(-2 + x)*(-1 + x)*x"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[x, 0]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[x, 1]]").unwrap(),
+      "x"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[5, 3]]").unwrap(),
+      "60"
+    );
+  }
+
+  // The step-h form x (x-h) … (x-(n-1)h) for a numeric step.
+  #[test]
+  fn factorial_power_numeric_step() {
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[y, 2, 3]]").unwrap(),
+      "(-3 + y)*y"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[a, 3, 2]]").unwrap(),
+      "(-4 + a)*(-2 + a)*a"
+    );
+  }
+
+  // A symbolic n expands to the Gamma-function ratio.
+  #[test]
+  fn factorial_power_symbolic_n() {
+    assert_eq!(
+      interpret("FunctionExpand[FactorialPower[x, n]]").unwrap(),
+      "Gamma[1 + x]/Gamma[1 - n + x]"
+    );
+  }
+
+  // Multinomial[a1, …, ak] → Gamma[1 + Σ ai] / ∏ Gamma[1 + ai].
+  #[test]
+  fn multinomial_symbolic() {
+    assert_eq!(
+      interpret("FunctionExpand[Multinomial[a, b, c]]").unwrap(),
+      "Gamma[1 + a + b + c]/(Gamma[1 + a]*Gamma[1 + b]*Gamma[1 + c])"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Multinomial[a, b]]").unwrap(),
+      "Gamma[1 + a + b]/(Gamma[1 + a]*Gamma[1 + b])"
+    );
+  }
+
+  // A single argument collapses to 1; all-integer arguments evaluate directly.
+  #[test]
+  fn multinomial_edge_cases() {
+    assert_eq!(interpret("FunctionExpand[Multinomial[n]]").unwrap(), "1");
+    assert_eq!(
+      interpret("FunctionExpand[Multinomial[2, 3]]").unwrap(),
+      "10"
+    );
+  }
+
+  #[test]
+  fn binomial_n_2() {
+    assert_eq!(
+      interpret("FunctionExpand[Binomial[n, 2]]").unwrap(),
+      "((-1 + n)*n)/2"
+    );
+  }
+
+  #[test]
+  fn haversine() {
+    assert_eq!(
+      interpret("FunctionExpand[Haversine[x]]").unwrap(),
+      "(1 - Cos[x])/2"
+    );
+  }
+
+  #[test]
+  fn inverse_haversine() {
+    assert_eq!(
+      interpret("FunctionExpand[InverseHaversine[x]]").unwrap(),
+      "2*ArcSin[Sqrt[x]]"
+    );
+  }
+
+  // Trig of an integer multiple of an inverse trig expands to a polynomial via
+  // the multiple-angle (Chebyshev) identities.
+  #[test]
+  fn trig_of_multiple_inverse_trig() {
+    assert_eq!(
+      interpret("FunctionExpand[Cos[2 ArcSin[x]]]").unwrap(),
+      "1 - 2*x^2"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Cos[2 ArcCos[x]]]").unwrap(),
+      "-1 + 2*x^2"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sin[3 ArcSin[x]]]").unwrap(),
+      "3*x - 4*x^3"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Cos[3 ArcCos[x]]]").unwrap(),
+      "-3*x + 4*x^3"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Cos[4 ArcCos[x]]]").unwrap(),
+      "1 - 8*x^2 + 8*x^4"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sin[5 ArcSin[x]]]").unwrap(),
+      "5*x - 20*x^3 + 16*x^5"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Cos[4 ArcSin[x]]]").unwrap(),
+      "1 - 8*x^2 + 8*x^4"
+    );
+  }
+
+  // Expansions that leave a square root get the radical split the way
+  // wolframscript does, since FunctionExpand assumes nothing about the sign
+  // of the parts: Sqrt[1 - x^2] becomes Sqrt[1-x] Sqrt[1+x].
+  #[test]
+  fn sqrt_producing_cases_split_the_radical() {
+    assert_eq!(
+      interpret("FunctionExpand[Sin[2 ArcSin[x]]]").unwrap(),
+      "2*Sqrt[1 - x]*x*Sqrt[1 + x]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sin[2 ArcCos[x]]]").unwrap(),
+      "2*Sqrt[1 - x]*x*Sqrt[1 + x]"
+    );
+  }
+
+  // FunctionExpand splits a Sqrt of a difference of squares on its own too,
+  // recursing so Sqrt[1 - x^4] fully factors.
+  #[test]
+  fn sqrt_of_square_difference_splits() {
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1 - x^2]]").unwrap(),
+      "Sqrt[1 - x]*Sqrt[1 + x]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[4 - x^2]]").unwrap(),
+      "Sqrt[2 - x]*Sqrt[2 + x]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1 - x^4]]").unwrap(),
+      "Sqrt[1 - x]*Sqrt[1 + x]*Sqrt[1 + x^2]"
+    );
+    // When the squared term's coefficient is not a perfect square the
+    // radicand is scaled by its squarefree part, and the scale stays outside.
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1 - 2 x^2]]").unwrap(),
+      "(Sqrt[Sqrt[2] - 2*x]*Sqrt[Sqrt[2] + 2*x])/Sqrt[2]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[3 - 5 x^2]]").unwrap(),
+      "(Sqrt[Sqrt[15] - 5*x]*Sqrt[Sqrt[15] + 5*x])/Sqrt[5]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1 - 8 x^2]]").unwrap(),
+      "(Sqrt[Sqrt[2] - 4*x]*Sqrt[Sqrt[2] + 4*x])/Sqrt[2]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1 - x^2/2]]").unwrap(),
+      "(Sqrt[Sqrt[2] - x]*Sqrt[Sqrt[2] + x])/Sqrt[2]"
+    );
+    // A constant that divides out into a perfect square comes out front.
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[3 - 12 x^2]]").unwrap(),
+      "Sqrt[3]*Sqrt[1 - 2*x]*Sqrt[1 + 2*x]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1/4 - x^2]]").unwrap(),
+      "(Sqrt[1 - 2*x]*Sqrt[1 + 2*x])/2"
+    );
+    // Both coefficients square: no scaling at all.
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[4 - 9 x^2]]").unwrap(),
+      "Sqrt[2 - 3*x]*Sqrt[2 + 3*x]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[6 - 4 x^2]]").unwrap(),
+      "Sqrt[Sqrt[6] - 2*x]*Sqrt[Sqrt[6] + 2*x]"
+    );
+    // The squared term need not be a monomial, and both sides are expanded.
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[9 - 4 (x + 1)^2]]").unwrap(),
+      "Sqrt[1 - 2*x]*Sqrt[5 + 2*x]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[1 - 2 Sin[x]^2]]").unwrap(),
+      "(Sqrt[Sqrt[2] - 2*Sin[x]]*Sqrt[Sqrt[2] + 2*Sin[x]])/Sqrt[2]"
+    );
+    // An exact constant that is not rational works the same way.
+    assert_eq!(
+      interpret("FunctionExpand[Sqrt[Pi - x^2]]").unwrap(),
+      "Sqrt[Sqrt[Pi] - x]*Sqrt[Sqrt[Pi] + x]"
+    );
+  }
+
+  // The split needs a positive constant on one side and a square (or fourth
+  // power) of a single expression on the other — wolframscript leaves every
+  // other shape alone, and so does Woxi.
+  #[test]
+  fn sqrt_of_square_difference_leaves_other_radicands_alone() {
+    for code in [
+      // The sign of the leading term is unknown.
+      "FunctionExpand[Sqrt[x^2 - 1]]",
+      "FunctionExpand[Sqrt[x^2 - y^2]]",
+      // Several symbolic factors, or a higher power.
+      "FunctionExpand[Sqrt[1 - x^2 y^2]]",
+      "FunctionExpand[Sqrt[1 - x^6]]",
+      "FunctionExpand[Sqrt[1 - x^8]]",
+      // A symbolic coefficient, and an inexact one.
+      "FunctionExpand[Sqrt[1 - a x^2]]",
+      "FunctionExpand[Sqrt[1.5 - x^2]]",
+      // Not a difference at all.
+      "FunctionExpand[Sqrt[1 + x^2]]",
+    ] {
+      let radicand = code
+        .trim_start_matches("FunctionExpand[Sqrt[")
+        .trim_end_matches("]]");
+      assert_eq!(
+        interpret(code).unwrap(),
+        interpret(&format!("Sqrt[{radicand}]")).unwrap(),
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn inverse_gudermannian() {
+    // wolframscript: FunctionExpand[InverseGudermannian[x]] gives the standard
+    // identity Log[Tan[Pi/4 + x/2]]. Plain InverseGudermannian[x] stays held.
+    assert_eq!(
+      interpret("FunctionExpand[InverseGudermannian[x]]").unwrap(),
+      "Log[Tan[Pi/4 + x/2]]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[InverseGudermannian[y]]").unwrap(),
+      "Log[Tan[Pi/4 + y/2]]"
+    );
+    // Numeric argument still evaluates to the same value as the direct call.
+    let r = interpret("FunctionExpand[InverseGudermannian[0.5]]").unwrap();
+    let m = "^0.522238103278440[23]$";
+    assert!(regex::Regex::new(m).unwrap().is_match(&r));
+  }
+
+  #[test]
+  fn inverse_haversine_complex_numeric() {
+    // 2 * ArcSin[Sqrt[z]] for complex z must be correctly-rounded to match
+    // wolframscript bit-for-bit (regression for mathics
+    // numbers/trig.py:723).
+    assert_eq!(
+      interpret("InverseHaversine[1 + 2.5 I]").unwrap(),
+      "1.764589463349829 + 2.3309746530493123*I"
+    );
+  }
+
+  #[test]
+  fn sinc() {
+    assert_eq!(interpret("FunctionExpand[Sinc[x]]").unwrap(), "Sin[x]/x");
+  }
+
+  // LogisticSigmoid[x] -> 1/(1 + E^(-x)).
+  #[test]
+  fn logistic_sigmoid() {
+    assert_eq!(
+      interpret("FunctionExpand[LogisticSigmoid[x]]").unwrap(),
+      "(1 + E^(-x))^(-1)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[LogisticSigmoid[2 x]]").unwrap(),
+      "(1 + E^(-2*x))^(-1)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[LogisticSigmoid[a + b]]").unwrap(),
+      "(1 + E^(-a - b))^(-1)"
+    );
+  }
+
+  #[test]
+  fn chebyshev_t() {
+    assert_eq!(
+      interpret("FunctionExpand[ChebyshevT[n, x]]").unwrap(),
+      "Cos[n*ArcCos[x]]"
+    );
+  }
+
+  #[test]
+  fn chebyshev_u() {
+    assert_eq!(
+      interpret("FunctionExpand[ChebyshevU[n, x]]").unwrap(),
+      "Sin[(1 + n)*ArcCos[x]]/(Sqrt[1 - x]*Sqrt[1 + x])"
+    );
+  }
+
+  #[test]
+  fn fibonacci() {
+    assert_eq!(
+      interpret("FunctionExpand[Fibonacci[n]]").unwrap(),
+      "(((1 + Sqrt[5])/2)^n - (2/(1 + Sqrt[5]))^n*Cos[n*Pi])/Sqrt[5]"
+    );
+  }
+
+  #[test]
+  fn lucas_l() {
+    assert_eq!(
+      interpret("FunctionExpand[LucasL[n]]").unwrap(),
+      "((1 + Sqrt[5])/2)^n + (2/(1 + Sqrt[5]))^n*Cos[n*Pi]"
+    );
+  }
+
+  #[test]
+  fn gamma_half() {
+    assert_eq!(interpret("FunctionExpand[Gamma[1/2]]").unwrap(), "Sqrt[Pi]");
+  }
+
+  // Gamma[A]/Gamma[B] with A - B a positive integer collapses to the rising
+  // factorial; a negative difference gives its reciprocal. Expected strings
+  // verified against wolframscript.
+  #[test]
+  fn gamma_ratio() {
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n + 1]/Gamma[n]]").unwrap(),
+      "n"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n + 2]/Gamma[n]]").unwrap(),
+      "n*(1 + n)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n + 3]/Gamma[n]]").unwrap(),
+      "n*(1 + n)*(2 + n)"
+    );
+    // A numeric prefactor survives.
+    assert_eq!(
+      interpret("FunctionExpand[2 Gamma[n + 1]/Gamma[n]]").unwrap(),
+      "2*n"
+    );
+    // Reciprocal ratio.
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n]/Gamma[n + 1]]").unwrap(),
+      "n^(-1)"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n]/Gamma[n + 2]]").unwrap(),
+      "1/(n*(1 + n))"
+    );
+    // A lone Gamma is left unchanged (it is only the ratio that collapses).
+    assert_eq!(
+      interpret("FunctionExpand[Gamma[n + 1]]").unwrap(),
+      "Gamma[1 + n]"
+    );
+  }
+
+  // HarmonicNumber expands to the digamma form; the generalized order gives the
+  // Zeta / HurwitzZeta difference. Verified against wolframscript.
+  #[test]
+  fn harmonic_number() {
+    assert_eq!(
+      interpret("FunctionExpand[HarmonicNumber[n]]").unwrap(),
+      "EulerGamma + PolyGamma[0, 1 + n]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[HarmonicNumber[m + 1]]").unwrap(),
+      "EulerGamma + PolyGamma[0, 2 + m]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[HarmonicNumber[n, r]]").unwrap(),
+      "-HurwitzZeta[r, 1 + n] + Zeta[r]"
+    );
+    // An integer order reduces the HurwitzZeta to a PolyGamma.
+    assert_eq!(
+      interpret("FunctionExpand[HarmonicNumber[n, 2]]").unwrap(),
+      "Pi^2/6 - PolyGamma[1, 1 + n]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[HarmonicNumber[n, 3]]").unwrap(),
+      "PolyGamma[2, 1 + n]/2 + Zeta[3]"
+    );
+    // A concrete HarmonicNumber still evaluates numerically.
+    assert_eq!(
+      interpret("FunctionExpand[HarmonicNumber[5]]").unwrap(),
+      "137/60"
+    );
+  }
+
+  // HurwitzZeta[m, a] with an integer m >= 2 reduces to a PolyGamma.
+  #[test]
+  fn hurwitz_zeta() {
+    assert_eq!(
+      interpret("FunctionExpand[HurwitzZeta[2, a]]").unwrap(),
+      "PolyGamma[1, a]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[HurwitzZeta[3, a]]").unwrap(),
+      "-1/2*PolyGamma[2, a]"
+    );
+    assert_eq!(
+      interpret("FunctionExpand[HurwitzZeta[4, a]]").unwrap(),
+      "PolyGamma[3, a]/6"
+    );
+    // A symbolic order is left unchanged.
+    assert_eq!(
+      interpret("FunctionExpand[HurwitzZeta[s, a]]").unwrap(),
+      "HurwitzZeta[s, a]"
+    );
+  }
+
+  // Factorial[n] (n!) expands to the Gamma function.
+  #[test]
+  fn factorial() {
+    assert_eq!(
+      interpret("FunctionExpand[Factorial[n]]").unwrap(),
+      "Gamma[1 + n]"
+    );
+    assert_eq!(interpret("FunctionExpand[n!]").unwrap(), "Gamma[1 + n]");
+    // A concrete factorial still evaluates numerically.
+    assert_eq!(interpret("FunctionExpand[Factorial[5]]").unwrap(), "120");
+  }
+
+  // Binomial with a symbolic second argument expands to the Gamma form.
+  #[test]
+  fn binomial_symbolic_k() {
+    assert_eq!(
+      interpret("FunctionExpand[Binomial[n, k]]").unwrap(),
+      "Gamma[1 + n]/(Gamma[1 + k]*Gamma[1 - k + n])"
+    );
+  }
+
+  #[test]
+  fn catalan_number() {
+    assert_eq!(
+      interpret("FunctionExpand[CatalanNumber[n]]").unwrap(),
+      "(2^(2*n)*Gamma[1/2 + n])/(Sqrt[Pi]*Gamma[2 + n])"
+    );
+    // A concrete value still evaluates.
+    assert_eq!(interpret("FunctionExpand[CatalanNumber[3]]").unwrap(), "5");
+  }
+
+  #[test]
+  fn subfactorial() {
+    assert_eq!(
+      interpret("FunctionExpand[Subfactorial[n]]").unwrap(),
+      "Gamma[1 + n, -1]/E"
+    );
+  }
+
+  #[test]
+  fn passthrough() {
+    // Functions without expansion rules pass through
+    assert_eq!(interpret("FunctionExpand[Sin[x]]").unwrap(), "Sin[x]");
+  }
+}
+
+mod root_objects_are_numeric {
+  use super::*;
+
+  // A `Root[…]` object is an exact algebraic number: it keeps its exact form
+  // when printed, but it counts as a number wherever one is wanted. Wolfram
+  // writes the vertex coordinates of a polyhedron this way when they are not
+  // expressible in radicals, and a `Graphics3D` built from them used to drop
+  // every face that touched one.
+  #[test]
+  fn a_root_object_is_numeric() {
+    assert_eq!(interpret("NumericQ[Root[#^2 - 2 &, 1]]").unwrap(), "True");
+    assert_eq!(
+      interpret("NumericQ[Root[1 - 20 #^2 + 80 #^4 &, 1]]").unwrap(),
+      "True"
+    );
+    // A root of a polynomial with symbolic coefficients is not a number.
+    assert_eq!(interpret("NumericQ[Root[#^2 - a &, 1]]").unwrap(), "False");
+  }
+
+  #[test]
+  fn a_root_object_evaluates_where_a_number_is_wanted() {
+    let value: f64 = interpret("Root[1 - 20 #^2 + 80 #^4 &, 1] + 0.0")
+      .unwrap()
+      .parse()
+      .expect("should be a number");
+    assert!(
+      (value - -0.42532540417601994).abs() < 1e-12,
+      "expected -0.4253254041760199, got {value}"
+    );
+    // The whole point: such a coordinate reaches the renderer.
+    let svg = interpret(
+      "ExportString[Graphics3D[{Polygon[{{0, 0, Root[#^2 - 2 &, 1]}, \
+       {1, 0, 0}, {1, 1, 0}}]}, Boxed -> False], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(
+      svg.matches("<polygon").count(),
+      1,
+      "the face must be drawn: {svg}"
+    );
+  }
+}
+
+mod to_radicals {
+  use super::*;
+
+  #[test]
+  fn quadratic() {
+    assert_eq!(
+      interpret("ToRadicals[Root[#^2 - 3 &, 1]]").unwrap(),
+      "-Sqrt[3]"
+    );
+    assert_eq!(
+      interpret("ToRadicals[Root[#^2 - 3 &, 2]]").unwrap(),
+      "Sqrt[3]"
+    );
+  }
+
+  #[test]
+  fn quadratic_with_linear() {
+    assert_eq!(
+      interpret("ToRadicals[Root[#^2 + 3# + 1 &, 1]]").unwrap(),
+      "(-3 - Sqrt[5])/2"
+    );
+    assert_eq!(
+      interpret("ToRadicals[Root[#^2 + 3# + 1 &, 2]]").unwrap(),
+      "(-3 + Sqrt[5])/2"
+    );
+  }
+
+  #[test]
+  fn cubic_pure() {
+    assert_eq!(
+      interpret("ToRadicals[Root[#^3 - 2 &, 1]]").unwrap(),
+      "2^(1/3)"
+    );
+  }
+
+  #[test]
+  fn quartic_pure() {
+    assert_eq!(
+      interpret("ToRadicals[Root[#^4 - 2 &, 1]]").unwrap(),
+      "-2^(1/4)"
+    );
+    assert_eq!(
+      interpret("ToRadicals[Root[#^4 - 2 &, 2]]").unwrap(),
+      "2^(1/4)"
+    );
+  }
+
+  #[test]
+  fn quintic_pure() {
+    assert_eq!(
+      interpret("ToRadicals[Root[#^5 - 2 &, 1]]").unwrap(),
+      "2^(1/5)"
+    );
+  }
+
+  #[test]
+  fn sixth_root() {
+    assert_eq!(
+      interpret("ToRadicals[Root[#^6 - 2 &, 1]]").unwrap(),
+      "-2^(1/6)"
+    );
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn maximize() {
+    assert_case(r#"Maximize[-2 x^2 - 3 x + 5, x]"#, r#"{49/8, {x -> -3/4}}"#);
+  }
+  #[test]
+  fn maximize_unsolved_keeps_original_objective() {
+    // When Maximize can't solve a constrained problem it echoes the call
+    // unevaluated; it must show the user's original objective, not the
+    // internally-negated one (was `Maximize[{-(x*y), ...}]`).
+    assert_case(
+      r#"Maximize[{x y, Sin[x] + Sin[y] == 1}, {x, y}]"#,
+      r#"Maximize[{x*y, Sin[x] + Sin[y] == 1}, {x, y}]"#,
+    );
+    assert_case(
+      r#"Maximize[{x y z, Sin[x] + Sin[y] + Sin[z] == 1}, {x, y, z}]"#,
+      r#"Maximize[{x*y*z, Sin[x] + Sin[y] + Sin[z] == 1}, {x, y, z}]"#,
+    );
+  }
+  #[test]
+  fn minimize() {
+    assert_case(r#"Minimize[2 x^2 - 3 x + 5, x]"#, r#"{31/8, {x -> 3/4}}"#);
+  }
+  #[test]
+  fn arg_max_unconstrained() {
+    // ArgMax[f, x] returns the bare argument maximizing f (scalar for a
+    // single variable). Matches wolframscript `2`.
+    assert_case(r#"ArgMax[-(x^2) + 4 x + 1, x]"#, r#"2"#);
+  }
+  #[test]
+  fn arg_min_unconstrained() {
+    assert_case(r#"ArgMin[x^2 + 2 x + 5, x]"#, r#"-1"#);
+  }
+  #[test]
+  fn arg_max_box_constraint() {
+    assert_case(r#"ArgMax[{x^2, -1 <= x <= 3}, x]"#, r#"3"#);
+  }
+  #[test]
+  fn arg_max_interval_objective() {
+    assert_case(r#"ArgMax[{x (10 - x), 0 <= x <= 10}, x]"#, r#"5"#);
+  }
+  #[test]
+  fn arg_max_disk_multivar() {
+    // Multiple variables yield a list of the optimizing arguments.
+    assert_case(
+      r#"ArgMax[{x + y, x^2 + y^2 <= 1}, {x, y}]"#,
+      r#"{1/Sqrt[2], 1/Sqrt[2]}"#,
+    );
+  }
+  #[test]
+  fn arg_min_equality_multivar() {
+    assert_case(
+      r#"ArgMin[{x^2 + y^2, x + y == 1}, {x, y}]"#,
+      r#"{1/2, 1/2}"#,
+    );
+  }
+  #[test]
+  fn min_value_univariate() {
+    assert_case(r#"MinValue[2 x^2 - 3 x + 5, x]"#, r#"31/8"#);
+  }
+  #[test]
+  fn min_value_multivariate() {
+    assert_case(r#"MinValue[(x y - 3)^2 + 1, {x, y}]"#, r#"1"#);
+    assert_case(r#"MinValue[x^2 + y^2 - 2 x, {x, y}]"#, r#"-1"#);
+  }
+  #[test]
+  fn min_value_disk_constraint() {
+    assert_case(
+      r#"MinValue[{x - 2 y, x^2 + y^2 <= 1}, {x, y}]"#,
+      r#"-Sqrt[5]"#,
+    );
+  }
+  #[test]
+  fn max_value_univariate() {
+    assert_case(r#"MaxValue[-x^2 + 4 x, x]"#, r#"4"#);
+  }
+  #[test]
+  fn max_value_disk_constraint() {
+    assert_case(
+      r#"MaxValue[{x + 2 y, x^2 + y^2 <= 1}, {x, y}]"#,
+      r#"Sqrt[5]"#,
+    );
+  }
+  #[test]
+  fn max_value_equality_constraint() {
+    assert_case(r#"MaxValue[{x y, x + y == 4}, {x, y}]"#, r#"4"#);
+  }
+  #[test]
+  fn max_value_unbounded_no_message() {
+    // Maximize emits Maximize::natt here; MaxValue must return Infinity
+    // without any message (matches wolframscript). Check[] detects a
+    // stray message and would return the fallback string instead.
+    assert_case(r#"MaxValue[x^2, x]"#, r#"Infinity"#);
+    assert_case(r#"Check[MaxValue[x^2, x], "msg emitted"]"#, r#"Infinity"#);
+  }
+  #[test]
+  fn extremum_value_unbounded_constraint_region() {
+    // An unbounded feasible direction that carries the objective off to
+    // infinity has no finite extremum — the boundary value is the *other*
+    // extremum, not this one.
+    assert_case(r#"MaxValue[{x^2, x > 1}, x]"#, r#"Infinity"#);
+    assert_case(r#"MinValue[{x^2, x > 1}, x]"#, r#"1"#);
+    assert_case(r#"MaxValue[{x^2, x >= 1}, x]"#, r#"Infinity"#);
+    assert_case(r#"MaxValue[{x^3, x > 1}, x]"#, r#"Infinity"#);
+    assert_case(r#"MinValue[{x^3, x > 1}, x]"#, r#"1"#);
+    // Unbounded downwards, and unbounded through the *lower* end.
+    assert_case(r#"MinValue[{-x^2, x > 1}, x]"#, r#"-Infinity"#);
+    assert_case(r#"MaxValue[{x^2, x < -1}, x]"#, r#"Infinity"#);
+    // Still no message, unlike Maximize/Minimize.
+    assert_case(
+      r#"Check[MaxValue[{x^2, x > 1}, x], "msg emitted"]"#,
+      r#"Infinity"#,
+    );
+  }
+  #[test]
+  fn unbounded_optimum_reports_the_diverging_end() {
+    // The variable value is the end of the axis the objective runs off at,
+    // which is not determined by the direction of the optimization.
+    assert_case(r#"Maximize[x, x]"#, r#"{Infinity, {x -> Infinity}}"#);
+    assert_case(r#"Minimize[x, x]"#, r#"{-Infinity, {x -> -Infinity}}"#);
+    assert_case(r#"Maximize[-x, x]"#, r#"{Infinity, {x -> -Infinity}}"#);
+    assert_case(r#"Minimize[-x, x]"#, r#"{-Infinity, {x -> Infinity}}"#);
+  }
+  #[test]
+  fn extremum_value_chained_inequality_constraint() {
+    // `1 < x < 3` is one chained comparison, not two separate constraints.
+    assert_case(r#"MaxValue[{x^2, 1 < x < 3}, x]"#, r#"9"#);
+    assert_case(r#"MinValue[{x^2, 1 < x < 3}, x]"#, r#"1"#);
+    assert_case(r#"MinValue[{x^2, -2 < x < 1}, x]"#, r#"0"#);
+    assert_case(r#"MaxValue[{Sin[x], 0 < x < 2 Pi}, x]"#, r#"1"#);
+  }
+  #[test]
+  fn extremum_value_approached_only_at_infinity() {
+    // 1/x never reaches 0 on x > 1, but 0 is still the infimum.
+    assert_case(r#"MinValue[{1/x, x > 1}, x]"#, r#"0"#);
+    assert_case(r#"MaxValue[{1/x, x > 1}, x]"#, r#"1"#);
+    assert_case(r#"MaxValue[{-1/x, x > 1}, x]"#, r#"0"#);
+    assert_case(r#"MinValue[{-1/x, x > 1}, x]"#, r#"-1"#);
+  }
+  #[test]
+  fn maximize_periodic_objective_over_an_interval() {
+    // The critical points come back as a periodic family; the member inside
+    // the constraint region is reported exactly, not as a float.
+    assert_case(
+      r#"Maximize[{Sin[x], 0 < x < 2 Pi}, x]"#,
+      r#"{1, {x -> Pi/2}}"#,
+    );
+    assert_case(
+      r#"Minimize[{Sin[x], 0 < x < 2 Pi}, x]"#,
+      r#"{-1, {x -> (3*Pi)/2}}"#,
+    );
+  }
+  #[test]
+  fn solve_strips_a_constant_factor_from_a_trig_equation() {
+    // A nonzero constant multiplier does not move the roots of `... == 0`.
+    assert_case(
+      r#"Solve[-Cos[x] == 0, x] === Solve[Cos[x] == 0, x]"#,
+      r#"True"#,
+    );
+    assert_case(
+      r#"Solve[3 Sin[x] == 0, x] === Solve[Sin[x] == 0, x]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn apart_1() {
+    assert_case(
+      r#"Apart[1 / (x^2 + 5x + 6)]"#,
+      r#"(2 + x)^(-1) - (3 + x)^(-1)"#,
+    );
+  }
+  #[test]
+  fn apart_2() {
+    assert_case(
+      r#"Apart[1 / (x^2 + 5x + 6)]; Apart[1 / (x^2 - y^2), x]"#,
+      r#"1/(2*(x - y)*y) - 1/(2*y*(x + y))"#,
+    );
+  }
+  #[test]
+  fn apart_3() {
+    assert_case(
+      r#"Apart[1 / (x^2 + 5x + 6)]; Apart[1 / (x^2 - y^2), x]; Apart[1 / (x^2 - y^2), y]"#,
+      r#"-1/2*1/(x*(-x + y)) + 1/(2*x*(x + y))"#,
+    );
+  }
+  #[test]
+  fn apart_4() {
+    assert_case(
+      r#"Apart[1 / (x^2 + 5x + 6)]; Apart[1 / (x^2 - y^2), x]; Apart[1 / (x^2 - y^2), y]; Apart[{1 / (x^2 + 5x + 6)}]"#,
+      r#"{(2 + x)^(-1) - (3 + x)^(-1)}"#,
+    );
+  }
+  #[test]
+  fn sin() {
+    assert_case(
+      r#"Apart[1 / (x^2 + 5x + 6)]; Apart[1 / (x^2 - y^2), x]; Apart[1 / (x^2 - y^2), y]; Apart[{1 / (x^2 + 5x + 6)}]; Sin[1 / (x ^ 2 - y ^ 2)] // Apart"#,
+      r#"Sin[(x^2 - y^2)^(-1)]"#,
+    );
+  }
+  #[test]
+  fn equal_1() {
+    assert_case(
+      r#"Apart[1 / (x^2 + 5x + 6)]; Apart[1 / (x^2 - y^2), x]; Apart[1 / (x^2 - y^2), y]; Apart[{1 / (x^2 + 5x + 6)}]; Sin[1 / (x ^ 2 - y ^ 2)] // Apart; a == "A" // Apart // InputForm"#,
+      r#"InputForm[a == "A"]"#,
+    );
+  }
+  #[test]
+  fn cancel_1() {
+    assert_case(r#"Cancel[x / x ^ 2]"#, r#"x^(-1)"#);
+  }
+  #[test]
+  fn cancel_2() {
+    assert_case(
+      r#"Cancel[x / x ^ 2]; Cancel[x / x ^ 2 + y / y ^ 2]"#,
+      r#"x^(-1) + y^(-1)"#,
+    );
+  }
+  #[test]
+  fn cancel_3() {
+    assert_case(
+      r#"Cancel[x / x ^ 2]; Cancel[x / x ^ 2 + y / y ^ 2]; Cancel[f[x] / x + x * f[x] / x ^ 2]"#,
+      r#"(2*f[x])/x"#,
+    );
+  }
+  #[test]
+  fn equal_2() {
+    assert_case(
+      r#"Cancel[x / x ^ 2]; Cancel[x / x ^ 2 + y / y ^ 2]; Cancel[f[x] / x + x * f[x] / x ^ 2]; a == "A" // Cancel // InputForm"#,
+      r#"InputForm[a == "A"]"#,
+    );
+  }
+  #[test]
+  fn coefficient_1() {
+    assert_case(r#"Coefficient[(x + y)^4, (x^2) * (y^2)]"#, r#"6"#);
+  }
+  #[test]
+  fn coefficient_2() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]"#,
+      r#"c"#,
+    );
+  }
+  #[test]
+  fn coefficient_3() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]"#,
+      r#"405*y^4"#,
+    );
+  }
+  #[test]
+  fn coefficient_4() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]"#,
+      r#"405"#,
+    );
+  }
+  #[test]
+  fn coefficient_5() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]"#,
+      r#"(-3 + y)^(-1) + (-2 + y)^(-1)"#,
+    );
+  }
+  #[test]
+  fn coefficient_6() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]; Coefficient[x*Cos[x + 3] + 6*y, x]"#,
+      r#"Cos[3 + x]"#,
+    );
+  }
+  #[test]
+  fn coefficient_7() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]; Coefficient[x*Cos[x + 3] + 6*y, x]; Coefficient[(x + 1)^3, x, 2]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn coefficient_8() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]; Coefficient[x*Cos[x + 3] + 6*y, x]; Coefficient[(x + 1)^3, x, 2]; Coefficient[a x^2 + b y^3 + c x + d y + 5, y, 3]"#,
+      r#"b"#,
+    );
+  }
+  #[test]
+  fn coefficient_9() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]; Coefficient[x*Cos[x + 3] + 6*y, x]; Coefficient[(x + 1)^3, x, 2]; Coefficient[a x^2 + b y^3 + c x + d y + 5, y, 3]; Coefficient[(x + 2)^3 + (x + 3)^2, x, 0]"#,
+      r#"17"#,
+    );
+  }
+  #[test]
+  fn coefficient_10() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]; Coefficient[x*Cos[x + 3] + 6*y, x]; Coefficient[(x + 1)^3, x, 2]; Coefficient[a x^2 + b y^3 + c x + d y + 5, y, 3]; Coefficient[(x + 2)^3 + (x + 3)^2, x, 0]; Coefficient[(x + 2)^3 + (x + 3)^2, y, 0]"#,
+      r#"(2 + x) ^ 3 + (3 + x) ^ 2"#,
+    );
+  }
+  #[test]
+  fn coefficient_11() {
+    assert_case(
+      r#"Coefficient[(x + y)^4, (x^2) * (y^2)]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x]; Coefficient[(x + 3 y)^5, x]; Coefficient[(x + 3 y)^5, x * y^4]; Coefficient[(x + 2)/(y - 3) + (x + 3)/(y - 2), x]; Coefficient[x*Cos[x + 3] + 6*y, x]; Coefficient[(x + 1)^3, x, 2]; Coefficient[a x^2 + b y^3 + c x + d y + 5, y, 3]; Coefficient[(x + 2)^3 + (x + 3)^2, x, 0]; Coefficient[(x + 2)^3 + (x + 3)^2, y, 0]; Coefficient[a x^2 + b y^3 + c x + d y + 5, x, 0]"#,
+      r#"5 + d*y + b*y^3"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_1() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]"#,
+      r#"{243, 405, 270, 90, 15, 1}"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_bigint_coefficient() {
+    // Regression: a coefficient beyond i128 made max_power/is_constant_wrt
+    // treat the term as variable-dependent, so CoefficientList stayed
+    // unevaluated. It must list the BigInteger coefficient.
+    assert_case(
+      r#"CoefficientList[100000000000000000000000000000000000000000 x^2 + 5 x + 7, x]"#,
+      r#"{7, 5, 100000000000000000000000000000000000000000}"#,
+    );
+    // The leading coefficient of (2 x + 3)^60 is 2^60.
+    assert_case(
+      r#"Last[CoefficientList[(2 x + 3)^60, x]]"#,
+      r#"1152921504606846976"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_2() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]; CoefficientList[(x + y)^4, x]"#,
+      r#"{y^4, 4*y^3, 6*y^2, 4*y, 1}"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_3() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]; CoefficientList[(x + y)^4, x]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, x]"#,
+      r#"{5 + d*y + b*y^3, c, a}"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_4() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]; CoefficientList[(x + y)^4, x]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, x]; CoefficientList[(x + 2)/(y - 3) + x/(y - 2), x]"#,
+      r#"{2/(-3 + y), (-3 + y)^(-1) + (-2 + y)^(-1)}"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_5() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]; CoefficientList[(x + y)^4, x]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, x]; CoefficientList[(x + 2)/(y - 3) + x/(y - 2), x]; CoefficientList[(x + y)^3, z]"#,
+      r#"{(x + y) ^ 3}"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_6() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]; CoefficientList[(x + y)^4, x]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, x]; CoefficientList[(x + 2)/(y - 3) + x/(y - 2), x]; CoefficientList[(x + y)^3, z]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, {x, y}]"#,
+      r#"{{5, d, 0, b}, {c, 0, 0, 0}, {a, 0, 0, 0}}"#,
+    );
+  }
+  #[test]
+  fn coefficient_list_7() {
+    assert_case(
+      r#"CoefficientList[(x + 3)^5, x]; CoefficientList[(x + y)^4, x]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, x]; CoefficientList[(x + 2)/(y - 3) + x/(y - 2), x]; CoefficientList[(x + y)^3, z]; CoefficientList[a x^2 + b y^3 + c x + d y + 5, {x, y}]; CoefficientList[(x - 2 y + 3 z)^3, {x, y, z}]"#,
+      r#"{{{0, 0, 0, 27}, {0, 0, -54, 0}, {0, 36, 0, 0}, {-8, 0, 0, 0}}, {{0, 0, 27, 0}, {0, -36, 0, 0}, {12, 0, 0, 0}, {0, 0, 0, 0}}, {{0, 9, 0, 0}, {-6, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}, {{1, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}}"#,
+    );
+  }
+  #[test]
+  fn collect_1() {
+    assert_case(r#"Collect[(x+y)^3, y]"#, r#"x^3 + 3*x^2*y + 3*x*y^2 + y^3"#);
+  }
+  #[test]
+  fn collect_2() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]"#,
+      r#"4*y^2*Sin[x*z] + 2*(x + x*Sin[y])*Sin[x*z]"#,
+    );
+  }
+  #[test]
+  fn collect_3() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, y]"#,
+      r#"x^3 + (3*x + 3*x^2)*y + y^3 + 4*x*Sin[x*z] + y^2*(3*x + 4*Sin[x*z])"#,
+    );
+  }
+  #[test]
+  fn collect_4() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}]"#,
+      r#"x^3 + 3*x^2*y + y^3 + 4*y^2*Sin[x*z] + x*(3*y + 3*y^2 + 4*Sin[x*z])"#,
+    );
+  }
+  #[test]
+  fn collect_5() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}, h]"#,
+      r#"x^3*h[1] + y^3*h[1] + x^2*y*h[3] + y^2*h[4*Sin[x*z]] + x*(y*h[3] + y^2*h[3] + h[4*Sin[x*z]])"#,
+    );
+  }
+  #[test]
+  fn collect_6() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}, h]; Collect[(1 + a + x)^3, x]"#,
+      r#"1 + 3*a + 3*a^2 + a^3 + (3 + 6*a + 3*a^2)*x + (3 + 3*a)*x^2 + x^3"#,
+    );
+  }
+  #[test]
+  fn collect_7() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}, h]; Collect[(1 + a + x)^3, x]; Collect[a x + b y + c x + d y, y]"#,
+      r#"a*x + c*x + (b + d)*y"#,
+    );
+  }
+  #[test]
+  fn collect_8() {
+    assert_case(
+      r#"Collect[(x+y)^3, y]; Collect[2 Sin[x z] (x+2 y^2 + Sin[y] x), y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, y]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}]; Collect[3 x y+2 Sin[x z] (x+2 y^2 + x) + (x+y)^3, {x,y}, h]; Collect[(1 + a + x)^3, x]; Collect[a x + b y + c x + d y, y]; Collect[(1 + a + x)^3, x, Simplify]"#,
+      r#"(1 + a)^3 + 3*(1 + a)^2*x + 3*(1 + a)*x^2 + x^3"#,
+    );
+  }
+  #[test]
+  fn denominator_1() {
+    assert_case(r#"Denominator[2 / 3]"#, r#"3"#);
+  }
+  #[test]
+  fn denominator_2() {
+    assert_case(r#"Denominator[2 / 3]; Denominator[a / b]"#, r#"b"#);
+  }
+  #[test]
+  fn denominator_3() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn denominator_4() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]; Denominator[a x^n y^-m]"#,
+      r#"y ^ m"#,
+    );
+  }
+  #[test]
+  fn denominator_5() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]; Denominator[a x^n y^-m]; Denominator[Sin[x]^a (Sin[x] - 2)^-b]"#,
+      r#"(-2 + Sin[x]) ^ b"#,
+    );
+  }
+  #[test]
+  fn denominator_6() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]; Denominator[a x^n y^-m]; Denominator[Sin[x]^a (Sin[x] - 2)^-b]; Denominator[3/7 + I/11]"#,
+      r#"77"#,
+    );
+  }
+  #[test]
+  fn denominator_7() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]; Denominator[a x^n y^-m]; Denominator[Sin[x]^a (Sin[x] - 2)^-b]; Denominator[3/7 + I/11]; Denominator[{1, 2, 3, 4, 5, 6}/3]"#,
+      r#"{3, 3, 1, 3, 3, 1}"#,
+    );
+  }
+  #[test]
+  fn denominator_8() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]; Denominator[a x^n y^-m]; Denominator[Sin[x]^a (Sin[x] - 2)^-b]; Denominator[3/7 + I/11]; Denominator[{1, 2, 3, 4, 5, 6}/3]; Denominator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]"#,
+      r#"{1, 1, Cos[x], Sin[x], Cos[x], Sin[x]}"#,
+    );
+  }
+  #[test]
+  fn denominator_9() {
+    assert_case(
+      r#"Denominator[2 / 3]; Denominator[a / b]; Denominator[a + b]; Denominator[a x^n y^-m]; Denominator[Sin[x]^a (Sin[x] - 2)^-b]; Denominator[3/7 + I/11]; Denominator[{1, 2, 3, 4, 5, 6}/3]; Denominator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]; Denominator[{Sinh[x], Cosh[x], Tanh[x], Csch[x] , Sech[x], Coth[x]}, Trig -> True]"#,
+      r#"{1, 1, Cosh[x], Sinh[x], Cosh[x], Sinh[x]}"#,
+    );
+  }
+  // A bare negative power (Power[base, -n] not inside a Times) is a pure
+  // denominator: Denominator[x^-2] = x^2 and Numerator[x^-2] = 1. Previously
+  // the standalone-Power case fell through to Denominator -> 1.
+  #[test]
+  fn denominator_bare_negative_power() {
+    assert_case(r#"Denominator[x^-1]"#, r#"x"#);
+    assert_case(r#"Denominator[x^-2]"#, r#"x^2"#);
+    assert_case(r#"Denominator[(x + 1)^-2]"#, r#"(1 + x)^2"#);
+    // A positive power still has denominator 1.
+    assert_case(r#"Denominator[x^2]"#, r#"1"#);
+  }
+  #[test]
+  fn numerator_bare_negative_power() {
+    assert_case(r#"Numerator[x^-1]"#, r#"1"#);
+    assert_case(r#"Numerator[x^-2]"#, r#"1"#);
+    assert_case(r#"Numerator[a^-3]"#, r#"1"#);
+    // A positive power is its own numerator.
+    assert_case(r#"Numerator[x^2]"#, r#"x^2"#);
+  }
+  // A negative RATIONAL exponent (x^(-1/2) = 1/Sqrt[x]) is also a denominator
+  // power. Previously negate_if_negative did not recognise Rational[-n, d].
+  #[test]
+  fn denominator_negative_rational_power() {
+    assert_case(r#"Denominator[x^(-1/2)]"#, r#"Sqrt[x]"#);
+    assert_case(r#"Denominator[x^(-3/2)]"#, r#"x^(3/2)"#);
+    assert_case(r#"Denominator[1/Sqrt[2]]"#, r#"Sqrt[2]"#);
+    // A positive fractional exponent has denominator 1.
+    assert_case(r#"Denominator[x^(1/2)]"#, r#"1"#);
+  }
+  #[test]
+  fn numerator_negative_rational_power() {
+    assert_case(r#"Numerator[x^(-1/2)]"#, r#"1"#);
+    assert_case(r#"Numerator[x^(-3/2)]"#, r#"1"#);
+  }
+  #[test]
+  fn expand_1() {
+    assert_case(r#"Expand[(x + y) ^ 3]"#, r#"x^3 + 3*x^2*y + 3*x*y^2 + y^3"#);
+  }
+  #[test]
+  fn expand_2() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]"#,
+      r#"a^2 + a*b + a*c + b*c + a*d + b*d"#,
+    );
+  }
+  #[test]
+  fn expand_3() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]"#,
+      r#"2*a^2*e + a*b*e + a*c*e + b*c*e + a*d*e + b*d*e + a^2*f + a*b*f + a*c*f + b*c*f + a*d*f + b*d*f"#,
+    );
+  }
+  #[test]
+  fn expand_4() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]"#,
+      r#"a^2*c + 2*a*b*c + b^2*c + a^2*d + 2*a*b*d + b^2*d"#,
+    );
+  }
+  #[test]
+  fn expand_5() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]"#,
+      r#"x^2 + 3*x*y + y^2"#,
+    );
+  }
+  #[test]
+  fn expand_6() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]"#,
+      r#"b + a*b + a^2*c^2 + 2*a*b*c^2 + b^2*c^2 + 2*a^2*c*d + 4*a*b*c*d + 2*b^2*c*d + a^2*d^2 + 2*a*b*d^2 + b^2*d^2"#,
+    );
+  }
+  #[test]
+  fn expand_7() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]"#,
+      r#"{4*x + 4*y, 2*x + 2*y -> 4*x + 4*y}"#,
+    );
+  }
+  #[test]
+  fn expand_8() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]; Expand[Sin[x + y], Trig -> True]"#,
+      r#"Cos[y]*Sin[x] + Cos[x]*Sin[y]"#,
+    );
+  }
+  #[test]
+  fn expand_9() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]; Expand[Sin[x + y], Trig -> True]; Expand[Tanh[x + y], Trig -> True]"#,
+      r#"(Cosh[y]*Sinh[x])/(Cosh[x]*Cosh[y] + Sinh[x]*Sinh[y]) + (Cosh[x]*Sinh[y])/(Cosh[x]*Cosh[y] + Sinh[x]*Sinh[y])"#,
+    );
+  }
+  #[test]
+  fn expand_10() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]; Expand[Sin[x + y], Trig -> True]; Expand[Tanh[x + y], Trig -> True]; Expand[Sin[x (1 + y)]]"#,
+      r#"Sin[x*(1 + y)]"#,
+    );
+  }
+  #[test]
+  fn expand_11() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]; Expand[Sin[x + y], Trig -> True]; Expand[Tanh[x + y], Trig -> True]; Expand[Sin[x (1 + y)]]; Expand[(x+a)^2+(y+a)^2+(x+y)(x+a), y]"#,
+      r#"a^2 + x*(a + x) + (a + x)^2 + 2*a*y + (a + x)*y + y^2"#,
+    );
+  }
+  #[test]
+  fn expand_12() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]; Expand[Sin[x + y], Trig -> True]; Expand[Tanh[x + y], Trig -> True]; Expand[Sin[x (1 + y)]]; Expand[(x+a)^2+(y+a)^2+(x+y)(x+a), y]; Expand[(1 + a)^12, Modulus -> 3]"#,
+      r#"1 + a ^ 3 + a ^ 9 + a ^ 12"#,
+    );
+  }
+  #[test]
+  fn expand_13() {
+    assert_case(
+      r#"Expand[(x + y) ^ 3]; Expand[(a + b) (a + c + d)]; Expand[(a + b) (a + c + d) (e + f) + e a a]; Expand[(a + b) ^ 2 * (c + d)]; Expand[(x + y) ^ 2 + x y]; Expand[((a + b) (c + d)) ^ 2 + b (1 + a)]; Expand[{4 (x + y), 2 (x + y) -> 4 (x + y)}]; Expand[Sin[x + y], Trig -> True]; Expand[Tanh[x + y], Trig -> True]; Expand[Sin[x (1 + y)]]; Expand[(x+a)^2+(y+a)^2+(x+y)(x+a), y]; Expand[(1 + a)^12, Modulus -> 3]; Expand[(1 + a)^12, Modulus -> 4]"#,
+      r#"1 + 2*a^2 + 3*a^4 + 3*a^8 + 2*a^10 + a^12"#,
+    );
+  }
+  #[test]
+  fn exponent_1() {
+    assert_case(r#"Exponent[5 x^2 - 3 x + 7, x]"#, r#"2"#);
+  }
+  #[test]
+  fn exponent_2() {
+    assert_case(
+      r#"Exponent[5 x^2 - 3 x + 7, x]; Exponent[(x^3 + 1)^2 + 1, x]"#,
+      r#"6"#,
+    );
+  }
+  #[test]
+  fn exponent_3() {
+    assert_case(
+      r#"Exponent[5 x^2 - 3 x + 7, x]; Exponent[(x^3 + 1)^2 + 1, x]; Exponent[x^(n + 1) + Sqrt[x] + 1, x]"#,
+      r#"Max[1 / 2, 1 + n]"#,
+    );
+  }
+  #[test]
+  fn exponent_4() {
+    assert_case(
+      r#"Exponent[5 x^2 - 3 x + 7, x]; Exponent[(x^3 + 1)^2 + 1, x]; Exponent[x^(n + 1) + Sqrt[x] + 1, x]; Exponent[x / y, y]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn exponent_5() {
+    assert_case(
+      r#"Exponent[5 x^2 - 3 x + 7, x]; Exponent[(x^3 + 1)^2 + 1, x]; Exponent[x^(n + 1) + Sqrt[x] + 1, x]; Exponent[x / y, y]; Exponent[(x^2 + 1)^3 - 1, x, Min]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn exponent_6() {
+    assert_case(
+      r#"Exponent[5 x^2 - 3 x + 7, x]; Exponent[(x^3 + 1)^2 + 1, x]; Exponent[x^(n + 1) + Sqrt[x] + 1, x]; Exponent[x / y, y]; Exponent[(x^2 + 1)^3 - 1, x, Min]; Exponent[0, x]"#,
+      r#"-Infinity"#,
+    );
+  }
+  #[test]
+  fn exponent_7() {
+    assert_case(
+      r#"Exponent[5 x^2 - 3 x + 7, x]; Exponent[(x^3 + 1)^2 + 1, x]; Exponent[x^(n + 1) + Sqrt[x] + 1, x]; Exponent[x / y, y]; Exponent[(x^2 + 1)^3 - 1, x, Min]; Exponent[0, x]; Exponent[1, x]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn factor_1() {
+    assert_case(r#"Factor[x ^ 2 + 2 x + 1]"#, r#"(1 + x) ^ 2"#);
+  }
+  #[test]
+  fn factor_2() {
+    assert_case(
+      r#"Factor[x ^ 2 + 2 x + 1]; Factor[1 / (x^2+2x+1) + 1 / (x^4+2x^2+1)]"#,
+      r#"(2 + 2*x + 3*x^2 + x^4)/((1 + x)^2*(1 + x^2)^2)"#,
+    );
+  }
+  #[test]
+  fn factor_3() {
+    assert_case(
+      r#"Factor[x ^ 2 + 2 x + 1]; Factor[1 / (x^2+2x+1) + 1 / (x^4+2x^2+1)]; Factor[x a == x b + x c]"#,
+      r#"a*x == (b + c)*x"#,
+    );
+  }
+  #[test]
+  fn factor_4() {
+    assert_case(
+      r#"Factor[x ^ 2 + 2 x + 1]; Factor[1 / (x^2+2x+1) + 1 / (x^4+2x^2+1)]; Factor[x a == x b + x c]; Factor[{x + x^2, 2 x + 2 y + 2}]"#,
+      r#"{x*(1 + x), 2*(1 + x + y)}"#,
+    );
+  }
+  #[test]
+  fn factor_5() {
+    assert_case(
+      r#"Factor[x ^ 2 + 2 x + 1]; Factor[1 / (x^2+2x+1) + 1 / (x^4+2x^2+1)]; Factor[x a == x b + x c]; Factor[{x + x^2, 2 x + 2 y + 2}]; Factor[x ^ 3 + 3 x ^ 2 y + 3 x y ^ 2 + y ^ 3]"#,
+      r#"(x + y) ^ 3"#,
+    );
+  }
+  #[test]
+  fn equal_3() {
+    assert_case(
+      r#"Factor[x ^ 2 + 2 x + 1]; Factor[1 / (x^2+2x+1) + 1 / (x^4+2x^2+1)]; Factor[x a == x b + x c]; Factor[{x + x^2, 2 x + 2 y + 2}]; Factor[x ^ 3 + 3 x ^ 2 y + 3 x y ^ 2 + y ^ 3]; x^2 - x == 0 // Factor"#,
+      r#"(-1 + x)*x == 0"#,
+    );
+  }
+  #[test]
+  fn equal_4() {
+    assert_case(
+      r#"Factor[x ^ 2 + 2 x + 1]; Factor[1 / (x^2+2x+1) + 1 / (x^4+2x^2+1)]; Factor[x a == x b + x c]; Factor[{x + x^2, 2 x + 2 y + 2}]; Factor[x ^ 3 + 3 x ^ 2 y + 3 x y ^ 2 + y ^ 3]; x^2 - x == 0 // Factor; a == "A" // Factor // InputForm"#,
+      r#"InputForm[a == "A"]"#,
+    );
+  }
+  #[test]
+  fn simplify_1() {
+    assert_case(r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]"#, r#"2"#);
+  }
+  #[test]
+  fn simplify_2() {
+    assert_case(r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]"#, r#"x"#);
+  }
+  #[test]
+  fn simplify_3() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]"#,
+      r#"f[x]"#,
+    );
+  }
+  #[test]
+  fn simplify_4() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]; $Assumptions={a <= 0}; Simplify[ConditionalExpression[1, a > 0]]"#,
+      r#"Undefined"#,
+    );
+  }
+  #[test]
+  fn simplify_5() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]; $Assumptions={a <= 0}; Simplify[ConditionalExpression[1, a > 0]]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], { b > 0 }]"#,
+      r#"Undefined"#,
+    );
+  }
+  #[test]
+  fn simplify_6() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]; $Assumptions={a <= 0}; Simplify[ConditionalExpression[1, a > 0]]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], Assumptions -> { b > 0 }]"#,
+      r#"ConditionalExpression[1, a > 0]"#,
+    );
+  }
+  #[test]
+  fn simplify_7() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]; $Assumptions={a <= 0}; Simplify[ConditionalExpression[1, a > 0]]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], Assumptions -> { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], {a>0},Assumptions -> { b > 0 }]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn simplify_8() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]; $Assumptions={a <= 0}; Simplify[ConditionalExpression[1, a > 0]]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], Assumptions -> { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], {a>0},Assumptions -> { b > 0 }]; $Assumptions={}; Simplify[20 Log[2]]"#,
+      r#"20*Log[2]"#,
+    );
+  }
+  #[test]
+  fn simplify_9() {
+    assert_case(
+      r#"Simplify[2*Sin[x]^2 + 2*Cos[x]^2]; Simplify[x]; Simplify[f[x]]; $Assumptions={a <= 0}; Simplify[ConditionalExpression[1, a > 0]]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], Assumptions -> { b > 0 }]; Simplify[ConditionalExpression[1, a > 0] ConditionalExpression[1, b > 0], {a>0},Assumptions -> { b > 0 }]; $Assumptions={}; Simplify[20 Log[2]]; Simplify[20 Log[2], ComplexityFunction->LeafCount]"#,
+      r#"Log[1048576]"#,
+    );
+  }
+  #[test]
+  fn full_simplify() {
+    assert_case(r#"FullSimplify[2*Sin[x]^2 + 2*Cos[x]^2]"#, r#"2"#);
+  }
+  #[test]
+  fn minimal_polynomial_1() {
+    assert_case(r#"MinimalPolynomial[7, x]"#, r#"-7 + x"#);
+  }
+  #[test]
+  fn minimal_polynomial_2() {
+    assert_case(
+      r#"MinimalPolynomial[7, x]; MinimalPolynomial[Sqrt[2] + Sqrt[3], x]"#,
+      r#"1 - 10*x^2 + x^4"#,
+    );
+  }
+  #[test]
+  fn minimal_polynomial_3() {
+    assert_case(
+      r#"MinimalPolynomial[7, x]; MinimalPolynomial[Sqrt[2] + Sqrt[3], x]; MinimalPolynomial[Sqrt[1 + Sqrt[3]], x]"#,
+      r#"-2 - 2*x^2 + x^4"#,
+    );
+  }
+  #[test]
+  fn minimal_polynomial_4() {
+    assert_case(
+      r#"MinimalPolynomial[7, x]; MinimalPolynomial[Sqrt[2] + Sqrt[3], x]; MinimalPolynomial[Sqrt[1 + Sqrt[3]], x]; MinimalPolynomial[Sqrt[I + Sqrt[6]], x]"#,
+      r#"49 - 10*x^4 + x^8"#,
+    );
+  }
+  #[test]
+  fn numerator_1() {
+    assert_case(r#"Numerator[2 / 3]"#, r#"2"#);
+  }
+  #[test]
+  fn numerator_2() {
+    assert_case(r#"Numerator[2 / 3]; Numerator[a / b]"#, r#"a"#);
+  }
+  #[test]
+  fn numerator_3() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]"#,
+      r#"(-2 + x)*(-1 + x)"#,
+    );
+  }
+  #[test]
+  fn numerator_4() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]"#,
+      r#"33 + 7*I"#,
+    );
+  }
+  #[test]
+  fn numerator_5() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]; Numerator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]"#,
+      r#"{Sin[x], Cos[x], Sin[x], 1, 1, Cos[x]}"#,
+    );
+  }
+  #[test]
+  fn numerator_6() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]; Numerator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]; Numerator[{Sinh[x], Cosh[x], Tanh[x], Csch[x], Sech[x], Coth[x]}, Trig -> True]"#,
+      r#"{Sinh[x], Cosh[x], Sinh[x], 1, 1, Cosh[x]}"#,
+    );
+  }
+  #[test]
+  fn set_1() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]; Numerator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]; Numerator[{Sinh[x], Cosh[x], Tanh[x], Csch[x], Sech[x], Coth[x]}, Trig -> True]; expr = 5/7 (x - 1)^2/(x - 2)^3 a^b c^-d"#,
+      r#"(5*a^b*(-1 + x)^2)/(7*c^d*(-2 + x)^3)"#,
+    );
+  }
+  #[test]
+  fn set_2() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]; Numerator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]; Numerator[{Sinh[x], Cosh[x], Tanh[x], Csch[x], Sech[x], Coth[x]}, Trig -> True]; expr = 5/7 (x - 1)^2/(x - 2)^3 a^b c^-d; num = Numerator[expr]"#,
+      r#"5*a^b*(-1 + x)^2"#,
+    );
+  }
+  #[test]
+  fn set_3() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]; Numerator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]; Numerator[{Sinh[x], Cosh[x], Tanh[x], Csch[x], Sech[x], Coth[x]}, Trig -> True]; expr = 5/7 (x - 1)^2/(x - 2)^3 a^b c^-d; num = Numerator[expr]; den = Denominator[expr]"#,
+      r#"7*c^d*(-2 + x)^3"#,
+    );
+  }
+  #[test]
+  fn equal_5() {
+    assert_case(
+      r#"Numerator[2 / 3]; Numerator[a / b]; Numerator[(x - 1) (x - 2)/(x - 3)^2]; Numerator[3/7 + I/11]; Numerator[{Sin[x], Cos[x], Tan[x], Csc[x], Sec[x], Cot[x]}, Trig -> True]; Numerator[{Sinh[x], Cosh[x], Tanh[x], Csch[x], Sech[x], Coth[x]}, Trig -> True]; expr = 5/7 (x - 1)^2/(x - 2)^3 a^b c^-d; num = Numerator[expr]; den = Denominator[expr]; expr === num / den"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn polynomial_q_1() {
+    assert_case(r#"PolynomialQ[x^2]"#, r#"True"#);
+  }
+  #[test]
+  fn polynomial_q_2() {
+    assert_case(r#"PolynomialQ[x^2]; PolynomialQ[2]"#, r#"True"#);
+  }
+  #[test]
+  fn polynomial_q_3() {
+    assert_case(
+      r#"PolynomialQ[x^2]; PolynomialQ[2]; PolynomialQ[x^2 + x/y]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn polynomial_q_4() {
+    assert_case(
+      r#"PolynomialQ[x^2]; PolynomialQ[2]; PolynomialQ[x^2 + x/y]; PolynomialQ[x^3 - 2 x/y + 3xz, x]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn polynomial_q_5() {
+    assert_case(
+      r#"PolynomialQ[x^2]; PolynomialQ[2]; PolynomialQ[x^2 + x/y]; PolynomialQ[x^3 - 2 x/y + 3xz, x]; PolynomialQ[x^3 - 2 x/y^2 + 3xz, y]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn polynomial_q_6() {
+    assert_case(
+      r#"PolynomialQ[x^2]; PolynomialQ[2]; PolynomialQ[x^2 + x/y]; PolynomialQ[x^3 - 2 x/y + 3xz, x]; PolynomialQ[x^3 - 2 x/y^2 + 3xz, y]; PolynomialQ[f[a] + f[a]^2, f[a]]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn polynomial_q_7() {
+    assert_case(
+      r#"PolynomialQ[x^2]; PolynomialQ[2]; PolynomialQ[x^2 + x/y]; PolynomialQ[x^3 - 2 x/y + 3xz, x]; PolynomialQ[x^3 - 2 x/y^2 + 3xz, y]; PolynomialQ[f[a] + f[a]^2, f[a]]; PolynomialQ[x^2 + axy^2 - bSin[c], {x, y}]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn polynomial_q_8() {
+    assert_case(
+      r#"PolynomialQ[x^2]; PolynomialQ[2]; PolynomialQ[x^2 + x/y]; PolynomialQ[x^3 - 2 x/y + 3xz, x]; PolynomialQ[x^3 - 2 x/y^2 + 3xz, y]; PolynomialQ[f[a] + f[a]^2, f[a]]; PolynomialQ[x^2 + axy^2 - bSin[c], {x, y}]; PolynomialQ[x^2 + axy^2 - bSin[c], {a, b, c}]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn together_1() {
+    assert_case(r#"Together[a / c + b / c]"#, r#"(a + b) / c"#);
+  }
+  #[test]
+  fn together_2() {
+    assert_case(
+      r#"Together[a / c + b / c]; Together[{x / (y+1) + x / (y+1)^2}]"#,
+      r#"{(x*(2 + y))/(1 + y)^2}"#,
+    );
+  }
+  #[test]
+  fn together_3() {
+    assert_case(
+      r#"Together[a / c + b / c]; Together[{x / (y+1) + x / (y+1)^2}]; Together[f[a / c + b / c]]"#,
+      r#"f[a / c + b / c]"#,
+    );
+  }
+  #[test]
+  fn find_maximum_1() {
+    assert_case(r#"FindMaximum[-(x-3)^2+2., {x, 1}]"#, r#"{2., {x -> 3.}}"#);
+  }
+  #[test]
+  fn find_maximum_2() {
+    assert_case(
+      r#"FindMaximum[-(x-3)^2+2., {x, 1}]; FindMaximum[-10*^-30 *(x-3)^2+2., {x, 1}]"#,
+      r#"{2., {x -> 3.}}"#,
+    );
+  }
+  #[test]
+  fn find_maximum_3() {
+    assert_case(
+      r#"FindMaximum[-(x-3)^2+2., {x, 1}]; FindMaximum[-10*^-30 *(x-3)^2+2., {x, 1}]; FindMaximum[Sin[x], {x, 1}]"#,
+      r#"{1., {x -> 1.5707963267948957}}"#,
+    );
+  }
+  #[test]
+  fn find_maximum_accepts_options() {
+    // Trailing options (Method, MaxIterations, ...) must not abort the
+    // call. Wolfram accepts the 3-arg form; Woxi previously rejected it
+    // with FindMaximum::argrx.
+    assert_case(
+      r#"FindMaximum[-(x-3)^2+2., {x, 1}, MaxIterations->2]"#,
+      r#"{2., {x -> 3.}}"#,
+    );
+    assert_case(
+      r#"FindMaximum[Sin[x], {x, 1}, Method->"Newton"]"#,
+      r#"{1., {x -> 1.5707963267948957}}"#,
+    );
+  }
+  #[test]
+  fn find_minimum_1() {
+    assert_case(r#"FindMinimum[(x-3)^2+2., {x, 1}]"#, r#"{2., {x -> 3.}}"#);
+  }
+  #[test]
+  fn find_minimum_2() {
+    assert_case(
+      r#"FindMinimum[(x-3)^2+2., {x, 1}]; FindMinimum[10*^-30 *(x-3)^2+2., {x, 1}]"#,
+      r#"{2., {x -> 3.}}"#,
+    );
+  }
+  #[test]
+  fn find_minimum_3() {
+    assert_case(
+      r#"FindMinimum[(x-3)^2+2., {x, 1}]; FindMinimum[10*^-30 *(x-3)^2+2., {x, 1}]; FindMinimum[Sin[x], {x, 1}]"#,
+      r#"{-1., {x -> -1.5707963267955243}}"#,
+    );
+  }
+  #[test]
+  fn nminvalue_bounded_interval() {
+    // NMinValue[{f, a <= x <= b}, x] minimizes over the bounded interval,
+    // even for a non-convex/oscillatory objective. Matches wolframscript's
+    // -2.4050151239695476.
+    assert_case(
+      r#"f = Sin[Sqrt[2] x] + Sin[x]; NMinValue[{D[f, x], 0 <= x <= 20}, x]"#,
+      r#"-2.4050151239695476"#,
+    );
+  }
+  #[test]
+  fn nmaxvalue_bounded_interval() {
+    assert_case(
+      r#"f = Sin[Sqrt[2] x] + Sin[x]; NMaxValue[{D[f, x], 0 <= x <= 20}, x]"#,
+      r#"2.414213562373095"#,
+    );
+  }
+  #[test]
+  fn find_root_1() {
+    assert_case(
+      r#"FindRoot[Cos[x], {x, 1}]"#,
+      r#"{x -> 1.5707963267948966}"#,
+    );
+  }
+  #[test]
+  fn find_root_2() {
+    assert_case(
+      r#"FindRoot[Cos[x], {x, 1}]; FindRoot[Sin[x] + Exp[x],{x, 0}]"#,
+      r#"{x -> -0.5885327439818611}"#,
+    );
+  }
+  #[test]
+  fn find_root_3() {
+    assert_case(
+      r#"FindRoot[Cos[x], {x, 1}]; FindRoot[Sin[x] + Exp[x],{x, 0}]; FindRoot[Sin[x] + Exp[x] == Pi,{x, 0}]"#,
+      r#"{x -> 0.8668152399114581}"#,
+    );
+  }
+  #[test]
+  fn find_root_4() {
+    assert_case(
+      r#"FindRoot[Cos[x], {x, 1}]; FindRoot[Sin[x] + Exp[x],{x, 0}]; FindRoot[Sin[x] + Exp[x] == Pi,{x, 0}]; x = "I am the result!"; FindRoot[Tan[x] + Sin[x] == Pi, {x, 1}]"#,
+      r#"{"I am the result!" -> 1.1491129543142686}"#,
+    );
+  }
+  #[test]
+  fn solve_1() {
+    assert_case(
+      r#"Solve[-4 - 4 x + x^4 + x^5 == 0, x, Integers]"#,
+      r#"{{x -> -1}}"#,
+    );
+  }
+  #[test]
+  fn solve_2() {
+    assert_case(
+      r#"Solve[-4 - 4 x + x^4 + x^5 == 0, x, Integers]; Solve[x^4 == 4, x, Integers]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn solve_3() {
+    assert_case(r#"Solve[x^3 == 1, x, Reals]"#, r#"{{x -> 1}}"#);
+  }
+  #[test]
+  fn root_1() {
+    assert_case(r#"Root[#1 ^ 2 - 1&, 1]"#, r#"-1"#);
+  }
+  #[test]
+  fn root_2() {
+    assert_case(r#"Root[#1 ^ 2 - 1&, 1]; Root[#1 ^ 2 - 1&, 2]"#, r#"1"#);
+  }
+  #[test]
+  fn root_3() {
+    assert_case(
+      r#"Root[#1 ^ 2 - 1&, 1]; Root[#1 ^ 2 - 1&, 2]; Root[#1 ^ 5 + 2 #1 + 1&, 2]"#,
+      r#"Root[1 + 2*#1 + #1^5 & , 2, 0]"#,
+    );
+  }
+
+  #[test]
+  fn root_three_argument_form_accepted() {
+    // wolframscript prints Root with an explicit 0 (exact) tag. Calling
+    // Root[f, k, 0] directly should not emit `Root::argrx` and should
+    // come back unchanged (it is already in canonical form).
+    assert_case(
+      r#"Root[1 + 2*#1 + #1^5 & , 1, 0]"#,
+      r#"Root[1 + 2*#1 + #1^5 & , 1, 0]"#,
+    );
+    assert_case(
+      r#"Root[1 + 2*#1 + #1^5 & , 3, 0]"#,
+      r#"Root[1 + 2*#1 + #1^5 & , 3, 0]"#,
+    );
+  }
+
+  #[test]
+  fn solve_unsolvable_quintic_returns_root_list() {
+    // The audit's Root diff case. wolframscript returns five Root
+    // expressions for an irreducible quintic with no radical solution.
+    assert_case(
+      r#"Solve[x^5 + 2*x + 1 == 0, x]"#,
+      r#"{{x -> Root[1 + 2*#1 + #1^5 & , 1, 0]}, {x -> Root[1 + 2*#1 + #1^5 & , 2, 0]}, {x -> Root[1 + 2*#1 + #1^5 & , 3, 0]}, {x -> Root[1 + 2*#1 + #1^5 & , 4, 0]}, {x -> Root[1 + 2*#1 + #1^5 & , 5, 0]}}"#,
+    );
+  }
+  #[test]
+  fn solve_4() {
+    assert_case(r#"Solve[x ^ 2 - 3 x == 4, x]"#, r#"{{x -> -1}, {x -> 4}}"#);
+  }
+  #[test]
+  fn solve_5() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]"#,
+      r#"{{y -> 2}}"#,
+    );
+  }
+  #[test]
+  fn equal_6() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]"#,
+      r#"{{x -> -1}, {x -> 6}}"#,
+    );
+  }
+  #[test]
+  fn divide() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol"#,
+      r#"{-1, 6}"#,
+    );
+  }
+  #[test]
+  fn solve_6() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol; Solve[x + 1 == x, x]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn solve_7() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol; Solve[x + 1 == x, x]; Solve[x ^ 2 == x ^ 2, x]"#,
+      r#"{{}}"#,
+    );
+  }
+  #[test]
+  fn solve_8() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol; Solve[x + 1 == x, x]; Solve[x ^ 2 == x ^ 2, x]; Solve[x / (x ^ 2 + 1) == 1, x]"#,
+      r#"{{x -> (-1)^(1/3)}, {x -> -(-1)^(2/3)}}"#,
+    );
+  }
+  #[test]
+  fn solve_9() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol; Solve[x + 1 == x, x]; Solve[x ^ 2 == x ^ 2, x]; Solve[x / (x ^ 2 + 1) == 1, x]; Solve[(x^2 + 3 x + 2)/(4 x - 2) == 0, x]"#,
+      r#"{{x -> -2}, {x -> -1}}"#,
+    );
+  }
+  #[test]
+  fn solve_10() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol; Solve[x + 1 == x, x]; Solve[x ^ 2 == x ^ 2, x]; Solve[x / (x ^ 2 + 1) == 1, x]; Solve[(x^2 + 3 x + 2)/(4 x - 2) == 0, x]; Solve[Cos[x] == 0, x]"#,
+      r#"{{x -> ConditionalExpression[-1/2*Pi + 2*Pi*C[1], Element[C[1], Integers]]}, {x -> ConditionalExpression[Pi/2 + 2*Pi*C[1], Element[C[1], Integers]]}}"#,
+    );
+  }
+  #[test]
+  fn solve_11() {
+    assert_case(
+      r#"Solve[x ^ 2 - 3 x == 4, x]; Solve[4 y - 8 == 0, y]; sol = Solve[2 x^2 - 10 x - 12 == 0, x]; x /. sol; Solve[x + 1 == x, x]; Solve[x ^ 2 == x ^ 2, x]; Solve[x / (x ^ 2 + 1) == 1, x]; Solve[(x^2 + 3 x + 2)/(4 x - 2) == 0, x]; Solve[Cos[x] == 0, x]; Solve[f[x + y] == 3, f[x + y]]"#,
+      r#"{{f[x + y] -> 3}}"#,
+    );
+  }
+  #[test]
+  fn simplify_10() {
+    assert_case(
+      r#"LeastSquares[{{1, 2}, {2, 3}, {5, 6}}, {1, 5, 3}]; Simplify[LeastSquares[{{1, 2}, {2, 3}, {5, 6}}, {1, x, 3}]]"#,
+      r#"{(-4*(-3 + 2*x))/13, (-4 + 7*x)/13}"#,
+    );
+  }
+  #[test]
+  fn least_squares() {
+    assert_case(
+      r#"LeastSquares[{{1, 2}, {2, 3}, {5, 6}}, {1, 5, 3}]; Simplify[LeastSquares[{{1, 2}, {2, 3}, {5, 6}}, {1, x, 3}]]; LeastSquares[{{1, 1, 1}, {1, 1, 2}}, {1, 3}]"#,
+      r#"{-1/2, -1/2, 2}"#,
+    );
+  }
+  #[test]
+  fn simplify_11() {
+    assert_case(
+      r#"Simplify[Gamma[z] - (z - 1)!]"#,
+      r#"-(-1 + z)! + Gamma[z]"#,
+    );
+  }
+  #[test]
+  fn gamma_1() {
+    assert_case(r#"Simplify[Gamma[z] - (z - 1)!]; Gamma[8]"#, r#"5040"#);
+  }
+  #[test]
+  fn gamma_2() {
+    assert_case(
+      r#"Simplify[Gamma[z] - (z - 1)!]; Gamma[8]; Gamma[1/2]"#,
+      r#"Sqrt[Pi]"#,
+    );
+  }
+  #[test]
+  fn gamma_3() {
+    assert_case(
+      r#"Simplify[Gamma[z] - (z - 1)!]; Gamma[8]; Gamma[1/2]; Gamma[123.78]"#,
+      r#"4.210777742909557*^204"#,
+    );
+  }
+  #[test]
+  fn gamma_4() {
+    assert_case(
+      r#"Simplify[Gamma[z] - (z - 1)!]; Gamma[8]; Gamma[1/2]; Gamma[123.78]; Gamma[1. + I]"#,
+      r#"0.49801566811835557 - 0.15494982830181037*I"#,
+    );
+  }
+  #[test]
+  fn gamma_5() {
+    assert_case(
+      r#"Simplify[Gamma[z] - (z - 1)!]; Gamma[8]; Gamma[1/2]; Gamma[123.78]; Gamma[1. + I]; Gamma[1, x]"#,
+      r#"E ^ (-x)"#,
+    );
+  }
+  #[test]
+  fn gamma_6() {
+    assert_case(
+      r#"Simplify[Gamma[z] - (z - 1)!]; Gamma[8]; Gamma[1/2]; Gamma[123.78]; Gamma[1. + I]; Gamma[1, x]; Gamma[0, x]"#,
+      r#"Gamma[0, x]"#,
+    );
+  }
+  #[test]
+  fn boolean_q() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn max() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]"#,
+      r#"x"#,
+    );
+  }
+  #[test]
+  fn min() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]; Min[x]"#,
+      r#"x"#,
+    );
+  }
+  #[test]
+  fn unequal_1() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]; Min[x]; Pi != N[Pi]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn unequal_2() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]; Min[x]; Pi != N[Pi]; a_ != b_"#,
+      r#"(a_) != (b_)"#,
+    );
+  }
+  #[test]
+  fn unequal_3() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]; Min[x]; Pi != N[Pi]; a_ != b_; Clear[a, b];a != a != a"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_literal() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]; Min[x]; Pi != N[Pi]; a_ != b_; Clear[a, b];a != a != a; "abc" != "def" != "abc""#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn unequal_4() {
+    assert_case(
+      r#"BooleanQ["string"]; BooleanQ[Together[x/y + y/x]]; Max[x]; Min[x]; Pi != N[Pi]; a_ != b_; Clear[a, b];a != a != a; "abc" != "def" != "abc"; a != b != a"#,
+      r#"a != b != a"#,
+    );
+  }
+  #[test]
+  fn solve_12() {
+    assert_case(r#"Solve[x^2 +1 == 0, x]"#, r#"{{x -> -I}, {x -> I}}"#);
+  }
+  #[test]
+  fn solve_13() {
+    assert_case(
+      r#"Solve[x^2 +1 == 0, x]; Solve[x^5==x,x]"#,
+      r#"{{x -> -1}, {x -> 0}, {x -> -I}, {x -> I}, {x -> 1}}"#,
+    );
+  }
+  #[test]
+  fn apart_5() {
+    assert_case(
+      r#"Attributes[f] = {HoldAll}; Apart[f[x + x]]"#,
+      r#"f[x + x]"#,
+    );
+  }
+  #[test]
+  fn apart_6() {
+    assert_case(
+      r#"Attributes[f] = {HoldAll}; Apart[f[x + x]]; Attributes[f] = {}; Apart[f[x + x]]"#,
+      r#"f[2*x]"#,
+    );
+  }
+}
+
+mod irreducible_polynomial_q {
+  use super::*;
+
+  #[test]
+  fn irreducible_univariate() {
+    // Irreducible over the rationals.
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^2 + 1]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^4 + 1]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^2 + x + 1]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^6 + x^3 + 1]").unwrap(),
+      "True"
+    );
+    // Linear polynomials are irreducible.
+    assert_eq!(interpret("IrreduciblePolynomialQ[x]").unwrap(), "True");
+    assert_eq!(interpret("IrreduciblePolynomialQ[x + 1]").unwrap(), "True");
+  }
+
+  #[test]
+  fn modulus_option_tests_over_gf_p() {
+    for (input, expected) in [
+      ("IrreduciblePolynomialQ[x^4 + x + 1, Modulus -> 2]", "True"),
+      (
+        "IrreduciblePolynomialQ[x^4 + x^2 + 1, Modulus -> 2]",
+        "False",
+      ),
+      ("IrreduciblePolynomialQ[x + 1, Modulus -> 2]", "True"),
+      ("IrreduciblePolynomialQ[7, Modulus -> 2]", "False"),
+      ("IrreduciblePolynomialQ[(x + 1)^2, Modulus -> 2]", "False"),
+      // Scalar multiples do not affect irreducibility
+      (
+        "IrreduciblePolynomialQ[2*x^2 + 2*x + 2, Modulus -> 5]",
+        "True",
+      ),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn reducible_univariate() {
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^2 - 1]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^3 - x]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^4 - 1]").unwrap(),
+      "False"
+    );
+    // Repeated factor (x+1)^2 — not irreducible.
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^2 + 2 x + 1]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn constant_content_is_ignored() {
+    // 2 (x^2 + 1) — the numeric content does not count as a factor.
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[2 x^2 + 2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[3 x + 6]").unwrap(),
+      "True"
+    );
+    // Rational coefficients are allowed.
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^2/4 + 1]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn multivariate() {
+    assert_eq!(
+      interpret("IrreduciblePolynomialQ[x^2 + y^2]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("IrreduciblePolynomialQ[x*y]").unwrap(), "False");
+  }
+
+  #[test]
+  fn constants_are_not_irreducible() {
+    assert_eq!(interpret("IrreduciblePolynomialQ[5]").unwrap(), "False");
+    assert_eq!(interpret("IrreduciblePolynomialQ[6]").unwrap(), "False");
+    assert_eq!(interpret("IrreduciblePolynomialQ[0]").unwrap(), "False");
+    assert_eq!(interpret("IrreduciblePolynomialQ[1]").unwrap(), "False");
+    assert_eq!(interpret("IrreduciblePolynomialQ[Pi]").unwrap(), "False");
+    assert_eq!(interpret("IrreduciblePolynomialQ[E]").unwrap(), "False");
+  }
+}
+
+mod primitive_polynomial_q {
+  use super::*;
+
+  // Primitive polynomials over GF(2): x is a generator of GF(2^d)*.
+  #[test]
+  fn primitive_over_gf2() {
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^2, 2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^3, 2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x^2 + x^3, 2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^4, 2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[x^5 + x^2 + 1, 2]").unwrap(),
+      "True"
+    );
+    // Degree 1: x + 1 has root 1, the generator of GF(2)*.
+    assert_eq!(interpret("PrimitivePolynomialQ[1 + x, 2]").unwrap(), "True");
+  }
+
+  // Reducible polynomials and ones with a zero constant term are not primitive.
+  #[test]
+  fn reducible_or_nonunit_is_not_primitive() {
+    // 1 + x^3 = (1 + x)(1 + x + x^2) over GF(2).
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x^3, 2]").unwrap(),
+      "False"
+    );
+    // 1 + x^2 = (1 + x)^2 over GF(2).
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x^2, 2]").unwrap(),
+      "False"
+    );
+    // x has a zero constant term, so x is not a unit.
+    assert_eq!(interpret("PrimitivePolynomialQ[x, 2]").unwrap(), "False");
+  }
+
+  // Irreducible but not primitive: the order of x is a proper divisor of
+  // p^d - 1. 1 + x + x^2 + x^3 + x^4 is the 5th cyclotomic polynomial, whose
+  // roots have order 5, not 2^4 - 1 = 15.
+  #[test]
+  fn irreducible_but_not_primitive() {
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^2 + x^3 + x^4, 2]").unwrap(),
+      "False"
+    );
+  }
+
+  // Odd prime moduli.
+  #[test]
+  fn primitive_over_odd_primes() {
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[2 + x + x^2, 3]").unwrap(),
+      "True"
+    );
+    // Irreducible over GF(3) but x has order 4, not 3^2 - 1 = 8.
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x^2, 3]").unwrap(),
+      "False"
+    );
+    // Reducible over GF(3): x = 1 is a root.
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^2, 3]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[3 + 2 x + x^2, 5]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[x^4 + 3 x^3 + 2 x^2 + x + 7, 13]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  // A composite modulus and the one-argument form stay unevaluated, matching
+  // wolframscript (which issues nprimemod / argrx messages and echoes).
+  #[test]
+  fn unevaluated_forms() {
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^2, 4]").unwrap(),
+      "PrimitivePolynomialQ[1 + x + x^2, 4]"
+    );
+    assert_eq!(
+      interpret("PrimitivePolynomialQ[1 + x + x^2]").unwrap(),
+      "PrimitivePolynomialQ[1 + x + x^2]"
+    );
+  }
+}
+
+mod inequality_display {
+  use super::*;
+
+  #[test]
+  fn mixed_strictness_keeps_head() {
+    // Regression: mixed-strictness Inequality used to print as the
+    // chained 1 < x <= 10; wolframscript keeps the head in script mode
+    assert_eq!(
+      interpret("1 < x <= 10").unwrap(),
+      "Inequality[1, Less, x, LessEqual, 10]"
+    );
+    assert_eq!(
+      interpret("Inequality[1, Less, x, Less, 5]").unwrap(),
+      "Inequality[1, Less, x, Less, 5]"
+    );
+  }
+
+  #[test]
+  fn numeric_inequalities_still_evaluate() {
+    assert_eq!(interpret("1 < 3 <= 10").unwrap(), "True");
+    assert_eq!(
+      interpret("Inequality[1, Less, x, LessEqual, 10] /. x -> 0").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn function_range_inequality_form() {
+    assert_eq!(
+      interpret("FunctionRange[1/(1 + x^2), x, y]").unwrap(),
+      "Inequality[0, Less, y, LessEqual, 1]"
+    );
+  }
+}
+
+mod sinusoid_extremum_values {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn plain_sin_cos() {
+    assert_case(r#"MinValue[Sin[x], x]"#, r#"-1"#);
+    assert_case(r#"MaxValue[Sin[x], x]"#, r#"1"#);
+  }
+
+  #[test]
+  fn scaled_and_shifted() {
+    assert_case(r#"MinValue[2 Sin[x] + 1, x]"#, r#"-1"#);
+    assert_case(r#"MaxValue[3 Cos[x] - 2, x]"#, r#"1"#);
+    // Inner argument doesn't affect the range
+    assert_case(r#"MinValue[2 Sin[3 x + 1] + 5, x]"#, r#"3"#);
+    assert_case(r#"MaxValue[2 Sin[3 x + 1] + 5, x]"#, r#"7"#);
+  }
+
+  #[test]
+  fn negative_and_rational_amplitudes() {
+    assert_case(r#"MinValue[-4 Cos[2 x], x]"#, r#"-4"#);
+    assert_case(r#"MinValue[Sin[x]/3, x]"#, r#"-1/3"#);
+  }
+}
+
+mod groebner_basis {
+  use super::*;
+
+  #[test]
+  fn linear_system() {
+    assert_eq!(
+      interpret("GroebnerBasis[{x + y, x - y}, {x, y}]").unwrap(),
+      "{y, x}"
+    );
+  }
+
+  // GroebnerBasis[polys, vars, Modulus -> p] computes over GF(p) with
+  // monic generators and coefficients in [0, p).
+  #[test]
+  fn modulus_option_computes_over_gf_p() {
+    for (input, expected) in [
+      (
+        "GroebnerBasis[{x^2 + y, y^2 + x}, {x, y}, Modulus -> 2]",
+        "{y + y^4, x + y^2}",
+      ),
+      // Leading coefficients invert mod p (basis is monic)
+      (
+        "GroebnerBasis[{2*x + y, 3*y^2 - x}, {x, y}, Modulus -> 5]",
+        "{y + y^2, x + 3*y}",
+      ),
+      (
+        "GroebnerBasis[{x^2 - 1, x*y - 1}, {x, y}, Modulus -> 3]",
+        "{2 + y^2, x + 2*y}",
+      ),
+      (
+        "GroebnerBasis[{x^2 + 2*y, y^2 + 3*x}, {x, y}, Modulus -> 7]",
+        "{4*y + y^4, x + 5*y^2}",
+      ),
+      // Rational input coefficients become modular inverses
+      (
+        "GroebnerBasis[{x/2 + y}, {x, y}, Modulus -> 5]",
+        "{x + 2*y}",
+      ),
+      // The trivial ideal is {1}, and inputs vanishing mod p leave {}
+      (
+        "GroebnerBasis[{x^2 + y^2 - 1, x - y}, {x, y}, Modulus -> 2]",
+        "{1}",
+      ),
+      ("GroebnerBasis[{6*x + 3}, {x}, Modulus -> 3]", "{}"),
+      // Modulus -> 0 is ordinary arithmetic
+      (
+        "GroebnerBasis[{x^2 + y, y^2 + x}, {x, y}, Modulus -> 0]",
+        "{y + y^4, x + y^2}",
+      ),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn circle_and_line() {
+    assert_eq!(
+      interpret("GroebnerBasis[{x^2 + y^2 - 1, x - y}, {x, y}]").unwrap(),
+      "{-1 + 2*y^2, x - y}"
+    );
+  }
+
+  #[test]
+  fn hyperbola_and_circle() {
+    assert_eq!(
+      interpret("GroebnerBasis[{x y - 1, x^2 + y^2 - 4}, {x, y}]").unwrap(),
+      "{1 - 4*y^2 + y^4, x - 4*y + y^3}"
+    );
+  }
+
+  #[test]
+  fn cyclic_three() {
+    assert_eq!(
+      interpret(
+        "GroebnerBasis[{x + y + z, x y + y z + z x, x y z - 1}, {x, y, z}]"
+      )
+      .unwrap(),
+      "{-1 + z^3, y^2 + y*z + z^2, x + y + z}"
+    );
+  }
+
+  #[test]
+  fn normalization() {
+    // Content is divided out
+    assert_eq!(
+      interpret("GroebnerBasis[{2 x + 2 y}, {x, y}]").unwrap(),
+      "{x + y}"
+    );
+    assert_eq!(
+      interpret("GroebnerBasis[{x^2 - 1}, {x}]").unwrap(),
+      "{-1 + x^2}"
+    );
+  }
+
+  #[test]
+  fn inconsistent_system_is_unit_ideal() {
+    assert_eq!(interpret("GroebnerBasis[{x, x + 1}, {x}]").unwrap(), "{1}");
+  }
+
+  #[test]
+  fn unsupported_stays_unevaluated() {
+    assert_eq!(
+      interpret("GroebnerBasis[{Sin[x]}, {x}]").unwrap(),
+      "GroebnerBasis[{Sin[x]}, {x}]"
+    );
+  }
+
+  /// A "variable" need not be a bare identifier — `f[x]`, say, is just as
+  /// valid an indeterminate to real Mathematica as `x`. Regression: the
+  /// variable list was required to hold only `Identifier`s, so a system
+  /// written in terms of function applications never computed a basis.
+  #[test]
+  fn function_call_variables() {
+    assert_eq!(
+      interpret("GroebnerBasis[{f[x]^2 - f[x], f[x]*g[y] - 1}, {f[x], g[y]}]")
+        .unwrap(),
+      "{-1 + g[y], -1 + f[x]}"
+    );
+  }
+}
+
+mod resolve {
+  use super::*;
+
+  #[test]
+  fn exists_decisions() {
+    assert_eq!(
+      interpret("Resolve[Exists[x, x^2 == 4], Reals]").unwrap(),
+      "True"
+    );
+    // Solutions are complex, so nothing exists over the reals
+    assert_eq!(
+      interpret("Resolve[Exists[x, x^2 == -1], Reals]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Resolve[Exists[x, x > 0 && x < 1]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn forall_decisions() {
+    assert_eq!(
+      interpret("Resolve[ForAll[x, x^2 >= 0], Reals]").unwrap(),
+      "True"
+    );
+    // x = 0 violates the strict inequality
+    assert_eq!(
+      interpret("Resolve[ForAll[x, x^2 > 0], Reals]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn parametric_conditions() {
+    assert_eq!(
+      interpret("Resolve[Exists[x, x^2 == c], Reals]").unwrap(),
+      "c >= 0"
+    );
+    assert_eq!(
+      interpret("Resolve[ForAll[x, x^2 + c > 0], Reals]").unwrap(),
+      "c > 0"
+    );
+  }
+
+  // Multiple bound variables, additively separable polynomial conditions.
+  #[test]
+  fn exists_multivar() {
+    // The unit disc is non-empty.
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y}, x^2 + y^2 < 1]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y}, x^2 + y^2 < 1], Reals]").unwrap(),
+      "True"
+    );
+    // x^2 + y^2 >= 0, so it can never be < -1.
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y}, x^2 + y^2 < -1]]").unwrap(),
+      "False"
+    );
+    // Over the reals the sum of squares can't equal -1 ...
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y}, x^2 + y^2 == -1], Reals]").unwrap(),
+      "False"
+    );
+    // ... but over the (default) complexes it can.
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y}, x^2 + y^2 == -1]]").unwrap(),
+      "True"
+    );
+    // An odd power makes the range all of R.
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y}, x^2 - y^2 == 5], Reals]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("Resolve[Exists[{x, y, z}, x^2 + y^2 + z^2 < 1], Reals]")
+        .unwrap(),
+      "True"
+    );
+    // Single-element variable lists behave like the scalar form.
+    assert_eq!(interpret("Resolve[Exists[{x}, x^2 < 1]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn forall_multivar() {
+    assert_eq!(
+      interpret("Resolve[ForAll[{x, y}, x^2 + y^2 >= 0], Reals]").unwrap(),
+      "True"
+    );
+    // x = y = 0 violates the strict inequality.
+    assert_eq!(
+      interpret("Resolve[ForAll[{x, y}, x^2 + y^2 > 0], Reals]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Resolve[ForAll[{x, y}, x^2 + y^2 + 1 > 0], Reals]").unwrap(),
+      "True"
+    );
+    // x^2 - y^2 ranges over all reals, so it is not always positive.
+    assert_eq!(
+      interpret("Resolve[ForAll[{x, y}, x^2 - y^2 > 0], Reals]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Resolve[ForAll[{x, y}, x^2 + y^2 != -1], Reals]").unwrap(),
+      "True"
+    );
+  }
+}
+
+mod trig_factor {
+  use super::*;
+
+  #[test]
+  fn sin_plus_minus_cos() {
+    // Pi/4 leads when the variable sorts after "Pi"
+    assert_eq!(
+      interpret("TrigFactor[Sin[x] + Cos[x]]").unwrap(),
+      "Sqrt[2]*Sin[Pi/4 + x]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[x] - Cos[x]]").unwrap(),
+      "-(Sqrt[2]*Sin[Pi/4 - x])"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cos[x] - Sin[x]]").unwrap(),
+      "Sqrt[2]*Sin[Pi/4 - x]"
+    );
+    // The variable leads when it sorts before "Pi"
+    assert_eq!(
+      interpret("TrigFactor[Sin[a] + Cos[a]]").unwrap(),
+      "Sqrt[2]*Sin[a + Pi/4]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[a] - Cos[a]]").unwrap(),
+      "Sqrt[2]*Sin[a - Pi/4]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cos[a] - Sin[a]]").unwrap(),
+      "-(Sqrt[2]*Sin[a - Pi/4])"
+    );
+    // Composite arguments
+    assert_eq!(
+      interpret("TrigFactor[Sin[a + b] + Cos[a + b]]").unwrap(),
+      "Sqrt[2]*Sin[a + b + Pi/4]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[a + b] - Cos[a + b]]").unwrap(),
+      "Sqrt[2]*Sin[a + b - Pi/4]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cos[a + b] - Sin[a + b]]").unwrap(),
+      "-(Sqrt[2]*Sin[a + b - Pi/4])"
+    );
+  }
+
+  #[test]
+  fn one_plus_minus_trig_half_angle_squares() {
+    assert_eq!(interpret("TrigFactor[1 + Cos[x]]").unwrap(), "2*Cos[x/2]^2");
+    assert_eq!(interpret("TrigFactor[1 - Cos[x]]").unwrap(), "2*Sin[x/2]^2");
+    assert_eq!(
+      interpret("TrigFactor[1 + Sin[x]]").unwrap(),
+      "2*Sin[Pi/4 + x/2]^2"
+    );
+    assert_eq!(
+      interpret("TrigFactor[1 - Sin[x]]").unwrap(),
+      "2*Sin[Pi/4 - x/2]^2"
+    );
+    assert_eq!(
+      interpret("TrigFactor[1 - Sin[a]]").unwrap(),
+      "2*Sin[a/2 - Pi/4]^2"
+    );
+    // Double angles halve exactly instead of printing (2*a)/2
+    assert_eq!(interpret("TrigFactor[1 + Cos[2 a]]").unwrap(), "2*Cos[a]^2");
+    assert_eq!(interpret("TrigFactor[1 - Cos[2 a]]").unwrap(), "2*Sin[a]^2");
+    assert_eq!(
+      interpret("TrigFactor[1 + Sin[2 a]]").unwrap(),
+      "2*Sin[a + Pi/4]^2"
+    );
+    assert_eq!(
+      interpret("TrigFactor[1 - Sin[2 a]]").unwrap(),
+      "2*Sin[a - Pi/4]^2"
+    );
+  }
+
+  #[test]
+  fn double_angles() {
+    assert_eq!(
+      interpret("TrigFactor[Sin[2 x]]").unwrap(),
+      "2*Cos[x]*Sin[x]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[2 t]]").unwrap(),
+      "2*Cos[t]*Sin[t]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cos[2 x]]").unwrap(),
+      "2*Sin[Pi/4 - x]*Sin[Pi/4 + x]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cos[2 a]]").unwrap(),
+      "-2*Sin[a - Pi/4]*Sin[a + Pi/4]"
+    );
+  }
+
+  #[test]
+  fn difference_of_squares() {
+    assert_eq!(
+      interpret("TrigFactor[Sin[x]^2 - Cos[x]^2]").unwrap(),
+      "-2*Sin[Pi/4 - x]*Sin[Pi/4 + x]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cos[x]^2 - Sin[x]^2]").unwrap(),
+      "2*Sin[Pi/4 - x]*Sin[Pi/4 + x]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[a]^2 - Cos[a]^2]").unwrap(),
+      "2*Sin[a - Pi/4]*Sin[a + Pi/4]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[2 x]^2 - Cos[2 x]^2]").unwrap(),
+      "-2*Sin[Pi/4 - 2*x]*Sin[Pi/4 + 2*x]"
+    );
+  }
+
+  #[test]
+  fn sin_sum_to_product() {
+    // Sin[p] +- Sin[q] sum-to-product for distinct atomic arguments.
+    assert_eq!(
+      interpret("TrigFactor[Sin[x] + Sin[y]]").unwrap(),
+      "2*Cos[x/2 - y/2]*Sin[x/2 + y/2]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[x] - Sin[y]]").unwrap(),
+      "2*Cos[x/2 + y/2]*Sin[x/2 - y/2]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[a] + Sin[b]]").unwrap(),
+      "2*Cos[a/2 - b/2]*Sin[a/2 + b/2]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sin[a] - Sin[b]]").unwrap(),
+      "2*Cos[a/2 + b/2]*Sin[a/2 - b/2]"
+    );
+    // Both terms negative: overall sign folds into the leading -2.
+    assert_eq!(
+      interpret("TrigFactor[-Sin[x] - Sin[y]]").unwrap(),
+      "-2*Cos[x/2 - y/2]*Sin[x/2 + y/2]"
+    );
+    // Reversed difference normalizes to x-before-y with a pulled sign.
+    assert_eq!(
+      interpret("TrigFactor[Sin[y] - Sin[x]]").unwrap(),
+      "-2*Cos[x/2 + y/2]*Sin[x/2 - y/2]"
+    );
+  }
+
+  #[test]
+  fn passthrough_when_nothing_factors() {
+    assert_eq!(interpret("TrigFactor[Sin[x]]").unwrap(), "Sin[x]");
+    assert_eq!(interpret("TrigFactor[x + 1]").unwrap(), "1 + x");
+    // Integer-multiple arguments factor further in Wolfram, so the
+    // single-step sum-to-product rule deliberately leaves them alone.
+    assert_eq!(
+      interpret("TrigFactor[Sin[2 x] + Sin[4 x]]").unwrap(),
+      "Sin[2*x] + Sin[4*x]"
+    );
+  }
+
+  // Hyperbolic sum-to-product, half-angle squares, double angle, and the
+  // fundamental identity. Verified against wolframscript.
+  #[test]
+  fn hyperbolic() {
+    assert_eq!(
+      interpret("TrigFactor[Sinh[x] + Sinh[y]]").unwrap(),
+      "2*Cosh[x/2 - y/2]*Sinh[x/2 + y/2]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Sinh[x] - Sinh[y]]").unwrap(),
+      "2*Cosh[x/2 + y/2]*Sinh[x/2 - y/2]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cosh[x] + Cosh[y]]").unwrap(),
+      "2*Cosh[x/2 - y/2]*Cosh[x/2 + y/2]"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cosh[x] - Cosh[y]]").unwrap(),
+      "2*Sinh[x/2 - y/2]*Sinh[x/2 + y/2]"
+    );
+    // Half-angle squares from a constant term.
+    assert_eq!(
+      interpret("TrigFactor[Cosh[x] + 1]").unwrap(),
+      "2*Cosh[x/2]^2"
+    );
+    assert_eq!(
+      interpret("TrigFactor[Cosh[x] - 1]").unwrap(),
+      "2*Sinh[x/2]^2"
+    );
+    assert_eq!(
+      interpret("TrigFactor[1 + Cosh[x]]").unwrap(),
+      "2*Cosh[x/2]^2"
+    );
+    // Double angle.
+    assert_eq!(
+      interpret("TrigFactor[Sinh[2 x]]").unwrap(),
+      "2*Cosh[x]*Sinh[x]"
+    );
+    // The fundamental identity collapses to a constant.
+    assert_eq!(interpret("TrigFactor[Cosh[x]^2 - Sinh[x]^2]").unwrap(), "1");
+    assert_eq!(
+      interpret("TrigFactor[Sinh[x]^2 - Cosh[x]^2]").unwrap(),
+      "-1"
+    );
+    // Non-factoring hyperbolic sums pass through unchanged.
+    assert_eq!(interpret("TrigFactor[1 + Sinh[x]]").unwrap(), "1 + Sinh[x]");
+  }
+}
+
+mod subresultants {
+  use super::*;
+
+  #[test]
+  fn integer_chains() {
+    // First element is the resultant; 0 there signals a common root
+    assert_eq!(
+      interpret("Subresultants[x^2 - 1, x^3 - 1, x]").unwrap(),
+      "{0, 1, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x^4 + x^2 + 1, x^2 + 1, x]").unwrap(),
+      "{1, 0, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x^3 - 2 x + 1, x^2 - 1, x]").unwrap(),
+      "{0, -1, 1}"
+    );
+    // gcd of degree 1: s_0 = 0, s_1 != 0
+    assert_eq!(
+      interpret("Subresultants[x^2 - 4, x^2 - 5 x + 6, x]").unwrap(),
+      "{0, -5, 1}"
+    );
+  }
+
+  #[test]
+  fn argument_order_changes_sign() {
+    assert_eq!(interpret("Subresultants[x - 2, x^3, x]").unwrap(), "{8, 1}");
+    assert_eq!(
+      interpret("Subresultants[x^3, x - 2, x]").unwrap(),
+      "{-8, 1}"
+    );
+  }
+
+  #[test]
+  fn symbolic_coefficients() {
+    assert_eq!(
+      interpret("Subresultants[x^2 + a, x + b, x]").unwrap(),
+      "{a + b^2, 1}"
+    );
+    // Classic discriminant pair (p, p')
+    assert_eq!(
+      interpret("Subresultants[a x^2 + b x + c, 2 a x + b, x]").unwrap(),
+      "{-(a*b^2) + 4*a^2*c, 2*a}"
+    );
+  }
+
+  #[test]
+  fn modulus_option_computes_over_gf_p() {
+    assert_eq!(
+      interpret(
+        "Subresultants[(x - 1)^2*(x - 2)*(x - 3), (x - 1)*(x - 4)^2, x, Modulus -> 7]"
+      )
+      .unwrap(),
+      "{0, 1, 4, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x^5 + 3, 2*x^2 + 1, x, Modulus -> 5]").unwrap(),
+      "{4, 4, 3}"
+    );
+    // The second input drops to degree 0 mod 2, shortening the chain
+    assert_eq!(
+      interpret("Subresultants[x^2 + 1, 2*x^2 - 1, x, Modulus -> 2]").unwrap(),
+      "{1}"
+    );
+    // ... and an input vanishing mod p leaves no chain at all
+    assert_eq!(
+      interpret("Subresultants[x^2 + 1, 5, x, Modulus -> 5]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("Subresultants[5*x^2 + 5, x + 3, x, Modulus -> 5]").unwrap(),
+      "{}"
+    );
+    // The first input dropping degree below the second selects the
+    // signed-swap presentation
+    assert_eq!(
+      interpret("Subresultants[3*x^3 + x, x^2 + 4, x, Modulus -> 3]").unwrap(),
+      "{1, 1}"
+    );
+    // Symbolic coefficients ignore the modulus
+    assert_eq!(
+      interpret("Subresultants[a*x^2 + b, x + 1, x, Modulus -> 5]").unwrap(),
+      "{a + b, 1}"
+    );
+  }
+
+  // For deg1 < deg2 wolframscript normalizes the swapped-argument value to
+  // [0, p) and then applies the transposition sign (-1)^((m-j)(n-j))
+  // without renormalizing, so entries can print as negative residues.
+  #[test]
+  fn modulus_option_lower_first_degree_uses_signed_swap_representatives() {
+    assert_eq!(
+      interpret("Subresultants[x + 1, x^3 + 2, x, Modulus -> 5]").unwrap(),
+      "{-4, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x + 1, x^3 + 2, x, Modulus -> 7]").unwrap(),
+      "{-6, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x + 2, x^3 + 5, x, Modulus -> 5]").unwrap(),
+      "{-3, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x^2 + x + 1, x^4 + 3, x, Modulus -> 5]")
+        .unwrap(),
+      "{2, -4, 1}"
+    );
+    // ... while the swapped argument order stays fully normalized
+    assert_eq!(
+      interpret("Subresultants[x^4 + 3, x^2 + x + 1, x, Modulus -> 5]")
+        .unwrap(),
+      "{2, 4, 1}"
+    );
+    // Even-sign positions and zero entries are unaffected
+    assert_eq!(
+      interpret("Subresultants[x^2 + 1, x^3 + 2, x, Modulus -> 7]").unwrap(),
+      "{5, 6, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[x + 1, x^3 + 1, x, Modulus -> 5]").unwrap(),
+      "{0, 1}"
+    );
+    assert_eq!(
+      interpret("Subresultants[2*x + 1, x^4 + x + 1, x, Modulus -> 3]")
+        .unwrap(),
+      "{0, 2}"
+    );
+  }
+
+  #[test]
+  fn degenerate_inputs() {
+    // Constant polynomial: only the resultant c^deg remains
+    assert_eq!(interpret("Subresultants[3, x^2 + 1, x]").unwrap(), "{9}");
+    // Two constants: empty Sylvester block determinant
+    assert_eq!(interpret("Subresultants[3, 5, x]").unwrap(), "{1}");
+    // Zero polynomial has no subresultant chain
+    assert_eq!(interpret("Subresultants[x^2 + 1, 0, x]").unwrap(), "{}");
+    // Identical polynomials: everything but the trivial entry vanishes
+    assert_eq!(
+      interpret("Subresultants[x^2 + 1, x^2 + 1, x]").unwrap(),
+      "{0, 0, 1}"
+    );
+  }
+}
+
+mod subresultant_polynomials {
+  use super::*;
+
+  #[test]
+  fn integer_chains() {
+    // Documentation example: the coefficient of x^j in entry j is the
+    // matching Subresultants entry {0, 36, 11, 1}
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomials[(x - 1)^2*(x - 2)*(x - 3), (x - 1)*(x - 4)^2, x]"
+      )
+      .unwrap(),
+      "{0, -36 + 36*x, 38 - 49*x + 11*x^2, -16 + 24*x - 9*x^2 + x^3}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 + 1, x^2 - 1, x]").unwrap(),
+      "{4, -2, -1 + x^2}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 - 4, x - 2, x]").unwrap(),
+      "{0, -2 + x}"
+    );
+    // A degree-1 entry can vanish entirely mid-chain
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^4 + x^2 + 1, x^2 + x + 1, x]")
+        .unwrap(),
+      "{0, 0, 1 + x + x^2}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^5 + 3, 2*x^2 + 1, x]").unwrap(),
+      "{289, 48 + 4*x, 4 + 8*x^2}"
+    );
+  }
+
+  #[test]
+  fn last_entry_lc_scaling() {
+    // Final entry is lc^(m-n-1) * poly2, expanded when m > n
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^4 + x^2 + 1, 2*x^2 + x + 1, x]")
+        .unwrap(),
+      "{7, -5 + x, 2 + 2*x + 4*x^2}"
+    );
+    // ... and kept as the quotient poly2/lc when m == n
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 + 1, 2*x^2 - 1, x]").unwrap(),
+      "{9, -3, (-1 + 2*x^2)/2}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[2*x + 3, 4*x + 1, x]").unwrap(),
+      "{-10, (1 + 4*x)/4}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^3 + 1, 2*x^3 - x, x]").unwrap(),
+      "{-7, 2 + x, -2 - x, (-x + 2*x^3)/2}"
+    );
+    // Negative leading coefficient distributes instead of dividing
+    assert_eq!(
+      interpret("SubresultantPolynomials[2*x^2 - 1, -x^2 + 3, x]").unwrap(),
+      "{25, 5, -3 + x^2}"
+    );
+  }
+
+  #[test]
+  fn symbolic_coefficients() {
+    // Documentation example: cubic against a general quadratic
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomials[a*x^3 + b*x^2 + c*x + d, 3*a*x^2 + b*x + c, x]"
+      )
+      .unwrap(),
+      "{4*a^2*c^3 + 2*a*b^3*d - 18*a^2*b*c*d + 27*a^3*d^2, \
+       -2*a*b*c + 9*a^2*d - 2*a*b^2*x + 6*a^2*c*x, c + b*x + 3*a*x^2}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[a*x^2 + b*x + c, d*x^2 + e*x + f, x]")
+        .unwrap(),
+      "{c^2*d^2 - b*c*d*e + a*c*e^2 + b^2*d*f - 2*a*c*d*f - a*b*e*f + a^2*f^2, \
+       -(c*d) + a*f - b*d*x + a*e*x, (f + e*x + d*x^2)/d}"
+    );
+    // Symbolic leading coefficient with m > n expands the scaled final entry
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^4 + x^2 + 1, d*x^2 + e*x + f, x]")
+        .unwrap(),
+      "{d^4 + d^2*e^2 + e^4 - 2*d^3*f - 4*d*e^2*f + 3*d^2*f^2 + e^2*f^2 - \
+       2*d*f^3 + f^4, -d^3 + d^2*f + e^2*f - d*f^2 + d^2*e*x + e^3*x - \
+       2*d*e*f*x, d*f + d*e*x + d^2*x^2}"
+    );
+    // Any symbol can serve as the variable
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 + y, x + y, y]").unwrap(),
+      "{x - x^2, x + y}"
+    );
+  }
+
+  #[test]
+  fn degenerate_inputs() {
+    // Constant second polynomial: only the resultant lc^m remains
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 + 1, 5, x]").unwrap(),
+      "{25}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[5, 5, x]").unwrap(),
+      "{1}"
+    );
+    // Zero second polynomial has no subresultant chain
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 + 1, 0, x]").unwrap(),
+      "{}"
+    );
+    assert_eq!(interpret("SubresultantPolynomials[0, 0, x]").unwrap(), "{}");
+    // Identical polynomials: all proper entries vanish
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^3 + 2*x, x^3 + 2*x, x]").unwrap(),
+      "{0, 0, 0, 2*x + x^3}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomials[x + 3, x + 1, x]").unwrap(),
+      "{-2, 1 + x}"
+    );
+  }
+
+  #[test]
+  fn modulus_option() {
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomials[(x - 1)^2*(x - 2)*(x - 3), (x - 1)*(x - 4)^2, x, Modulus -> 7]"
+      )
+      .unwrap(),
+      "{0, 6 + x, 3 + 4*x^2, 5 + 3*x + 5*x^2 + x^3}"
+    );
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomials[x^3 - 2*x + 1, 3*x^2 - 2, x, Modulus -> 5]"
+      )
+      .unwrap(),
+      "{0, 4 + 3*x, 3 + 3*x^2}"
+    );
+    // The scaled final entry reduces mod p ...
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^5 + 3, 2*x^2 + 1, x, Modulus -> 5]")
+        .unwrap(),
+      "{4, 3 + 4*x, 4 + 3*x^2}"
+    );
+    // ... but the m == n quotient keeps its unreduced divisor
+    assert_eq!(
+      interpret("SubresultantPolynomials[x^2 + 1, 2*x^2 - 1, x, Modulus -> 5]")
+        .unwrap(),
+      "{4, 2, (4 + 2*x^2)/2}"
+    );
+  }
+
+  // A first polynomial of lower degree emits `npolys` and stays unevaluated.
+  #[test]
+  fn lower_first_degree_emits_npolys() {
+    let result =
+      woxi::interpret_with_stdout("SubresultantPolynomials[2, x + 1, x]")
+        .unwrap();
+    assert_eq!(result.result, "SubresultantPolynomials[2, 1 + x, x]");
+    assert!(
+      result.warnings.iter().any(|w| w.contains(
+        "SubresultantPolynomials::npolys: 2 and 1 + x should be polynomials \
+         with exact coefficients and the degree of 2 in x should not be \
+         less than the degree of 1 + x in x."
+      )),
+      "expected npolys, got {:?}",
+      result.warnings
+    );
+  }
+}
+
+mod subresultant_polynomial_remainders {
+  use super::*;
+
+  #[test]
+  fn integer_chains() {
+    // Documentation example: both inputs expanded, then the remainders
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[(x - 1)^2*(x - 2)*(x - 3), (x - 1)*(x - 4)^2, x]"
+      )
+      .unwrap(),
+      "{6 - 17*x + 17*x^2 - 7*x^3 + x^4, -16 + 24*x - 9*x^2 + x^3, \
+       38 - 49*x + 11*x^2, -36 + 36*x}"
+    );
+    // Knuth's classic subresultant PRS example
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[x^8 + x^6 - 3*x^4 - 3*x^3 + 8*x^2 + 2*x - 5, 3*x^6 + 5*x^4 - 4*x^2 - 9*x + 21, x]"
+      )
+      .unwrap(),
+      "{-5 + 2*x + 8*x^2 - 3*x^3 - 3*x^4 + x^6 + x^8, \
+       21 - 9*x - 4*x^2 + 5*x^4 + 3*x^6, 9 - 3*x^2 + 15*x^4, \
+       -245 + 125*x + 65*x^2, -12300 + 9326*x, 260708}"
+    );
+    // Degree gaps in the chain (defective case)
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^7 - x, x^3 + 2, x]")
+        .unwrap(),
+      "{-x + x^7, 2 + x^3, -3*x, 54}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^6 - 1, x^2, x]").unwrap(),
+      "{-1 + x^6, x^2, 1}"
+    );
+    // Equal degrees: the first pseudo-remainder gets sign (-1)^(0+1)
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^2 + 1, x^2 - 1, x]")
+        .unwrap(),
+      "{1 + x^2, -1 + x^2, -2}"
+    );
+  }
+
+  #[test]
+  fn symbolic_coefficients() {
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[a*x^2 + b*x + c, d*x + e, x]"
+      )
+      .unwrap(),
+      "{c + b*x + a*x^2, e + d*x, c*d^2 - b*d*e + a*e^2}"
+    );
+    // delta = 2 flips the sign of the first pseudo-remainder
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^4 + a, x^2 + b, x]")
+        .unwrap(),
+      "{a + x^4, b + x^2, -a - b^2}"
+    );
+    // Documentation example: a longer chain whose later steps divide the
+    // pseudo-remainder by a symbolic beta factor
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[(x - a)^2*(x - b)*(x - c), (x - a)*(x - b)^2*(x - d), x]"
+      )
+      .unwrap(),
+      "{a^2*b*c - a^2*b*x - a^2*c*x - 2*a*b*c*x + a^2*x^2 + 2*a*b*x^2 + \
+       2*a*c*x^2 + b*c*x^2 - 2*a*x^3 - b*x^3 - c*x^3 + x^4, \
+       a*b^2*d - a*b^2*x - 2*a*b*d*x - b^2*d*x + 2*a*b*x^2 + b^2*x^2 + \
+       a*d*x^2 + 2*b*d*x^2 - a*x^3 - 2*b*x^3 - d*x^3 + x^4, \
+       -(a^2*b*c) + a*b^2*d + a^2*b*x - a*b^2*x + a^2*c*x + 2*a*b*c*x - \
+       2*a*b*d*x - b^2*d*x - a^2*x^2 + b^2*x^2 - 2*a*c*x^2 - b*c*x^2 + \
+       a*d*x^2 + 2*b*d*x^2 + a*x^3 - b*x^3 + c*x^3 - d*x^3, \
+       -(a^3*b^2*c) + a^2*b^3*c + a^3*b*c^2 - a^2*b^2*c^2 + a^3*b^2*d - \
+       a^2*b^3*d - a^3*b*c*d + 2*a^2*b^2*c*d - a*b^3*c*d - a^2*b*c^2*d + \
+       a*b^2*c^2*d - a^2*b^2*d^2 + a*b^3*d^2 + a^2*b*c*d^2 - a*b^2*c*d^2 + \
+       a^3*b*c*x - a*b^3*c*x - a^3*c^2*x + a*b^2*c^2*x - a^3*b*d*x + \
+       a*b^3*d*x + a^3*c*d*x - a^2*b*c*d*x - a*b^2*c*d*x + b^3*c*d*x + \
+       a^2*c^2*d*x - b^2*c^2*d*x + a^2*b*d^2*x - b^3*d^2*x - a^2*c*d^2*x + \
+       b^2*c*d^2*x - a^2*b*c*x^2 + a*b^2*c*x^2 + a^2*c^2*x^2 - a*b*c^2*x^2 + \
+       a^2*b*d*x^2 - a*b^2*d*x^2 - a^2*c*d*x^2 + 2*a*b*c*d*x^2 - \
+       b^2*c*d*x^2 - a*c^2*d*x^2 + b*c^2*d*x^2 - a*b*d^2*x^2 + b^2*d^2*x^2 + \
+       a*c*d^2*x^2 - b*c*d^2*x^2}"
+    );
+  }
+
+  #[test]
+  fn zero_remainders_terminate_the_chain() {
+    // An exact division stops the sequence without appending the zero
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^2 - 1, x - 1, x]").unwrap(),
+      "{-1 + x^2, -1 + x}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^3 + 2*x, x^3 + 2*x, x]")
+        .unwrap(),
+      "{2*x + x^3, 2*x + x^3}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^4, x^2, x]").unwrap(),
+      "{x^4, x^2}"
+    );
+    // ... but a literal zero second argument is echoed
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^2 + 1, 0, x]").unwrap(),
+      "{1 + x^2, 0}"
+    );
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[0, 0, x]").unwrap(),
+      "{0, 0}"
+    );
+    // A constant second argument stops immediately
+    assert_eq!(
+      interpret("SubresultantPolynomialRemainders[x^2 + 1, 5, x]").unwrap(),
+      "{1 + x^2, 5}"
+    );
+  }
+
+  #[test]
+  fn modulus_option_computes_over_gf_p() {
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[(x - 1)^2*(x - 2)*(x - 3), (x - 1)*(x - 4)^2, x, Modulus -> 7]"
+      )
+      .unwrap(),
+      "{6 + 4*x + 3*x^2 + x^4, 5 + 3*x + 5*x^2 + x^3, 3 + 4*x^2, 6 + x}"
+    );
+    // Leading coefficients vanish mod 5, so the chain genuinely differs
+    // from a coefficient reduction of the plain sequence
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[x^8 + x^6 - 3*x^4 - 3*x^3 + 8*x^2 + 2*x - 5, 3*x^6 + 5*x^4 - 4*x^2 - 9*x + 21, x, Modulus -> 5]"
+      )
+      .unwrap(),
+      "{2*x + 3*x^2 + 2*x^3 + 2*x^4 + x^6 + x^8, 1 + x + x^2 + 3*x^6, \
+       4 + 2*x^2, x, 3}"
+    );
+    // The second input drops to degree 1 after reduction mod 2
+    assert_eq!(
+      interpret(
+        "SubresultantPolynomialRemainders[x^4 + x^2 + 1, 2*x^2 + x + 1, x, Modulus -> 2]"
+      )
+      .unwrap(),
+      "{1 + x^2 + x^4, 1 + x, 1}"
+    );
+  }
+
+  // A first polynomial of lower degree emits `npolys` and stays unevaluated.
+  #[test]
+  fn lower_first_degree_emits_npolys() {
+    let result = woxi::interpret_with_stdout(
+      "SubresultantPolynomialRemainders[2, x + 1, x]",
+    )
+    .unwrap();
+    assert_eq!(
+      result.result,
+      "SubresultantPolynomialRemainders[2, 1 + x, x]"
+    );
+    assert!(
+      result.warnings.iter().any(|w| w.contains(
+        "SubresultantPolynomialRemainders::npolys: 2 and 1 + x should be \
+         polynomials with exact coefficients and the degree of 2 in x \
+         should not be less than the degree of 1 + x in x."
+      )),
+      "expected npolys, got {:?}",
+      result.warnings
+    );
+  }
+}
+
+mod power_symmetric_polynomial {
+  use super::*;
+
+  #[test]
+  fn scalar_exponent() {
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[3, {x, y, z}]").unwrap(),
+      "x^3 + y^3 + z^3"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[1, {a, b, c, d}]").unwrap(),
+      "a + b + c + d"
+    );
+    // Exponent 0 counts the elements
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[0, {x, y, z}]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[3, {2, 3, 4}]").unwrap(),
+      "99"
+    );
+    assert_eq!(interpret("PowerSymmetricPolynomial[2, {}]").unwrap(), "0");
+  }
+
+  #[test]
+  fn symbolic_rational_and_real_exponents() {
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[k, {x, y}]").unwrap(),
+      "x^k + y^k"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[1/2, {x, y}]").unwrap(),
+      "Sqrt[x] + Sqrt[y]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[2.5, {x, y}]").unwrap(),
+      "x^2.5 + y^2.5"
+    );
+  }
+
+  #[test]
+  fn multivariate_tuple_spec() {
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, 1}, {{x1, y1}, {x2, y2}}]")
+        .unwrap(),
+      "x1^2*y1 + x2^2*y2"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, 1}, {{1, 2}, {3, 4}}]").unwrap(),
+      "38"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, 1, 3}, {{a, b, c}, {d, e, f}}]")
+        .unwrap(),
+      "a^2*b*c^3 + d^2*e*f^3"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2}, {{x}, {y}}]").unwrap(),
+      "x^2 + y^2"
+    );
+    // Symbolic exponents and zero components evaluate too
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{k, 1}, {{x, y}, {u, v}}]").unwrap(),
+      "u^k*v + x^k*y"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, 0}, {{x, y}, {u, v}}]").unwrap(),
+      "u^2 + x^2"
+    );
+  }
+
+  #[test]
+  fn augmented_symmetric_polynomial() {
+    // Distinct parts: sum over ordered tuples of distinct variables.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{2, 1}, {a, b, c}]").unwrap(),
+      "a^2*b + a*b^2 + a^2*c + b^2*c + a*c^2 + b*c^2"
+    );
+    // Equal parts double-count each unordered selection.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{1, 1}, {a, b, c}]").unwrap(),
+      "2*a*b + 2*a*c + 2*b*c"
+    );
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{2, 2}, {a, b, c}]").unwrap(),
+      "2*a^2*b^2 + 2*a^2*c^2 + 2*b^2*c^2"
+    );
+    // Single-part partition is the power sum.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{2}, {a, b, c}]").unwrap(),
+      "a^2 + b^2 + c^2"
+    );
+    // Full-length partition of ones gives m! times the product.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{1, 1, 1}, {a, b, c}]").unwrap(),
+      "6*a*b*c"
+    );
+    // Repeated ones with a distinct part.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{2, 1, 1}, {a, b, c}]").unwrap(),
+      "2*a^2*b*c + 2*a*b^2*c + 2*a*b*c^2"
+    );
+    // Partition longer than the variable list vanishes.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{1, 1, 1, 1}, {a, b, c}]")
+        .unwrap(),
+      "0"
+    );
+    // Empty partition is the empty product.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{}, {a, b, c}]").unwrap(),
+      "1"
+    );
+    // Fewer variables than parts still works when m <= n.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{3, 1}, {a, b}]").unwrap(),
+      "a^3*b + a*b^3"
+    );
+    // Numeric variables reduce to a number.
+    assert_eq!(
+      interpret("AugmentedSymmetricPolynomial[{2, 1}, {1, 2, 3}]").unwrap(),
+      "48"
+    );
+  }
+
+  #[test]
+  fn scalar_exponent_threads_listably_over_rows() {
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[2, {{1, 2}, {3, 4}}]").unwrap(),
+      "{10, 20}"
+    );
+  }
+
+  #[test]
+  fn unevaluated_forms() {
+    // Explicitly negative numeric exponents stay unevaluated
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[-2, {x, y}]").unwrap(),
+      "PowerSymmetricPolynomial[-2, {x, y}]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[-1/2, {x, y}]").unwrap(),
+      "PowerSymmetricPolynomial[-1/2, {x, y}]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, -1}, {{x, y}, {u, v}}]").unwrap(),
+      "PowerSymmetricPolynomial[{2, -1}, {{x, y}, {u, v}}]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[-2, {2, 3}]").unwrap(),
+      "PowerSymmetricPolynomial[-2, {2, 3}]"
+    );
+    // A list spec needs tuple rows of the same length
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, 1}, {x, y}]").unwrap(),
+      "PowerSymmetricPolynomial[{2, 1}, {x, y}]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2}, {x, y}]").unwrap(),
+      "PowerSymmetricPolynomial[{2}, {x, y}]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[{2, 1}, {{1, 2}, {3, 4, 5}}]")
+        .unwrap(),
+      "PowerSymmetricPolynomial[{2, 1}, {{1, 2}, {3, 4, 5}}]"
+    );
+    // Non-list data and the one-argument formal form
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[2, x]").unwrap(),
+      "PowerSymmetricPolynomial[2, x]"
+    );
+    assert_eq!(
+      interpret("PowerSymmetricPolynomial[3]").unwrap(),
+      "PowerSymmetricPolynomial[3]"
+    );
+  }
+}
+
+mod count_roots {
+  use super::*;
+
+  #[test]
+  fn all_reals_simple() {
+    assert_eq!(interpret("CountRoots[x^2 - 1, x]").unwrap(), "2");
+    assert_eq!(interpret("CountRoots[x^2 + 1, x]").unwrap(), "0");
+    assert_eq!(interpret("CountRoots[x^3 - x, x]").unwrap(), "3");
+    assert_eq!(interpret("CountRoots[x^4 + 1, x]").unwrap(), "0");
+    assert_eq!(interpret("CountRoots[x^6 - 1, x]").unwrap(), "2");
+  }
+
+  #[test]
+  fn counts_with_multiplicity() {
+    assert_eq!(interpret("CountRoots[(x - 2)^3, x]").unwrap(), "3");
+    assert_eq!(interpret("CountRoots[(x^2 - 2)^2, x]").unwrap(), "4");
+    assert_eq!(
+      interpret("CountRoots[(x - 1)^2 (x - 2)^3 (x - 3), x]").unwrap(),
+      "6"
+    );
+    // Triple root at the origin.
+    assert_eq!(interpret("CountRoots[x^3, x]").unwrap(), "3");
+  }
+
+  #[test]
+  fn closed_interval_includes_endpoints() {
+    let p = "(x - 1) (x - 2) (x - 3) (x - 4)";
+    assert_eq!(
+      interpret(&format!("CountRoots[{p}, {{x, 0, 5}}]")).unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret(&format!("CountRoots[{p}, {{x, 2, 4}}]")).unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(&format!("CountRoots[{p}, {{x, 2, 3}}]")).unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn interval_with_irrational_roots() {
+    // Sqrt[2] ~ 1.414 lies in [0, 2] but not [0, 1].
+    assert_eq!(interpret("CountRoots[x^2 - 2, {x, 0, 1}]").unwrap(), "0");
+    assert_eq!(interpret("CountRoots[x^2 - 2, {x, 0, 2}]").unwrap(), "1");
+    assert_eq!(interpret("CountRoots[x^2 - 2, x]").unwrap(), "2");
+  }
+
+  #[test]
+  fn rational_roots_and_bounds() {
+    assert_eq!(
+      interpret("CountRoots[(x - 1/2) (x - 3/2), x]").unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("CountRoots[(x - 1/2) (x - 3/2), {x, 0, 1}]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn infinite_bounds() {
+    assert_eq!(
+      interpret(
+        "CountRoots[(x - 1) (x - 2) (x - 3) (x - 4), {x, -Infinity, Infinity}]"
+      )
+      .unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret("CountRoots[(x + 5) (x - 5), {x, -Infinity, 0}]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("CountRoots[(x + 5) (x - 5), {x, 0, Infinity}]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn multiplicity_inside_interval() {
+    // Double root at 1, triple at 2, simple at 3; on [1, 2]: 2 + 3 = 5.
+    assert_eq!(
+      interpret("CountRoots[(x - 1)^2 (x - 2)^3 (x - 3), {x, 1, 2}]").unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn constants_and_linear() {
+    assert_eq!(interpret("CountRoots[5, x]").unwrap(), "0");
+    assert_eq!(interpret("CountRoots[x, x]").unwrap(), "1");
+  }
+
+  #[test]
+  fn non_polynomial_stays_unevaluated() {
+    assert_eq!(
+      interpret("CountRoots[Sin[x], x]").unwrap(),
+      "CountRoots[Sin[x], x]"
+    );
+  }
+}
+
+mod arctan_two_arg {
+  use super::*;
+
+  // ArcTan[x, y] reduces to the quadrant-adjusted ArcTan[y/x], kept symbolic
+  // when it doesn't simplify further.
+  #[test]
+  fn first_quadrant() {
+    assert_eq!(interpret("ArcTan[3, 4]").unwrap(), "ArcTan[4/3]");
+    assert_eq!(interpret("ArcTan[2, 6]").unwrap(), "ArcTan[3]");
+    assert_eq!(interpret("ArcTan[1/2, 3/4]").unwrap(), "ArcTan[3/2]");
+  }
+
+  #[test]
+  fn other_quadrants() {
+    assert_eq!(interpret("ArcTan[3, -4]").unwrap(), "-ArcTan[4/3]");
+    assert_eq!(interpret("ArcTan[-3, 4]").unwrap(), "Pi - ArcTan[4/3]");
+    assert_eq!(interpret("ArcTan[-3, -4]").unwrap(), "-Pi + ArcTan[4/3]");
+    assert_eq!(interpret("ArcTan[-1/2, 3/4]").unwrap(), "Pi - ArcTan[3/2]");
+  }
+
+  #[test]
+  fn axes_and_special_angles() {
+    assert_eq!(interpret("ArcTan[0, 5]").unwrap(), "Pi/2");
+    assert_eq!(interpret("ArcTan[5, 0]").unwrap(), "0");
+    assert_eq!(interpret("ArcTan[-5, 0]").unwrap(), "Pi");
+    assert_eq!(interpret("ArcTan[1, 1]").unwrap(), "Pi/4");
+    assert_eq!(interpret("ArcTan[1, Sqrt[3]]").unwrap(), "Pi/3");
+  }
+
+  // Single-argument ArcTan is odd: negative integers/rationals factor the sign.
+  #[test]
+  fn single_arg_odd_function() {
+    assert_eq!(interpret("ArcTan[-2]").unwrap(), "-ArcTan[2]");
+    assert_eq!(interpret("ArcTan[-4/3]").unwrap(), "-ArcTan[4/3]");
+    assert_eq!(interpret("ArcTan[-1]").unwrap(), "-1/4*Pi");
+  }
+}
+
+// Numeric evaluation of the inverse trig / hyperbolic functions at complex
+// float arguments. Values verified against wolframscript (to machine
+// precision; last-digit differences are libm-level rounding).
+mod inverse_trig_complex {
+  use super::*;
+
+  #[test]
+  fn arctan() {
+    assert_eq!(
+      interpret("ArcTan[1.0 + 1.0 I]").unwrap(),
+      "1.0172219678978514 + 0.4023594781085251*I"
+    );
+  }
+
+  #[test]
+  fn arcsin() {
+    assert_eq!(
+      interpret("ArcSin[1.0 + 1.0 I]").unwrap(),
+      "0.6662394324925153 + 1.0612750619050355*I"
+    );
+  }
+
+  #[test]
+  fn arccos() {
+    assert_eq!(
+      interpret("ArcCos[0.5 + 0.5 I]").unwrap(),
+      "1.118517879643706 - 0.5306375309525178*I"
+    );
+  }
+
+  #[test]
+  fn arcsinh() {
+    assert_eq!(
+      interpret("ArcSinh[1.0 + 1.0 I]").unwrap(),
+      "1.0612750619050357 + 0.6662394324925153*I"
+    );
+  }
+
+  // ArcTan[±I] is a pole: wolframscript returns Indeterminate.
+  #[test]
+  fn arctan_pole_is_indeterminate() {
+    assert_eq!(interpret("ArcTan[1.0 I]").unwrap(), "Indeterminate");
+    assert_eq!(interpret("ArcTan[-1.0 I]").unwrap(), "Indeterminate");
+  }
+
+  // Exact/symbolic arguments stay symbolic (unchanged by the numeric path).
+  #[test]
+  fn exact_arguments_unchanged() {
+    assert_eq!(interpret("ArcTan[1]").unwrap(), "Pi/4");
+    assert_eq!(interpret("ArcSin[1/2]").unwrap(), "Pi/6");
+    assert_eq!(interpret("ArcTan[x]").unwrap(), "ArcTan[x]");
+  }
+}
+
+mod arccot_exact {
+  use super::*;
+
+  // ArcCot keeps exact arguments symbolic unless they reduce to a closed
+  // form; it must not numericize an exact integer like ArcCot[2].
+  #[test]
+  fn integer_arguments_stay_symbolic() {
+    assert_eq!(interpret("ArcCot[2]").unwrap(), "ArcCot[2]");
+    assert_eq!(interpret("ArcCot[3]").unwrap(), "ArcCot[3]");
+  }
+
+  #[test]
+  fn closed_form_values() {
+    assert_eq!(interpret("ArcCot[0]").unwrap(), "Pi/2");
+    assert_eq!(interpret("ArcCot[1]").unwrap(), "Pi/4");
+    assert_eq!(interpret("ArcCot[Sqrt[3]]").unwrap(), "Pi/6");
+    assert_eq!(interpret("ArcCot[1/Sqrt[3]]").unwrap(), "Pi/3");
+  }
+
+  #[test]
+  fn limits_at_infinity() {
+    assert_eq!(interpret("ArcCot[Infinity]").unwrap(), "0");
+    assert_eq!(interpret("ArcCot[-Infinity]").unwrap(), "0");
+  }
+
+  // Odd function: the sign factors out.
+  #[test]
+  fn odd_function() {
+    assert_eq!(interpret("ArcCot[-1]").unwrap(), "-1/4*Pi");
+    assert_eq!(interpret("ArcCot[-2]").unwrap(), "-ArcCot[2]");
+    assert_eq!(interpret("ArcCot[-3]").unwrap(), "-ArcCot[3]");
+  }
+
+  // Inexact arguments still evaluate numerically. The exact last ULP of the
+  // result depends on the platform's libm (macOS/wolframscript give
+  // 0.46364760900080615; glibc on Linux CI differs by one ULP), so compare
+  // numerically rather than by exact string — matching how the other
+  // floating-point tests in this suite assert (see `rms_reals`).
+  #[test]
+  fn real_argument_is_numeric() {
+    let result = interpret("ArcCot[2.0]").unwrap();
+    let val: f64 = result.parse().unwrap();
+    assert!((val - 0.46364760900080615).abs() < 1e-12);
+  }
+}
+
+mod arccsch_arccoth_exact {
+  use super::*;
+
+  // ArcCsch keeps exact arguments symbolic (it had numericized ArcCsch[2]).
+  #[test]
+  fn arccsch_exact_symbolic() {
+    assert_eq!(interpret("ArcCsch[2]").unwrap(), "ArcCsch[2]");
+    assert_eq!(interpret("ArcCsch[1]").unwrap(), "ArcCsch[1]");
+  }
+
+  #[test]
+  fn arccsch_special_and_odd() {
+    assert_eq!(interpret("ArcCsch[0]").unwrap(), "ComplexInfinity");
+    assert_eq!(interpret("ArcCsch[Infinity]").unwrap(), "0");
+    assert_eq!(interpret("ArcCsch[-Infinity]").unwrap(), "0");
+    assert_eq!(interpret("ArcCsch[-2]").unwrap(), "-ArcCsch[2]");
+    assert_eq!(interpret("ArcCsch[-1/2]").unwrap(), "-ArcCsch[1/2]");
+  }
+
+  #[test]
+  fn arccsch_real_numeric() {
+    assert_eq!(interpret("ArcCsch[2.0]").unwrap(), "0.48121182505960347");
+  }
+
+  // ArcCoth gains the odd-function negation and ±Infinity limits.
+  #[test]
+  fn arccoth_odd_and_infinity() {
+    assert_eq!(interpret("ArcCoth[-2]").unwrap(), "-ArcCoth[2]");
+    assert_eq!(interpret("ArcCoth[-1/2]").unwrap(), "-ArcCoth[1/2]");
+    assert_eq!(interpret("ArcCoth[Infinity]").unwrap(), "0");
+    assert_eq!(interpret("ArcCoth[-Infinity]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arccoth_existing_values_unchanged() {
+    assert_eq!(interpret("ArcCoth[1]").unwrap(), "Infinity");
+    assert_eq!(interpret("ArcCoth[-1]").unwrap(), "-Infinity");
+    assert_eq!(interpret("ArcCoth[2]").unwrap(), "ArcCoth[2]");
+  }
+}
+
+#[cfg(test)]
+mod log_power_exact {
+  use woxi::interpret;
+
+  // Log[Sqrt[n]] = Log[n]/2 for positive integers (verified against wolframscript)
+  #[test]
+  fn log_sqrt_integer() {
+    assert_eq!(interpret("Log[Sqrt[2]]").unwrap(), "Log[2]/2");
+    assert_eq!(interpret("Log[Sqrt[15]]").unwrap(), "Log[15]/2");
+    assert_eq!(interpret("Log[Sqrt[7]]").unwrap(), "Log[7]/2");
+  }
+
+  // Log[n^(p/q)] = (p/q) Log[n] for fractional exponents
+  #[test]
+  fn log_integer_fractional_power() {
+    assert_eq!(interpret("Log[3^(2/5)]").unwrap(), "(2*Log[3])/5");
+    assert_eq!(interpret("Log[2^(1/3)]").unwrap(), "Log[2]/3");
+    assert_eq!(interpret("Log[6^(2/3)]").unwrap(), "(2*Log[6])/3");
+  }
+
+  // Negative fractional exponent
+  #[test]
+  fn log_integer_negative_power() {
+    assert_eq!(interpret("Log[5^(-1/2)]").unwrap(), "-1/2*Log[5]");
+  }
+
+  // Positive real constant bases: Pi, EulerGamma, GoldenRatio, Catalan
+  #[test]
+  fn log_constant_power() {
+    assert_eq!(interpret("Log[Pi^(1/2)]").unwrap(), "Log[Pi]/2");
+    assert_eq!(interpret("Log[Pi^(3/2)]").unwrap(), "(3*Log[Pi])/2");
+    assert_eq!(
+      interpret("Log[EulerGamma^(1/2)]").unwrap(),
+      "Log[EulerGamma]/2"
+    );
+    assert_eq!(
+      interpret("Log[GoldenRatio^(1/2)]").unwrap(),
+      "Log[GoldenRatio]/2"
+    );
+    assert_eq!(interpret("Log[Catalan^(1/3)]").unwrap(), "Log[Catalan]/3");
+  }
+
+  // LogGamma[1/2] = Log[Sqrt[Pi]] must now simplify to Log[Pi]/2
+  #[test]
+  fn log_gamma_half() {
+    assert_eq!(interpret("LogGamma[1/2]").unwrap(), "Log[Pi]/2");
+  }
+
+  // Symbolic bases must NOT simplify (sign unknown); E base handled separately;
+  // integer base with |exp|>1 stays a product; perfect powers reduce first.
+  #[test]
+  fn log_power_passthrough_and_special() {
+    assert_eq!(interpret("Log[Sqrt[x]]").unwrap(), "Log[Sqrt[x]]");
+    assert_eq!(interpret("Log[E^(1/2)]").unwrap(), "1/2");
+    assert_eq!(interpret("Log[2^(3/2)]").unwrap(), "Log[2*Sqrt[2]]");
+    assert_eq!(interpret("Log[8^(1/3)]").unwrap(), "Log[2]");
+  }
+
+  // Numeric value is unchanged by the symbolic simplification
+  #[test]
+  fn log_sqrt_numeric() {
+    assert_eq!(interpret("N[Log[Sqrt[2]]]").unwrap(), "0.34657359027997264");
+  }
+}
+
+// Sqrt[a]/Sqrt[b] = Sqrt[a/b] for positive numeric/constant radicands, matching
+// wolframscript. Free symbols stay split; a non-radical numerator stays as-is.
+mod sqrt_ratio_combination {
+  use super::*;
+
+  #[test]
+  fn integer_over_constant() {
+    assert_eq!(interpret("Sqrt[2]/Sqrt[Pi]").unwrap(), "Sqrt[2/Pi]");
+    assert_eq!(interpret("Sqrt[2]/Sqrt[E]").unwrap(), "Sqrt[2/E]");
+  }
+
+  #[test]
+  fn constant_over_integer() {
+    assert_eq!(interpret("Sqrt[Pi]/Sqrt[2]").unwrap(), "Sqrt[Pi/2]");
+  }
+
+  #[test]
+  fn constant_over_constant() {
+    assert_eq!(interpret("Sqrt[Pi]/Sqrt[E]").unwrap(), "Sqrt[Pi/E]");
+  }
+
+  #[test]
+  fn with_outer_coefficient() {
+    assert_eq!(interpret("2*Sqrt[2]/Sqrt[Pi]").unwrap(), "2*Sqrt[2/Pi]");
+  }
+
+  #[test]
+  fn product_radicands() {
+    assert_eq!(interpret("Sqrt[2*Pi]/Sqrt[3]").unwrap(), "Sqrt[(2*Pi)/3]");
+    assert_eq!(interpret("Sqrt[2]/Sqrt[3*Pi]").unwrap(), "Sqrt[2/(3*Pi)]");
+  }
+
+  // The merged radicand must be canonicalised: Sqrt[2/Pi]/Sqrt[5] has a
+  // numerator base of 2/Pi, and dividing it by 5 must reduce to 2/(5*Pi)
+  // rather than leaving the unreduced (2*Pi^(-1))/5 inside the Sqrt.
+  #[test]
+  fn reciprocal_radicand_is_normalized() {
+    assert_eq!(interpret("Sqrt[2/Pi]/Sqrt[5]").unwrap(), "Sqrt[2/(5*Pi)]");
+    assert_eq!(interpret("Sqrt[2/Pi]/Sqrt[3]").unwrap(), "Sqrt[2/(3*Pi)]");
+    assert_eq!(
+      interpret("2*Sqrt[2/Pi]*1/Sqrt[1 + 2^2]").unwrap(),
+      "2*Sqrt[2/(5*Pi)]"
+    );
+  }
+
+  #[test]
+  fn integer_over_integer_unchanged() {
+    assert_eq!(interpret("Sqrt[3]/Sqrt[5]").unwrap(), "Sqrt[3/5]");
+    assert_eq!(interpret("Sqrt[6]/Sqrt[2]").unwrap(), "Sqrt[3]");
+  }
+
+  #[test]
+  fn free_symbols_stay_split() {
+    assert_eq!(interpret("Sqrt[x]/Sqrt[y]").unwrap(), "Sqrt[x]/Sqrt[y]");
+    assert_eq!(interpret("Sqrt[2]/Sqrt[a]").unwrap(), "Sqrt[2]/Sqrt[a]");
+  }
+
+  #[test]
+  fn non_radical_numerator_stays() {
+    // Numerator 2 is not a square root, so wolframscript keeps 2/Sqrt[Pi].
+    assert_eq!(interpret("2/Sqrt[Pi]").unwrap(), "2/Sqrt[Pi]");
+  }
+
+  #[test]
+  fn besselj_half_integer() {
+    assert_eq!(
+      interpret("BesselJ[1/2, x]").unwrap(),
+      "(Sqrt[2/Pi]*Sin[x])/Sqrt[x]"
+    );
+    assert_eq!(
+      interpret("BesselJ[-1/2, x]").unwrap(),
+      "(Sqrt[2/Pi]*Cos[x])/Sqrt[x]"
+    );
+  }
+}
+
+mod apart_square_free_tests {
+  use woxi::interpret;
+
+  // The denominator's syntactic bases are used as given and never factored:
+  // an expanded square-free denominator stays put.
+  #[test]
+  fn square_free_bases_stay_unfactored() {
+    assert_eq!(
+      interpret("ApartSquareFree[1/(x^2 - 1)]").unwrap(),
+      "(-1 + x^2)^(-1)"
+    );
+    assert_eq!(
+      interpret("ApartSquareFree[1/(x^2 + x - 2)^2]").unwrap(),
+      "(-2 + x + x^2)^(-2)"
+    );
+    // …while explicitly factored products split fully.
+    assert_eq!(
+      interpret("ApartSquareFree[(3 + x)/((1 + x) (2 + x))]").unwrap(),
+      "2/(1 + x) - (2 + x)^(-1)"
+    );
+  }
+
+  #[test]
+  fn repeated_factors_split() {
+    assert_eq!(
+      interpret("ApartSquareFree[(x^2 + 1)/((x - 1)^2 (x + 2))]").unwrap(),
+      "2/(3*(-1 + x)^2) + 4/(9*(-1 + x)) + 5/(9*(2 + x))"
+    );
+    assert_eq!(
+      interpret("ApartSquareFree[(x^2 + 1)/((x - 1)^2 (x + 2)^2)]").unwrap(),
+      "2/(9*(-1 + x)^2) + 2/(27*(-1 + x)) + 5/(9*(2 + x)^2) - 2/(27*(2 + x))"
+    );
+    assert_eq!(
+      interpret("ApartSquareFree[1/((x - 1) (x + 2)^2)]").unwrap(),
+      "1/(9*(-1 + x)) - 1/(3*(2 + x)^2) - 1/(9*(2 + x))"
+    );
+  }
+
+  // Quadratic bases stay quadratic in the split terms.
+  #[test]
+  fn quadratic_bases() {
+    assert_eq!(
+      interpret("ApartSquareFree[1/((x^2 + 1) (x - 1)^2)]").unwrap(),
+      "1/(2*(-1 + x)^2) - 1/(2*(-1 + x)) + x/(2*(1 + x^2))"
+    );
+    assert_eq!(
+      interpret("ApartSquareFree[1/((x^2 - 2) (x - 1)^2)]").unwrap(),
+      "-(-1 + x)^(-2) - 2/(-1 + x) + (3 + 2*x)/(-2 + x^2)"
+    );
+  }
+
+  // Improper fractions split off their whole part; non-polynomial
+  // numerators pass through; lists thread.
+  #[test]
+  fn whole_parts_and_fallbacks() {
+    assert_eq!(
+      interpret("ApartSquareFree[(x^2 + 1)/(x^2 - 1)]").unwrap(),
+      "1 + 2/(-1 + x^2)"
+    );
+    assert_eq!(
+      interpret("ApartSquareFree[Sin[x]/(x^2 - 1)]").unwrap(),
+      "Sin[x]/(-1 + x^2)"
+    );
+    assert_eq!(
+      interpret("ApartSquareFree[{1/((x-1)(x+2)^2), 1/(x^2-1)}]").unwrap(),
+      "{1/(9*(-1 + x)) - 1/(3*(2 + x)^2) - 1/(9*(2 + x)), (-1 + x^2)^(-1)}"
+    );
+  }
+}
+
+mod unate_q_tests {
+  use woxi::interpret;
+
+  // UnateQ tests POSITIVE unateness (monotone increasing) in every
+  // variable by default — so x || !y is False despite being unate in the
+  // signed sense.
+  #[test]
+  fn default_all_variables() {
+    assert_eq!(interpret("UnateQ[x && y]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[x || (y && z)]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[x]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[x || ! y]").unwrap(), "False");
+    assert_eq!(interpret("UnateQ[! x]").unwrap(), "False");
+    assert_eq!(interpret("UnateQ[! x && ! y]").unwrap(), "False");
+    assert_eq!(interpret("UnateQ[Xor[x, y]]").unwrap(), "False");
+    assert_eq!(
+      interpret("UnateQ[Or[And[x, ! y], And[! x, y]], {x, y}]").unwrap(),
+      "False"
+    );
+  }
+
+  // The second argument restricts the check to the listed variables.
+  #[test]
+  fn selected_variables() {
+    assert_eq!(interpret("UnateQ[x && y, {x, y}]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[x && y, {x}]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[x || ! y, {x}]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[! x, {x}]").unwrap(), "False");
+  }
+
+  // Constants and opaque non-Boolean atoms are vacuously unate.
+  #[test]
+  fn vacuous_cases() {
+    assert_eq!(interpret("UnateQ[True]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[False]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[5]").unwrap(), "True");
+    assert_eq!(interpret("UnateQ[x + y]").unwrap(), "True");
+  }
+}
+
+// Regression tests for ReplaceAll descending into UnaryOp operands
+// (previously `!y /. y -> True` left the expression untouched).
+mod replace_all_unary_op_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn substitutes_inside_not() {
+    assert_eq!(interpret("ReplaceAll[! y, {y -> True}]").unwrap(), "False");
+    assert_eq!(
+      interpret("ReplaceAll[x || ! y, {x -> False, y -> True}]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("(x || ! y) /. y -> True").unwrap(), "x");
+  }
+}
+
+mod boolean_maxterms_tests {
+  use woxi::interpret;
+
+  // The dual of BooleanMinterms: Or-terms with the same literal polarity
+  // (plain where True / bit 1), conjoined in ascending index order.
+  #[test]
+  fn rows_and_indices() {
+    assert_eq!(
+      interpret("BooleanMaxterms[{{True, False}}, {x, y}]").unwrap(),
+      "x ||  !y"
+    );
+    assert_eq!(
+      interpret("BooleanMaxterms[{1, 2}, {x, y}]").unwrap(),
+      "( !x || y) && (x ||  !y)"
+    );
+    // Indices sort ascending regardless of the given order.
+    assert_eq!(
+      interpret("BooleanMaxterms[{2, 1}, {x, y}]").unwrap(),
+      "( !x || y) && (x ||  !y)"
+    );
+    assert_eq!(
+      interpret("BooleanMaxterms[{{False, False}}, {x, y}]").unwrap(),
+      " !x ||  !y"
+    );
+    assert_eq!(interpret("BooleanMaxterms[{0}, {x}]").unwrap(), " !x");
+    // Prefix rows cover the remaining variables.
+    assert_eq!(interpret("BooleanMaxterms[{{True}}, {x, y}]").unwrap(), "x");
+    // An empty specification is True (dual of Minterms' False).
+    assert_eq!(interpret("BooleanMaxterms[{}, {x, y}]").unwrap(), "True");
+  }
+}
+
+mod boolean_quantifier_tests {
+  use woxi::interpret;
+
+  // Conjunction/Disjunction are And/Or over all True/False assignments of
+  // the given variables, minimized like wolframscript.
+  #[test]
+  fn conjunction() {
+    assert_eq!(interpret("Conjunction[x && y || z, {x}]").unwrap(), "z");
+    assert_eq!(
+      interpret("Conjunction[Xor[x, y], {x, y}]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Conjunction[x || y, {x, y, z}]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Conjunction[(x && y) || (! x && z), {x}]").unwrap(),
+      "y && z"
+    );
+    // A bare symbol counts as one variable.
+    assert_eq!(interpret("Conjunction[x, x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn disjunction() {
+    assert_eq!(interpret("Disjunction[x && y, {x}]").unwrap(), "y");
+    assert_eq!(interpret("Disjunction[x, {y}]").unwrap(), "x");
+    assert_eq!(
+      interpret("Disjunction[(x && y) || (! x && z), {x}]").unwrap(),
+      "y || z"
+    );
+  }
+}
+
+mod algebraic_number_functions {
+  use super::*;
+
+  #[test]
+  fn algebraic_unit_q() {
+    for (input, expected) in [
+      ("AlgebraicUnitQ[I]", "True"),
+      ("AlgebraicUnitQ[Sqrt[2]]", "False"),
+      ("AlgebraicUnitQ[1 + Sqrt[2]]", "True"),
+      ("AlgebraicUnitQ[GoldenRatio]", "True"),
+      ("AlgebraicUnitQ[2]", "False"),
+      ("AlgebraicUnitQ[1]", "True"),
+      ("AlgebraicUnitQ[-1]", "True"),
+      ("AlgebraicUnitQ[0]", "False"),
+      ("AlgebraicUnitQ[1/2]", "False"),
+      ("AlgebraicUnitQ[Sqrt[2]/2]", "False"),
+      ("AlgebraicUnitQ[(1 + Sqrt[5])/2]", "True"),
+      ("AlgebraicUnitQ[2^(1/3)]", "False"),
+      ("AlgebraicUnitQ[1 + 2^(1/3) + 4^(1/3)]", "True"),
+      ("AlgebraicUnitQ[3 + 4*I]", "False"),
+      // Non-algebraic input gives False without a message
+      ("AlgebraicUnitQ[Pi]", "False"),
+      ("AlgebraicUnitQ[1.5]", "False"),
+      ("AlgebraicUnitQ[x]", "False"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn algebraic_number_norm() {
+    for (input, expected) in [
+      ("AlgebraicNumberNorm[Sqrt[2]]", "-2"),
+      ("AlgebraicNumberNorm[1 + Sqrt[2]]", "-1"),
+      ("AlgebraicNumberNorm[I]", "1"),
+      ("AlgebraicNumberNorm[3]", "3"),
+      ("AlgebraicNumberNorm[1/2]", "1/2"),
+      ("AlgebraicNumberNorm[GoldenRatio]", "-1"),
+      ("AlgebraicNumberNorm[2^(1/3)]", "2"),
+      ("AlgebraicNumberNorm[1 + I]", "2"),
+      ("AlgebraicNumberNorm[3 + 4*I]", "25"),
+      ("AlgebraicNumberNorm[0]", "0"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn algebraic_number_trace() {
+    for (input, expected) in [
+      ("AlgebraicNumberTrace[Sqrt[2]]", "0"),
+      ("AlgebraicNumberTrace[1 + Sqrt[2]]", "2"),
+      ("AlgebraicNumberTrace[I]", "0"),
+      ("AlgebraicNumberTrace[3]", "3"),
+      ("AlgebraicNumberTrace[1/2]", "1/2"),
+      ("AlgebraicNumberTrace[GoldenRatio]", "1"),
+      ("AlgebraicNumberTrace[2^(1/3)]", "0"),
+      ("AlgebraicNumberTrace[1 + I]", "2"),
+      ("AlgebraicNumberTrace[3 + 4*I]", "6"),
+      ("AlgebraicNumberTrace[0]", "0"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  #[test]
+  fn algebraic_number_denominator() {
+    for (input, expected) in [
+      ("AlgebraicNumberDenominator[Sqrt[2]]", "1"),
+      ("AlgebraicNumberDenominator[Sqrt[2]/2]", "2"),
+      ("AlgebraicNumberDenominator[1/2]", "2"),
+      ("AlgebraicNumberDenominator[3]", "1"),
+      ("AlgebraicNumberDenominator[GoldenRatio]", "1"),
+      ("AlgebraicNumberDenominator[(1 + Sqrt[5])/2]", "1"),
+      ("AlgebraicNumberDenominator[2^(1/3)/3]", "3"),
+      ("AlgebraicNumberDenominator[I/2]", "2"),
+      ("AlgebraicNumberDenominator[(1 + I)/2]", "2"),
+      ("AlgebraicNumberDenominator[0]", "1"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected, "{input}");
+    }
+  }
+
+  // Non-algebraic arguments emit `nalg` and stay unevaluated.
+  #[test]
+  fn non_algebraic_emits_nalg() {
+    for (head, shown) in [
+      ("AlgebraicNumberNorm", "Pi"),
+      ("AlgebraicNumberTrace", "Pi"),
+      ("AlgebraicNumberDenominator", "1.5"),
+    ] {
+      let input = format!("{head}[{shown}]");
+      let result = woxi::interpret_with_stdout(&input).unwrap();
+      assert_eq!(result.result, input);
+      assert!(
+        result.warnings.iter().any(|w| w.contains(&format!(
+          "{head}::nalg: {shown} is not an explicit algebraic number."
+        ))),
+        "expected nalg for {input}, got {:?}",
+        result.warnings
+      );
+    }
+  }
+}
+
+mod number_field_signature_tests {
+  use woxi::interpret;
+
+  // {r1, r2}: the minimal polynomial has r1 real roots and r2
+  // complex-conjugate pairs. All values verified against wolframscript.
+  #[test]
+  fn signatures_of_algebraic_numbers() {
+    assert_eq!(
+      interpret("NumberFieldSignature[Sqrt[2]]").unwrap(),
+      "{2, 0}"
+    );
+    assert_eq!(
+      interpret("NumberFieldSignature[2^(1/3)]").unwrap(),
+      "{1, 1}"
+    );
+    assert_eq!(interpret("NumberFieldSignature[I]").unwrap(), "{0, 1}");
+    assert_eq!(interpret("NumberFieldSignature[3]").unwrap(), "{1, 0}");
+    assert_eq!(interpret("NumberFieldSignature[1/2]").unwrap(), "{1, 0}");
+    assert_eq!(
+      interpret("NumberFieldSignature[Sqrt[2] + Sqrt[3]]").unwrap(),
+      "{4, 0}"
+    );
+    assert_eq!(
+      interpret("NumberFieldSignature[GoldenRatio]").unwrap(),
+      "{2, 0}"
+    );
+    assert_eq!(interpret("NumberFieldSignature[1 + I]").unwrap(), "{0, 1}");
+    assert_eq!(
+      interpret("NumberFieldSignature[Sqrt[-5]]").unwrap(),
+      "{0, 1}"
+    );
+  }
+
+  #[test]
+  fn signatures_of_root_objects() {
+    assert_eq!(
+      interpret("NumberFieldSignature[Root[#^5 - # - 1 &, 1]]").unwrap(),
+      "{1, 2}"
+    );
+    assert_eq!(
+      interpret("NumberFieldSignature[Root[#^4 + 2 #^2 + 2 &, 1]]").unwrap(),
+      "{0, 2}"
+    );
+    // A Root that collapses to a rational.
+    assert_eq!(
+      interpret("NumberFieldSignature[Root[#^2 - 1 &, 2]]").unwrap(),
+      "{1, 0}"
+    );
+    // Multi-argument form is interpreted as a Root specification.
+    assert_eq!(
+      interpret("NumberFieldSignature[#^2 - 2 &, 1]").unwrap(),
+      "{2, 0}"
+    );
+  }
+
+  // Non-algebraic arguments emit `nalg` and stay unevaluated.
+  #[test]
+  fn non_algebraic_emits_nalg() {
+    for (input, shown) in [
+      ("NumberFieldSignature[Pi]", "Pi"),
+      ("NumberFieldSignature[x]", "x"),
+      ("NumberFieldSignature[1.5]", "1.5"),
+      ("NumberFieldSignature[Sqrt[2], 3]", "Root[Sqrt[2], 3]"),
+    ] {
+      let result = woxi::interpret_with_stdout(input).unwrap();
+      assert_eq!(result.result, input);
+      assert!(
+        result.warnings.iter().any(|w| w.contains(&format!(
+          "NumberFieldSignature::nalg: {shown} is not an explicit algebraic number."
+        ))),
+        "expected nalg for {input}, got {:?}",
+        result.warnings
+      );
+    }
+  }
+
+  // The Root-object arm also closes a MinimalPolynomial gap.
+  #[test]
+  fn minimal_polynomial_of_root_objects() {
+    assert_eq!(
+      interpret("MinimalPolynomial[Root[#^5 - # - 1 &, 1], x]").unwrap(),
+      "-1 - x + x^5"
+    );
+    assert_eq!(
+      interpret("MinimalPolynomial[Root[#^4 + 2 #^2 + 2 &, 1], x]").unwrap(),
+      "2 + 2*x^2 + x^4"
+    );
+  }
+}
+
+// Differential-fuzzer regression tests (seed 1784293790651335963):
+// canonical ordering, Apart normalization, Simplify extraction, and
+// machine-fold divergences against wolframscript 15.0. All expectations
+// wolframscript-verified.
+mod fuzz_diff_round_2026_07_17 {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn rational_base_radicals_order_by_numeric_base() {
+    // case seed 3699346173710306347
+    assert_case(
+      "Numerator[Plus[Divide[Sqrt[10], Sqrt[6]], Sqrt[3]]]",
+      "Sqrt[5/3] + Sqrt[3]",
+    );
+    // case seed 320857114228749038
+    assert_case(
+      "Expand[Plus[Plus[Sqrt[9], Sqrt[11]], Divide[Times[4, Sqrt[10]], Sqrt[29]]]]",
+      "3 + 4*Sqrt[10/29] + Sqrt[11]",
+    );
+    // case seed 17866292230593708820
+    assert_case(
+      "Abs[Subtract[Divide[Sqrt[24], Sqrt[29]], Divide[Times[-2, Sqrt[27]], Sqrt[14]]]]",
+      "2*Sqrt[6/29] + 3*Sqrt[6/7]",
+    );
+    assert_case("Sort[{Sqrt[3], Sqrt[5/3]}]", "{Sqrt[5/3], Sqrt[3]}");
+    assert_case("Sort[{Sqrt[3], Sqrt[7/2]}]", "{Sqrt[3], Sqrt[7/2]}");
+    assert_case("Sort[{Sqrt[2], Sqrt[1/2]}]", "{1/Sqrt[2], Sqrt[2]}");
+  }
+
+  #[test]
+  fn rational_coefficient_merges_into_a_numeric_radical() {
+    // The coefficient squares into the radicand and square factors come
+    // back out, also when other factors ride along.
+    assert_case("Sqrt[6] x/4", "(Sqrt[3/2]*x)/2");
+    assert_case("2 x/Sqrt[30]", "Sqrt[2/15]*x");
+    assert_case("4 x/Sqrt[2 Pi]", "2*Sqrt[2/Pi]*x");
+    assert_case("3 x/Sqrt[2 Pi]", "(3*x)/Sqrt[2*Pi]");
+    // A radicand with reciprocal constants joins in too.
+    assert_case("Sqrt[6/Pi]/4", "Sqrt[3/(2*Pi)]/2");
+    assert_case("Sqrt[6/Pi] Sin[t]/4", "(Sqrt[3/(2*Pi)]*Sin[t])/2");
+  }
+
+  #[test]
+  fn unit_fraction_bases_flip() {
+    // A unit fraction under a root or a power flips to its denominator.
+    assert_case("Sqrt[1/(2 Pi)]", "1/Sqrt[2*Pi]");
+    assert_case("Sqrt[x/(2 Pi)]", "Sqrt[x]/Sqrt[2*Pi]");
+    assert_case("Sqrt[1/(2 Pi)]/3", "1/(3*Sqrt[2*Pi])");
+    assert_case(
+      "{(1/2)^x, (1/3)^(-x), (1/2)^(x + 1), (1/2)^Pi}",
+      "{2^(-x), 3^x, 2^(-1 - x), 2^(-Pi)}",
+    );
+    assert_case(
+      "{(1/2)^(1/3), (1/4)^(1/3), (1/2)^(I x)}",
+      "{2^(-1/3), 2^(-2/3), 2^(-I*x)}",
+    );
+    // A complex number exponent keeps the fraction, and (2/3)^x is no
+    // unit fraction.
+    assert_case(
+      "{(1/2)^I, (1/2)^(1 + I), (2/3)^x}",
+      "{(1/2)^I, (1/2)^(1 + I), (2/3)^x}",
+    );
+    // A perfect-power base reduces under a negative exponent as it does
+    // under a positive one.
+    assert_case(
+      "{4^(-1/3), 8^(-2/9), 100^(-1/3)}",
+      "{2^(-2/3), 2^(-2/3), 10^(-2/3)}",
+    );
+  }
+
+  #[test]
+  fn number_base_powers_lead_a_product() {
+    assert_case("Sqrt[3/2] E^(I p)", "Sqrt[3/2]*E^(I*p)");
+    assert_case("(3/2)^x E^y", "(3/2)^x*E^y");
+    assert_case("Sqrt[3] (-1)^(1/4) x", "(-1)^(1/4)*Sqrt[3]*x");
+    assert_case("I Sqrt[3/2] x", "I*Sqrt[3/2]*x");
+  }
+
+  #[test]
+  fn exact_numeric_factor_joins_a_bigfloat() {
+    assert_case(
+      "N[2, 20] 3^(1/3)",
+      "2.88449914061481676464327662156021917678`20.",
+    );
+  }
+
+  #[test]
+  fn number_base_powers_sort_before_symbols_and_strings() {
+    // A power of a number compares by its base, and a number precedes any
+    // symbol, string or compound.
+    assert_case("Sort[{E, Sqrt[2]}]", "{Sqrt[2], E}");
+    assert_case(
+      "Sort[{1 + x, Sqrt[2], f[x], x, Pi, a^2, 2^x, E^2, Sqrt[x], \
+       1/Sqrt[2], Sqrt[2/3], \"s\", 2^(1/3)}]",
+      "{Sqrt[2/3], 1/Sqrt[2], 2^(1/3), Sqrt[2], 2^x, s, a^2, E^2, Pi, \
+       Sqrt[x], x, 1 + x, f[x]}",
+    );
+    assert_case(
+      "Sort[{Pi, Sqrt[2], 3^(1/3), E, GoldenRatio, Sqrt[5]}]",
+      "{Sqrt[2], 3^(1/3), Sqrt[5], E, GoldenRatio, Pi}",
+    );
+    assert_case(
+      "{Order[Sqrt[2], E], Order[E, Sqrt[2]], Order[\"s\", 2^x]}",
+      "{1, -1, -1}",
+    );
+  }
+
+  #[test]
+  fn sort_union_same_base_powers_and_sums() {
+    // case seed 16300912233182470467 (Union canonical order)
+    assert_case("Union[{Pi}, {1/Pi}]", "{Pi^(-1), Pi}");
+    assert_case("Sort[{Pi, 1/Pi}]", "{Pi^(-1), Pi}");
+    assert_case("Sort[{Pi, 1 + 1/Pi}]", "{1 + Pi^(-1), Pi}");
+    assert_case("Sort[{Pi, -3910 + 93/Pi}]", "{-3910 + 93/Pi, Pi}");
+    assert_case("Sort[{Pi, 2 + Pi}]", "{Pi, 2 + Pi}");
+    assert_case("Sort[{Pi^2, 1 + Pi}]", "{Pi^2, 1 + Pi}");
+    assert_case("Sort[{x, 5 - x}]", "{5 - x, x}");
+    assert_case("Sort[{x, -3 + x}]", "{-3 + x, x}");
+    assert_case("Sort[{1/x, x - x^2}]", "{x^(-1), x - x^2}");
+    assert_case("Sort[{Cos[x], 1 + x}]", "{1 + x, Cos[x]}");
+    assert_case(
+      "Union[{27, 5.7, Pi}, {Plus[Divide[18, 3], Times[81, Divide[-17, 3]]], Subtract[Times[85, -46], Divide[-93, Pi]], Divide[Subtract[8, Divide[6, 2]], Divide[17, 5]]}]",
+      "{-453, 25/17, 5.7, 27, -3910 + 93/Pi, Pi}",
+    );
+  }
+
+  #[test]
+  fn apart_denominator_leading_positive_with_content() {
+    // case seed 8021134854569802508
+    assert_case(
+      "Apart[Divide[Plus[0, Times[4, x], Times[-3, Power[x, 2]], Times[-1, Power[x, 3]]], Plus[0, Times[1, x], Times[1, Power[x, 2]], Times[-5, Power[x, 3]]]]]",
+      "1/5 + (-19 + 16*x)/(5*(-1 - x + 5*x^2))",
+    );
+    assert_case(
+      "Apart[1/(x + x^2 - 5*x^3)]",
+      "x^(-1) + (1 - 5*x)/(-1 - x + 5*x^2)",
+    );
+    assert_case(
+      "Apart[1/(2*x + x^2 - 5*x^3)]",
+      "1/(2*x) + (1 - 5*x)/(2*(-2 - x + 5*x^2))",
+    );
+    // unchanged conventions
+    assert_case(
+      "Apart[(5 + 3*x)/(-1 - 2*x + 3*x^2)]",
+      "2/(-1 + x) - 3/(1 + 3*x)",
+    );
+    assert_case("Apart[1/(x^2*(x + 1))]", "x^(-2) - x^(-1) + (1 + x)^(-1)");
+    assert_case("Apart[(2 - 4*x)/(2 - 5*x)]", "4/5 - 2/(5*(-2 + 5*x))");
+  }
+
+  #[test]
+  fn simplify_radical_and_content_extraction() {
+    // case seed 16005587802477298591
+    assert_case(
+      "Simplify[Times[Subtract[Sqrt[16], Sqrt[3]], Divide[Sqrt[8], Sqrt[26]]]]",
+      "(-2*(-4 + Sqrt[3]))/Sqrt[13]",
+    );
+    assert_case("Simplify[Sqrt[8] - Sqrt[24]]", "-2*Sqrt[2]*(-1 + Sqrt[3])");
+    assert_case("Simplify[-Sqrt[8] + Sqrt[24]]", "2*Sqrt[2]*(-1 + Sqrt[3])");
+    assert_case("Simplify[Sqrt[8] + Sqrt[24]]", "2*(Sqrt[2] + Sqrt[6])");
+    assert_case("Simplify[-Sqrt[8] - Sqrt[24]]", "-2*(Sqrt[2] + Sqrt[6])");
+    assert_case(
+      "Simplify[(8 + 2*Sqrt[3])/Sqrt[13]]",
+      "(2*(4 + Sqrt[3]))/Sqrt[13]",
+    );
+    assert_case(
+      "Simplify[(-8 - 2*Sqrt[3])/Sqrt[13]]",
+      "(-2*(4 + Sqrt[3]))/Sqrt[13]",
+    );
+    assert_case(
+      "Simplify[(5 - 3*Sqrt[3])/Sqrt[13]]",
+      "(5 - 3*Sqrt[3])/Sqrt[13]",
+    );
+    // bare sums keep their form on the SimplifyCount tie
+    assert_case("Simplify[8 - 2*Sqrt[3]]", "8 - 2*Sqrt[3]");
+    assert_case("Simplify[-3*Sqrt[2] + Sqrt[10]]", "Sqrt[2]*(-3 + Sqrt[5])");
+    assert_case("Simplify[4*Sqrt[2] - 8*Sqrt[30]]", "4*Sqrt[2] - 8*Sqrt[30]");
+
+    // case seed 14323847961001369104: a radical times a sum of radicals.
+    // Pulling the shared Sqrt out only wins when a cofactor collapses to a
+    // bare integer; here every cofactor stays a Sqrt, so the content-only
+    // form is kept, and on the unit-cofactor cost tie WL keeps it factored
+    // only when the leading term stays positive.
+    assert_case(
+      "Simplify[Times[Subtract[Sqrt[3], Sqrt[17]], Times[Sqrt[19], Times[-3, Sqrt[28]]]]]",
+      "-6*Sqrt[399] + 6*Sqrt[2261]",
+    );
+    assert_case(
+      "Simplify[2*Sqrt[19]*(Sqrt[3] - Sqrt[17])]",
+      "2*(Sqrt[57] - Sqrt[323])",
+    );
+    assert_case(
+      "Simplify[6*Sqrt[133]*(Sqrt[3] - Sqrt[17])]",
+      "6*(Sqrt[399] - Sqrt[2261])",
+    );
+    assert_case(
+      "Simplify[Sqrt[19]*(Sqrt[3] - Sqrt[17])]",
+      "Sqrt[57] - Sqrt[323]",
+    );
+    // unit-cofactor cost tie: factored only when the leading term is positive
+    assert_case("Simplify[2*Sqrt[3] - 2*Sqrt[5]]", "2*(Sqrt[3] - Sqrt[5])");
+    assert_case(
+      "Simplify[6*Sqrt[399] - 6*Sqrt[2261]]",
+      "6*(Sqrt[399] - Sqrt[2261])",
+    );
+    // non-unit cofactor: strict cost win keeps the content form even with a
+    // negative leading term
+    assert_case(
+      "Simplify[-12*Sqrt[5] + 3*Sqrt[19]]",
+      "3*(-4*Sqrt[5] + Sqrt[19])",
+    );
+    assert_case(
+      "Simplify[12*Sqrt[5] - 3*Sqrt[19]]",
+      "12*Sqrt[5] - 3*Sqrt[19]",
+    );
+  }
+
+  #[test]
+  fn simplify_quotient_sign_and_denominator_content() {
+    // case seed 862368627941598145
+    assert_case(
+      "Simplify[Divide[Plus[4, Times[-3, x]], Plus[-4, Times[-1, x], Times[-3, Power[x, 2]], Times[5, Power[x, 3]]]]]",
+      "-((4 - 3*x)/(4 + x + 3*x^2 - 5*x^3))",
+    );
+    assert_case("Simplify[1/(-3*x^2 + 5*x^3)]", "1/(x^2*(-3 + 5*x))");
+    assert_case("Simplify[1/(3*x^2 - 5*x^3)]", "1/((3 - 5*x)*x^2)");
+    assert_case("Simplify[1/(4*x + 3*x^2)]", "(4*x + 3*x^2)^(-1)");
+    assert_case("Simplify[1/(2*x^2 + 4*x^3)]", "(2*x^2 + 4*x^3)^(-1)");
+    assert_case(
+      "Simplify[(1 - 5*x - 3*x^2 - x^3)/(-1 - 2*x + 4*x^2)]",
+      "-((-1 + 5*x + 3*x^2 + x^3)/(-1 - 2*x + 4*x^2))",
+    );
+    assert_case(
+      "Simplify[(2 - 2*x + 2*x^2)/(1 - 2*x)]",
+      "(2 - 2*x + 2*x^2)/(1 - 2*x)",
+    );
+  }
+
+  #[test]
+  fn machine_times_nested_exact_const_fold() {
+    // case seed 4134943276941009607
+    assert_case(
+      "Times[39, Times[Plus[Divide[-63, -70], Plus[-83, Divide[4, 8]]], Pi], Subtract[Plus[Subtract[Pi, -19.5], -76], -5.2]]",
+      "481478.3397922004",
+    );
+    assert_case(
+      "Times[39, Times[-35, Pi], -51.3 + Pi]",
+      "206516.44476381145",
+    );
+    assert_case("(-1365*Pi)*(-51.3 + Pi)", "206516.44476381148");
+    assert_case(
+      "Times[13, Times[-17, Pi], Plus[-51.3, Pi]]",
+      "33435.995818902804",
+    );
+    assert_case(
+      "Times[7, Times[11, E], Plus[-51.3, Pi]]",
+      "-10079.92551545021",
+    );
+    // case seed 4125733669514322931
+    assert_case(
+      "Times[Subtract[Divide[58, -60], Divide[-83, Plus[Divide[-4, 5], Pi]]], Divide[Plus[21, Times[Pi, -22]], Pi], -14.9]",
+      "7868.203629768974",
+    );
+    assert_case(
+      "Times[-14.9, Divide[Plus[21, Times[Pi, -22]], Pi]]",
+      "228.2008366130919",
+    );
+    // flat folds keep their order
+    assert_case("Times[2.7, Times[3, Pi]]", "25.44690049407733");
+    assert_case("Times[0.1, Pi, 0.3, -Pi]", "-0.2960881320326807");
+    // real-first exact factors multiply sequentially in input order
+    // (case seed 15183690236476585210)
+    assert_case(
+      "Times[Times[Plus[Pi, 51], Times[Plus[64, -7.3], Plus[16, Pi]]], -10, Divide[-15, 5]]",
+      "1.762842087037921*^6",
+    );
+  }
+
+  #[test]
+  fn factor_content_sign_follows_lex_leading_term() {
+    assert_case("Factor[2*x^2 - 3*x*y^2]", "x*(2*x - 3*y^2)");
+    assert_case("Factor[5*y - 3*x*y^2]", "-(y*(-5 + 3*x*y))");
+    assert_case("Factor[5*y - 3*x*y]", "-((-5 + 3*x)*y)");
+    assert_case("Factor[-2*x^2*y + 4*x*y^2]", "-2*x*(x - 2*y)*y");
+    assert_case("FactorTerms[2 - 4*x - 4*x^2]", "-2*(-1 + 2*x + 2*x^2)");
+  }
+}
+
+mod binomial_equation_roots {
+  use super::*;
+
+  // wolframscript keeps the roots of x^n == c in radical form and lists them
+  // in canonical order, so the real root of x^3 == 8 comes first and the
+  // complex ones stay as roots of unity times the radical.
+  #[test]
+  fn perfect_power_keeps_roots_of_unity() {
+    assert_eq!(
+      interpret("Solve[x^3 == 8, x]").unwrap(),
+      "{{x -> 2}, {x -> -2*(-1)^(1/3)}, {x -> 2*(-1)^(2/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 27, x]").unwrap(),
+      "{{x -> 3}, {x -> -3*(-1)^(1/3)}, {x -> 3*(-1)^(2/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[8 x^3 == 1, x]").unwrap(),
+      "{{x -> 1/2}, {x -> -1/2*(-1)^(1/3)}, {x -> (-1)^(2/3)/2}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 1/8, x]").unwrap(),
+      "{{x -> 1/2}, {x -> -1/2*(-1)^(1/3)}, {x -> (-1)^(2/3)/2}}"
+    );
+  }
+
+  // A radicand that is not a perfect power stays in radicals rather than
+  // falling back to Root objects.
+  #[test]
+  fn irrational_radicand_stays_in_radicals() {
+    assert_eq!(
+      interpret("Solve[x^3 - 2 == 0, x]").unwrap(),
+      "{{x -> -(-2)^(1/3)}, {x -> 2^(1/3)}, {x -> (-1)^(2/3)*2^(1/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 5, x]").unwrap(),
+      "{{x -> -(-5)^(1/3)}, {x -> 5^(1/3)}, {x -> (-1)^(2/3)*5^(1/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 12, x]").unwrap(),
+      "{{x -> -((-3)^(1/3)*2^(2/3))}, {x -> (-2)^(2/3)*3^(1/3)}, \
+       {x -> 2^(2/3)*3^(1/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^4 == 2, x]").unwrap(),
+      "{{x -> -2^(1/4)}, {x -> -I*2^(1/4)}, {x -> I*2^(1/4)}, {x -> 2^(1/4)}}"
+    );
+  }
+
+  #[test]
+  fn roots_of_unity_of_every_degree() {
+    assert_eq!(
+      interpret("Solve[x^4 == 1, x]").unwrap(),
+      "{{x -> -1}, {x -> -I}, {x -> I}, {x -> 1}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^5 == 1, x]").unwrap(),
+      "{{x -> 1}, {x -> -(-1)^(1/5)}, {x -> (-1)^(2/5)}, \
+       {x -> -(-1)^(3/5)}, {x -> (-1)^(4/5)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^6 == 1, x]").unwrap(),
+      "{{x -> -1}, {x -> 1}, {x -> -(-1)^(1/3)}, {x -> (-1)^(1/3)}, \
+       {x -> -(-1)^(2/3)}, {x -> (-1)^(2/3)}}"
+    );
+  }
+
+  // For an odd degree the generating root is the REAL one, so x^3 == -2
+  // reports -2^(1/3) rather than expanding (-2)^(1/3) everywhere.
+  #[test]
+  fn negative_right_hand_side() {
+    assert_eq!(
+      interpret("Solve[x^3 == -8, x]").unwrap(),
+      "{{x -> -2}, {x -> 2*(-1)^(1/3)}, {x -> -2*(-1)^(2/3)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == -2, x]").unwrap(),
+      "{{x -> (-2)^(1/3)}, {x -> -2^(1/3)}, {x -> -((-1)^(2/3)*2^(1/3))}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^5 == -1, x]").unwrap(),
+      "{{x -> -1}, {x -> (-1)^(1/5)}, {x -> -(-1)^(2/5)}, \
+       {x -> (-1)^(3/5)}, {x -> -(-1)^(4/5)}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^4 == -1, x]").unwrap(),
+      "{{x -> -(-1)^(1/4)}, {x -> (-1)^(1/4)}, {x -> -(-1)^(3/4)}, \
+       {x -> (-1)^(3/4)}}"
+    );
+  }
+
+  // x^n == 0 reports the single root with its multiplicity.
+  #[test]
+  fn zero_right_hand_side_repeats_the_root() {
+    assert_eq!(
+      interpret("Solve[x^3 == 0, x]").unwrap(),
+      "{{x -> 0}, {x -> 0}, {x -> 0}}"
+    );
+  }
+
+  #[test]
+  fn solve_values_and_replacement_agree() {
+    assert_eq!(
+      interpret("SolveValues[x^3 == 8, x]").unwrap(),
+      "{2, -2*(-1)^(1/3), 2*(-1)^(2/3)}"
+    );
+    assert_eq!(
+      interpret("x /. Solve[x^3 == 8, x]").unwrap(),
+      "{2, -2*(-1)^(1/3), 2*(-1)^(2/3)}"
+    );
+  }
+
+  // NSolve stays on the numeric root finder, so a conjugate pair agrees to
+  // the last bit instead of rounding each radical on its own.
+  #[test]
+  fn numeric_roots_are_conjugate_pairs() {
+    assert_eq!(
+      interpret("NSolve[x^3 == 8, x]").unwrap(),
+      "{{x -> -1. - 1.7320508075688772*I}, \
+       {x -> -1. + 1.7320508075688772*I}, {x -> 2.}}"
+    );
+    assert_eq!(
+      interpret("NSolve[x^3 == -2, x]").unwrap(),
+      "{{x -> -1.2599210498948732}, \
+       {x -> 0.6299605249474366 - 1.0911236359717214*I}, \
+       {x -> 0.6299605249474366 + 1.0911236359717214*I}}"
+    );
+    assert_eq!(
+      interpret("NSolve[x^3 == 2, x, Reals]").unwrap(),
+      "{{x -> 1.2599210498948732}}"
+    );
+  }
+
+  // Root reports an explicit value only when the polynomial factors over the
+  // rationals into pieces of degree at most 2; an irreducible cubic keeps the
+  // canonical Root form even though Solve writes that root as 2^(1/3).
+  #[test]
+  fn root_resolves_only_reducible_polynomials() {
+    assert_eq!(
+      interpret("Root[x^3 - 2, 1]").unwrap(),
+      "Root[-2 + #1^3 & , 1, 0]"
+    );
+    assert_eq!(
+      interpret("Root[x^4 - 2, 1]").unwrap(),
+      "Root[-2 + #1^4 & , 1, 0]"
+    );
+    assert_eq!(interpret("Root[x^3 - 8, 1]").unwrap(), "2");
+    assert_eq!(interpret("Root[x^3 - 8, 2]").unwrap(), "-1 - I*Sqrt[3]");
+    assert_eq!(interpret("Root[x^3 - 8, 3]").unwrap(), "-1 + I*Sqrt[3]");
+    assert_eq!(interpret("Root[x^4 - 16, 1]").unwrap(), "-2");
+  }
+
+  // Complex roots of a quadratic index by ascending imaginary part, which
+  // needs the -I Sqrt[3] term to be read as a number and not as a symbol.
+  #[test]
+  fn quadratic_roots_index_by_imaginary_part() {
+    assert_eq!(
+      interpret("Root[x^2 + 2 x + 4, 1]").unwrap(),
+      "-1 - I*Sqrt[3]"
+    );
+    assert_eq!(
+      interpret("Root[x^2 + 2 x + 4, 2]").unwrap(),
+      "-1 + I*Sqrt[3]"
+    );
+  }
+}
+
+mod polynomial_mod_and_monomial_orders {
+  use super::*;
+
+  // A polynomial modulus divides and keeps the remainder, in the variable
+  // the modulus is written in.
+  #[test]
+  fn polynomial_modulus_divides() {
+    assert_eq!(interpret("PolynomialMod[x^3 + 2 x, x^2 + 1]").unwrap(), "x");
+    assert_eq!(interpret("PolynomialMod[x^2 - 1, x - 1]").unwrap(), "0");
+    assert_eq!(interpret("PolynomialMod[x^5, x^2 - 1]").unwrap(), "x");
+    assert_eq!(
+      interpret("PolynomialMod[a x^2 + 1, x^2 + 1]").unwrap(),
+      "1 - a"
+    );
+    assert_eq!(
+      interpret("PolynomialMod[2 x^2 + 1, 3 x + 1]").unwrap(),
+      "11/9"
+    );
+    assert_eq!(interpret("PolynomialMod[5, x]").unwrap(), "5");
+    assert_eq!(interpret("PolynomialMod[x, 0]").unwrap(), "x");
+  }
+
+  #[test]
+  fn polynomial_modulus_picks_its_own_variable() {
+    assert_eq!(
+      interpret("PolynomialMod[x^2 + y, y - 1]").unwrap(),
+      "1 + x^2"
+    );
+    assert_eq!(interpret("PolynomialMod[x^2, x + y]").unwrap(), "y^2");
+    assert_eq!(interpret("PolynomialMod[x^2 y + x, y]").unwrap(), "x");
+  }
+
+  // A list of moduli reduces modulo all of them at once — modulo the ideal
+  // they generate, so integers that are coprime kill the polynomial.
+  #[test]
+  fn a_list_of_moduli_reduces_by_all_of_them() {
+    assert_eq!(
+      interpret("PolynomialMod[7 x^2 + 3, {x^2 - 1, 5}]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("PolynomialMod[6 x^2 + 4 x + 2, {x + 1, 4}]").unwrap(),
+      "0"
+    );
+    assert_eq!(interpret("PolynomialMod[x^4, {x^2 - 2, 3}]").unwrap(), "1");
+    assert_eq!(interpret("PolynomialMod[3 x^2 + 2, {2, x}]").unwrap(), "0");
+    assert_eq!(
+      interpret("PolynomialMod[x^2 + y^2, {x + y, 3}]").unwrap(),
+      "2*y^2"
+    );
+    assert_eq!(interpret("PolynomialMod[7, {5, 3}]").unwrap(), "0");
+  }
+
+  // A numeric modulus keeps reducing the coefficients, and the whole thing
+  // threads over a list of polynomials.
+  #[test]
+  fn numeric_modulus_and_threading() {
+    assert_eq!(interpret("PolynomialMod[2 x + 7, 3]").unwrap(), "1 + 2*x");
+    assert_eq!(interpret("PolynomialMod[-3 x, 2]").unwrap(), "x");
+    assert_eq!(
+      interpret("PolynomialMod[{2 x, 4 x}, 3]").unwrap(),
+      "{2*x, x}"
+    );
+  }
+
+  // MonomialList takes a monomial order as its third argument.
+  #[test]
+  fn monomial_orders() {
+    let p = "x^2 + y^3 + x*y";
+    assert_eq!(
+      interpret(&format!("MonomialList[{p}, {{x, y}}, \"Lexicographic\"]"))
+        .unwrap(),
+      "{x^2, x*y, y^3}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "MonomialList[{p}, {{x, y}}, \"DegreeLexicographic\"]"
+      ))
+      .unwrap(),
+      "{y^3, x^2, x*y}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "MonomialList[{p}, {{x, y}}, \"DegreeReverseLexicographic\"]"
+      ))
+      .unwrap(),
+      "{y^3, x^2, x*y}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "MonomialList[{p}, {{x, y}}, \"NegativeLexicographic\"]"
+      ))
+      .unwrap(),
+      "{y^3, x*y, x^2}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "MonomialList[{p}, {{x, y}}, \"NegativeDegreeLexicographic\"]"
+      ))
+      .unwrap(),
+      "{x^2, x*y, y^3}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "MonomialList[{p}, {{x, y}}, \"NegativeDegreeReverseLexicographic\"]"
+      ))
+      .unwrap(),
+      "{x^2, x*y, y^3}"
+    );
+  }
+
+  #[test]
+  fn monomial_orders_keep_the_coefficients() {
+    assert_eq!(
+      interpret(
+        r#"MonomialList[(1 + x + y)^2, {x, y}, "DegreeReverseLexicographic"]"#
+      )
+      .unwrap(),
+      "{x^2, 2*x*y, y^2, 2*x, 2*y, 1}"
+    );
+    assert_eq!(
+      interpret(
+        r#"MonomialList[3 x^2 y + 2 x y^2 + z, {x, y, z}, "Lexicographic"]"#
+      )
+      .unwrap(),
+      "{3*x^2*y, 2*x*y^2, z}"
+    );
+    assert_eq!(
+      interpret(r#"MonomialList[x + 1, {x}, "NegativeLexicographic"]"#)
+        .unwrap(),
+      "{1, x}"
+    );
+  }
+
+  #[test]
+  fn an_unknown_monomial_order_is_refused() {
+    let r = woxi::interpret_with_stdout(
+      r#"MonomialList[x^2 + x*y + y^3, {x, y}, "Foo"]"#,
+    )
+    .unwrap();
+    assert_eq!(r.result, "MonomialList[x^2 + x*y + y^3, {x, y}, Foo]");
+    assert!(
+      r.warnings.iter().any(|w| w
+        .contains("MonomialList::mnmord1: Foo is not a valid monomial order.")),
+      "expected mnmord1, got {:?}",
+      r.warnings
+    );
+  }
+}
+
+mod constrained_numeric_optimization {
+  use super::*;
+
+  // A `{f, cons}` objective states a constrained problem; the starting
+  // values are only a hint. wolframscript's interior-point method reports
+  // these to about 8 digits (e.g. 1.000000013 for the second one) — the
+  // values below agree with it and are the exact optima.
+  #[test]
+  fn find_minimum_with_constraints() {
+    assert_eq!(
+      interpret("FindMinimum[{x^2 + y^2, x + y == 1}, {{x, 0}, {y, 0}}]")
+        .unwrap(),
+      "{0.5, {x -> 0.5, y -> 0.5}}"
+    );
+    assert_eq!(
+      interpret("FindMinimum[{x^2, x >= 1}, {x, 0}]").unwrap(),
+      "{1., {x -> 1.}}"
+    );
+    assert_eq!(
+      interpret("FindMinimum[{-x, x <= 5}, {x, 0}]").unwrap(),
+      "{-5., {x -> 5.}}"
+    );
+  }
+
+  // The variables may be given without starting values.
+  #[test]
+  fn find_minimum_without_starting_values() {
+    assert_eq!(
+      interpret("FindMinimum[{x^2, x >= 1}, x]").unwrap(),
+      "{1., {x -> 1.}}"
+    );
+    // Rounded restatement of the same call: wolframscript's interior-point
+    // method stops at 1.000000013282579 here, so only a rounded projection
+    // can be compared against it.
+    assert_eq!(
+      interpret(
+        "Round[{#[[1]], x /. #[[2]]} &[FindMinimum[{x^2, x >= 1}, x]], 10^-6]"
+      )
+      .unwrap(),
+      "{1, 1}"
+    );
+  }
+
+  #[test]
+  fn find_maximum_with_constraints() {
+    assert_eq!(
+      interpret("FindMaximum[{2 x, x <= 3}, {x, 0}]").unwrap(),
+      "{6., {x -> 3.}}"
+    );
+    assert_eq!(
+      interpret("FindMaximum[{x + y, x^2 + y^2 <= 1}, {{x, 0.5}, {y, 0.5}}]")
+        .unwrap(),
+      "{1.4142135623730951, {x -> 0.7071067811865476, y -> 0.7071067811865476}}"
+    );
+    // wolframscript answers the circle case with 1.4142157575770362, so the
+    // agreement is only to about 5 digits — round to 10^-4 to compare.
+    assert_eq!(
+      interpret(
+        "Round[{#[[1]], {x, y} /. #[[2]]} &[\
+         FindMaximum[{x + y, x^2 + y^2 <= 1}, {{x, 0.5}, {y, 0.5}}]], 10^-4]"
+      )
+      .unwrap(),
+      "{7071/5000, {7071/10000, 7071/10000}}"
+    );
+  }
+
+  // Several constraints combine with And.
+  #[test]
+  fn several_constraints() {
+    assert_eq!(
+      interpret(
+        "FindMinimum[{x^2 + y^2, x + y == 1 && x >= 0.7}, {{x, 0}, {y, 0}}]"
+      )
+      .unwrap(),
+      "{0.58, {x -> 0.7, y -> 0.30000000000000004}}"
+    );
+    // wolframscript lands on 0.580000011263976 for the same problem; the
+    // rounded projection is what both engines agree on.
+    assert_eq!(
+      interpret(
+        "Round[{#[[1]], {x, y} /. #[[2]]} &[\
+         FindMinimum[{x^2 + y^2, x + y == 1 && x >= 0.7}, {{x, 0}, {y, 0}}]], 10^-6]"
+      )
+      .unwrap(),
+      "{29/50, {7/10, 3/10}}"
+    );
+  }
+
+  // NArgMin and NArgMax report where the optimum sits: one value for a
+  // single variable, a list for several.
+  #[test]
+  fn narg_min_and_max_with_constraints() {
+    assert_eq!(
+      interpret("NArgMin[{x^2 + y^2, x + y == 1}, {x, y}]").unwrap(),
+      "{0.5, 0.5}"
+    );
+    assert_eq!(
+      interpret("NArgMin[{x^2 + y^2, x + y == 2}, {x, y}]").unwrap(),
+      "{1., 1.}"
+    );
+    assert_eq!(
+      interpret("NArgMax[{x + y, x^2 + y^2 <= 1}, {x, y}]").unwrap(),
+      "{0.7071067811865475, 0.7071067811865475}"
+    );
+    assert_eq!(interpret("NArgMin[{x^2, x >= 1}, x]").unwrap(), "1.");
+    // wolframscript stops at 1.0000000066412895 for the inequality case.
+    assert_eq!(
+      interpret("Round[NArgMin[{x^2, x >= 1}, x], 10^-6]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn narg_min_over_several_variables_without_constraints() {
+    assert_eq!(interpret("NArgMin[x^2 + y^2, {x, y}]").unwrap(), "{0., 0.}");
+  }
+}
+
+mod refine_bounded_variables {
+  use super::*;
+
+  // A chained inequality pins Floor when the range cannot straddle an
+  // integer boundary.
+  #[test]
+  fn floor_of_a_bounded_variable() {
+    assert_eq!(interpret("Refine[Floor[x], 0 < x < 1]").unwrap(), "0");
+    assert_eq!(interpret("Refine[Floor[x], 2 < x < 3]").unwrap(), "2");
+    assert_eq!(interpret("Refine[Floor[x], -1 < x < 0]").unwrap(), "-1");
+    assert_eq!(interpret("Refine[Floor[x], 0 <= x < 1]").unwrap(), "0");
+    // x could be 1 here, so the floor is not settled.
+    assert_eq!(
+      interpret("Refine[Floor[x], 0 < x <= 1]").unwrap(),
+      "Floor[x]"
+    );
+  }
+
+  #[test]
+  fn ceiling_of_a_bounded_variable() {
+    assert_eq!(interpret("Refine[Ceiling[x], 0 < x < 1]").unwrap(), "1");
+    assert_eq!(interpret("Refine[Ceiling[x], 1 < x < 2]").unwrap(), "2");
+    // x could be 0 here, which ceils to 0 rather than 1.
+    assert_eq!(
+      interpret("Refine[Ceiling[x], 0 <= x < 1]").unwrap(),
+      "Ceiling[x]"
+    );
+  }
+
+  // IntegerPart truncates toward zero, so it settles on either side of it.
+  #[test]
+  fn integer_and_fractional_part_of_a_bounded_variable() {
+    assert_eq!(interpret("Refine[IntegerPart[x], 0 < x < 1]").unwrap(), "0");
+    assert_eq!(
+      interpret("Refine[IntegerPart[x], -1 < x < 0]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("Refine[FractionalPart[x], 0 < x < 1]").unwrap(),
+      "x"
+    );
+  }
+
+  // Round is not settled by that range: it is 0 below 1/2 and 1 above.
+  #[test]
+  fn round_stays_when_the_range_does_not_settle_it() {
+    assert_eq!(
+      interpret("Refine[Round[x], 0 < x < 1]").unwrap(),
+      "Round[x]"
+    );
+  }
+
+  // The sign facts of a chained inequality reach the other refinements too.
+  #[test]
+  fn a_chained_inequality_gives_the_sign() {
+    assert_eq!(interpret("Refine[Sign[x], 0 < x < 1]").unwrap(), "1");
+    assert_eq!(interpret("Refine[Abs[x], 0 < x < 1]").unwrap(), "x");
+  }
+
+  #[test]
+  fn simplify_and_assuming_take_the_same_route() {
+    assert_eq!(interpret("Simplify[Floor[x], 0 < x < 1]").unwrap(), "0");
+    assert_eq!(
+      interpret("Assuming[0 < x < 1, Simplify[Floor[x]]]").unwrap(),
+      "0"
+    );
+  }
+
+  // The explicit Inequality form works the same way.
+  #[test]
+  fn the_inequality_head_is_understood() {
+    assert_eq!(
+      interpret("Refine[Floor[x], Inequality[0, Less, x, Less, 1]]").unwrap(),
+      "0"
+    );
+  }
+}
+
+mod fuzz_diff_round_2026_07_26 {
+  use super::super::case_helpers::assert_case;
+
+  // Simplify displays a univariate polynomial quotient's parts in
+  // FactorSquareFree form, never fully factored: a squarefree numerator
+  // stays expanded even when the factored form has a lower SimplifyCount
+  // (case seed 13512828096256521534; wolframscript-verified).
+  #[test]
+  fn simplify_squarefree_quotient_numerator_stays_expanded() {
+    assert_case(
+      "Simplify[Divide[Plus[-4, Times[-5, x], Times[-5, Power[x, 2]], Times[-4, Power[x, 3]]], Plus[0, Times[-2, x], Times[-3, Power[x, 2]]]]]",
+      "(4 + 5*x + 5*x^2 + 4*x^3)/(2*x + 3*x^2)",
+    );
+    assert_case(
+      "Simplify[(-4 - 5*x - 5*x^2 - 4*x^3)/(2*x + 3*x^2)]",
+      "-((4 + 5*x + 5*x^2 + 4*x^3)/(2*x + 3*x^2))",
+    );
+    assert_case(
+      "Simplify[(2 + 3*x + x^2)/(2 + 3*x)]",
+      "(2 + 3*x + x^2)/(2 + 3*x)",
+    );
+    assert_case(
+      "Simplify[(2 + 3*x + x^2)/(1 - 2*x + x^2)]",
+      "(2 + 3*x + x^2)/(-1 + x)^2",
+    );
+    // Monomial content and perfect powers still come out, and the
+    // denominator follows into squarefree form when the numerator
+    // changed.
+    assert_case(
+      "Simplify[(4*x^2 - 2*x)/(2 + 3*x)]",
+      "(2*x*(-1 + 2*x))/(2 + 3*x)",
+    );
+    assert_case(
+      "Simplify[(1 + 2*x + x^2)/(2*x + 3*x^2)]",
+      "(1 + x)^2/(x*(2 + 3*x))",
+    );
+    // Full cancellation keeps the reduced pair's own orientation:
+    // x/(x*(1-3x)) leaves a positive constant numerator.
+    assert_case(
+      "Simplify[Divide[x, Plus[0, x, Times[-3, Power[x, 2]]]]]",
+      "(1 - 3*x)^(-1)",
+    );
+    // Sign handling around the squarefree display is unchanged.
+    assert_case("Simplify[x^2/(1 - 3*x + 3*x^2 - x^3)]", "-(x^2/(-1 + x)^3)");
+    assert_case("Simplify[1/(1 - 3*x + 3*x^2 - x^3)]", "-(-1 + x)^(-3)");
+    assert_case("Simplify[-1/(2 - 4*x)]", "(-2 + 4*x)^(-1)");
+    assert_case(
+      "Simplify[(2 + 3*x + x^2)/(4 + 5*x + 5*x^2 + 4*x^3)]",
+      "(2 + x)/(4 + x + 4*x^2)",
+    );
+  }
+}
+
+mod constrained_solve_roots {
+  use super::*;
+
+  /// `NSolve[eqns]` with the variable left out solves for whatever the
+  /// equations contain, as `Solve[eqns]` does. The "Filling Cone,
+  /// Hemisphere and Cylinder" Demonstration inverts its hemisphere volume
+  /// this way.
+  #[test]
+  fn nsolve_infers_its_variable() {
+    clear_state();
+    assert_eq!(
+      interpret("NSolve[x^2 == 2]").unwrap(),
+      "{{x -> -1.4142135623730951}, {x -> 1.4142135623730951}}"
+    );
+  }
+
+  /// An inequality alongside the equation narrows the answer even when the
+  /// roots have no radical form: the bound is decided on the root's value.
+  /// Regression: a cubic whose roots came back as `Root[…]` objects kept
+  /// all three, so the notebook read the wrong one out of position 1.
+  #[test]
+  fn an_exact_root_is_filtered_by_its_bounds() {
+    clear_state();
+    assert_eq!(
+      interpret("NSolve[1 == f^2 (3 - f) && 0 <= f <= 1, f]").unwrap(),
+      "{{f -> 0.6527036446661393}}"
+    );
+    assert_eq!(
+      interpret("Solve[1 == f^2 (3 - f) && 0 <= f <= 1, f]").unwrap(),
+      "{{f -> Root[1 - 3*#1^2 + #1^3 & , 2, 0]}}"
+    );
+  }
+
+  /// Nothing orders a complex number, so an ordering bound rules one out.
+  #[test]
+  fn an_ordering_bound_rules_out_complex_roots() {
+    clear_state();
+    assert_eq!(
+      interpret("Solve[x^4 == 16 && x > 0, x]").unwrap(),
+      "{{x -> 2}}"
+    );
+    assert_eq!(
+      interpret("Solve[x^3 == 8 && x > 0, x]").unwrap(),
+      "{{x -> 2}}"
+    );
+  }
+
+  /// A `!=` constraint is not an ordering: it still admits any value that
+  /// differs, and the real roots either side of the bound stay.
+  #[test]
+  fn inequality_constraints_are_not_ordering_bounds() {
+    clear_state();
+    assert_eq!(
+      interpret("NSolve[x^2 - 1 == 0 && x != 1, x]").unwrap(),
+      "{{x -> -1.}}"
+    );
+  }
+}
+
+/// `Simplify` used to expand a `(sum)^n` denominator, which both diverged from
+/// wolframscript and destroyed the shared base that `Together` needs to take
+/// the LCM of a sum's denominators. Re-simplifying its own output then combined
+/// over a *product* of coprime-looking polynomials and blew the interpreter
+/// stack (issue #426).
+mod power_denominators_survive_simplify {
+  use super::*;
+
+  /// wolframscript keeps the power form: expanding it is never a
+  /// simplification. The multivariate case has no polynomial-GCD path that
+  /// would rebuild the base, so it has to survive untouched.
+  #[test]
+  fn a_multivariate_power_denominator_stays_factored() {
+    assert_eq!(
+      interpret("Simplify[(x^2 + y^2)/(x^2 + y^2 + z^2)^3]").unwrap(),
+      "(x^2 + y^2)/(x^2 + y^2 + z^2)^3"
+    );
+    assert_eq!(
+      interpret("Simplify[(a*x^2 + b*y^2)/(x^2 + y^2 + z^2)^7]").unwrap(),
+      "(a*x^2 + b*y^2)/(x^2 + y^2 + z^2)^7"
+    );
+    assert_eq!(
+      interpret("Expand[(a + b)/(x + y)^2]").unwrap(),
+      "a/(x + y)^2 + b/(x + y)^2"
+    );
+  }
+
+  /// A denominator that genuinely shares a factor with the numerator still
+  /// cancels — the power form is only restored when nothing reduced.
+  #[test]
+  fn a_cancelling_power_denominator_still_reduces() {
+    assert_eq!(
+      interpret("Simplify[(x^2 - 1)/(x - 1)^2]").unwrap(),
+      "(1 + x)/(-1 + x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(x^3 + x)/(x^2 + 1)^2]").unwrap(),
+      "x/(1 + x^2)"
+    );
+    assert_eq!(
+      interpret("Simplify[1/(x^2 + y^2)^2 + 1/(x^2 + y^2)^3]").unwrap(),
+      "(1 + x^2 + y^2)/(x^2 + y^2)^3"
+    );
+  }
+
+  /// The reported crash: `Simplify` is idempotent, so a second pass over a sum
+  /// of quotients with ascending powers of one base returns its own input
+  /// instead of combining over their degree-70 product.
+  #[test]
+  fn simplify_is_idempotent_on_a_sum_of_power_quotients() {
+    let once =
+      interpret("Simplify[D[1/(x^2 + y^2 + z^2), {x, 6}, {y, 2}]]").unwrap();
+    assert!(
+      once.contains("(x^2 + y^2 + z^2)^9"),
+      "denominators stay factored, got {once}"
+    );
+    let twice =
+      interpret("Simplify[Simplify[D[1/(x^2 + y^2 + z^2), {x, 6}, {y, 2}]]]")
+        .unwrap();
+    assert_eq!(once, twice);
+  }
+
+  /// The single-quotient shape of the same bug: `D[…, {x, 4}, {y, 2}]`
+  /// simplifies to one fraction over `(x^2 + y^2 + z^2)^7`, and a second
+  /// `Simplify` used to expand that denominator to degree 14.
+  #[test]
+  fn simplify_is_idempotent_on_a_single_power_quotient() {
+    let once =
+      interpret("Simplify[D[1/(x^2 + y^2 + z^2), {x, 4}, {y, 2}]]").unwrap();
+    let twice =
+      interpret("Simplify[Simplify[D[1/(x^2 + y^2 + z^2), {x, 4}, {y, 2}]]]")
+        .unwrap();
+    assert_eq!(once, twice);
+    assert!(
+      once.ends_with("/(x^2 + y^2 + z^2)^7"),
+      "denominator stays factored, got {once}"
+    );
+  }
+}
+
+mod nested_product_expansion_stays_bounded {
+  use super::*;
+
+  /// `distribute_product` multiplies out one product of sums, so a *nested*
+  /// product multiplied the term count at every level and only collapsed
+  /// them at the very top. The Newton form `InterpolatingPolynomial`
+  /// returns is the worst case: one symbolic ordinate among ten numeric ones
+  /// made degree 10 build ~130000 intermediate terms for a 21-term answer,
+  /// which took 68s (11s at degree 9, 0.8s at 8 — it grew ~4x per degree).
+  /// Combining after each multiplication bounds the intermediate by the
+  /// number of distinct monomials; the same expansion now takes 0.2s.
+  ///
+  /// Found by the nightly fuzzer, which reported it as an interpreter hang.
+  /// These cases are the regression guard: the assertions are cheap, but a
+  /// return to the old behaviour makes them take minutes.
+  #[test]
+  fn a_symbolic_ordinate_does_not_blow_up_the_intermediate() {
+    let pts = "{{0,1},{1,6},{2,17},{3,34},{4,57},{5,q},{6,121},{7,162},\
+               {8,209},{9,262},{10,321}}";
+    assert_eq!(
+      interpret(&format!("Expand[InterpolatingPolynomial[{pts}, x]]")).unwrap(),
+      "1 - (21662*x)/5 + (252*q*x)/5 + (295786*x^2)/25 - (6877*q*x^2)/50 \
+       - (51471*x^3)/4 + (1197*q*x^3)/8 + (2689607*x^4)/360 \
+       - (62549*q*x^4)/720 - (1862717*x^5)/720 + (43319*q*x^5)/1440 \
+       + (4032239*x^6)/7200 - (93773*q*x^6)/14400 - (688*x^7)/9 \
+       + (8*q*x^7)/9 + (4601*x^8)/720 - (107*q*x^8)/1440 - (43*x^9)/144 \
+       + (q*x^9)/288 + (43*x^10)/7200 - (q*x^10)/14400"
+    );
+    // The all-numeric interpolation has to keep reducing to the exact
+    // quadratic it came from — combining early must not lose a term.
+    assert_eq!(
+      interpret(
+        "Expand[InterpolatingPolynomial[{{0,1},{1,6},{2,17},{3,34},{4,57},\
+         {5,86},{6,121},{7,162},{8,209},{9,262},{10,321}}, x]]"
+      )
+      .unwrap(),
+      "1 + 2*x + 3*x^2"
+    );
+  }
+
+  /// The same expansion reached through `Simplify`, which runs it twice.
+  /// Asserted by value rather than by form: Woxi expands the numerator where
+  /// wolframscript keeps `(-86 + q)` factored out of each coefficient, and
+  /// that difference is not what this test is about.
+  #[test]
+  fn simplify_over_a_symbolic_interpolation_terminates() {
+    let pts = "{{0,1},{1,6},{2,17},{3,34},{4,57},{5,q},{6,121},{7,162},\
+               {8,209},{9,262},{10,321}}";
+    assert_eq!(
+      interpret(&format!(
+        "Expand[Simplify[InterpolatingPolynomial[{pts}, x]] \
+         - Expand[InterpolatingPolynomial[{pts}, x]]]"
+      ))
+      .unwrap(),
+      "0"
+    );
+    // It still interpolates: substituting the symbolic ordinate back gives
+    // every sample point.
+    assert_eq!(
+      interpret(&format!(
+        "Table[Simplify[InterpolatingPolynomial[{pts}, x]] \
+         /. {{q -> 86, x -> k}}, {{k, 0, 10}}]"
+      ))
+      .unwrap(),
+      "{1, 6, 17, 34, 57, 86, 121, 162, 209, 262, 321}"
+    );
+  }
+
+  /// Expanding a deeply nested product of binomials is the same shape
+  /// without the rational coefficients: 2^12 products collapse to 13 terms.
+  #[test]
+  fn a_deep_product_of_binomials_collapses() {
+    let prod = (0..12)
+      .map(|i| format!("(x + {i})"))
+      .collect::<Vec<_>>()
+      .join("*");
+    let out = interpret(&format!("Expand[{prod}]")).unwrap();
+    assert!(out.starts_with("39916800*x"), "got {out}");
+    assert!(out.ends_with("+ x^12"), "got {out}");
+    // Every power from 1 to 12 is present exactly once.
+    for k in 2..=12 {
+      assert!(out.contains(&format!("x^{k}")), "missing x^{k} in {out}");
+    }
+  }
+}

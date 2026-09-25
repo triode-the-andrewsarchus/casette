@@ -1,0 +1,199 @@
+#[allow(unused_imports)]
+use super::*;
+
+pub fn dispatch_boolean_functions(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  // A `BooleanFunction[bdd][v1, …, vn]` application is opaque to the
+  // evaluator, so the Boolean-algebra functions first rewrite it to the
+  // explicit expression in those variables and work on that.
+  let expanded: Vec<Expr>;
+  let args = if matches!(
+    name,
+    "BooleanConvert"
+      | "BooleanMinimize"
+      | "BooleanVariables"
+      | "SatisfiableQ"
+      | "SatisfiabilityCount"
+      | "SatisfiabilityInstances"
+      | "TautologyQ"
+      | "UnateQ"
+      | "LogicalExpand"
+  ) {
+    expanded = args
+      .iter()
+      .map(crate::functions::boolean_ast::expand_boolean_function_objects)
+      .collect();
+    &expanded[..]
+  } else {
+    args
+  };
+  match name {
+    "And" => {
+      return Some(crate::functions::boolean_ast::and_ast(args));
+    }
+    "Or" => {
+      return Some(crate::functions::boolean_ast::or_ast(args));
+    }
+    "Not" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::not_ast(args));
+    }
+    "Xor" => {
+      return Some(crate::functions::boolean_ast::xor_ast(args));
+    }
+    "Xnor" => {
+      return Some(crate::functions::boolean_ast::xnor_ast(args));
+    }
+    "Equivalent" => {
+      return Some(crate::functions::boolean_ast::equivalent_ast(args));
+    }
+    "Majority" => {
+      return Some(crate::functions::majority_ast(args));
+    }
+    "BooleanMinterms" if args.len() == 2 => {
+      return Some(crate::functions::boolean_minterms_ast(args));
+    }
+    "BooleanVariables" if args.len() == 1 => {
+      return Some(crate::functions::boolean_variables_ast(args));
+    }
+    "SatisfiableQ" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::satisfiable_q_ast(args));
+    }
+    "SatisfiabilityCount" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::satisfiability_count_ast(args));
+    }
+    "TautologyQ" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::boolean_ast::tautology_q_ast(args));
+    }
+    "Return" => {
+      let val = if args.is_empty() {
+        null_expr()
+      } else {
+        args[0].clone()
+      };
+      return Some(Err(InterpreterError::ReturnValue(Box::new(val))));
+    }
+    // ControlActive[activeform, normalform] displays as `activeform` only
+    // while it appears inside a control that is being actively manipulated,
+    // and as `normalform` otherwise. In script mode (and any non-interactive
+    // evaluation) nothing is ever actively manipulated, so it evaluates to
+    // its inactive form `normalform`, matching wolframscript.
+    "ControlActive" if args.len() == 2 => {
+      return Some(Ok(args[1].clone()));
+    }
+    // ControlActive[] with no arguments queries whether a control is currently
+    // being actively manipulated. Outside an interactive notebook nothing is,
+    // so it evaluates to False, matching wolframscript in script mode.
+    "ControlActive" if args.is_empty() => {
+      return Some(Ok(bool_expr(false)));
+    }
+    // A structural comparison consumes its arguments, so the `Unevaluated`
+    // wrapper comes off first: `SameQ[Unevaluated[x], x]` is True. It is
+    // what WLX's `With[{s = Extract[…, Unevaluated]}, s === Symbol]` asks.
+    "SameQ" => {
+      let bare: Vec<Expr> = args
+        .iter()
+        .map(crate::evaluator::strip_unevaluated)
+        .collect();
+      return Some(crate::functions::boolean_ast::same_q_ast(&bare));
+    }
+    "UnsameQ" => {
+      let bare: Vec<Expr> = args
+        .iter()
+        .map(crate::evaluator::strip_unevaluated)
+        .collect();
+      return Some(crate::functions::boolean_ast::unsame_q_ast(&bare));
+    }
+    "Which" => {
+      // which_ast handles all arities: Which[] -> Null, even counts process
+      // the test/value pairs, and an odd count warns Which::argct(u).
+      return Some(crate::functions::boolean_ast::which_ast(args));
+    }
+    "While" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::boolean_ast::while_ast(args));
+    }
+    "Equal" => {
+      return Some(crate::functions::boolean_ast::equal_ast(args));
+    }
+    "Unequal" if args.len() >= 2 => {
+      return Some(crate::functions::boolean_ast::unequal_ast(args));
+    }
+    // 0- or 1-arg Unequal is trivially True (no pair of unequal items).
+    "Unequal" if args.len() < 2 => {
+      return Some(Ok(bool_expr(true)));
+    }
+    // Route the functional forms through the same Comparison evaluation
+    // as the operator syntax, so e.g. the ComplexInfinity `nord` messages
+    // fire identically for LessEqual[1/0, 0] and 1/0 <= 0.
+    "Less" | "Greater" | "LessEqual" | "GreaterEqual" if args.len() >= 2 => {
+      let op = match name {
+        "Less" => ComparisonOp::Less,
+        "Greater" => ComparisonOp::Greater,
+        "LessEqual" => ComparisonOp::LessEqual,
+        _ => ComparisonOp::GreaterEqual,
+      };
+      return Some(crate::evaluator::evaluate_expr_to_expr(
+        &Expr::Comparison {
+          operands: args.to_vec(),
+          operators: vec![op; args.len() - 1],
+        },
+      ));
+    }
+    "Boole" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::boole_ast(args));
+    }
+    "TrueQ" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::true_q_ast(args));
+    }
+    "Implies" if args.len() == 2 => {
+      return Some(crate::functions::boolean_ast::implies_ast(args));
+    }
+    "Nand" => {
+      return Some(crate::functions::boolean_ast::nand_ast(args));
+    }
+    "Nor" => {
+      return Some(crate::functions::boolean_ast::nor_ast(args));
+    }
+    "LogicalExpand" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::logical_expand_ast(args));
+    }
+    "BooleanTable" => {
+      return Some(crate::functions::boolean_ast::boolean_table_ast(args));
+    }
+    "BooleanFunction" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::boolean_ast::boolean_function_ast(args));
+    }
+    "BooleanMinimize" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::boolean_minimize_ast(args));
+    }
+    "BooleanCountingFunction" if args.len() == 2 || args.len() == 3 => {
+      return Some(
+        crate::functions::boolean_ast::boolean_counting_function_ast(args),
+      );
+    }
+    "BooleanConvert" if !args.is_empty() && args.len() <= 2 => {
+      return Some(crate::functions::boolean_ast::boolean_convert_ast(args));
+    }
+    "UnateQ" if !args.is_empty() && args.len() <= 2 => {
+      return Some(crate::functions::boolean_ast::unate_q_ast(args));
+    }
+    "BooleanMaxterms" if args.len() == 2 => {
+      return Some(crate::functions::boolean_ast::boolean_maxterms_ast(args));
+    }
+    "Conjunction" if args.len() == 2 => {
+      return Some(crate::functions::boolean_ast::conjunction_ast(args));
+    }
+    "Disjunction" if args.len() == 2 => {
+      return Some(crate::functions::boolean_ast::disjunction_ast(args));
+    }
+    "VectorLess" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::vector_less_ast(args));
+    }
+    "VectorLessEqual" if args.len() == 1 => {
+      return Some(crate::functions::boolean_ast::vector_less_equal_ast(args));
+    }
+    _ => {}
+  }
+  None
+}

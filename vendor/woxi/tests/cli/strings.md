@@ -1,0 +1,23 @@
+---
+icon: lucide/type
+---
+
+# Strings
+
+Woxi implements a large subset of the Wolfram Language string API.
+The documentation is split into four topical pages:
+
+- [Basics](strings/basics.md) — `StringLength`, `StringJoin`, `StringSplit`, `StringTake`, `StringDrop`, `StringReverse`, `StringRepeat`, `StringTrim`, `Characters`, `CharacterRange`, `Print`.
+- [Manipulation](strings/manipulation.md) — `StringInsert`, `StringDelete`, `StringReplace`, `StringPartition`, `StringRiffle`, `StringRotate*`, `StringPad*`, `Capitalize`, `Decapitalize`, `ToLowerCase`, `ToUpperCase`, `RemoveDiacritics`, …
+- [Matching & Searching](strings/matching.md) — `StringMatchQ`, `StringStartsQ`, `StringContainsQ`, `StringPosition`, `StringCases`, `StringCount`, `EditDistance`, `HammingDistance`, `LongestCommonSubsequence`, `SequenceAlignment`, `LowerCaseQ`, `UpperCaseQ`, `DictionaryWordQ`, `SyntaxQ`, …
+- [Conversion & Encoding](strings/conversion.md) — `ToString`, `ToExpression`, `TextString`, `TextWords`, `IntegerString`, `NumericalSort`, `ToCharacterCode`, `FromCharacterCode`, `Alphabet`, `LetterNumber`, `Hash`, `Uncompress`, `URLDecode`, `URLEncode`, …
+
+
+
+# Additional Functions
+
+- [`ByteArrayToString`](strings/ByteArrayToString.md)
+- [`Compress`](strings/Compress.md)
+- [`Character`](strings/Character.md)
+- [`StringExpression`](strings/StringExpression.md)
+- [`Word`](strings/Word.md)

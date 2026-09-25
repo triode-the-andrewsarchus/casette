@@ -1,0 +1,425 @@
+//! Reader for Wolfram Language's binary serialization format, the byte stream
+//! produced by `Compress` / consumed by `Uncompress` (and embedded in
+//! `CompressedData[...]`). After the `"1:"` prefix is stripped, base64-decoded
+//! and zlib-inflated, the payload begins with the magic `!boR` followed by a
+//! tree of tagged tokens. This module turns that tree back into an [`Expr`].
+//!
+//! Ground-truth tokens (single leading byte), verified against `wolframscript`:
+//!
+//! | tag | meaning                                                            |
+//! |-----|--------------------------------------------------------------------|
+//! | `i` | machine integer: `<i32 LE>`                                         |
+//! | `I` | big integer: `<i32 len><len ASCII decimal digits>`                  |
+//! | `r` | machine real: `<f64 LE>`                                            |
+//! | `S` | string: `<i32 len><len UTF-8 bytes>`                                |
+//! | `s` | symbol (used as a head): `<i32 len><len UTF-8 bytes>`               |
+//! | `f` | normal expression: `<i32 nargs><head expr><arg expr>*nargs`         |
+//! | `n` | integer raw array: `<i32 type>?<i32 rank><i32 dims><packed ints>`  |
+//! | `e` | real packed array: `<i32 rank><i32 dims><packed f64>`               |
+//! | `b` | byte raw array: `<i32 rank><i32 dims><raw u8>`                      |
+//!
+//! The `b` token carries raster pixel payloads — the `RawArray` data inside
+//! `RasterBox[CompressedData["…"]]` and inline `Image[…]` literals; its
+//! elements are unsigned, unlike the sign-extended `n` token.
+
+#[allow(unused_imports)]
+use super::*;
+
+/// Decode a WL binary serialization payload (must start with `!boR`).
+/// Returns `None` when the data is not in this format or is malformed.
+pub fn deserialize(data: &[u8]) -> Option<Expr> {
+  if data.len() < 5 || &data[0..4] != b"!boR" {
+    return None;
+  }
+  let mut pos = 4;
+  let expr = read_expr(data, &mut pos)?;
+  Some(expr)
+}
+
+fn read_i32(data: &[u8], pos: &mut usize) -> Option<i32> {
+  let end = pos.checked_add(4)?;
+  if end > data.len() {
+    return None;
+  }
+  let v = i32::from_le_bytes([
+    data[*pos],
+    data[*pos + 1],
+    data[*pos + 2],
+    data[*pos + 3],
+  ]);
+  *pos = end;
+  Some(v)
+}
+
+fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
+  let end = pos.checked_add(8)?;
+  if end > data.len() {
+    return None;
+  }
+  let mut b = [0u8; 8];
+  b.copy_from_slice(&data[*pos..end]);
+  *pos = end;
+  Some(f64::from_le_bytes(b))
+}
+
+fn read_len_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+  let len = read_i32(data, pos)?;
+  if len < 0 {
+    return None;
+  }
+  let len = len as usize;
+  let end = pos.checked_add(len)?;
+  if end > data.len() {
+    return None;
+  }
+  let slice = &data[*pos..end];
+  *pos = end;
+  Some(slice)
+}
+
+fn read_expr(data: &[u8], pos: &mut usize) -> Option<Expr> {
+  let tag = *data.get(*pos)?;
+  *pos += 1;
+  match tag {
+    b'i' => Some(Expr::Integer(read_i32(data, pos)? as i128)),
+    b'r' => Some(Expr::Real(read_f64(data, pos)?)),
+    b'I' => {
+      let s = std::str::from_utf8(read_len_bytes(data, pos)?).ok()?;
+      Some(parse_integer(s))
+    }
+    b'S' => {
+      let s = std::str::from_utf8(read_len_bytes(data, pos)?).ok()?;
+      Some(Expr::String(s.to_string()))
+    }
+    b's' => {
+      let s = std::str::from_utf8(read_len_bytes(data, pos)?).ok()?;
+      Some(Expr::Identifier(s.to_string()))
+    }
+    b'f' => {
+      let nargs = read_i32(data, pos)?;
+      if nargs < 0 {
+        return None;
+      }
+      let head = read_expr(data, pos)?;
+      let mut args = Vec::with_capacity(nargs as usize);
+      for _ in 0..nargs {
+        args.push(read_expr(data, pos)?);
+      }
+      Some(build_normal(&head, args))
+    }
+    b'n' => read_integer_array(data, pos),
+    b'e' => read_real_array(data, pos),
+    b'b' => read_byte_array(data, pos),
+    _ => None,
+  }
+}
+
+/// `f`-token reconstruction: a `List` head becomes [`Expr::List`], any other
+/// symbol head becomes a [`Expr::FunctionCall`]. A non-symbol head is wrapped
+/// as `head[args...]` via its rendered name so nothing is silently dropped.
+fn build_normal(head: &Expr, args: Vec<Expr>) -> Expr {
+  match &head {
+    Expr::Identifier(name) if name == "List" => Expr::List(args.into()),
+    Expr::Identifier(name) => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.into(),
+    },
+    other => Expr::FunctionCall {
+      name: expr_to_string(other),
+      args: args.into(),
+    },
+  }
+}
+
+fn parse_integer(s: &str) -> Expr {
+  if let Ok(i) = s.parse::<i128>() {
+    Expr::Integer(i)
+  } else if let Ok(big) = s.parse::<BigInt>() {
+    Expr::BigInteger(big)
+  } else {
+    Expr::Integer(0)
+  }
+}
+
+/// Build a (possibly nested) list of `count` leaves over the given dimensions.
+fn nest(dims: &[usize], leaves: &mut std::vec::IntoIter<Expr>) -> Expr {
+  match dims.split_first() {
+    None => leaves.next().unwrap_or(Expr::Integer(0)),
+    Some((&first, rest)) => Expr::List(
+      (0..first)
+        .map(|_| nest(rest, leaves))
+        .collect::<Vec<_>>()
+        .into(),
+    ),
+  }
+}
+
+fn read_dims(data: &[u8], pos: &mut usize, rank: i32) -> Option<Vec<usize>> {
+  // A real WL array is never more than a handful of dimensions deep; a
+  // rank outside that range means a field got misread (garbage data, or —
+  // since `read_integer_array` now tries the `n` token's type-field and
+  // type-less layouts against the same bytes — the wrong layout landing on
+  // a small value from the other one and reading it as an enormous rank).
+  // Rejecting it here, before `Vec::with_capacity(rank as usize)`, avoids
+  // an allocation request large enough to abort the process outright
+  // (`Vec::with_capacity` aborts on allocation failure; it does not
+  // return an `Err` the caller could recover from).
+  if !(0..=64).contains(&rank) {
+    return None;
+  }
+  let mut dims = Vec::with_capacity(rank as usize);
+  for _ in 0..rank {
+    let d = read_i32(data, pos)?;
+    if d < 0 {
+      return None;
+    }
+    dims.push(d as usize);
+  }
+  Some(dims)
+}
+
+/// Total element count of an array's dimensions, as `dims.iter().product()`
+/// would compute — but checked, since a malformed or truncated
+/// `CompressedData` payload can carry a garbage dimension large enough to
+/// overflow `usize` on multiplication. Returns `None` for that case instead
+/// of panicking, so the caller falls back to treating the payload as plain
+/// text (see `decompress_to_expr`).
+fn dims_product(dims: &[usize]) -> Option<usize> {
+  dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
+}
+
+/// `n` token — raw integer array. Two layouts have both been observed in
+/// real Wolfram output: `<i32 type><i32 rank><i32 dims><packed ints>` (a
+/// `TemporalData`/`TimeSeries` packed array — `type` disambiguating the
+/// element width when the trailing-bytes inference below is ambiguous) and
+/// `<i32 rank><i32 dims><packed ints>` with no type field at all (a
+/// `GraphicsComplex` face-index list saved by `Manipulate[…,
+/// SaveDefinitions -> True]`). Nothing in the token distinguishes which
+/// layout a given payload uses up front, so both are tried: the type-field
+/// layout first (it's the one the reader has always assumed, and the one a
+/// tie goes to), falling back to the type-less layout only when the first
+/// attempt's dimensions don't validate — e.g. reading a real rank as a type
+/// and a real first dimension as an absurd rank overflowed `dims_product`
+/// or failed the remaining-bytes check, so `deserialize` gave up and the
+/// caller's UTF-8 fallback failed too (the payload is binary, not text): a
+/// `SaveDefinitions` capture with such an array anywhere in it silently
+/// lost its whole `Initialization`, leaving every symbol it defines
+/// undefined and any `Graphics3D`/`Manipulate` built from them blank.
+fn read_integer_array(data: &[u8], pos: &mut usize) -> Option<Expr> {
+  if let Some((expr, end)) = try_read_integer_array(data, *pos, true) {
+    *pos = end;
+    return Some(expr);
+  }
+  let (expr, end) = try_read_integer_array(data, *pos, false)?;
+  *pos = end;
+  Some(expr)
+}
+
+/// One attempt at reading the `n` token's rank/dims/data, optionally
+/// preceded by a 4-byte type field it discards. Returns the parsed
+/// expression and the position just past the consumed bytes, without
+/// mutating the caller's cursor — `read_integer_array` commits whichever
+/// attempt validates.
+fn try_read_integer_array(
+  data: &[u8],
+  start: usize,
+  with_type_field: bool,
+) -> Option<(Expr, usize)> {
+  let mut pos = start;
+  if with_type_field {
+    let _typ = read_i32(data, &mut pos)?;
+  }
+  let rank = read_i32(data, &mut pos)?;
+  let dims = read_dims(data, &mut pos, rank)?;
+  // A zero dimension is a normal "empty along this axis" shape (e.g. dims
+  // `{3, 0}` for `{{}, {}, {}}`), but *more than one* zero dimension is a
+  // near-certain sign the rank/dims fields were misaligned: this attempt's
+  // `with_type_field` guess was wrong, so what should have been packed data
+  // (mostly zero for a mostly-zero matrix, like a Demonstration's potential
+  // barrier) got read as a run of bogus trailing dimensions. A real array
+  // essentially never has more than one degenerate axis, so reject here and
+  // let the caller fall back to the other layout instead of silently
+  // building a wrong-shaped nest of empty lists.
+  if dims.iter().filter(|&&d| d == 0).count() > 1 {
+    return None;
+  }
+  let count: usize = dims_product(&dims)?;
+  let values = if count == 0 {
+    Vec::new()
+  } else {
+    let rest = data.len().checked_sub(pos)?;
+    if rest % count != 0 {
+      return None;
+    }
+    let width = rest / count;
+    if !matches!(width, 1 | 2 | 4 | 8) {
+      return None;
+    }
+    let mut vals = Vec::with_capacity(count);
+    for _ in 0..count {
+      let mut buf = [0u8; 8];
+      buf[..width].copy_from_slice(&data[pos..pos + width]);
+      // Sign-extend a little-endian signed integer of `width` bytes.
+      let raw = u64::from_le_bytes(buf);
+      let shift = 64 - width * 8;
+      let signed = ((raw << shift) as i64) >> shift;
+      vals.push(Expr::Integer(signed as i128));
+      pos += width;
+    }
+    vals
+  };
+  Some((nest(&dims, &mut values.into_iter()), pos))
+}
+
+/// `b` token — packed unsigned byte array: `<i32 rank><i32 dims><raw u8>`.
+/// This is how the FrontEnd stores raster pixel data — the `RawArray`
+/// payload inside `RasterBox[CompressedData["…"]]` and inline `Image[…]`
+/// literals. Bytes come back as 0–255, not sign-extended like `n`.
+fn read_byte_array(data: &[u8], pos: &mut usize) -> Option<Expr> {
+  let rank = read_i32(data, pos)?;
+  let dims = read_dims(data, pos, rank)?;
+  let count: usize = dims_product(&dims)?;
+  let end = pos.checked_add(count)?;
+  if end > data.len() {
+    return None;
+  }
+  let vals: Vec<Expr> = data[*pos..end]
+    .iter()
+    .map(|&byte| Expr::Integer(byte as i128))
+    .collect();
+  *pos = end;
+  Some(nest(&dims, &mut vals.into_iter()))
+}
+
+/// `e` token — packed real (f64) array.
+fn read_real_array(data: &[u8], pos: &mut usize) -> Option<Expr> {
+  let rank = read_i32(data, pos)?;
+  let dims = read_dims(data, pos, rank)?;
+  let count: usize = dims_product(&dims)?;
+  let mut vals = Vec::with_capacity(count);
+  for _ in 0..count {
+    vals.push(Expr::Real(read_f64(data, pos)?));
+  }
+  Some(nest(&dims, &mut vals.into_iter()))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn render(data: &[u8]) -> String {
+    expr_to_string(&deserialize(data).unwrap())
+  }
+
+  #[test]
+  fn reads_machine_integer_list() {
+    // Compress[{1, 2, 3}] payload
+    let data = b"!boRf\x03\x00\x00\x00s\x04\x00\x00\x00Listi\x01\x00\x00\x00i\x02\x00\x00\x00i\x03\x00\x00\x00";
+    assert_eq!(render(data), "{1, 2, 3}");
+  }
+
+  #[test]
+  fn reads_string_token() {
+    assert_eq!(render(b"!boRS\x02\x00\x00\x00hi"), "\"hi\"");
+  }
+
+  #[test]
+  fn reads_big_integer_token() {
+    // I token: length-prefixed ASCII decimal
+    assert_eq!(render(b"!boRI\x02\x00\x00\x0010"), "10");
+  }
+
+  #[test]
+  fn reads_byte_array_token() {
+    // b token: rank 2, dims {2, 3}, then raw bytes — the layout the
+    // FrontEnd uses for raster pixel data in inline Image literals.
+    let data = b"!boRb\x02\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x00\x7f\xff\x01\x02\x03";
+    assert_eq!(render(data), "{{0, 127, 255}, {1, 2, 3}}");
+  }
+
+  #[test]
+  fn reads_machine_real() {
+    // r token: f64 little-endian 1.5
+    assert_eq!(render(b"!boRr\x00\x00\x00\x00\x00\x00\xf8?"), "1.5");
+  }
+
+  #[test]
+  fn rejects_non_magic() {
+    assert!(deserialize(b"nope").is_none());
+  }
+
+  #[test]
+  fn reads_raw_byte_array() {
+    // RawArray["UnsignedInteger8", {{200, 10}, {0, 255}}]: f-normal with a
+    // `b` token payload (rank 2, dims 2x2, unsigned bytes). High-bit bytes
+    // must NOT be sign-extended.
+    let data = b"!boRf\x02\x00\x00\x00s\x08\x00\x00\x00RawArrayS\x10\x00\x00\x00UnsignedInteger8b\x02\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\xc8\x0a\x00\xff";
+    assert_eq!(
+      render(data),
+      "RawArray[\"UnsignedInteger8\", {{200, 10}, {0, 255}}]"
+    );
+  }
+
+  // Regression: a corrupted or truncated `CompressedData` payload can carry
+  // dimensions whose product overflows `usize` on multiplication. Each
+  // array token (`n`, `b`, `e`) used to compute that product with a plain
+  // `dims.iter().product()`, which panicked with overflow checks on —
+  // crashing Woxi Studio when a real Wolfram Demonstrations notebook's
+  // saved widget state embedded one. `deserialize` must return `None`
+  // instead, so the caller falls back to treating the payload as plain
+  // text (see `decompress_to_expr`).
+  #[test]
+  fn integer_array_with_overflowing_dims_does_not_panic() {
+    // n token: rank 3, dims {i32::MAX, i32::MAX, i32::MAX} — the product
+    // vastly exceeds usize::MAX on multiplication.
+    let data =
+      b"!boRn\x03\x00\x00\x00\xff\xff\xff\x7f\xff\xff\xff\x7f\xff\xff\xff\x7f";
+    assert!(deserialize(data).is_none());
+  }
+
+  #[test]
+  fn reads_integer_array_token() {
+    // n token: rank 2, dims {2, 3}, signed 32-bit little-endian ints — the
+    // layout real Wolfram output uses for a GraphicsComplex face-index
+    // list, with no leading element-type field (unlike what an earlier,
+    // never-verified-against-real-output version of this reader assumed).
+    let data = b"!boRn\x02\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x05\x00\x00\x00\x06\x00\x00\x00";
+    assert_eq!(render(data), "{{1, 2, 3}, {4, 5, 6}}");
+  }
+
+  // Regression: a real Wolfram Demonstrations notebook's `SaveDefinitions`
+  // dump embedded a mostly-zero integer matrix (a `Table[If[…, 10000, 0],
+  // …]` potential barrier). The `with_type_field = true` attempt misread
+  // this payload's real `<rank><dim1><dim2>` header as `<type><rank><dims>`,
+  // landing on a "rank" that happened to equal the real `dim1` and then
+  // reading the *data* that followed (mostly zero) as further dimensions —
+  // producing `dims = [3, 0, 0]`, whose product is 0, which the `count == 0`
+  // fast path accepted without checking any bytes at all. The result was a
+  // silently wrong `{{}, {}, {}}` instead of the real 3x3 matrix — every
+  // downstream `Part` on it then failed. This payload has no type field:
+  // rank=2, dims={3, 3}, nine i32s (mostly zero, like the real barrier).
+  #[test]
+  fn reads_integer_array_with_misleading_zero_padded_prefix() {
+    let data = b"!boRn\x02\x00\x00\x00\x03\x00\x00\x00\x03\x00\x00\x00\
+\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\
+\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+\x00\x00\x00\x00\x00\x00\x00\x00\x09\x00\x00\x00";
+    assert_eq!(render(data), "{{0, 0, 5}, {0, 0, 0}, {0, 0, 9}}");
+  }
+
+  #[test]
+  fn byte_array_with_overflowing_dims_does_not_panic() {
+    // b token: rank 3, dims {i32::MAX, i32::MAX, i32::MAX}.
+    let data =
+      b"!boRb\x03\x00\x00\x00\xff\xff\xff\x7f\xff\xff\xff\x7f\xff\xff\xff\x7f";
+    assert!(deserialize(data).is_none());
+  }
+
+  #[test]
+  fn real_array_with_overflowing_dims_does_not_panic() {
+    // e token: rank 3, dims {i32::MAX, i32::MAX, i32::MAX}.
+    let data =
+      b"!boRe\x03\x00\x00\x00\xff\xff\xff\x7f\xff\xff\xff\x7f\xff\xff\xff\x7f";
+    assert!(deserialize(data).is_none());
+  }
+}

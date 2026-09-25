@@ -1,0 +1,429 @@
+---
+icon: lucide/music
+---
+
+# Computational Music
+
+Woxi supports the symbolic music objects introduced in Wolfram Language 15
+(the [ComputationalMusic](https://reference.wolfram.com/language/guide/ComputationalMusic.html)
+guide). Notes, chords, rests, pitches and the other music objects are kept as
+canonical symbolic expressions, just like `Sound` and `SoundNote`.
+
+
+## MusicObjectQ
+
+`MusicObjectQ` tests whether an expression is a music object.
+
+```scrut
+$ wo 'MusicObjectQ[MusicPitch["C4"]]'
+True
+```
+
+```scrut
+$ wo 'MusicObjectQ[MusicNote[MusicPitch["C4"], MusicDuration["Half"]]]'
+True
+```
+
+```scrut
+$ wo 'MusicObjectQ[42]'
+False
+```
+
+
+## MusicPitch
+
+A pitch given by name in scientific notation canonicalizes to an association
+carrying its accidental, octave, key letter, and spelled name.
+
+```scrut
+$ wo 'MusicPitch["C4"]'
+MusicPitch[<|Accidental -> 0, Octave -> 4, Key -> C, Name -> C|>]
+```
+
+An integer is interpreted as a MIDI note number (middle C is MIDI 60, and A4
+is MIDI 69). A MIDI number fixes no letter spelling, so the canonical object
+keeps just the number.
+
+```scrut
+$ wo 'MusicPitch[60]'
+MusicPitch[<|MIDINumber -> 60|>]
+```
+
+```scrut
+$ wo 'MusicPitch[69]'
+MusicPitch[<|MIDINumber -> 69|>]
+```
+
+A frequency resolves to the nearest MIDI number (A4 is tuned to 440 Hz).
+
+```scrut
+$ wo 'MusicPitch[Quantity[440, "Hertz"]]'
+MusicPitch[<|MIDINumber -> 69|>]
+```
+
+The pitch of a `SoundNote` (numbered relative to middle C) or of a
+`MusicNote` can also be used as a pitch specification.
+
+```scrut
+$ wo 'MusicPitch[SoundNote[0]]'
+MusicPitch[<|MIDINumber -> 60|>]
+```
+
+```scrut
+$ wo 'MusicPitch[MusicNote["G3"]]'
+MusicPitch[<|Accidental -> 0, Octave -> 3, Key -> G, Name -> G|>]
+```
+
+Pitches can be added and subtracted. Both the diatonic staff position (which
+letter, in which register) and the MIDI number are combined, then the result is
+returned as a `<|"Accidental" -> …, "Key" -> …, "MIDINumber" -> …|>` association.
+Names without an octave default to octave 4.
+
+```scrut
+$ wo 'MusicPitch["Bb"] + MusicPitch["A#"] - MusicPitch["C"]'
+MusicPitch[<|Accidental -> 1, Key -> G, MIDINumber -> 80|>]
+```
+
+Enharmonic spellings denote the same pitch, so they compare equal.
+
+```scrut
+$ wo 'MusicPitch["C#"] == MusicPitch["Db"]'
+True
+```
+
+Adding a `MusicInterval` transposes a pitch, spelling the result from the
+interval's diatonic step: a minor third above C is Eb (not D#).
+
+```scrut
+$ wo 'MusicPitch["C"] + MusicInterval["MinorThird"]'
+MusicPitch[<|Accidental -> -1, Key -> E, MIDINumber -> 63|>]
+```
+
+A bare-semitone interval such as `MusicInterval[7]` transposes by that many
+semitones, spelled the simplest way (7 semitones above C is G).
+
+```scrut
+$ wo 'MusicPitch["C"] + MusicInterval[7]'
+MusicPitch[<|Accidental -> 0, Key -> G, MIDINumber -> 67|>]
+```
+
+
+## Notes and chords
+
+A chord given by an explicit pitch list canonicalizes to its `"PitchList"`
+association, each tone spelled as a full pitch object (octaveless pitches
+default to register 4).
+
+```scrut
+$ wo 'MusicChord[{MusicPitch["C"], MusicPitch["E"], MusicPitch["G"]}]'
+MusicChord[<|PitchList -> {MusicPitch[<|Accidental -> 0, Octave -> 4, Key -> C|>], MusicPitch[<|Accidental -> 0, Octave -> 4, Key -> E|>], MusicPitch[<|Accidental -> 0, Octave -> 4, Key -> G|>]}|>]
+```
+
+```scrut
+$ wo 'Head[MusicNote[MusicPitch["C4"]]]'
+MusicNote
+```
+
+`MusicNote[pitch, duration]` canonicalizes to an association exposing its
+`"Pitch"` and `"Duration"`.
+
+```scrut
+$ wo 'MusicNote["A#", 1/2]'
+MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 1, Key -> A|>], Duration -> MusicDuration[<|Duration -> 1/2|>]|>]
+```
+
+```scrut
+$ wo 'MusicNote["A#", 1/2]["Pitch"]'
+MusicPitch[<|Accidental -> 1, Key -> A|>]
+```
+
+```scrut
+$ wo 'MusicNote["A#", 1/2]["Duration"]'
+MusicDuration[<|Duration -> 1/2|>]
+```
+
+Adding a `MusicInterval` transposes a note's pitch. A bare-semitone interval
+spells the result straight from the MIDI number (C up five semitones is F); a
+named interval keeps the diatonic step (C up a minor third is Eb, not D#).
+
+```scrut
+$ wo 'MusicNote["C"] + MusicInterval[5]'
+MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> F, MIDINumber -> 65|>]|>]
+```
+
+```scrut
+$ wo 'MusicNote["C"] + MusicInterval["MinorThird"]'
+MusicNote[<|Pitch -> MusicPitch[<|Accidental -> -1, Key -> E, MIDINumber -> 63|>]|>]
+```
+
+Durations add up, scaled by any leading coefficient. The sum counts in the
+default quarter-note beat, so it carries a `BeatDuration`.
+
+```scrut
+$ wo '3 MusicDuration[<|"Duration" -> 1/2|>] + MusicDuration[1/4]'
+MusicDuration[<|Duration -> 7/4, BeatDuration -> 1/4|>]
+```
+
+A named chord canonicalizes to its `"Name"` and `"Root"`, and can report its
+constituent pitches and the intervals between them.
+
+```scrut
+$ wo 'MusicChord["GMajor"]'
+MusicChord[<|Name -> Major, Root -> MusicPitch[<|Key -> G, Accidental -> 0|>]|>]
+```
+
+```scrut
+$ wo 'MusicChord["GMajor"]["PitchList"]'
+{MusicPitch[<|Accidental -> 0, Octave -> 4, Key -> G|>], MusicPitch[<|Accidental -> 0, Octave -> 4, Key -> B|>], MusicPitch[<|Accidental -> 0, Octave -> 5, Key -> D|>]}
+```
+
+```scrut
+$ wo 'MusicChord["GMajor"]["IntervalList"]'
+{MusicInterval[<|Semitones -> 4, Name -> MajorThird, CompoundOctaves -> 0|>], MusicInterval[<|Semitones -> 3, Name -> MinorThird, CompoundOctaves -> 0|>]}
+```
+
+The name accepts the common jazz/pop chord symbols too, and a space between
+the root and the quality is optional. A bare root such as `"G"` sounds a major
+triad but stores no `"Name"` key, so it is not identical to the explicitly
+major forms.
+
+```scrut
+$ wo 'MusicChord["G"] === MusicChord["GMajor"] === MusicChord["G Major"]'
+False
+```
+
+Short symbols such as `m`, `dim`, `maj7`, `m7b5`, and `sus4` resolve to their
+canonical qualities (stored in their spaced display spelling); casing
+distinguishes `m` (minor) from `M` (major).
+
+```scrut
+$ wo 'MusicChord["Cm7"]["Name"]'
+Minor Seventh
+```
+
+```scrut
+$ wo 'MusicChord["Cm7b5"]["Name"]'
+Half Diminished Seventh
+```
+
+A root followed only by a digit is read as the note's *octave*, not a seventh
+chord: `"C7"` is the note C in octave 7, whose default triad is major.
+
+```scrut
+$ wo 'MusicChord["C7"]["PitchList"]'
+{MusicPitch[<|Accidental -> 0, Octave -> 7, Key -> C|>], MusicPitch[<|Accidental -> 0, Octave -> 7, Key -> E|>], MusicPitch[<|Accidental -> 0, Octave -> 7, Key -> G|>]}
+```
+
+Adding a `MusicInterval` to an explicit-pitch chord transposes every tone by the
+interval, so a C-major triad up a perfect fourth becomes an F-major triad. The
+transposed chord is returned in the canonical `<|"PitchList" -> …|>` form, and a
+bare-semitone interval spells each tone straight from its MIDI number.
+
+```scrut
+$ wo 'MusicChord[{MusicPitch["C4"], MusicPitch["E4"], MusicPitch["G4"]}] + MusicInterval[5]'
+MusicChord[<|PitchList -> {MusicPitch[<|Accidental -> 0, Key -> F, MIDINumber -> 65|>], MusicPitch[<|Accidental -> 0, Key -> A, MIDINumber -> 69|>], MusicPitch[<|Accidental -> 0, Key -> C, MIDINumber -> 72|>]}|>]
+```
+
+A minor-third stack transposed by a bare semitone interval spells its tones from
+MIDI (G#, not the enharmonic Ab), matching Wolfram's `InputForm`.
+
+```scrut
+$ wo 'InputForm[MusicChord[NestList[# + MusicInterval["MinorThird"] &, MusicPitch["C"], 4]] + MusicInterval[5]]'
+InputForm[MusicChord[<|PitchList -> {MusicPitch[<|Accidental -> 0, Key -> F, MIDINumber -> 65|>], MusicPitch[<|Accidental -> 1, Key -> G, MIDINumber -> 68|>], MusicPitch[<|Accidental -> 0, Key -> B, MIDINumber -> 71|>], MusicPitch[<|Accidental -> 0, Key -> D, MIDINumber -> 74|>], MusicPitch[<|Accidental -> 0, Key -> F, MIDINumber -> 77|>]}|>]]
+```
+
+
+## Rendering as notation
+
+In the visual hosts — the [Woxi Playground](https://woxi.dev) and Woxi Studio —
+music objects (`MusicNote`, `MusicChord`, `MusicScale`, `MusicMeasure`,
+`MusicVoice`, `MusicScore`, …) are drawn on a treble staff the way Mathematica
+displays them, with note heads, stems, flags, accidentals, ledger lines, rests
+and barlines. On the command line they stay symbolic (as shown above).
+
+`MusicPlot` renders a music object explicitly and, like `Plot`, yields a
+graphic:
+
+```scrut
+$ wo 'Head[MusicPlot[MusicMeasure[{"C", "E", "G"}]]]'
+Graphics
+```
+
+A `MusicScale` requires any second argument to be a property *association*; a
+pitch object there is rejected with `MusicScale::passc`, and `MusicPlot` then
+refuses the invalid scale with `MusicPlot::music` instead of drawing it.
+
+```scrut {output_stream: combined}
+$ wo 'Head[MusicPlot[MusicScale["Major", MusicPitch["C4"]]]]'
+
+MusicScale::passc: -MusicPitch- is not a valid property association.
+
+MusicPlot::music: Expecting a valid music object instead of MusicScale[Major, -MusicPitch-].
+MusicPlot
+```
+
+The same notation SVG is produced by `ExportString[obj, "SVG"]`. A chord built
+from transposed pitches — here a stack of minor thirds above C — draws as one
+staff with all its note heads and (double) accidentals.
+
+```scrut
+$ wo 'StringContainsQ[ExportString[MusicChord[NestList[# + MusicInterval["MinorThird"] &, MusicPitch["C"], 4]], "SVG"], "<svg"]'
+True
+```
+
+Transposing that chord by a further interval still renders as a chord.
+
+```scrut
+$ wo 'StringContainsQ[ExportString[MusicChord[NestList[# + MusicInterval["MinorThird"] &, MusicPitch["C"], 4]] + MusicInterval[5], "SVG"], "<svg"]'
+True
+```
+
+`MusicPlot` of a `MusicMeasure` draws its pitches as quarter notes on the staff.
+
+```scrut
+$ wo 'Head[MusicPlot[MusicMeasure[{"C", "G", "A", "C"}]]]'
+Graphics
+```
+
+```scrut
+$ wo 'StringContainsQ[ExportString[MusicPlot[MusicMeasure[{"C", "G", "A", "C"}]], "SVG"], "<svg"]'
+True
+```
+
+A `MusicMeasure`, `MusicVoice` or `MusicScore` prints its time signature on the
+staff, and the meter is re-printed whenever it changes mid-stream — here a
+voice whose second measure switches to 3/4.
+
+```scrut
+$ wo 'StringContainsQ[ExportString[MusicVoice[{MusicMeasure[{"C", "D", "E", "F"}], MusicMeasure[{"G", "E", "D"}, MusicTimeSignature[3, 4]]}], "SVG"], "<svg"]'
+True
+```
+
+
+## Measures and time signatures
+
+`MusicTimeSignature[n, d]` canonicalizes to its `Numerator`/`Denominator`
+association, and a `MusicRest` to its own association form.
+
+```scrut
+$ wo 'MusicTimeSignature[3, 4]'
+MusicTimeSignature[<|Numerator -> 3, Denominator -> 4|>]
+```
+
+```scrut
+$ wo 'MusicRest[1/2]'
+MusicRest[<|Duration -> MusicDuration[<|Duration -> 1/2|>]|>]
+```
+
+`MusicMeasure[{events…}, MusicTimeSignature[…]]` resolves the events' rhythm
+against the meter, annotating each with its `BeatDuration` and `Beats` and
+stretching the final note to fill the bar (an explicit half note is two quarter
+beats; the trailing default note grows to fill the remaining two beats of 4/4).
+
+```scrut
+$ wo 'MusicMeasure[{MusicNote["E", 1/2], MusicNote["D"]}, MusicTimeSignature[4, 4]]'
+MusicMeasure[<|NoteList -> {MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> E|>], Duration -> MusicDuration[<|Duration -> 1/2, BeatDuration -> 1/4, Beats -> 2|>]|>], MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> D|>], Duration -> MusicDuration[<|BeatDuration -> 1/4, Beats -> 2|>]|>]}, TimeSignature -> MusicTimeSignature[<|Numerator -> 4, Denominator -> 4|>]|>]
+```
+
+When the events overflow the measure — a half note is two beats, so E + C + D
+totals four beats in a three-beat 3/4 bar — `MusicMeasure::measdur` warns and
+the expression is returned unresolved.
+
+```scrut {output_stream: combined}
+$ wo 'MusicMeasure[{MusicNote["E"], MusicNote["C", 1/2], MusicNote["D"]}, MusicTimeSignature[3, 4]]'
+
+MusicMeasure::measdur: The total duration of beats 4 exceeds the allowed number of beats per measure 3.
+MusicMeasure[{MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> E|>]|>], MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> C|>], Duration -> MusicDuration[<|Duration -> 1/2|>]|>], MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> D|>]|>]}, MusicTimeSignature[<|Numerator -> 3, Denominator -> 4|>]]
+```
+
+A `MusicVoice` packs its measures into a `"MeasureList"`, and a `MusicScore` its
+voices into a `"VoiceList"`; each takes its time signature from the first child.
+Empty containers resolve to their key-only forms.
+
+```scrut
+$ wo 'MusicVoice[{MusicMeasure[{MusicNote["C"], MusicNote["E"]}, MusicTimeSignature[2, 4]]}]'
+MusicVoice[<|MeasureList -> {MusicMeasure[<|NoteList -> {MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> C|>], Duration -> MusicDuration[<|BeatDuration -> 1/4, Beats -> 1|>]|>], MusicNote[<|Pitch -> MusicPitch[<|Accidental -> 0, Key -> E|>], Duration -> MusicDuration[<|BeatDuration -> 1/4, Beats -> 1|>]|>]}, TimeSignature -> MusicTimeSignature[<|Numerator -> 2, Denominator -> 4|>]|>]}, TimeSignature -> MusicTimeSignature[<|Numerator -> 2, Denominator -> 4|>]|>]
+```
+
+```scrut
+$ wo 'MusicScore[]'
+MusicScore[<|VoiceList -> {}|>]
+```
+
+
+## Exporting to MIDI
+
+`Export[…, obj]` to a `.mid` file writes a Standard MIDI File. A `MusicScore`
+becomes one track per `MusicVoice`; each voice's pitches fill a 4/4 measure, so
+three notes play as quarter, quarter, half at 120 BPM.
+
+```scrut
+$ wo 'Export["score.mid", MusicScore[{MusicVoice[{"A", "G", "E"}], MusicVoice[{"F", "E", "C"}]}]]; FileByteCount["score.mid"]'
+130
+```
+
+## Reading an audio object
+
+The accessors say what an audio object is made of. `AudioData` hands back the
+samples, one list per channel even when there is only one:
+
+```scrut
+$ wo 'AudioData[Audio[{0., 0.5, 1.}]]'
+{{0., 0.5, 1.}}
+```
+
+```scrut
+$ wo 'AudioChannels[Audio[{{0., 0.5}, {1., 0.}}]]'
+2
+```
+
+```scrut
+$ wo 'AudioSampleRate[Audio[{0., 0.5}, SampleRate -> 8000]]'
+Quantity[8000, Hertz]
+```
+
+An integer sample type scales the samples onto its range and clips at the
+ends, so a full-scale `1.` lands one below the top:
+
+```scrut
+$ wo 'AudioData[Audio[{0., 0.5, 1., -1.}], "SignedInteger16"]'
+{{0, 16384, 32767, -32768}}
+```
+
+`AudioQ` asks whether the expression *is* an audio object, which a `Sound` is
+not however readily it turns into samples:
+
+```scrut
+$ wo 'AudioQ[Sound[SoundNote[0]]]'
+False
+```
+
+## Editing audio
+
+`AudioNormalize` brings the loudest sample to full scale. The scale is taken
+over every channel at once, so the balance between them survives:
+
+```scrut
+$ wo 'AudioData[AudioNormalize[Audio[{0., 0.25, -0.5}]]]'
+{{0., 0.5, -1.}}
+```
+
+`AudioReverse` plays each channel backwards:
+
+```scrut
+$ wo 'AudioData[AudioReverse[Audio[{0., 0.5, 1.}]]]'
+{{1., 0.5, 0.}}
+```
+
+`AudioPad` measures in seconds unless told otherwise, and a bare amount goes
+on the end while a pair puts one on each side:
+
+```scrut
+$ wo 'AudioData[AudioPad[Audio[{1.}, SampleRate -> 2], {1, 2}]]'
+{{0., 0., 1., 0., 0., 0., 0.}}
+```
+
+```scrut
+$ wo 'AudioData[AudioPad[Audio[{1., 2.}], Quantity[2, "Samples"]]]'
+{{1., 2., 0., 0.}}
+```

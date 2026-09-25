@@ -26,6 +26,7 @@ what actually happened lives in `PROGRESS.md`. Hard-won pattern lessons live in
 | [plans/HELP-SYSTEM.md](plans/HELP-SYSTEM.md) | Native Help window for the Friendly Compiler mini-language, opened from the Help menu, with searchable command examples and generated Sage output. |
 | [plans/RUST-EGUI-PORT.md](plans/RUST-EGUI-PORT.md) | Architectural migration plan to Rust and egui for Linux: crate structure, Tokio process manager, FriendlyCompiler port with 69-test parity, MathRenderer, and UI roadmap. |
 | [plans/UNITS-SYSTEM.md](plans/UNITS-SYSTEM.md) | Dimensional physical units system, natural unit syntax (`32 mi`, `52 mi^2`, `to mph`), `logos` + `nom` parser, and Sage symbolic unit conversion engine. |
+| [plans/WOXI-ENGINE.md](plans/WOXI-ENGINE.md) | In-process Wolfram Language math engine migration using Woxi with implemented UnitSimplify, thread-isolated worker, and pure Rust evaluation. |
 | [docs/COMPLETION-UI.md](docs/COMPLETION-UI.md) | Canonical completion UI contract: `ShellModel.draft` as source of truth, typed friendly IR, full-width hint lane layout, tape-reference preservation, the partial-edit round-trip rule, and extension rules. |
 | [docs/COMPLETIONS-GUIDE.md](docs/COMPLETIONS-GUIDE.md) | The shipped completion vocabulary: every trigger/alias, accepted forms, chips, and Sage lowering for all 58 completions, plus the deliberately-deferred list. |
 | [SWIFTUI-RULES.md](SWIFTUI-RULES.md) | Imperative SwiftUI rules + the failure modes that taught them. Apply up front; use as a review checklist. |

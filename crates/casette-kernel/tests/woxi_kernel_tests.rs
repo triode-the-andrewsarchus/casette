@@ -1,0 +1,88 @@
+//! Integration tests for in-process `WoxiKernel`.
+
+use casette_kernel::WoxiKernel;
+use std::time::Duration;
+
+#[tokio::test]
+async fn test_woxi_boot_eval_ping() {
+    let kernel = WoxiKernel::launch().await.expect("launch woxi kernel");
+    assert!(kernel.is_alive());
+    assert!(kernel.worker_pid().is_some());
+
+    // 1. Test ping
+    let latency = kernel.ping().await.expect("ping");
+    assert!(latency < Duration::from_secs(1));
+
+    // 2. Test arithmetic & factor
+    let resp = kernel
+        .eval("factor(x^2 - 1)", false, None)
+        .await
+        .expect("eval");
+    assert!(resp.ok);
+    assert_eq!(resp.kind.as_deref(), Some("symbolic"));
+    let plain = resp.plain.as_deref().unwrap();
+    assert!(plain.contains("-1 + x") && plain.contains("1 + x") || plain.contains("x - 1"));
+
+    // 3. Test calculus: differentiation & integration
+    let diff_resp = kernel.eval("diff(x^3, x)", false, None).await.expect("diff");
+    assert!(diff_resp.ok);
+    assert_eq!(diff_resp.plain.as_deref(), Some("3*x^2"));
+
+    let int_resp = kernel
+        .eval("integrate(1/(1-x^2), x)", false, None)
+        .await
+        .expect("integrate");
+    assert!(int_resp.ok);
+    let int_plain = int_resp.plain.as_deref().unwrap();
+    assert!(int_plain.contains("Log"));
+
+    // 4. Test matrices and matrix properties
+    let mat_resp = kernel
+        .eval("matrix([[1, 2], [3, 4]]).det()", false, None)
+        .await
+        .expect("det");
+    assert!(mat_resp.ok);
+    assert_eq!(mat_resp.plain.as_deref(), Some("-2"));
+
+    // 5. Test Physical Units & UnitSimplify (the core migration test!)
+    let ratio_resp = kernel
+        .eval("__casette_convert(50*km / (32*mi))", false, None)
+        .await
+        .expect("ratio units");
+    assert!(ratio_resp.ok);
+    assert_eq!(ratio_resp.plain.as_deref(), Some("390625/402336"));
+
+    let conv_resp = kernel
+        .eval("__casette_convert((100*km) / (2*hr), mph)", false, None)
+        .await
+        .expect("conversion units");
+    assert!(conv_resp.ok);
+    assert!(conv_resp.plain.as_deref().unwrap().contains("390625/12573"));
+
+    // 6. Test symbols query
+    kernel
+        .eval("testSymbol = 104729", false, None)
+        .await
+        .expect("eval symbol");
+    let symbols = kernel.symbols().await.expect("symbols");
+    assert!(symbols.iter().any(|s| s.name == "testSymbol"));
+
+    // 7. Test precision config
+    let prec = kernel.config_precision(25).await.expect("config precision");
+    assert_eq!(prec, 25);
+
+    // 8. Test numeric approximation
+    let num_resp = kernel.eval("1/3", true, Some(15)).await.expect("numeric");
+    assert!(num_resp.ok);
+    assert!(num_resp.plain.as_deref().unwrap().contains("0.333333333333333"));
+
+    // 9. Test restart
+    kernel.restart().await.expect("restart");
+    let after_restart = kernel.eval("2 + 2", false, None).await.expect("after restart");
+    assert!(after_restart.ok);
+    assert_eq!(after_restart.plain.as_deref(), Some("4"));
+
+    // 10. Shutdown
+    kernel.shutdown().await.expect("shutdown");
+    assert!(!kernel.is_alive());
+}

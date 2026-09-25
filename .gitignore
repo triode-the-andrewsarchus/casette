@@ -4,4 +4,5 @@ dist/
 *.xcodeproj/
 .DS_Store
 .agents/
-/target
+target/
+**/target/

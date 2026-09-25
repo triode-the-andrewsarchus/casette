@@ -1,0 +1,6953 @@
+use pest::Parser;
+use pest::iterators::Pair;
+use pest_derive::Parser;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use thiserror::Error;
+
+pub mod evaluator;
+pub mod expr_list;
+pub mod functions;
+pub mod helpers;
+pub mod lsp;
+pub mod named_characters;
+pub mod notebook;
+pub mod syntax;
+pub mod utils;
+pub mod vfs;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
+pub use expr_list::ExprList;
+
+#[derive(Parser)]
+#[grammar = "wolfram.pest"]
+pub struct WolframParser;
+
+#[derive(Clone)]
+enum StoredValue {
+  // Keys keep their input-form string (used for lookup comparisons); values
+  // stay structured ASTs so large associations never round-trip through the
+  // parser on access.
+  Association(Vec<(String, syntax::Expr)>),
+  Raw(String),           // keep evaluated textual value
+  ExprVal(syntax::Expr), // keep as structured AST for fast Part access
+}
+thread_local! {
+    static ENV: RefCell<HashMap<String, StoredValue>> = RefCell::new(HashMap::new());
+    //            name         Vec of (param_names, conditions, defaults, head_constraints, blank_types, body_AST) for multi-arity + condition + optional support
+    //            blank_types: 1=Blank, 2=BlankSequence, 3=BlankNullSequence
+    static FUNC_DEFS: RefCell<HashMap<String, Vec<(Vec<String>, Vec<Option<syntax::Expr>>, Vec<Option<syntax::Expr>>, Vec<Option<String>>, Vec<u8>, syntax::Expr)>>> = RefCell::new(HashMap::new());
+    // Memoized literal-argument definitions (the `f[x_] := f[x] = …` idiom):
+    // function name -> (joined argument key -> (arg Exprs, stored value)).
+    // Kept separate from FUNC_DEFS so dispatch is O(1) per memoized value
+    // instead of linearly scanning thousands of accumulated literal DownValues
+    // (which made memoization O(n²)). The arg Exprs are retained so the
+    // entries can be reconstructed as rules for DownValues introspection.
+    pub static MEMO_VALUES: RefCell<HashMap<String, HashMap<String, (Vec<syntax::Expr>, syntax::Expr)>>> = RefCell::new(HashMap::new());
+    // Function attributes (e.g., Listable, Flat, etc.)
+    static FUNC_ATTRS: RefCell<HashMap<String, evaluator::Attributes>> = RefCell::new(HashMap::new());
+    // Builtin attributes that have been explicitly removed (via Unprotect,
+    // ClearAttributes, or ClearAll). Subtracted from `Attributes[sym]` so
+    // that e.g. `Unprotect[Pi]; Attributes[Pi]` no longer contains
+    // `Protected`. Re-adding via SetAttributes/Protect prunes the entry.
+    pub static FUNC_ATTRS_REMOVED: RefCell<HashMap<String, evaluator::Attributes>> = RefCell::new(HashMap::new());
+    // Function options (e.g., Options[f] = {a -> 1})
+    pub static FUNC_OPTIONS: RefCell<HashMap<String, Vec<syntax::Expr>>> = RefCell::new(HashMap::new());
+    // Track whether Options[f] was set with `:=` (SetDelayed) so Definition can
+    // re-emit the matching operator. Symbols set with plain `=` are absent.
+    pub static FUNC_OPTIONS_DELAYED: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
+    // UpValues: tag symbol -> Vec of (outer_func_name, params, conditions, defaults, heads, body, original_lhs, original_body)
+    // Stored by tag symbol; checked during evaluation when a function's arguments contain the tag as head
+    pub static UPVALUES: RefCell<HashMap<String, Vec<(String, Vec<String>, Vec<Option<syntax::Expr>>, Vec<Option<syntax::Expr>>, Vec<Option<String>>, syntax::Expr, syntax::Expr, syntax::Expr)>>> = RefCell::new(HashMap::new());
+    // Track Part evaluation nesting depth for Part::partd warnings
+    static PART_DEPTH: RefCell<usize> = const { RefCell::new(0) };
+    // Track evaluation recursion depth for $RecursionLimit enforcement
+    pub static RECURSION_DEPTH: Cell<usize> = const { Cell::new(0) };
+    // Set to the `TerminatedEvaluation` tag while a resource-limit overrun
+    // unwinds. See `recursion_limit_exceeded`.
+    static TERMINATION_IN_FLIGHT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    // Reap/Sow stack: each Reap call pushes a Vec to collect (value, tag) pairs
+    pub static SOW_STACK: RefCell<Vec<Vec<(syntax::Expr, syntax::Expr)>>> = const { RefCell::new(Vec::new()) };
+    // Context stack for Begin/End: stores the context strings pushed by Begin[]
+    static CONTEXT_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // Stack of saved $ContextPath values, pushed by BeginPackage[] and
+    // popped by EndPackage[]. The top entry (when present) is the
+    // currently-active path; an empty stack falls back to the System`/Global`
+    // default.
+    static CONTEXT_PATH_STACK: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    // `$ContextPath` while no `BeginPackage[]` is open. The stack is empty
+    // then, so an assignment made at top level needs somewhere of its own to
+    // live; `EndPackage[]` falls back to it once the stack drains.
+    static CONTEXT_PATH_BASE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    // Extra packages registered by `BeginPackage[]` (and the explicit second
+    // argument). `$Packages` returns these prepended to the canonical
+    // `{"System`", "Global`"}` baseline.
+    pub static PACKAGES_EXTRA: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // Current option bindings for OptionValue during function evaluation
+    // Stack of (function_name, Vec<(option_name, option_value)>)
+    pub static OPTION_VALUE_CONTEXT: RefCell<Vec<(String, Vec<(String, syntax::Expr)>)>> = const { RefCell::new(Vec::new()) };
+    // Inline OptionsPattern defaults: func_name -> Vec of Option<Vec<Expr>> per overload
+    // When OptionsPattern[{a -> a0, ...}] is used, stores the inline defaults for that overload
+    pub static FUNC_OPTS_INLINE: RefCell<HashMap<String, Vec<Option<Vec<syntax::Expr>>>>> = RefCell::new(HashMap::new());
+    // Evaluation stack: tracks the chain of function calls currently being evaluated.
+    // Used to produce stack traces when evaluation errors/messages occur.
+    pub static EVAL_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    // Last captured stack trace: set when an EvaluationError propagates through
+    // the function call evaluation, so the top-level handler can print it.
+    pub static LAST_ERROR_TRACE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+#[derive(Error, Debug)]
+pub enum InterpreterError {
+  #[error("Parse error: {0}")]
+  ParseError(#[from] Box<pest::error::Error<Rule>>),
+  #[error("Empty input")]
+  EmptyInput,
+  #[error("Evaluation error: {0}")]
+  EvaluationError(String),
+  #[error("Return")]
+  ReturnValue(Box<syntax::Expr>),
+  #[error("Break")]
+  BreakSignal,
+  #[error("Continue")]
+  ContinueSignal,
+  #[error("Throw")]
+  ThrowValue(Box<syntax::Expr>, Option<Box<syntax::Expr>>),
+  #[error("$Aborted")]
+  Abort,
+  /// A resource limit — so far only `$RecursionLimit` — was exceeded. Like
+  /// `Abort`, this unwinds the whole evaluation; the top level reports it
+  /// as `TerminatedEvaluation[<tag>]`.
+  #[error("TerminatedEvaluation")]
+  Terminated(&'static str),
+  /// Internal signal for tail-call optimization (never user-visible)
+  #[error("TailCall")]
+  TailCall(Box<syntax::Expr>),
+  /// Internal signal for Goto[tag] — caught by CompoundExpression
+  #[error("Goto")]
+  GotoSignal(Box<syntax::Expr>),
+}
+
+/// A playable audio output captured during evaluation. Visual hosts (the
+/// Woxi Playground and Woxi Studio) render it as a graphical audio player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioOutput {
+  /// Base64-encoded audio data. Empty when the data is unavailable (e.g. a
+  /// file-backed `Audio` whose file cannot be read, as in the browser
+  /// playground) — hosts still render the player chrome, it just cannot play.
+  pub base64: String,
+  /// MIME type of the encoded data (e.g. "audio/wav", "audio/flac").
+  pub mime: String,
+  /// Display label — the file name for file-backed `Audio` objects.
+  pub label: Option<String>,
+}
+
+/// Extended result type that includes both stdout and the result
+#[derive(Debug, Clone)]
+pub struct InterpretResult {
+  pub stdout: String,
+  pub result: String,
+  /// The final value as an expression tree, for hosts that want structure
+  /// rather than the formatted `result` text. `None` when the evaluation
+  /// produced no top-level value.
+  pub expr: Option<syntax::Expr>,
+  pub graphics: Option<String>,
+  pub output_svg: Option<String>,
+  /// Playable audio (synthesized from Play/Sound, or an Audio object), if any.
+  pub sound: Option<AudioOutput>,
+  pub warnings: Vec<String>,
+}
+
+impl WolframParser {
+  pub fn parse_wolfram(
+    input: &str,
+  ) -> Result<pest::iterators::Pairs<'_, Rule>, Box<pest::error::Error<Rule>>>
+  {
+    // Deeply nested invalid input (e.g. `f[f[f[...` without closing
+    // brackets) makes pest backtrack exponentially, so rejecting it would
+    // take hours. The call limit turns that into a "call limit reached"
+    // parse error. The worst script in tests/scripts needs ~5,700 calls
+    // per byte, so 20,000 per byte (plus a base allowance covering the
+    // fixed overhead on tiny inputs) leaves ample headroom for legitimate
+    // code of any size, while short pathological inputs are rejected in
+    // well under a second even in debug builds on slow CI hardware.
+    let limit =
+      1_000_000_usize.saturating_add(input.len().saturating_mul(20_000));
+    pest::set_call_limit(std::num::NonZeroUsize::new(limit));
+    Self::parse(Rule::Program, input).map_err(Box::new)
+  }
+}
+
+pub fn parse(
+  input: &str,
+) -> Result<pest::iterators::Pairs<'_, Rule>, Box<pest::error::Error<Rule>>> {
+  WolframParser::parse_wolfram(input)
+}
+
+// Global RNG state: None = use thread_rng(), Some = use seeded ChaCha8Rng
+thread_local! {
+    static SEEDED_RNG: RefCell<Option<ChaCha8Rng>> = const { RefCell::new(None) };
+}
+
+/// Seed the global RNG with a specific seed value (SeedRandom[n]).
+pub fn seed_rng(seed: u64) {
+  SEEDED_RNG.with(|rng| {
+    *rng.borrow_mut() = Some(ChaCha8Rng::seed_from_u64(seed));
+  });
+}
+
+/// Reset the global RNG to non-deterministic mode (SeedRandom[]).
+pub fn unseed_rng() {
+  SEEDED_RNG.with(|rng| {
+    *rng.borrow_mut() = None;
+  });
+}
+
+/// Snapshot the current RNG state (used by `BlockRandom` to localize any
+/// `SeedRandom` calls made inside its body).
+pub fn snapshot_rng_state() -> Option<ChaCha8Rng> {
+  SEEDED_RNG.with(|rng| rng.borrow().clone())
+}
+
+/// Restore a previously snapshotted RNG state (see [`snapshot_rng_state`]).
+pub fn restore_rng_state(state: Option<ChaCha8Rng>) {
+  SEEDED_RNG.with(|rng| {
+    *rng.borrow_mut() = state;
+  });
+}
+
+/// Execute a closure with a mutable reference to the current RNG.
+/// Uses the seeded RNG if set, otherwise falls back to thread_rng().
+pub fn with_rng<F, R>(f: F) -> R
+where
+  F: FnOnce(&mut dyn rand::RngCore) -> R,
+{
+  SEEDED_RNG.with(|cell| {
+    let mut borrow = cell.borrow_mut();
+    if let Some(ref mut seeded) = *borrow {
+      f(seeded)
+    } else {
+      f(&mut rand::thread_rng())
+    }
+  })
+}
+
+// Captured output from Print statements
+thread_local! {
+    static CAPTURED_STDOUT: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+// Quiet print mode — suppresses Print's stdout output while still
+// capturing to the internal buffer. Used by conformance tests to
+// separate Print side-effects from expression results.
+thread_local! {
+    static QUIET_PRINT: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Enable/disable quiet print mode (suppresses Print's stdout output).
+pub fn set_quiet_print(enabled: bool) {
+  QUIET_PRINT.with(|q| *q.borrow_mut() = enabled);
+}
+
+/// Check if quiet print mode is enabled.
+pub fn is_quiet_print() -> bool {
+  QUIET_PRINT.with(|q| *q.borrow())
+}
+
+// Interactive-stdin mode — lets `Input[]` / `InputString[]` consume the
+// process's standard input, the way `wolframscript -file` does. Off by
+// default so embedders that don't own stdin (the wasm playground, the
+// Jupyter kernel, the Python bindings, unit tests) keep the
+// non-interactive `EndOfFile` behaviour instead of blocking on a stream
+// that will never deliver a line.
+thread_local! {
+    static STDIN_INPUT: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Enable/disable reading `Input[]` / `InputString[]` from standard input.
+pub fn set_stdin_input(enabled: bool) {
+  STDIN_INPUT.with(|s| *s.borrow_mut() = enabled);
+}
+
+/// Check whether `Input[]` / `InputString[]` may read from standard input.
+pub fn is_stdin_input() -> bool {
+  STDIN_INPUT.with(|s| *s.borrow())
+}
+
+/// Read one line from standard input for `Input[]` / `InputString[]`,
+/// with the trailing newline stripped. Returns `None` at end of input, or
+/// when interactive stdin is disabled — both of which the callers turn
+/// into `EndOfFile`.
+pub fn read_stdin_line() -> Option<String> {
+  if !is_stdin_input() {
+    return None;
+  }
+  use std::io::BufRead as _;
+  let mut line = String::new();
+  match std::io::stdin().lock().read_line(&mut line) {
+    Ok(0) | Err(_) => None,
+    Ok(_) => {
+      if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+          line.pop();
+        }
+      }
+      Some(line)
+    }
+  }
+}
+
+// Visual display mode flag — set by interpret_with_stdout to enable
+// rendering of display wrappers like TableForm as SVG grids
+thread_local! {
+    static VISUAL_MODE: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Whether the interpreter is in visual (notebook-like) display mode, where
+/// front-end-only behaviors apply (e.g. `Defer[expr]` shows `expr` without
+/// its wrapper). False in plain CLI/script mode, which matches wolframscript.
+pub fn is_visual_mode() -> bool {
+  VISUAL_MODE.with(|v| *v.borrow())
+}
+
+// REPL session flag — set by the `woxi repl` command. It enables persistent
+// `%` / `Out[]` history caching across evaluations in the same process and
+// switches the printed result to the OutputForm digits wolframscript's
+// terminal REPL shows (see `to_display_precision`). It does not turn on the
+// SVG/notebook rendering that VISUAL_MODE controls.
+thread_local! {
+    static REPL_MODE: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Enable or disable REPL session mode (persistent `%` / `Out[]` history plus
+/// OutputForm number display).
+pub fn set_repl_mode(enabled: bool) {
+  REPL_MODE.with(|v| *v.borrow_mut() = enabled);
+}
+
+/// Whether the terminal REPL (`woxi repl`) is driving evaluation.
+pub fn is_repl_mode() -> bool {
+  REPL_MODE.with(|v| *v.borrow())
+}
+
+/// Whether output history (`%` / `Out[]`) should persist across evaluations.
+/// True in both visual (notebook) mode and terminal REPL mode. Plain
+/// `interpret` — the `woxi eval` / script path, one fresh process per
+/// program — neither records nor consults history, so `%` collapses to
+/// `Out[0]` exactly as it does in wolframscript's script mode.
+pub fn output_history_enabled() -> bool {
+  VISUAL_MODE.with(|v| *v.borrow()) || REPL_MODE.with(|v| *v.borrow())
+}
+
+// Dark mode flag — when true, SVG output uses a dark color palette
+thread_local! {
+    static DARK_MODE: RefCell<bool> = const { RefCell::new(false) };
+}
+
+pub fn is_dark_mode() -> bool {
+  DARK_MODE.with(|d| *d.borrow())
+}
+
+pub fn set_dark_mode(enabled: bool) {
+  DARK_MODE.with(|d| *d.borrow_mut() = enabled);
+}
+
+// Captured graphical output (SVG) from Plot and related functions
+thread_local! {
+    static CAPTURED_GRAPHICS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+// Captured GraphicsBox expression (Mathematica .nb format) from Graphics/Plot
+thread_local! {
+    static CAPTURED_GRAPHICSBOX: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+// Captured SVG rendering of the text output (always generated, with superscripts etc.)
+thread_local! {
+    static CAPTURED_OUTPUT_SVG: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+// Captured playable audio (from Play/Sound synthesis or an Audio object).
+// The visual hosts turn this into a graphical audio player.
+thread_local! {
+    static CAPTURED_SOUND: RefCell<Option<AudioOutput>> = const { RefCell::new(None) };
+}
+
+// Most-recent evaluated expression for `%` / `Out[]` shortcuts. Set by
+// `interpret_with_stdout` after each successful evaluation and consulted by
+// the `Out[]` dispatch path. Kept alongside the numbered history below
+// because hosts that don't maintain `$Line` (woxi-studio, the playground)
+// still need `%` to reach the previous cell's result.
+thread_local! {
+    static LAST_OUTPUT_EXPR: RefCell<Option<syntax::Expr>> = const { RefCell::new(None) };
+}
+
+// Numbered output history: `$Line` at the time of evaluation → the value
+// that line produced. This is what makes `Out[9]` / `%9` — and the
+// relative `%%…` forms, which resolve to `Out[$Line - k]` — return real
+// values in a session that numbers its input lines (the terminal REPL and
+// the Jupyter kernel).
+thread_local! {
+    static OUTPUT_HISTORY: RefCell<std::collections::HashMap<i128, syntax::Expr>> =
+      RefCell::new(std::collections::HashMap::new());
+}
+
+/// Stash an evaluated expression so subsequent `%` / `Out[]` references
+/// can resolve to it. Called from `interpret_with_stdout` after success.
+fn set_last_output(expr: syntax::Expr) {
+  let line = current_line();
+  if line_numbering_enabled() && line > 0 {
+    OUTPUT_HISTORY.with(|c| c.borrow_mut().insert(line, expr.clone()));
+  }
+  LAST_OUTPUT_EXPR.with(|c| *c.borrow_mut() = Some(expr));
+}
+
+/// Retrieve the most recent stashed expression, if any.
+pub fn get_last_output() -> Option<syntax::Expr> {
+  LAST_OUTPUT_EXPR.with(|c| c.borrow().clone())
+}
+
+/// The value produced on input line `line`, if that line has been
+/// evaluated in this session. Backs `Out[k]`.
+pub fn get_output_at_line(line: i128) -> Option<syntax::Expr> {
+  OUTPUT_HISTORY.with(|c| c.borrow().get(&line).cloned())
+}
+
+/// Whether the host numbers its input lines, i.e. assigns `$Line` before
+/// each evaluation. Only then does a numbered history mean anything:
+/// woxi-studio, the playground and the JupyterLite kernel evaluate cell
+/// after cell without ever advancing `$Line`, so every value would land in
+/// — and be read back out of — the same slot, making `Out[1]` answer with
+/// whatever ran most recently. Those hosts keep only the single previous
+/// value that backs `%`.
+fn line_numbering_enabled() -> bool {
+  ENV.with(|e| e.borrow().contains_key("$Line"))
+}
+
+/// The current input-line number (`$Line`). Defaults to 1 — the value
+/// wolframscript reports in a fresh script-mode session — when no host has
+/// advanced it.
+pub fn current_line() -> i128 {
+  let stored = ENV.with(|e| e.borrow().get("$Line").cloned());
+  let text = match stored {
+    Some(StoredValue::Raw(s)) => s,
+    Some(StoredValue::ExprVal(syntax::Expr::Integer(n))) => return n,
+    _ => return 1,
+  };
+  text.trim().parse::<i128>().unwrap_or(1)
+}
+
+/// Drop the cached previous output — used when the studio resets state
+/// before re-evaluating the whole notebook.
+pub fn clear_last_output() {
+  LAST_OUTPUT_EXPR.with(|c| *c.borrow_mut() = None);
+  OUTPUT_HISTORY.with(|c| c.borrow_mut().clear());
+  INPUT_HISTORY.with(|c| c.borrow_mut().clear());
+}
+
+// Numbered input history: `$Line` → the source text entered on that line.
+// `In[k]` re-evaluates it, the way a Wolfram session does. Only hosts that
+// hand us their input line by line (the terminal REPL, the Jupyter kernel)
+// record here; script mode keeps no input history at all.
+thread_local! {
+    static INPUT_HISTORY: RefCell<std::collections::HashMap<i128, String>> =
+      RefCell::new(std::collections::HashMap::new());
+    // Lines whose input is currently being re-evaluated, so a self-
+    // referential `In[k]` cannot recurse forever.
+    static INPUT_EXPANDING: RefCell<std::collections::HashSet<i128>> =
+      RefCell::new(std::collections::HashSet::new());
+}
+
+/// Record the source text evaluated on input line `line`, so a later
+/// `In[line]` can re-run it.
+pub fn record_input_line(line: i128, text: &str) {
+  if line > 0 {
+    INPUT_HISTORY
+      .with(|c| c.borrow_mut().insert(line, text.trim().to_string()));
+  }
+}
+
+/// Marks a line as being re-evaluated; clears the mark when dropped.
+pub struct InputExpansion(i128);
+
+impl Drop for InputExpansion {
+  fn drop(&mut self) {
+    INPUT_EXPANDING.with(|c| {
+      c.borrow_mut().remove(&self.0);
+    });
+  }
+}
+
+/// Claim line `line`'s recorded input for re-evaluation, returning its
+/// source text along with a guard that releases the claim. Returns `None`
+/// when the line has no recorded input or is already being expanded
+/// (`In[1]` on line 1, say), which keeps `In[k]` symbolic instead of
+/// recursing.
+pub fn begin_input_expansion(line: i128) -> Option<(String, InputExpansion)> {
+  let text = INPUT_HISTORY.with(|c| c.borrow().get(&line).cloned())?;
+  let fresh = INPUT_EXPANDING.with(|c| c.borrow_mut().insert(line));
+  fresh.then(|| (text, InputExpansion(line)))
+}
+
+// Structured result of the most recent top-level evaluation. Unlike
+// `LAST_OUTPUT_EXPR` — which backs `%` / `Out[]` and is therefore only
+// filled when output history is enabled — this is set on every top-level
+// result, so `interpret_with_stdout` can hand callers the expression tree
+// alongside the formatted string.
+thread_local! {
+    static LAST_RESULT_EXPR: RefCell<Option<syntax::Expr>> = const { RefCell::new(None) };
+}
+
+/// Record the structured value of a top-level result. Called from
+/// `format_top_level_result` for the outermost evaluation only.
+fn set_last_result_expr(expr: syntax::Expr) {
+  LAST_RESULT_EXPR.with(|c| *c.borrow_mut() = Some(expr));
+}
+
+/// Record the value of a result that `interpret` returned through one of
+/// its literal fast paths, which produce formatted text without ever
+/// reaching `format_top_level_result`.
+///
+/// Those paths return before the depth guard runs, so the nesting level is
+/// read here rather than passed in: only an outermost evaluation may
+/// record, or an inner `ToExpression["3"]` would leave its `3` behind as
+/// the reported result of the whole program.
+fn set_fast_path_result_expr(expr: syntax::Expr) {
+  record_value_expr(&expr);
+  if INTERPRET_DEPTH.with(|d| *d.borrow()) == 0 {
+    // A line that is nothing but a literal (`11`) is still a line with a
+    // value, so it has to enter `%` / `Out[]` history like any other.
+    if output_history_enabled() {
+      set_last_output(expr.clone());
+    }
+    set_last_result_expr(expr);
+  }
+}
+
+/// Take the structured result of the most recent top-level evaluation,
+/// clearing it so a later evaluation cannot pick up a stale value.
+fn take_last_result_expr() -> Option<syntax::Expr> {
+  LAST_RESULT_EXPR.with(|c| c.borrow_mut().take())
+}
+
+thread_local! {
+    /// The value of the statement `interpret` is evaluating right now, at
+    /// whatever nesting level. Unlike `LAST_RESULT_EXPR` — which reports the
+    /// outermost result to a host — this exists so a nested `interpret`
+    /// (what `Get` runs) can hand its caller the value itself instead of the
+    /// text it displays as. Round-tripping a 29,000-line table of
+    /// associations through its OutputForm both loses the quoting and takes
+    /// far longer than reading the file did.
+    static CURRENT_VALUE_EXPR: RefCell<Option<syntax::Expr>> =
+        const { RefCell::new(None) };
+}
+
+/// Record the value of the statement being evaluated, at any nesting level.
+fn record_value_expr(expr: &syntax::Expr) {
+  CURRENT_VALUE_EXPR.with(|c| *c.borrow_mut() = Some(expr.clone()));
+}
+
+/// Forget the recorded value — called before each top-level statement, so
+/// only the statement whose value the program returns leaves one behind.
+fn clear_value_expr() {
+  CURRENT_VALUE_EXPR.with(|c| *c.borrow_mut() = None);
+}
+
+/// Take the value the most recent statement recorded.
+pub(crate) fn take_value_expr() -> Option<syntax::Expr> {
+  CURRENT_VALUE_EXPR.with(|c| c.borrow_mut().take())
+}
+
+// Session start time for SessionTime[]
+static SESSION_START: std::sync::LazyLock<web_time::Instant> =
+  std::sync::LazyLock::new(web_time::Instant::now);
+
+/// Returns the elapsed time in seconds since the session started.
+pub fn session_time() -> f64 {
+  SESSION_START.elapsed().as_secs_f64()
+}
+
+/// Look up the value stored in ENV for a name and return it as an Expr.
+/// Used by introspection functions like OwnValues. Returns None if the name
+/// has no stored value.
+pub fn lookup_env_as_expr(name: &str) -> Option<syntax::Expr> {
+  ENV.with(|e| {
+    e.borrow().get(name).map(|v| match v {
+      StoredValue::ExprVal(expr) => expr.clone(),
+      StoredValue::Raw(s) => match interpret_to_expr(s) {
+        Ok(expr) => expr,
+        Err(_) => syntax::Expr::String(s.clone()),
+      },
+      StoredValue::Association(_) => syntax::Expr::Identifier(name.to_string()),
+    })
+  })
+}
+
+// Captured unimplemented function calls (e.g. "Quantity[13.77, \"BillionYears\"]")
+thread_local! {
+    static UNIMPLEMENTED_CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+// Captured Wolfram-style messages (printed inline, tracked for Check/Quiet interaction)
+thread_local! {
+    static CAPTURED_MESSAGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Per-calculation display counts by message name (Symbol::tag), for
+    /// wolframscript's General::stop suppression of repeated messages.
+    static MESSAGE_STOP_COUNTS: RefCell<std::collections::HashMap<String, usize>> =
+      RefCell::new(std::collections::HashMap::new());
+    /// `Symbol::tag` names of the messages generated during the current
+    /// calculation, in order — the content of `$MessageList`.
+    static MESSAGE_LIST: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// How many messages have been generated, by `Quiet` nesting depth and
+    /// by name.
+    ///
+    /// `Check` reacts to a message being *generated*, not to its being
+    /// printed, so a message `General::stop` withheld still triggers it —
+    /// `Do[Check[1/0, "F"], {6}]` is `"F"` six times in wolframscript, not
+    /// three. `CAPTURED_MESSAGES`, `MESSAGE_LIST` and the printed output all
+    /// stop at three, which is why `Check` cannot be read off them.
+    ///
+    /// The depth is recorded because only a `Quiet` *inside* the `Check`
+    /// stops it: `Check[Quiet[1/0], "F"]` is `ComplexInfinity` but
+    /// `Quiet[Check[1/0, "F"]]` is `"F"`. A `Check` counts the messages
+    /// generated at its own depth or above it, never the deeper ones.
+    ///
+    /// Unlike the other three this is never reset: only differences across a
+    /// `Check` are ever read, and a reset in between would make one negative.
+    /// It holds counts rather than a list of names so that a loop generating
+    /// millions of messages does not grow it.
+    static GENERATED_MESSAGES: RefCell<GeneratedMessages> =
+      RefCell::new(GeneratedMessages::default());
+}
+
+/// Counts of generated messages, indexed by `Quiet` nesting depth.
+/// See [`GENERATED_MESSAGES`].
+#[derive(Default)]
+struct GeneratedMessages {
+  by_depth: Vec<usize>,
+  by_name: std::collections::HashMap<String, Vec<usize>>,
+}
+
+impl GeneratedMessages {
+  fn record(&mut self, name: Option<String>, depth: usize) {
+    fn bump(counts: &mut Vec<usize>, depth: usize) {
+      if counts.len() <= depth {
+        counts.resize(depth + 1, 0);
+      }
+      counts[depth] += 1;
+    }
+    bump(&mut self.by_depth, depth);
+    if let Some(name) = name {
+      bump(self.by_name.entry(name).or_default(), depth);
+    }
+  }
+
+  fn upto(counts: &[usize], depth: usize) -> usize {
+    counts.iter().take(depth + 1).sum()
+  }
+}
+
+/// The `Symbol::tag` names behind `$MessageList`, oldest first.
+pub fn message_list_names() -> Vec<String> {
+  MESSAGE_LIST.with(|m| m.borrow().clone())
+}
+
+/// The current `Quiet` nesting depth, which `Check` snapshots on entry.
+pub fn quiet_depth() -> usize {
+  QUIET_LEVEL.with(|level| *level.borrow())
+}
+
+/// How many messages have been generated so far at `Quiet` depth `depth` or
+/// above it, including the ones `General::stop` kept from printing.
+/// See [`GENERATED_MESSAGES`].
+pub fn generated_message_count(depth: usize) -> usize {
+  GENERATED_MESSAGES
+    .with(|m| GeneratedMessages::upto(&m.borrow().by_depth, depth))
+}
+
+/// How many times `name` (a `Symbol::tag`) has been generated so far at
+/// `Quiet` depth `depth` or above it.
+pub fn generated_message_count_of(name: &str, depth: usize) -> usize {
+  GENERATED_MESSAGES.with(|m| {
+    m.borrow()
+      .by_name
+      .get(name)
+      .map_or(0, |counts| GeneratedMessages::upto(counts, depth))
+  })
+}
+
+/// How many unimplemented built-in calls have been recorded so far. Woxi
+/// reports one as a warning, and `Check` treats it as it does a message.
+pub fn unimplemented_call_count() -> usize {
+  UNIMPLEMENTED_CALLS.with(|buffer| buffer.borrow().len())
+}
+
+/// Record a generated message for `Check`, whatever becomes of its display.
+fn note_generated_message(msg: &str) {
+  let name = message_name(msg);
+  let depth = quiet_depth();
+  GENERATED_MESSAGES.with(|m| m.borrow_mut().record(name, depth));
+}
+
+// Set of message tags suppressed via `Off[head::tag]`. Keys are formatted as
+// "Head::tag" (e.g. "Power::indet"). When a message about to be emitted starts
+// with one of these tags, it is silently dropped instead of being printed.
+thread_local! {
+    static OFF_MESSAGES: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Mark a message tag as off, so future `emit_message` calls whose text starts
+/// with `"<tag>: "` are dropped. Used to implement `Off[Head::tag]`.
+pub fn off_message(tag: &str) {
+  OFF_MESSAGES.with(|s| {
+    s.borrow_mut().insert(tag.to_string());
+  });
+}
+
+/// Re-enable a previously suppressed message tag (mirror of `off_message`).
+pub fn on_message(tag: &str) {
+  OFF_MESSAGES.with(|s| {
+    s.borrow_mut().remove(tag);
+  });
+}
+
+fn message_is_off(msg: &str) -> bool {
+  // Scan each line for a `Head::tag: ` prefix and check whether any matches
+  // a suppressed tag. We can't just take msg[..find(": ")] because some
+  // messages prepend a right-aligned context line (e.g. the exponent above
+  // the base in Power::indet) before the tag line.
+  OFF_MESSAGES.with(|set| {
+    let set = set.borrow();
+    if set.is_empty() {
+      return false;
+    }
+    for line in msg.lines() {
+      if let Some(colon_space) = line.find(": ")
+        && let Some(double_colon) = line[..colon_space].find("::")
+      {
+        let tag = &line[..colon_space];
+        // Validate `tag` looks like Head::tag (no spaces).
+        if tag.contains(' ') || double_colon == 0 {
+          continue;
+        }
+        // `Off[General::tag]` switches the message off for every symbol —
+        // `General` is where a symbol without its own text for the tag
+        // reads it from, so `Off[General::shdw]` silences `foo::shdw` too.
+        let general = format!("General::{}", &tag[double_colon + 2..]);
+        if set.contains(tag) || set.contains(&general) {
+          return true;
+        }
+      }
+    }
+    false
+  })
+}
+
+// Directory of the notebook the current evaluation is running in. Front-ends
+// (e.g. woxi-studio) set this to the parent directory of the loaded `.nb`
+// file so `NotebookDirectory[]` returns a real path; when unset, the function
+// stays unevaluated to match wolframscript's behavior in non-FrontEnd mode.
+thread_local! {
+    static NOTEBOOK_DIRECTORY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Set the directory returned by `NotebookDirectory[]` for the current
+/// thread. Pass `None` to clear it.
+pub fn set_notebook_directory(dir: Option<String>) {
+  NOTEBOOK_DIRECTORY.with(|d| *d.borrow_mut() = dir);
+}
+
+/// Get the directory configured via `set_notebook_directory`, if any.
+pub fn get_notebook_directory() -> Option<String> {
+  NOTEBOOK_DIRECTORY.with(|d| d.borrow().clone())
+}
+
+// When true, emit_message prints to stdout instead of stderr (matching wolframscript behavior)
+thread_local! {
+    static MESSAGES_TO_STDOUT: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Enable/disable routing messages to stdout (for eval mode, matching wolframscript).
+pub fn set_messages_to_stdout(enabled: bool) {
+  MESSAGES_TO_STDOUT.with(|f| *f.borrow_mut() = enabled);
+}
+
+// Quiet level: when > 0, message printing is suppressed
+thread_local! {
+    static QUIET_LEVEL: RefCell<usize> = const { RefCell::new(0) };
+}
+
+/// Clears the captured stdout buffer
+fn clear_captured_stdout() {
+  CAPTURED_STDOUT.with(|buffer| {
+    buffer.borrow_mut().clear();
+  });
+}
+
+/// Appends to the captured stdout buffer
+fn capture_stdout(text: &str) {
+  CAPTURED_STDOUT.with(|buffer| {
+    buffer.borrow_mut().push_str(text);
+    buffer.borrow_mut().push('\n');
+  });
+}
+
+/// Appends to the captured stdout buffer without a trailing newline.
+pub fn capture_stdout_raw(text: &str) {
+  CAPTURED_STDOUT.with(|buffer| {
+    buffer.borrow_mut().push_str(text);
+  });
+}
+
+/// Gets the captured stdout content
+fn get_captured_stdout() -> String {
+  CAPTURED_STDOUT.with(|buffer| buffer.borrow().clone())
+}
+
+/// Clears the captured messages and unimplemented calls buffers
+fn clear_captured_warnings() {
+  UNIMPLEMENTED_CALLS.with(|buffer| {
+    buffer.borrow_mut().clear();
+  });
+  CAPTURED_MESSAGES.with(|buffer| {
+    buffer.borrow_mut().clear();
+  });
+}
+
+/// Records a call to an unimplemented built-in function (e.g. "Quantity[13.77, \"BillionYears\"]")
+pub fn capture_unimplemented_call(call_str: &str) {
+  UNIMPLEMENTED_CALLS.with(|buffer| {
+    buffer.borrow_mut().push(call_str.to_string());
+  });
+}
+
+/// Gets the captured warnings, consolidating unimplemented function calls into a single message.
+/// Includes both general warnings and Wolfram-style messages.
+pub fn get_captured_warnings() -> Vec<String> {
+  let mut warnings = Vec::new();
+
+  let calls = UNIMPLEMENTED_CALLS.with(|buffer| buffer.borrow().clone());
+  if !calls.is_empty() {
+    let joined = calls.join(", ");
+    let verb = if calls.len() == 1 {
+      "is a built-in Wolfram Language function"
+    } else {
+      "are built-in Wolfram Language functions"
+    };
+    warnings.push(format!("{joined} {verb} not yet implemented in Woxi."));
+  }
+
+  // Include messages (used by Check[] to detect message generation)
+  CAPTURED_MESSAGES.with(|buffer| {
+    warnings.extend(buffer.borrow().clone());
+  });
+
+  warnings
+}
+
+/// Gets warnings suitable for end-of-interpretation display.
+/// Excludes CAPTURED_MESSAGES since those are already printed inline by emit_message.
+fn get_warnings_for_display() -> Vec<String> {
+  let mut warnings = Vec::new();
+
+  let calls = UNIMPLEMENTED_CALLS.with(|buffer| buffer.borrow().clone());
+  if !calls.is_empty() {
+    let joined = calls.join(", ");
+    let verb = if calls.len() == 1 {
+      "is a built-in Wolfram Language function"
+    } else {
+      "are built-in Wolfram Language functions"
+    };
+    warnings.push(format!("{joined} {verb} not yet implemented in Woxi."));
+  }
+
+  warnings
+}
+
+/// Gets the raw CAPTURED_MESSAGES buffer
+pub fn get_captured_messages_raw() -> Vec<String> {
+  CAPTURED_MESSAGES.with(|buffer| buffer.borrow().clone())
+}
+
+/// Returns true if currently inside a Quiet[] evaluation
+fn is_quiet() -> bool {
+  QUIET_LEVEL.with(|level| *level.borrow() > 0)
+}
+
+/// Increment the quiet level (enter a Quiet[] block)
+pub fn push_quiet() {
+  QUIET_LEVEL.with(|level| *level.borrow_mut() += 1);
+}
+
+/// Decrement the quiet level (leave a Quiet[] block)
+pub fn pop_quiet() {
+  QUIET_LEVEL.with(|level| {
+    let mut l = level.borrow_mut();
+    if *l > 0 {
+      *l -= 1;
+    }
+  });
+}
+
+/// A saved copy of every message buffer, taken before a speculative or quieted
+/// evaluation so it can be rolled back afterwards.
+#[derive(Clone, Default)]
+pub struct WarningSnapshot {
+  unimplemented: Vec<String>,
+  messages: Vec<String>,
+  message_list: Vec<String>,
+}
+
+impl WarningSnapshot {
+  /// The `UNIMPLEMENTED_CALLS` entries present when the snapshot was taken.
+  pub fn unimplemented(&self) -> &[String] {
+    &self.unimplemented
+  }
+
+  /// The `CAPTURED_MESSAGES` entries present when the snapshot was taken.
+  pub fn messages(&self) -> &[String] {
+    &self.messages
+  }
+
+  /// The `$MessageList` entries present when the snapshot was taken.
+  pub fn message_list(&self) -> &[String] {
+    &self.message_list
+  }
+}
+
+/// Snapshot the current state of all warning/message buffers (for Quiet save/restore)
+pub fn snapshot_warnings() -> WarningSnapshot {
+  WarningSnapshot {
+    unimplemented: UNIMPLEMENTED_CALLS.with(|b| b.borrow().clone()),
+    messages: CAPTURED_MESSAGES.with(|b| b.borrow().clone()),
+    message_list: MESSAGE_LIST.with(|b| b.borrow().clone()),
+  }
+}
+
+/// Restore all warning/message buffers to a previous snapshot
+pub fn restore_warnings(snapshot: WarningSnapshot) {
+  UNIMPLEMENTED_CALLS.with(|b| *b.borrow_mut() = snapshot.unimplemented);
+  CAPTURED_MESSAGES.with(|b| *b.borrow_mut() = snapshot.messages);
+  MESSAGE_LIST.with(|b| *b.borrow_mut() = snapshot.message_list);
+}
+
+/// Replace the message buffers with explicit contents (used by `Quiet` when
+/// only some of the messages raised inside the block are rolled back).
+pub fn restore_warnings_filtered(
+  unimplemented: Vec<String>,
+  messages: Vec<String>,
+  message_list: Vec<String>,
+) {
+  restore_warnings(WarningSnapshot {
+    unimplemented,
+    messages,
+    message_list,
+  });
+}
+
+/// Capture the current evaluation stack trace for the most recent error.
+/// Called when an error propagates through function call evaluation.
+/// Only captures if no trace has been captured yet (preserves the deepest trace).
+pub fn capture_error_trace() {
+  LAST_ERROR_TRACE.with(|t| {
+    if t.borrow().is_none()
+      && let Some(trace) = format_stack_trace()
+    {
+      *t.borrow_mut() = Some(trace);
+    }
+  });
+}
+
+/// Take the last captured error stack trace (clears it).
+pub fn take_error_trace() -> Option<String> {
+  LAST_ERROR_TRACE.with(|t| t.borrow_mut().take())
+}
+
+/// Push a function name onto the evaluation stack.
+pub fn push_eval_stack(name: &str) {
+  EVAL_STACK.with(|s| s.borrow_mut().push(name.to_string()));
+}
+
+/// Pop the top entry from the evaluation stack.
+pub fn pop_eval_stack() {
+  EVAL_STACK.with(|s| {
+    s.borrow_mut().pop();
+  });
+}
+
+/// Get a snapshot of the current evaluation stack (bottom to top).
+pub fn get_eval_stack() -> Vec<String> {
+  EVAL_STACK.with(|s| s.borrow().clone())
+}
+
+/// Format the evaluation stack as a human-readable stack trace string.
+/// Always returns None now — the trace was Woxi-specific debug info that
+/// diverged from wolframscript's output. Keeping the helper so callers
+/// don't need to change.
+fn format_stack_trace() -> Option<String> {
+  None
+}
+
+/// Emit a Wolfram-style message (e.g. "Power::infy: Infinite expression 1/0 encountered.").
+/// Suppressed when inside Quiet[]. Tracked in CAPTURED_MESSAGES for Check[] interaction.
+/// When messages_to_stdout is enabled, prints to stdout (matching wolframscript).
+/// Includes a stack trace showing the chain of function calls.
+///
+/// This writes to the process stream only (stdout when `messages_to_stdout`
+/// is enabled — the CLI `eval`/`run`/REPL paths — stderr otherwise). It does
+/// NOT touch the `CAPTURED_STDOUT` buffer that `interpret_with_stdout`
+/// returns: most messages are diagnostics, and Woxi still emits some that
+/// wolframscript does not, so mirroring them all into captured stdout would
+/// pollute snapshots with Woxi-only output. Use [`emit_message_to_stdout`]
+/// only at the specific sites whose message provably matches wolframscript's
+/// stdout (e.g. Import/MedianFilter argument errors).
+pub fn emit_message(msg: &str) {
+  let _ = emit_message_core(msg);
+}
+
+/// Like [`emit_message`], but renders the text only when the message still
+/// has somewhere to go.
+///
+/// Some messages quote the whole expression they are about — a failing
+/// `Part` names the object it indexed — so building one costs as much as
+/// printing that object. A loop that trips the same message on a large list
+/// pays it every iteration even though wolframscript stops after three:
+/// `per = Permutations[Range[6], {6}]; Do[per[[1,1,1]], {t, 1, 4320}]` spent
+/// four seconds formatting 14 kB of permutations 4320 times over, enough for
+/// the nightly fuzzer to report it as a hang. Checking the `General::stop`
+/// counter first makes the run flat.
+///
+/// `name` is the `Head::tag` the built message will carry; `build` must
+/// produce a message that starts with it.
+pub fn emit_message_with(name: &str, build: impl FnOnce() -> String) {
+  if message_name_is_off(name) || message_stop_count(name) >= 3 {
+    return;
+  }
+  emit_message(&build());
+}
+
+/// Whether `Off` covers a `Head::tag`, without a message to scan. Mirrors
+/// the tag matching in [`message_is_off`], including `Off[General::tag]`
+/// standing in for every symbol's `tag`.
+fn message_name_is_off(name: &str) -> bool {
+  OFF_MESSAGES.with(|set| {
+    let set = set.borrow();
+    if set.is_empty() {
+      return false;
+    }
+    if set.contains(name) {
+      return true;
+    }
+    match name.find("::") {
+      Some(dc) => set.contains(&format!("General::{}", &name[dc + 2..])),
+      None => false,
+    }
+  })
+}
+
+/// How many times a `Head::tag` has already been emitted in this
+/// calculation. At three the next one is suppressed (see
+/// [`emit_message_core`]).
+fn message_stop_count(name: &str) -> usize {
+  MESSAGE_STOP_COUNTS.with(|m| m.borrow().get(name).copied().unwrap_or(0))
+}
+
+/// Public wrapper for [`message_name`], used by Check's tag filtering.
+pub fn message_name_of(msg: &str) -> Option<String> {
+  message_name(msg)
+}
+
+/// Extract the `Symbol::tag` message name from a message string. Some
+/// messages start with right-aligned context lines (e.g. Power::indet
+/// prints the exponent above the base), so scan every line for the tag.
+fn message_name(msg: &str) -> Option<String> {
+  for line in msg.lines() {
+    if let Some(dc) = line.find("::")
+      && let Some(rest) = line[dc + 2..].find(':')
+    {
+      let name = &line[..dc + 2 + rest];
+      if !name.contains(' ') {
+        return Some(name.to_string());
+      }
+    }
+  }
+  None
+}
+
+/// Shared emission path: captures the message, applies wolframscript's
+/// General::stop suppression (the same Symbol::tag prints at most three
+/// times per calculation; the third is followed by a General::stop notice
+/// and later ones are silent), and prints to the configured stream.
+/// Returns whether the message was displayed and the General::stop line
+/// when one was announced, so `emit_message_to_stdout` can mirror both.
+fn emit_message_core(msg: &str) -> (bool, Option<String>) {
+  if message_is_off(msg) {
+    return (false, None);
+  }
+  // Count before recording. Past the limit a message is not merely
+  // undisplayed, it is gone: wolframscript's `$MessageList` holds the three
+  // that printed plus the `General::stop` notice, however many more the
+  // calculation went on to generate. The counter runs inside `Quiet` just as
+  // it does outside — `Quiet[Do[{{1,2},{3,4}}[[1,1,1]], {10}]; $MessageList]`
+  // is the same four entries — so this precedes the `is_quiet` check too.
+  let mut stop_line: Option<String> = None;
+  let mut past_the_limit = false;
+  if let Some(name) = message_name(msg)
+    && name != "General::stop"
+  {
+    let count = MESSAGE_STOP_COUNTS.with(|m| {
+      let mut m = m.borrow_mut();
+      let c = m.entry(name.clone()).or_insert(0);
+      *c += 1;
+      *c
+    });
+    if count > 3 {
+      past_the_limit = true;
+    }
+    if count == 3 {
+      let stop = format!(
+        "General::stop: Further output of {name} will be suppressed during this calculation."
+      );
+      // `Off[General::stop]` silences the notice itself, leaving only the
+      // suppression it announces.
+      if !message_is_off(&stop) {
+        stop_line = Some(stop);
+      }
+    }
+  }
+  // `Check` watches generation, so it is told before the limit is applied.
+  note_generated_message(msg);
+  if past_the_limit {
+    return (false, None);
+  }
+  CAPTURED_MESSAGES.with(|buffer| {
+    buffer.borrow_mut().push(msg.to_string());
+  });
+  // A quieted message still joins `$MessageList` — wolframscript's `Quiet`
+  // saves and restores the list around the block, so the entry is visible to
+  // code *inside* the block and gone once it returns (see `quiet_ast`).
+  if let Some(name) = message_name(msg) {
+    MESSAGE_LIST.with(|m| m.borrow_mut().push(name));
+  }
+  if let Some(stop) = &stop_line {
+    CAPTURED_MESSAGES.with(|buffer| {
+      buffer.borrow_mut().push(stop.clone());
+    });
+    MESSAGE_LIST.with(|m| m.borrow_mut().push("General::stop".to_string()));
+  }
+  if is_quiet() {
+    return (false, None);
+  }
+  let to_stdout = MESSAGES_TO_STDOUT.with(|f| *f.borrow());
+  let trace = format_stack_trace();
+  if to_stdout {
+    println!();
+    println!("{msg}");
+    if let Some(trace) = trace {
+      println!("{trace}");
+    }
+    if let Some(stop) = &stop_line {
+      println!();
+      println!("{stop}");
+    }
+  } else {
+    eprintln!();
+    eprintln!("{msg}");
+    if let Some(trace) = trace {
+      eprintln!("{trace}");
+    }
+    if let Some(stop) = &stop_line {
+      eprintln!();
+      eprintln!("{stop}");
+    }
+  }
+  (true, stop_line)
+}
+
+/// Reset the per-calculation General::stop counters (a new top-level
+/// evaluation is a new "calculation").
+fn reset_message_stop_counts() {
+  MESSAGE_STOP_COUNTS.with(|m| m.borrow_mut().clear());
+  MESSAGE_LIST.with(|m| m.borrow_mut().clear());
+}
+
+/// Like [`emit_message`], but also mirrors the message — with wolframscript's
+/// leading-blank-line format — into `CAPTURED_STDOUT`, the buffer that
+/// `interpret_with_stdout` returns to the snapshot tests, playground, and
+/// Jupyter kernel. wolframscript writes messages to stdout, so this keeps
+/// those library consumers byte-for-byte consistent with it.
+///
+/// Use this ONLY where Woxi's message provably matches wolframscript's
+/// stdout for the same input; for the general diagnostic case use
+/// [`emit_message`] (see its note). Respects `Quiet[]`/`Off[]`.
+pub fn emit_message_to_stdout(msg: &str) {
+  let (shown, stop_line) = emit_message_core(msg);
+  if !shown {
+    return;
+  }
+  capture_stdout_raw("\n");
+  capture_stdout_raw(msg);
+  capture_stdout_raw("\n");
+  if let Some(stop) = stop_line {
+    capture_stdout_raw("\n");
+    capture_stdout_raw(&stop);
+    capture_stdout_raw("\n");
+  }
+}
+
+/// Clears the captured graphics buffer
+pub fn clear_captured_graphics() {
+  CAPTURED_GRAPHICS.with(|buffer| {
+    buffer.borrow_mut().clear();
+  });
+}
+
+/// Stores SVG graphics for capture by the Jupyter kernel
+pub fn capture_graphics(svg: &str) {
+  CAPTURED_GRAPHICS.with(|buffer| {
+    buffer.borrow_mut().push(svg.to_string());
+  });
+}
+
+/// Capture SVG and return an Expr::Graphics carrying the SVG data.
+pub fn graphics_result(svg: String) -> syntax::Expr {
+  capture_graphics(&svg);
+  syntax::Expr::Graphics {
+    svg,
+    is_3d: false,
+    source: None,
+    head: None,
+    structure: None,
+  }
+}
+
+/// Like `graphics_result` but reports `head` (e.g. `GeoGraphics`) from `Head`
+/// instead of the default `Graphics`. The SVG renders identically.
+fn graphics_result_with_head(svg: String, head: &str) -> syntax::Expr {
+  capture_graphics(&svg);
+  syntax::Expr::Graphics {
+    svg,
+    is_3d: false,
+    source: None,
+    head: Some(head.to_string()),
+    structure: None,
+  }
+}
+
+/// Like `graphics_result` but also stores the source plot data
+/// so that `Show` can later merge pre-rendered plots by re-rendering
+/// via plotters.
+pub fn graphics_result_with_source(
+  svg: String,
+  source: syntax::PlotSource,
+) -> syntax::Expr {
+  capture_graphics(&svg);
+  syntax::Expr::Graphics {
+    svg,
+    is_3d: false,
+    source: Some(Box::new(source)),
+    head: None,
+    structure: None,
+  }
+}
+
+/// Capture SVG and return an Expr::Graphics for 3D graphics.
+pub fn graphics3d_result(svg: String) -> syntax::Expr {
+  capture_graphics(&svg);
+  syntax::Expr::Graphics {
+    svg,
+    is_3d: true,
+    source: None,
+    head: None,
+    structure: None,
+  }
+}
+
+/// Like `graphics3d_result` but remembers the symbolic expression the
+/// rendering came from, so `Part` can index into it (Wolfram's
+/// Like `graphics_result` but also remembers the symbolic expression the
+/// rendering came from, so structural operations can look inside it (Wolfram's
+/// `ContourPlot[…][[1]]` returns the graphic's content).
+pub fn graphics_result_with_structure(
+  svg: String,
+  structure: syntax::Expr,
+) -> syntax::Expr {
+  capture_graphics(&svg);
+  syntax::Expr::Graphics {
+    svg,
+    is_3d: false,
+    source: None,
+    head: None,
+    structure: Some(Box::new(structure)),
+  }
+}
+
+/// `Graphics3D[…][[1]]` returns the graphic's content).
+pub fn graphics3d_result_with_structure(
+  svg: String,
+  structure: syntax::Expr,
+) -> syntax::Expr {
+  capture_graphics(&svg);
+  syntax::Expr::Graphics {
+    svg,
+    is_3d: true,
+    source: None,
+    head: None,
+    structure: Some(Box::new(structure)),
+  }
+}
+
+/// Gets the last captured graphics content (backward compatible)
+pub fn get_captured_graphics() -> Option<String> {
+  CAPTURED_GRAPHICS.with(|buffer| buffer.borrow().last().cloned())
+}
+
+/// Make `expr`'s own picture the one visual hosts read back, when the value
+/// a cell displays is a graphic.
+///
+/// Hosts (playground, woxi-studio, the Jupyter kernel) take the *last*
+/// entry of the capture buffer, which is the last picture drawn while
+/// evaluating — not necessarily the one the cell evaluates to. A body that
+/// builds several plots and then picks one,
+/// `p1 = Plot[…]; p2 = ContourPlot[…]; Switch[which, 1, p1, 2, p2]`, drew
+/// `p2` last, so the chosen `p1` was displayed as `p2`. Re-capturing the
+/// result's SVG puts the picked picture back at the end of the buffer.
+///
+/// `TabView[{label1 -> pane1, label2 -> pane2, …}, sel]` is the same problem
+/// in a different shape: unlike `Switch`, it has no "the value is exactly
+/// this one branch" reduction — every pane's content is still evaluated
+/// eagerly here, so a pane with a picture still calls `capture_graphics` as
+/// a side effect, and the last pane in the list wins the buffer, not the
+/// tab a live front end is actually showing. `sel` (usually a bare variable
+/// or a `Dynamic[var]` written by the FrontEnd, e.g. a hidden
+/// `ControlType -> None` tab-index control) names which pane that is:
+/// evaluated against whatever the Manipulate body already assigned that
+/// variable to, matched against each pane's explicit key (the 3-argument
+/// `key -> label -> content` form) or, for the plain `label -> content`
+/// form Demonstrations normally write, the pane's 1-based position — the
+/// same shorthand the Wolfram front end uses. Recurse into the selected
+/// pane (or the first one, absent a usable `sel` or a match) and promote
+/// its picture the same way.
+fn promote_result_graphics(expr: &syntax::Expr) {
+  if let syntax::Expr::Graphics { svg, .. } = expr {
+    if get_captured_graphics().as_deref() != Some(svg.as_str()) {
+      capture_graphics(svg);
+    }
+    return;
+  }
+  if let syntax::Expr::FunctionCall { name, args } = expr
+    && name == "TabView"
+    && let Some(syntax::Expr::List(items)) = args.first()
+    && !items.is_empty()
+  {
+    let selected = args
+      .get(1)
+      .and_then(|sel| selected_tabview_pane(items, sel))
+      .unwrap_or(&items[0]);
+    let pane = match selected {
+      syntax::Expr::Rule { replacement, .. }
+      | syntax::Expr::RuleDelayed { replacement, .. } => match replacement
+        .as_ref()
+      {
+        // 3-argument `key -> label -> content` form: unwrap once more.
+        syntax::Expr::Rule { replacement, .. }
+        | syntax::Expr::RuleDelayed { replacement, .. } => replacement.as_ref(),
+        other => other,
+      },
+      other => other,
+    };
+    promote_result_graphics(pane);
+  }
+}
+
+/// Find the pane `TabView[{…}, sel]`'s selector currently names: `sel`
+/// (stripped of any `Dynamic[…]` wrapper) is evaluated against the live
+/// global state and compared, by `InputForm` text, against each pane's
+/// explicit key when the pane is given in the 3-argument `key -> label ->
+/// content` form; the plain 2-argument `label -> content` form has no
+/// separate key, so its pane is matched against its 1-based list position
+/// instead — the same shorthand the Wolfram front end applies. `None` when
+/// `sel` fails to evaluate or no pane matches.
+fn selected_tabview_pane<'a>(
+  items: &'a [syntax::Expr],
+  sel: &syntax::Expr,
+) -> Option<&'a syntax::Expr> {
+  let sel = functions::graphics::unwrap_pane_selector(sel);
+  let selector = interpret_to_expr(&syntax::expr_to_input_form(sel)).ok()?;
+  let selector = syntax::expr_to_input_form(&selector);
+  items
+    .iter()
+    .enumerate()
+    .find(|(idx, pane)| {
+      let key = match pane {
+        syntax::Expr::Rule {
+          pattern,
+          replacement,
+        }
+        | syntax::Expr::RuleDelayed {
+          pattern,
+          replacement,
+        } => {
+          match replacement.as_ref() {
+            // 3-argument form: the pane's own explicit key.
+            syntax::Expr::Rule { .. } | syntax::Expr::RuleDelayed { .. } => {
+              syntax::expr_to_input_form(pattern)
+            }
+            // 2-argument form: the implicit 1-based position.
+            _ => (idx + 1).to_string(),
+          }
+        }
+        _ => (idx + 1).to_string(),
+      };
+      key == selector
+    })
+    .map(|(_, pane)| pane)
+}
+
+/// Number of entries currently in the captured-graphics buffer. Paired with
+/// `truncate_captured_graphics` so a renderer that evaluates sub-expressions
+/// (e.g. the content of a `Dynamic[…]` inside `Graphics[…]`) can drop any
+/// graphics those evaluations captured — they are embedded in the outer
+/// rendering, not standalone outputs.
+pub fn captured_graphics_count() -> usize {
+  CAPTURED_GRAPHICS.with(|buffer| buffer.borrow().len())
+}
+
+/// Truncates the captured-graphics buffer back to `len` entries.
+pub fn truncate_captured_graphics(len: usize) {
+  CAPTURED_GRAPHICS.with(|buffer| {
+    let mut buf = buffer.borrow_mut();
+    if buf.len() > len {
+      buf.truncate(len);
+    }
+  });
+}
+
+/// Removes the most recent captured-graphics entry equal to `svg`.
+///
+/// `Export` uses this so that writing a graphic to a file does not also
+/// surface that graphic as inline output in visual frontends (playground,
+/// woxi-studio). Evaluating the exported value (e.g. `BarChart[...]`) pushes
+/// its SVG into the capture buffer before `Export` runs; this drops exactly
+/// that entry while leaving any unrelated captured graphics untouched.
+pub fn remove_captured_graphics(svg: &str) {
+  CAPTURED_GRAPHICS.with(|buffer| {
+    let mut buf = buffer.borrow_mut();
+    if let Some(pos) = buf.iter().rposition(|s| s == svg) {
+      buf.remove(pos);
+    }
+  });
+}
+
+/// Gets all captured graphics SVGs
+fn get_all_captured_graphics() -> Vec<String> {
+  CAPTURED_GRAPHICS.with(|buffer| buffer.borrow().clone())
+}
+
+/// Clears the captured GraphicsBox buffer
+fn clear_captured_graphicsbox() {
+  CAPTURED_GRAPHICSBOX.with(|buffer| {
+    *buffer.borrow_mut() = None;
+  });
+}
+
+/// Stores a GraphicsBox expression string for .nb export
+pub fn capture_graphicsbox(expr: &str) {
+  CAPTURED_GRAPHICSBOX.with(|buffer| {
+    *buffer.borrow_mut() = Some(expr.to_string());
+  });
+}
+
+/// Gets the captured GraphicsBox expression
+pub fn get_captured_graphicsbox() -> Option<String> {
+  CAPTURED_GRAPHICSBOX.with(|buffer| buffer.borrow().clone())
+}
+
+/// Clears the captured output SVG buffer
+fn clear_captured_output_svg() {
+  CAPTURED_OUTPUT_SVG.with(|buffer| {
+    *buffer.borrow_mut() = None;
+  });
+}
+
+/// Stores an SVG rendering of the text output
+fn capture_output_svg(svg: &str) {
+  CAPTURED_OUTPUT_SVG.with(|buffer| {
+    *buffer.borrow_mut() = Some(svg.to_string());
+  });
+}
+
+/// Gets the captured output SVG
+pub fn get_captured_output_svg() -> Option<String> {
+  CAPTURED_OUTPUT_SVG.with(|buffer| buffer.borrow().clone())
+}
+
+/// Clears the captured audio buffer
+fn clear_captured_sound() {
+  CAPTURED_SOUND.with(|buffer| {
+    *buffer.borrow_mut() = None;
+  });
+}
+
+/// Stores synthesized audio as a base64-encoded WAV (from Play/Sound).
+fn capture_sound(wav_base64: &str) {
+  capture_audio(AudioOutput {
+    base64: wav_base64.to_string(),
+    mime: "audio/wav".to_string(),
+    label: None,
+  });
+}
+
+/// Stores playable audio (e.g. from a file-backed Audio object).
+fn capture_audio(audio: AudioOutput) {
+  CAPTURED_SOUND.with(|buffer| {
+    *buffer.borrow_mut() = Some(audio);
+  });
+}
+
+/// Gets the captured playable audio, if any.
+pub fn get_captured_sound() -> Option<AudioOutput> {
+  CAPTURED_SOUND.with(|buffer| buffer.borrow().clone())
+}
+
+/// Set a system variable (like $ScriptCommandLine) in the environment
+/// The active `$RecursionLimit` as a depth: the user-assigned value when one
+/// is in scope (`Infinity` — or any value too large for `usize` — meaning
+/// unlimited), otherwise Wolfram's default of 1024.
+///
+/// `Block[{$RecursionLimit = Infinity}, …]` writes and restores the variable
+/// through the ordinary environment, so this reads it live rather than caching
+/// it; the evaluator only calls it once a recursion is already deep.
+pub(crate) fn recursion_limit() -> usize {
+  const DEFAULT_RECURSION_LIMIT: usize = 1024;
+  let stored = ENV.with(|e| e.borrow().get("$RecursionLimit").cloned());
+  let text = match stored {
+    Some(StoredValue::Raw(s)) => s,
+    Some(StoredValue::ExprVal(expr)) => {
+      syntax::format_expr(&expr, syntax::ExprForm::Input)
+    }
+    _ => return DEFAULT_RECURSION_LIMIT,
+  };
+  let text = text.trim();
+  if text == "Infinity" {
+    return usize::MAX;
+  }
+  text.parse::<usize>().unwrap_or(DEFAULT_RECURSION_LIMIT)
+}
+
+/// Report a `$RecursionLimit` overrun the way wolframscript does and raise
+/// the signal that unwinds the evaluation.
+///
+/// Returning the over-deep call *unevaluated* instead — what Woxi used to do
+/// — is not a cheaper approximation but a hang: a recursion that branches
+/// keeps exploring its siblings once the deep one is capped, so a bounded
+/// depth still costs an unbounded number of evaluations. The nightly fuzzer
+/// timed out on exactly that (a `MergeSort` whose `Partition` never
+/// evaluated, so `Map` recursed over its arguments), where wolframscript
+/// terminates in seconds.
+pub(crate) fn recursion_limit_exceeded(limit: usize) -> InterpreterError {
+  emit_message(&format!(
+    "$RecursionLimit::reclim: Recursion depth of {limit} exceeded."
+  ));
+  start_termination("RecursionLimit")
+}
+
+/// Begin unwinding the current evaluation with a `TerminatedEvaluation[tag]`.
+///
+/// The signal is latched rather than merely returned: plenty of evaluation
+/// sites read a sub-evaluation's `Err` as "this did not work out" and go on
+/// to try something else — a `/;` condition that fails to produce `True` is
+/// simply not met, for one — which would restart the very recursion that hit
+/// the limit and report the overrun again. While the latch is set, every
+/// evaluation refuses to start, so the unwind reaches the top level whatever
+/// it passes through. [`take_termination`] clears it there.
+pub(crate) fn start_termination(tag: &'static str) -> InterpreterError {
+  TERMINATION_IN_FLIGHT.with(|t| t.set(Some(tag)));
+  InterpreterError::Terminated(tag)
+}
+
+/// The tag of the termination currently unwinding, if any.
+pub(crate) fn termination_in_flight() -> Option<&'static str> {
+  TERMINATION_IN_FLIGHT.with(Cell::get)
+}
+
+/// Clear the latch and report which termination, if any, was in flight.
+pub(crate) fn take_termination() -> Option<&'static str> {
+  TERMINATION_IN_FLIGHT.with(std::cell::Cell::take)
+}
+
+/// The value a terminated evaluation reports.
+fn terminated_evaluation_expr(tag: &'static str) -> syntax::Expr {
+  syntax::Expr::FunctionCall {
+    name: "TerminatedEvaluation".to_string(),
+    args: vec![syntax::Expr::Identifier(tag.to_string())].into(),
+  }
+}
+
+/// Resolve an evaluation's outcome against a pending termination, clearing
+/// the latch. A termination outranks both the `Err` it raised and whatever
+/// value a call site that swallowed that `Err` came back with.
+fn settle_termination(
+  result: Result<syntax::Expr, InterpreterError>,
+) -> Result<syntax::Expr, InterpreterError> {
+  match take_termination() {
+    Some(tag) => Ok(terminated_evaluation_expr(tag)),
+    None => result,
+  }
+}
+
+pub fn set_system_variable(name: &str, value: &str) {
+  ENV.with(|e| {
+    e.borrow_mut()
+      .insert(name.to_string(), StoredValue::Raw(value.to_string()));
+  });
+}
+
+/// Remove a first line that starts with "#!" (shebang);
+/// returns the remainder as a new `String`.
+pub fn without_shebang(src: &str) -> String {
+  if src.starts_with("#!") {
+    src.lines().skip(1).collect::<Vec<_>>().join("\n")
+  } else {
+    src.to_owned()
+  }
+}
+
+/// Get all defined symbol names (variables and user functions).
+/// Used by the Names[] function.
+pub fn get_defined_names() -> Vec<String> {
+  let mut names = Vec::new();
+  ENV.with(|e| {
+    for key in e.borrow().keys() {
+      names.push(key.clone());
+    }
+  });
+  FUNC_DEFS.with(|m| {
+    for key in m.borrow().keys() {
+      if !names.contains(key) {
+        names.push(key.clone());
+      }
+    }
+  });
+  names.sort();
+  names
+}
+
+/// Push a context onto the Begin/End context stack.
+pub fn push_context(ctx: String) {
+  CONTEXT_STACK.with(|s| s.borrow_mut().push(ctx));
+}
+
+/// Pop a context from the Begin/End context stack.
+/// Returns the popped context, or None if the stack is empty.
+pub fn pop_context() -> Option<String> {
+  CONTEXT_STACK.with(|s| s.borrow_mut().pop())
+}
+
+/// The currently active context — the top of the Begin/BeginPackage
+/// stack, or `"Global`"` when nothing has been pushed.
+pub fn current_context() -> String {
+  CONTEXT_STACK.with(|s| {
+    s.borrow()
+      .last()
+      .cloned()
+      .unwrap_or_else(|| "Global`".to_string())
+  })
+}
+
+/// Fold a `$ContextPath` that was assigned to the variable into the path
+/// Woxi resolves symbols against.
+///
+/// `$ContextPath` is an ordinary variable in the Wolfram Language, and
+/// `AppendTo[$ContextPath, "C`"]` is a normal way to make a context's symbols
+/// reachable. Woxi keeps the path on a stack that `BeginPackage[]` and
+/// `EndPackage[]` maintain, so an assignment has to be moved onto whichever
+/// entry is current when it happens — otherwise the two disagree, and which
+/// one answers depends on who is asking.
+fn absorb_assigned_context_path() {
+  let assigned = match &variable_value("$ContextPath") {
+    Some(syntax::Expr::List(entries)) => entries
+      .iter()
+      .map(|entry| match entry {
+        syntax::Expr::String(context) => Some(context.clone()),
+        _ => None,
+      })
+      .collect::<Option<Vec<String>>>(),
+    _ => None,
+  };
+  // A value that is not a list of contexts is left where it is: it is not a
+  // path, and dropping it would lose whatever the user stored.
+  let Some(path) = assigned else {
+    return;
+  };
+  ENV.with(|e| e.borrow_mut().remove("$ContextPath"));
+  CONTEXT_PATH_STACK.with(|s| {
+    let mut stack = s.borrow_mut();
+    match stack.last_mut() {
+      Some(top) => *top = path,
+      None => CONTEXT_PATH_BASE.with(|b| *b.borrow_mut() = Some(path)),
+    }
+  });
+}
+
+/// The currently active `$ContextPath` — the top of the
+/// `CONTEXT_PATH_STACK`, or the `["System`", "Global`"]` default
+/// when nothing has been pushed by `BeginPackage[]`.
+pub fn current_context_path() -> Vec<String> {
+  absorb_assigned_context_path();
+  CONTEXT_PATH_STACK
+    .with(|s| s.borrow().last().cloned())
+    .or_else(|| CONTEXT_PATH_BASE.with(|b| b.borrow().clone()))
+    .unwrap_or_else(|| vec!["System`".to_string(), "Global`".to_string()])
+}
+
+/// Put `context` at the front of `$ContextPath`, as loading a package that
+/// provides it does. A context already on the path stays where it is.
+pub fn prepend_to_context_path(context: &str) {
+  let mut path = current_context_path();
+  if path.iter().any(|entry| entry == context) {
+    return;
+  }
+  path.insert(0, context.to_string());
+  CONTEXT_PATH_STACK.with(|s| {
+    let mut stack = s.borrow_mut();
+    match stack.last_mut() {
+      Some(top) => *top = path,
+      None => CONTEXT_PATH_BASE.with(|b| *b.borrow_mut() = Some(path)),
+    }
+  });
+}
+
+/// Push a new `$ContextPath` value (used by `BeginPackage[]`).
+pub fn push_context_path(path: Vec<String>) {
+  absorb_assigned_context_path();
+  CONTEXT_PATH_STACK.with(|s| s.borrow_mut().push(path));
+}
+
+/// Pop the topmost `$ContextPath` value (used by `EndPackage[]`).
+pub fn pop_context_path() -> Option<Vec<String>> {
+  absorb_assigned_context_path();
+  CONTEXT_PATH_STACK.with(|s| s.borrow_mut().pop())
+}
+
+/// Whether any `BeginPackage[]` is currently active (i.e. the
+/// `$ContextPath` stack is non-empty). Used by `EndPackage[]` to decide
+/// between popping and emitting `EndPackage::noctx`.
+pub fn has_package_context() -> bool {
+  CONTEXT_PATH_STACK.with(|s| !s.borrow().is_empty())
+}
+
+/// Everything that decides what `$ContextPath` is right now. Paired with
+/// [`restore_context_path`] to undo whatever a file did to the path while it
+/// was being read — `Needs["ctx`" -> alias]` leaves `$ContextPath` exactly as
+/// it found it.
+pub type ContextPathState = (Vec<Vec<String>>, Option<Vec<String>>);
+
+/// Snapshot the `$ContextPath` state.
+pub fn save_context_path() -> ContextPathState {
+  absorb_assigned_context_path();
+  (
+    CONTEXT_PATH_STACK.with(|s| s.borrow().clone()),
+    CONTEXT_PATH_BASE.with(|b| b.borrow().clone()),
+  )
+}
+
+/// Put the `$ContextPath` state back the way [`save_context_path`] found it.
+pub fn restore_context_path(saved: ContextPathState) {
+  let (stack, base) = saved;
+  ENV.with(|e| e.borrow_mut().remove("$ContextPath"));
+  CONTEXT_PATH_STACK.with(|s| *s.borrow_mut() = stack);
+  CONTEXT_PATH_BASE.with(|b| *b.borrow_mut() = base);
+}
+
+/// The value a variable is bound to in the store, as an expression. `None`
+/// when nothing has been assigned to it — a system variable then still has
+/// its built-in default, which `get_system_variable` supplies.
+pub fn variable_value(name: &str) -> Option<syntax::Expr> {
+  // A store that is mid-update is borrowed mutably by the evaluator; a lookup
+  // that lands there (resolving a context alias while a value is being
+  // assigned, say) reads it as "unbound" rather than panicking.
+  let stored =
+    ENV.with(|e| e.try_borrow().ok().and_then(|env| env.get(name).cloned()))?;
+  match stored {
+    StoredValue::ExprVal(expr) => Some(expr),
+    StoredValue::Raw(raw) => syntax::string_to_expr(&raw).ok(),
+    StoredValue::Association(items) => Some(syntax::Expr::Association(
+      items
+        .into_iter()
+        .map(|(k, v)| {
+          let key = syntax::string_to_expr(&k)
+            .unwrap_or_else(|_| syntax::Expr::String(k.clone()));
+          (key, v)
+        })
+        .collect(),
+    )),
+  }
+}
+
+/// Is the symbol `name` bound to an Association?
+///
+/// One reaches `ENV` in either of two shapes: the key-string
+/// [`StoredValue::Association`] a top-level `a = <||>` builds, or a plain
+/// `Expr::Association` inside [`StoredValue::ExprVal`] — which is what
+/// `Module[{a = <||>}, …]` leaves, since localisation stores the evaluated
+/// initial value as an expression. Both must count, or `a[key] = value`
+/// installs a DownValue on the local instead of adding a key.
+pub fn symbol_holds_association(name: &str) -> bool {
+  ENV.with(|e| {
+    e.try_borrow().is_ok_and(|env| {
+      matches!(
+        env.get(name),
+        Some(
+          StoredValue::Association(_)
+            | StoredValue::ExprVal(syntax::Expr::Association(_))
+        )
+      )
+    })
+  })
+}
+
+/// Set one entry of the Association bound to `name`, appending it when the
+/// key is new. Returns false when `name` holds no Association.
+pub fn set_association_entry(
+  name: &str,
+  key: &syntax::Expr,
+  value: syntax::Expr,
+) -> bool {
+  let key_string = syntax::expr_to_string(key);
+  ENV.with(|e| {
+    let mut env = e.borrow_mut();
+    match env.get_mut(name) {
+      Some(StoredValue::Association(pairs)) => {
+        match pairs.iter_mut().find(|(k, _)| *k == key_string) {
+          Some(pair) => pair.1 = value,
+          None => pairs.push((key_string, value)),
+        }
+        true
+      }
+      Some(StoredValue::ExprVal(syntax::Expr::Association(pairs))) => {
+        match pairs
+          .iter_mut()
+          .find(|(k, _)| syntax::expr_to_string(k) == key_string)
+        {
+          Some(pair) => pair.1 = value,
+          None => pairs.push((key.clone(), value)),
+        }
+        true
+      }
+      _ => false,
+    }
+  })
+}
+
+/// Whether any context alias is in force. Kept to a single lookup: this sits
+/// on the path every symbol resolution takes, while [`context_aliases`] has
+/// to decode the association.
+pub fn has_context_aliases() -> bool {
+  ENV.with(|e| {
+    e.try_borrow()
+      .is_ok_and(|env| match env.get("$ContextAliases") {
+        Some(StoredValue::Association(items)) => !items.is_empty(),
+        Some(StoredValue::ExprVal(syntax::Expr::Association(items))) => {
+          !items.is_empty()
+        }
+        Some(_) => true,
+        None => false,
+      })
+  })
+}
+
+/// The `$ContextAliases` mapping as `(alias, target)` pairs, in the order the
+/// association holds them. Aliases live in the ordinary variable store, so a
+/// plain `$ContextAliases["c`"] = "LongContext`"` sets one just as
+/// `Needs["LongContext`" -> "c`"]` does.
+pub fn context_aliases() -> Vec<(String, String)> {
+  let Some(value) = variable_value("$ContextAliases") else {
+    return Vec::new();
+  };
+  let syntax::Expr::Association(pairs) = &value else {
+    return Vec::new();
+  };
+  pairs
+    .iter()
+    .filter_map(|(k, v)| match (k, v) {
+      (syntax::Expr::String(alias), syntax::Expr::String(target)) => {
+        Some((alias.clone(), target.clone()))
+      }
+      _ => None,
+    })
+    .collect()
+}
+
+/// The context `alias` currently stands for, if any.
+pub fn context_alias_target(alias: &str) -> Option<String> {
+  context_aliases()
+    .into_iter()
+    .find(|(name, _)| name == alias)
+    .map(|(_, target)| target)
+}
+
+/// Record `alias` as standing for `target` in `$ContextAliases`, replacing an
+/// entry that already maps that alias. `None` drops the entry instead.
+pub fn set_context_alias(alias: &str, target: Option<&str>) {
+  let mut aliases = context_aliases();
+  match (target, aliases.iter_mut().find(|(name, _)| name == alias)) {
+    (Some(target), Some(entry)) => entry.1 = target.to_string(),
+    (Some(target), None) => {
+      aliases.push((alias.to_string(), target.to_string()));
+    }
+    (None, _) => aliases.retain(|(name, _)| name != alias),
+  }
+  let items = aliases
+    .into_iter()
+    .map(|(name, target)| {
+      (
+        syntax::expr_to_string(&syntax::Expr::String(name)),
+        syntax::Expr::String(target),
+      )
+    })
+    .collect();
+  ENV.with(|e| {
+    e.borrow_mut().insert(
+      "$ContextAliases".to_string(),
+      StoredValue::Association(items),
+    )
+  });
+}
+
+/// Register an additional package context to be reported by `$Packages`.
+/// Pushed by `BeginPackage[]` (the first argument and any extras in the
+/// second argument). Duplicate entries are ignored.
+pub fn register_package(name: String) {
+  PACKAGES_EXTRA.with(|s| {
+    let mut v = s.borrow_mut();
+    if !v.contains(&name) {
+      v.push(name);
+    }
+  });
+}
+
+/// Return the dynamic `$Packages` list — extras pushed by `BeginPackage[]`
+/// followed by the canonical `{"System`", "Global`"}` baseline.
+pub fn packages_list() -> Vec<String> {
+  let mut out = PACKAGES_EXTRA.with(|s| s.borrow().clone());
+  out.push("System`".to_string());
+  out.push("Global`".to_string());
+  out
+}
+
+/// DownValues for `sym` as stored 6-tuples, merging the literal-argument
+/// memoizations (kept in MEMO_VALUES, not FUNC_DEFS) back in as if they were
+/// ordinary literal DownValues — synthesizing the same shape `set_ast` would
+/// have produced. Memoized entries come first (literal definitions precede
+/// pattern ones, matching specificity ordering) and are sorted by key for a
+/// deterministic order. Returns None only when the symbol has neither.
+/// Used by Definition / Information so they still report `f[0] = 42`-style
+/// literal definitions after the memoization fast-path routed them aside.
+#[allow(clippy::type_complexity)]
+pub fn down_values_with_memo(
+  sym: &str,
+) -> Option<
+  Vec<(
+    Vec<String>,
+    Vec<Option<syntax::Expr>>,
+    Vec<Option<syntax::Expr>>,
+    Vec<Option<String>>,
+    Vec<u8>,
+    syntax::Expr,
+  )>,
+> {
+  let memo_entries = MEMO_VALUES.with(|m| {
+    m.borrow().get(sym).map(|cache| {
+      let mut entries: Vec<_> = cache.iter().collect();
+      entries.sort_by(|a, b| a.0.cmp(b.0));
+      entries
+        .into_iter()
+        .map(|(_key, (arg_exprs, value))| {
+          let n = arg_exprs.len();
+          let params: Vec<String> = (0..n).map(|i| format!("_dv{i}")).collect();
+          let conditions: Vec<Option<syntax::Expr>> = arg_exprs
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+              Some(syntax::Expr::Comparison {
+                operands: vec![
+                  syntax::Expr::Identifier(format!("_dv{i}")),
+                  a.clone(),
+                ],
+                operators: vec![syntax::ComparisonOp::SameQ],
+              })
+            })
+            .collect();
+          (
+            params,
+            conditions,
+            vec![None; n],
+            vec![None; n],
+            vec![1u8; n],
+            value.clone(),
+          )
+        })
+        .collect::<Vec<_>>()
+    })
+  });
+  let func_defs = FUNC_DEFS.with(|m| m.borrow().get(sym).cloned());
+  match (memo_entries, func_defs) {
+    (None, None) => None,
+    (Some(m), None) => Some(m),
+    (None, Some(f)) => Some(f),
+    (Some(mut m), Some(f)) => {
+      m.extend(f);
+      Some(m)
+    }
+  }
+}
+
+/// Restores previously-saved global bindings when dropped, so `f` in
+/// [`with_scoped_globals`] cannot leak or lose bindings even on early return.
+struct ScopedGlobals {
+  saved: Vec<(String, Option<StoredValue>)>,
+}
+
+impl Drop for ScopedGlobals {
+  fn drop(&mut self) {
+    // Restore in reverse installation order.
+    for (name, prev) in self.saved.drain(..).rev() {
+      ENV.with(|e| {
+        let mut env = e.borrow_mut();
+        match prev {
+          Some(v) => {
+            env.insert(name, v);
+          }
+          None => {
+            env.remove(&name);
+          }
+        }
+      });
+    }
+  }
+}
+
+/// Run `f` with `(name, value)` bindings installed as global symbol values,
+/// restoring the previous globals afterward.
+///
+/// Each `value` string is parsed and evaluated *once* here and stored
+/// structurally (`ExprVal`), so a large literal (e.g. a Manipulate `data`
+/// matrix) is parsed a single time rather than re-embedded and re-parsed on
+/// every body/display/probe evaluation inside `f`. Parsing large list
+/// literals dominates the cost of an interactive re-render, so this is the
+/// difference between a snappy and a sluggish Manipulate widget.
+pub fn with_scoped_globals<R>(
+  bindings: &[(String, String)],
+  f: impl FnOnce() -> R,
+) -> R {
+  let mut saved: Vec<(String, Option<StoredValue>)> =
+    Vec::with_capacity(bindings.len());
+  for (name, value) in bindings {
+    let evaluated = interpret_to_expr(value)
+      .unwrap_or_else(|_| syntax::Expr::Identifier(name.clone()));
+    let prev = ENV.with(|e| {
+      e.borrow_mut()
+        .insert(name.clone(), StoredValue::ExprVal(evaluated))
+    });
+    saved.push((name.clone(), prev));
+  }
+  let _guard = ScopedGlobals { saved };
+  f()
+}
+
+/// Clear all thread-local interpreter state (environment variables
+/// and user-defined functions).  Useful for isolating test runs.
+pub fn clear_state() {
+  ENV.with(|e| e.borrow_mut().clear());
+  FUNC_DEFS.with(|m| m.borrow_mut().clear());
+  MEMO_VALUES.with(|m| m.borrow_mut().clear());
+  FUNC_ATTRS.with(|m| m.borrow_mut().clear());
+  FUNC_OPTIONS.with(|m| m.borrow_mut().clear());
+  FUNC_OPTIONS_DELAYED.with(|m| m.borrow_mut().clear());
+  FUNC_OPTS_INLINE.with(|m| m.borrow_mut().clear());
+  UPVALUES.with(|m| m.borrow_mut().clear());
+  SOW_STACK.with(|s| s.borrow_mut().clear());
+  CONTEXT_STACK.with(|s| s.borrow_mut().clear());
+  CONTEXT_PATH_STACK.with(|s| s.borrow_mut().clear());
+  CONTEXT_PATH_BASE.with(|b| *b.borrow_mut() = None);
+  evaluator::contexts::clear_symbol_table();
+  PACKAGES_EXTRA.with(|s| s.borrow_mut().clear());
+  RECURSION_DEPTH.with(|d| d.set(0));
+  EVAL_STACK.with(|s| s.borrow_mut().clear());
+  LAST_ERROR_TRACE.with(|t| *t.borrow_mut() = None);
+  evaluator::assignment::USER_PRINT_FORMS.with(|v| v.borrow_mut().clear());
+  evaluator::assignment::FORMAT_VALUES.with(|m| m.borrow_mut().clear());
+  evaluator::assignment::SUB_VALUES.with(|m| m.borrow_mut().clear());
+  evaluator::assignment::N_VALUES.with(|m| m.borrow_mut().clear());
+  functions::entity_ast::clear_entity_stores();
+  // Closes this thread's sockets and stops the threads behind them, so a
+  // cleared session cannot inherit a server bound by an earlier one.
+  functions::socket_ast::clear_sockets();
+  #[cfg(not(target_arch = "wasm32"))]
+  functions::paclet::clear_loaded_directories();
+  unseed_rng();
+  clear_captured_stdout();
+  reset_message_stop_counts();
+  // Which messages are switched off is session state like any other, so a
+  // cleared session starts with every message on again. (Not part of
+  // `reset_message_stop_counts`, which runs at the start of every top-level
+  // evaluation — an `Off` holds for the rest of the session.)
+  OFF_MESSAGES.with(|s| s.borrow_mut().clear());
+  clear_captured_graphics();
+  clear_captured_graphicsbox();
+}
+
+/// Set the $ScriptCommandLine variable from command-line arguments
+pub fn set_script_command_line(args: &[String]) {
+  // Format as a Wolfram list: {"script.wls", "arg1", "arg2", ...}
+  let list_str = format!(
+    "{{{}}}",
+    args
+      .iter()
+      .map(|s| format!("\"{s}\""))
+      .collect::<Vec<_>>()
+      .join(", ")
+  );
+  set_system_variable("$ScriptCommandLine", &list_str);
+}
+
+// Track recursion depth to avoid clearing stdout in nested calls
+thread_local! {
+    static INTERPRET_DEPTH: std::cell::RefCell<usize> = const { std::cell::RefCell::new(0) };
+}
+
+/// Whether `s` is one balanced `{…}` group rather than several in a row.
+///
+/// Starting with `{` and ending with `}` is not enough: `{1, 2} {3, 4}` also
+/// does, and it is an implicit multiplication (`{3, 8}`), not a list literal.
+/// Callers use this to keep the list fast path from echoing such input back.
+fn is_single_brace_group(s: &str) -> bool {
+  let mut depth = 0usize;
+  for (i, c) in s.char_indices() {
+    match c {
+      '{' => depth += 1,
+      '}' => {
+        depth -= 1;
+        if depth == 0 && i + c.len_utf8() != s.len() {
+          return false;
+        }
+      }
+      _ => {}
+    }
+  }
+  depth == 0
+}
+
+/// Render a bare machine-real literal for the `interpret` fast path, applying
+/// the REPL's OutputForm rounding (see [`to_display_precision`]) so a typed-in
+/// `492.44000000000005` echoes as `492.44` there but stays exact in `eval`.
+fn real_literal_output(n: f64) -> String {
+  let shown = if is_repl_mode() {
+    round_machine_real_display(n)
+  } else {
+    n
+  };
+  syntax::format_real(shown)
+}
+
+/// Stack headroom below which a public entry point first moves evaluation
+/// onto a freshly allocated stack segment. It must exceed the 2 MB red zone of
+/// the evaluator's own `stacker::maybe_grow` calls by a wide margin: when the
+/// caller's thread is small (a test thread, a host's worker thread — anything
+/// but the CLI's 512 MB worker), every recursive evaluation step would
+/// otherwise find less than the red zone left and mmap/munmap a new 4 MB
+/// segment on each call, slowing evaluation down by an order of magnitude.
+const ENTRY_STACK_RED_ZONE: usize = 32 * 1024 * 1024;
+/// Size of the segment an entry point grows onto. Virtual memory, paged in
+/// lazily, so reserving generously costs nothing until deep recursion uses it.
+const ENTRY_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+/// Run `f` with at least [`ENTRY_STACK_RED_ZONE`] of stack left, growing onto
+/// a new [`ENTRY_STACK_SIZE`] segment once if the current thread has less.
+fn with_entry_stack<R>(f: impl FnOnce() -> R) -> R {
+  stacker::maybe_grow(ENTRY_STACK_RED_ZONE, ENTRY_STACK_SIZE, f)
+}
+
+pub fn interpret(input: &str) -> Result<String, InterpreterError> {
+  with_entry_stack(|| interpret_on_stack(input))
+}
+
+fn interpret_on_stack(input: &str) -> Result<String, InterpreterError> {
+  // A fresh input starts from a clean slate: a termination latch that some
+  // display-time evaluation left behind would otherwise refuse every later
+  // evaluation on this thread. Only at the outermost call — `interpret` is
+  // re-entrant, and a nested one must let the unwind through.
+  if RECURSION_DEPTH.get() == 0 {
+    take_termination();
+  }
+  // Normalize CRLF to LF so line continuation and newline handling work
+  // consistently regardless of line ending style.
+  let input = if input.contains('\r') {
+    std::borrow::Cow::Owned(input.replace("\r\n", "\n").replace('\r', "\n"))
+  } else {
+    std::borrow::Cow::Borrowed(input)
+  };
+  // Expand Wolfram character escapes (\.HH, \:HHHH, \OOO) to their UTF-8
+  // characters BEFORE any fast paths so quoted-string and other shortcuts
+  // see the post-expansion form (matching wolframscript).
+  let input = if input.contains('\\') {
+    std::borrow::Cow::Owned(expand_char_escapes(&input))
+  } else {
+    input
+  };
+  // Treat the modifier-letter circumflex `ˆ` (U+02C6) as the Power operator.
+  let input = if input.contains('\u{02C6}') {
+    std::borrow::Cow::Owned(normalize_circumflex_operator(&input))
+  } else {
+    input
+  };
+  let trimmed = input.trim();
+
+  // Fast path for simple literals that don't need parsing
+  // Check for integer
+  if let Ok(n) = trimmed.parse::<i64>() {
+    // Visual hosts (Playground/Studio) still want the typeset SVG so a bare
+    // literal gets the same digit grouping as a computed result
+    // (`10000` → `10 000`). The CLI skips this (not visual mode).
+    if is_visual_mode() {
+      generate_output_svg(&syntax::Expr::Integer(n.into()));
+    }
+    set_fast_path_result_expr(syntax::Expr::Integer(n.into()));
+    return Ok(n.to_string());
+  }
+  // Check for float (must contain '.' to distinguish from integer)
+  if trimmed.contains('.')
+    && let Ok(n) = trimmed.parse::<f64>()
+  {
+    // Skip the fast path when the literal would be parsed as an
+    // accuracy/precision-tagged BigFloat by Wolfram:
+    // - `0.000…0` with 18+ trailing zeros → accuracy form `0``N.`
+    // - non-zero literal with 18+ total digits → precision form
+    if let Some(dot) = trimmed.find('.') {
+      let int_part = &trimmed[..dot];
+      let frac_part = &trimmed[dot + 1..];
+      let int_signless = int_part.trim_start_matches(['+', '-']);
+      let int_zero =
+        int_signless.is_empty() || int_signless.chars().all(|c| c == '0');
+      let total_digits = int_signless.len() + frac_part.len();
+      let zero_accuracy = n == 0.0
+        && int_zero
+        && frac_part.len() >= 18
+        && frac_part.chars().all(|c| c == '0');
+      // Use significant-digit count: leading zeros in 0.xxx don't count.
+      let significant_digits = if int_zero {
+        let leading_zeros = frac_part.chars().take_while(|c| *c == '0').count();
+        frac_part.len().saturating_sub(leading_zeros)
+      } else {
+        total_digits
+      };
+      let nonzero_precision = n != 0.0 && significant_digits >= 18;
+      if zero_accuracy || nonzero_precision {
+        // Fall through to the full parser.
+      } else {
+        if is_visual_mode() {
+          generate_output_svg(&syntax::Expr::Real(n));
+        }
+        set_fast_path_result_expr(syntax::Expr::Real(n));
+        return Ok(real_literal_output(n));
+      }
+    } else {
+      if is_visual_mode() {
+        generate_output_svg(&syntax::Expr::Real(n));
+      }
+      set_fast_path_result_expr(syntax::Expr::Real(n));
+      return Ok(real_literal_output(n));
+    }
+  }
+  // Check for quoted string - return content without quotes (like wolframscript)
+  if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+    // Make sure there are no unescaped quotes inside
+    let inner = &trimmed[1..trimmed.len() - 1];
+    // Skip fast path if string contains escape sequences that the parser
+    // would expand (named characters, box-syntax markers, backtick escapes,
+    // a linear-syntax literal space).
+    if !inner.contains('"')
+      && !inner.contains("\\[")
+      && !inner.contains("\\(")
+      && !inner.contains("\\)")
+      && !inner.contains("\\!")
+      && !inner.contains("\\*")
+      && !inner.contains("\\`")
+      && !inner.contains("\\ ")
+    {
+      set_fast_path_result_expr(syntax::Expr::String(inner.to_string()));
+      return Ok(inner.to_string());
+    }
+  }
+
+  // Fast path for simple list literals like {a, b, c}
+  // This handles many cases where we're just passing data around
+  if trimmed.starts_with('{')
+    && trimmed.ends_with('}')
+    && is_single_brace_group(trimmed)
+  {
+    // Check if it's a simple list (no operators that need evaluation)
+    if !trimmed.contains("->")
+      && !trimmed.contains(":>")
+      && !trimmed.contains("/.")
+      && !trimmed.contains("//")
+      && !trimmed.contains("/@")
+      && !trimmed.contains("@@")
+      && !trimmed.contains('!')
+      && !trimmed.contains('+')
+      && !trimmed.contains('-')
+      && !trimmed.contains('*')
+      && !trimmed.contains('/')
+      && !trimmed.contains('[')
+      && !trimmed.contains('"')
+      && !trimmed.contains('#')
+      && !trimmed.contains("Nothing")
+      && !trimmed.contains(" . ")
+      && !trimmed.contains(".{")
+      && !trimmed.contains('^')
+      && !trimmed.contains('.')
+      && !trimmed.contains('=')
+      && !trimmed.contains('~')
+      && !trimmed.contains('<')
+      && !trimmed.contains('>')
+      && !trimmed.contains('&')
+      && !trimmed.contains('|')
+      && !trimmed.contains('?')
+      && !trimmed.contains(';')
+      && !trimmed.contains('@')
+      && !trimmed.contains('\u{2A2F}') // ⨯ Cross product
+      && !trimmed.contains('\u{F4A0}') // \[Cross] PUA form
+      && !trimmed.contains('\u{F3C4}') // pre-13 \[Cross] PUA form
+      && !trimmed.contains("\\[")
+    // any named character operator
+    // Reals may need scientific notation formatting
+    {
+      // Check if any element needs evaluation (named colors, date symbols, etc.)
+      let needs_eval = trimmed[1..trimmed.len() - 1].split(',').any(|item| {
+        let item = item.trim();
+        evaluator::named_color_expr(item).is_some()
+          // A name that stands for something — a `$…` system variable, or a
+          // symbol this session has assigned to — has to be looked up;
+          // echoing the name back would report the symbol instead of its
+          // value.
+          || item.starts_with('$')
+          || ENV.with(|e| e.borrow().contains_key(item))
+          || matches!(
+            item,
+            "Now"
+              | "Today"
+              | "Tomorrow"
+              | "Yesterday"
+              | "Thick"
+              | "Thin"
+              | "Dashed"
+              | "Dotted"
+              | "DotDashed"
+          )
+      });
+      // In visual mode fall through to the full parser so a list of literals
+      // gets a typeset SVG with digit-grouped numbers (`{10000}` → `{10 000}`);
+      // the CLI keeps the fast return. Falling through is also what lets
+      // `interpret_with_stdout` report a structured result here — it always
+      // runs in visual mode, so this early return never fires for it and
+      // needs no `set_fast_path_result_expr`.
+      if !needs_eval && !is_visual_mode() {
+        // Simple list with no function calls or operators - return as-is
+        return Ok(trimmed.to_string());
+      }
+    }
+  }
+
+  // Fast path for simple identifiers (variable lookup)
+  if trimmed
+    .chars()
+    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    && !trimmed.is_empty()
+    && trimmed.chars().next().unwrap().is_ascii_alphabetic()
+  {
+    // This is a simple identifier
+    if let Some(stored) = ENV.with(|e| e.borrow().get(trimmed).cloned()) {
+      // A bare variable echo goes through the same OutputForm rounding as a
+      // computed result, so `x = 3203.60 - 2711.16; x` shows `492.44` in the
+      // REPL (see `to_display_precision`).
+      let shown = |e: &syntax::Expr| {
+        if is_repl_mode() {
+          to_display_precision(e)
+        } else {
+          e.clone()
+        }
+      };
+      // Each arm reports the value it echoed, so a host asking for the
+      // structured result gets the variable's value rather than nothing.
+      let (expr, text) = match stored {
+        StoredValue::ExprVal(e) => {
+          let e = shown(&e);
+          (Some(e.clone()), syntax::top_level_output(&e))
+        }
+        // A `Raw` binding holds the value's InputForm text; the REPL has to
+        // re-read it to round the numbers it contains (a string value keeps
+        // its quotes there, so its digits stay untouched).
+        StoredValue::Raw(val) => match syntax::string_to_expr(&val) {
+          Ok(e) if is_repl_mode() => {
+            let e = shown(&e);
+            (Some(e.clone()), syntax::top_level_output(&e))
+          }
+          Ok(e) => (Some(e), val),
+          Err(_) => (None, val),
+        },
+        StoredValue::Association(items) => {
+          let items_expr: Vec<(syntax::Expr, syntax::Expr)> = items
+            .iter()
+            .map(|(k, v)| {
+              let key_expr = syntax::string_to_expr(k)
+                .unwrap_or(syntax::Expr::Identifier(k.clone()));
+              (key_expr, v.clone())
+            })
+            .collect();
+          let e = shown(&syntax::Expr::Association(items_expr));
+          (Some(e.clone()), syntax::expr_to_output(&e))
+        }
+      };
+      if let Some(e) = expr {
+        set_fast_path_result_expr(e);
+      }
+      return Ok(text);
+    }
+    // Handle built-in symbols that evaluate to values
+    #[cfg(not(target_arch = "wasm32"))]
+    if trimmed == "Now" {
+      use chrono::Local;
+      let now = Local::now();
+      let seconds = now
+        .format("%S%.f")
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0);
+      let tz_offset_hours = now.offset().local_minus_utc() as f64 / 3600.0;
+      let expr = syntax::Expr::FunctionCall {
+        name: "DateObject".to_string(),
+        args: vec![
+          syntax::Expr::List(
+            vec![
+              syntax::Expr::Integer(
+                now.format("%Y").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Integer(
+                now.format("%m").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Integer(
+                now.format("%d").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Integer(
+                now.format("%H").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Integer(
+                now.format("%M").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Real(seconds),
+            ]
+            .into(),
+          ),
+          syntax::Expr::String("Instant".to_string()),
+          syntax::Expr::String("Gregorian".to_string()),
+          syntax::Expr::Real(tz_offset_hours),
+        ]
+        .into(),
+      };
+      set_fast_path_result_expr(expr.clone());
+      return Ok(syntax::expr_to_output(&expr));
+    }
+    #[cfg(target_arch = "wasm32")]
+    if trimmed == "Now" {
+      let now = js_sys::Date::new_0();
+      let seconds =
+        now.get_seconds() as f64 + now.get_milliseconds() as f64 / 1000.0;
+      let tz_offset_hours = -(now.get_timezone_offset() / 60.0);
+      let expr = syntax::Expr::FunctionCall {
+        name: "DateObject".to_string(),
+        args: vec![
+          syntax::Expr::List(
+            vec![
+              syntax::Expr::Integer(now.get_full_year() as i128),
+              syntax::Expr::Integer((now.get_month() + 1) as i128),
+              syntax::Expr::Integer(now.get_date() as i128),
+              syntax::Expr::Integer(now.get_hours() as i128),
+              syntax::Expr::Integer(now.get_minutes() as i128),
+              syntax::Expr::Real(seconds),
+            ]
+            .into(),
+          ),
+          syntax::Expr::String("Instant".to_string()),
+          syntax::Expr::String("Gregorian".to_string()),
+          syntax::Expr::Real(tz_offset_hours),
+        ]
+        .into(),
+      };
+      set_fast_path_result_expr(expr.clone());
+      return Ok(syntax::expr_to_output(&expr));
+    }
+    // Handle Today/Tomorrow/Yesterday → DateObject[{y, m, d}, Day]
+    #[cfg(not(target_arch = "wasm32"))]
+    if trimmed == "Today" || trimmed == "Tomorrow" || trimmed == "Yesterday" {
+      use chrono::{Duration, Local};
+      let now = Local::now();
+      let date = match trimmed {
+        "Tomorrow" => now + Duration::days(1),
+        "Yesterday" => now - Duration::days(1),
+        _ => now,
+      };
+      let expr = syntax::Expr::FunctionCall {
+        name: "DateObject".to_string(),
+        args: vec![
+          syntax::Expr::List(
+            vec![
+              syntax::Expr::Integer(
+                date.format("%Y").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Integer(
+                date.format("%m").to_string().parse::<i128>().unwrap(),
+              ),
+              syntax::Expr::Integer(
+                date.format("%d").to_string().parse::<i128>().unwrap(),
+              ),
+            ]
+            .into(),
+          ),
+          syntax::Expr::String("Day".to_string()),
+        ]
+        .into(),
+      };
+      set_fast_path_result_expr(expr.clone());
+      return Ok(syntax::expr_to_output(&expr));
+    }
+    #[cfg(target_arch = "wasm32")]
+    if trimmed == "Today" || trimmed == "Tomorrow" || trimmed == "Yesterday" {
+      let now = js_sys::Date::new_0();
+      let offset_days: i32 = match trimmed {
+        "Tomorrow" => 1,
+        "Yesterday" => -1,
+        _ => 0,
+      };
+      let ms = now.get_time() + (offset_days as f64) * 86_400_000.0;
+      let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
+      let expr = syntax::Expr::FunctionCall {
+        name: "DateObject".to_string(),
+        args: vec![
+          syntax::Expr::List(
+            vec![
+              syntax::Expr::Integer(d.get_full_year() as i128),
+              syntax::Expr::Integer((d.get_month() + 1) as i128),
+              syntax::Expr::Integer(d.get_date() as i128),
+            ]
+            .into(),
+          ),
+          syntax::Expr::String("Day".to_string()),
+        ]
+        .into(),
+      };
+      set_fast_path_result_expr(expr.clone());
+      return Ok(syntax::expr_to_output(&expr));
+    }
+    // Handle named colors (Red → RGBColor[1, 0, 0], etc.)
+    if let Some(color_expr) = evaluator::named_color_expr(trimmed) {
+      set_fast_path_result_expr(color_expr.clone());
+      return Ok(syntax::expr_to_output(&color_expr));
+    }
+    // Thick → Thickness[Large], Dashed → Dashing[{Small, Small}], …
+    if let Some(style_expr) = evaluator::style_directive_expr(trimmed) {
+      let text = syntax::expr_to_output(&style_expr);
+      set_fast_path_result_expr(style_expr);
+      return Ok(text);
+    }
+    // Return identifier as-is if not found
+    set_fast_path_result_expr(syntax::Expr::Identifier(trimmed.to_string()));
+    return Ok(trimmed.to_string());
+  }
+
+  // Fast path for simple function calls like MemberQ[{a, b}, x]
+  // This handles the common case in Select predicates
+  if let Some(result) = try_fast_function_call(trimmed) {
+    return result;
+  }
+
+  let depth = INTERPRET_DEPTH.with(|d| {
+    let mut depth = d.borrow_mut();
+    let current = *depth;
+    *depth += 1;
+    current
+  });
+
+  // Only clear buffers at top level; a top-level interpret call is one
+  // "calculation" for General::stop message suppression.
+  if depth == 0 {
+    clear_captured_stdout();
+    clear_captured_warnings();
+    reset_message_stop_counts();
+  }
+
+  // Decrement depth on scope exit
+  struct DepthGuard;
+  impl Drop for DepthGuard {
+    fn drop(&mut self) {
+      INTERPRET_DEPTH.with(|d| *d.borrow_mut() -= 1);
+    }
+  }
+  let _guard = DepthGuard;
+
+  // Insert semicolons at top-level newline boundaries so the PEG grammar
+  // correctly separates statements like "fib[0] = 0\nfib[1] = 1" instead
+  // of treating them as implicit multiplication.
+  let preprocessed = insert_statement_separators(trimmed);
+
+  // Regular interpretation - use AST-based evaluation
+  let pairs = parse(&preprocessed)?;
+  let mut pairs = pairs.into_iter();
+  let program = pairs.next().ok_or(InterpreterError::EmptyInput)?;
+
+  if program.as_rule() != Rule::Program {
+    return Err(InterpreterError::EvaluationError(format!(
+      "Expected Program, got {:?}",
+      program.as_rule()
+    )));
+  }
+
+  // Collect all program statements upfront so we can support Goto/Label
+  // across top-level semicolon-separated expressions.
+  enum ProgramStmt<'a> {
+    Expr(syntax::Expr),
+    FunctionDefinition(Pair<'a, Rule>),
+    TagSetDelayed(Pair<'a, Rule>),
+    TagSet(Pair<'a, Rule>),
+    TagUnset(Pair<'a, Rule>),
+    TrailingSemicolon,
+  }
+  let mut stmts: Vec<ProgramStmt> = Vec::new();
+  // Also collect the Expr ASTs separately (with indices) for Label lookup
+  let mut expr_asts: Vec<syntax::Expr> = Vec::new();
+  // The source line each statement was read from. The Wolfram Language
+  // resolves symbol names per *input unit* — a line here — so everything on
+  // one line is resolved together, before any of it evaluates. See
+  // `evaluator::contexts`.
+  let mut stmt_lines: Vec<usize> = Vec::new();
+  // Keep in step with `is_statement_rule`; this arm needs the pest pair
+  // rather than an `Expr`, so it cannot use the predicate directly.
+  for node in program.into_inner() {
+    let line = node.as_span().start_pos().line_col().0;
+    match node.as_rule() {
+      Rule::Expression => {
+        let expr = syntax::pair_to_expr(node);
+        expr_asts.push(expr.clone());
+        stmts.push(ProgramStmt::Expr(expr));
+      }
+      Rule::FunctionDefinition => {
+        stmts.push(ProgramStmt::FunctionDefinition(node));
+      }
+      Rule::TagSetDelayed => stmts.push(ProgramStmt::TagSetDelayed(node)),
+      Rule::TagSet => stmts.push(ProgramStmt::TagSet(node)),
+      Rule::TagUnset => stmts.push(ProgramStmt::TagUnset(node)),
+      Rule::TrailingSemicolon => stmts.push(ProgramStmt::TrailingSemicolon),
+      _ => continue, // ignore EOI, etc.
+    }
+    stmt_lines.push(line);
+  }
+  // Statements already resolved (see the per-line pass in the loop below).
+  let mut resolved: Vec<bool> = vec![false; stmts.len()];
+  // The contexts open when the current line started being read, which is
+  // what the definitions on it resolve against.
+  let mut line_read_context = evaluator::contexts::read_context();
+
+  // The outcome of the most recently executed statement. Expression results
+  // are kept as bare `Expr`s during the loop; the display pipeline (render
+  // passes, SVG typesetting, text formatting) runs once after the loop on
+  // whichever value actually becomes the program's output. Running it per
+  // statement typeset multi-million-cell intermediates just to throw the
+  // text away — `data = Import["big.csv"]; Length[data]` spent nearly all
+  // of its time formatting the discarded list.
+  enum StmtOutcome {
+    Display(syntax::Expr),
+    Text(String),
+  }
+  let mut last_result: Option<StmtOutcome> = None;
+  let mut any_nonempty = false;
+  let mut trailing_semicolon = false;
+  let mut stmt_idx = 0;
+  'goto_loop: loop {
+    if stmt_idx >= stmts.len() {
+      break;
+    }
+    // Only the statement whose value the program returns should leave a
+    // recorded value behind (see `CURRENT_VALUE_EXPR`).
+    clear_value_expr();
+    // Read the whole line before evaluating any of it: the Wolfram Language
+    // resolves every name in an input unit up front, so
+    // `BeginPackage["P`"]; f[] := 1` written on one line files `f` in the
+    // context that was open *before* the line, while the same two lines
+    // written separately file it in `P``. Outside packages this is a no-op.
+    if !resolved[stmt_idx] {
+      line_read_context = evaluator::contexts::read_context();
+      let line = stmt_lines[stmt_idx];
+      for i in stmt_idx..stmts.len() {
+        if stmt_lines[i] != line {
+          break;
+        }
+        if let ProgramStmt::Expr(expr) = &stmts[i] {
+          stmts[i] = ProgramStmt::Expr(evaluator::contexts::rewrite(expr));
+        }
+        resolved[i] = true;
+      }
+    }
+    match &stmts[stmt_idx] {
+      ProgramStmt::Expr(expr) => {
+        // Evaluate using AST-based evaluation
+        // At top level, uncaught Return[] just yields its argument value
+        // (matching wolframscript: `Return[5]` outputs `5`, not `Return[5]`).
+        //
+        // Pre-pass (visual mode only): when the top-level expression is a
+        // list (1-D or 2-D) of graphics-producing function calls, inject
+        // `ImageSize -> per_cell_w` into each child so plots are rendered
+        // at the right per-cell size instead of being scaled down after
+        // the fact. Skipped in plain `interpret()` mode so symbolic text
+        // output (e.g. `{TreeForm[f[x]], TreeForm[g[y]]}`) isn't polluted
+        // with an injected ImageSize option that was never written.
+        let rewritten_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+          functions::graphics::inject_image_size_for_list_of_graphics(expr)
+        } else {
+          None
+        };
+        let expr_to_eval: &syntax::Expr =
+          rewritten_expr.as_ref().unwrap_or(expr);
+        // Track Return propagation so multi-statement programs short-
+        // circuit at the first Return — wolframscript treats top-level
+        // `;`-separated statements as a CompoundExpression, where Return
+        // bubbles past the remaining steps.
+        let mut return_short_circuit = false;
+        let mut result_expr =
+          match evaluator::evaluate_expr_to_expr(expr_to_eval) {
+            Err(InterpreterError::ReturnValue(val)) => {
+              return_short_circuit = true;
+              *val
+            }
+            Ok(syntax::Expr::FunctionCall { ref name, ref args })
+              if name == "Return" && args.len() == 1 =>
+            {
+              return_short_circuit = true;
+              args[0].clone()
+            }
+            Err(InterpreterError::Abort) => {
+              return Ok("$Aborted".to_string());
+            }
+            Err(InterpreterError::Terminated(tag)) => {
+              take_termination();
+              return Ok(format!("TerminatedEvaluation[{tag}]"));
+            }
+            Err(InterpreterError::GotoSignal(tag)) => {
+              // Search for matching Label in the top-level expression list
+              if let Some(label_idx) =
+                evaluator::find_label_index(&expr_asts, &tag)
+              {
+                // Find the stmt index corresponding to this expr_ast index
+                let mut expr_count = 0;
+                for (si, s) in stmts.iter().enumerate() {
+                  if matches!(s, ProgramStmt::Expr(_)) {
+                    if expr_count == label_idx {
+                      stmt_idx = si + 1; // resume after the Label
+                      continue 'goto_loop;
+                    }
+                    expr_count += 1;
+                  }
+                }
+              }
+              let tag_str = syntax::expr_to_string(&tag);
+              emit_message(&format!(
+                "Goto::nolabel: Label {tag_str} not found."
+              ));
+              syntax::Expr::Identifier("Null".to_string())
+            }
+            Err(InterpreterError::ThrowValue(val, tag)) => {
+              // An uncaught Throw aborts evaluation at top level.
+              // wolframscript emits Throw::nocatch and produces no result;
+              // surface the same message instead of leaking the internal
+              // error. The throw form shows its value (and tag, if any).
+              let throw_args = match tag {
+                Some(t) => vec![*val, *t],
+                None => vec![*val],
+              };
+              let throw_expr = syntax::Expr::FunctionCall {
+                name: "Throw".to_string(),
+                args: throw_args.into(),
+              };
+              emit_message(&format!(
+                "Throw::nocatch: Uncaught {} returned to top level.",
+                syntax::format_expr(&throw_expr, syntax::ExprForm::Output)
+              ));
+              // wolframscript produces no result (the message is the only
+              // output), so return an empty string rather than a value.
+              return Ok(String::new());
+            }
+            other => other?,
+          };
+        // A termination whose `Err` was swallowed on the way up still
+        // terminates the statement: the latch outlives the signal, so the
+        // value that came back instead is not one wolframscript would give.
+        if let Some(tag) = take_termination() {
+          return Ok(format!("TerminatedEvaluation[{tag}]"));
+        }
+        // Multi-statement input behaves like CompoundExpression: a
+        // trailing `Sequence[…]` splices, so we keep just its last
+        // element. A lone `Sequence[1, 2]` (single-statement program)
+        // still prints as `12`.
+        let multi_statement = stmts
+          .iter()
+          .filter(|s| matches!(s, ProgramStmt::Expr(_)))
+          .count()
+          > 1;
+        if multi_statement
+          && let syntax::Expr::FunctionCall {
+            name: n,
+            args: seq_args,
+          } = &result_expr
+          && n == "Sequence"
+        {
+          result_expr = seq_args
+            .last()
+            .cloned()
+            .unwrap_or_else(|| syntax::Expr::Identifier("Null".to_string()));
+        }
+        // Keep `%` / `Out[]` history per statement (notebook semantics:
+        // `2+2` then `% + 1` within one cell sees the intermediate 4). The
+        // final statement's entry is overwritten with the post-render value
+        // by the deferred display pipeline below.
+        if output_history_enabled() {
+          set_last_output(result_expr.clone());
+        }
+        last_result = Some(StmtOutcome::Display(result_expr));
+        any_nonempty = true;
+        // A Return inside a multi-statement program propagates past any
+        // remaining statements — drop them and emit the Return value.
+        if return_short_circuit {
+          break;
+        }
+      }
+      ProgramStmt::FunctionDefinition(node) => {
+        let _read =
+          evaluator::contexts::ReadContext::install(&line_read_context);
+        match store_function_definition(node.clone())? {
+          Some(s) => last_result = Some(StmtOutcome::Text(s)),
+          None => last_result = Some(StmtOutcome::Text("\0".to_string())),
+        }
+        any_nonempty = true;
+      }
+      ProgramStmt::TagSetDelayed(node) => {
+        let _read =
+          evaluator::contexts::ReadContext::install(&line_read_context);
+        match store_tag_set_delayed(node.clone(), false)? {
+          Some(s) => last_result = Some(StmtOutcome::Text(s)),
+          None => last_result = Some(StmtOutcome::Text("\0".to_string())),
+        }
+        any_nonempty = true;
+      }
+      ProgramStmt::TagSet(node) => {
+        let _read =
+          evaluator::contexts::ReadContext::install(&line_read_context);
+        if let Some(rhs_str) = store_tag_set_delayed(node.clone(), true)? {
+          last_result = Some(StmtOutcome::Text(rhs_str));
+        } else {
+          last_result = Some(StmtOutcome::Text("\0".to_string()));
+        }
+        any_nonempty = true;
+      }
+      ProgramStmt::TagUnset(node) => {
+        execute_tag_unset(node.clone());
+        last_result = Some(StmtOutcome::Text("\0".to_string()));
+        any_nonempty = true;
+      }
+      ProgramStmt::TrailingSemicolon => {
+        trailing_semicolon = true;
+      }
+    }
+    stmt_idx += 1;
+  }
+
+  // Deferred display pipeline: render/format only the value that becomes
+  // the program's output (see the StmtOutcome comment above). A trailing
+  // semicolon suppresses display entirely, so `Import["big.csv"];` never
+  // pays for formatting the discarded table.
+  let last_result: Option<String> = match last_result {
+    None => None,
+    Some(StmtOutcome::Text(s)) => Some(s),
+    Some(StmtOutcome::Display(_)) if trailing_semicolon => {
+      Some("\0".to_string())
+    }
+    Some(StmtOutcome::Display(result_expr)) => {
+      Some(format_top_level_result(result_expr, depth))
+    }
+  };
+
+  // Print consolidated unimplemented-function warning to stderr (top-level only)
+  // Uses get_warnings_for_display() to avoid re-printing messages already shown by emit_message.
+  if depth == 0 {
+    for w in get_warnings_for_display() {
+      eprintln!("{w}");
+    }
+  }
+
+  if any_nonempty {
+    if trailing_semicolon {
+      Ok("\0".to_string())
+    } else {
+      last_result.ok_or(InterpreterError::EmptyInput)
+    }
+  } else {
+    Err(InterpreterError::EmptyInput)
+  }
+}
+
+/// Strip a top-level `Return[val]` wrapper (left by a Block/Module/While/For
+/// that caught an internal Return) down to the bare `val`, matching
+/// wolframscript's REPL. The symbolic form is preserved when the Return
+/// wrapper is held (e.g. inside `ToString[…, InputForm]`), which is why this
+/// only applies to a top-level result.
+fn unwrap_top_level_return(expr: &syntax::Expr) -> &syntax::Expr {
+  match expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Return" && args.len() == 1 =>
+    {
+      &args[0]
+    }
+    other => other,
+  }
+}
+
+/// Run the display pipeline on a top-level statement's evaluated value:
+/// render passes (Image/Graphics/Dataset/... wrappers), SVG typesetting for
+/// visual hosts, `%` history, and the final text formatting. Returns the
+/// output string ("\0" for Null, i.e. suppressed display).
+///
+/// `depth` is the `interpret` nesting level; only the outermost call decides
+/// which picture the cell shows (see `promote_result_graphics`).
+fn format_top_level_result(result_expr: syntax::Expr, depth: usize) -> String {
+  // Report the evaluated value as the structured result *before* the
+  // display pipeline below rewrites it into rendered forms — an Image into
+  // an `<img>` tag, a Grid into an SVG. A host asking for the structure
+  // wants `Image[…]`, not its rendering.
+  record_value_expr(unwrap_top_level_return(&result_expr));
+  if depth == 0 {
+    set_last_result_expr(unwrap_top_level_return(&result_expr).clone());
+  }
+  // If the result is an Image, render it as a PNG <img> tag
+  let result_expr = render_image_if_needed(result_expr);
+  // Render unevaluated Graphics[{...}] FunctionCalls to SVG (e.g.
+  // from VoronoiMesh, or Graphics that stayed symbolic for Show merging).
+  // Must run before other render passes that expect Expr::Graphics.
+  let result_expr = render_graphics_fc_if_needed(result_expr);
+  // Curve objects (PolarCurve, FilledPolarCurve) display as rendered
+  // graphics in visual hosts (playground, studio), like in Wolfram
+  // notebooks. The CLI keeps the symbolic echo to match wolframscript.
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_polar_curve_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // If the result is a Sound built from Play[...] segments, synthesize a
+  // playable WAV and embed it as an <audio> element (visual hosts only —
+  // CLI mode keeps the Sound[...] expression, which renders as -Sound-).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_sound_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // If the result is an Audio object (file-backed or from sample data),
+  // capture it as playable audio so the visual hosts render a graphical
+  // audio player (CLI mode keeps the symbolic Audio[...] expression).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_audio_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // Render ComputationalMusic objects (MusicNote, MusicChord, …) as
+  // musical-staff SVGs (visual mode only — CLI keeps them symbolic).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_music_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // Render Molecule results as a 2-D structure diagram (visual mode
+  // only — the CLI keeps the symbolic Molecule[…] echo to match
+  // wolframscript).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_molecule_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // Render DateObject results (e.g. from RandomDate, Now) as the
+  // framed date panel Wolfram notebooks show (visual mode only —
+  // CLI keeps the symbolic form to match wolframscript).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_date_object_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // If the result is a Grid expression, render it as SVG (visual mode
+  // only — CLI mode keeps Grid[...] symbolic to match wolframscript).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_grid_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  // If the result is a Dataset expression, render it as an SVG table
+  let result_expr = render_dataset_if_needed(result_expr);
+  // If the result is a Tabular expression, render it as an SVG table
+  let result_expr = render_tabular_if_needed(result_expr);
+  // In visual mode, render TableForm[list], MatrixForm[list], and Column[list] as SVGs
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_visual_display_pipeline(&result_expr)
+  } else {
+    result_expr
+  };
+  // If the result is a list of Graphics objects, combine their SVGs
+  // (visual contexts only — plain `interpret` keeps the list shape so
+  // tests like Length[Table[Graphics[...], ...]] stay accurate).
+  let result_expr = if VISUAL_MODE.with(|v| *v.borrow()) {
+    render_graphics_list_if_needed(result_expr)
+  } else {
+    result_expr
+  };
+  let result_expr = unwrap_top_level_return(&result_expr).clone();
+  // The picture a cell shows is the one its value *is*, not the last one
+  // drawn on the way there.
+  if depth == 0 {
+    promote_result_graphics(&result_expr);
+  }
+  // Generate SVG rendering of the result for playground display
+  generate_output_svg(&result_expr);
+  // Stash the top-level Expr so `%` / `Out[]` in a subsequent
+  // evaluation resolves to this cell's result. We only do this when
+  // output history is enabled — visual mode (e.g. woxi-studio) or the
+  // terminal REPL (`woxi repl`). Plain command-line semantics (a fresh
+  // process per evaluation, where `%` collapses to `Out[0]`) are
+  // preserved — matching wolframscript.
+  if output_history_enabled() {
+    set_last_output(result_expr.clone());
+  }
+  // The terminal REPL prints OutputForm digits (a machine real at 6
+  // significant figures, an arbitrary-precision real without its backtick
+  // marker), matching wolframscript's REPL. `%` / `Out[]` were stashed above
+  // from the unrounded expression, so only the printed text changes.
+  let shown_expr = if is_repl_mode() {
+    std::borrow::Cow::Owned(to_display_precision(&result_expr))
+  } else {
+    std::borrow::Cow::Borrowed(&result_expr)
+  };
+  // In visual mode (playground), unwrap StandardForm/InputForm wrappers
+  // so they display like in a Wolfram notebook.
+  // CLI mode preserves wrappers to match wolframscript behavior.
+  let is_visual = VISUAL_MODE.with(|v| *v.borrow());
+  let output_text = if is_visual {
+    match shown_expr.as_ref() {
+      syntax::Expr::FunctionCall { name, args }
+        if name == "StandardForm" && args.len() == 1 =>
+      {
+        syntax::expr_to_output(&args[0])
+      }
+      syntax::Expr::FunctionCall { name, args }
+        if name == "InputForm" && args.len() == 1 =>
+      {
+        syntax::expr_to_input_form(&args[0])
+      }
+      syntax::Expr::FunctionCall { name, args }
+        if name == "Quantity" && args.len() == 2 =>
+      {
+        syntax::quantity_to_visual_string(&args[0], &args[1])
+      }
+      _ => syntax::top_level_output(&shown_expr),
+    }
+  } else {
+    syntax::top_level_output(&shown_expr)
+  };
+  // Convert to output string (strips quotes from strings for display).
+  // Use "\0" sentinel for the Null symbol so consumers can suppress it
+  // without confusing it with the string "Null".
+  if matches!(&result_expr, syntax::Expr::Identifier(s) if s == "Null") {
+    "\0".to_string()
+  } else {
+    output_text
+  }
+}
+
+/// If `expr` is a Grid[…] or TextGrid[…] call (possibly nested in a list),
+/// render it as SVG and return `-Graphics-`. Grid/TextGrid stay symbolic
+/// during evaluation so that part-assignment works; rendering only happens
+/// at the output stage.  Also unwraps TraditionalForm[Grid[…]] wrappers.
+fn render_grid_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    // `Text[Grid[…]]`/`Text[TextGrid[…]]` — the Demonstrations idiom for a
+    // Manipulate body that should render as a plain (non-`Graphics`-framed)
+    // table, e.g. `Manipulate[Text@Grid[{…}], …]`. `Text[…]` otherwise
+    // passes through unrendered (a bare `Text["…"]` outside `Graphics[…]`
+    // has no picture to draw), so only replace it when the wrapped content
+    // actually resolves to one.
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Text" && args.len() == 1 =>
+    {
+      match render_grid_if_needed(args[0].clone()) {
+        graphics @ syntax::Expr::Graphics { .. } => graphics,
+        _ => expr,
+      }
+    }
+    syntax::Expr::FunctionCall { name, args }
+      if (name == "Grid" || name == "TextGrid") && !args.is_empty() =>
+    {
+      match functions::graphics::grid_ast(args) {
+        Ok(result) => result,
+        Err(_) => expr,
+      }
+    }
+    // TraditionalForm[Grid[...]] or TraditionalForm[TextGrid[...]] — unwrap and render
+    syntax::Expr::FunctionCall { name, args }
+      if name == "TraditionalForm"
+        && args.len() == 1
+        && matches!(
+          &args[0],
+          syntax::Expr::FunctionCall { name: inner, args: inner_args }
+          if (inner == "Grid" || inner == "TextGrid") && !inner_args.is_empty()
+        ) =>
+    {
+      if let syntax::Expr::FunctionCall {
+        args: grid_args, ..
+      } = &args[0]
+      {
+        match functions::graphics::grid_ast(grid_args) {
+          Ok(result) => result,
+          Err(_) => expr,
+        }
+      } else {
+        expr
+      }
+    }
+    // Style[Grid[...], directives...] — propagate style into grid
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Style"
+        && args.len() >= 2
+        && matches!(
+          &args[0],
+          syntax::Expr::FunctionCall { name: inner, args: inner_args }
+          if (inner == "Grid" || inner == "TextGrid") && !inner_args.is_empty()
+        ) =>
+    {
+      if let syntax::Expr::FunctionCall {
+        args: grid_args, ..
+      } = &args[0]
+      {
+        let style = functions::graphics::parse_grid_style(&args[1..]);
+        match functions::graphics::grid_ast_styled(grid_args, &style) {
+          Ok(result) => result,
+          Err(_) => expr,
+        }
+      } else {
+        expr
+      }
+    }
+    // `Labeled[content, label, position?, opts?]` — and its multi-caption
+    // form `Labeled[content, {label…}, {position…}, opts?]`, which places
+    // one caption per side of the content — where `content` renders as a
+    // table through this same function (a plain `Grid`, or another
+    // wrapper handled below). This is the shape a Demonstration uses to
+    // caption a data table rather than a `Graphics` picture (which the
+    // separate `Labeled`-composition pipeline in `expr_to_svg` already
+    // handles for an actual graphic). Each label is itself rendered
+    // through the one-cell `Grid` pipeline so its font matches the table
+    // it labels; `RotateLabel` is not honored — a `Left`/`Right` caption
+    // renders upright rather than rotated.
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Labeled" && args.len() >= 2 =>
+    {
+      let rendered_content = render_grid_if_needed(args[0].clone());
+      let content_svg = match &rendered_content {
+        syntax::Expr::Graphics { svg, .. } => svg.clone(),
+        _ => return expr,
+      };
+      let placements: Vec<(syntax::Expr, String)> =
+        match (&args[1], args.get(2)) {
+          (syntax::Expr::List(labels), Some(syntax::Expr::List(positions)))
+            if labels.len() == positions.len() =>
+          {
+            labels
+              .iter()
+              .cloned()
+              .zip(positions.iter().map(|p| match p {
+                syntax::Expr::Identifier(s) => s.clone(),
+                _ => "Bottom".to_string(),
+              }))
+              .collect()
+          }
+          _ => {
+            let position = match args.get(2) {
+              Some(syntax::Expr::Identifier(p)) => p.clone(),
+              _ => "Bottom".to_string(),
+            };
+            vec![(args[1].clone(), position)]
+          }
+        };
+      let mut top = Vec::new();
+      let mut bottom = Vec::new();
+      let mut left = Vec::new();
+      let mut right = Vec::new();
+      for (label, position) in &placements {
+        let label_grid = syntax::Expr::FunctionCall {
+          name: "Grid".to_string(),
+          args: vec![syntax::Expr::List(
+            vec![syntax::Expr::List(vec![label.clone()].into())].into(),
+          )]
+          .into(),
+        };
+        let rendered_label = render_grid_if_needed(label_grid);
+        let syntax::Expr::Graphics { svg: label_svg, .. } = &rendered_label
+        else {
+          return expr;
+        };
+        match position.as_str() {
+          "Top" => top.push(label_svg.clone()),
+          "Left" => left.push(label_svg.clone()),
+          "Right" => right.push(label_svg.clone()),
+          _ => bottom.push(label_svg.clone()),
+        }
+      }
+      // Stack same-side labels into one cell (rows of a mini grid), an
+      // empty side becoming an empty cell so the 3x3 layout below stays
+      // rectangular.
+      let side_cell = |svgs: &[String]| -> String {
+        match svgs.len() {
+          0 => String::new(),
+          1 => svgs[0].clone(),
+          _ => functions::graphics::combine_graphics_svgs(
+            &svgs.iter().map(|s| vec![s.clone()]).collect::<Vec<_>>(),
+          )
+          .unwrap_or_default(),
+        }
+      };
+      let rows = vec![
+        vec![String::new(), side_cell(&top), String::new()],
+        vec![side_cell(&left), content_svg, side_cell(&right)],
+        vec![String::new(), side_cell(&bottom), String::new()],
+      ];
+      match functions::graphics::combine_graphics_svgs(&rows) {
+        Some(svg) => graphics_result(svg),
+        None => expr,
+      }
+    }
+    // `Pane`/`Panel`/`Framed` wrapping the multi-table compositions this
+    // function builds above (`Labeled`, or the `Times`-as-`Row` idiom
+    // below) — pass through to what they wrap, the way a notebook shows
+    // it. Deliberately narrower than "any content this function can
+    // render": a `Pane`/`Panel`/`Framed` directly around a *plain* table
+    // (`Pane[Grid[{{1, 2}, {3, 4}}]]`, no `Labeled`/`Times` in between) is
+    // left to the text renderer — composing it as a picture would be a
+    // regression (`a_pane_without_pictures_is_not_composed` in
+    // svg_rendering.rs), since a plain data table is more useful as
+    // selectable text than as a picture.
+    syntax::Expr::FunctionCall { name, args }
+      if matches!(name.as_str(), "Pane" | "Panel" | "Framed")
+        && !args.is_empty()
+        && matches!(
+          &args[0],
+          syntax::Expr::FunctionCall { name: inner, .. }
+          if inner == "Labeled" || inner == "Times"
+        ) =>
+    {
+      match render_grid_if_needed(args[0].clone()) {
+        graphics @ syntax::Expr::Graphics { .. } => graphics,
+        _ => expr,
+      }
+    }
+    // `Times[a, b, …]` — Wolfram's box form for a `Times` of non-numeric
+    // factors lays them out side by side with an invisible multiplication
+    // glyph between them, visually identical to `Row[{a, b, …}]`. A
+    // Demonstration exploits this (two labeled tables written one after
+    // another with no comma, inside a `Pane`) to lay them out side by
+    // side without an explicit `Row`. Only taken when every factor
+    // renders as a table on its own — a genuine numeric product was
+    // already reduced by the evaluator before this pass ever runs, so
+    // reaching here unevaluated means the factors could not combine.
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Times" && args.len() >= 2 =>
+    {
+      let rendered: Vec<syntax::Expr> =
+        args.iter().cloned().map(render_grid_if_needed).collect();
+      if rendered
+        .iter()
+        .all(|e| matches!(e, syntax::Expr::Graphics { .. }))
+      {
+        let cells: Vec<String> = rendered
+          .iter()
+          .map(|e| match e {
+            syntax::Expr::Graphics { svg, .. } => svg.clone(),
+            _ => unreachable!(),
+          })
+          .collect();
+        match functions::graphics::combine_graphics_svgs(&[cells]) {
+          Some(svg) => graphics_result(svg),
+          None => expr,
+        }
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::List(items) => {
+      let new_items: Vec<syntax::Expr> =
+        items.iter().cloned().map(render_grid_if_needed).collect();
+      syntax::Expr::List(new_items.into())
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is a Dataset[data, …] call, render it as an SVG table
+/// and return `-Graphics-`.
+fn render_dataset_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Dataset" && !args.is_empty() =>
+    {
+      let data = &args[0];
+      if let Some(svg) = functions::graphics::dataset_to_svg(data) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is a Tabular[data, schema] call, render it as an SVG table
+/// and return `-Graphics-`.
+fn render_tabular_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Tabular" && args.len() >= 2 =>
+    {
+      let data = &args[0];
+      let schema = &args[1];
+      if let Some(svg) = functions::graphics::tabular_to_svg(data, schema) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// Check if an expression is an explicit color function call (not a named color
+/// identifier like `Red`). Returns `true` for `RGBColor[…]`, `Hue[…]`,
+/// `GrayLevel[…]`, `Darker[…]`, `Lighter[…]`, and theme-resolved colors
+/// (`LightDarkSwitched[…]`, `ThemeColor[…]`, `SystemColor[…]`).
+fn is_color_function_call(expr: &syntax::Expr) -> bool {
+  matches!(
+    expr,
+    syntax::Expr::FunctionCall { name, .. }
+      if matches!(
+        name.as_str(),
+        "RGBColor" | "Hue" | "GrayLevel" | "Darker" | "Lighter"
+          | "LightDarkSwitched" | "ThemeColor" | "SystemColor"
+      )
+  )
+}
+
+/// If `expr` is an explicit color specification (RGBColor, Hue, GrayLevel,
+/// Darker, Lighter), render it as a 16×16 colored-square SVG swatch.
+/// If it's a list, recursively convert color elements so they become
+/// individual swatch graphics (the list itself is left intact for
+/// `render_graphics_list_if_needed` to wrap with `{…, …}`).
+/// Bare named colors (e.g. `Red`) are left as text.
+fn render_color_if_needed(mut expr: syntax::Expr) -> syntax::Expr {
+  if is_color_function_call(&expr)
+    && let Some(color) = functions::graphics::parse_color(&expr)
+  {
+    let svg = functions::graphics::color_swatch_svg(&color);
+    return graphics_result(svg);
+  }
+  if let syntax::Expr::List(ref mut items) = expr {
+    let new_items: Vec<syntax::Expr> = std::mem::take(items)
+      .into_iter()
+      .map(render_color_if_needed)
+      .collect();
+    return syntax::Expr::List(new_items.into());
+  }
+  expr
+}
+
+/// If `expr` is an `Audio[…]` object — file-backed (`Audio[File["path"]]` /
+/// `Audio["path.flac"]`) or built from raw sample data — capture it as
+/// playable audio so visual hosts (the Woxi Playground and Woxi Studio)
+/// render a graphical audio player, and return the `-Audio-` placeholder.
+/// Audio objects that cannot be turned into a player (e.g. symbolic data)
+/// are left unchanged. Visual hosts only — the CLI keeps the symbolic form.
+fn render_audio_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if let syntax::Expr::FunctionCall { ref name, .. } = expr
+    && name == "Audio"
+    && let Some(audio) = functions::sound::audio_to_output(&expr)
+  {
+    capture_audio(audio);
+    return syntax::Expr::Identifier("-Audio-".to_string());
+  }
+  expr
+}
+
+/// If `expr` is a `Sound` containing one or more `Play[f, {t, …}]` segments,
+/// synthesize a WAV, capture it as an `<audio>` element, and return the
+/// `-Sound-` identifier. Sounds with no samplable `Play` segment are left
+/// unchanged (they still render textually as `-Sound-`).
+fn render_sound_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if let syntax::Expr::FunctionCall { ref name, .. } = expr
+    && name == "Sound"
+    && let Some(wav_base64) = functions::sound::sound_to_wav_base64(&expr)
+  {
+    capture_sound(&wav_base64);
+    return syntax::Expr::Identifier("-Sound-".to_string());
+  }
+  expr
+}
+
+/// If `expr` is a ComputationalMusic object (MusicNote, MusicChord,
+/// MusicScale, MusicScore, …), render it as a musical-staff SVG the way
+/// Mathematica displays it, capture it as graphics, and return `-Graphics-`.
+/// Music objects that carry no notation (a bare `MusicDuration`, `MusicTempo`,
+/// …) are left symbolic. Visual hosts only — the CLI keeps the symbolic form.
+fn render_music_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  // A single music object draws one staff.
+  if let syntax::Expr::FunctionCall { ref name, .. } = expr
+    && functions::music_ast::MUSIC_OBJECT_HEADS.contains(&name.as_str())
+    && let Some(svg) = functions::music_render::music_to_svg(&expr)
+  {
+    return graphics_result(svg);
+  }
+  // A plain list of music events (e.g. {MusicNote[…], MusicNote[…]}) keeps its
+  // list structure: `{ <staff>, <staff>, … }`, one staff per element.
+  if functions::music_ast::is_music_object_list(&expr)
+    && let Some(svg) = functions::music_render::music_list_to_svg(&expr)
+  {
+    return graphics_result(svg);
+  }
+  expr
+}
+
+/// If `expr` is a `Molecule[…]`, render its 2-D structure diagram and capture
+/// it as graphics, the way Wolfram notebooks display a molecule. Visual hosts
+/// only — the CLI keeps the symbolic `Molecule[…]` echo to match wolframscript.
+fn render_molecule_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if let syntax::Expr::FunctionCall { ref name, .. } = expr
+    && name == "Molecule"
+    && let Some(svg) = functions::molecule_render::molecule_to_svg(&expr)
+  {
+    return graphics_result_with_head(svg, "Molecule");
+  }
+  expr
+}
+
+/// If `expr` is a `DateObject[…]` (e.g. from RandomDate or Now), render it
+/// as the framed date panel Wolfram notebooks show. Visual hosts only —
+/// the CLI keeps the symbolic form. Dates with symbolic components stay
+/// symbolic.
+fn render_date_object_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if let syntax::Expr::FunctionCall { ref name, .. } = expr
+    && name == "DateObject"
+    && let Some(svg) = functions::datetime_ast::date_object_panel_svg(&expr)
+  {
+    return graphics_result_with_head(svg, "DateObject");
+  }
+  expr
+}
+
+/// If `expr` is an Image, encode it as a base64 PNG `<img>` tag,
+/// capture it as graphics, and return `-Image-` identifier.
+fn render_image_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if let syntax::Expr::Image {
+    width,
+    height,
+    channels,
+    ref data,
+    ..
+  } = expr
+  {
+    let html =
+      functions::image_ast::image_to_html_img(width, height, channels, data);
+    capture_graphics(&html);
+    syntax::Expr::Identifier("-Image-".to_string())
+  } else {
+    expr
+  }
+}
+
+/// Check if an expression represents a Graphics placeholder
+/// (either `-Graphics-` directly or `Style[-Graphics-, ...]`)
+fn is_graphics_placeholder(expr: &syntax::Expr) -> bool {
+  match expr {
+    syntax::Expr::Identifier(s) if s == "-Graphics-" || s == "-Image-" => true,
+    syntax::Expr::Graphics { .. } => true,
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Style" && !args.is_empty() =>
+    {
+      is_graphics_placeholder(&args[0])
+    }
+    _ => false,
+  }
+}
+
+/// Check if an expression tree contains any Graphics placeholder
+fn contains_graphics_placeholder(expr: &syntax::Expr) -> bool {
+  if is_graphics_placeholder(expr) {
+    return true;
+  }
+  match expr {
+    syntax::Expr::List(items) => {
+      items.iter().any(contains_graphics_placeholder)
+    }
+    syntax::Expr::FunctionCall { args, .. } => {
+      args.iter().any(contains_graphics_placeholder)
+    }
+    _ => false,
+  }
+}
+
+/// Check if a list's items form a 3D structure (list of lists of lists)
+fn is_3d_list(items: &[syntax::Expr]) -> bool {
+  !items.is_empty()
+    && items.iter().all(|item| {
+      if let syntax::Expr::List(sub) = item {
+        !sub.is_empty()
+          && sub.iter().all(|s| matches!(s, syntax::Expr::List(_)))
+      } else {
+        false
+      }
+    })
+}
+
+/// Compute the `Grid` arguments (data reshaped into rows + forwarded options
+/// like `TableHeadings`) and the group-gap row indices for a
+/// `TableForm[data, opts…]` call's argument list.
+///
+/// Returns `None` when the data isn't a renderable list, or when it contains
+/// Graphics placeholders (those are combined by the graphics-grid path
+/// instead). Shared by the plain and `Style`-wrapped rendering paths.
+pub(crate) fn tableform_grid_args(
+  args: &[syntax::Expr],
+) -> Option<(Vec<syntax::Expr>, Vec<usize>)> {
+  let data = args.first()?;
+  // Skip if content contains Graphics placeholders (handled by
+  // render_graphics_list_if_needed / the graphics-grid combine path).
+  if contains_graphics_placeholder(data) {
+    return None;
+  }
+  // TableDepth -> d caps how far TableForm descends into nested lists; deeper
+  // lists are shown inline as literal expressions. The default (unset) lets it
+  // descend as far as the structure allows (the 3D-expansion path below).
+  let table_depth: Option<i64> = args[1..].iter().find_map(|a| match a {
+    syntax::Expr::Rule {
+      pattern,
+      replacement,
+    } if matches!(pattern.as_ref(),
+      syntax::Expr::Identifier(n) if n == "TableDepth") =>
+    {
+      match replacement.as_ref() {
+        syntax::Expr::Integer(d) => Some(*d as i64),
+        _ => None,
+      }
+    }
+    _ => None,
+  });
+  // Build grid data and optional group gap indices
+  let (grid_data, group_gaps) = match data {
+    // TableDepth -> 1: each top-level element is one row in a single column,
+    // rendered inline (even if it is itself a list).
+    syntax::Expr::List(items) if table_depth == Some(1) => (
+      syntax::Expr::List(
+        items
+          .iter()
+          .map(|e| syntax::Expr::List(vec![e.clone()].into()))
+          .collect(),
+      ),
+      vec![],
+    ),
+    // TableDepth -> 2: treat the data as a flat 2-D grid — cells that are
+    // themselves lists stay inline rather than expanding into a third axis.
+    syntax::Expr::List(items)
+      if table_depth == Some(2)
+        && items
+          .iter()
+          .all(|item| matches!(item, syntax::Expr::List(_))) =>
+    {
+      (data.clone(), vec![])
+    }
+    syntax::Expr::List(items) if is_3d_list(items) => {
+      // 3D list M[dim1][dim2][dim3]:
+      // Each block M[i] is transposed (sub-lists become columns),
+      // then blocks are stacked vertically.
+      let mut rows: Vec<syntax::Expr> = Vec::new();
+      let mut gaps: Vec<usize> = Vec::new();
+      for (bi, block) in items.iter().enumerate() {
+        if let syntax::Expr::List(sub_lists) = block {
+          if bi > 0 {
+            gaps.push(rows.len());
+          }
+          let dim3 = sub_lists
+            .iter()
+            .map(|sl| {
+              if let syntax::Expr::List(v) = sl {
+                v.len()
+              } else {
+                0
+              }
+            })
+            .max()
+            .unwrap_or(0);
+          for k in 0..dim3 {
+            let row: Vec<syntax::Expr> = sub_lists
+              .iter()
+              .map(|sl| {
+                if let syntax::Expr::List(v) = sl {
+                  v.get(k)
+                    .cloned()
+                    .unwrap_or(syntax::Expr::Identifier(String::new()))
+                } else {
+                  sl.clone()
+                }
+              })
+              .collect();
+            rows.push(syntax::Expr::List(row.into()));
+          }
+        }
+      }
+      (syntax::Expr::List(rows.into()), gaps)
+    }
+    syntax::Expr::List(items)
+      if items
+        .iter()
+        .all(|item| matches!(item, syntax::Expr::List(_))) =>
+    {
+      (data.clone(), vec![])
+    }
+    syntax::Expr::List(items) if !items.is_empty() => {
+      // 1D list — wrap each element in a single-element list (column)
+      (
+        syntax::Expr::List(
+          items
+            .iter()
+            .map(|e| syntax::Expr::List(vec![e.clone()].into()))
+            .collect(),
+        ),
+        vec![],
+      )
+    }
+    _ => return None,
+  };
+  // TableDirections -> Row transposes the table (the outer list runs across
+  // columns instead of down rows). The default (Column) leaves it as built.
+  let transpose_rows = args[1..].iter().any(|a| {
+    matches!(a, syntax::Expr::Rule { pattern, replacement }
+      if matches!(pattern.as_ref(), syntax::Expr::Identifier(n) if n == "TableDirections")
+        && match replacement.as_ref() {
+          syntax::Expr::Identifier(v) => v == "Row",
+          syntax::Expr::List(items) => matches!(items.first(),
+            Some(syntax::Expr::Identifier(v)) if v == "Row"),
+          _ => false,
+        })
+  });
+  let grid_data = if transpose_rows {
+    transpose_grid_list(&grid_data)
+  } else {
+    grid_data
+  };
+  // Forward extra args (options like TableHeadings) to grid rendering.
+  // TableForm defaults to left alignment (unlike Grid which centers).
+  let mut grid_args = vec![grid_data];
+  let has_alignment = args[1..].iter().any(|a| {
+    matches!(a, syntax::Expr::Rule { pattern, .. }
+      if matches!(pattern.as_ref(), syntax::Expr::Identifier(n) if n == "Alignment"))
+  });
+  // TableAlignments -> Center|Left|Right (or {horizontal, vertical}) maps to
+  // the grid's Alignment option. The "." decimal-point form maps to the
+  // grid's decimal alignment (numbers line up on their decimal point).
+  let table_alignment: Option<syntax::Expr> =
+    args[1..].iter().find_map(|a| match a {
+      syntax::Expr::Rule {
+        pattern,
+        replacement,
+      } if matches!(pattern.as_ref(),
+        syntax::Expr::Identifier(n) if n == "TableAlignments") =>
+      {
+        let horiz = match replacement.as_ref() {
+          syntax::Expr::List(items) => items.first(),
+          other => Some(other),
+        };
+        match horiz {
+          Some(syntax::Expr::Identifier(v))
+            if v == "Center" || v == "Left" || v == "Right" =>
+          {
+            Some(syntax::Expr::Identifier(v.clone()))
+          }
+          Some(syntax::Expr::String(s)) if s == "." => {
+            Some(syntax::Expr::String(".".into()))
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    });
+  if !has_alignment {
+    let align = table_alignment
+      .unwrap_or_else(|| syntax::Expr::Identifier("Left".into()));
+    grid_args.push(syntax::Expr::Rule {
+      pattern: Box::new(syntax::Expr::Identifier("Alignment".into())),
+      replacement: Box::new(align),
+    });
+  }
+  grid_args.extend(args[1..].iter().cloned());
+  Some((grid_args, group_gaps))
+}
+
+/// Transpose a rectangular list-of-rows `{{a,b},{c,d},{e,f}}` into
+/// `{{a,c,e},{b,d,f}}`. Ragged rows are padded with empty cells. A non-list
+/// or empty input is returned unchanged.
+fn transpose_grid_list(data: &syntax::Expr) -> syntax::Expr {
+  let syntax::Expr::List(rows) = data else {
+    return data.clone();
+  };
+  let cols = rows
+    .iter()
+    .map(|r| match r {
+      syntax::Expr::List(c) => c.len(),
+      _ => 1,
+    })
+    .max()
+    .unwrap_or(0);
+  if cols == 0 {
+    return data.clone();
+  }
+  let mut out: Vec<syntax::Expr> = Vec::with_capacity(cols);
+  for j in 0..cols {
+    let new_row: Vec<syntax::Expr> = rows
+      .iter()
+      .map(|r| match r {
+        syntax::Expr::List(c) => c
+          .get(j)
+          .cloned()
+          .unwrap_or_else(|| syntax::Expr::Identifier(String::new())),
+        other if j == 0 => other.clone(),
+        _ => syntax::Expr::Identifier(String::new()),
+      })
+      .collect();
+    out.push(syntax::Expr::List(new_row.into()));
+  }
+  syntax::Expr::List(out.into())
+}
+
+/// If `expr` is a TableForm[list] with non-graphics data, render as a Grid SVG.
+/// This is only called from `interpret_with_stdout` (visual contexts),
+/// not from plain `interpret` (where TableForm stays symbolic).
+pub(crate) fn render_tableform_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "TableForm" && !args.is_empty() =>
+    {
+      let Some((grid_args, group_gaps)) = tableform_grid_args(args) else {
+        // `TableForm[expr]` for a non-list `expr` is a pass-through in
+        // Wolfram: expr displays exactly as it would on its own, with
+        // TableForm contributing nothing (`tableform_grid_args` only
+        // builds grid data for list-shaped input, so it returns `None`
+        // here). A Demonstration's Manipulate commonly keeps whichever
+        // "screen" is on display in one variable and always wraps it
+        // `TableForm[display, …]` for the one screen where `display`
+        // really is tabular data — every other screen (a title card, a
+        // caption panel, …) is some other layout construct
+        // (`Framed[Pane[Text[…]]]`, a `Column` that has its own nested
+        // `TableForm`, …) that should just render untouched. Render it
+        // through the same wrapper pipeline instead of falling through to
+        // the raw, unevaluated `TableForm[…]` source text below.
+        return if matches!(&args[0], syntax::Expr::List(_)) {
+          expr
+        } else {
+          render_inline_display_wrapper(&args[0])
+        };
+      };
+      let result = if group_gaps.is_empty() {
+        functions::graphics::grid_ast(&grid_args)
+      } else {
+        functions::graphics::grid_ast_with_gaps(&grid_args, &group_gaps)
+      };
+      match result {
+        Ok(result) => result,
+        Err(_) => expr,
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is a MatrixForm[list] with non-graphics data, render as a Grid SVG.
+/// For 2D lists, render as a parenthesized matrix.
+/// For 3D lists, render each sub-matrix as a parenthesized matrix, stacked vertically.
+/// For 1D lists, render as a column vector with parentheses.
+pub(crate) fn render_matrixform_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "MatrixForm" && args.len() == 1 =>
+    {
+      let data = &args[0];
+      if contains_graphics_placeholder(data) {
+        return expr;
+      }
+      match data {
+        // 3D list: 2D grid of column vectors, each parenthesized, with outer parens
+        syntax::Expr::List(items) if is_3d_list(items) => {
+          // Build outer_rows: Vec<Vec<Expr>> where each inner Expr is a sub-list
+          let outer_rows: Vec<Vec<syntax::Expr>> = items
+            .iter()
+            .map(|row| {
+              if let syntax::Expr::List(cells) = row {
+                cells.to_vec()
+              } else {
+                vec![row.clone()]
+              }
+            })
+            .collect();
+          match functions::graphics::matrixform_3d_ast(&outer_rows) {
+            Ok(result) => result,
+            Err(_) => expr,
+          }
+        }
+        // 2D list: single matrix
+        syntax::Expr::List(items)
+          if items
+            .iter()
+            .all(|item| matches!(item, syntax::Expr::List(_))) =>
+        {
+          match functions::graphics::grid_ast_with_parens(std::slice::from_ref(
+            data,
+          )) {
+            Ok(result) => result,
+            Err(_) => expr,
+          }
+        }
+        // 1D list: column vector
+        syntax::Expr::List(items) if !items.is_empty() => {
+          let grid_data = syntax::Expr::List(
+            items
+              .iter()
+              .map(|e| syntax::Expr::List(vec![e.clone()].into()))
+              .collect(),
+          );
+          match functions::graphics::grid_ast_with_parens(&[grid_data]) {
+            Ok(result) => result,
+            Err(_) => expr,
+          }
+        }
+        _ => expr,
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is `TraditionalForm[{…}]`, render the list as a parenthesized matrix
+/// (same visual treatment as MatrixForm).
+pub(crate) fn render_traditionalform_list_if_needed(
+  expr: syntax::Expr,
+) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "TraditionalForm"
+        && args.len() == 1
+        && matches!(&args[0], syntax::Expr::List(_)) =>
+    {
+      let data = &args[0];
+      if contains_graphics_placeholder(data) {
+        return expr;
+      }
+      match data {
+        // 2D list: matrix with parentheses
+        syntax::Expr::List(items)
+          if items
+            .iter()
+            .all(|item| matches!(item, syntax::Expr::List(_))) =>
+        {
+          match functions::graphics::grid_ast_with_parens(std::slice::from_ref(
+            data,
+          )) {
+            Ok(result) => result,
+            Err(_) => expr,
+          }
+        }
+        // 1D list: column vector with parentheses
+        syntax::Expr::List(items) if !items.is_empty() => {
+          let grid_data = syntax::Expr::List(
+            items
+              .iter()
+              .map(|e| syntax::Expr::List(vec![e.clone()].into()))
+              .collect(),
+          );
+          match functions::graphics::grid_ast_with_parens(&[grid_data]) {
+            Ok(result) => result,
+            Err(_) => expr,
+          }
+        }
+        _ => expr,
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// Wrappers that say how to *set* what they hold rather than what to show:
+/// `Pane[expr, opts…]`, `Text[expr]`, `Item[expr, opts…]` and the form
+/// wrappers. A display pass has to see through them to reach the thing that
+/// actually draws — a `Framed[…]` inside a `Text@TraditionalForm@…` is
+/// still a framed box, and `Pane[Column[{…, Graphics[…]}]]` (the shape of
+/// many Manipulate bodies) is still the column underneath.
+fn unwrap_display_pass_through(expr: &syntax::Expr) -> syntax::Expr {
+  functions::graphics::unwrap_display_wrappers(expr)
+}
+
+/// In visual (notebook) display mode, `ClickPane[expr, …]` and
+/// `LocatorPane[locators, body, …]` display the picture they wrap —
+/// clicking or dragging one is a front-end affordance that the picture
+/// itself does not carry. Without this a Manipulate body that *is* one of
+/// these panes showed only the textual echo of the call.
+fn render_interactive_pane_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  let is_pane = matches!(&expr, syntax::Expr::FunctionCall { name, args }
+    if (name == "ClickPane" || name == "LocatorPane") && args.len() >= 2);
+  if !is_pane {
+    return expr;
+  }
+  let svg = evaluator::dispatch::io_functions::expr_to_svg(&expr);
+  if svg.starts_with("<svg") {
+    graphics_result(svg)
+  } else {
+    expr
+  }
+}
+
+/// In visual (notebook) display mode, `Labeled[graphic, caption, pos]`
+/// displays as the two set beside each other. Without this a Manipulate
+/// body that captions its graphic would show only the textual echo of the
+/// call. (Grid, Column and Row have passes of their own, below.)
+fn render_labeled_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match evaluator::dispatch::io_functions::labeled_display_svg(&expr) {
+    Some(svg) => graphics_result(svg),
+    None => expr,
+  }
+}
+
+/// Pre-render display wrappers (TableForm, MatrixForm, Grid, Framed, Row,
+/// nested Column, Dataset, …) inside an arbitrary expression so they appear
+/// as real `Expr::Graphics` sub-SVGs when embedded into a parent layout
+/// (e.g. items of a `Column[…]`). Plain text / numeric items are returned
+/// unchanged.
+fn render_inline_display_wrapper(expr: &syntax::Expr) -> syntax::Expr {
+  // The top-level pipeline transformations don't recurse into nested
+  // wrapper arguments, so we apply the relevant ones here for a single
+  // sub-expression.
+  let expr = unwrap_display_pass_through(expr);
+  let expr = render_interactive_pane_if_needed(expr);
+  let expr = render_dynamic_if_needed(expr);
+  let expr = render_event_handler_if_needed(expr);
+  let expr = render_grid_if_needed(expr);
+  let expr = render_dataset_if_needed(expr);
+  let expr = render_tabular_if_needed(expr);
+  let expr = render_tableform_if_needed(expr);
+  let expr = render_matrixform_if_needed(expr);
+  let expr = render_traditionalform_list_if_needed(expr);
+  let expr = render_overlay_if_needed(expr);
+  let expr = render_column_if_needed(expr);
+  let expr = render_row_if_needed(expr);
+  let expr = render_treeform_if_needed(expr);
+  let expr = render_framed_if_needed(expr);
+  let expr = render_highlighted_if_needed(expr);
+  // Raw `Graphics[…]` / `Graphics3D[…]` items (e.g. from Plot or
+  // PolyhedronData) are rendered to embedded SVG so a `Column[{plot, …}]`
+  // shows the actual graphic instead of a `-Graphics-` text placeholder.
+  render_graphics_fc_if_needed(expr)
+}
+
+/// In visual (notebook) display mode, `Dynamic[expr, …]` displays the
+/// current value of `expr` — the front end re-evaluates it as its
+/// dependencies change, and Woxi's visual hosts (Playground, Studio)
+/// re-evaluate the whole cell on any control change, so the current value
+/// is the correct rendering. Script/CLI mode keeps the symbolic
+/// `Dynamic[…]` echo to match wolframscript.
+fn render_dynamic_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if !is_visual_mode() {
+    return expr;
+  }
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Dynamic" && !args.is_empty() =>
+    {
+      // Dynamic is HoldFirst: its content arrives unevaluated. Release
+      // the hold; on error keep the symbolic form rather than failing
+      // the whole rendering pipeline.
+      match evaluator::evaluate_expr_to_expr(&args[0]) {
+        Ok(inner) => inner,
+        Err(_) => expr,
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// In visual (notebook) display mode, `EventHandler[content, event-rules…]`
+/// displays `content` — the front end wires the event rules to live mouse
+/// input, which Woxi's visual hosts don't wire through, but the wrapped
+/// content still renders exactly as it would on its own (a Demonstrations
+/// idiom wraps the whole `Dynamic[Show[…]]` display of a Manipulate in an
+/// `EventHandler` to make it click-to-toggle). Script/CLI mode keeps the
+/// symbolic `EventHandler[…]` echo to match wolframscript.
+fn render_event_handler_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  if !is_visual_mode() {
+    return expr;
+  }
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "EventHandler" && !args.is_empty() =>
+    {
+      render_visual_display_pipeline(&args[0])
+    }
+    _ => expr,
+  }
+}
+
+/// The full visual-mode display-rendering pipeline: release `Dynamic[…]`
+/// holds, drop `EventHandler[…]` event rules, and render `TableForm`,
+/// `MatrixForm`, `Column`, `Row`, `Grid`, … wrappers into embedded SVGs.
+/// Used for a cell's top-level result and, recursively, for the content an
+/// `EventHandler[…]` wraps once its event rules have been dropped.
+fn render_visual_display_pipeline(expr: &syntax::Expr) -> syntax::Expr {
+  // A `Pane[content, {width, height}]` reserves a fixed box in the
+  // FrontEnd; capture that now, before `unwrap_display_pass_through`
+  // discards the wrapper below, so the composed picture can be clipped to
+  // it once the passes below have built it. There is no scrollbar in a
+  // static rendering — content taller or wider than the box is silently
+  // cut off there, not drawn past it into a stray sliver of raw markup
+  // underneath (a Demonstration's fixed-size Pane rendered in Woxi
+  // Studio).
+  let pane_box = pane_fixed_size(expr);
+
+  // Strip the wrappers that only say how to set what they hold, so the
+  // passes below see the wrapped content (e.g. Pane[Column[{…,
+  // Graphics[…]}]] renders the column with its embedded graphic). CLI
+  // mode keeps the symbolic Pane[…] echo to match wolframscript.
+  let expr = unwrap_display_pass_through(expr);
+  let expr = render_interactive_pane_if_needed(expr);
+  let expr = render_labeled_if_needed(expr);
+  let expr = render_dynamic_if_needed(expr);
+  let expr = render_event_handler_if_needed(expr);
+  let expr = render_graphics_fc_if_needed(expr);
+  let expr = render_color_if_needed(expr);
+  let expr = render_tableform_if_needed(expr);
+  let expr = render_matrixform_if_needed(expr);
+  let expr = render_traditionalform_list_if_needed(expr);
+  let expr = render_styled_layout_if_needed(expr);
+  let expr = render_overlay_if_needed(expr);
+  let expr = render_column_if_needed(expr);
+  let expr = render_row_if_needed(expr);
+  let expr = render_treeform_if_needed(expr);
+  let expr = render_framed_if_needed(expr);
+  let result = render_highlighted_if_needed(expr);
+
+  match (pane_box, &result) {
+    (Some((w, h)), syntax::Expr::Graphics { svg, .. }) => {
+      let clipped = functions::graphics::clip_svg_to_pane_box(svg, w, h);
+      let mut clipped_result = result.clone();
+      if let syntax::Expr::Graphics { svg, .. } = &mut clipped_result {
+        *svg = clipped;
+      }
+      clipped_result
+    }
+    _ => result,
+  }
+}
+
+/// The `{width, height}` a top-level `Pane[content, {width, height}]`
+/// declares — looking through the same pass-through wrappers
+/// `unwrap_display_wrappers` peels (`Text`, `TraditionalForm`,
+/// `StandardForm`, `DisplayForm`, `Deploy`, `Item`) so a caption'd or
+/// wrapped fixed-size Pane is still found. `None` when the expression
+/// isn't such a Pane, or its size isn't two plain numbers — a single
+/// width, `Automatic`, or `Full` leave the box unconstrained here, the
+/// same as `unwrap_display_wrappers`' unconditional peel handles every
+/// other Pane shape.
+fn pane_fixed_size(expr: &syntax::Expr) -> Option<(f64, f64)> {
+  let mut current = expr;
+  loop {
+    let syntax::Expr::FunctionCall { name, args } = current else {
+      return None;
+    };
+    match name.as_str() {
+      "Text" | "TraditionalForm" | "StandardForm" | "DisplayForm"
+      | "Deploy" | "Item"
+        if !args.is_empty() =>
+      {
+        current = &args[0];
+      }
+      "Pane" if args.len() >= 2 => {
+        let syntax::Expr::List(size) = &args[1] else {
+          return None;
+        };
+        if size.len() != 2 {
+          return None;
+        }
+        let w =
+          evaluator::dispatch::io_functions::pane_size_component(&size[0])?;
+        let h =
+          evaluator::dispatch::io_functions::pane_size_component(&size[1])?;
+        return Some((w, h));
+      }
+      _ => return None,
+    }
+  }
+}
+
+/// If `expr` is `Overlay[{…}]`, composite its items into the one stacked
+/// picture a notebook shows and return `-Graphics-`.
+///
+/// Like `Grid`/`Column`/`Row`, `Overlay` stays symbolic through evaluation —
+/// `Head[Overlay[…]]` is `Overlay`, and CLI mode keeps the
+/// `Overlay[{-Graphics-, …}]` echo wolframscript prints. Only the visual
+/// (notebook) display is the composed picture.
+fn render_overlay_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Overlay" && !args.is_empty() =>
+    {
+      // Pre-render display wrappers inside the items, so an item that is
+      // itself a layout (a `Grid` of plots, say) is drawn rather than
+      // written out as source.
+      let mut new_args: Vec<syntax::Expr> = args.to_vec();
+      if let syntax::Expr::List(items) = &args[0] {
+        new_args[0] = syntax::Expr::List(
+          items.iter().map(render_inline_display_wrapper).collect(),
+        );
+      }
+      match functions::graphics::overlay_svg(&new_args) {
+        Some(svg) => graphics_result(svg),
+        None => expr,
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is `Column[{…}]`, render it as an SVG column and return `-Graphics-`.
+fn render_column_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Column" && !args.is_empty() =>
+    {
+      if let Some(svg) = column_svg_with_rendered_items(args) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// Pre-render display wrappers inside a `Column[…]`'s items (so e.g.
+/// `Column[{"hi", TableForm[{{1,2},{3,4}}]}]` embeds actual graphics rather
+/// than their textual echoes) and render the whole column as a vertical
+/// SVG. `None` when the arguments don't form a renderable column.
+pub(crate) fn column_svg_with_rendered_items(
+  args: &[syntax::Expr],
+) -> Option<String> {
+  let mut new_args: Vec<syntax::Expr> = args.to_vec();
+  if let syntax::Expr::List(items) = &args[0] {
+    let new_items: Vec<syntax::Expr> =
+      items.iter().map(render_inline_display_wrapper).collect();
+    new_args[0] = syntax::Expr::List(new_items.into());
+  }
+  functions::graphics::column_to_svg(&new_args)
+}
+
+/// `Style[Column[{…}], directives…]` / `Style[Row[{…}], …]` displays the
+/// layout it wraps with the directives in force — a `Style` is inherited by
+/// everything inside it, so `Style[Column[{…}], 65, Hue[c]]` is a large
+/// coloured column, not a column at the default size. Distributing the
+/// directives over the items is what lets the layout renderers, which read
+/// each item's own `Style`, apply them. (`Grid`/`TextGrid` take a different
+/// route below: they have their own styled path in `render_grid_if_needed`,
+/// which colours frames and dividers too, not only cells — distributing
+/// directives over the cells first would hide that, and would wrap span
+/// placeholders like `SpanFromLeft` in a `Style` they aren't recognized
+/// through.)
+fn render_styled_layout_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  let syntax::Expr::FunctionCall { name, args } = &expr else {
+    return expr;
+  };
+  if !functions::graphics::is_style_wrapper(name) || args.len() < 2 {
+    return expr;
+  }
+  // Look through pass-through display wrappers (`Text[…]`, `Pane[…]`, …) to
+  // find the Column/Row/Grid underneath — a Demonstration's Manipulate body
+  // commonly styles the whole display as `Style[Text[Column[{…}]], size]`,
+  // not a bare `Style[Column[{…}], size]`. Without this the Style wrapper
+  // never matched, so neither this pass nor the plain Column/Row/Grid passes
+  // below recognized the expression, and the entire body fell back to its
+  // unevaluated text echo instead of rendering at all.
+  let inner = unwrap_display_pass_through(&args[0]);
+  let inner_name = match &inner {
+    syntax::Expr::FunctionCall {
+      name: inner_name, ..
+    } => inner_name.as_str(),
+    _ => return expr,
+  };
+  if !matches!(
+    inner_name,
+    "Column" | "Row" | "Grid" | "TextGrid" | "Dynamic"
+  ) {
+    return expr;
+  }
+  let rendered = match inner_name {
+    "Column" | "Row" => {
+      let Some(styled) =
+        functions::graphics::style_pushed_into_layout(&inner, &args[1..])
+      else {
+        return expr;
+      };
+      if inner_name == "Column" {
+        render_column_if_needed(styled)
+      } else {
+        render_row_if_needed(styled)
+      }
+    }
+    // `Style[Dynamic[…], directives…]` — a Demonstration idiom that styles
+    // (or, as with `DynamicEvaluationTimeout`, merely annotates) a live
+    // display rather than a static layout. The directives carry no visual
+    // meaning for an already-rendered graphic, so releasing the `Dynamic`
+    // hold and dropping them is the same trade `render_event_handler_if_needed`
+    // makes for the event rules it wraps.
+    // Releasing the `Dynamic` hold only gets as far as a symbolic
+    // `Graphics[…]`/`Image[…]` call — same as the top-level pipeline, it
+    // still needs a render pass to turn that into the drawn picture.
+    "Dynamic" => render_graphics_fc_if_needed(render_dynamic_if_needed(inner)),
+    // Rebuild `Style[inner, directives…]` (with the outer wrappers now
+    // stripped) rather than pushing the directives into each cell, so this
+    // hits the same `Style[Grid[…], …]` arm of `render_grid_if_needed` a
+    // bare (unwrapped) styled Grid already takes.
+    _ => {
+      let restyled = syntax::Expr::FunctionCall {
+        name: "Style".to_string(),
+        args: std::iter::once(inner)
+          .chain(args[1..].iter().cloned())
+          .collect::<Vec<_>>()
+          .into(),
+      };
+      render_grid_if_needed(restyled)
+    }
+  };
+  if matches!(
+    rendered,
+    syntax::Expr::Graphics { .. } | syntax::Expr::Image { .. }
+  ) {
+    rendered
+  } else {
+    expr
+  }
+}
+
+/// If `expr` is `Row[{…}]` or `Row[{…}, sep]`, render as a horizontal SVG row.
+fn render_row_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Row" && !args.is_empty() =>
+    {
+      if let Some(svg) = row_svg_with_rendered_items(args) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// Pre-render display wrappers inside a `Row[…]`'s items (so e.g.
+/// `Row[{Graphics[…], Framed[x]}]` embeds actual graphics rather than
+/// their textual echoes) and render the whole row as a horizontal SVG.
+/// `None` when the arguments don't form a renderable row.
+pub(crate) fn row_svg_with_rendered_items(
+  args: &[syntax::Expr],
+) -> Option<String> {
+  let mut new_args: Vec<syntax::Expr> = args.to_vec();
+  if let syntax::Expr::List(items) = &args[0] {
+    let new_items: Vec<syntax::Expr> =
+      items.iter().map(render_inline_display_wrapper).collect();
+    new_args[0] = syntax::Expr::List(new_items.into());
+  }
+  functions::graphics::row_to_svg(&new_args)
+}
+
+/// If `expr` is a `Framed[expr]` call, render it as an SVG box with a border
+/// and return `-Graphics-`. If the expression is a list containing any
+/// `Framed` elements, render the whole list as a Row-like Grid so all
+/// elements appear together in a single graphical output.
+fn render_framed_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Framed" && !args.is_empty() =>
+    {
+      if let Some(svg) = functions::graphics::framed_to_svg(args) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::List(items) if items.iter().any(contains_framed) => {
+      // Render the whole list as a Row-style SVG so all items
+      // (text and Framed) appear together in one graphic.
+      if let Some(svg) = functions::graphics::row_with_framed_to_svg(items) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// Check if an expression is or contains a Framed call.
+fn contains_framed(expr: &syntax::Expr) -> bool {
+  match expr {
+    syntax::Expr::FunctionCall { name, .. } if name == "Framed" => true,
+    syntax::Expr::List(items) => items.iter().any(contains_framed),
+    _ => false,
+  }
+}
+
+/// If `expr` is a `Highlighted[expr]` (or `Highlighted[expr, color]`) call,
+/// render it as an SVG box with a colored background and return `-Graphics-`.
+/// If the expression is a list containing any `Highlighted` elements, render
+/// the whole list as a Row-like layout so all elements appear together.
+fn render_highlighted_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Highlighted" && !args.is_empty() =>
+    {
+      if let Some(svg) = functions::graphics::highlighted_to_svg(args) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::List(items) if items.iter().any(contains_highlighted) => {
+      if let Some(svg) = functions::graphics::row_with_framed_to_svg(items) {
+        graphics_result(svg)
+      } else {
+        expr
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// Check if an expression is or contains a Highlighted call.
+fn contains_highlighted(expr: &syntax::Expr) -> bool {
+  match expr {
+    syntax::Expr::FunctionCall { name, .. } if name == "Highlighted" => true,
+    syntax::Expr::List(items) => items.iter().any(contains_highlighted),
+    _ => false,
+  }
+}
+
+/// If `expr` is `TreeForm[...]`, render it as a tree diagram graphic.
+fn render_treeform_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "TreeForm" && !args.is_empty() =>
+    {
+      match functions::tree_form::tree_form_ast(args) {
+        Ok(result) => result,
+        Err(_) => expr,
+      }
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is a top-level `PolarCurve[…]` or `FilledPolarCurve[…]` call,
+/// render it as a Graphics SVG (visual mode only — the CLI keeps the
+/// symbolic form to match wolframscript). Invalid curve arguments stay
+/// symbolic.
+fn render_polar_curve_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if (name == "PolarCurve" || name == "FilledPolarCurve")
+        && !args.is_empty() =>
+    {
+      functions::graphics::polar_curve_to_graphics(name, args).unwrap_or(expr)
+    }
+    _ => expr,
+  }
+}
+
+/// If `expr` is an unevaluated `Graphics[{...}]` or `Graphics3D[{...}]`
+/// FunctionCall (e.g. returned by VoronoiMesh), render it to SVG.
+/// Also recurses into lists and wrapper forms so that e.g. `{Graphics[...], Graphics[...]}`
+/// and `TableForm[{Graphics[...], ...}]` are rendered correctly.
+fn render_graphics_fc_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  match &expr {
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Graphics" && !args.is_empty() =>
+    {
+      if let Ok(rendered) = functions::graphics::graphics_ast(args) {
+        rendered
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Graphics3D" && !args.is_empty() =>
+    {
+      if let Ok(rendered) = functions::plot3d::graphics3d_ast(args) {
+        rendered
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Graph" && args.len() >= 2 =>
+    {
+      // wolframscript summarises Graph as `Graph[<n>, <m>]` instead of
+      // the `-Graphics-` placeholder. Render the SVG (so jupyter/HTML
+      // surfaces still get it via capture_graphics) but keep the Expr
+      // as the original FunctionCall so expr_to_string can print the
+      // summary. ExportString[Graph[…], "SVG"] re-invokes graph_ast
+      // directly, so it does not depend on this auto-render step.
+      if let Ok(rendered) = functions::graph::graph_ast(args)
+        && let syntax::Expr::Graphics { ref svg, .. } = rendered
+      {
+        capture_graphics(svg);
+      }
+      expr
+    }
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Region" && !args.is_empty() =>
+    {
+      // Region[reg, opts…] displays as a plot of the region (embedding
+      // dimension 2 or 3), like in Wolfram notebooks. Unsupported or
+      // symbolic regions keep the textual Region[…] echo.
+      if let Some(rendered) = functions::region::region_to_graphics(args) {
+        rendered
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::FunctionCall { name, args }
+      if (name == "MeshRegion" || name == "BoundaryMeshRegion")
+        && args.len() >= 2 =>
+    {
+      // Render the mesh as a picture (e.g. from VoronoiMesh, or a
+      // ConvexHullMesh's BoundaryMeshRegion, which also carries a Method
+      // option and so has more than 2 args). A 3D mesh goes through the
+      // ordinary Graphics3D pipeline for its lighting and Show/Part support;
+      // a 2D one uses the flat mesh renderer.
+      let is_3d_mesh = matches!(&args[0], syntax::Expr::List(items)
+        if items.first().is_some_and(|v| matches!(v, syntax::Expr::List(c) if c.len() == 3)));
+      if is_3d_mesh {
+        functions::graphics::mesh_region_to_graphics3d(
+          &args[0],
+          &args[1],
+          &args[2..],
+        )
+        .unwrap_or(expr)
+      } else if let Some(svg) =
+        functions::voronoi::mesh_region_to_svg(&args[0], &args[1])
+      {
+        capture_graphics(&svg);
+        syntax::Expr::Graphics {
+          svg,
+          is_3d: false,
+          source: None,
+          head: None,
+          structure: None,
+        }
+      } else {
+        expr
+      }
+    }
+    syntax::Expr::List(items) => {
+      let new_items: Vec<syntax::Expr> = items
+        .iter()
+        .cloned()
+        .map(render_graphics_fc_if_needed)
+        .collect();
+      syntax::Expr::List(new_items.into())
+    }
+    syntax::Expr::FunctionCall { name, args }
+      if matches!(
+        name.as_str(),
+        "TableForm"
+          | "MatrixForm"
+          | "Column"
+          | "Row"
+          | "Style"
+          | "MathMLForm"
+          | "StandardForm"
+          | "InputForm"
+          | "OutputForm"
+          | "Plus"
+          | "Times"
+          | "Power"
+      ) =>
+    {
+      let new_args: Vec<syntax::Expr> = args
+        .iter()
+        .cloned()
+        .map(render_graphics_fc_if_needed)
+        .collect();
+      syntax::Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args.into(),
+      }
+    }
+    // Arithmetic BinaryOps (Plus, Times, Power, etc.) can carry a
+    // Graphics[...] FunctionCall as a child — wolframscript still
+    // summarizes that inner graphic as `-Graphics-`, so recurse.
+    syntax::Expr::BinaryOp { op, left, right } => syntax::Expr::BinaryOp {
+      op: *op,
+      left: Box::new(render_graphics_fc_if_needed(*left.clone())),
+      right: Box::new(render_graphics_fc_if_needed(*right.clone())),
+    },
+    syntax::Expr::UnaryOp { op, operand } => syntax::Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(render_graphics_fc_if_needed(*operand.clone())),
+    },
+    _ => expr,
+  }
+}
+
+/// Render a layout wrapper that has a picture inside it — `Grid`, `Column`,
+/// `Row`, `Labeled`, `Pane` and the panes built on them — as the single
+/// composed picture a notebook shows, rather than leaving the caller to
+/// pick one of the captured sub-pictures.
+///
+/// `None` for anything that is not such a layout, for a layout with no
+/// picture in it (a `Grid` of strings already lays out correctly as
+/// typeset text), and for a picture that is *already* one graphic —
+/// re-rendering that would only round-trip what was captured.
+fn composed_layout_svg(expr: &syntax::Expr) -> Option<String> {
+  let syntax::Expr::FunctionCall { name, .. } = expr else {
+    return None;
+  };
+  if !matches!(
+    name.as_str(),
+    "Grid"
+      | "Column"
+      | "Row"
+      | "Labeled"
+      | "Overlay"
+      | "Pane"
+      | "Item"
+      | "ClickPane"
+  ) {
+    return None;
+  }
+  if !evaluator::lays_out_a_graphic(expr) {
+    return None;
+  }
+  let svg = evaluator::expr_to_svg(expr);
+  svg.starts_with("<svg").then_some(svg)
+}
+
+/// The SVG an already-evaluated graphics item carries on itself — from
+/// `Expr::Graphics { svg, .. }`, peeling a `Style[…]` wrapper first. `None`
+/// for the bare `-Graphics-`/`-Image-` text placeholder, which carries no
+/// data of its own.
+fn item_embedded_svg(expr: &syntax::Expr) -> Option<String> {
+  match expr {
+    syntax::Expr::Graphics { svg, .. } => Some(svg.clone()),
+    syntax::Expr::FunctionCall { name, args }
+      if name == "Style" && !args.is_empty() =>
+    {
+      item_embedded_svg(&args[0])
+    }
+    _ => None,
+  }
+}
+
+/// If the result is a list (1D, 2D, or 3D) of `-Graphics-` items,
+/// or a `TableForm` wrapping such a list, combine captured SVGs into a grid.
+fn render_graphics_list_if_needed(expr: syntax::Expr) -> syntax::Expr {
+  // Unwrap TableForm[list] or MathMLForm[TableForm[list]] etc.
+  let has_tableform = has_form_wrapper(&expr, "TableForm");
+  let inner = unwrap_form_wrappers(&expr);
+
+  // NB: an empty buffer does *not* mean there's nothing to combine — a
+  // Woxi Studio Manipulate runs its `Initialization` and body as separate
+  // `interpret_with_stdout` calls (each starting with a fresh, empty
+  // buffer), so a body that merely returns an already-built value (e.g.
+  // `pickShow[choice]` handing back a `TableForm[{panelA, panelB}, …]`
+  // assembled during Initialization) triggers no new graphics-producing
+  // calls at all — the items below carry their own embedded SVGs instead
+  // (see `item_embedded_svg`) and don't need the buffer. Only the
+  // positional-slice fallbacks further down actually require it, and they
+  // already guard their own use of `all_svgs`.
+  let all_svgs = get_all_captured_graphics();
+
+  // A layout that holds pictures — `Grid[{{plot1, plot2}, …}]`, a `Column`
+  // of them, a `Pane` around either — is one picture in a notebook, laid
+  // out cell by cell. Without this the captured-graphics buffer only ever
+  // reports its *last* entry, so a Manipulate body that arranges several
+  // plots in a grid (the standard Demonstrations panel) showed a single
+  // one of them and dropped the rest.
+  if let Some(composed) = composed_layout_svg(inner) {
+    clear_captured_graphics();
+    return graphics_result(composed);
+  }
+
+  // 1D list of Graphics
+  if let syntax::Expr::List(items) = inner {
+    if items.iter().all(is_graphics_placeholder) && items.len() > 1 {
+      // Each item's own embedded SVG is authoritative when present. The
+      // shared capture buffer accumulates every graphic created during the
+      // whole statement sequence (e.g. every intermediate assignment in an
+      // Initialization block), and an earlier statement that itself
+      // combined-and-cleared a graphics list (a nested TableForm assigned
+      // to its own variable, say) leaves the buffer's tail no longer
+      // aligned with these items — so a positional "last N" slice of it
+      // can silently pick up stale entries. Only fall back to that
+      // heuristic when an item is a bare `-Graphics-`/`-Image-`
+      // placeholder with no SVG of its own.
+      let row = items
+        .iter()
+        .map(item_embedded_svg)
+        .collect::<Option<Vec<String>>>()
+        .or_else(|| {
+          (items.len() <= all_svgs.len()).then(|| {
+            // Take the last N SVGs (they correspond to the list items)
+            let start = all_svgs.len() - items.len();
+            all_svgs[start..].to_vec()
+          })
+        });
+      if let Some(row) = row
+        && let Some(combined) = functions::graphics::graphics_list_svg(&row)
+      {
+        // Clear and re-capture with the combined SVG
+        clear_captured_graphics();
+        return graphics_result(combined);
+      }
+    }
+
+    // 2D list: list of lists of Graphics
+    if items.iter().all(|e| {
+      if let syntax::Expr::List(inner) = e {
+        inner.iter().all(is_graphics_placeholder) && !inner.is_empty()
+      } else {
+        false
+      }
+    }) && !items.is_empty()
+    {
+      let total_cells: usize = items
+        .iter()
+        .map(|e| {
+          if let syntax::Expr::List(inner) = e {
+            inner.len()
+          } else {
+            0
+          }
+        })
+        .sum();
+      // Prefer each item's own embedded SVG (see the 1D case above for why
+      // the shared capture buffer's positional tail can be stale); fall
+      // back to the buffer heuristic only when some item has no SVG of its
+      // own.
+      let rows = items
+        .iter()
+        .map(|item| match item {
+          syntax::Expr::List(inner) => inner
+            .iter()
+            .map(item_embedded_svg)
+            .collect::<Option<Vec<_>>>(),
+          _ => None,
+        })
+        .collect::<Option<Vec<Vec<String>>>>()
+        .or_else(|| {
+          (total_cells <= all_svgs.len()).then(|| {
+            let start = all_svgs.len() - total_cells;
+            let mut offset = start;
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for item in items {
+              if let syntax::Expr::List(inner) = item {
+                let row: Vec<String> =
+                  all_svgs[offset..offset + inner.len()].to_vec();
+                offset += inner.len();
+                rows.push(row);
+              }
+            }
+            rows
+          })
+        });
+      if let Some(rows) = rows
+        && let Some(combined) =
+          functions::graphics::combine_graphics_svgs(&rows)
+      {
+        clear_captured_graphics();
+        return graphics_result(combined);
+      }
+    }
+
+    // 3D list: list of lists of lists of Graphics
+    // Structure: items[dim1][dim2][dim3]
+    if items.iter().all(|e| {
+      if let syntax::Expr::List(rows) = e {
+        rows.iter().all(|r| {
+          if let syntax::Expr::List(cols) = r {
+            cols.iter().all(is_graphics_placeholder) && !cols.is_empty()
+          } else {
+            false
+          }
+        }) && !rows.is_empty()
+      } else {
+        false
+      }
+    }) && !items.is_empty()
+    {
+      let total_cells: usize = items
+        .iter()
+        .map(|e| {
+          if let syntax::Expr::List(rows) = e {
+            rows
+              .iter()
+              .map(|r| {
+                if let syntax::Expr::List(cols) = r {
+                  cols.len()
+                } else {
+                  0
+                }
+              })
+              .sum()
+          } else {
+            0
+          }
+        })
+        .sum();
+      if total_cells <= all_svgs.len() {
+        let start = all_svgs.len() - total_cells;
+
+        // Collect SVGs into 3D structure [dim1][dim2][dim3]
+        let mut offset = start;
+        let mut svg_3d: Vec<Vec<Vec<String>>> = Vec::new();
+        for item in items {
+          if let syntax::Expr::List(inner_rows) = item {
+            let mut block: Vec<Vec<String>> = Vec::new();
+            for r in inner_rows {
+              if let syntax::Expr::List(cols) = r {
+                let mut row_svgs: Vec<String> = Vec::new();
+                for _ in cols {
+                  if offset < all_svgs.len() {
+                    row_svgs.push(all_svgs[offset].clone());
+                    offset += 1;
+                  }
+                }
+                block.push(row_svgs);
+              }
+            }
+            svg_3d.push(block);
+          }
+        }
+
+        let rows: Vec<Vec<String>> = if has_tableform {
+          // TableForm: transpose each block (dim3→rows, dim2→cols),
+          // stack blocks vertically
+          let mut rows = Vec::new();
+          for block in &svg_3d {
+            let dim3 = block.iter().map(std::vec::Vec::len).max().unwrap_or(0);
+            for k in 0..dim3 {
+              let row: Vec<String> = block
+                .iter()
+                .map(|sub| sub.get(k).cloned().unwrap_or_default())
+                .collect();
+              rows.push(row);
+            }
+          }
+          rows
+        } else {
+          // No TableForm: one row per dim1, flatten dim2×dim3 as columns
+          svg_3d
+            .into_iter()
+            .map(|block| block.into_iter().flatten().collect())
+            .collect()
+        };
+
+        if let Some(combined) =
+          functions::graphics::combine_graphics_svgs(&rows)
+        {
+          clear_captured_graphics();
+          return graphics_result(combined);
+        }
+      }
+    }
+  }
+
+  expr
+}
+
+/// Check if an expression has a specific form wrapper (e.g. "TableForm")
+///
+/// `TableForm` carries its data as the first argument with any options
+/// (`TableDirections -> Row`, `TableSpacing -> {0}`, …) trailing it, so this
+/// looks at `args[0]` rather than requiring exactly one argument — a
+/// `TableForm[data, opts…]` wrapping graphics is the shape every
+/// Demonstrations-style "assemble the panel, TableDirections -> Row" idiom
+/// actually uses. `Style[…]` is peeled through the same way (its directives
+/// carry no meaning for the already-rendered picture this unwrap feeds into,
+/// same trade `is_graphics_placeholder` already makes for individual items)
+/// so a body like `Style[dispatcher[choice], Background -> …]` that resolves
+/// to a `TableForm` of graphics is still recognized.
+fn has_form_wrapper(expr: &syntax::Expr, target: &str) -> bool {
+  match expr {
+    syntax::Expr::FunctionCall { name, args }
+      if !args.is_empty()
+        && matches!(
+          name.as_str(),
+          "TableForm"
+            | "MathMLForm"
+            | "StandardForm"
+            | "InputForm"
+            | "OutputForm"
+            | "TraditionalForm"
+            | "Style"
+        ) =>
+    {
+      name == target || has_form_wrapper(&args[0], target)
+    }
+    _ => false,
+  }
+}
+
+/// Unwrap form wrappers like TableForm, MathMLForm, StandardForm, etc.
+/// See `has_form_wrapper` for why this looks at `args[0]` rather than
+/// requiring exactly one argument.
+fn unwrap_form_wrappers(expr: &syntax::Expr) -> &syntax::Expr {
+  match expr {
+    syntax::Expr::FunctionCall { name, args }
+      if !args.is_empty()
+        && matches!(
+          name.as_str(),
+          "TableForm"
+            | "MathMLForm"
+            | "StandardForm"
+            | "InputForm"
+            | "OutputForm"
+            | "TraditionalForm"
+            | "Style"
+        ) =>
+    {
+      unwrap_form_wrappers(&args[0])
+    }
+    _ => expr,
+  }
+}
+
+/// Generate an SVG rendering of the result expression and capture it.
+/// This is used by the playground to display all results with proper formatting.
+/// Upper bound on the number of atomic tokens the output-SVG typesetter
+/// will process. A larger result (e.g. a full `Import` of a big CSV) would
+/// produce a multi-hundred-MB SVG that no host can usefully display; the
+/// visual hosts fall back to the plain-text rendering when no output SVG is
+/// captured.
+const OUTPUT_SVG_MAX_TOKENS: usize = 20_000;
+
+/// Count atomic tokens in `expr`, stopping early once `budget` is
+/// exhausted. Returns true when the expression is larger than the budget.
+fn expr_exceeds_token_budget(expr: &syntax::Expr, budget: &mut usize) -> bool {
+  expr_exceeds_token_budget_depth(expr, budget, 0)
+}
+
+/// Deeply-nested results (e.g. `Nest[f, x, 500]`) are treated as exceeding the
+/// budget once they pass `MAX_SVG_DEPTH`. This both bounds this counter's own
+/// recursion and makes `generate_output_svg` skip typesetting expressions too
+/// deep for the (unbounded-recursion) box renderer — which would otherwise
+/// overflow the stack.
+fn expr_exceeds_token_budget_depth(
+  expr: &syntax::Expr,
+  budget: &mut usize,
+  depth: usize,
+) -> bool {
+  use syntax::Expr;
+  const MAX_SVG_DEPTH: usize = 256;
+  if *budget == 0 || depth > MAX_SVG_DEPTH {
+    return true;
+  }
+  let d = depth + 1;
+  match expr {
+    Expr::List(items) => items
+      .iter()
+      .any(|e| expr_exceeds_token_budget_depth(e, budget, d)),
+    Expr::FunctionCall { args, .. } => {
+      *budget = budget.saturating_sub(1);
+      args
+        .iter()
+        .any(|e| expr_exceeds_token_budget_depth(e, budget, d))
+    }
+    Expr::Association(pairs) => pairs.iter().any(|(k, v)| {
+      expr_exceeds_token_budget_depth(k, budget, d)
+        || expr_exceeds_token_budget_depth(v, budget, d)
+    }),
+    Expr::BinaryOp { left, right, .. } => {
+      *budget = budget.saturating_sub(1);
+      expr_exceeds_token_budget_depth(left, budget, d)
+        || expr_exceeds_token_budget_depth(right, budget, d)
+    }
+    Expr::UnaryOp { operand, .. } => {
+      *budget = budget.saturating_sub(1);
+      expr_exceeds_token_budget_depth(operand, budget, d)
+    }
+    _ => {
+      *budget = budget.saturating_sub(1);
+      false
+    }
+  }
+}
+
+fn generate_output_svg(expr: &syntax::Expr) {
+  // Very large results are not typeset: the box conversion + glyph layout +
+  // SVG string would each be orders of magnitude bigger than the data
+  // itself (this made large CSV `Import`s appear to hang in the browser).
+  let mut budget = OUTPUT_SVG_MAX_TOKENS;
+  if expr_exceeds_token_budget(expr, &mut budget) {
+    return;
+  }
+  // Skip for Graphics/Image results (they already have captured SVG/HTML)
+  if matches!(expr, syntax::Expr::Identifier(s) if s == "-Graphics-" || s == "-Graphics3D-" || s == "-Image-")
+    || matches!(expr, syntax::Expr::Graphics { .. })
+    || matches!(expr, syntax::Expr::Image { .. })
+  {
+    return;
+  }
+  // Skip for FullForm results — display as plain text in the playground
+  if matches!(expr, syntax::Expr::FunctionCall { name, args } if name == "FullForm" && args.len() == 1)
+  {
+    return;
+  }
+  // QuestionObject renders as a question panel (prompt, answer choices,
+  // Submit button) rather than as typeset expression text.
+  if let Some(svg) = functions::assessment_render::question_object_to_svg(expr)
+  {
+    capture_output_svg(&svg);
+    return;
+  }
+  // Skip SVG for InputForm results — display as plain text
+  if matches!(expr, syntax::Expr::FunctionCall { name, args } if name == "InputForm" && args.len() == 1)
+  {
+    return;
+  }
+  // Skip SVG for CForm/TeXForm/FortranForm — display converted text as plain text
+  if matches!(expr, syntax::Expr::FunctionCall { name, args }
+    if (name == "CForm" || name == "TeXForm" || name == "FortranForm") && args.len() == 1)
+  {
+    return;
+  }
+  // Unwrap StandardForm/TraditionalForm — render SVG for the inner expression.
+  // TraditionalForm routes through the dedicated traditional typesetter so
+  // math renders in conventional notation (∑/∫ operators, invisible HoldForm,
+  // π/∞ glyphs, `sin(x)` instead of `Sin[x]`, …) rather than the literal
+  // StandardForm box tree.
+  let mut traditional = false;
+  let expr = if let syntax::Expr::FunctionCall { name, args } = expr {
+    if (name == "StandardForm" || name == "TraditionalForm") && args.len() == 1
+    {
+      traditional = name == "TraditionalForm";
+      &args[0]
+    } else {
+      expr
+    }
+  } else {
+    expr
+  };
+  // Convert expression to box form, then render boxes to SVG.
+  // RawBoxes[...] and DisplayForm[...] pass their contents directly as boxes.
+  let boxes = if let syntax::Expr::FunctionCall { name, args } = expr {
+    if (name == "RawBoxes" || name == "DisplayForm") && args.len() == 1 {
+      args[0].clone()
+    } else if traditional {
+      evaluator::dispatch::complex_and_special::expr_to_box_form_traditional(
+        expr,
+      )
+    } else {
+      evaluator::dispatch::complex_and_special::expr_to_box_form(expr)
+    }
+  } else if traditional {
+    evaluator::dispatch::complex_and_special::expr_to_box_form_traditional(expr)
+  } else {
+    evaluator::dispatch::complex_and_special::expr_to_box_form(expr)
+  };
+  // The box form of a machine/arbitrary-precision Real carries a trailing
+  // backtick precision marker (e.g. `2.``), matching wolframscript's textual
+  // `MakeBoxes` output. In a typeset display — which the Playground/Studio
+  // SVG emulates — that marker is suppressed, so strip it before layout.
+  let boxes = strip_number_precision_markers(&boxes);
+  let layout = functions::graphics::layout_box(&boxes, 14.0);
+  let text_fill = functions::graphics::theme().text_primary;
+  let svg = functions::graphics::layout_to_svg(&layout, text_fill);
+  capture_output_svg(&svg);
+}
+
+/// Rewrite numeric box-String leaves to their typeset notebook form: the
+/// trailing precision marker is dropped (so a machine real shows `2.` instead
+/// of `` 2.` ``) and an arbitrary-precision real is truncated to its precision
+/// in significant digits (so `` N[Pi, 3] `` shows `3.14`, not all 20 digits).
+/// Recurses through the box tree (RowBox/SuperscriptBox/… → List args).
+pub(crate) fn strip_number_precision_markers(
+  expr: &syntax::Expr,
+) -> syntax::Expr {
+  use syntax::Expr;
+  match expr {
+    Expr::String(s) => {
+      let display = precision_number_display(s).unwrap_or_else(|| s.clone());
+      // A machine/real Real in `mantissa*^exp` scientific notation is stored as
+      // a literal InputForm string (`1.*^10`). Typeset it as `1. × 10^exp` so
+      // the Playground/Studio SVG shows a superscript exponent instead of the
+      // raw `*^`, matching the notebook front-end.
+      match scientific_string_to_box(&display) {
+        Some(boxed) => boxed,
+        // A plain (non-scientific) number gets thin-space digit grouping for
+        // the notebook-style display (`10000000000` → `10 000 000 000`). The
+        // scientific mantissa above is intentionally left ungrouped, matching
+        // the Wolfram notebook.
+        None => Expr::String(functions::graphics::group_digits_str(&display)),
+      }
+    }
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(strip_number_precision_markers)
+        .collect::<Vec<_>>()
+        .into(),
+    ),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(strip_number_precision_markers)
+        .collect::<Vec<_>>()
+        .into(),
+    },
+    other => other.clone(),
+  }
+}
+
+/// If `s` is a real number in `mantissa*^exp` scientific notation, build the
+/// typeset box `RowBox[{mantissa, " × ", SuperscriptBox["10", exp]}]` so the
+/// Playground/Studio SVG renders `1. × 10^10` (with a superscript exponent)
+/// instead of the literal InputForm `1.*^10`. The exponent is an optionally
+/// signed integer; anything else (or no `*^` factor) returns `None`.
+fn scientific_string_to_box(s: &str) -> Option<syntax::Expr> {
+  use syntax::Expr;
+  let idx = s.find("*^")?;
+  let mantissa = &s[..idx];
+  let exp = &s[idx + 2..];
+  if mantissa.is_empty() || exp.is_empty() {
+    return None;
+  }
+  let exp_digits = exp.strip_prefix('-').unwrap_or(exp);
+  if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+    return None;
+  }
+  Some(Expr::FunctionCall {
+    name: "RowBox".to_string(),
+    args: vec![Expr::List(
+      vec![
+        Expr::String(mantissa.to_string()),
+        Expr::String(" \u{00d7} ".to_string()),
+        Expr::FunctionCall {
+          name: "SuperscriptBox".to_string(),
+          args: vec![
+            Expr::String("10".to_string()),
+            Expr::String(exp.to_string()),
+          ]
+          .into(),
+        },
+      ]
+      .into(),
+    )]
+    .into(),
+  })
+}
+
+/// Convert a single numeric token in Wolfram backtick notation to its typeset
+/// notebook display form. Returns `None` when `token` is not a number with a
+/// precision marker, so symbol context names like `` Global` `` (which start
+/// with a letter) are left untouched.
+///
+/// - A machine real (bare backtick, `` 2.` ``) just loses the marker → `2.`.
+/// - An arbitrary-precision real (`` 3.1415…`3. ``) is truncated to its
+///   precision in significant figures → `3.14`.
+/// - A `*^exp` scientific suffix is preserved (`` 1.23`5.*^6 `` → `1.23*^6`).
+fn precision_number_display(token: &str) -> Option<String> {
+  // Numeric leaves start with a digit (negatives are wrapped in a RowBox
+  // with a separate "-" token, so the magnitude leaf is unsigned).
+  if !token.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+    return None;
+  }
+  let tick = token.find('`')?;
+  // The backtick must immediately follow a digit or decimal point.
+  let prev = token[..tick].chars().next_back()?;
+  if !(prev.is_ascii_digit() || prev == '.') {
+    return None;
+  }
+  let mantissa = &token[..tick];
+  // Skip the second backtick of an accuracy form (`` 0``5. ``).
+  let after = &token[tick + 1..];
+  let after = after.strip_prefix('`').unwrap_or(after);
+  // The precision spec is the run of digits/dots after the backtick(s);
+  // anything else (e.g. a `*^exp` scientific suffix) is preserved.
+  let spec_end = after
+    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+    .unwrap_or(after.len());
+  let prec_spec = &after[..spec_end];
+  let suffix = &after[spec_end..];
+  // A parseable precision → round to that many significant digits, keeping
+  // trailing zeros (an arbitrary-precision real shows every requested figure).
+  // A bare backtick marks a machine-precision real: the notebook front end
+  // shows those at 6 significant figures with trailing zeros dropped
+  // (`N[Pi]` → `3.14159`, `0.1 + 0.2` → `0.3`), so round to 6 and trim.
+  let body = match prec_spec.parse::<f64>() {
+    Ok(prec) => {
+      let digits = (prec.round() as i64).max(1) as usize;
+      round_significant(mantissa, digits)
+    }
+    Err(_) => drop_trailing_frac_zeros(&round_significant(mantissa, 6)),
+  };
+  Some(format!("{body}{suffix}"))
+}
+
+/// Round the unsigned decimal `mantissa` (e.g. `"3.1415926"`, `"0.00123"`, no
+/// sign or precision marker) to `prec` significant figures for notebook
+/// display, matching Wolfram's `N[Pi, 4]` → `3.142`. Magnitude is preserved
+/// with placeholder zeros in the integer part (`314.159` → 2 sig figs →
+/// `310.`), rounding carries propagate (`9.99` → 2 sig figs → `10.`), and a
+/// trailing decimal point is always kept so an approximate real still reads as
+/// `3.` rather than `3`. When `prec` exceeds the digits available the result is
+/// padded with trailing zeros, because an arbitrary-precision real shows every
+/// figure its precision claims (`N[28, 6]` → `28.0000`, `3.14`5` → `3.1400`).
+pub(crate) fn round_significant(mantissa: &str, prec: usize) -> String {
+  let prec = prec.max(1);
+  let (int_s, frac_s) = match mantissa.find('.') {
+    Some(i) => (&mantissa[..i], &mantissa[i + 1..]),
+    None => (mantissa, ""),
+  };
+  // Flatten to a digit stream and record the decimal point position (the
+  // number of integer digits), so each digit's place value is known.
+  let digits: Vec<u8> = int_s
+    .chars()
+    .chain(frac_s.chars())
+    .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+    .collect();
+  let point_pos = int_s.chars().filter(char::is_ascii_digit).count() as isize;
+
+  // Index of the first significant (non-zero) digit; a zero value shows "0.".
+  let Some(fs) = digits.iter().position(|&d| d != 0) else {
+    return "0.".to_string();
+  };
+
+  let avail = digits.len() - fs;
+  let keep = prec.min(avail);
+  let mut kept = digits[fs..fs + keep].to_vec();
+  // Place-value exponent of the first kept digit (10^lead_exp).
+  let mut lead_exp = point_pos - 1 - fs as isize;
+
+  // Round half-up using the first dropped digit, propagating any carry. A
+  // carry out of the front (all nines) grows the magnitude by one place.
+  if keep < avail && digits[fs + keep] >= 5 {
+    let mut i = kept.len();
+    loop {
+      if i == 0 {
+        kept.insert(0, 1);
+        kept.truncate(prec); // drop the now-redundant trailing zero
+        lead_exp += 1;
+        break;
+      }
+      i -= 1;
+      if kept[i] == 9 {
+        kept[i] = 0;
+      } else {
+        kept[i] += 1;
+        break;
+      }
+    }
+  }
+
+  // Show every figure the precision claims, padding when the stored digits
+  // run out (`28.` at 6 significant figures displays as `28.0000`).
+  kept.resize(prec, 0);
+
+  let m = kept.len() as isize;
+  let tail_exp = lead_exp - (m - 1);
+  // Digit at a given place-value exponent (kept digits, else placeholder 0).
+  let digit_at = |exp: isize| -> char {
+    if (tail_exp..=lead_exp).contains(&exp) {
+      (b'0' + kept[(lead_exp - exp) as usize]) as char
+    } else {
+      '0'
+    }
+  };
+
+  let mut int_str = String::new();
+  for exp in (0..=lead_exp.max(0)).rev() {
+    int_str.push(digit_at(exp));
+  }
+  let mut frac_str = String::new();
+  if tail_exp < 0 {
+    for exp in (tail_exp..=-1).rev() {
+      frac_str.push(digit_at(exp));
+    }
+  }
+  format!("{int_str}.{frac_str}")
+}
+
+/// Drop trailing zeros from the fractional part of an `int.frac` decimal string
+/// while always keeping the decimal point (`0.300000` → `0.3`, `2.` → `2.`,
+/// `100.` → `100.`). Only fractional zeros are trimmed; integer-part zeros carry
+/// magnitude and stay. Used for machine-precision real display, which shows no
+/// trailing zeros (unlike a fixed arbitrary-precision real).
+fn drop_trailing_frac_zeros(s: &str) -> String {
+  match s.split_once('.') {
+    Some((int_s, frac_s)) => {
+      format!("{}.{}", int_s, frac_s.trim_end_matches('0'))
+    }
+    None => s.to_string(),
+  }
+}
+
+/// Number of significant figures a Wolfram front end shows for a
+/// machine-precision real (`MachinePrecision` values print as `0.333333`,
+/// `492.44`, `1.23457*^10`), independent of the ~17 digits the `double`
+/// actually round-trips through.
+const MACHINE_REAL_DISPLAY_DIGITS: usize = 6;
+
+/// Round `f` to the [`MACHINE_REAL_DISPLAY_DIGITS`] significant figures a
+/// front end displays, so the existing [`syntax::format_real`] then renders the
+/// notebook form (`492.44000000000005` → `492.44`, `999999.6` → `1.*^6`, the
+/// `1e-5`/`1e6` scientific thresholds still applied to the *rounded* value).
+/// Zero and non-finite values are returned unchanged.
+fn round_machine_real_display(f: f64) -> f64 {
+  if !f.is_finite() || f == 0.0 {
+    return f;
+  }
+  format!("{:.prec$e}", f, prec = MACHINE_REAL_DISPLAY_DIGITS - 1)
+    .parse()
+    .unwrap_or(f)
+}
+
+/// Display form of an arbitrary-precision real: the InputForm rendering with
+/// the backtick precision marker dropped and the mantissa rounded to that
+/// precision (`` 3.14159265358979323846…`20. `` → `3.1415926535897932385`).
+/// Any `*^exp` scientific suffix is preserved.
+fn bigfloat_display(digits: &str, prec: f64) -> String {
+  let full = syntax::format_bigfloat(digits, prec);
+  let (sign, body) = match full.strip_prefix('-') {
+    Some(rest) => ("-", rest),
+    None => ("", full.as_str()),
+  };
+  match precision_number_display(body) {
+    Some(shown) => format!("{sign}{shown}"),
+    None => full,
+  }
+}
+
+/// Rewrite every inexact number in `expr` to the digits a front end actually
+/// prints: a machine real to 6 significant figures and an arbitrary-precision
+/// real to its stored precision without the backtick marker.
+///
+/// `wolframscript`'s terminal REPL prints results in OutputForm, which shows
+/// only those digits, while `wolframscript -code` prints the full round-trip
+/// InputForm — `3203.60 - 2711.16` is `492.44` in the REPL and
+/// `492.44000000000005` from `-code`. Woxi mirrors that split: `woxi repl`
+/// applies this transform to the *printed* expression only, so `%` / `Out[]`
+/// still resolve to the unrounded value, and `woxi eval` does not apply it
+/// at all.
+pub(crate) fn to_display_precision(expr: &syntax::Expr) -> syntax::Expr {
+  use syntax::Expr;
+  functions::string_ast::map_expr_tree(expr, &|e| match e {
+    Expr::Real(f) => Some(Expr::Real(round_machine_real_display(*f))),
+    // Rendered eagerly: no Expr variant can hold a marker-free
+    // arbitrary-precision decimal, and `Raw` prints verbatim.
+    Expr::BigFloat(digits, prec) => {
+      Some(Expr::Raw(bigfloat_display(digits, *prec)))
+    }
+    // `map_expr_tree` stops at function bodies on purpose (slot scoping);
+    // display rounding has no scope, so recurse into them here.
+    Expr::Function { body } => Some(Expr::Function {
+      body: Box::new(to_display_precision(body)),
+    }),
+    Expr::NamedFunction {
+      params,
+      body,
+      bracketed,
+    } => Some(Expr::NamedFunction {
+      params: params.clone(),
+      body: Box::new(to_display_precision(body)),
+      bracketed: *bracketed,
+    }),
+    _ => None,
+  })
+}
+
+/// Rewrite every arbitrary-precision real in a flat output string to its
+/// notebook display form: the backtick precision marker is removed and the
+/// mantissa truncated to its precision in significant figures
+/// (`` {3.1415…`1., 3.1415…`3.} `` → `{3., 3.14}`). Machine-real text carries
+/// no marker, so it passes through unchanged.
+///
+/// The CLI / `eval` result string keeps the backtick InputForm (it must match
+/// `wolframscript -code`), so notebook front-ends (Woxi Studio) apply this at
+/// the display layer only.
+pub fn truncate_precision_reals(text: &str) -> String {
+  let bytes = text.as_bytes();
+  let n = bytes.len();
+  let mut out = String::with_capacity(n);
+  let mut i = 0;
+  // Whether the previous char continues an identifier/number, so a digit that
+  // follows it starts no fresh number token (e.g. the `2` in the symbol `x2`).
+  let mut in_word = false;
+  while i < n {
+    let c = bytes[i];
+    if c.is_ascii_digit() && !in_word {
+      let start = i;
+      let mut j = i;
+      while j < n && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+        j += 1;
+      }
+      if j < n && bytes[j] == b'`' {
+        // Consume the marker: an optional second backtick, the precision
+        // digits/dots, then an optional `*^exp` scientific suffix.
+        let mut k = j + 1;
+        if k < n && bytes[k] == b'`' {
+          k += 1;
+        }
+        while k < n && (bytes[k].is_ascii_digit() || bytes[k] == b'.') {
+          k += 1;
+        }
+        if k + 1 < n && bytes[k] == b'*' && bytes[k + 1] == b'^' {
+          k += 2;
+          if k < n && bytes[k] == b'-' {
+            k += 1;
+          }
+          while k < n && bytes[k].is_ascii_digit() {
+            k += 1;
+          }
+        }
+        if let Some(display) = precision_number_display(&text[start..k]) {
+          out.push_str(&display);
+          i = k;
+          in_word = true;
+          continue;
+        }
+      }
+      // Not a precision token — copy the scanned digits verbatim.
+      out.push_str(&text[start..j]);
+      i = j;
+      in_word = true;
+      continue;
+    }
+    let ch = text[i..].chars().next().unwrap();
+    let len = ch.len_utf8();
+    out.push_str(&text[i..i + len]);
+    // A following digit continues a symbol iff this char is alphanumeric, an
+    // underscore, or a context backtick.
+    in_word = ch.is_ascii_alphanumeric() || ch == '_' || ch == '`';
+    i += len;
+  }
+  scientific_to_caret(&out)
+}
+
+/// Rewrite the InputForm scientific-notation operator `*^` (as in `1.5*^-8`) to
+/// the readable `×10^` form for plain-text notebook display (Woxi Studio):
+/// `1.*^10` → `1.×10^10`, `1.5*^-8` → `1.5×10^-8`. `*^` only ever occurs as a
+/// real literal's exponent marker, always immediately after a digit or `.`, so
+/// the guard on the preceding character leaves any other `*` / `^` untouched.
+/// The Playground/Studio SVG path renders the exponent as a true superscript
+/// via [`scientific_string_to_box`]; the plain-text widget cannot, so the base
+/// stays inline with a caret.
+fn scientific_to_caret(text: &str) -> String {
+  let mut out = String::with_capacity(text.len() + 8);
+  let mut prev: Option<char> = None;
+  let mut chars = text.chars().peekable();
+  while let Some(c) = chars.next() {
+    if c == '*'
+      && chars.peek() == Some(&'^')
+      && prev.is_some_and(|p| p.is_ascii_digit() || p == '.')
+    {
+      chars.next(); // consume the '^'
+      out.push_str("\u{00d7}10^");
+      prev = Some('^');
+    } else {
+      out.push(c);
+      prev = Some(c);
+    }
+  }
+  out
+}
+
+/// Expand Wolfram character escape sequences to UTF-8 characters:
+///   `\.HH`     → 2-digit hex code point (ASCII range)
+///   `\:HHHH`   → 4-digit hex code point (BMP)
+///   `\OOO`     → 3-digit octal code point
+/// Inside string literals (`"..."`), the leading `\\` (literal backslash) is
+/// preserved unchanged so the string parser still sees its own escapes.
+/// Outside strings, escapes are expanded directly. Other escape sequences
+/// like `\n`, `\[Name]`, `\"` are left untouched for the string parser /
+/// named-character handler to deal with.
+/// Normalize the modifier-letter circumflex `ˆ` (U+02C6) to the ASCII caret
+/// `^` so it acts as the Power operator. Some keyboards (notably macOS, where
+/// the `^` dead key emits a lone modifier circumflex) produce U+02C6 instead of
+/// U+005E. Because U+02C6 is a Unicode letter (category Lm), the grammar would
+/// otherwise swallow it into an identifier (e.g. `xˆ2` → symbol `xˆ`), so we
+/// fix it at the source. Characters inside string literals are left untouched.
+fn normalize_circumflex_operator(input: &str) -> String {
+  if !input.contains('\u{02C6}') {
+    return input.to_string();
+  }
+  let mut result = String::with_capacity(input.len());
+  let mut in_string = false;
+  let mut chars = input.chars().peekable();
+  while let Some(ch) = chars.next() {
+    if ch == '"' {
+      in_string = !in_string;
+      result.push(ch);
+      continue;
+    }
+    if in_string {
+      result.push(ch);
+      // Preserve escapes (e.g. `\"`) verbatim so a quote inside the escape
+      // doesn't flip the string state.
+      if ch == '\\'
+        && let Some(next) = chars.next()
+      {
+        result.push(next);
+      }
+      continue;
+    }
+    result.push(if ch == '\u{02C6}' { '^' } else { ch });
+  }
+  result
+}
+
+fn expand_char_escapes(input: &str) -> String {
+  // Fast path: no backslash means nothing to do.
+  if !input.contains('\\') {
+    return input.to_string();
+  }
+  let chars: Vec<char> = input.chars().collect();
+  let len = chars.len();
+  let mut result = String::with_capacity(input.len());
+  let mut i = 0;
+  let mut in_string = false;
+  while i < len {
+    let ch = chars[i];
+    if ch == '"' {
+      in_string = !in_string;
+      result.push(ch);
+      i += 1;
+      continue;
+    }
+    if ch != '\\' {
+      result.push(ch);
+      i += 1;
+      continue;
+    }
+    // `ch == '\\'` here. Decide what kind of escape follows.
+    let next = chars.get(i + 1).copied();
+    // Inside strings, `\\` is a literal-backslash escape — preserve it so the
+    // string parser still produces a single backslash.
+    if in_string && next == Some('\\') {
+      result.push('\\');
+      result.push('\\');
+      i += 2;
+      continue;
+    }
+    match next {
+      Some('.')
+        // `\.HH` — 2 hex digits
+        if i + 3 < len
+          && chars[i + 2].is_ascii_hexdigit()
+          && chars[i + 3].is_ascii_hexdigit()
+        => {
+          let hex: String = [chars[i + 2], chars[i + 3]].iter().collect();
+          if let Ok(code) = u32::from_str_radix(&hex, 16)
+            && let Some(c) = char::from_u32(code)
+          {
+            result.push(c);
+            i += 4;
+            continue;
+          }
+        }
+      Some(':')
+        // `\:HHHH` — 4 hex digits
+        if i + 5 < len
+          && chars[i + 2].is_ascii_hexdigit()
+          && chars[i + 3].is_ascii_hexdigit()
+          && chars[i + 4].is_ascii_hexdigit()
+          && chars[i + 5].is_ascii_hexdigit()
+        => {
+          let hex: String =
+            [chars[i + 2], chars[i + 3], chars[i + 4], chars[i + 5]]
+              .iter()
+              .collect();
+          if let Ok(code) = u32::from_str_radix(&hex, 16)
+            && let Some(c) = char::from_u32(code)
+          {
+            result.push(c);
+            i += 6;
+            continue;
+          }
+        }
+      Some(d) if ('0'..='7').contains(&d)
+        // `\OOO` — 3 octal digits (must all be 0-7).
+        && i + 3 < len
+          && ('0'..='7').contains(&chars[i + 2])
+          && ('0'..='7').contains(&chars[i + 3])
+        => {
+          let oct: String =
+            [chars[i + 1], chars[i + 2], chars[i + 3]].iter().collect();
+          if let Ok(code) = u32::from_str_radix(&oct, 8)
+            && let Some(c) = char::from_u32(code)
+          {
+            result.push(c);
+            i += 4;
+            continue;
+          }
+        }
+      _ => {}
+    }
+    // Not a recognized escape — emit the backslash and continue.
+    result.push(ch);
+    i += 1;
+  }
+  result
+}
+
+/// Does the code on this line end in a `;;` (a complete `Span`) rather than
+/// in a statement separator? Both are spelled with `;`, so the trailing run
+/// decides: an even run is `;;` (or `;;;;`) and the line still needs a
+/// separator after it, an odd one ends in a `;` that already separates.
+fn ends_with_span_separator(code_tail: &str) -> bool {
+  let semicolons = code_tail.chars().rev().take_while(|c| *c == ';').count();
+  semicolons > 0 && semicolons % 2 == 0
+}
+
+/// Append a code character to a line's rolling tail, keeping the tail bounded.
+/// Whitespace is skipped, so `f[x] \[Star]` ends in `\[Star]` either way.
+fn push_code_tail(tail: &mut String, ch: char) {
+  if ch.is_whitespace() {
+    return;
+  }
+  tail.push(ch);
+  // 32 bytes comfortably covers the longest named operator.
+  if tail.len() > 64 {
+    let cut = (tail.len() - 32..tail.len())
+      .find(|i| tail.is_char_boundary(*i))
+      .unwrap_or(0);
+    tail.drain(..cut);
+  }
+}
+
+/// Insert semicolons at top-level newline boundaries so the parser treats
+/// each logical line as a separate statement.  Newlines inside brackets,
+/// parentheses or braces are left alone (they're part of a multiline expression).
+/// Lines that already end with `;` or `:=` are also left alone.
+pub fn insert_statement_separators(input: &str) -> String {
+  // Fast path: no newlines means nothing to do
+  if !input.contains('\n') {
+    return input.to_string();
+  }
+
+  let mut result = String::with_capacity(input.len() + 32);
+  let mut depth: i32 = 0; // nesting depth of [], (), {}
+  let mut in_string = false;
+  let mut comment_depth: i32 = 0;
+  let mut line_has_code = false; // whether the current line has non-whitespace, non-comment content
+  let mut last_code_char: Option<char> = None; // last meaningful (non-comment) character
+  let mut prev_code_char: Option<char> = None; // second-to-last meaningful character
+  // Tail of the current line's code with whitespace squeezed out, so a
+  // trailing multi-character operator (`\[Star]`) can be recognized — a
+  // single `last_code_char` of `]` cannot tell it from a closing bracket.
+  let mut code_tail = String::new();
+  // Deferred semicolon: instead of inserting `;` immediately at a newline,
+  // we record the position where it should go. We only actually insert it
+  // when we later encounter actual code on a subsequent line. This avoids
+  // adding a spurious trailing `;` when only comments/whitespace follow.
+  let mut pending_semi_pos: Option<usize> = None;
+  let chars: Vec<char> = input.chars().collect();
+  let len = chars.len();
+  let mut i = 0;
+
+  while i < len {
+    let ch = chars[i];
+
+    // Track comment state: (* ... *) with nesting support
+    if !in_string && i + 1 < len && ch == '(' && chars[i + 1] == '*' {
+      comment_depth += 1;
+      result.push(ch);
+      i += 1;
+      continue;
+    }
+    if comment_depth > 0 && i + 1 < len && ch == '*' && chars[i + 1] == ')' {
+      comment_depth -= 1;
+      result.push(ch);
+      result.push(chars[i + 1]);
+      i += 2;
+      continue;
+    }
+    if comment_depth > 0 {
+      result.push(ch);
+      i += 1;
+      continue;
+    }
+
+    // A backslash inside a string escapes the character after it, so `\"`
+    // does not close the string and `\\` before a quote does not stop that
+    // quote from closing it. Without this, a regular expression written as a
+    // string literal flips the in-string state and every statement boundary
+    // after it is misjudged.
+    if in_string && ch == '\\' && i + 1 < len {
+      result.push(ch);
+      result.push(chars[i + 1]);
+      prev_code_char = Some(ch);
+      last_code_char = Some(chars[i + 1]);
+      push_code_tail(&mut code_tail, ch);
+      push_code_tail(&mut code_tail, chars[i + 1]);
+      i += 2;
+      continue;
+    }
+
+    // Track string state
+    if ch == '"' {
+      in_string = !in_string;
+      // A string is actual code — flush any pending semicolon
+      if let Some(pos) = pending_semi_pos.take() {
+        result.insert(pos, ';');
+      }
+      result.push(ch);
+      line_has_code = true;
+      prev_code_char = last_code_char;
+      last_code_char = Some(ch);
+      push_code_tail(&mut code_tail, ch);
+      i += 1;
+      continue;
+    }
+    if in_string {
+      result.push(ch);
+      prev_code_char = last_code_char;
+      last_code_char = Some(ch);
+      push_code_tail(&mut code_tail, ch);
+      i += 1;
+      continue;
+    }
+
+    // Handle line continuation: backslash followed by newline
+    if ch == '\\' && i + 1 < len && chars[i + 1] == '\n' {
+      // Skip both the backslash and the newline — the next line continues this one
+      i += 2;
+      continue;
+    }
+
+    // Track nesting depth (including <| |> for associations)
+    if ch == '<' && i + 1 < len && chars[i + 1] == '|' {
+      depth += 1;
+      // Push both characters and advance past them
+      if let Some(pos) = pending_semi_pos.take() {
+        result.insert(pos, ';');
+      }
+      line_has_code = true;
+      prev_code_char = Some('<');
+      last_code_char = Some('|');
+      push_code_tail(&mut code_tail, '<');
+      push_code_tail(&mut code_tail, '|');
+      result.push('<');
+      result.push('|');
+      i += 2;
+      continue;
+    } else if ch == '|' && i + 1 < len && chars[i + 1] == '>' {
+      depth -= 1;
+      if let Some(pos) = pending_semi_pos.take() {
+        result.insert(pos, ';');
+      }
+      line_has_code = true;
+      prev_code_char = Some('|');
+      last_code_char = Some('>');
+      push_code_tail(&mut code_tail, '|');
+      push_code_tail(&mut code_tail, '>');
+      result.push('|');
+      result.push('>');
+      i += 2;
+      continue;
+    }
+    match ch {
+      '[' | '(' | '{' => depth += 1,
+      ']' | ')' | '}' => depth -= 1,
+      _ => {}
+    }
+
+    if ch == '\n' && depth == 0 {
+      // Only add `;` if the current line had actual code (not just comments/whitespace)
+      // and doesn't already end with `;` or `:=` or `/:` (TagSet continuation)
+      // or an operator character (indicating the expression continues on the next line)
+      let ends_with_set_delayed =
+        last_code_char == Some('=') && prev_code_char == Some(':');
+      let ends_with_tag_set =
+        last_code_char == Some(':') && prev_code_char == Some('/');
+      // Line ending with an operator means the expression continues on the next line.
+      // `>` alone is the Greater operator; `<>` is StringJoin; `->`, `:>`, `>>`, `>>>`
+      // all end in `>`. Treating any trailing `>` as a continuation covers all forms.
+      let ends_with_operator = matches!(
+        last_code_char,
+        Some('+' | '-' | '*' | '/' | '^' | '@' | '~' | ',' | '=' | '<' | '>' | '|')
+      ) || (last_code_char == Some('&')
+        && prev_code_char == Some('&')) // &&
+        || (last_code_char == Some('.')
+        && prev_code_char == Some('/')); // /. or //.
+      // `!` at end of line is ambiguous: postfix Factorial (`5!`) or prefix
+      // Not (`:= ! palindromeQ@...`). Treat it as a continuation when the
+      // preceding code char is one that can't be a value (operators or
+      // openers), since only then is the `!` necessarily prefix Not.
+      let ends_with_prefix_not = last_code_char == Some('!')
+        && matches!(
+          prev_code_char,
+          Some(
+            '='
+              | '&'
+              | '|'
+              | ','
+              | ';'
+              | '{'
+              | '('
+              | '['
+              | '+'
+              | '-'
+              | '*'
+              | '/'
+              | '^'
+              | '@'
+              | '~'
+              | '<'
+              | '>'
+          )
+        );
+      let needs_semi = line_has_code
+        && (last_code_char != Some(';')
+          || ends_with_span_separator(&code_tail))
+        && !ends_with_set_delayed
+        && !ends_with_tag_set
+        && !ends_with_operator
+        && !ends_with_prefix_not
+        && !syntax::ends_with_continuing_named_operator(&code_tail);
+
+      if needs_semi {
+        // Defer the semicolon — record position before the newline
+        pending_semi_pos = Some(result.len());
+      }
+      result.push('\n');
+
+      // Reset line tracking
+      line_has_code = false;
+      last_code_char = None;
+      prev_code_char = None;
+      code_tail.clear();
+    } else if ch == '\n' {
+      // Newline inside nesting — just pass through
+      result.push(ch);
+    } else {
+      if !ch.is_whitespace() {
+        // Actual code encountered — flush any pending semicolon
+        if let Some(pos) = pending_semi_pos.take() {
+          result.insert(pos, ';');
+        }
+        line_has_code = true;
+        prev_code_char = last_code_char;
+        last_code_char = Some(ch);
+        push_code_tail(&mut code_tail, ch);
+      }
+      result.push(ch);
+    }
+
+    i += 1;
+  }
+
+  result
+}
+
+/// Split input into top-level statements at newline boundaries.
+/// Respects bracket nesting (newlines inside `[]`, `()`, `{}` are kept),
+/// strings, comments, and `:=` continuations.
+pub fn split_into_statements(input: &str) -> Vec<String> {
+  // Normalize CRLF to LF so line continuation and newline handling work
+  // consistently regardless of line ending style.
+  let input = if input.contains('\r') {
+    std::borrow::Cow::Owned(input.replace("\r\n", "\n").replace('\r', "\n"))
+  } else {
+    std::borrow::Cow::Borrowed(input)
+  };
+  let trimmed = input.trim();
+  if trimmed.is_empty() {
+    return vec![String::new()];
+  }
+  if !trimmed.contains('\n') {
+    return vec![trimmed.to_string()];
+  }
+
+  let mut statements = Vec::new();
+  let mut current = String::with_capacity(trimmed.len());
+  let mut depth: i32 = 0;
+  let mut in_string = false;
+  let mut comment_depth: i32 = 0;
+  let mut line_has_code = false;
+  let mut current_has_code = false; // tracks whether the current buffer has actual code (not just comments/whitespace)
+  let mut last_code_char: Option<char> = None;
+  let mut prev_code_char: Option<char> = None;
+  // See `insert_statement_separators`: a trailing `\[Star]` is only visible in
+  // the whitespace-squeezed tail, not in `last_code_char`.
+  let mut code_tail = String::new();
+  let chars: Vec<char> = trimmed.chars().collect();
+  let len = chars.len();
+  let mut i = 0;
+
+  while i < len {
+    let ch = chars[i];
+
+    // Handle line continuation: backslash followed by newline
+    if !in_string
+      && comment_depth == 0
+      && ch == '\\'
+      && i + 1 < len
+      && chars[i + 1] == '\n'
+    {
+      // Skip both the backslash and the newline — the next line continues this one
+      i += 2;
+      continue;
+    }
+
+    // Track comment state: (* ... *) with nesting support
+    if !in_string && i + 1 < len && ch == '(' && chars[i + 1] == '*' {
+      comment_depth += 1;
+      current.push(ch);
+      i += 1;
+      continue;
+    }
+    if comment_depth > 0 && i + 1 < len && ch == '*' && chars[i + 1] == ')' {
+      comment_depth -= 1;
+      current.push(ch);
+      current.push(chars[i + 1]);
+      i += 2;
+      continue;
+    }
+    if comment_depth > 0 {
+      current.push(ch);
+      i += 1;
+      continue;
+    }
+
+    // A backslash inside a string escapes the character after it, so `\"`
+    // does not close the string and `\\` before a quote does not stop that
+    // quote from closing it. Without this, a regular expression written as a
+    // string literal flips the in-string state and every statement boundary
+    // after it is misjudged.
+    if in_string && ch == '\\' && i + 1 < len {
+      current.push(ch);
+      current.push(chars[i + 1]);
+      prev_code_char = Some(ch);
+      last_code_char = Some(chars[i + 1]);
+      push_code_tail(&mut code_tail, ch);
+      push_code_tail(&mut code_tail, chars[i + 1]);
+      i += 2;
+      continue;
+    }
+
+    // Track string state
+    if ch == '"' {
+      in_string = !in_string;
+      current.push(ch);
+      line_has_code = true;
+      prev_code_char = last_code_char;
+      last_code_char = Some(ch);
+      push_code_tail(&mut code_tail, ch);
+      i += 1;
+      continue;
+    }
+    if in_string {
+      current.push(ch);
+      prev_code_char = last_code_char;
+      last_code_char = Some(ch);
+      push_code_tail(&mut code_tail, ch);
+      i += 1;
+      continue;
+    }
+
+    // Track nesting depth (including <| |> for associations)
+    if ch == '<' && i + 1 < len && chars[i + 1] == '|' {
+      depth += 1;
+      line_has_code = true;
+      current_has_code = true;
+      prev_code_char = Some('<');
+      last_code_char = Some('|');
+      push_code_tail(&mut code_tail, '<');
+      push_code_tail(&mut code_tail, '|');
+      current.push('<');
+      current.push('|');
+      i += 2;
+      continue;
+    } else if ch == '|' && i + 1 < len && chars[i + 1] == '>' {
+      depth -= 1;
+      line_has_code = true;
+      current_has_code = true;
+      prev_code_char = Some('|');
+      last_code_char = Some('>');
+      push_code_tail(&mut code_tail, '|');
+      push_code_tail(&mut code_tail, '>');
+      current.push('|');
+      current.push('>');
+      i += 2;
+      continue;
+    }
+    match ch {
+      '[' | '(' | '{' => depth += 1,
+      ']' | ')' | '}' => depth -= 1,
+      _ => {}
+    }
+
+    if ch == '\n' && depth == 0 {
+      let ends_with_set_delayed =
+        last_code_char == Some('=') && prev_code_char == Some(':');
+      let ends_with_tag_set =
+        last_code_char == Some(':') && prev_code_char == Some('/');
+      // /; (Condition) at end of line means the expression continues
+      let ends_with_condition =
+        last_code_char == Some(';') && prev_code_char == Some('/');
+      // Line ending with an operator means the expression continues
+      let ends_with_operator = matches!(
+        last_code_char,
+        Some('+' | '-' | '*' | '/' | '^' | '@' | '~' | ',' | '=' | '<' | '|')
+      ) || (last_code_char == Some('>')
+        && matches!(prev_code_char, Some('-' | ':' | '>')))
+        || (last_code_char == Some('&') && prev_code_char == Some('&'));
+      // Trailing `!` is prefix Not (and thus a continuation) when the
+      // previous code char is an operator/opener rather than a value.
+      let ends_with_prefix_not = last_code_char == Some('!')
+        && matches!(
+          prev_code_char,
+          Some(
+            '='
+              | '&'
+              | '|'
+              | ','
+              | ';'
+              | '{'
+              | '('
+              | '['
+              | '+'
+              | '-'
+              | '*'
+              | '/'
+              | '^'
+              | '@'
+              | '~'
+              | '<'
+              | '>'
+          )
+        );
+
+      let should_split = line_has_code
+        && !ends_with_set_delayed
+        && !ends_with_tag_set
+        && !ends_with_condition
+        && !ends_with_operator
+        && !ends_with_prefix_not
+        && !syntax::ends_with_continuing_named_operator(&code_tail);
+
+      if should_split {
+        let stmt = current.trim().to_string();
+        if !stmt.is_empty() {
+          statements.push(stmt);
+        }
+        current.clear();
+        current_has_code = false;
+      } else {
+        current.push(ch);
+      }
+
+      line_has_code = false;
+      last_code_char = None;
+      prev_code_char = None;
+      code_tail.clear();
+    } else if ch == '\n' {
+      // Newline inside nesting — just pass through
+      current.push(ch);
+    } else {
+      if !ch.is_whitespace() {
+        line_has_code = true;
+        current_has_code = true;
+        prev_code_char = last_code_char;
+        last_code_char = Some(ch);
+        push_code_tail(&mut code_tail, ch);
+      }
+      current.push(ch);
+    }
+
+    i += 1;
+  }
+
+  let stmt = current.trim().to_string();
+  if !stmt.is_empty() && current_has_code {
+    statements.push(stmt);
+  }
+
+  if statements.is_empty() {
+    statements.push(String::new());
+  }
+
+  statements
+}
+
+/// Try to evaluate a simple function call without full parsing.
+/// Returns Some(result) if successfully handled, None if needs full parsing.
+/// Report a boolean fast-path result both as text and as an expression.
+/// Recorded after the argument scan, so an element this path evaluated on
+/// the way (`MemberQ[{f[1], 2}, 2]`) cannot be left behind as the result.
+fn bool_fast_path_result(value: bool) -> String {
+  let text = if value { "True" } else { "False" };
+  set_fast_path_result_expr(syntax::Expr::Identifier(text.to_string()));
+  text.to_string()
+}
+
+fn try_fast_function_call(
+  input: &str,
+) -> Option<Result<String, InterpreterError>> {
+  // Pattern: FunctionName[arg1, arg2, ...]
+  // Must start with a letter and have exactly one balanced [...] pair at the end
+
+  let open_bracket = input.find('[')?;
+  if !input.ends_with(']') {
+    return None;
+  }
+
+  let func_name = &input[..open_bracket];
+  // Validate function name is a simple identifier
+  if func_name.is_empty()
+    || !func_name
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    || !func_name.chars().next().unwrap().is_ascii_alphabetic()
+  {
+    return None;
+  }
+
+  let args_str = &input[open_bracket + 1..input.len() - 1];
+
+  // Check for nested brackets (indicates complex expression)
+  let mut depth = 0;
+  for c in args_str.chars() {
+    match c {
+      '[' => depth += 1,
+      ']' => depth -= 1,
+      _ => {}
+    }
+    if depth < 0 {
+      return None; // Unbalanced
+    }
+  }
+  // After processing, we should be at depth 0 for well-formed args
+
+  // Split arguments by comma (respecting nested structures)
+  let args = split_args(args_str);
+
+  // Handle specific functions that are commonly called
+  match func_name {
+    "MemberQ" => {
+      if args.len() != 2 {
+        return None;
+      }
+      let elem_expr = args[1].trim();
+
+      // If the second argument looks like a pattern, skip the fast path
+      // and let the full evaluator handle it with proper pattern matching
+      if elem_expr.contains('_')
+        || elem_expr.starts_with("Repeated")
+        || elem_expr.starts_with("Alternatives")
+        || elem_expr.contains("Pattern[")
+        || elem_expr.contains("Blank[")
+      {
+        return None;
+      }
+
+      // First arg should be a list, second is the element to find
+      let list_str = args[0].trim();
+
+      // Evaluate the element expression
+      let Ok(target) = interpret(elem_expr) else {
+        return None;
+      };
+      // A pattern needs real matching, not the literal comparison below.
+      // The textual check above misses the heads that constrain a match
+      // without spelling a blank (`Except[2]`, `Except[0]?NumericQ`), so
+      // ask the canonical predicate once the element has been parsed.
+      if syntax::string_to_expr(&target)
+        .is_ok_and(|e| evaluator::pattern_matching::contains_pattern(&e))
+      {
+        return None;
+      }
+
+      // Parse the list
+      if !list_str.starts_with('{') || !list_str.ends_with('}') {
+        return None; // Not a literal list, need full parsing
+      }
+
+      let inner = &list_str[1..list_str.len() - 1];
+      let list_elems = split_args(inner);
+
+      // Check if target is in the list
+      for elem in list_elems {
+        let elem = elem.trim();
+        // Evaluate the list element so it is compared in the same form the
+        // target is: `interpret` renders a string literal without its
+        // quotes, so comparing the raw source text made
+        // `MemberQ[{"x"}, "x"]` False.
+        let elem_val = match interpret(elem) {
+          Ok(v) => v,
+          Err(_) => elem.to_string(),
+        };
+        if elem_val == target {
+          return Some(Ok(bool_fast_path_result(true)));
+        }
+      }
+      Some(Ok(bool_fast_path_result(false)))
+    }
+    // First/Rest intentionally have no fast path: the AST
+    // implementations carry the conformant ::nofirst/::norest/::normal
+    // message behavior.
+    _ => None,
+  }
+}
+
+/// Split a comma-separated argument list, respecting nested structures
+fn split_args(s: &str) -> Vec<String> {
+  let mut args = Vec::new();
+  let mut current = String::new();
+  let mut depth = 0;
+
+  for c in s.chars() {
+    match c {
+      '{' | '[' | '(' => {
+        depth += 1;
+        current.push(c);
+      }
+      '}' | ']' | ')' => {
+        depth -= 1;
+        current.push(c);
+      }
+      ',' if depth == 0 => {
+        args.push(current.trim().to_string());
+        current.clear();
+      }
+      _ => {
+        current.push(c);
+      }
+    }
+  }
+  if !current.is_empty() {
+    args.push(current.trim().to_string());
+  }
+  args
+}
+
+/// Parse and evaluate a single expression, returning the raw `Expr` so
+/// callers can inspect the evaluated AST (e.g. to detect a held
+/// `Manipulate[…]` call). Only the first top-level expression in
+/// `input` is evaluated.
+///
+/// Unlike `interpret` this does not format the result as a string, so
+/// held function calls like `Manipulate[…]` are preserved as
+/// `Expr::FunctionCall` values.
+/// The grammar's `Statement` rule alternatives, as they appear among a
+/// `Program`'s children.
+///
+/// Every place that walks a parsed program has to agree on this set. Two bugs
+/// came from copies of it drifting apart: a definition whose left side carries
+/// a pattern parses as `FunctionDefinition`, and loops that only looked for
+/// `Expression` silently threw it away. `interpret`'s own classifier (which
+/// needs the pest pair, not an `Expr`) matches these same rules explicitly.
+pub(crate) fn is_statement_rule(rule: Rule) -> bool {
+  matches!(
+    rule,
+    Rule::Expression
+      | Rule::FunctionDefinition
+      | Rule::TagSetDelayed
+      | Rule::TagSet
+      | Rule::TagUnset
+  )
+}
+
+/// Bring source text into the shape the grammar expects, exactly as
+/// `interpret` does before parsing: LF line endings, expanded Wolfram
+/// character escapes (`\.HH`, `\:HHHH`, `\OOO`), the modifier-letter
+/// circumflex read as `^`, and a statement break at every top-level
+/// newline.
+///
+/// Notebook cells store non-ASCII characters in escaped form, so without
+/// the expansion a held expression — the `Manipulate` a Studio cell builds
+/// its controls from — keeps the literal escape text where the evaluated
+/// string has the character. And without the statement breaks, a cell
+/// reading `f[x_] := x + 1⏎g[y_] := f[y]` parses as one statement with an
+/// implicit multiplication across the line break, leaving only the first
+/// symbol defined.
+fn normalize_source(input: &str) -> String {
+  let normalized = if input.contains('\r') {
+    input.replace("\r\n", "\n").replace('\r', "\n")
+  } else {
+    input.to_string()
+  };
+  let normalized = if normalized.contains('\\') {
+    expand_char_escapes(&normalized)
+  } else {
+    normalized
+  };
+  let normalized = normalize_circumflex_operator(&normalized);
+  insert_statement_separators(normalized.trim())
+}
+
+/// Parse the program in `input` into its statements, without evaluating.
+fn parse_statements(
+  input: &str,
+) -> Result<Vec<syntax::Expr>, InterpreterError> {
+  let normalized = normalize_source(input);
+  let mut pairs = parse(&normalized).map_err(|e| {
+    InterpreterError::EvaluationError(format!("Parse error: {e}"))
+  })?;
+  let program = pairs.next().ok_or(InterpreterError::EmptyInput)?;
+  if program.as_rule() != Rule::Program {
+    return Err(InterpreterError::EvaluationError(format!(
+      "Expected Program, got {:?}",
+      program.as_rule()
+    )));
+  }
+  Ok(
+    program
+      .into_inner()
+      .filter(|node| is_statement_rule(node.as_rule()))
+      .map(syntax::pair_to_expr)
+      .collect(),
+  )
+}
+
+/// Parse source text into a single expression *without* evaluating it, so
+/// held and unevaluated forms stay intact. Several statements come back as
+/// one `CompoundExpression`, the way `a; b` reads.
+pub fn parse_to_expr(input: &str) -> Result<syntax::Expr, InterpreterError> {
+  let mut statements = parse_statements(input)?;
+  match statements.len() {
+    0 => Err(InterpreterError::EmptyInput),
+    1 => Ok(statements.remove(0)),
+    _ => Ok(syntax::Expr::CompoundExpr(statements)),
+  }
+}
+
+pub fn interpret_to_expr(
+  input: &str,
+) -> Result<syntax::Expr, InterpreterError> {
+  // Evaluate every statement and return the last value, as `interpret` does.
+  // Returning at the first `Expression` made `"a = 1; {a}"` come back as `1`,
+  // and skipping the other `Statement` alternatives dropped a definition
+  // whose left side carries a pattern (`f[x_] := …`) on the floor.
+  with_entry_stack(|| {
+    let mut last: Option<syntax::Expr> = None;
+    for expr in parse_statements(input)? {
+      last = Some(settle_termination(evaluator::evaluate_expr_to_expr(&expr))?);
+    }
+    last.ok_or(InterpreterError::EmptyInput)
+  })
+}
+
+/// Run `evaluate` with the output capture buffers and visual mode that a
+/// notebook-style host expects, and collect everything it produced into an
+/// [`InterpretResult`]. Shared by the text and expression entry points so
+/// the two cannot drift apart.
+fn with_capture<F>(evaluate: F) -> Result<InterpretResult, InterpreterError>
+where
+  F: FnOnce() -> Result<String, InterpreterError>,
+{
+  // Clear the capture buffers
+  clear_captured_stdout();
+  clear_captured_graphics();
+  clear_captured_graphicsbox();
+  clear_captured_warnings();
+  clear_captured_output_svg();
+  clear_captured_sound();
+  // Drop any structured result left over from a previous evaluation, so a
+  // failed or value-less one cannot report the older tree.
+  take_last_result_expr();
+
+  // Enable visual mode for display wrapper rendering (e.g. TableForm → Grid SVG)
+  VISUAL_MODE.with(|v| *v.borrow_mut() = true);
+
+  // Capture the top-level Expr so `%` resolves to this cell's result in
+  // subsequent evaluations. The cache is set at the moment evaluation
+  // completes (inside the dispatch loop) via `set_last_output`, so we
+  // do nothing here besides keep the value put there.
+  let result = evaluate();
+
+  // Reset visual mode
+  VISUAL_MODE.with(|v| *v.borrow_mut() = false);
+
+  let result = result?;
+  let expr = take_last_result_expr();
+
+  // Get the captured output
+  let stdout = get_captured_stdout();
+  let graphics = get_captured_graphics();
+  let output_svg = get_captured_output_svg();
+  let sound = get_captured_sound();
+  let warnings = get_captured_warnings();
+
+  // When `Information[…]` (or the `?sym` / `?Plot*` shortcuts) captured a
+  // styled SVG card, suppress the textual `InformationData[…]` echo so the
+  // visual host (playground, woxi-studio) shows only the graphical card.
+  // The CLI path is unaffected because it calls `interpret()` directly.
+  let result = if graphics.is_some()
+    && (result.starts_with("InformationData[")
+      || result.starts_with("InformationDataGrid["))
+    && (result.ends_with("|>]")
+      || result.ends_with("False]")
+      || result.ends_with("True]"))
+  {
+    String::new()
+  } else {
+    result
+  };
+
+  // Return stdout, result, and any graphical output
+  Ok(InterpretResult {
+    stdout,
+    result,
+    expr,
+    graphics,
+    output_svg,
+    sound,
+    warnings,
+  })
+}
+
+/// New interpret function that returns both stdout and the result
+pub fn interpret_with_stdout(
+  input: &str,
+) -> Result<InterpretResult, InterpreterError> {
+  with_capture(|| interpret(input))
+}
+
+/// Evaluate an already-built expression tree, capturing stdout, graphics and
+/// warnings the way [`interpret_with_stdout`] does for source text. Lets a
+/// host submit an expression it constructed itself — the Python bindings'
+/// `evaluate_expr` — without going through a string round-trip.
+pub fn interpret_expr_with_stdout(
+  expr: &syntax::Expr,
+) -> Result<InterpretResult, InterpreterError> {
+  with_capture(|| {
+    with_entry_stack(|| {
+      let evaluated =
+        settle_termination(evaluator::evaluate_expr_to_expr(expr))?;
+      Ok(format_top_level_result(evaluated, 0))
+    })
+  })
+}
+
+pub fn func_attrs_contains(func_name: &str, attr: u32) -> bool {
+  FUNC_ATTRS.with(|m| {
+    m.borrow()
+      .get(func_name)
+      .is_some_and(|attrs| attrs.contains(attr))
+  })
+}
+
+pub fn func_attrs_removed_contains(func_name: &str, attr: u32) -> bool {
+  FUNC_ATTRS_REMOVED.with(|m| {
+    m.borrow()
+      .get(func_name)
+      .is_some_and(|attrs| attrs.contains(attr))
+  })
+}
+
+fn store_function_definition(
+  pair: Pair<Rule>,
+) -> Result<Option<String>, InterpreterError> {
+  use evaluator::Attributes as A;
+  // FunctionDefinition  :=  Identifier "[" (Pattern ("," Pattern)*)? "]" ":=" Expression
+  // pest pairs are not Clone, so capture the source slices around ":=".
+  let (raw_lhs, raw_rhs) = {
+    let span = pair.as_span().as_str();
+    span.split_once(":=").map_or_else(
+      || (span.trim().to_string(), String::new()),
+      |(l, r)| (l.trim().to_string(), r.trim().to_string()),
+    )
+  };
+  let mut inner = pair.into_inner();
+  let func_name = inner.next().unwrap().as_str().to_owned(); // Identifier
+
+  // A symbol holding an association gains a key rather than a DownValue:
+  // `s = <|"a" -> 1|>; s[n_Integer] := n + 100` writes the entry
+  // `n_Integer :> n + 100`, which no lookup ever matches. `set_delayed_ast`
+  // knows that rule, so hand the definition to it rather than storing one.
+  let holds_association = ENV.with(|e| {
+    matches!(
+      e.borrow().get(&func_name),
+      Some(StoredValue::Association(_))
+    )
+  });
+  if holds_association
+    && let Ok(lhs_expr) = syntax::string_to_expr(&raw_lhs)
+    && let Ok(rhs_expr) = syntax::string_to_expr(&raw_rhs)
+  {
+    evaluator::assignment::set_delayed_ast(&lhs_expr, &rhs_expr)?;
+    return Ok(None);
+  }
+
+  // Reject assignments to built-in Protected heads (e.g. `Sin`,
+  // `Plus`, …). wolframscript emits `SetDelayed::write: Tag <h>
+  // in <lhs> is Protected.` and returns `$Failed`. Special case:
+  // `N[sym, …] := body` is stored as an NValue on `sym` instead
+  // of as a DownValue on `N`, so wolframscript allows it even
+  // though `N` is Protected. Treat that pattern as not-rejected.
+  // Heads where wolframscript allows DownValue-shaped assignment
+  // (the rule is redirected to a per-symbol mechanism — NValues
+  // for `N`, Messages for `MessageName`, Format/Default/Options
+  // for the formatting heads, etc.).
+  let allows_redirected_rule = matches!(
+    func_name.as_str(),
+    "N" | "MessageName" | "Format" | "Default" | "Options"
+  );
+  let is_n_value_assignment = allows_redirected_rule;
+  let was_unprotected = func_attrs_removed_contains(&func_name, A::Protected);
+  let is_builtin_protected = !is_n_value_assignment
+    && !was_unprotected
+    && evaluator::get_builtin_attributes(&func_name).contains(A::Protected);
+  let is_user_protected = func_attrs_contains(&func_name, A::Protected);
+  if is_builtin_protected || is_user_protected {
+    let (tag, ret) = if is_builtin_protected && !is_user_protected {
+      ("SetDelayed::write", Some("$Failed".to_string()))
+    } else {
+      ("SetDelayed::wrsym", None)
+    };
+    emit_message(&format!(
+      "{tag}: Tag {func_name} in {raw_lhs} is Protected."
+    ));
+    return Ok(ret);
+  }
+
+  // Collect all pattern parameters with their optional conditions, defaults, and head constraints
+  let mut params = Vec::new();
+  let mut conditions: Vec<Option<syntax::Expr>> = Vec::new();
+  let mut defaults: Vec<Option<syntax::Expr>> = Vec::new();
+  let mut heads: Vec<Option<String>> = Vec::new();
+  let mut blank_types: Vec<u8> = Vec::new();
+  let mut body_pair = None;
+  let mut has_any_condition = false;
+
+  // The dispatch condition for a `?test` slot. A plain Blank (`bt == 1`)
+  // binds `param` to a single expression, so `test[param]` checks it
+  // directly. A BlankSequence/BlankNullSequence (`bt >= 2`) binds `param`
+  // to a `Sequence[...]` of zero or more matched arguments instead —
+  // applying `test` to that directly would splice it into `test`'s own
+  // argument list at evaluation time (`test[Sequence[a, b]]` becomes the
+  // two-argument call `test[a, b]`, and `test[Sequence[]]` becomes
+  // `test[]`), rather than testing each element the way `x___?test`
+  // matches in real Wolfram (vacuously true when the sequence is empty).
+  // A `__StructuralPattern__` marker routes such a slot through
+  // `structural_slot_match` in `evaluate_functions.rs`, which checks the
+  // test against each element individually.
+  fn pattern_test_condition(
+    param_name: &str,
+    head: Option<String>,
+    bt: u8,
+    test_expr: syntax::Expr,
+  ) -> syntax::Expr {
+    if bt >= 2 {
+      syntax::Expr::FunctionCall {
+        name: "__StructuralPattern__".to_string(),
+        args: vec![
+          syntax::Expr::Identifier(param_name.to_string()),
+          syntax::Expr::PatternTest {
+            name: param_name.to_string(),
+            head,
+            blank_type: bt,
+            test: Box::new(test_expr),
+          },
+        ]
+        .into(),
+      }
+    } else {
+      syntax::Expr::FunctionCall {
+        name: syntax::expr_to_string(&test_expr),
+        args: vec![syntax::Expr::Identifier(param_name.to_string())].into(),
+      }
+    }
+  }
+
+  for item in inner {
+    match item.as_rule() {
+      Rule::PatternCondition => {
+        // PatternCondition = { PatternName ~ "_" ~ "/;" ~ ConditionExpr }
+        let mut pat_inner = item.into_inner();
+        let param_name = pat_inner.next().unwrap().as_str().to_owned();
+        // The second child is the ConditionExpr
+        let cond_pair = pat_inner.next().unwrap();
+        let cond_expr = syntax::pair_to_expr(cond_pair);
+        params.push(param_name);
+        conditions.push(Some(cond_expr));
+        defaults.push(None);
+        heads.push(None);
+        blank_types.push(1);
+        has_any_condition = true;
+      }
+      Rule::PatternOptionalSimple => {
+        // PatternOptionalSimple = { PatternName ~ "_" ~ ":" ~ Term }
+        let mut pat_inner = item.into_inner();
+        let param_name = pat_inner.next().unwrap().as_str().to_owned();
+        let default_pair = pat_inner.next().unwrap();
+        let default_expr = syntax::pair_to_expr(default_pair);
+        params.push(param_name);
+        conditions.push(None);
+        defaults.push(Some(default_expr));
+        heads.push(None);
+        blank_types.push(1);
+      }
+      Rule::PatternOptionalWithHead => {
+        // PatternOptionalWithHead = { PatternName ~ "_" ~ Identifier ~ ":" ~ Term }
+        let mut pat_inner = item.into_inner();
+        let param_name = pat_inner.next().unwrap().as_str().to_owned();
+        let head_name = pat_inner.next().unwrap().as_str().to_owned();
+        let default_pair = pat_inner.next().unwrap();
+        let default_expr = syntax::pair_to_expr(default_pair);
+        params.push(param_name);
+        conditions.push(None);
+        defaults.push(Some(default_expr));
+        heads.push(Some(head_name));
+        blank_types.push(1);
+      }
+      Rule::PatternOptionalDefaultSimple => {
+        // PatternOptionalDefaultSimple = { PatternName? ~ "_" ~ "." }
+        let mut pat_inner = item.into_inner();
+        let param_name = pat_inner
+          .next()
+          .map(|p| p.as_str().to_owned())
+          .unwrap_or_default();
+        let position = params.len() + 1;
+        params.push(param_name);
+        conditions.push(None);
+        // `x_.` resolves its default from `Default[func, position]` at
+        // dispatch time. Store that as the placeholder so the runtime
+        // lookup chain (which falls through to `Default[func]`) supplies
+        // the user-set value (matching Wolfram's `f[x_.] := ...` +
+        // `Default[f] = c` semantics).
+        defaults.push(Some(syntax::Expr::FunctionCall {
+          name: "Default".to_string(),
+          args: vec![
+            syntax::Expr::Identifier(func_name.clone()),
+            syntax::Expr::Integer(position as i128),
+          ]
+          .into(),
+        }));
+        heads.push(None);
+        blank_types.push(1);
+      }
+      Rule::PatternWithHead => {
+        // Extract parameter name and head (e.g., "x_List" -> name="x", head="List")
+        // The name is optional (`PatternName? ~ PatternBlanks ~ Identifier`),
+        // so an anonymous `_String` yields the head as the only child.
+        let full = item.as_str();
+        let children: Vec<_> = item.into_inner().collect();
+        let (param_name, head_name) = match children.as_slice() {
+          [name, head, ..] => {
+            (name.as_str().to_owned(), head.as_str().to_owned())
+          }
+          [head] => (String::new(), head.as_str().to_owned()),
+          [] => (String::new(), String::new()),
+        };
+        let blank_count = full[param_name.len()..]
+          .trim_start()
+          .chars()
+          .take_while(|&c| c == '_')
+          .count();
+        params.push(param_name);
+        conditions.push(None);
+        defaults.push(None);
+        heads.push(Some(head_name));
+        blank_types.push(blank_count.min(3) as u8);
+      }
+      Rule::PatternTest => {
+        // PatternTest: x_?test or _?test or x_Head?test or _Head?test etc.
+        let full_str = item.as_str();
+        let mut pat_inner = item.into_inner();
+        let first = pat_inner.next().unwrap();
+        // `(x_)?test` — the brackets only group, so read the pattern they
+        // hold and treat it as if it had been written without them.
+        if first.as_rule() == Rule::PatternTestLhsParen {
+          let inner = first.into_inner().next().map_or(
+            syntax::Expr::Identifier(String::new()),
+            syntax::pair_to_expr,
+          );
+          let test_expr = syntax::pair_to_expr(pat_inner.next().unwrap());
+          let (param_name, head, bt) = match &inner {
+            syntax::Expr::Pattern {
+              name,
+              head,
+              blank_type,
+            } => (name.clone(), head.clone(), *blank_type),
+            _ => (format!("__pt{}", params.len()), None, 1u8),
+          };
+          let param_name = if param_name.is_empty() {
+            format!("__pt{}", params.len())
+          } else {
+            param_name
+          };
+          conditions.push(Some(pattern_test_condition(
+            &param_name,
+            head.clone(),
+            bt,
+            test_expr,
+          )));
+          params.push(param_name);
+          defaults.push(None);
+          heads.push(head);
+          blank_types.push(bt);
+          has_any_condition = true;
+          continue;
+        }
+        let (param_name, remaining) = if first.as_rule() == Rule::PatternName {
+          (first.as_str().to_owned(), pat_inner.next().unwrap())
+        } else {
+          // Anonymous blank _?test — generate a placeholder param name
+          (format!("__pt{}", params.len()), first)
+        };
+        // Check for optional head (PatternTestHead)
+        let (head, test_pair) = if remaining.as_rule() == Rule::PatternTestHead
+        {
+          (
+            Some(remaining.as_str().to_owned()),
+            pat_inner.next().unwrap(),
+          )
+        } else {
+          (None, remaining)
+        };
+        // Extract blank_type from underscores between name and ?
+        // Skip auto-generated names when computing offset
+        let name_offset = if param_name.starts_with("__pt") {
+          0
+        } else {
+          param_name.len()
+        };
+        let bt = full_str[name_offset..]
+          .chars()
+          .take_while(|&c| c == '_')
+          .count()
+          .min(3) as u8;
+        let test_expr = syntax::pair_to_expr(test_pair);
+        // Build condition: testFunc[paramName] for a plain Blank, or a
+        // per-element structural check for a BlankSequence/BlankNullSequence
+        // (see `pattern_test_condition`).
+        let cond_expr =
+          pattern_test_condition(&param_name, head.clone(), bt, test_expr);
+        params.push(param_name);
+        conditions.push(Some(cond_expr));
+        defaults.push(None);
+        heads.push(head);
+        blank_types.push(bt);
+        has_any_condition = true;
+      }
+      Rule::PatternSimple => {
+        // Extract parameter name and blank type from pattern
+        // "x_" -> (name="x", blank_type=1), "u__" -> (name="u", blank_type=2), "v___" -> (name="v", blank_type=3)
+        // The rule's span can carry trailing whitespace — pest skips it
+        // inside the rule, before the closing lookahead — so `f[x_ ] := x`
+        // would otherwise store the parameter as `"x_ "` with no blank,
+        // leaving `x` unbound in the body.
+        let s = item.as_str().trim();
+        let blank_count = s.chars().rev().take_while(|&c| c == '_').count();
+        let name = s[..s.len() - blank_count].trim_end();
+        params.push(name.to_owned());
+        conditions.push(None);
+        defaults.push(None);
+        heads.push(None);
+        blank_types.push(blank_count.min(3) as u8);
+      }
+      Rule::Expression
+      | Rule::ExpressionNoImplicit
+      | Rule::CompoundExpression => {
+        body_pair = Some(item);
+      }
+      _ => {}
+    }
+  }
+
+  // Convert body to AST instead of storing as string
+  let raw_body_expr = syntax::pair_to_expr(body_pair.ok_or_else(|| {
+    InterpreterError::EvaluationError("Missing function body".into())
+  })?);
+
+  // f[x_] := body /; test parses as `body = Condition[actual_body, test]`.
+  // Keep the Condition wrapper on the stored body so DownValues can show
+  // the original `body /; test` form. Dispatch treats `Condition[expr,
+  // False]` as "skip this rule", which preserves the runtime guard
+  // behavior even though we no longer mirror the test in the parameter
+  // condition slots.
+  let body_expr = if let syntax::Expr::FunctionCall { ref name, args: _ } =
+    raw_body_expr
+    && name == "Condition"
+  {
+    has_any_condition = true;
+    raw_body_expr
+  } else {
+    raw_body_expr
+  };
+
+  // A pattern variable repeated across the argument list (`f[i_, i_] := …`)
+  // constrains the arguments to be identical; lower it before the definition
+  // is filed so dispatch enforces it.
+  evaluator::assignment::constrain_repeated_params(
+    &mut params,
+    &mut conditions,
+    &heads,
+    &blank_types,
+  );
+  let has_any_condition =
+    has_any_condition || conditions.iter().any(std::option::Option::is_some);
+
+  // Resolve the definition's symbols against the contexts open while the
+  // line is read: the head, the pattern variables (symbols of their own in
+  // the Wolfram Language), the head constraints and everything in the body.
+  // Outside a package every one of these resolves to itself.
+  let (func_name, params, conditions, defaults, heads, body_expr) = {
+    use evaluator::contexts::{resolve, rewrite};
+    let rewrite_opt = |e: &Option<syntax::Expr>| e.as_ref().map(rewrite);
+    (
+      resolve(&func_name),
+      params.iter().map(|p| resolve(p)).collect::<Vec<_>>(),
+      conditions.iter().map(rewrite_opt).collect::<Vec<_>>(),
+      defaults.iter().map(rewrite_opt).collect::<Vec<_>>(),
+      heads
+        .iter()
+        .map(|h| h.as_ref().map(|h| resolve(h)))
+        .collect::<Vec<_>>(),
+      rewrite(&body_expr),
+    )
+  };
+
+  // `rule_dominates` below may evaluate a candidate rule's default/condition
+  // expressions (e.g. to compare `x_:f[]` against another optional default)
+  // and that evaluation can reach `get_defined_names`, which reads
+  // `FUNC_DEFS` itself. Holding this thread local's `borrow_mut` across that
+  // call would panic on the reentrant borrow, so the retain — the only step
+  // that actually mutates `entry` — runs under its own short borrow, and the
+  // rule-ordering comparison runs against a snapshot taken after it, with no
+  // borrow of `FUNC_DEFS` live.
+  let snapshot: Vec<_> = FUNC_DEFS.with(|m| {
+    let mut defs = m.borrow_mut();
+    let entry = defs.entry(func_name.clone()).or_insert_with(Vec::new);
+    let arity = params.len();
+    if has_any_condition {
+      // Conditional definition: only remove existing definitions with same arity
+      // that have the exact same conditions (re-definition of same pattern)
+      // For simplicity, just append - Wolfram keeps all conditional defs
+    } else {
+      // Unconditional definition: remove only other unconditional defs with same arity,
+      // same blank_types, AND same head constraints (keep conditional definitions and defs
+      // with different blank patterns or different heads,
+      // e.g. f[u_] and f[u__] are distinct overloads,
+      // and f[x_Integer] and f[x_String] are distinct overloads).
+      //
+      // A `/;` guard (`f[x_] := body /; test`) is stored as a `Condition`
+      // wrapper on the BODY, not in the parameter `conds` slots, so it must
+      // be detected via the body too — otherwise a later same-pattern
+      // unconditional rule would wrongly delete the guarded rule. In Wolfram,
+      // `f[a_,b_] := f[b,a] /; a>b` and `f[a_,b_] := …` are distinct
+      // DownValues and both are retained.
+      let new_repeats =
+        evaluator::pattern_matching::repeated_param_pairs(&params);
+      entry.retain(|(p, conds, d, h, bt, body)| {
+        p.len() != arity
+          || bt != &blank_types
+          || h != &heads
+          // Repeated pattern variables are part of the pattern, not just a
+          // naming choice: `f[i_, i_]` constrains its two slots to be equal
+          // while `f[j_, k_]` does not, so they are distinct DownValues and
+          // neither redefines the other.
+          || evaluator::pattern_matching::repeated_param_pairs(p)
+            != new_repeats
+          // Optional (defaulted) positions distinguish overloads: `f[x_, y_]`
+          // and `f[x_, y_:0]` are separate DownValues, so keep an existing rule
+          // whose optional-arg pattern differs from the new one's.
+          || d.iter()
+            .map(std::option::Option::is_some)
+            .ne(defaults.iter().map(std::option::Option::is_some))
+          || conds.iter().any(std::option::Option::is_some)
+          || evaluator::assignment::body_is_conditional(body)
+      });
+    }
+    entry.clone()
+  });
+  // Add the new definition with parsed AST, conditions, defaults, and head constraints.
+  // Insert by the rule partial order: place the new rule before the first
+  // existing rule it strictly dominates (is more specific than). Rules it does
+  // not dominate — including incomparable ones, such as a guarded but
+  // structurally looser rule vs an unguarded tighter one — keep definition
+  // order, matching Wolfram.
+  let pos = snapshot
+    .iter()
+    .position(|(p, c, d, h, bt, b)| {
+      crate::evaluator::assignment::rule_dominates(
+        &params,
+        &heads,
+        &blank_types,
+        &conditions,
+        &defaults,
+        &body_expr,
+        p,
+        h,
+        bt,
+        c,
+        d,
+        b,
+      )
+    })
+    .unwrap_or(snapshot.len());
+  FUNC_DEFS.with(|m| {
+    let mut defs = m.borrow_mut();
+    let entry = defs.entry(func_name).or_insert_with(Vec::new);
+    // `entry` may have grown or shrunk since the snapshot if `rule_dominates`
+    // reentrantly stored another definition; clamp rather than panic.
+    let pos = pos.min(entry.len());
+    entry.insert(
+      pos,
+      (params, conditions, defaults, heads, blank_types, body_expr),
+    );
+  });
+  Ok(None)
+}
+
+/// Handle TagSetDelayed: tag /: f[args...] := body  (evaluate_rhs=false)
+/// Handle TagSet:        tag /: f[args...] = body   (evaluate_rhs=true)
+/// Stores an upvalue definition for `tag` that fires when `f` is called
+/// with arguments containing `tag` as a head.
+///
+/// The pest node's names are read against the contexts open right now —
+/// `Pk /: Keys[Pk] := …` inside a package tags `P`Pk`, not a `Global`` one —
+/// and the definition itself is left to `tag_set_delayed_ast`, the same
+/// code path a `TagSetDelayed[…]` reached through evaluation takes.
+fn store_tag_set_delayed(
+  pair: Pair<Rule>,
+  evaluate_rhs: bool,
+) -> Result<Option<String>, InterpreterError> {
+  let mut inner = pair.into_inner();
+  // First child: tag identifier (e.g. `g` in `g /: f[g[x_]] := …`), then the
+  // LHS function call, then the body.
+  let tag = syntax::Expr::Identifier(inner.next().unwrap().as_str().to_owned());
+  let lhs = syntax::pair_to_expr(inner.next().unwrap());
+  let body = syntax::pair_to_expr(inner.next().unwrap());
+  let rewrite = evaluator::contexts::rewrite;
+  let result = evaluator::assignment::tag_set_delayed_ast(
+    &rewrite(&tag),
+    &rewrite(&lhs),
+    &rewrite(&body),
+    evaluate_rhs,
+  )?;
+  if evaluate_rhs {
+    Ok(Some(syntax::expr_to_string(&result)))
+  } else if matches!(&result, syntax::Expr::Identifier(s) if s == "$Failed") {
+    // A definition that could not be stored — a tag too deep to be found
+    // again — answers `$Failed`, and that answer is shown. A stored one
+    // answers `Null`, which is not.
+    Ok(Some(syntax::expr_to_string(&result)))
+  } else {
+    Ok(None)
+  }
+}
+
+/// Handle TagUnset: tag /: f[args...] =.  (removes an upvalue)
+fn execute_tag_unset(pair: Pair<Rule>) {
+  let mut inner = pair.into_inner();
+
+  // First child: tag identifier
+  let tag_name = inner.next().unwrap().as_str().to_owned();
+
+  // Next child: BaseFunctionCall (the LHS pattern)
+  let func_call_pair = inner.next().unwrap();
+  let func_call_expr = syntax::pair_to_expr(func_call_pair);
+
+  // Extract outer function name from the LHS
+  let outer_func = match &func_call_expr {
+    syntax::Expr::FunctionCall { name, .. } => name.clone(),
+    syntax::Expr::CurriedCall { func, .. } => {
+      if let syntax::Expr::FunctionCall { name, .. } = func.as_ref() {
+        name.clone()
+      } else {
+        return;
+      }
+    }
+    _ => return,
+  };
+
+  let lhs_str = syntax::expr_to_string(&func_call_expr);
+
+  // Remove matching entries from UPVALUES
+  let removed = UPVALUES.with(|m| {
+    let mut defs = m.borrow_mut();
+    let mut removed_entries = Vec::new();
+    let mut should_remove_key = false;
+    if let Some(entry) = defs.get_mut(&tag_name) {
+      entry.retain(
+        |(
+          _of,
+          rule_params,
+          _conds,
+          _defaults,
+          _heads,
+          body,
+          orig_lhs,
+          _orig_body,
+        )| {
+          let orig_lhs_str = syntax::expr_to_string(orig_lhs);
+          if orig_lhs_str == lhs_str {
+            removed_entries
+              .push((rule_params.clone(), syntax::expr_to_string(body)));
+            false
+          } else {
+            true
+          }
+        },
+      );
+      if entry.is_empty() {
+        should_remove_key = true;
+      }
+    }
+    if should_remove_key {
+      defs.remove(&tag_name);
+    }
+    removed_entries
+  });
+
+  // Also remove from FUNC_DEFS
+  if !removed.is_empty() {
+    FUNC_DEFS.with(|m| {
+      if let Some(entry) = m.borrow_mut().get_mut(&outer_func) {
+        for (params, body_str) in &removed {
+          entry.retain(|(p, _, _, _, _, b)| {
+            !(p == params && syntax::expr_to_string(b) == *body_str)
+          });
+        }
+      }
+    });
+  }
+}

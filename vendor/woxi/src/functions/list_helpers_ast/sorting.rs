@@ -1,0 +1,2371 @@
+use super::utilities::*;
+use super::*;
+
+/// Wolfram canonical ordering for expressions.
+/// For strings: case-insensitive first, then lowercase before uppercase for ties.
+/// For numbers: numeric comparison.
+/// Mixed: numbers before strings.
+/// Extract (real, imaginary) parts from a numeric expression for sorting.
+/// Returns None for non-numeric expressions.
+pub fn expr_to_complex_parts(e: &Expr) -> Option<(f64, f64)> {
+  use crate::functions::math_ast::try_eval_to_f64;
+  use crate::functions::math_ast::try_eval_to_f64_with_infinity;
+  // Pure real number (including Infinity/-Infinity)
+  if let Some(v) = try_eval_to_f64_with_infinity(e) {
+    return Some((v, 0.0));
+  }
+  // Check if expression contains I (complex unit)
+  let s = expr_to_string(e);
+  if !s.contains('I') {
+    return None;
+  }
+  match e {
+    // Pure imaginary: n*I (BinaryOp form)
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      if matches!(right.as_ref(), Expr::Identifier(name) if name == "I")
+        && let Some(im) = try_eval_to_f64(left)
+      {
+        return Some((0.0, im));
+      }
+      if matches!(left.as_ref(), Expr::Identifier(name) if name == "I")
+        && let Some(im) = try_eval_to_f64(right)
+      {
+        return Some((0.0, im));
+      }
+      None
+    }
+    // a + b*I (BinaryOp form)
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      if let Some(re) = try_eval_to_f64(left)
+        && let Some((_, im)) = expr_to_complex_parts(right)
+      {
+        return Some((re, im));
+      }
+      None
+    }
+    // a - b*I (BinaryOp form)
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      if let Some(re) = try_eval_to_f64(left)
+        && let Some((_, im)) = expr_to_complex_parts(right)
+      {
+        return Some((re, -im));
+      }
+      None
+    }
+    // FunctionCall Plus[re, Times[im, I]]
+    Expr::FunctionCall { name, args } if name == "Plus" && args.len() == 2 => {
+      if let Some(re) = try_eval_to_f64(&args[0])
+        && let Some((_, im)) = expr_to_complex_parts(&args[1])
+      {
+        return Some((re, im));
+      }
+      if let Some(re) = try_eval_to_f64(&args[1])
+        && let Some((_, im)) = expr_to_complex_parts(&args[0])
+      {
+        return Some((0.0 + im, re)); // im is imaginary coefficient
+      }
+      None
+    }
+    // FunctionCall Times[…, I, …] — one I among real factors, of which
+    // there may be more than one: `-I Sqrt[3]` is Times[-1, I, Sqrt[3]].
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      let mut imaginary_units = 0;
+      let mut coefficient = 1.0;
+      for arg in args {
+        if matches!(arg, Expr::Identifier(n) | Expr::Constant(n) if n == "I") {
+          imaginary_units += 1;
+        } else {
+          coefficient *= try_eval_to_f64(arg)?;
+        }
+      }
+      if imaginary_units == 1 {
+        return Some((0.0, coefficient));
+      }
+      None
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Complex" && args.len() == 2 =>
+    {
+      if let (Some(re), Some(im)) =
+        (try_eval_to_f64(&args[0]), try_eval_to_f64(&args[1]))
+      {
+        return Some((re, im));
+      }
+      None
+    }
+    // Just I
+    Expr::Identifier(name) if name == "I" => Some((0.0, 1.0)),
+    // Negated: -I, -(a+bI)
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      if let Some((re, im)) = expr_to_complex_parts(operand) {
+        return Some((-re, -im));
+      }
+      None
+    }
+    _ => None,
+  }
+}
+
+/// Check if an expression is Infinity or -Infinity (DirectedInfinity).
+/// In Wolfram's canonical ordering, these sort after all finite numbers.
+fn is_infinity_expr(e: &Expr) -> Option<i8> {
+  let s = expr_to_string(e);
+  if s == "Infinity" {
+    Some(1)
+  } else if s == "-Infinity" {
+    Some(-1)
+  } else if s == "ComplexInfinity" {
+    Some(0)
+  } else {
+    None
+  }
+}
+
+/// Exact ordering for real exact numbers (`Integer`, `BigInteger`, and
+/// `Rational[…]` with integer parts), via BigInt cross-multiplication. Used
+/// ahead of the f64 comparison in `canonical_cmp`, which collapses magnitudes
+/// beyond ~1.8e308 to ±inf and reports distinct values as equal — breaking
+/// Sort/MaximalBy on very large BigIntegers (e.g. Egyptian-fraction
+/// denominators). Returns None unless both arguments are exact real numbers,
+/// so Reals, complex values, and symbolic terms fall through unchanged.
+fn exact_real_cmp(a: &Expr, b: &Expr) -> Option<std::cmp::Ordering> {
+  fn as_ratio(e: &Expr) -> Option<(BigInt, BigInt)> {
+    match e {
+      Expr::Integer(n) => Some((BigInt::from(*n), BigInt::from(1))),
+      Expr::BigInteger(n) => Some((n.clone(), BigInt::from(1))),
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        let n = crate::functions::math_ast::expr_to_bigint(&args[0])?;
+        let d = crate::functions::math_ast::expr_to_bigint(&args[1])?;
+        match d.sign() {
+          Sign::NoSign => None,
+          Sign::Minus => Some((-n, -d)),
+          Sign::Plus => Some((n, d)),
+        }
+      }
+      _ => None,
+    }
+  }
+  let (an, ad) = as_ratio(a)?;
+  let (bn, bd) = as_ratio(b)?;
+  // a/ad vs b/bd  ⇔  an*bd vs bn*ad  (both denominators positive).
+  Some((an * &bd).cmp(&(bn * &ad)))
+}
+
+/// `#n` / `##n` as the `Slot[n]` / `SlotSequence[n]` compound they are, so
+/// the comparators order them by head like any other call:
+/// `Sort[{#, a, f[x]}]` = `{a, f[x], #1}`.
+pub(crate) fn slot_as_call(e: &Expr) -> Option<Expr> {
+  match e {
+    Expr::Slot(n) => Some(call("Slot", vec![Expr::Integer(*n as i128)])),
+    Expr::SlotSequence(n) => {
+      Some(call("SlotSequence", vec![Expr::Integer(*n as i128)]))
+    }
+    _ => None,
+  }
+}
+
+pub fn canonical_cmp(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  let (sa, sb) = (slot_as_call(a), slot_as_call(b));
+  if sa.is_some() || sb.is_some() {
+    return canonical_cmp(sa.as_ref().unwrap_or(a), sb.as_ref().unwrap_or(b));
+  }
+  // Two compatible Quantities sort by their physical value (converted to a
+  // common unit): Sort[{3 m, 100 cm, 2 m}] -> {100 cm, 2 m, 3 m}. A tie in
+  // value falls through to the structural comparison below.
+  if let Some(ord) = crate::functions::quantity_ast::try_quantity_compare(a, b)
+    && ord != std::cmp::Ordering::Equal
+  {
+    return ord;
+  }
+
+  // Handle Infinity/-Infinity separately: they sort after all finite numbers
+  let a_inf = is_infinity_expr(a);
+  let b_inf = is_infinity_expr(b);
+  match (a_inf, b_inf) {
+    (Some(ai), Some(bi)) => {
+      // Both infinity: -Infinity < ComplexInfinity < Infinity
+      return ai.cmp(&bi);
+    }
+    (Some(_), None) => return std::cmp::Ordering::Greater, // Infinity after everything
+    (None, Some(_)) => return std::cmp::Ordering::Less,
+    (None, None) => {}
+  }
+
+  // Exact comparison for large integers/rationals before falling back to the
+  // f64 path (which loses precision and collapses values beyond f64 range).
+  if let Some(ord) = exact_real_cmp(a, b) {
+    return ord;
+  }
+
+  // Only NUMBER LITERALS compare numerically; symbolic constants (Pi, E,
+  // Degree, GoldenRatio) and numeric composites (2*Pi, Sqrt[2]) sort
+  // structurally after all numbers, per Wolfram canonical order
+  // (Sort[{E, 3}] = {3, E}, Sort[{Sqrt[2], 7}] = {7, Sqrt[2]}).
+  let is_number_literal = |e: &Expr| -> bool {
+    matches!(
+      e,
+      Expr::Integer(_)
+        | Expr::BigInteger(_)
+        | Expr::Real(_)
+        | Expr::BigFloat(..)
+    ) || matches!(e, Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2)
+      || crate::functions::predicate_ast::is_complex_number(e)
+  };
+  let a_num = if is_number_literal(a) {
+    expr_to_complex_parts(a)
+  } else {
+    None
+  };
+  let b_num = if is_number_literal(b) {
+    expr_to_complex_parts(b)
+  } else {
+    None
+  };
+
+  match (a_num, b_num) {
+    (Some((a_re, a_im)), Some((b_re, b_im))) => {
+      // Both numeric: compare by real part first, then imaginary part
+      match a_re.partial_cmp(&b_re).unwrap_or(std::cmp::Ordering::Equal) {
+        std::cmp::Ordering::Equal => {
+          // Same real part: pure reals (im=0) come first
+          if a_im == 0.0 && b_im != 0.0 {
+            return std::cmp::Ordering::Less;
+          }
+          if a_im != 0.0 && b_im == 0.0 {
+            return std::cmp::Ordering::Greater;
+          }
+          match a_im.partial_cmp(&b_im).unwrap_or(std::cmp::Ordering::Equal) {
+            std::cmp::Ordering::Equal => {
+              // Numerically equal number atoms tie-break by type:
+              // Integer before Real before Rational. wolframscript:
+              // Sort[{1., 1}] = {1, 1.}, Sort[{3/2, 1.5}] = {1.5, 3/2}.
+              let type_rank = |e: &Expr| -> Option<u8> {
+                match e {
+                  Expr::Integer(_) | Expr::BigInteger(_) => Some(0),
+                  Expr::Real(_) | Expr::BigFloat(..) => Some(1),
+                  Expr::FunctionCall { name, args }
+                    if name == "Rational" && args.len() == 2 =>
+                  {
+                    Some(2)
+                  }
+                  _ => None,
+                }
+              };
+              match (type_rank(a), type_rank(b)) {
+                (Some(ra), Some(rb)) => ra.cmp(&rb),
+                _ => std::cmp::Ordering::Equal,
+              }
+            }
+            other => other,
+          }
+        }
+        other => other,
+      }
+    }
+    (Some(_), None) => std::cmp::Ordering::Less, // numbers before non-numbers
+    (None, Some(_)) => std::cmp::Ordering::Greater,
+    (None, None) => {
+      // Number-literal coefficients strip off before comparing — Wolfram's
+      // canonical order gives Sort[{Sqrt[11], 2*Sqrt[2]}] =
+      // {2*Sqrt[2], Sqrt[11]} — and only break a tie on the symbolic
+      // part, ascending (Sort[{2*x, x}] = {x, 2*x}).
+      {
+        let (ca, ra) = numeric_coeff_and_rest_expr(a);
+        let (cb, rb) = numeric_coeff_and_rest_expr(b);
+        if ra.is_some() || rb.is_some() {
+          let ord =
+            canonical_cmp(ra.as_ref().unwrap_or(a), rb.as_ref().unwrap_or(b));
+          if ord != std::cmp::Ordering::Equal {
+            return ord;
+          }
+          if ca != cb {
+            return if ca < cb {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+        }
+      }
+      // A leading factor that is not a number literal behaves like a
+      // coefficient too: wolframscript compares products from their last
+      // factor backwards, so `(a + b) x` sorts before `x^2` (x precedes
+      // x^2) while `(a + b) x^2` sorts after `x^2` (same last factor, and
+      // the extra factor breaks the tie).
+      let (fa, fb) = (times_factors_for_order(a), times_factors_for_order(b));
+      if fa.is_some() || fb.is_some() {
+        let single_a = [a];
+        let single_b = [b];
+        let fa = fa.unwrap_or_else(|| single_a.to_vec());
+        let fb = fb.unwrap_or_else(|| single_b.to_vec());
+        let mut i = fa.len();
+        let mut j = fb.len();
+        while i > 0 && j > 0 {
+          let ord = canonical_cmp(fa[i - 1], fb[j - 1]);
+          if ord != std::cmp::Ordering::Equal {
+            return ord;
+          }
+          i -= 1;
+          j -= 1;
+        }
+        if i != j {
+          return i.cmp(&j);
+        }
+      }
+
+      // Powers of integer or rational bases order by base then exponent,
+      // ascending (Sort[{Sqrt[11], Sqrt[2]}] = {Sqrt[2], Sqrt[11]},
+      // Sort[{Sqrt[3], Sqrt[5/3]}] = {Sqrt[5/3], Sqrt[3]}); the
+      // head-name/argument comparison below would order 11 before 2.
+      if let (Some((ba, ea)), Some((bb, eb))) =
+        (int_base_power(a), int_base_power(b))
+      {
+        match ratio_cmp(ba, bb) {
+          std::cmp::Ordering::Equal => {}
+          other => return other,
+        }
+        if ea != eb {
+          return if ea < eb {
+            std::cmp::Ordering::Less
+          } else {
+            std::cmp::Ordering::Greater
+          };
+        }
+        return std::cmp::Ordering::Equal;
+      }
+      // A power of a number compares by its base first, and a number
+      // precedes everything that is not one — so it sorts ahead of every
+      // symbol, string or compound, and two such powers of the same base
+      // compare by exponent: Sort[{E, "s", 2^x, Sqrt[2]}] =
+      // {Sqrt[2], 2^x, s, E} (wolframscript-verified). Kept in step with
+      // the same rule in `compare_exprs`.
+      match (number_base_power(a), number_base_power(b)) {
+        (Some(_), None) => return std::cmp::Ordering::Less,
+        (None, Some(_)) => return std::cmp::Ordering::Greater,
+        (Some((ba, ea)), Some((bb, eb))) => {
+          let ord = canonical_cmp(&ba, &bb);
+          if ord != std::cmp::Ordering::Equal {
+            return ord;
+          }
+          let ord = canonical_cmp(&ea, &eb);
+          if ord != std::cmp::Ordering::Equal {
+            return ord;
+          }
+        }
+        (None, None) => {}
+      }
+      // Same-base powers (or a power against its bare base) compare by
+      // exponent, ascending: Sort[{Pi, 1/Pi}] = {Pi^(-1), Pi},
+      // Sort[{x, Sqrt[x], x^2}] = {Sqrt[x], x, x^2} (wolframscript-verified).
+      {
+        let base_exp = |e: &Expr| -> Option<(String, f64)> {
+          if let Some((base, exp)) = power_parts(e) {
+            let v = crate::functions::math_ast::try_eval_to_f64(&exp)?;
+            Some((expr_to_string(&base), v))
+          } else {
+            Some((expr_to_string(e), 1.0))
+          }
+        };
+        let a_is_pow = power_parts(a).is_some();
+        let b_is_pow = power_parts(b).is_some();
+        if (a_is_pow || b_is_pow)
+          && let (Some((sa, ea)), Some((sb, eb))) = (base_exp(a), base_exp(b))
+          && sa == sb
+          && ea != eb
+        {
+          return if ea < eb {
+            std::cmp::Ordering::Less
+          } else {
+            std::cmp::Ordering::Greater
+          };
+        }
+      }
+      // Additive expressions (sums) hold a class-based place in canonical
+      // order (wolframscript-verified probe families in Pi and x):
+      //   {1, 1+x^(-1), 1+Sqrt[x], x^(-2), x^(-1), 93/x, Sqrt[x], x, 2*x,
+      //    x^2, x^3, 1+x, 2+x, 1+2*x, 1+x^2, x+x^2}
+      // A sum whose greatest (last canonical) term is sub-linear (exponent
+      // < 1), has a negative leading coefficient, or carries a negative
+      // lower-order term sorts BEFORE monomials and atoms; every other sum
+      // sorts AFTER them but before plain function calls
+      // (Sort[{Cos[x], 1+x}] = {1+x, Cos[x]}). Two sums compare termwise
+      // from the greatest term down.
+      {
+        let a_terms = sum_terms_list(a);
+        let b_terms = sum_terms_list(b);
+        let skip = matches!(a, Expr::List(_) | Expr::Pattern { .. })
+          || matches!(b, Expr::List(_) | Expr::Pattern { .. });
+        if !skip {
+          match (&a_terms, &b_terms) {
+            (Some(ta), Some(tb)) => {
+              let (ca, cb) = (sum_sorts_early(ta), sum_sorts_early(tb));
+              if ca != cb {
+                return if ca {
+                  std::cmp::Ordering::Less
+                } else {
+                  std::cmp::Ordering::Greater
+                };
+              }
+              let ord = cmp_sum_terms(ta, tb);
+              if ord != std::cmp::Ordering::Equal {
+                return ord;
+              }
+            }
+            (Some(ta), None) => {
+              return if sum_sorts_early(ta) || is_plain_call_non_power(b) {
+                std::cmp::Ordering::Less
+              } else {
+                std::cmp::Ordering::Greater
+              };
+            }
+            (None, Some(tb)) => {
+              return if sum_sorts_early(tb) || is_plain_call_non_power(a) {
+                std::cmp::Ordering::Greater
+              } else {
+                std::cmp::Ordering::Less
+              };
+            }
+            (None, None) => {}
+          }
+        }
+      }
+      // Handle compound expressions (lists, function calls) element-wise
+      match (a, b) {
+        // Both lists: Wolfram's canonical order compares by length first, then
+        // element by element — so `{2}` and `{3}` precede `{1, 2}`.
+        (Expr::List(a_items), Expr::List(b_items)) => {
+          match a_items.len().cmp(&b_items.len()) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+          }
+          for (ai, bi) in a_items.iter().zip(b_items.iter()) {
+            let ord = canonical_cmp(ai, bi);
+            if ord != std::cmp::Ordering::Equal {
+              return ord;
+            }
+          }
+          return std::cmp::Ordering::Equal;
+        }
+        // Both function calls: compare by name first, then args element-wise
+        (
+          Expr::FunctionCall {
+            name: a_name,
+            args: a_args,
+          },
+          Expr::FunctionCall {
+            name: b_name,
+            args: b_args,
+          },
+        ) => {
+          let name_ord = wolfram_string_cmp(a_name, b_name);
+          if name_ord != std::cmp::Ordering::Equal {
+            return name_ord;
+          }
+          // Same head: Wolfram orders by argument count first, then argument
+          // by argument (so f[3] precedes f[1, 2]).
+          match a_args.len().cmp(&b_args.len()) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+          }
+          for (ai, bi) in a_args.iter().zip(b_args.iter()) {
+            let ord = canonical_cmp(ai, bi);
+            if ord != std::cmp::Ordering::Equal {
+              return ord;
+            }
+          }
+          return std::cmp::Ordering::Equal;
+        }
+        // Lists sort after non-lists
+        (Expr::List(_), _) => return std::cmp::Ordering::Greater,
+        (_, Expr::List(_)) => return std::cmp::Ordering::Less,
+        // Function calls sort after atoms but before lists
+        (Expr::FunctionCall { .. }, _) => return std::cmp::Ordering::Greater,
+        (_, Expr::FunctionCall { .. }) => return std::cmp::Ordering::Less,
+        // Pattern-vs-Pattern: order by the head name (e.g. `_Integer` <
+        // `_Symbol` because `Integer` < `Symbol` alphabetically), then by
+        // the optional pattern variable name. Matches wolframscript's
+        // `Sort[{_Symbol, _Integer}]` = `{_Integer, _Symbol}`.
+        (
+          Expr::Pattern {
+            name: a_name,
+            head: a_head,
+            blank_type: a_bt,
+          },
+          Expr::Pattern {
+            name: b_name,
+            head: b_head,
+            blank_type: b_bt,
+          },
+        ) => {
+          let a_h = a_head.as_deref().unwrap_or("");
+          let b_h = b_head.as_deref().unwrap_or("");
+          let head_ord = wolfram_string_cmp(a_h, b_h);
+          if head_ord != std::cmp::Ordering::Equal {
+            return head_ord;
+          }
+          let bt_ord = a_bt.cmp(b_bt);
+          if bt_ord != std::cmp::Ordering::Equal {
+            return bt_ord;
+          }
+          return wolfram_string_cmp(a_name, b_name);
+        }
+        // Patterns (`_Symbol`, `x_Integer`, etc.) sort like function calls:
+        // an atomic Identifier comes before a Pattern. Matches
+        // wolframscript's `Sort[{a, _Symbol, _Integer}]` =
+        // `{a, _Integer, _Symbol}`.
+        (Expr::Pattern { .. }, _) => return std::cmp::Ordering::Greater,
+        (_, Expr::Pattern { .. }) => return std::cmp::Ordering::Less,
+        _ => {}
+      }
+
+      // Atomic non-numeric: string/symbol comparison
+      let sa = expr_to_string(a);
+      let sb = expr_to_string(b);
+      wolfram_string_cmp(&sa, &sb)
+    }
+  }
+}
+
+/// AST-based SortBy: sort elements by the value of a function.
+/// SortBy[{a, b, c}, f] -> elements sorted by f[x]
+/// Compute the sort key for `item` under `func`. A list of functions
+/// `{f1, …, fn}` yields the tuple `{f1[item], …, fn[item]}`, giving a
+/// lexicographic multi-criteria sort; any other `func` is applied directly.
+fn sort_key(func: &Expr, item: &Expr) -> Result<Expr, InterpreterError> {
+  if let Expr::List(funcs) = func {
+    let keys: Vec<Expr> = funcs
+      .iter()
+      .map(|f| apply_func_ast(f, item))
+      .collect::<Result<_, InterpreterError>>()?;
+    Ok(Expr::List(keys.into()))
+  } else {
+    apply_func_ast(func, item)
+  }
+}
+
+/// Ordering induced by a user-supplied comparison function. `p[a, b]` giving
+/// True puts `a` first and `p[b, a]` giving True puts `b` first; anything else
+/// (a symbolic, non-Boolean result — `c < a` say) leaves the pair
+/// incomparable, so a stable sort keeps them in their original order.
+pub fn comparator_cmp(p: &Expr, a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  let is_true = |e: &Expr| matches!(e, Expr::Identifier(s) if s == "True");
+  if matches!(apply_func_to_two_args(p, a, b), Ok(ref r) if is_true(r)) {
+    return std::cmp::Ordering::Less;
+  }
+  if matches!(apply_func_to_two_args(p, b, a), Ok(ref r) if is_true(r)) {
+    return std::cmp::Ordering::Greater;
+  }
+  std::cmp::Ordering::Equal
+}
+
+/// `SortBy[list, f, p]` — like [`sort_by_ast`], but the keys `f` produces are
+/// ordered by the comparison function `p` instead of canonically.
+pub fn sort_by_with_ordering_ast(
+  list: &Expr,
+  func: &Expr,
+  p: &Expr,
+) -> Result<Expr, InterpreterError> {
+  // Sort `items` by their keys, returning the reordered items.
+  let ordered = |items: &[Expr],
+                 key_of: &dyn Fn(&Expr) -> &Expr|
+   -> Result<Vec<usize>, InterpreterError> {
+    let keys: Vec<Expr> = items
+      .iter()
+      .map(|i| sort_key(func, key_of(i)))
+      .collect::<Result<_, InterpreterError>>()?;
+    let mut idx: Vec<usize> = (0..items.len()).collect();
+    idx.sort_by(|&a, &b| comparator_cmp(p, &keys[a], &keys[b]));
+    Ok(idx)
+  };
+  match list {
+    Expr::List(items) => {
+      let idx = ordered(items, &|e| e)?;
+      Ok(Expr::List(idx.iter().map(|&i| items[i].clone()).collect()))
+    }
+    Expr::Association(pairs) => {
+      let values: Vec<Expr> = pairs.iter().map(|(_, v)| v.clone()).collect();
+      let idx = ordered(&values, &|e| e)?;
+      Ok(Expr::Association(
+        idx.iter().map(|&i| pairs[i].clone()).collect(),
+      ))
+    }
+    Expr::FunctionCall { name, args } => {
+      let idx = ordered(args, &|e| e)?;
+      Ok(Expr::FunctionCall {
+        name: name.clone(),
+        args: idx.iter().map(|&i| args[i].clone()).collect(),
+      })
+    }
+    other => {
+      if is_atomic_arg(other) {
+        emit_nonatomic_normal_message(
+          "SortBy",
+          &[list.clone(), func.clone(), p.clone()],
+        );
+      }
+      Ok(call("SortBy", vec![list.clone(), func.clone(), p.clone()]))
+    }
+  }
+}
+
+pub fn sort_by_ast(list: &Expr, func: &Expr) -> Result<Expr, InterpreterError> {
+  match list {
+    Expr::List(items) => {
+      let mut keyed: Vec<(Expr, Expr)> = items
+        .iter()
+        .map(|item| {
+          let key = sort_key(func, item)?;
+          Ok((item.clone(), key))
+        })
+        .collect::<Result<_, InterpreterError>>()?;
+
+      keyed.sort_by(|a, b| {
+        let key_ord = canonical_cmp(&a.1, &b.1);
+        if key_ord == std::cmp::Ordering::Equal {
+          canonical_cmp(&a.0, &b.0)
+        } else {
+          key_ord
+        }
+      });
+
+      Ok(Expr::List(
+        keyed.into_iter().map(|(item, _)| item).collect(),
+      ))
+    }
+    Expr::Association(pairs) => {
+      let mut keyed: Vec<((Expr, Expr), Expr)> = pairs
+        .iter()
+        .map(|(k, v)| {
+          let key = sort_key(func, v)?;
+          Ok(((k.clone(), v.clone()), key))
+        })
+        .collect::<Result<_, InterpreterError>>()?;
+
+      keyed.sort_by(|a, b| {
+        let key_ord = canonical_cmp(&a.1, &b.1);
+        if key_ord == std::cmp::Ordering::Equal {
+          canonical_cmp(&(a.0).1, &(b.0).1)
+        } else {
+          key_ord
+        }
+      });
+
+      Ok(Expr::Association(
+        keyed.into_iter().map(|(pair, _)| pair).collect(),
+      ))
+    }
+    Expr::FunctionCall { name, args } => {
+      let mut keyed: Vec<(Expr, Expr)> = args
+        .iter()
+        .map(|item| {
+          let key = sort_key(func, item)?;
+          Ok((item.clone(), key))
+        })
+        .collect::<Result<_, InterpreterError>>()?;
+
+      keyed.sort_by(|a, b| {
+        let key_ord = canonical_cmp(&a.1, &b.1);
+        if key_ord == std::cmp::Ordering::Equal {
+          canonical_cmp(&a.0, &b.0)
+        } else {
+          key_ord
+        }
+      });
+
+      Ok(Expr::FunctionCall {
+        name: name.clone(),
+        args: keyed.into_iter().map(|(item, _)| item).collect(),
+      })
+    }
+    other => {
+      if is_atomic_arg(other) {
+        emit_nonatomic_normal_message("SortBy", &[list.clone(), func.clone()]);
+      }
+      Ok(call("SortBy", vec![list.clone(), func.clone()]))
+    }
+  }
+}
+
+///// Ordering[list] / Ordering[list, n] / Ordering[list, n, p]
+/// PositionLargest[list] / PositionSmallest[list]: the 1-based positions of all
+/// occurrences of the maximum (resp. minimum) element of a numeric list, in
+/// ascending order. Non-numeric lists are left unevaluated. (The 2-argument
+/// n-extrema form is not handled here.)
+pub fn position_extreme_ast(
+  args: &[Expr],
+  largest: bool,
+) -> Result<Expr, InterpreterError> {
+  let name = if largest {
+    "PositionLargest"
+  } else {
+    "PositionSmallest"
+  };
+  let unevaluated = || Ok(unevaluated(name, args));
+  let Some(Expr::List(items)) = args.first() else {
+    return unevaluated();
+  };
+  if items.is_empty() {
+    return unevaluated();
+  }
+  let mut vals = Vec::with_capacity(items.len());
+  for it in items {
+    match crate::functions::math_ast::try_eval_to_f64(it) {
+      Some(v) => vals.push(v),
+      None => return unevaluated(),
+    }
+  }
+  // `PositionLargest[list, n]` groups the positions by value and keeps the n
+  // extreme values, one sublist each. `Automatic` (and no second argument)
+  // asks for the single extreme value and gives its positions flat.
+  let n: Option<usize> = match args.get(1) {
+    None => None,
+    Some(Expr::Identifier(s)) if s == "Automatic" => None,
+    Some(Expr::Integer(n)) if *n >= 0 => Some(*n as usize),
+    // `PositionLargest[list, n, Order]` is the default ordering spelled out.
+    Some(_) => {
+      crate::emit_message(&format!(
+        "{name}::intpma: Positive machine-sized integer or Automatic expected at position 2 in {}.",
+        crate::syntax::format_expr(
+          &crate::helpers::unevaluated(name, args),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+      return unevaluated();
+    }
+  };
+
+  if let Some(n) = n {
+    // Distinct values in ascending order, each with its ascending positions.
+    let mut groups: Vec<(f64, Vec<Expr>)> = Vec::new();
+    for (i, v) in vals.iter().enumerate() {
+      let pos = Expr::Integer((i + 1) as i128);
+      match groups.iter_mut().find(|(g, _)| g == v) {
+        Some((_, ps)) => ps.push(pos),
+        None => groups.push((*v, vec![pos])),
+      }
+    }
+    groups.sort_by(|a, b| {
+      a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut kept: Vec<Vec<Expr>> = if largest {
+      // The n largest, then reversed at both levels — wolframscript builds
+      // the ascending grouping and reverses the whole structure, so the
+      // positions inside each sublist come out descending too. Asking for a
+      // single value takes the same path as the one-argument form, which
+      // leaves those positions ascending.
+      let start = groups.len().saturating_sub(n);
+      groups[start..]
+        .iter()
+        .map(|(_, ps)| {
+          if n == 1 {
+            ps.clone()
+          } else {
+            ps.iter().rev().cloned().collect()
+          }
+        })
+        .collect()
+    } else {
+      groups.iter().take(n).map(|(_, ps)| ps.clone()).collect()
+    };
+    if largest {
+      kept.reverse();
+    }
+    return Ok(Expr::List(
+      kept.into_iter().map(|ps| Expr::List(ps.into())).collect(),
+    ));
+  }
+
+  let target = if largest {
+    vals.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+  } else {
+    vals.iter().copied().fold(f64::INFINITY, f64::min)
+  };
+  let positions: Vec<Expr> = vals
+    .iter()
+    .enumerate()
+    .filter(|(_, v)| **v == target)
+    .map(|(i, _)| Expr::Integer((i + 1) as i128))
+    .collect();
+  Ok(Expr::List(positions.into()))
+}
+
+/// Apply the position-count argument of `Ordering` / `OrderingBy` to the full
+/// ordering. `n` positions are taken from the front, `-n` from the back, and
+/// `All` keeps everything.
+///
+/// Asking for more positions than exist is a `Take` failure in wolframscript,
+/// reported against the ordering itself rather than the original list, after
+/// which the whole call is left unevaluated.
+fn limit_ordering(
+  count: Option<&Expr>,
+  ordering: Vec<Expr>,
+) -> Option<Vec<Expr>> {
+  let Some(count) = count else {
+    return Some(ordering);
+  };
+  if matches!(count, Expr::Identifier(n) if n == "All") {
+    return Some(ordering);
+  }
+  let Some(n) = expr_to_i128(count) else {
+    return Some(ordering);
+  };
+  if n.unsigned_abs() as usize > ordering.len() {
+    let (from, to) = if n >= 0 {
+      ("1".to_string(), n.to_string())
+    } else {
+      (n.to_string(), "-1".to_string())
+    };
+    crate::emit_message(&format!(
+      "Take::take: Cannot take positions {from} through {to} in {}.",
+      expr_to_output(&Expr::List(ordering.into()))
+    ));
+    return None;
+  }
+  let mut ordering = ordering;
+  if n >= 0 {
+    ordering.truncate(n as usize);
+  } else {
+    let abs_n = n.unsigned_abs() as usize;
+    ordering = ordering.split_off(ordering.len() - abs_n);
+  }
+  Some(ordering)
+}
+
+/// Sort with an explicit ordering function the way wolframscript does: a merge
+/// sort whose merge step takes from the left run unless `p[left, right]`
+/// evaluates to exactly `False`.
+///
+/// A definite `False` therefore *swaps* a pair the comparison cannot separate —
+/// `Sort[{1, 2}, #1 === #2 &]` is `{2, 1}` and `Sort[Range[5],
+/// Mod[#1, 2] > Mod[#2, 2] &]` is `{5, 3, 1, 4, 2}` — while a symbolic
+/// (non-Boolean) result keeps the original order, so `Sort[{c, a, b}, Less]` is
+/// unchanged. A plain stable sort cannot express this: it keeps the input order
+/// in both cases.
+pub fn wl_ordering_sort<T: Clone>(
+  items: &[T],
+  take_left: &mut impl FnMut(&T, &T) -> Result<bool, InterpreterError>,
+) -> Result<Vec<T>, InterpreterError> {
+  if items.len() <= 1 {
+    return Ok(items.to_vec());
+  }
+  let mid = items.len() / 2;
+  let left = wl_ordering_sort(&items[..mid], take_left)?;
+  let right = wl_ordering_sort(&items[mid..], take_left)?;
+  let mut out = Vec::with_capacity(items.len());
+  let (mut i, mut j) = (0usize, 0usize);
+  while i < left.len() && j < right.len() {
+    if take_left(&left[i], &right[j])? {
+      out.push(left[i].clone());
+      i += 1;
+    } else {
+      out.push(right[j].clone());
+      j += 1;
+    }
+  }
+  out.extend_from_slice(&left[i..]);
+  out.extend_from_slice(&right[j..]);
+  Ok(out)
+}
+
+/// `p[a, b]` for a sort comparison: `Ok(false)` only when it evaluates to a
+/// definite `False`, so a symbolic result leaves the pair in place.
+pub fn comparator_keeps_order(
+  comparator: &Expr,
+  a: &Expr,
+  b: &Expr,
+) -> Result<bool, InterpreterError> {
+  let verdict = crate::functions::list_helpers_ast::apply_func_to_two_args(
+    comparator, a, b,
+  )?;
+  Ok(!matches!(&verdict, Expr::Identifier(s) if s == "False"))
+}
+
+pub fn ordering_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "Ordering expects 1, 2, or 3 arguments".into(),
+    ));
+  }
+
+  // Ordering works on any nonatomic expression; atoms emit ::normal.
+  // An association is ordered by its values (the result is positional indices,
+  // not keys): Ordering[<|a->3, b->1, c->2|>] -> {2, 3, 1}.
+  let assoc_values: Vec<Expr>;
+  let items: &[Expr] = match &args[0] {
+    Expr::List(items) => items.as_slice(),
+    Expr::Association(pairs) => {
+      assoc_values = pairs.iter().map(|(_, v)| v.clone()).collect();
+      &assoc_values
+    }
+    // Rational/Complex are atoms — their internal args have no ordering.
+    Expr::FunctionCall { args: fc_args, .. } if !is_atomic_arg(&args[0]) => {
+      fc_args.as_slice()
+    }
+    _ => {
+      emit_nonatomic_normal_message("Ordering", args);
+      return Ok(unevaluated("Ordering", args));
+    }
+  };
+
+  let mut indexed: Vec<(usize, &Expr)> = items.iter().enumerate().collect();
+
+  // With 3 args the third is an ordering function p (a bare symbol like
+  // Less/Greater, or a predicate). p[a, b] is applied to each pair: a comes
+  // before b when it is True, after when False, and when p[a, b] yields
+  // neither (e.g. Less on non-numeric symbols, where `c < a` stays symbolic)
+  // the pair is treated as incomparable so the original order is kept — this
+  // is why `Ordering[{c, a, b}, All, Less]` is {1, 2, 3}, not the canonical
+  // {2, 3, 1}. Without a comparator, the default canonical order is used.
+  if let Some(comparator) = args.get(2) {
+    let p = comparator.clone();
+    let mut take_left = |a: &(usize, &Expr), b: &(usize, &Expr)| {
+      comparator_keeps_order(&p, a.1, b.1)
+    };
+    indexed = wl_ordering_sort(&indexed, &mut take_left)?;
+  } else {
+    indexed.sort_by(|a, b| {
+      crate::functions::list_helpers_ast::canonical_cmp(a.1, b.1)
+    });
+  }
+
+  let result: Vec<Expr> = indexed
+    .iter()
+    .map(|(idx, _)| Expr::Integer((*idx + 1) as i128))
+    .collect();
+
+  // The second argument, if present and not the symbol `All`, limits the
+  // number of positions returned.
+  match limit_ordering(args.get(1), result) {
+    Some(result) => Ok(Expr::List(result.into())),
+    None => Ok(unevaluated("Ordering", args)),
+  }
+}
+
+/// OrderingBy[list, f] / OrderingBy[list, f, n] — the positions that order
+/// `list` by `f` applied to each element (ascending, stable). `n` limits the
+/// number of positions: positive keeps the first `n`, negative the last `|n|`,
+/// `All` keeps them all.
+pub fn ordering_by_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 4 {
+    return Err(InterpreterError::EvaluationError(
+      "OrderingBy expects 2, 3, or 4 arguments".into(),
+    ));
+  }
+  // Like Ordering, OrderingBy operates on any nonatomic expression. For an
+  // association it orders by the values, returning positional indices (not
+  // keys): OrderingBy[<|a->{5,2}, b->{3,8}, c->{1,0}|>, First] -> {3, 2, 1}.
+  let assoc_values: Vec<Expr>;
+  let items: &[Expr] = match &args[0] {
+    Expr::List(items) => items.as_slice(),
+    Expr::Association(pairs) => {
+      assoc_values = pairs.iter().map(|(_, v)| v.clone()).collect();
+      &assoc_values
+    }
+    Expr::FunctionCall { args: fc_args, .. } if !is_atomic_arg(&args[0]) => {
+      fc_args.as_slice()
+    }
+    _ => {
+      return Ok(unevaluated("OrderingBy", args));
+    }
+  };
+
+  let func = &args[1];
+  let mut keyed: Vec<(usize, Expr)> = Vec::with_capacity(items.len());
+  for (i, item) in items.iter().enumerate() {
+    keyed.push((i, apply_func_ast(func, item)?));
+  }
+
+  // The optional 4th argument is an ordering function `p` applied to the
+  // *keys* (the f-values), mirroring Ordering's 3-arg comparator: keys a and b
+  // are ordered by p[a, b] / p[b, a], and incomparable pairs keep their
+  // original order (stable). Without it, the default key comparison is used.
+  if let Some(comparator) = args.get(3) {
+    let p = comparator.clone();
+    let mut err: Option<InterpreterError> = None;
+    let is_true = |e: &Expr| matches!(e, Expr::Identifier(s) if s == "True");
+    keyed.sort_by(|a, b| {
+      if err.is_some() {
+        return std::cmp::Ordering::Equal;
+      }
+      match crate::functions::list_helpers_ast::apply_func_to_two_args(
+        &p, &a.1, &b.1,
+      ) {
+        Ok(ref r) if is_true(r) => return std::cmp::Ordering::Less,
+        Ok(_) => {}
+        Err(e) => {
+          err = Some(e);
+          return std::cmp::Ordering::Equal;
+        }
+      }
+      match crate::functions::list_helpers_ast::apply_func_to_two_args(
+        &p, &b.1, &a.1,
+      ) {
+        Ok(ref r) if is_true(r) => std::cmp::Ordering::Greater,
+        Ok(_) => std::cmp::Ordering::Equal,
+        Err(e) => {
+          err = Some(e);
+          std::cmp::Ordering::Equal
+        }
+      }
+    });
+    if let Some(e) = err {
+      return Err(e);
+    }
+  } else {
+    keyed.sort_by(|a, b| by_key_cmp(&a.1, &b.1));
+  }
+
+  let result: Vec<Expr> = keyed
+    .iter()
+    .map(|(idx, _)| Expr::Integer((*idx + 1) as i128))
+    .collect();
+
+  // The 3rd argument, if present and not `All`, limits how many positions are
+  // returned: positive keeps the first n, negative the last |n|.
+  match limit_ordering(args.get(2), result) {
+    Some(result) => Ok(Expr::List(result.into())),
+    None => Ok(unevaluated("OrderingBy", args)),
+  }
+}
+
+/// Comparator for *By key expressions: numeric when possible, lexicographic fallback.
+fn by_key_cmp(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  // Exact ordering for integer/rational keys first: parsing them as f64
+  // (below) collapses any magnitude beyond ~1.8e308 to inf, so e.g. a
+  // 1348-digit and a 2847-digit denominator would compare equal — making
+  // MaximalBy/MinimalBy pick the wrong element on huge BigIntegers.
+  if let Some(ord) = exact_real_cmp(a, b) {
+    return ord;
+  }
+  let ka = expr_to_string(a);
+  let kb = expr_to_string(b);
+  if let (Ok(na), Ok(nb)) = (ka.parse::<f64>(), kb.parse::<f64>()) {
+    na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+  } else {
+    ka.cmp(&kb)
+  }
+}
+
+/// MinimalBy[list, f] - Returns all elements that minimize f
+/// MinimalBy[list, f, n] - Returns the n elements with smallest f values
+/// MinimalBy/MaximalBy over an association: rank each (key, value) pair by
+/// `func` applied to the *value*, returning an association of the selected
+/// pairs. Without `n`, keep every pair tying the extreme value (in original
+/// order). With `n`, keep the `n` pairs sorted by the criterion (stable).
+fn minimal_maximal_by_assoc(
+  pairs: &[(Expr, Expr)],
+  func: &Expr,
+  n: Option<i128>,
+  maximal: bool,
+) -> Result<Expr, InterpreterError> {
+  if pairs.is_empty() {
+    return Ok(Expr::Association(vec![]));
+  }
+  // (key, value, criterion = func[value])
+  let keyed: Vec<((Expr, Expr), Expr)> = pairs
+    .iter()
+    .map(|(k, v)| Ok(((k.clone(), v.clone()), apply_func_ast(func, v)?)))
+    .collect::<Result<_, InterpreterError>>()?;
+
+  if let Some(n_val) = n {
+    let mut indexed: Vec<(usize, &Expr)> =
+      keyed.iter().enumerate().map(|(i, (_, c))| (i, c)).collect();
+    indexed.sort_by(|(_, a), (_, b)| {
+      if maximal {
+        by_key_cmp(b, a)
+      } else {
+        by_key_cmp(a, b)
+      }
+    });
+    let take = (n_val.max(0) as usize).min(keyed.len());
+    let result: Vec<(Expr, Expr)> = indexed
+      .into_iter()
+      .take(take)
+      .map(|(i, _)| keyed[i].0.clone())
+      .collect();
+    Ok(Expr::Association(result))
+  } else {
+    let extreme = keyed
+      .iter()
+      .map(|(_, c)| c)
+      .min_by(|a, b| {
+        if maximal {
+          by_key_cmp(b, a)
+        } else {
+          by_key_cmp(a, b)
+        }
+      })
+      .cloned();
+    let result: Vec<(Expr, Expr)> = match extreme {
+      Some(ex) => {
+        let ex_str = expr_to_string(&ex);
+        keyed
+          .into_iter()
+          .filter(|(_, c)| expr_to_string(c) == ex_str)
+          .map(|(kv, _)| kv)
+          .collect()
+      }
+      None => vec![],
+    };
+    Ok(Expr::Association(result))
+  }
+}
+
+pub fn minimal_by_ast(
+  list: &Expr,
+  func: &Expr,
+  n: Option<i128>,
+) -> Result<Expr, InterpreterError> {
+  // Association form: rank by f applied to each value, return an association.
+  if let Expr::Association(pairs) = list {
+    return minimal_maximal_by_assoc(pairs, func, n, false);
+  }
+  let items = match list {
+    Expr::List(items) if !items.is_empty() => items,
+    Expr::List(_) => return Ok(Expr::List(vec![].into())),
+    _ => {
+      let mut args = vec![list.clone(), func.clone()];
+      if let Some(nv) = n {
+        args.push(Expr::Integer(nv));
+      }
+      return Ok(call("MinimalBy", args));
+    }
+  };
+
+  let keyed: Vec<(Expr, Expr)> = items
+    .iter()
+    .map(|item| {
+      let key = apply_func_ast(func, item)?;
+      Ok((item.clone(), key))
+    })
+    .collect::<Result<_, InterpreterError>>()?;
+
+  if let Some(n_val) = n {
+    // Sort by key ascending, take n elements
+    let mut indexed: Vec<(usize, &Expr)> =
+      keyed.iter().enumerate().map(|(i, (_, k))| (i, k)).collect();
+    indexed.sort_by(|(_, a), (_, b)| by_key_cmp(a, b));
+    let take = (n_val as usize).min(keyed.len());
+    let result: Vec<Expr> = indexed
+      .into_iter()
+      .take(take)
+      .map(|(i, _)| keyed[i].0.clone())
+      .collect();
+    Ok(Expr::List(result.into()))
+  } else {
+    let min_key = keyed
+      .iter()
+      .map(|(_, k)| k)
+      .min_by(|a, b| by_key_cmp(a, b))
+      .cloned();
+
+    if let Some(min_k) = min_key {
+      let min_str = expr_to_string(&min_k);
+      let result: Vec<Expr> = keyed
+        .into_iter()
+        .filter(|(_, k)| expr_to_string(k) == min_str)
+        .map(|(item, _)| item)
+        .collect();
+      Ok(Expr::List(result.into()))
+    } else {
+      Ok(Expr::List(vec![].into()))
+    }
+  }
+}
+
+/// MaximalBy[list, f] - Returns all elements that maximize f
+/// MaximalBy[list, f, n] - Returns the n elements with largest f values
+pub fn maximal_by_ast(
+  list: &Expr,
+  func: &Expr,
+  n: Option<i128>,
+) -> Result<Expr, InterpreterError> {
+  // Association form: rank by f applied to each value, return an association.
+  if let Expr::Association(pairs) = list {
+    return minimal_maximal_by_assoc(pairs, func, n, true);
+  }
+  let items = match list {
+    Expr::List(items) if !items.is_empty() => items,
+    Expr::List(_) => return Ok(Expr::List(vec![].into())),
+    _ => {
+      let mut args = vec![list.clone(), func.clone()];
+      if let Some(nv) = n {
+        args.push(Expr::Integer(nv));
+      }
+      return Ok(call("MaximalBy", args));
+    }
+  };
+
+  let keyed: Vec<(Expr, Expr)> = items
+    .iter()
+    .map(|item| {
+      let key = apply_func_ast(func, item)?;
+      Ok((item.clone(), key))
+    })
+    .collect::<Result<_, InterpreterError>>()?;
+
+  if let Some(n_val) = n {
+    // Sort by key descending, take n elements
+    let mut indexed: Vec<(usize, &Expr)> =
+      keyed.iter().enumerate().map(|(i, (_, k))| (i, k)).collect();
+    indexed.sort_by(|(_, a), (_, b)| by_key_cmp(b, a));
+    let take = (n_val as usize).min(keyed.len());
+    let result: Vec<Expr> = indexed
+      .into_iter()
+      .take(take)
+      .map(|(i, _)| keyed[i].0.clone())
+      .collect();
+    Ok(Expr::List(result.into()))
+  } else {
+    let max_key = keyed
+      .iter()
+      .map(|(_, k)| k)
+      .max_by(|a, b| by_key_cmp(a, b))
+      .cloned();
+
+    if let Some(max_k) = max_key {
+      let max_str = expr_to_string(&max_k);
+      let result: Vec<Expr> = keyed
+        .into_iter()
+        .filter(|(_, k)| expr_to_string(k) == max_str)
+        .map(|(item, _)| item)
+        .collect();
+      Ok(Expr::List(result.into()))
+    } else {
+      Ok(Expr::List(vec![].into()))
+    }
+  }
+}
+
+/// AST-based Sort: sort a list.
+/// Whether `e` is an atomic argument for which list functions emit
+/// `::normal` (numbers, strings, symbols, constants). Lists, function calls,
+/// and associations are nonatomic and operable. Rational and Complex are
+/// atoms despite their FunctionCall storage (AtomQ[5/3] = True), so list
+/// functions must not operate on their internal arguments.
+pub fn is_atomic_arg(e: &Expr) -> bool {
+  matches!(
+    e,
+    Expr::Integer(_)
+      | Expr::BigInteger(_)
+      | Expr::Real(_)
+      | Expr::BigFloat(_, _)
+      | Expr::String(_)
+      | Expr::Identifier(_)
+      | Expr::Constant(_)
+  ) || matches!(e, Expr::FunctionCall { name, args }
+      if (name == "Rational" || name == "Complex") && args.len() == 2)
+    || crate::functions::predicate_ast::is_complex_number(e)
+}
+
+/// Emit `<F>::normal: Nonatomic expression expected at position 1 in <call>.`,
+/// matching wolframscript for list functions applied to an atom. The call
+/// renders in 2D OutputForm — a rational argument spans three lines with the
+/// message text on the baseline, exactly as wolframscript prints it.
+pub fn emit_nonatomic_normal_message(name: &str, args: &[Expr]) {
+  crate::emit_message(&crate::syntax::format_message_with_expr(
+    &format!("{name}::normal: Nonatomic expression expected at position 1 in "),
+    &unevaluated(name, args),
+    ".",
+  ));
+}
+
+/// Purely lexicographic comparison: unlike canonical `Sort`, lists are
+/// compared element by element (shorter lists are a tie-break, not pulled to
+/// the front), so `{2}` sorts between `{1, 9}` and `{3}`. Non-list expressions
+/// fall back to the canonical order.
+fn lexicographic_cmp(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  if let (Expr::List(la), Expr::List(lb)) = (a, b) {
+    for (ai, bi) in la.iter().zip(lb.iter()) {
+      let ord = lexicographic_cmp(ai, bi);
+      if ord != std::cmp::Ordering::Equal {
+        return ord;
+      }
+    }
+    return la.len().cmp(&lb.len());
+  }
+  canonical_cmp(a, b)
+}
+
+/// `LexicographicSort[list]` — sort by the purely lexicographic order.
+pub fn lexicographic_sort_ast(list: &Expr) -> Result<Expr, InterpreterError> {
+  match list {
+    Expr::List(items) => {
+      let mut sorted = items.clone();
+      sorted.sort_by(lexicographic_cmp);
+      Ok(Expr::List(sorted))
+    }
+    _ => sort_ast(list),
+  }
+}
+
+pub fn sort_ast(list: &Expr) -> Result<Expr, InterpreterError> {
+  match list {
+    Expr::List(items) => {
+      let mut sorted = items.clone();
+      sorted.sort_by(canonical_cmp);
+      Ok(Expr::List(sorted))
+    }
+    Expr::Association(pairs) => {
+      let mut sorted = pairs.clone();
+      sorted.sort_by(|a, b| canonical_cmp(&a.1, &b.1));
+      Ok(Expr::Association(sorted))
+    }
+    // Rational/Complex are atoms — their internal args must not sort
+    // (Sort[5/3] emits Sort::normal, it does not become 3/5).
+    Expr::FunctionCall { name, args } if !is_atomic_arg(list) => {
+      let mut sorted = args.clone();
+      sorted.sort_by(canonical_cmp);
+      Ok(Expr::FunctionCall {
+        name: name.clone(),
+        args: sorted,
+      })
+    }
+    other => {
+      if is_atomic_arg(other) {
+        emit_nonatomic_normal_message("Sort", std::slice::from_ref(other));
+      }
+      Ok(call1("Sort", list.clone()))
+    }
+  }
+}
+
+/// OrderedQ[list] - Tests if a list is in sorted (non-decreasing) order
+pub fn ordered_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "OrderedQ expects exactly 1 argument".into(),
+    ));
+  }
+
+  if let Expr::List(items) = &args[0] {
+    if items.len() <= 1 {
+      return Ok(bool_expr(true));
+    }
+    for i in 0..items.len() - 1 {
+      if !expr_le(&items[i], &items[i + 1]) {
+        return Ok(bool_expr(false));
+      }
+    }
+    Ok(bool_expr(true))
+  } else {
+    Ok(unevaluated("OrderedQ", args))
+  }
+}
+
+/// Compare two Expr values for canonical ordering.
+/// Returns 1 if a < b, -1 if a > b, 0 if equal (Wolfram Order convention).
+pub fn compare_exprs(a: &Expr, b: &Expr) -> i64 {
+  use crate::functions::math_ast::try_eval_to_f64_with_infinity;
+  let (sa, sb) = (slot_as_call(a), slot_as_call(b));
+  if sa.is_some() || sb.is_some() {
+    return compare_exprs(sa.as_ref().unwrap_or(a), sb.as_ref().unwrap_or(b));
+  }
+  // ByteArray vs ByteArray: compare by decoded byte payload, not by the
+  // wrapping `ByteArray["<base64>"]` string. wolframscript:
+  //   Order[ByteArray[{1, 99}], ByteArray[{2, 0}]] = 1
+  // because the first byte 1 < 2.
+  if let (Some(a_bytes), Some(b_bytes)) =
+    (decode_byte_array(a), decode_byte_array(b))
+  {
+    return match a_bytes.as_slice().cmp(b_bytes.as_slice()) {
+      std::cmp::Ordering::Less => 1,
+      std::cmp::Ordering::Greater => -1,
+      std::cmp::Ordering::Equal => 0,
+    };
+  }
+  // Only NUMBER LITERALS compare by value — symbolic constants (Pi, E)
+  // and numeric composites (2*Pi, Sqrt[2]) sort structurally after all
+  // numbers in Wolfram's canonical order (Sort[{Pi, 7}] = {7, Pi}).
+  // Complex literals order by real part, then imaginary part
+  // (Sort[{I, -I, 1, 1 + I}] = {-I, I, 1, 1 + I}).
+  let literal_parts = |e: &Expr| -> Option<(f64, f64)> {
+    match e {
+      Expr::Integer(_)
+      | Expr::BigInteger(_)
+      | Expr::Real(_)
+      | Expr::BigFloat(..) => {
+        try_eval_to_f64_with_infinity(e).map(|v| (v, 0.0))
+      }
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        try_eval_to_f64_with_infinity(e).map(|v| (v, 0.0))
+      }
+      _ if crate::functions::predicate_ast::is_complex_number(e) => {
+        crate::functions::math_ast::try_extract_complex_float(e)
+      }
+      _ => None,
+    }
+  };
+  let a_lit = literal_parts(a);
+  let b_lit = literal_parts(b);
+  if let (Some((ar, ai)), Some((br, bi))) = (a_lit, b_lit) {
+    if ar != br {
+      return if ar < br { 1 } else { -1 };
+    }
+    if ai != bi {
+      return if ai < bi { 1 } else { -1 };
+    }
+    // Numerically equal number atoms tie-break by type: Integer
+    // before Real before Rational. wolframscript: Sort[{1., 1}] =
+    // {1, 1.} and Sort[{3/2, 1.5}] = {1.5, 3/2}.
+    let type_rank = |e: &Expr| -> Option<i64> {
+      match e {
+        Expr::Integer(_) | Expr::BigInteger(_) => Some(0),
+        Expr::Real(_) | Expr::BigFloat(..) => Some(1),
+        Expr::FunctionCall { name, args }
+          if name == "Rational" && args.len() == 2 =>
+        {
+          Some(2)
+        }
+        _ => None,
+      }
+    };
+    return match (type_rank(a), type_rank(b)) {
+      (Some(ra), Some(rb)) if ra < rb => 1,
+      (Some(ra), Some(rb)) if ra > rb => -1,
+      _ => 0,
+    };
+  }
+  // Numbers come before non-numbers
+  if a_lit.is_some() {
+    return 1;
+  }
+  if b_lit.is_some() {
+    return -1;
+  }
+  // Directed infinities (Infinity, -Infinity, ComplexInfinity) order as
+  // their DirectedInfinity[...] head: after symbols, among composites,
+  // with -Infinity before Infinity (Sort[{-Infinity, 5}] = {5, -Infinity}).
+  let normalize_infinity = |e: &Expr| -> Option<Expr> {
+    if matches!(e, Expr::FunctionCall { name, .. } if name == "DirectedInfinity")
+    {
+      return None; // already in canonical form
+    }
+    if !crate::functions::predicate_ast::is_directed_infinity(e) {
+      return None;
+    }
+    let dir = if matches!(e, Expr::Identifier(s) | Expr::Constant(s) if s == "ComplexInfinity")
+    {
+      vec![]
+    } else if crate::functions::math_ast::is_neg_infinity(e) {
+      vec![Expr::Integer(-1)]
+    } else {
+      vec![Expr::Integer(1)]
+    };
+    Some(call("DirectedInfinity", dir))
+  };
+  let a_inf = normalize_infinity(a);
+  let b_inf = normalize_infinity(b);
+  if a_inf.is_some() || b_inf.is_some() {
+    return compare_exprs(
+      a_inf.as_ref().unwrap_or(a),
+      b_inf.as_ref().unwrap_or(b),
+    );
+  }
+
+  // Two Lists: Wolfram's canonical order compares expressions with the same
+  // head by length first, then element by element — so `{2}` and `{3}` (each
+  // length 1) precede `{1, 2}` (length 2). Without this, Lists fell through to
+  // a lexicographic string comparison that ordered `{1, 2}` first.
+  if let (Expr::List(la), Expr::List(lb)) = (a, b) {
+    match la.len().cmp(&lb.len()) {
+      std::cmp::Ordering::Less => return 1,
+      std::cmp::Ordering::Greater => return -1,
+      std::cmp::Ordering::Equal => {}
+    }
+    for (ai, bi) in la.iter().zip(lb.iter()) {
+      let ord = compare_exprs(ai, bi);
+      if ord != 0 {
+        return ord;
+      }
+    }
+    return 0;
+  }
+
+  // Two sums: like products, Wolfram compares them from their LAST term
+  // backwards, so the leading (highest) terms decide and the constant only
+  // breaks a tie — Order[-3 + x^2, 3 + x] = -1 (x < x^2), Order[2 + x^3,
+  // 1 + x^4] = 1, Order[3 + x^5, 1 + x + x^2] = -1 (element-wise beats the
+  // shorter length). A sum that runs out of terms first comes first:
+  // Order[x + x^2, 1 + x + x^2] = 1. All wolframscript-verified.
+  if let (Some(ta), Some(tb)) =
+    (plus_terms_for_order(a), plus_terms_for_order(b))
+  {
+    let mut i = ta.len();
+    let mut j = tb.len();
+    while i > 0 && j > 0 {
+      let ord = compare_exprs(ta[i - 1], tb[j - 1]);
+      if ord != 0 {
+        return ord;
+      }
+      i -= 1;
+      j -= 1;
+    }
+    if i != j {
+      return if i < j { 1 } else { -1 };
+    }
+    return 0;
+  }
+
+  // Wolfram's canonical order compares terms with their number-literal
+  // coefficients stripped first — Order[2*Sqrt[2], Sqrt[11]] = 1 because
+  // Sqrt[2] < Sqrt[11], Order[-Sqrt[11], 2*Sqrt[6]] = -1 — and only breaks
+  // a tie on the symbolic part by the coefficients, ascending:
+  // Order[-6*x^2, -5*x^2] = 1, Order[-x, x] = 1, Order[2*x, x] = -1
+  // (all wolframscript-verified).
+  {
+    let (ca, ra) = numeric_coeff_and_rest_expr(a);
+    let (cb, rb) = numeric_coeff_and_rest_expr(b);
+    if ra.is_some() || rb.is_some() {
+      let ord =
+        compare_exprs(ra.as_ref().unwrap_or(a), rb.as_ref().unwrap_or(b));
+      if ord != 0 {
+        return ord;
+      }
+      if ca != cb {
+        return if ca < cb { 1 } else { -1 };
+      }
+      // Coefficient and symbolic part both tie (e.g. 2*x vs 2.*x): fall
+      // through so the structural comparison below can still distinguish
+      // numerically-equal-but-distinct coefficient types.
+    }
+  }
+
+  // A leading factor that is not a number literal behaves like a coefficient
+  // too, products comparing from their last factor backwards:
+  // Order[(a + b)*x, a*x] = -1 because the tie on x falls to a vs a + b.
+  let (fa, fb) = (times_factors_for_order(a), times_factors_for_order(b));
+  if fa.is_some() || fb.is_some() {
+    let single_a = [a];
+    let single_b = [b];
+    let fa = fa.unwrap_or_else(|| single_a.to_vec());
+    let fb = fb.unwrap_or_else(|| single_b.to_vec());
+    let mut i = fa.len();
+    let mut j = fb.len();
+    while i > 0 && j > 0 {
+      let ord = compare_exprs(fa[i - 1], fb[j - 1]);
+      if ord != 0 {
+        return ord;
+      }
+      i -= 1;
+      j -= 1;
+    }
+    if i != j {
+      return if i < j { 1 } else { -1 };
+    }
+  }
+
+  // Two powers of integer or rational bases with numeric exponents compare
+  // by base ascending, then exponent ascending: Order[Sqrt[2], Sqrt[11]] = 1,
+  // Order[2^(1/3), Sqrt[2]] = 1, Order[Sqrt[5/3], Sqrt[3]] = 1 (all
+  // wolframscript-verified). The string comparisons below would order
+  // "11" before "2" lexicographically.
+  if let (Some((ba, ea)), Some((bb, eb))) =
+    (int_base_power(a), int_base_power(b))
+  {
+    match ratio_cmp(ba, bb) {
+      std::cmp::Ordering::Equal => {}
+      std::cmp::Ordering::Less => return 1,
+      std::cmp::Ordering::Greater => return -1,
+    }
+    if ea != eb {
+      return if ea < eb { 1 } else { -1 };
+    }
+    return 0;
+  }
+
+  // A power of a number compares by its base first, and a number precedes
+  // everything that is not one — so it sorts ahead of every symbol, string
+  // or compound, and two such powers of the same base compare by exponent:
+  // Sort[{E, "s", 2^x, Sqrt[2]}] = {Sqrt[2], 2^x, s, E}
+  // (wolframscript-verified).
+  {
+    match (number_base_power(a), number_base_power(b)) {
+      (Some(_), None) => return 1,
+      (None, Some(_)) => return -1,
+      (Some((ba, ea)), Some((bb, eb))) => {
+        let ord = compare_exprs(&ba, &bb);
+        if ord != 0 {
+          return ord;
+        }
+        let ord = compare_exprs(&ea, &eb);
+        if ord != 0 {
+          return ord;
+        }
+      }
+      (None, None) => {}
+    }
+  }
+
+  // Powers with the same symbolic base compare by exponent, canonically:
+  // Order[E^(-2*t), E^(-1/9*t^2)] = 1 because the exponent -2*t precedes
+  // -1/9*t^2 (degree ascending; wolframscript-verified). The string
+  // comparison below would order "E^(-1/9*t^2)" first on '1' < '2'.
+  if let (Some((ba, ea)), Some((bb, eb))) = (power_parts(a), power_parts(b))
+    && expr_to_string(&ba) == expr_to_string(&bb)
+  {
+    let ord = compare_exprs(&ea, &eb);
+    if ord != 0 {
+      return ord;
+    }
+  }
+
+  // Wolfram canonical ordering: symbols and compounds are compared structurally
+  // Classification: atom-like (atoms, constants, powers) sort before function calls
+  let a_is_atom = is_atom_expr(a);
+  let b_is_atom = is_atom_expr(b);
+  let a_is_power = is_power_expr(a);
+  let b_is_power = is_power_expr(b);
+  let a_is_func_call = !a_is_atom && !a_is_power && is_plain_func_call(a);
+  let b_is_func_call = !b_is_atom && !b_is_power && is_plain_func_call(b);
+  // Patterns (`_Symbol`, `x_`, `x_Integer`, etc.) sort like function calls
+  // for canonical-order purposes: an atom always comes before a Pattern,
+  // matching wolframscript's `Sort[{a, _Symbol, _Integer}]` =
+  // `{a, _Integer, _Symbol}`.
+  let a_is_pattern = matches!(a, Expr::Pattern { .. });
+  let b_is_pattern = matches!(b, Expr::Pattern { .. });
+
+  // Atoms and powers always sort before plain function calls
+  let a_is_atom_like = a_is_atom || a_is_power;
+  let b_is_atom_like = b_is_atom || b_is_power;
+  let a_is_compound = a_is_func_call || a_is_pattern;
+  let b_is_compound = b_is_func_call || b_is_pattern;
+
+  if a_is_atom_like && b_is_compound {
+    1 // atom/power always before function call / pattern
+  } else if a_is_compound && b_is_atom_like {
+    -1 // function call / pattern always after atom/power
+  } else {
+    // Same category: use standard ordering
+    match (a_is_atom, b_is_atom) {
+      (true, true) => {
+        // Both atoms: alphabetical comparison
+        let a_str = expr_to_string(a);
+        let b_str = expr_to_string(b);
+        wolfram_string_order(&a_str, &b_str)
+      }
+      (true, false) => {
+        // Atom vs compound: compare atom with compound's sort key
+        // Special case: Plus[neg, atom] with same atom sorts before the atom
+        // (Wolfram: (-3+x)*x not x*(-3+x))
+        if crate::functions::additive_is_neg_const_plus_ident(b, a) {
+          return -1; // compound (Plus) comes before atom
+        }
+        // A sum whose highest canonical term is the NEGATED atom sorts
+        // before the atom (coefficient -1 < 1 on the tied term), matching
+        // wolframscript: Gamma[a - s]*Gamma[s], but Gamma[s]*Gamma[2 + s].
+        if sum_highest_term_negates(b, a) {
+          return -1;
+        }
+        let b_key = expr_sort_key(b);
+        let a_str = expr_to_string(a);
+        let cmp = wolfram_string_order(&a_str, &b_key);
+        if cmp == 0 {
+          1 // atom comes before compound with same key
+        } else {
+          cmp
+        }
+      }
+      (false, true) => {
+        // Compound vs atom: reverse of above
+        if crate::functions::additive_is_neg_const_plus_ident(a, b) {
+          return 1; // compound (Plus) comes before atom
+        }
+        if sum_highest_term_negates(a, b) {
+          return 1;
+        }
+        let a_key = expr_sort_key(a);
+        let b_str = expr_to_string(b);
+        let cmp = wolfram_string_order(&a_key, &b_str);
+        if cmp == 0 {
+          -1 // compound comes after atom with same key
+        } else {
+          cmp
+        }
+      }
+      (false, false) => {
+        // Same-head plain function calls: compare arguments structurally.
+        // This matches Wolfram's canonical ordering, e.g. Cos[x] before
+        // Cos[Cos[x]] (because x < Cos[x] — atoms precede function calls).
+        if let (
+          Expr::FunctionCall { name: na, args: aa },
+          Expr::FunctionCall { name: nb, args: ab },
+        ) = (a, b)
+          && na == nb
+          && a_is_func_call
+          && b_is_func_call
+        {
+          // Same head: order by argument count first, then argument by
+          // argument (Wolfram: f[3] precedes f[1, 2]).
+          match aa.len().cmp(&ab.len()) {
+            std::cmp::Ordering::Less => return 1,
+            std::cmp::Ordering::Greater => return -1,
+            std::cmp::Ordering::Equal => {}
+          }
+          for (ai, bi) in aa.iter().zip(ab.iter()) {
+            let ord = compare_exprs(ai, bi);
+            if ord != 0 {
+              return ord;
+            }
+          }
+          return 0;
+        }
+        // Both compounds: compare sort keys, then by full string
+        let a_key = expr_sort_key(a);
+        let b_key = expr_sort_key(b);
+        let cmp = wolfram_string_order(&a_key, &b_key);
+        if cmp != 0 {
+          return cmp;
+        }
+        let a_str = expr_to_string(a);
+        let b_str = expr_to_string(b);
+        wolfram_string_order(&a_str, &b_str)
+      }
+    }
+  }
+}
+
+/// A power of an integer base with a numeric exponent — Sqrt[2],
+/// 2^(1/3), Power[5, -1] — as `(base, exponent)`. These compare by base
+/// ascending then exponent ascending in Wolfram's canonical order.
+fn int_base_power(e: &Expr) -> Option<((i128, i128), f64)> {
+  use crate::functions::math_ast::try_eval_to_f64_with_infinity;
+  let (base, exp) = match e {
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => (
+      args[0].clone(),
+      call("Rational", vec![Expr::Integer(1), Expr::Integer(2)]),
+    ),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (args[0].clone(), args[1].clone())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => ((**left).clone(), (**right).clone()),
+    _ => return None,
+  };
+  // Bases may be integers or rationals — Sort[{Sqrt[3], Sqrt[5/3]}] =
+  // {Sqrt[5/3], Sqrt[3]} because 5/3 < 3. Normalized to den > 0.
+  let b = match &base {
+    Expr::Integer(b) => (*b, 1),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(n), Expr::Integer(d)) if *d != 0 => {
+          if *d < 0 {
+            (-n, -d)
+          } else {
+            (*n, *d)
+          }
+        }
+        _ => return None,
+      }
+    }
+    _ => return None,
+  };
+  let e = try_eval_to_f64_with_infinity(&exp)?;
+  Some((b, e))
+}
+
+/// Order two powers of integer/rational bases with numeric exponents by
+/// base ascending, then exponent ascending — Wolfram's canonical order for
+/// numeric radicals (Order[Sqrt[5/3], Sqrt[3]] = 1, Order[2^(1/3),
+/// Sqrt[2]] = 1). None unless both expressions are such powers.
+pub fn numeric_base_power_cmp(
+  a: &Expr,
+  b: &Expr,
+) -> Option<std::cmp::Ordering> {
+  let (ba, ea) = int_base_power(a)?;
+  let (bb, eb) = int_base_power(b)?;
+  Some(
+    ratio_cmp(ba, bb)
+      .then(ea.partial_cmp(&eb).unwrap_or(std::cmp::Ordering::Equal)),
+  )
+}
+
+/// Compare two exact rationals `(num, den)` with positive denominators by
+/// cross-multiplication, falling back to f64 on i128 overflow.
+fn ratio_cmp(a: (i128, i128), b: (i128, i128)) -> std::cmp::Ordering {
+  if let (Some(l), Some(r)) = (a.0.checked_mul(b.1), b.0.checked_mul(a.1)) {
+    l.cmp(&r)
+  } else {
+    let l = a.0 as f64 / a.1 as f64;
+    let r = b.0 as f64 / b.1 as f64;
+    l.partial_cmp(&r).unwrap_or(std::cmp::Ordering::Equal)
+  }
+}
+
+/// Decompose a power expression — Power[b, e] (either Expr shape) or
+/// Sqrt[b] — into `(base, exponent)`. Non-power expressions yield None.
+/// `(base, exponent)` of a power whose base is an integer or rational.
+fn number_base_power(e: &Expr) -> Option<(Expr, Expr)> {
+  power_parts(e).filter(|(base, _)| {
+    matches!(base, Expr::Integer(_) | Expr::BigInteger(_))
+      || matches!(base, Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2)
+  })
+}
+
+fn power_parts(e: &Expr) -> Option<(Expr, Expr)> {
+  match e {
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => {
+      Some((
+        args[0].clone(),
+        call("Rational", vec![Expr::Integer(1), Expr::Integer(2)]),
+      ))
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      Some((args[0].clone(), args[1].clone()))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => Some(((**left).clone(), (**right).clone())),
+    _ => None,
+  }
+}
+
+/// Split a term into its leading number-literal coefficient and the
+/// remaining symbolic factors. Returns `((re, im), Some(rest))` when a
+/// literal coefficient (or unary minus) was actually stripped, and
+/// `((1.0, 0.0), None)` when the term carries no literal coefficient — so
+/// callers can tell `x` (nothing stripped) apart from `1.0*x`. Imaginary
+/// coefficients count as literals so that `-I x` sorts between `-x` and
+/// `I x` the way number literals themselves do.
+fn numeric_coeff_and_rest_expr(e: &Expr) -> ((f64, f64), Option<Expr>) {
+  use crate::functions::math_ast::try_eval_to_f64_with_infinity;
+  let literal = |x: &Expr| -> Option<(f64, f64)> {
+    match x {
+      Expr::Integer(_)
+      | Expr::BigInteger(_)
+      | Expr::Real(_)
+      | Expr::BigFloat(..) => {
+        try_eval_to_f64_with_infinity(x).map(|v| (v, 0.0))
+      }
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        try_eval_to_f64_with_infinity(x).map(|v| (v, 0.0))
+      }
+      Expr::Identifier(s) | Expr::Constant(s) if s == "I" => Some((0.0, 1.0)),
+      Expr::FunctionCall { name, args }
+        if name == "Complex" && args.len() == 2 =>
+      {
+        crate::functions::math_ast::try_extract_complex_float(x)
+      }
+      _ => None,
+    }
+  };
+  match e {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let ((cr, ci), r) = numeric_coeff_and_rest_expr(operand);
+      ((-cr, -ci), Some(r.unwrap_or_else(|| (**operand).clone())))
+    }
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      // Every literal factor joins the coefficient, so `-I x` compares as
+      // coefficient -I against `x` rather than leaving `I x` in the
+      // symbolic part.
+      let mut coeff = (1.0, 0.0);
+      let mut rest: Vec<Expr> = Vec::new();
+      let mut stripped = false;
+      for arg in args {
+        if let Some((r, i)) = literal(arg) {
+          coeff = (coeff.0 * r - coeff.1 * i, coeff.0 * i + coeff.1 * r);
+          stripped = true;
+        } else {
+          rest.push(arg.clone());
+        }
+      }
+      if stripped && !rest.is_empty() {
+        let rest = if rest.len() == 1 {
+          rest.remove(0)
+        } else {
+          unevaluated("Times", &rest)
+        };
+        (coeff, Some(rest))
+      } else {
+        ((1.0, 0.0), None)
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      if let Some((lr, li)) = literal(left) {
+        let ((rr, ri), r) = numeric_coeff_and_rest_expr(right);
+        (
+          (lr * rr - li * ri, lr * ri + li * rr),
+          Some(r.unwrap_or_else(|| (**right).clone())),
+        )
+      } else {
+        ((1.0, 0.0), None)
+      }
+    }
+    _ => ((1.0, 0.0), None),
+  }
+}
+
+/// Flattened additive terms of a sum, in stored (canonical, ascending)
+/// order — the greatest term is last. Minus-chain right operands come back
+/// negated. Returns None unless `e` is an additive expression with at
+/// least two terms.
+fn sum_terms_list(e: &Expr) -> Option<Vec<Expr>> {
+  fn collect(e: &Expr, negate: bool, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Plus" => {
+        for a in args {
+          collect(a, negate, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => {
+        collect(left, negate, out);
+        collect(right, negate, out);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        left,
+        right,
+      } => {
+        collect(left, negate, out);
+        collect(right, !negate, out);
+      }
+      _ => out.push(if negate { neg1(e.clone()) } else { e.clone() }),
+    }
+  }
+  if !matches!(e, Expr::FunctionCall { name, .. } if name == "Plus")
+    && !matches!(
+      e,
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus | BinaryOperator::Minus,
+        ..
+      }
+    )
+  {
+    return None;
+  }
+  let mut out = Vec::new();
+  collect(e, false, &mut out);
+  if out.len() >= 2 { Some(out) } else { None }
+}
+
+/// The numeric exponent of a term with its literal coefficient stripped:
+/// `x` -> 1, `Sqrt[x]` -> 0.5, `x^n` -> n, `93/x` -> -1. None when the
+/// exponent is not numeric (e.g. `2^x`).
+fn term_exponent(t: &Expr) -> Option<f64> {
+  let (_, r) = numeric_coeff_and_rest_expr(t);
+  let rest = r.as_ref().unwrap_or(t);
+  if let Some((_, exp)) = power_parts(rest) {
+    crate::functions::math_ast::try_eval_to_f64(&exp)
+  } else {
+    Some(1.0)
+  }
+}
+
+/// True when `t` is a negative number literal or carries a negative literal
+/// coefficient (`-3`, `-x`, `-2*Sqrt[5]`).
+fn term_is_negative(t: &Expr) -> bool {
+  if matches!(
+    t,
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      ..
+    }
+  ) {
+    return true;
+  }
+  if let Some(v) = crate::functions::math_ast::try_eval_to_f64(t) {
+    return v < 0.0;
+  }
+  let ((cre, cim), r) = numeric_coeff_and_rest_expr(t);
+  r.is_some() && cim == 0.0 && cre < 0.0
+}
+
+/// Whether a sum sorts in the EARLY class — before monomials and atoms —
+/// in Wolfram's canonical Sort order. wolframscript-verified:
+///   Sort[{Pi, 1 + 1/Pi}]  = {1 + Pi^(-1), Pi}   (sub-linear lead)
+///   Sort[{x, 5 - x}]      = {5 - x, x}          (negative lead coeff)
+///   Sort[{1/x, -3 + x}]   = {-3 + x, x^(-1)}    (negative lower term)
+///   Sort[{x, 2 + x}]      = {x, 2 + x}          (late: all-positive linear)
+///   Sort[{1/x, x - x^2}]  = {x^(-1), x - x^2}   (late: super-linear lead)
+fn sum_sorts_early(terms: &[Expr]) -> bool {
+  let Some(lead) = terms.last() else {
+    return false;
+  };
+  let Some(exp) = term_exponent(lead) else {
+    return false;
+  };
+  if exp < 1.0 {
+    return true;
+  }
+  if exp == 1.0
+    && (term_is_negative(lead)
+      || terms[..terms.len() - 1].iter().any(term_is_negative))
+  {
+    return true;
+  }
+  false
+}
+
+/// Compare two sums termwise from the greatest (last canonical) term down;
+/// when one runs out, its missing terms count as 0 against the other's
+/// remaining greatest term (Sort[{2 + Pi, Pi}] = {Pi, 2 + Pi} but
+/// Sort[{-3 + x, x}] = {-3 + x, x}).
+fn cmp_sum_terms(ta: &[Expr], tb: &[Expr]) -> std::cmp::Ordering {
+  let (mut i, mut j) = (ta.len(), tb.len());
+  loop {
+    match (i, j) {
+      (0, 0) => return std::cmp::Ordering::Equal,
+      (0, _) => return canonical_cmp(&Expr::Integer(0), &tb[j - 1]),
+      (_, 0) => return canonical_cmp(&ta[i - 1], &Expr::Integer(0)),
+      _ => {
+        let ord = canonical_cmp(&ta[i - 1], &tb[j - 1]);
+        if ord != std::cmp::Ordering::Equal {
+          return ord;
+        }
+        i -= 1;
+        j -= 1;
+      }
+    }
+  }
+}
+
+/// A plain function call that is not itself a power (Sqrt/Power) — sums
+/// sort before these (Sort[{Cos[x], 1 + x}] = {1 + x, Cos[x]}).
+fn is_plain_call_non_power(e: &Expr) -> bool {
+  is_plain_func_call(e)
+    && !matches!(e, Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1)
+}
+
+/// True when `sum` is an additive expression whose highest (last) canonical
+/// term is exactly the negation of `atom`. Wolfram's canonical order compares
+/// sums by their highest term first, and on a symbol tie the negative
+/// coefficient sorts first — so `a - s` and `2 - s` sort before `s`, while
+/// `2 + s` sorts after it.
+fn sum_highest_term_negates(sum: &Expr, atom: &Expr) -> bool {
+  let last = match sum {
+    Expr::FunctionCall { name, args } if name == "Plus" && args.len() >= 2 => {
+      args.last().cloned()
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      right,
+      ..
+    } => Some(Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand: right.clone(),
+    }),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      right,
+      ..
+    } => Some((**right).clone()),
+    _ => None,
+  };
+  let Some(last) = last else { return false };
+  let negated_inner = match &last {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => Some((**operand).clone()),
+    Expr::FunctionCall { name, args }
+      if name == "Times"
+        && args.len() == 2
+        && matches!(&args[0], Expr::Integer(n) if *n < 0) =>
+    {
+      Some(args[1].clone())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } if matches!(left.as_ref(), Expr::Integer(n) if *n < 0) => {
+      Some((**right).clone())
+    }
+    _ => None,
+  };
+  match negated_inner {
+    Some(inner) => expr_to_string(&inner) == expr_to_string(atom),
+    None => false,
+  }
+}
+
+/// If `expr` is `ByteArray["<base64>"]`, decode and return its raw byte
+/// payload. Used by `compare_exprs` so canonical-order comparisons walk
+/// the underlying bytes rather than the base64 wrapper string.
+fn decode_byte_array(expr: &Expr) -> Option<Vec<u8>> {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "ByteArray"
+    && args.len() == 1
+    && let Expr::String(b64) = &args[0]
+  {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    return engine.decode(b64).ok();
+  }
+  None
+}
+
+/// Check if an expression is a Power (BinaryOp or FunctionCall)
+fn is_power_expr(e: &Expr) -> bool {
+  matches!(
+    e,
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      ..
+    }
+  ) || matches!(e, Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2)
+}
+
+/// Check if an expression is a plain function call (not Plus/Times/Power/Rational)
+fn is_plain_func_call(e: &Expr) -> bool {
+  matches!(e, Expr::FunctionCall { name, .. }
+    if name != "Plus" && name != "Times" && name != "Power" && name != "Rational")
+}
+
+/// Extract the sort key for a compound expression.
+/// For Plus/Times: the last (largest) symbolic argument
+/// For Power: the base
+/// For other functions: the last argument, or the function name
+pub fn expr_sort_key(e: &Expr) -> String {
+  match e {
+    Expr::FunctionCall { name, args } if !args.is_empty() => {
+      // For Plus/Times (Orderless), use the last symbolic argument
+      if (name == "Plus" || name == "Times")
+        && let Some(last) = args.last()
+      {
+        if is_atom_expr(last) {
+          return expr_to_string(last);
+        }
+        return expr_sort_key(last);
+      }
+      // For Power/Sqrt: sort key is the base (same as BinaryOp::Power)
+      if name == "Power" && args.len() == 2 {
+        if is_atom_expr(&args[0]) {
+          return expr_to_string(&args[0]);
+        }
+        return expr_sort_key(&args[0]);
+      }
+      if let Some(sqrt_arg) = crate::functions::math_ast::is_sqrt(e) {
+        if is_atom_expr(sqrt_arg) {
+          return expr_to_string(sqrt_arg);
+        }
+        return expr_sort_key(sqrt_arg);
+      }
+      // For other function calls (like C[1], Sin[x]), use the function name
+      name.clone()
+    }
+    // For CurriedCall whose head is itself a FunctionCall (e.g. the
+    // `Derivative[1][f]` shape stored as `CurriedCall { Derivative[1], [f] }`),
+    // use the inner head name as the sort key. This keeps mixed flat
+    // (`FunctionCall { Derivative, [1, f] }`) and curried forms in the
+    // same sort bucket so Times canonical ordering can compare their
+    // arguments structurally.
+    Expr::CurriedCall { func, .. } => {
+      if let Expr::FunctionCall { name, .. } = func.as_ref() {
+        return name.clone();
+      }
+      expr_to_string(e)
+    }
+    Expr::BinaryOp { op, left, right } => {
+      match op {
+        BinaryOperator::Power => {
+          // Power: sort key is the base (recurse for compound bases)
+          if is_atom_expr(left) {
+            expr_to_string(left)
+          } else {
+            expr_sort_key(left)
+          }
+        }
+        BinaryOperator::Plus | BinaryOperator::Times => {
+          // For binary plus/times: use the "larger" operand
+          let l = expr_to_string(left);
+          let r = expr_to_string(right);
+          if wolfram_string_order(&l, &r) >= 0 {
+            r
+          } else {
+            l
+          }
+        }
+        _ => expr_to_string(e),
+      }
+    }
+    _ => expr_to_string(e),
+  }
+}
+
+/// Wolfram canonical string comparison (returns std::cmp::Ordering)
+fn wolfram_string_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+  match wolfram_string_order(a, b) {
+    n if n > 0 => std::cmp::Ordering::Less,
+    n if n < 0 => std::cmp::Ordering::Greater,
+    _ => std::cmp::Ordering::Equal,
+  }
+}
+
+/// Wolfram canonical string ordering: case-insensitive alphabetical, then lowercase < uppercase
+pub fn wolfram_string_order(a: &str, b: &str) -> i64 {
+  // Collation rank: Wolfram sorts the Nordic letters å/ä/ö/æ/ø after
+  // `z` (in that order) and ñ after the plain Latin letters, not by
+  // Unicode codepoint. wolframscript: Sort[{"ä", "å"}] = {å, ä}.
+  fn collate(c: char) -> u32 {
+    match c {
+      'å' | 'Å' => 0x110000 + 27,
+      'ä' | 'Ä' => 0x110000 + 28,
+      'ö' | 'Ö' => 0x110000 + 29,
+      'æ' | 'Æ' => 0x110000 + 30,
+      'ø' | 'Ø' => 0x110000 + 31,
+      'ñ' | 'Ñ' => 0x100000 + ('n' as u32) + 1,
+      other => other as u32,
+    }
+  }
+  let a_chars: Vec<char> = a.chars().collect();
+  let b_chars: Vec<char> = b.chars().collect();
+
+  // Pass 1: case-insensitive comparison over the whole strings, with a
+  // shorter string sorting first on a prefix match. wolframscript:
+  // Sort[{"MathML", "MAT"}] = {MAT, MathML} — the case difference at
+  // the second letter must not outrank the length/letter comparison.
+  for (ac, bc) in a_chars.iter().zip(b_chars.iter()) {
+    let al = ac.to_lowercase().next().unwrap_or(*ac);
+    let bl = bc.to_lowercase().next().unwrap_or(*bc);
+    if collate(al) != collate(bl) {
+      return if collate(al) < collate(bl) { 1 } else { -1 };
+    }
+  }
+  match a_chars.len().cmp(&b_chars.len()) {
+    std::cmp::Ordering::Less => return 1,
+    std::cmp::Ordering::Greater => return -1,
+    std::cmp::Ordering::Equal => {}
+  }
+  // Pass 2: case-insensitively equal strings tie-break at the first
+  // case difference, lowercase first: Sort[{"Ab", "aB"}] = {aB, Ab}.
+  for (ac, bc) in a_chars.iter().zip(b_chars.iter()) {
+    if ac != bc {
+      if ac.is_lowercase() && bc.is_uppercase() {
+        return 1;
+      } else if ac.is_uppercase() && bc.is_lowercase() {
+        return -1;
+      }
+    }
+  }
+  0
+}
+
+/// Helper: compare two Expr values for ordering (less-or-equal)
+fn expr_le(a: &Expr, b: &Expr) -> bool {
+  // Use canonical_cmp for consistency with Sort
+  !matches!(canonical_cmp(a, b), std::cmp::Ordering::Greater)
+}
+
+/// The terms of a sum, flattened, for the canonical order's
+/// last-term-first comparison. `None` for anything that is not a sum. A
+/// `a - b` binary node is rejected rather than flattened: its second term
+/// carries an implicit negation that the borrowed terms cannot express, and
+/// evaluated sums always arrive as `Plus[...]` with explicit `-1` factors.
+fn plus_terms_for_order(e: &Expr) -> Option<Vec<&Expr>> {
+  fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+    match e {
+      Expr::FunctionCall { name, args }
+        if name == "Plus" && args.len() >= 2 =>
+      {
+        for a in args {
+          flatten(a, out);
+        }
+        true
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => {
+        flatten(left, out);
+        flatten(right, out);
+        true
+      }
+      other => {
+        out.push(other);
+        false
+      }
+    }
+  }
+  let mut terms = Vec::new();
+  if !flatten(e, &mut terms) || terms.len() < 2 {
+    return None;
+  }
+  Some(terms)
+}
+
+/// The factors of a product, flattened, for the canonical order's
+/// last-factor-first comparison. `None` for anything that is not a product,
+/// and for a product whose leading factor is a number literal (that case is
+/// already handled by the numeric-coefficient rule).
+fn times_factors_for_order(e: &Expr) -> Option<Vec<&Expr>> {
+  fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+    match e {
+      Expr::FunctionCall { name, args }
+        if name == "Times" && args.len() >= 2 =>
+      {
+        for a in args {
+          flatten(a, out);
+        }
+        true
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        flatten(left, out);
+        flatten(right, out);
+        true
+      }
+      other => {
+        out.push(other);
+        false
+      }
+    }
+  }
+  let mut factors = Vec::new();
+  if !flatten(e, &mut factors) || factors.len() < 2 {
+    return None;
+  }
+  if matches!(
+    factors[0],
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) | Expr::BigFloat(..)
+  ) || matches!(factors[0], Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2)
+  {
+    return None;
+  }
+  Some(factors)
+}

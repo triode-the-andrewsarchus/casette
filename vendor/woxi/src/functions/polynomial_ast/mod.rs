@@ -1,0 +1,74 @@
+//! AST-native polynomial functions.
+//!
+//! Expand, Factor, Simplify, Coefficient, Exponent, PolynomialQ.
+
+use super::*;
+use crate::functions::math_ast::{
+  gcd_i128, is_sqrt, lcm_i128, make_sqrt, rat_reduce, rat_reduce_bigint,
+};
+
+mod apart;
+mod cancel;
+mod coefficient;
+mod collect;
+mod cyclotomic;
+mod decompose;
+mod discriminant;
+mod eliminate;
+mod expand;
+mod exponent;
+mod factor;
+mod function_expand;
+mod gf_factor;
+mod helpers;
+pub mod horner;
+mod interpolating_polynomial;
+mod linear_programming;
+mod minimal_polynomial;
+mod polynomial_division;
+mod polynomial_extended_gcd;
+mod polynomial_gcd;
+mod polynomial_mod;
+mod polynomial_q;
+mod reduce;
+mod reduce_backend;
+mod resultant;
+mod simplify;
+pub mod solve;
+mod symmetric_reduction;
+mod to_radicals;
+pub mod together;
+mod zassenhaus;
+
+pub use apart::*;
+pub use cancel::*;
+pub use coefficient::*;
+pub use collect::*;
+pub use cyclotomic::*;
+pub use decompose::*;
+pub use discriminant::*;
+pub use eliminate::*;
+pub use expand::*;
+pub use exponent::*;
+pub use factor::*;
+pub use function_expand::*;
+pub use gf_factor::*;
+pub use helpers::*;
+pub use horner::*;
+pub use interpolating_polynomial::*;
+pub use linear_programming::*;
+pub use minimal_polynomial::*;
+pub use polynomial_division::*;
+pub use polynomial_extended_gcd::*;
+pub use polynomial_gcd::*;
+pub use polynomial_mod::*;
+pub use polynomial_q::*;
+pub use reduce::*;
+pub(crate) use reduce_backend::try_linear_integer_resolve;
+pub(crate) use reduce_backend::try_linear_rational_resolve;
+pub use resultant::*;
+pub use simplify::*;
+pub use solve::*;
+pub use symmetric_reduction::*;
+pub use to_radicals::*;
+pub use together::*;

@@ -1,0 +1,148 @@
+[profile.default]
+# Fail any individual test that takes longer than 20 seconds.
+slow-timeout = { period = "20s", terminate-after = 1 }
+
+# NOTE: nextest applies the FIRST matching override for a given setting.
+# The most specific overrides must therefore come BEFORE the broad
+# `/^script_/` rule below, or they will be shadowed by it.
+
+# `D[x^x, {x, 10}]` is intentionally a heavy regression test for the Plus
+# comparator panic — order 10 matches the originally panicking input. It
+# takes ~10s standalone in debug builds and can brush against the default
+# 20s timeout under full parallel load. Give it a wider window.
+[[profile.default.overrides]]
+filter = 'test(high_order_derivative_of_x_x_does_not_panic)'
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+# `demonstration_three_phase_field_manipulate_opens_with_its_widget` builds
+# its widget from a stored `SaveDefinitions -> True` Manipulate and renders
+# a `ParametricPlot`/`Show`/`GraphicsRow` twice (initial render plus one
+# after moving a slider): ~13s standalone in debug builds, close enough to
+# the default 20s timeout to time out under full parallel load. Give it a
+# wider window.
+[[profile.default.overrides]]
+filter = 'test(demonstration_three_phase_field_manipulate_opens_with_its_widget)'
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+# `demonstration_gaussian_kernel_manipulate_renders_amplitude_and_phase_grid`
+# builds a `GraphicsGrid` mixing a schematic panel with two `DensityPlot`s of
+# a complex kernel (`Abs` and `Arg`), driven by three continuous sliders with
+# `SaveDefinitions -> True`: ~9.5s standalone in debug builds, close enough
+# to the default 20s timeout to time out under full parallel load. Give it a
+# wider window.
+[[profile.default.overrides]]
+filter = 'test(demonstration_gaussian_kernel_manipulate_renders_amplitude_and_phase_grid)'
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+# `axial_dispersion_manipulate_builds_widget` integrates a ten-equation
+# finite-difference system twice (once to build the widget, once after moving
+# the slider), and the tracer pulse in its forcing term makes NDSolve bisect
+# its way down to a 10^-6 feature. That is ~20s standalone, so it needs a
+# wider window than the default to survive parallel load.
+[[profile.default.overrides]]
+filter = 'test(axial_dispersion_manipulate_builds_widget)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# `fourier_matrix_boundary_materializes` materializes a large matrix and is
+# allocation-heavy: ~10s solo, but it exceeds the 20s default timeout under the
+# parallel contention of a full CI run (the job otherwise fails here). Give it
+# a wider window.
+[[profile.default.overrides]]
+filter = 'test(fourier_matrix_boundary_materializes)'
+slow-timeout = { period = "90s", terminate-after = 1 }
+
+# `two_species_competition_manipulate_builds_widget` solves a two-equation
+# `Solve[..., Reals]` system, integrates it with `NDSolve`, and rasterizes a
+# `StreamPlot` vector field alongside the trajectory `Plot`: ~37s standalone
+# in debug builds, well past the default 20s timeout under parallel load.
+# Give it a wider window.
+[[profile.default.overrides]]
+filter = 'test(two_species_competition_manipulate_builds_widget)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# `demonstration_sphere_torus_segments_manipulate_reshapes_and_spreads`
+# renders a `Table` of `ParametricPlot3D` lune surfaces three times (initial
+# render, after toggling full-torus, after moving the spread slider), each
+# doubled by a direct re-evaluation to compare pictures: ~14s standalone in
+# debug builds, close enough to the default 20s timeout to time out under
+# full parallel load. Give it a wider window.
+[[profile.default.overrides]]
+filter = 'test(demonstration_sphere_torus_segments_manipulate_reshapes_and_spreads)'
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+# `demonstration_guided_pair_manipulate_traces_its_ndsolve_trajectory`
+# integrates a coupled two-equation system with `NDSolve` and samples three
+# `ParametricPlot3D` curves off the solution, twice over per view (once to
+# build/refresh the widget, once to re-render for the picture comparison),
+# for three views in all: ~18s standalone in debug builds, right at the
+# default 20s timeout and well past it under parallel load. Give it a wider
+# window.
+[[profile.default.overrides]]
+filter = 'test(demonstration_guided_pair_manipulate_traces_its_ndsolve_trajectory)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# `rolling_polygon_on_catenary_notebook_rolls_its_polygon` re-solves the
+# rolling polygon's contact geometry and rasterizes the traced curve for every
+# animation step: ~12s standalone in debug builds, which the 20s default does
+# not survive under parallel load. Give it a wider window.
+[[profile.default.overrides]]
+filter = 'test(rolling_polygon_on_catenary_notebook_rolls_its_polygon)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# `formatting_every_script_keeps_it_the_same_code` formats all ~870 scripts
+# in `tests/scripts` four times over (format, re-tokenize, re-parse, format
+# again for idempotence): ~6s standalone on fast hardware, but past the 20s
+# default on the slower Windows runner of the nightly job under full
+# parallel load. Give it a wider window.
+[[profile.default.overrides]]
+filter = 'test(formatting_every_script_keeps_it_the_same_code)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# `unsolved_search_stays_unevaluated` runs `FindInstance` over a five-variable
+# fifth-power Diophantine system that has no solution inside the search radius,
+# so it always exhausts the bounded search rather than returning early: ~5s
+# standalone on fast hardware, but past the 20s default on the slower Windows
+# runner of the nightly job under full parallel load. Give it a wider window.
+[[profile.default.overrides]]
+filter = 'test(unsolved_search_stays_unevaluated)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# The remaining (non-`#[ignore]`d) RosettaCode script snapshots run a few
+# seconds in debug builds; under full parallel load they can brush past the
+# default 20s timeout. Give them a safety ceiling. The genuinely heavy
+# scripts (tens of seconds each in debug) are marked `#[ignore]` via the
+# `slow_script_test!` macro and run only via `make test-slow` under the
+# `slow` profile below — they never run during `make test`.
+[[profile.default.overrides]]
+filter = 'test(/^script_/)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
+# Profile for `make test-slow` (`cargo nextest run --features slow-tests
+# --profile slow --run-ignored only`). The heavy `#[ignore]`d scripts run with heavy
+# mutual CPU contention and are ~270s+ standalone in debug builds, so give
+# every test a very wide window.
+#
+# NOTE: a custom profile inherits `[[profile.default.overrides]]`, and the
+# active profile's own overrides are evaluated *before* the inherited ones.
+# Without the explicit `script_` override below, the default profile's
+# 120s `/^script_/` rule would shadow this profile's 900s base and the
+# heavy scripts would (wrongly) time out at 120s.
+[profile.slow]
+slow-timeout = { period = "900s", terminate-after = 1 }
+
+# `script_egyptian_fractions` is allocation-throughput-bound (~330s standalone
+# in debug). Run concurrently with the other ~23 heavy scripts, the shared
+# allocator / memory-bandwidth contention on a CI runner pushes it past the
+# 900s ceiling and the job fails. Reserve all test threads so it runs in
+# isolation — its wall time then stays close to standalone — and give it a wide
+# timeout for the slower-than-local CI hardware. This override must precede the
+# broad `/^script_/` rule below, since nextest applies the FIRST matching
+# override for a given setting.
+[[profile.slow.overrides]]
+filter = 'test(script_egyptian_fractions)'
+threads-required = 'num-cpus'
+slow-timeout = { period = "1800s", terminate-after = 1 }
+
+[[profile.slow.overrides]]
+filter = 'test(/^script_/)'
+slow-timeout = { period = "900s", terminate-after = 1 }

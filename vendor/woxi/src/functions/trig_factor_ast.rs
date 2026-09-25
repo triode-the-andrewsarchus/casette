@@ -1,0 +1,468 @@
+//! TrigFactor[expr] — single-step trigonometric factoring for the
+//! same-argument families, in wolframscript's printed forms:
+//! Sin[u] + Cos[u] -> Sqrt[2]*Sin[u + Pi/4], 1 +- Cos[u] -> half-angle
+//! squares, Sin/Cos double angles, and the Sin^2 - Cos^2 products.
+//! Each Sin[v +- Pi/4] factor follows Wolfram's canonical term order:
+//! v leads when its first symbol sorts before "Pi" (case-insensitive),
+//! otherwise Pi/4 leads and a negative leading term pulls -1 out of
+//! the (odd) sine. Anything else passes through unchanged, as
+//! wolframscript does for already-factored or non-trig input.
+
+#[allow(unused_imports)]
+use super::*;
+
+pub fn trig_factor_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Ok(unevaluated("TrigFactor", args));
+  }
+  Ok(factor(&args[0]).unwrap_or_else(|| args[0].clone()))
+}
+
+fn times(fs: Vec<Expr>) -> Expr {
+  call("Times", fs)
+}
+
+fn plus(ts: Vec<Expr>) -> Expr {
+  call("Plus", ts)
+}
+
+fn div(a: Expr, b: i128) -> Expr {
+  div2(a, Expr::Integer(b))
+}
+
+/// Half-angle term `e/2`, printed as `e/2` (Wolfram's distributed form,
+/// not the collapsed `(...)/2`).
+fn half(e: &Expr) -> Expr {
+  div(e.clone(), 2)
+}
+
+/// `p/2 + q/2`.
+fn half_sum(p: &Expr, q: &Expr) -> Expr {
+  plus(vec![half(p), half(q)])
+}
+
+/// `p/2 - q/2`.
+fn half_diff(p: &Expr, q: &Expr) -> Expr {
+  plus(vec![half(p), neg1(half(q))])
+}
+
+fn square(e: Expr) -> Expr {
+  pow2(e, Expr::Integer(2))
+}
+
+fn sqrt2() -> Expr {
+  call1("Sqrt", Expr::Integer(2))
+}
+
+fn pi_quarter() -> Expr {
+  div(const_expr("Pi"), 4)
+}
+
+/// First symbol of `v` in canonical term order, lowercased; decides
+/// whether v sorts before Pi inside the printed sum.
+fn leading_symbol(v: &Expr) -> Option<String> {
+  match v {
+    Expr::Identifier(s) | Expr::Constant(s) => Some(s.to_lowercase()),
+    Expr::FunctionCall { name, args }
+      if (name == "Plus" || name == "Times") && !args.is_empty() =>
+    {
+      args.iter().find_map(leading_symbol)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      leading_symbol(left).or_else(|| leading_symbol(right))
+    }
+    Expr::UnaryOp { operand, .. } => leading_symbol(operand),
+    _ => None,
+  }
+}
+
+fn v_sorts_first(v: &Expr) -> bool {
+  matches!(leading_symbol(v), Some(s) if s.as_str() < "pi")
+}
+
+/// Build the canonical Sin[v +- Pi/4] factor; returns (factor, sign)
+/// where sign is -1 when -1 was pulled out of the sine.
+fn sin_pm(v: &Expr, plus_quarter: bool) -> (Expr, i32) {
+  if v_sorts_first(v) {
+    let mut terms: Vec<Expr> = match v {
+      Expr::FunctionCall { name, args } if name == "Plus" => args.to_vec(),
+      _ => vec![v.clone()],
+    };
+    terms.push(if plus_quarter {
+      pi_quarter()
+    } else {
+      neg1(pi_quarter())
+    });
+    (call1("Sin", plus(terms)), 1)
+  } else if plus_quarter {
+    // Sin[v + Pi/4] == Sin[Pi/4 + v]
+    (call1("Sin", plus(vec![pi_quarter(), v.clone()])), 1)
+  } else {
+    // Sin[v - Pi/4] == -Sin[Pi/4 - v]
+    (call1("Sin", plus(vec![pi_quarter(), neg1(v.clone())])), -1)
+  }
+}
+
+/// Sqrt[2]*Sin[u +- Pi/4], with an overall sign applied per Wolfram's
+/// pulled-out-minus print form.
+fn sqrt2_sin(u: &Expr, plus_quarter: bool, sign: i32) -> Expr {
+  let (factor, fsign) = sin_pm(u, plus_quarter);
+  let product = times(vec![sqrt2(), factor]);
+  if sign * fsign < 0 {
+    neg1(product)
+  } else {
+    product
+  }
+}
+
+/// 2*Sin[h +- Pi/4]^2 (the square absorbs any pulled-out sign).
+fn two_sin_sq(h: &Expr, plus_quarter: bool) -> Expr {
+  let (factor, _) = sin_pm(h, plus_quarter);
+  times(vec![Expr::Integer(2), square(factor)])
+}
+
+/// sign*2*Sin[u - Pi/4]*Sin[u + Pi/4] in canonical form (the Cos[2u]
+/// product family).
+fn double_angle_product(u: &Expr, sign: i32) -> Expr {
+  let (f1, s1) = sin_pm(u, false);
+  let (f2, s2) = sin_pm(u, true);
+  let coeff = sign * s1 * s2;
+  times(vec![Expr::Integer(2 * coeff as i128), f1, f2])
+}
+
+/// Match Sin[u] / Cos[u] and return (is_sin, u).
+fn trig_of(e: &Expr) -> Option<(bool, Expr)> {
+  match e {
+    Expr::FunctionCall { name, args } if args.len() == 1 => match name.as_str()
+    {
+      "Sin" => Some((true, args[0].clone())),
+      "Cos" => Some((false, args[0].clone())),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// Match Sinh[u] / Cosh[u] and return (is_sinh, u).
+fn hyp_of(e: &Expr) -> Option<(bool, Expr)> {
+  match e {
+    Expr::FunctionCall { name, args } if args.len() == 1 => match name.as_str()
+    {
+      "Sinh" => Some((true, args[0].clone())),
+      "Cosh" => Some((false, args[0].clone())),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// Match Times[-1, inner] / UnaryMinus(inner).
+fn negated(e: &Expr) -> Option<&Expr> {
+  match e {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => Some(operand),
+    Expr::FunctionCall { name, args }
+      if name == "Times"
+        && args.len() == 2
+        && matches!(&args[0], Expr::Integer(-1)) =>
+    {
+      Some(&args[1])
+    }
+    _ => None,
+  }
+}
+
+fn same(a: &Expr, b: &Expr) -> bool {
+  expr_to_string(a) == expr_to_string(b)
+}
+
+fn factor(expr: &Expr) -> Option<Expr> {
+  // Double angles: Sin[2 u] and Cos[2 u]
+  if let Some((is_sin, arg)) = trig_of(expr)
+    && let Some(u) = halved(&arg)
+  {
+    return Some(if is_sin {
+      // 2*Cos[u]*Sin[u]
+      times(vec![
+        Expr::Integer(2),
+        call1("Cos", u.clone()),
+        call1("Sin", u),
+      ])
+    } else {
+      // Cos[2u] = 2*Sin[Pi/4 - u]*Sin[Pi/4 + u]
+      //         = -2*Sin[u - Pi/4]*Sin[u + Pi/4]
+      double_angle_product(&u, -1)
+    });
+  }
+
+  // Hyperbolic double angle Sinh[2 u] = 2 Cosh[u] Sinh[u]. (Cosh[2 u] factors
+  // over the complex numbers, so wolframscript uses I there; skip it.)
+  if let Some((true, arg)) = hyp_of(expr)
+    && let Some(u) = halved(&arg)
+  {
+    return Some(times(vec![
+      Expr::Integer(2),
+      call1("Cosh", u.clone()),
+      call1("Sinh", u),
+    ]));
+  }
+
+  let terms: Vec<&Expr> = match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" && args.len() == 2 => {
+      args.iter().collect()
+    }
+    _ => return None,
+  };
+  let (a, b) = (terms[0], terms[1]);
+
+  // 1 +- Cos[u] / 1 +- Sin[u]
+  if matches!(a, Expr::Integer(1)) {
+    let half = |u: &Expr| halved(u).unwrap_or_else(|| div(u.clone(), 2));
+    if let Some((is_sin, u)) = trig_of(b) {
+      let h = half(&u);
+      return Some(if is_sin {
+        // 2*Sin[h + Pi/4]^2
+        two_sin_sq(&h, true)
+      } else {
+        // 2*Cos[h]^2
+        times(vec![Expr::Integer(2), square(call1("Cos", h))])
+      });
+    }
+    if let Some(inner) = negated(b)
+      && let Some((is_sin, u)) = trig_of(inner)
+    {
+      let h = half(&u);
+      return Some(if is_sin {
+        // 2*Sin[h - Pi/4]^2
+        two_sin_sq(&h, false)
+      } else {
+        // 2*Sin[h]^2
+        times(vec![Expr::Integer(2), square(call1("Sin", h))])
+      });
+    }
+  }
+
+  // Sin[u] +- Cos[u] (either Plus order, either negation)
+  let classify = |e: &Expr| -> Option<(bool, bool, Expr)> {
+    // (is_sin, negated, u)
+    if let Some((is_sin, u)) = trig_of(e) {
+      return Some((is_sin, false, u));
+    }
+    if let Some(inner) = negated(e)
+      && let Some((is_sin, u)) = trig_of(inner)
+    {
+      return Some((is_sin, true, u));
+    }
+    None
+  };
+  if let (Some((sa, na, ua)), Some((sb, nb, ub))) = (classify(a), classify(b))
+    && sa != sb
+    && same(&ua, &ub)
+  {
+    let (sin_neg, cos_neg) = if sa { (na, nb) } else { (nb, na) };
+    let u = ua;
+    return match (sin_neg, cos_neg) {
+      // Sin + Cos = Sqrt[2]*Sin[u + Pi/4]
+      (false, false) => Some(sqrt2_sin(&u, true, 1)),
+      // Sin - Cos = Sqrt[2]*Sin[u - Pi/4]
+      (false, true) => Some(sqrt2_sin(&u, false, 1)),
+      // Cos - Sin = -Sqrt[2]*Sin[u - Pi/4]
+      (true, false) => Some(sqrt2_sin(&u, false, -1)),
+      _ => None,
+    };
+  }
+
+  // Sin[p] +- Sin[q] sum-to-product, restricted to distinct atomic
+  // arguments where Wolfram yields the plain single-step factoring
+  // (e.g. Sin[2 x] + Sin[4 x] factors further, so non-symbols are
+  // deliberately excluded). The two factors carry different heads
+  // (Cos and Sin), so Woxi's Times ordering already matches Wolfram.
+  //   Sin[p] + Sin[q] = 2 Cos[p/2 - q/2] Sin[p/2 + q/2]
+  //   Sin[p] - Sin[q] = 2 Cos[p/2 + q/2] Sin[p/2 - q/2]
+  if let (Some((true, na, ua)), Some((true, nb, ub))) =
+    (classify(a), classify(b))
+    && matches!(ua, Expr::Identifier(_))
+    && matches!(ub, Expr::Identifier(_))
+    && !same(&ua, &ub)
+  {
+    let hd = half_diff(&ua, &ub);
+    let hs = half_sum(&ua, &ub);
+    // Fold the overall sign into the leading coefficient (-2, not -(2 ...))
+    // to match Wolfram's printed form.
+    let cos_sin = |k: i128, c: Expr, s: Expr| {
+      times(vec![Expr::Integer(k), call1("Cos", c), call1("Sin", s)])
+    };
+    return Some(match (na, nb) {
+      (false, false) => cos_sin(2, hd, hs), // +Sin[p] +Sin[q]
+      (false, true) => cos_sin(2, hs, hd),  // +Sin[p] -Sin[q]
+      (true, false) => cos_sin(-2, hs, hd), // -Sin[p] +Sin[q]
+      (true, true) => cos_sin(-2, hd, hs),  // -Sin[p] -Sin[q]
+    });
+  }
+
+  // Sin[u]^2 - Cos[u]^2 and Cos[u]^2 - Sin[u]^2
+  let squared_trig = |e: &Expr| -> Option<(bool, bool, Expr)> {
+    let (inner, negd) = match negated(e) {
+      Some(inner) => (inner, true),
+      None => (e, false),
+    };
+    if let Expr::FunctionCall { name, args } = inner
+      && name == "Power"
+      && args.len() == 2
+      && matches!(&args[1], Expr::Integer(2))
+      && let Some((is_sin, u)) = trig_of(&args[0])
+    {
+      return Some((is_sin, negd, u));
+    }
+    if let Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } = inner
+      && matches!(right.as_ref(), Expr::Integer(2))
+      && let Some((is_sin, u)) = trig_of(left)
+    {
+      return Some((is_sin, negd, u));
+    }
+    None
+  };
+  if let (Some((sa, na, ua)), Some((sb, nb, ub))) =
+    (squared_trig(a), squared_trig(b))
+    && sa != sb
+    && na != nb
+    && same(&ua, &ub)
+  {
+    let sin_negated = if sa { na } else { nb };
+    // Cos^2 - Sin^2 = Cos[2u]; Sin^2 - Cos^2 = -Cos[2u]
+    return Some(double_angle_product(&ua, if sin_negated { -1 } else { 1 }));
+  }
+
+  // Hyperbolic 1 +- Cosh[u] / Cosh[u] +- 1 -> half-angle squares.
+  //   1 + Cosh[u] = 2 Cosh[u/2]^2,   Cosh[u] - 1 = 2 Sinh[u/2]^2.
+  let const_and_cosh = |c: &Expr, other: &Expr| -> Option<(i128, Expr)> {
+    if let Expr::Integer(k @ (1 | -1)) = c
+      && let Some((false, u)) = hyp_of(other)
+    {
+      return Some((*k, u));
+    }
+    None
+  };
+  if let Some((k, u)) = const_and_cosh(a, b).or_else(|| const_and_cosh(b, a)) {
+    let h = halved(&u).unwrap_or_else(|| div(u.clone(), 2));
+    return Some(if k == 1 {
+      times(vec![Expr::Integer(2), square(call1("Cosh", h))])
+    } else {
+      times(vec![Expr::Integer(2), square(call1("Sinh", h))])
+    });
+  }
+
+  // Hyperbolic sum-to-product for distinct atomic arguments:
+  //   Sinh[x] + Sinh[y] = 2 Cosh[(x-y)/2] Sinh[(x+y)/2]
+  //   Cosh[x] + Cosh[y] = 2 Cosh[(x-y)/2] Cosh[(x+y)/2]
+  //   Cosh[x] - Cosh[y] = 2 Sinh[(x-y)/2] Sinh[(x+y)/2]
+  let classify_hyp = |e: &Expr| -> Option<(bool, bool, Expr)> {
+    // (is_sinh, negated, u)
+    if let Some((is_sinh, u)) = hyp_of(e) {
+      return Some((is_sinh, false, u));
+    }
+    if let Some(inner) = negated(e)
+      && let Some((is_sinh, u)) = hyp_of(inner)
+    {
+      return Some((is_sinh, true, u));
+    }
+    None
+  };
+  if let (Some((sa, na, ua)), Some((sb, nb, ub))) =
+    (classify_hyp(a), classify_hyp(b))
+    && sa == sb
+    && matches!(ua, Expr::Identifier(_))
+    && matches!(ub, Expr::Identifier(_))
+    && !same(&ua, &ub)
+  {
+    let hd = half_diff(&ua, &ub); // x/2 - y/2
+    let hs = half_sum(&ua, &ub); // x/2 + y/2
+    let prod = |k: i128, h1: &str, a1: Expr, h2: &str, a2: Expr| {
+      times(vec![Expr::Integer(k), call1(h1, a1), call1(h2, a2)])
+    };
+    return Some(if sa {
+      // Both Sinh: the product is Cosh * Sinh.
+      match (na, nb) {
+        (false, false) => prod(2, "Cosh", hd, "Sinh", hs),
+        (false, true) => prod(2, "Cosh", hs, "Sinh", hd),
+        (true, false) => prod(-2, "Cosh", hs, "Sinh", hd),
+        (true, true) => prod(-2, "Cosh", hd, "Sinh", hs),
+      }
+    } else {
+      // Both Cosh.
+      match (na, nb) {
+        (false, false) => prod(2, "Cosh", hd, "Cosh", hs),
+        (false, true) => prod(2, "Sinh", hd, "Sinh", hs),
+        (true, false) => prod(-2, "Sinh", hd, "Sinh", hs),
+        (true, true) => prod(-2, "Cosh", hd, "Cosh", hs),
+      }
+    });
+  }
+
+  // Cosh[u]^2 - Sinh[u]^2 = 1 (and Sinh[u]^2 - Cosh[u]^2 = -1).
+  let squared_hyp = |e: &Expr| -> Option<(bool, bool, Expr)> {
+    let (inner, negd) = match negated(e) {
+      Some(inner) => (inner, true),
+      None => (e, false),
+    };
+    let base = match inner {
+      Expr::FunctionCall { name, args }
+        if name == "Power"
+          && args.len() == 2
+          && matches!(&args[1], Expr::Integer(2)) =>
+      {
+        &args[0]
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } if matches!(right.as_ref(), Expr::Integer(2)) => left.as_ref(),
+      _ => return None,
+    };
+    hyp_of(base).map(|(is_sinh, u)| (is_sinh, negd, u))
+  };
+  if let (Some((sa, na, ua)), Some((sb, nb, ub))) =
+    (squared_hyp(a), squared_hyp(b))
+    && sa != sb
+    && na != nb
+    && same(&ua, &ub)
+  {
+    // The result is +1 when the Cosh^2 term is the positive one.
+    let cosh_negated = if sa { nb } else { na };
+    return Some(Expr::Integer(if cosh_negated { -1 } else { 1 }));
+  }
+
+  None
+}
+
+/// Match an argument with an exact leading factor of 2 and return the
+/// other half (2*x -> x, 2*(a + b) -> a + b).
+fn halved(arg: &Expr) -> Option<Expr> {
+  match arg {
+    Expr::FunctionCall { name, args }
+      if name == "Times"
+        && args.len() >= 2
+        && matches!(&args[0], Expr::Integer(2)) =>
+    {
+      let rest: Vec<Expr> = args[1..].to_vec();
+      Some(if rest.len() == 1 {
+        rest.into_iter().next().unwrap()
+      } else {
+        times(rest)
+      })
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } if matches!(left.as_ref(), Expr::Integer(2)) => Some((**right).clone()),
+    _ => None,
+  }
+}

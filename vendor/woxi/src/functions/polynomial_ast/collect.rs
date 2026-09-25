@@ -1,0 +1,733 @@
+#[allow(unused_imports)]
+use super::*;
+use crate::functions::calculus_ast::simplify;
+use crate::functions::math_ast::times_ast;
+use crate::functions::polynomial_ast::expand::is_sum;
+
+// ─── Collect ────────────────────────────────────────────────────────
+
+/// Collect[expr, x] - Collects terms by powers of x
+pub fn collect_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "Collect expects 2 or 3 arguments".into(),
+    ));
+  }
+
+  // Extract optional head function (3rd argument)
+  let head = if args.len() == 3 {
+    Some(&args[2])
+  } else {
+    None
+  };
+
+  // Handle list of variables: Collect[expr, {x, y, ...}]
+  // Collects by first variable, then recursively collects each coefficient by remaining.
+  if let Expr::List(vars) = &args[1] {
+    if vars.is_empty() {
+      return Ok(args[0].clone());
+    }
+    if vars.len() == 1 {
+      let mut call = vec![args[0].clone(), vars[0].clone()];
+      if let Some(h) = head {
+        call.push(h.clone());
+      }
+      return collect_ast(&call);
+    }
+    // Collect by first variable, then recursively by remaining
+    // For multi-variable collect with head, apply head at the innermost level
+    let first_call = vec![args[0].clone(), vars[0].clone()];
+    let first_collected = collect_ast(&first_call)?;
+    let remaining = Expr::List(vars[1..].to_vec().into());
+    // Pass head to the inner collect via collect_in_coefficients
+    if let Some(h) = head {
+      return collect_in_coefficients_with_head(
+        &first_collected,
+        &vars[0],
+        &remaining,
+        h,
+      );
+    }
+    return collect_in_coefficients(&first_collected, &vars[0], &remaining);
+  }
+  let var = match &args[1] {
+    Expr::Identifier(name) => name.as_str(),
+    Expr::FunctionCall { .. } => {
+      // Compound target like q[x] or q[0, x]: replace it with a fresh
+      // identifier, collect over the identifier, then substitute back.
+      let placeholder = "__collect_target__";
+      let placeholder_id = Expr::Identifier(placeholder.to_string());
+      let substituted =
+        substitute_expr_local(&args[0], &args[1], &placeholder_id);
+      let mut sub_call = vec![substituted, placeholder_id.clone()];
+      if let Some(h) = head {
+        sub_call.push(h.clone());
+      }
+      let result = collect_ast(&sub_call)?;
+      return Ok(substitute_expr_local(&result, &placeholder_id, &args[1]));
+    }
+    _ => {
+      // Collecting with respect to a bare number is a no-op: wolframscript
+      // returns the expression unchanged (Collect[x^2, 5] = x^2) rather than
+      // staying unevaluated.
+      if matches!(
+        &args[1],
+        Expr::Integer(_)
+          | Expr::Real(_)
+          | Expr::BigInteger(_)
+          | Expr::BigFloat(_, _)
+      ) {
+        return Ok(args[0].clone());
+      }
+      return Ok(unevaluated("Collect", args));
+    }
+  };
+
+  // If the input is `Times[outer1, outer2, …, Plus[…]]` with all the
+  // `outer_i` independent of `var`, factor those outer multipliers out
+  // and collect the Plus inside, keeping each var-power's coefficient
+  // as a single sub-Plus. This reproduces wolframscript's
+  // `Collect[2*Sin[x*z]*(x + 2*y^2 + Sin[y]*x), y]` shape, where the
+  // outer `2*Sin[x*z]` stays factored over `(x + x*Sin[y])` instead of
+  // distributing through the Plus.
+  if head.is_none()
+    && let Some((outer_factors, inner)) =
+      extract_var_free_outer_factors(&args[0], var)
+    && let Some(inner_plus_terms) = as_plus_terms(&inner)
+    && inner_plus_terms.len() >= 2
+  {
+    // Group inner-Plus terms by var-power, summing coefficients but
+    // keeping each bucket's sum as a Plus when it has more than one
+    // contribution.
+    let mut buckets: Vec<(i128, Vec<Expr>)> = Vec::new();
+    for t in &inner_plus_terms {
+      let (p, c) = term_var_power_and_coeff(t, var);
+      if let Some(entry) = buckets.iter_mut().find(|(bp, _)| *bp == p) {
+        entry.1.push(c);
+      } else {
+        buckets.push((p, vec![c]));
+      }
+    }
+    // wolframscript orders the result Plus by descending power of `var`
+    // when at least one var-power bucket has more than one coefficient
+    // term (so the outer-Plus coefficient stays grouped); otherwise it
+    // orders ascending. This matches both
+    //   Collect[2*(x+y^2), y] → 2*x + 2*y^2  (ascending)
+    //   Collect[2*Sin[x*z]*(x+2*y^2+Sin[y]*x), y]
+    //     → 4*y^2*Sin[x*z] + 2*(x + x*Sin[y])*Sin[x*z]  (descending).
+    let any_multi = buckets.iter().any(|(_, c)| c.len() > 1);
+    if any_multi {
+      buckets.sort_by_key(|(p, _)| -*p);
+    } else {
+      buckets.sort_by_key(|(p, _)| *p);
+    }
+    let mut result_terms: Vec<Expr> = Vec::new();
+    for (power, coeffs) in buckets {
+      let coeff = if coeffs.len() == 1 {
+        coeffs.into_iter().next().unwrap()
+      } else {
+        call("Plus", coeffs)
+      };
+      // Build the var^power part.
+      let var_part = if power == 0 {
+        None
+      } else if power == 1 {
+        Some(Expr::Identifier(var.to_string()))
+      } else {
+        Some(pow2(
+          Expr::Identifier(var.to_string()),
+          Expr::Integer(power),
+        ))
+      };
+      // Assemble outer * coeff * var_part as a Times list, then sort
+      // canonically via times_ast. Use `Plus[…]` for the coefficient
+      // (when it has >1 term) so it stays grouped under the Times.
+      let mut factors: Vec<Expr> = outer_factors.clone();
+      // Skip a `1` coefficient in the product.
+      if !matches!(&coeff, Expr::Integer(1)) {
+        factors.push(coeff);
+      }
+      if let Some(v) = var_part {
+        factors.push(v);
+      }
+      let term = if factors.is_empty() {
+        Expr::Integer(1)
+      } else if factors.len() == 1 {
+        factors.into_iter().next().unwrap()
+      } else {
+        times_ast(&factors).unwrap_or_else(|_| call("Times", factors))
+      };
+      result_terms.push(term);
+    }
+    return Ok(build_sum(result_terms));
+  }
+  // Expand and collect terms by power of var
+  let expanded = expand_and_combine(&args[0]);
+  let terms = collect_additive_terms(&expanded);
+
+  // Group terms by power of var
+  let mut power_groups: Vec<(i128, Vec<Expr>)> = Vec::new();
+
+  for term in &terms {
+    let (power, coeff) = term_var_power_and_coeff(term, var);
+    if let Some(entry) = power_groups.iter_mut().find(|(p, _)| *p == power) {
+      entry.1.push(coeff);
+    } else {
+      power_groups.push((power, vec![coeff]));
+    }
+  }
+
+  // Sort by power ascending
+  power_groups.sort_by_key(|(p, _)| *p);
+
+  // Build result: sum of (combined_coeff * var^power), tracking each term's
+  // var-power so the constant (power 0) can be placed canonically afterwards.
+  let mut result_terms: Vec<(i128, Expr)> = Vec::new();
+  for (power, coeffs) in power_groups {
+    // Sum the coefficients
+    let combined_coeff = if coeffs.len() == 1 {
+      simplify(coeffs[0].clone())
+    } else {
+      let sum = coeffs
+        .into_iter()
+        .reduce(|a, b| add_exprs(&a, &b))
+        .unwrap_or(Expr::Integer(0));
+      simplify(sum)
+    };
+
+    if matches!(&combined_coeff, Expr::Integer(0)) {
+      continue;
+    }
+
+    // Apply head function to coefficient if provided
+    let combined_coeff = if let Some(h) = head {
+      let wrapped = Expr::FunctionCall {
+        name: if let Expr::Identifier(n) = h {
+          n.clone()
+        } else {
+          expr_to_string(h)
+        },
+        args: vec![combined_coeff].into(),
+      };
+      crate::evaluator::evaluate_expr_to_expr(&wrapped).unwrap_or(wrapped)
+    } else {
+      combined_coeff
+    };
+
+    let var_part = if power == 0 {
+      None
+    } else if power == 1 {
+      Some(Expr::Identifier(var.to_string()))
+    } else {
+      Some(pow2(
+        Expr::Identifier(var.to_string()),
+        Expr::Integer(power),
+      ))
+    };
+
+    let term = match (combined_coeff.clone(), var_part) {
+      (c, None) => c,
+      (Expr::Integer(1), Some(v)) => v,
+      (c, Some(v)) if matches!(&c, Expr::Integer(-1)) => negate_term(&v),
+      (c, Some(v)) => {
+        // If the coefficient is a sum, keep it grouped.
+        // Wolfram ordering: if the coefficient contains a variable
+        // that sorts after the collect variable, put var first.
+        if is_sum(&c) {
+          let mut coeff_vars = std::collections::HashSet::new();
+          collect_variables(&c, &mut coeff_vars);
+          if coeff_vars.iter().any(|cv| cv.as_str() > var) {
+            multiply_exprs(&v, &c)
+          } else {
+            multiply_exprs(&c, &v)
+          }
+        } else {
+          // Flatten coefficient and variable into a single product,
+          // then use times_ast for Wolfram canonical ordering.
+          let mut factors = Vec::new();
+          flatten_product_factors_collect(&c, &mut factors);
+          flatten_product_factors_collect(&v, &mut factors);
+          times_ast(&factors).unwrap_or_else(|_| multiply_exprs(&c, &v))
+        }
+      }
+    };
+    result_terms.push((power, term));
+  }
+
+  if result_terms.is_empty() {
+    Ok(Expr::Integer(0))
+  } else {
+    // Order the collected terms with Wolfram's canonical Plus ordering.
+    // Routing through plus_ast — which keeps a Times-grouped coefficient like
+    // `(a + c)*x^2` atomic while flattening a bare-Plus constant term into its
+    // individual monomials — reproduces wolframscript's order for every case,
+    // including where the constant leads (`y + x*(y + z)`, `e + (c + d)*x`)
+    // and where it trails (`x + x^3 + y`). The var-power terms were built
+    // coefficient-grouped above, so plus_ast never distributes them.
+    Ok(plus_ast_canonical(
+      result_terms.into_iter().map(|(_, t)| t).collect(),
+    ))
+  }
+}
+
+/// If `expr` is a Times whose factors split cleanly into a non-empty
+/// set independent of `var` and at least one factor that depends on
+/// `var`, return `(outer_factors, inner)` where `inner` is the
+/// reassembled var-dependent factor (or the single var-dependent
+/// factor if there's only one). Returns `None` otherwise.
+fn extract_var_free_outer_factors(
+  expr: &Expr,
+  var: &str,
+) -> Option<(Vec<Expr>, Expr)> {
+  use crate::functions::calculus_ast::is_constant_wrt;
+  let factors: Vec<Expr> = match expr {
+    Expr::FunctionCall { name, args } if name == "Times" => args.to_vec(),
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => vec![*left.clone(), *right.clone()],
+    _ => return None,
+  };
+  let mut outer: Vec<Expr> = Vec::new();
+  let mut inner: Vec<Expr> = Vec::new();
+  for f in factors {
+    if is_constant_wrt(&f, var) {
+      outer.push(f);
+    } else {
+      inner.push(f);
+    }
+  }
+  if outer.is_empty() || inner.is_empty() {
+    return None;
+  }
+  let inner_expr = if inner.len() == 1 {
+    inner.remove(0)
+  } else {
+    call("Times", inner)
+  };
+  Some((outer, inner_expr))
+}
+
+/// Extract the args of a Plus expression, or return None if `expr` is
+/// not a Plus. Used to identify whether the var-containing inner of a
+/// Times[..., Plus] structure is itself a Plus that we can recurse on.
+fn as_plus_terms(expr: &Expr) -> Option<Vec<Expr>> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => Some(args.to_vec()),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => Some(vec![*left.clone(), *right.clone()]),
+    _ => None,
+  }
+}
+
+/// Order `terms` with Wolfram's canonical Plus ordering by re-evaluating them
+/// as a `Plus[…]` expression — the same path a parsed sum takes. Full
+/// evaluation (rather than a bare `plus_ast` call) canonicalizes each term's
+/// internal structure first, so a Collect-built product like `(a + c)*x^2`
+/// sorts identically to the parsed form. Plus does not distribute a Times over
+/// a Plus, so grouped coefficients stay intact. Falls back to a plain Plus
+/// chain if evaluation fails.
+fn plus_ast_canonical(terms: Vec<Expr>) -> Expr {
+  let sum = call("Plus", terms.clone());
+  crate::evaluator::evaluate_expr_to_expr(&sum).unwrap_or_else(|_| {
+    crate::functions::math_ast::plus_ast(&terms)
+      .unwrap_or_else(|_| build_sum(terms))
+  })
+}
+
+/// After collecting by `collected_var`, walk the result sum and apply
+/// Collect[coeff, remaining_vars] to each grouped coefficient.
+fn collect_in_coefficients(
+  expr: &Expr,
+  collected_var: &Expr,
+  remaining_vars: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let var_str = match collected_var {
+    Expr::Identifier(s) => s.as_str(),
+    _ => return Ok(expr.clone()),
+  };
+
+  // Re-expand to get individual terms for grouping
+  let expanded = expand_and_combine(expr);
+  let terms = collect_additive_terms(&expanded);
+
+  // Group terms by power of the collected variable
+  let mut power_groups: Vec<(i128, Vec<Expr>)> = Vec::new();
+  for term in &terms {
+    let (power, coeff) = term_var_power_and_coeff(term, var_str);
+    if let Some(entry) = power_groups.iter_mut().find(|(p, _)| *p == power) {
+      entry.1.push(coeff);
+    } else {
+      power_groups.push((power, vec![coeff]));
+    }
+  }
+
+  // Sort by power ascending. The final canonical Plus order is applied
+  // to `result_terms` below via `sort_collect_terms`, so the insertion
+  // order here only determines tie-breaks when the monomial signatures
+  // are equal.
+  power_groups.sort_by_key(|(p, _)| *p);
+
+  let mut result_terms = Vec::new();
+  for (power, coeffs) in power_groups {
+    // Sum the coefficients for this power
+    let combined = if coeffs.len() == 1 {
+      coeffs.into_iter().next().unwrap()
+    } else {
+      coeffs
+        .into_iter()
+        .reduce(|a, b| add_exprs(&a, &b))
+        .unwrap_or(Expr::Integer(0))
+    };
+
+    // Recursively collect the combined coefficient by remaining variables
+    let collected_coeff = collect_ast(&[combined, remaining_vars.clone()])?;
+
+    if matches!(&collected_coeff, Expr::Integer(0)) {
+      continue;
+    }
+
+    let var_part = if power == 0 {
+      None
+    } else if power == 1 {
+      Some(collected_var.clone())
+    } else {
+      Some(pow2(collected_var.clone(), Expr::Integer(power)))
+    };
+
+    let rebuilt = match (collected_coeff, var_part) {
+      (c, None) => c,
+      (Expr::Integer(1), Some(v)) => v,
+      (c, Some(v)) if matches!(&c, Expr::Integer(-1)) => negate_term(&v),
+      (c, Some(v)) => {
+        if is_sum(&c) {
+          let mut coeff_vars = std::collections::HashSet::new();
+          collect_variables(&c, &mut coeff_vars);
+          if coeff_vars.iter().any(|cv| cv.as_str() > var_str) {
+            multiply_exprs(&v, &c)
+          } else {
+            multiply_exprs(&c, &v)
+          }
+        } else if let Some((plus_factor, other_factors)) = split_plus_factor(&c)
+        {
+          // Coefficient is a Times containing a Plus (e.g. `(a+b)*y`).
+          // Preserve the Plus-first display order that Collect wants:
+          //   Plus * x^power * other_factors.
+          let mut factors = vec![plus_factor];
+          factors.push(v);
+          factors.extend(other_factors);
+          build_times_chain(&factors)
+        } else {
+          let mut factors = Vec::new();
+          flatten_product_factors_collect(&c, &mut factors);
+          flatten_product_factors_collect(&v, &mut factors);
+          times_ast(&factors).unwrap_or_else(|_| multiply_exprs(&c, &v))
+        }
+      }
+    };
+    result_terms.push(rebuilt);
+  }
+
+  if result_terms.is_empty() {
+    Ok(Expr::Integer(0))
+  } else {
+    // Flatten any nested Plus (e.g. a coefficient that was itself a sum
+    // from the recursive collect pass) so every leaf term gets its own
+    // monomial signature and participates in the canonical Plus ordering.
+    let mut flat_terms: Vec<Expr> = Vec::new();
+    for t in &result_terms {
+      flatten_plus_terms(t, &mut flat_terms);
+    }
+    if flat_terms.len() == 1 {
+      Ok(flat_terms.into_iter().next().unwrap())
+    } else {
+      sort_collect_terms(&mut flat_terms);
+      Ok(build_sum(flat_terms))
+    }
+  }
+}
+
+/// Recursively flatten Plus terms (both `BinaryOp::Plus` chains and
+/// `FunctionCall["Plus"]`) into a flat vector of addends.
+fn flatten_plus_terms(e: &Expr, out: &mut Vec<Expr>) {
+  match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      flatten_plus_terms(left, out);
+      flatten_plus_terms(right, out);
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      for a in args {
+        flatten_plus_terms(a, out);
+      }
+    }
+    _ => out.push(e.clone()),
+  }
+}
+
+/// Sort Collect's result terms using Wolfram's canonical Plus ordering
+/// over their monomial signatures.
+///
+/// Each term has the form `coeff * monomial` where `coeff` may be a numeric
+/// factor or a `Plus[...]` (the collected coefficient) and `monomial` is a
+/// product of the collect variables and possibly other identifiers. We sort
+/// by a monomial signature — a sorted list of `(variable, exponent)` pairs
+/// extracted from the non-`Plus`, non-numeric factors — comparing the
+/// entries from the last (largest) variable backwards. Terms with shorter
+/// signatures come first when all compared entries match.
+fn sort_collect_terms(terms: &mut [Expr]) {
+  terms.sort_by(|a, b| {
+    let sig_a = monomial_signature(a);
+    let sig_b = monomial_signature(b);
+    compare_monomial_signatures(&sig_a, &sig_b)
+  });
+}
+
+/// Return the monomial signature (sorted by variable name) for a Collect term.
+fn monomial_signature(term: &Expr) -> Vec<(String, i128)> {
+  let mut pairs: Vec<(String, i128)> = Vec::new();
+  collect_monomial_factors(term, &mut pairs);
+  pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+  pairs
+}
+
+fn collect_monomial_factors(e: &Expr, out: &mut Vec<(String, i128)>) {
+  match e {
+    Expr::Identifier(name) => out.push((name.clone(), 1)),
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      collect_monomial_factors(left, out);
+      collect_monomial_factors(right, out);
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      for a in args {
+        collect_monomial_factors(a, out);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      if let (Expr::Identifier(name), Expr::Integer(exp)) =
+        (left.as_ref(), right.as_ref())
+      {
+        out.push((name.clone(), *exp));
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      if let (Expr::Identifier(var), Expr::Integer(exp)) = (&args[0], &args[1])
+      {
+        out.push((var.clone(), *exp));
+      }
+    }
+    // Plus coefficients, numbers, and other compound exprs contribute nothing.
+    _ => {}
+  }
+}
+
+/// Compare monomial signatures by Wolfram's canonical Plus order: walk
+/// the entries from the end (largest variable) inward. When one signature
+/// is a strict prefix of the other (after matching the largest entries),
+/// the shorter one sorts first.
+fn compare_monomial_signatures(
+  a: &[(String, i128)],
+  b: &[(String, i128)],
+) -> std::cmp::Ordering {
+  let mut ia = a.iter().rev();
+  let mut ib = b.iter().rev();
+  loop {
+    match (ia.next(), ib.next()) {
+      (Some((va, ea)), Some((vb, eb))) => {
+        let name_cmp = va.cmp(vb);
+        if name_cmp != std::cmp::Ordering::Equal {
+          return name_cmp;
+        }
+        let exp_cmp = ea.cmp(eb);
+        if exp_cmp != std::cmp::Ordering::Equal {
+          return exp_cmp;
+        }
+      }
+      (None, Some(_)) => return std::cmp::Ordering::Less,
+      (Some(_), None) => return std::cmp::Ordering::Greater,
+      (None, None) => return std::cmp::Ordering::Equal,
+    }
+  }
+}
+
+/// If `expr` is a Times expression with exactly one `Plus` factor, return
+/// the Plus factor and the remaining (non-Plus) factors in their original
+/// order. Otherwise return `None`.
+fn split_plus_factor(expr: &Expr) -> Option<(Expr, Vec<Expr>)> {
+  let mut factors = Vec::new();
+  flatten_product_factors_collect(expr, &mut factors);
+  let mut plus: Option<Expr> = None;
+  let mut rest: Vec<Expr> = Vec::new();
+  for f in factors {
+    if is_sum(&f) {
+      if plus.is_some() {
+        return None; // more than one Plus factor — caller can fall back
+      }
+      plus = Some(f);
+    } else {
+      rest.push(f);
+    }
+  }
+  plus.map(|p| (p, rest))
+}
+
+/// Build a Times expression by chaining the given factors with
+/// `BinaryOp::Times`, preserving their order (so the caller controls the
+/// display ordering). For a single factor, returns it directly.
+fn build_times_chain(factors: &[Expr]) -> Expr {
+  if factors.is_empty() {
+    return Expr::Integer(1);
+  }
+  if factors.len() == 1 {
+    return factors[0].clone();
+  }
+  let mut iter = factors.iter();
+  let mut result = iter.next().unwrap().clone();
+  for f in iter {
+    result = times2(result, f.clone());
+  }
+  result
+}
+
+/// Recursively replace every occurrence of `from` with `to` in `expr`,
+/// using structural equality (via pretty-printed form).
+fn substitute_expr_local(expr: &Expr, from: &Expr, to: &Expr) -> Expr {
+  if expr_to_string(expr) == expr_to_string(from) {
+    return to.clone();
+  }
+  match expr {
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(|e| substitute_expr_local(e, from, to))
+        .collect(),
+    ),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(|e| substitute_expr_local(e, from, to))
+        .collect(),
+    },
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(substitute_expr_local(left, from, to)),
+      right: Box::new(substitute_expr_local(right, from, to)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(substitute_expr_local(operand, from, to)),
+    },
+    _ => expr.clone(),
+  }
+}
+
+/// Flatten a Times expression into its factors.
+fn flatten_product_factors_collect(expr: &Expr, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      flatten_product_factors_collect(left, out);
+      flatten_product_factors_collect(right, out);
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      for a in args {
+        flatten_product_factors_collect(a, out);
+      }
+    }
+    _ => out.push(expr.clone()),
+  }
+}
+
+/// Like collect_in_coefficients but passes a head function to the inner collect calls
+fn collect_in_coefficients_with_head(
+  expr: &Expr,
+  collected_var: &Expr,
+  remaining_vars: &Expr,
+  head: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let var_str = match collected_var {
+    Expr::Identifier(s) => s.as_str(),
+    _ => return Ok(expr.clone()),
+  };
+
+  let expanded = expand_and_combine(expr);
+  let terms = collect_additive_terms(&expanded);
+
+  let mut power_groups: Vec<(i128, Vec<Expr>)> = Vec::new();
+  for term in &terms {
+    let (power, coeff) = term_var_power_and_coeff(term, var_str);
+    if let Some(entry) = power_groups.iter_mut().find(|(p, _)| *p == power) {
+      entry.1.push(coeff);
+    } else {
+      power_groups.push((power, vec![coeff]));
+    }
+  }
+
+  power_groups.sort_by_key(|(p, _)| *p);
+
+  let mut result_terms = Vec::new();
+  for (power, coeffs) in power_groups {
+    let combined = if coeffs.len() == 1 {
+      coeffs.into_iter().next().unwrap()
+    } else {
+      coeffs
+        .into_iter()
+        .reduce(|a, b| add_exprs(&a, &b))
+        .unwrap_or(Expr::Integer(0))
+    };
+
+    // Recursively collect with head
+    let collected_coeff =
+      collect_ast(&[combined, remaining_vars.clone(), head.clone()])?;
+
+    if matches!(&collected_coeff, Expr::Integer(0)) {
+      continue;
+    }
+
+    let var_part = if power == 0 {
+      None
+    } else if power == 1 {
+      Some(collected_var.clone())
+    } else {
+      Some(pow2(collected_var.clone(), Expr::Integer(power)))
+    };
+
+    let rebuilt = match (collected_coeff, var_part) {
+      (c, None) => c,
+      (Expr::Integer(1), Some(v)) => v,
+      (c, Some(v)) => multiply_exprs(&c, &v),
+    };
+    result_terms.push(rebuilt);
+  }
+
+  if result_terms.is_empty() {
+    return Ok(Expr::Integer(0));
+  }
+  if result_terms.len() == 1 {
+    return Ok(result_terms.into_iter().next().unwrap());
+  }
+  let result = result_terms
+    .into_iter()
+    .reduce(|a, b| add_exprs(&a, &b))
+    .unwrap();
+  Ok(result)
+}

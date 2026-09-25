@@ -1,0 +1,13980 @@
+use super::*;
+use contains_inexact_real as contains_real;
+
+/// Combine `SeriesData[var, x0, coeffs, nmin, nmax, denom]` summands that
+/// share the same `(var, x0, denom)` into a single SeriesData. The result
+/// truncates to `min(nmax_i)` so the O(…) order matches Wolfram's behaviour
+/// when adding two truncated series. Returns `None` if no two SeriesData
+/// summands are present.
+/// If `e` is a polynomial term `c * var^n` (or `var^n`, `var`, or a
+/// constant w.r.t. `var`), return a singleton `SeriesData[var, x0, {c}, n,
+/// n+1, 1]` — used by `try_series_data_plus` to absorb plain polynomial
+/// summands into a SeriesData. Returns `None` for shapes that don't fit
+/// (e.g. terms in a different variable, fractional exponents, products
+/// containing the var more than once).
+fn polynomial_term_to_series_data(
+  e: &Expr,
+  var_name: &str,
+  sd_var: &Expr,
+  sd_x0: &Expr,
+  sd_nmax: &Expr,
+) -> Option<Expr> {
+  let make_sd = |coeff: Expr, n: i128| {
+    // Pad with zeros so the singleton spans `[n, sd_nmax)` — this keeps the
+    // truncation point at the original SeriesData's `nmax` rather than the
+    // polynomial term's degree+1.
+    let nmax_int = match sd_nmax {
+      Expr::Integer(m) => *m,
+      _ => n + 1,
+    };
+    let span = (nmax_int - n).max(1);
+    let mut coeffs: Vec<Expr> = Vec::with_capacity(span as usize);
+    coeffs.push(coeff);
+    for _ in 1..span {
+      coeffs.push(Expr::Integer(0));
+    }
+    let data = vec![
+      sd_var.clone(),
+      sd_x0.clone(),
+      Expr::List(coeffs.into()),
+      Expr::Integer(n),
+      Expr::Integer(nmax_int),
+      Expr::Integer(1),
+    ];
+    call("SeriesData", data)
+  };
+  // Constant w.r.t. var → coeff at order 0
+  if !crate::functions::polynomial_ast::contains_var(e, var_name) {
+    return Some(make_sd(e.clone(), 0));
+  }
+  // Bare `var` → coeff 1 at order 1
+  if matches!(e, Expr::Identifier(s) if s == var_name) {
+    return Some(make_sd(Expr::Integer(1), 1));
+  }
+  // `var^n` for non-negative integer n
+  let parse_pow = |base: &Expr, exp: &Expr| -> Option<i128> {
+    let is_var = matches!(base, Expr::Identifier(s) if s == var_name);
+    if !is_var {
+      return None;
+    }
+    if let Expr::Integer(n) = exp
+      && *n >= 0
+    {
+      return Some(*n);
+    }
+    None
+  };
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Power,
+    left,
+    right,
+  } = e
+    && let Some(n) = parse_pow(left, right)
+  {
+    return Some(make_sd(Expr::Integer(1), n));
+  }
+  if let Expr::FunctionCall { name, args } = e
+    && name == "Power"
+    && args.len() == 2
+    && let Some(n) = parse_pow(&args[0], &args[1])
+  {
+    return Some(make_sd(Expr::Integer(1), n));
+  }
+  // `-var` and `-var^n`
+  if let Expr::UnaryOp {
+    op: UnaryOperator::Minus,
+    operand,
+  } = e
+  {
+    let inner = polynomial_term_to_series_data(
+      operand, var_name, sd_var, sd_x0, sd_nmax,
+    )?;
+    if let Expr::FunctionCall { args: sa, .. } = &inner
+      && let Expr::List(coeffs) = &sa[2]
+    {
+      let negated: Vec<Expr> = coeffs
+        .iter()
+        .map(|c| match c {
+          Expr::Integer(n) => Expr::Integer(-n),
+          other => neg1(other.clone()),
+        })
+        .collect();
+      let data = vec![
+        sa[0].clone(),
+        sa[1].clone(),
+        Expr::List(negated.into()),
+        sa[3].clone(),
+        sa[4].clone(),
+        sa[5].clone(),
+      ];
+      return Some(call("SeriesData", data));
+    }
+    return None;
+  }
+  // `c * var^n`, `c * var`, `var * c`, etc. — Times of one var-bearing
+  // factor and any number of var-free factors.
+  let times_args: Option<Vec<Expr>> = match e {
+    Expr::FunctionCall { name, args } if name == "Times" => Some(args.to_vec()),
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => Some(vec![*left.clone(), *right.clone()]),
+    _ => None,
+  };
+  if let Some(factors) = times_args {
+    let mut coeff_factors: Vec<Expr> = Vec::new();
+    let mut var_order: Option<i128> = None;
+    for f in &factors {
+      if !crate::functions::polynomial_ast::contains_var(f, var_name) {
+        coeff_factors.push(f.clone());
+        continue;
+      }
+      // The var-bearing factor must be `var` or `var^n`.
+      let n = if matches!(f, Expr::Identifier(s) if s == var_name) {
+        1
+      } else if let Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } = f
+      {
+        parse_pow(left, right)?
+      } else if let Expr::FunctionCall { name, args: pargs } = f
+        && name == "Power"
+        && pargs.len() == 2
+      {
+        parse_pow(&pargs[0], &pargs[1])?
+      } else {
+        return None;
+      };
+      if var_order.is_some() {
+        return None; // more than one var-bearing factor
+      }
+      var_order = Some(n);
+    }
+    let n = var_order.unwrap_or(0);
+    let coeff = if coeff_factors.is_empty() {
+      Expr::Integer(1)
+    } else if coeff_factors.len() == 1 {
+      coeff_factors.remove(0)
+    } else {
+      call("Times", coeff_factors)
+    };
+    return Some(make_sd(coeff, n));
+  }
+  None
+}
+
+fn try_series_data_plus(
+  args: &[Expr],
+) -> Result<Option<Expr>, InterpreterError> {
+  // Nothing to combine if there are 0 or 1 summands total.
+  // Guards against infinite recursion when called on a single SeriesData via
+  // the single-SeriesData lifting branch below (lifted = args = [SD]).
+  if args.len() < 2 {
+    return Ok(None);
+  }
+
+  // Collect indices of SeriesData arguments grouped by (var, x0).
+  // Different denoms are merged by lcm.
+  let series_indices: Vec<usize> = args
+    .iter()
+    .enumerate()
+    .filter_map(|(i, a)| match a {
+      Expr::FunctionCall { name, args: sa }
+        if name == "SeriesData" && sa.len() == 6 =>
+      {
+        Some(i)
+      }
+      _ => None,
+    })
+    .collect();
+  if series_indices.is_empty() {
+    return Ok(None);
+  }
+
+  // When there is exactly one SeriesData but other args are polynomial
+  // terms in the same `(var, x0)` (constant, `c*x^n`, `c*x`, `x^n`, `x`),
+  // lift each polynomial term to a singleton SeriesData and merge — that's
+  // wolframscript's behaviour for e.g.
+  // `Series[Exp[x],{x,0,3}] - 1 - x - x^2`
+  // → `SeriesData[x, 0, {-1/2, 1/6}, 2, 4, 1]`.
+  // Polynomials are exact (no truncation), so the lifted singleton uses the
+  // SeriesData's own `nmax` instead of the polynomial term's degree+1.
+  if series_indices.len() == 1 {
+    let only_idx = series_indices[0];
+    let (sd_var, sd_x0, sd_nmax) =
+      if let Expr::FunctionCall { args: sa, .. } = &args[only_idx] {
+        (sa[0].clone(), sa[1].clone(), sa[4].clone())
+      } else {
+        return Ok(None);
+      };
+    // Only handle x0 = 0 here; other expansion centres would need the
+    // polynomial term to be expressed in `(x - x0)` already.
+    if !matches!(&sd_x0, Expr::Integer(0)) {
+      return Ok(None);
+    }
+    let var_name = match &sd_var {
+      Expr::Identifier(s) => s.clone(),
+      _ => return Ok(None),
+    };
+    let mut lifted: Vec<Expr> = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+      if i == only_idx {
+        lifted.push(a.clone());
+        continue;
+      }
+      match polynomial_term_to_series_data(
+        a, &var_name, &sd_var, &sd_x0, &sd_nmax,
+      ) {
+        Some(sd) => lifted.push(sd),
+        None => return Ok(None),
+      }
+    }
+    return try_series_data_plus(&lifted);
+  }
+
+  // Extract var and x0 from the first SeriesData; require all others to match.
+  let first = &args[series_indices[0]];
+  let (var0, x0_0) = match first {
+    Expr::FunctionCall { args: sa, .. } => (sa[0].clone(), sa[1].clone()),
+    _ => return Ok(None),
+  };
+  for &idx in &series_indices[1..] {
+    if let Expr::FunctionCall { args: sa, .. } = &args[idx] {
+      let var_eq = expr_to_string(&sa[0]) == expr_to_string(&var0);
+      let x0_eq = expr_to_string(&sa[1]) == expr_to_string(&x0_0);
+      if !var_eq || !x0_eq {
+        return Ok(None);
+      }
+    }
+  }
+
+  // Common denom = lcm of all denoms; require Integer denoms.
+  let denom_of = |sa: &[Expr]| -> Option<i128> {
+    if let Expr::Integer(d) = &sa[5] {
+      Some(*d)
+    } else {
+      None
+    }
+  };
+  let mut common_denom: i128 = 1;
+  for &idx in &series_indices {
+    if let Expr::FunctionCall { args: sa, .. } = &args[idx] {
+      let d = denom_of(sa).ok_or_else(|| {
+        InterpreterError::EvaluationError(
+          "SeriesData denom must be Integer".into(),
+        )
+      })?;
+      let g = gcd_i128(common_denom, d);
+      if g == 0 {
+        return Ok(None);
+      }
+      common_denom = (common_denom / g).saturating_mul(d.abs());
+    }
+  }
+
+  // For each SeriesData, find its (nmin, nmax) in units of 1/common_denom.
+  // Also collect the coefficient lists.
+  let mut nmins: Vec<i128> = Vec::new();
+  let mut nmaxs: Vec<i128> = Vec::new();
+  let mut coeff_lists: Vec<Vec<Expr>> = Vec::new();
+  for &idx in &series_indices {
+    if let Expr::FunctionCall { args: sa, .. } = &args[idx] {
+      let nmin = match &sa[3] {
+        Expr::Integer(n) => *n,
+        _ => return Ok(None),
+      };
+      let nmax = match &sa[4] {
+        Expr::Integer(n) => *n,
+        _ => return Ok(None),
+      };
+      let denom = denom_of(sa).unwrap();
+      let scale = common_denom / denom;
+      nmins.push(nmin * scale);
+      nmaxs.push(nmax * scale);
+      let coeffs = match &sa[2] {
+        Expr::List(items) => items.clone(),
+        _ => return Ok(None),
+      };
+      coeff_lists.push(coeffs.to_vec());
+    }
+  }
+  let new_nmin = *nmins.iter().min().unwrap();
+  let new_nmax = *nmaxs.iter().min().unwrap();
+  if new_nmax <= new_nmin {
+    return Ok(None);
+  }
+  let m_new = (new_nmax - new_nmin) as usize;
+  let mut new_coeffs: Vec<Expr> = vec![Expr::Integer(0); m_new];
+
+  for (idx_i, &orig_idx) in series_indices.iter().enumerate() {
+    let denom_i = if let Expr::FunctionCall { args: sa, .. } = &args[orig_idx] {
+      denom_of(sa).unwrap()
+    } else {
+      return Ok(None);
+    };
+    let scale_i = common_denom / denom_i;
+    let nmin_i_scaled = nmins[idx_i];
+    let coeffs_i = &coeff_lists[idx_i];
+    for (k, c) in coeffs_i.iter().enumerate() {
+      let exp_scaled = nmin_i_scaled + (k as i128) * scale_i;
+      if exp_scaled >= new_nmax {
+        break;
+      }
+      let pos = (exp_scaled - new_nmin) as usize;
+      // Only fill positions that align with the common-denom grid.
+      // (When scale_i > 1, intermediate slots stay at 0.)
+      if pos < m_new {
+        new_coeffs[pos] = plus_ast(&[new_coeffs[pos].clone(), c.clone()])?;
+      }
+    }
+  }
+
+  // Strip leading zero coefficients (advancing `nmin`) so cancellation
+  // collapses to wolframscript's canonical form — e.g.
+  // `Series[Exp[x],{x,0,3}] - 1 - x - x^2` reduces from
+  // `SeriesData[x, 0, {0, 0, -1/2, 1/6}, 0, 4, 1]` to
+  // `SeriesData[x, 0, {-1/2, 1/6}, 2, 4, 1]`.
+  let mut adjusted_nmin = new_nmin;
+  while !new_coeffs.is_empty() && matches!(&new_coeffs[0], Expr::Integer(0)) {
+    new_coeffs.remove(0);
+    adjusted_nmin += 1;
+  }
+  // Strip trailing zero coefficients too (keeping `new_nmax`), so a
+  // cancellation at the top order collapses to wolframscript's form — e.g.
+  // Series[Exp[x],…] + Series[Sin[x],…] where the x^3 terms cancel.
+  while !new_coeffs.is_empty()
+    && matches!(new_coeffs.last(), Some(Expr::Integer(0)))
+  {
+    new_coeffs.pop();
+  }
+
+  // Collect non-SeriesData summands and prepend the unified SeriesData.
+  let series_idx_set: std::collections::HashSet<usize> =
+    series_indices.iter().copied().collect();
+  let other: Vec<Expr> = args
+    .iter()
+    .enumerate()
+    .filter(|(i, _)| !series_idx_set.contains(i))
+    .map(|(_, a)| a.clone())
+    .collect();
+  let data = vec![
+    var0,
+    x0_0,
+    Expr::List(new_coeffs.into()),
+    Expr::Integer(adjusted_nmin),
+    Expr::Integer(new_nmax),
+    Expr::Integer(common_denom),
+  ];
+  let merged = call("SeriesData", data);
+  if other.is_empty() {
+    Ok(Some(merged))
+  } else {
+    let mut new_args = vec![merged];
+    new_args.extend(other);
+    Ok(Some(plus_ast(&new_args)?))
+  }
+}
+
+/// Combine two SeriesData factors into one via Cauchy product. Both must
+/// share the same `(var, x0)`. The new denom is `lcm(d1, d2)`, the new
+/// `nmin` is the sum of starting orders (in common-denom units), and the
+/// new `nmax` is `min(n1max+n2min, n2max+n1min)` so the truncation matches
+/// the tighter of the two `O(…)` orders. Returns `None` if no two
+/// SeriesData factors are present.
+fn try_series_data_times(
+  args: &[Expr],
+) -> Result<Option<Expr>, InterpreterError> {
+  let series_indices: Vec<usize> = args
+    .iter()
+    .enumerate()
+    .filter_map(|(i, a)| match a {
+      Expr::FunctionCall { name, args: sa }
+        if name == "SeriesData" && sa.len() == 6 =>
+      {
+        Some(i)
+      }
+      _ => None,
+    })
+    .collect();
+  if series_indices.len() < 2 {
+    return Ok(None);
+  }
+
+  let first = &args[series_indices[0]];
+  let (var0, x0_0) = match first {
+    Expr::FunctionCall { args: sa, .. } => (sa[0].clone(), sa[1].clone()),
+    _ => return Ok(None),
+  };
+  for &idx in &series_indices[1..] {
+    if let Expr::FunctionCall { args: sa, .. } = &args[idx] {
+      let var_eq = expr_to_string(&sa[0]) == expr_to_string(&var0);
+      let x0_eq = expr_to_string(&sa[1]) == expr_to_string(&x0_0);
+      if !var_eq || !x0_eq {
+        return Ok(None);
+      }
+    }
+  }
+
+  let denom_of = |sa: &[Expr]| -> Option<i128> {
+    if let Expr::Integer(d) = &sa[5] {
+      Some(*d)
+    } else {
+      None
+    }
+  };
+  let mut common_denom: i128 = 1;
+  for &idx in &series_indices {
+    if let Expr::FunctionCall { args: sa, .. } = &args[idx] {
+      let d = denom_of(sa).ok_or_else(|| {
+        InterpreterError::EvaluationError(
+          "SeriesData denom must be Integer".into(),
+        )
+      })?;
+      let g = gcd_i128(common_denom, d);
+      if g == 0 {
+        return Ok(None);
+      }
+      common_denom = (common_denom / g).saturating_mul(d.abs());
+    }
+  }
+
+  // Multiply the SeriesData factors pairwise. Start with the first
+  // SeriesData rescaled to the common denom, then fold subsequent factors
+  // in via a Cauchy product.
+  let to_common = |sa: &[Expr]| -> Option<(i128, i128, Vec<Expr>)> {
+    let nmin = match &sa[3] {
+      Expr::Integer(n) => *n,
+      _ => return None,
+    };
+    let nmax = match &sa[4] {
+      Expr::Integer(n) => *n,
+      _ => return None,
+    };
+    let denom = denom_of(sa)?;
+    let scale = common_denom / denom;
+    let coeffs = match &sa[2] {
+      Expr::List(items) => items.clone(),
+      _ => return None,
+    };
+    Some((nmin * scale, nmax * scale, coeffs.to_vec()))
+  };
+
+  let mut acc: Option<(i128, i128, Vec<Expr>, i128)> = None; // (nmin, nmax, coeffs, scale_used)
+  for &idx in &series_indices {
+    if let Expr::FunctionCall { args: sa, .. } = &args[idx] {
+      let denom_i = denom_of(sa).unwrap();
+      let scale_i = common_denom / denom_i;
+      let Some((nmin_i, nmax_i, coeffs_i)) = to_common(sa) else {
+        return Ok(None);
+      };
+      acc = Some(match acc {
+        None => (nmin_i, nmax_i, coeffs_i, scale_i),
+        Some((nmin_a, nmax_a, coeffs_a, scale_a)) => {
+          // Cauchy product: c_k_new = sum_{i+j*scale_a*scale_i = k_new} a_i * b_j
+          // After rescaling, slot k corresponds to exponent (nmin_*+k)/D.
+          // Acc occupies slots [0..coeffs_a.len()-1] mapping to scaled
+          // exponents nmin_a + k * scale_a (only k where slot is filled
+          // with non-zero data; intermediate slots are 0).
+          // Same for b: occupies slots at nmin_i + j*scale_i.
+          let nmin_new = nmin_a + nmin_i;
+          let nmax_new = (nmax_a + nmin_i).min(nmax_i + nmin_a);
+          if nmax_new <= nmin_new {
+            return Ok(None);
+          }
+          let m_new = (nmax_new - nmin_new) as usize;
+          let mut coeffs_new: Vec<Expr> = vec![Expr::Integer(0); m_new];
+          for (i, ai) in coeffs_a.iter().enumerate() {
+            let exp_a = nmin_a + (i as i128) * scale_a;
+            for (j, bj) in coeffs_i.iter().enumerate() {
+              let exp_b = nmin_i + (j as i128) * scale_i;
+              let exp_total = exp_a + exp_b;
+              if exp_total >= nmax_new {
+                continue;
+              }
+              let pos = (exp_total - nmin_new) as usize;
+              if pos < m_new {
+                let prod = times_ast(&[ai.clone(), bj.clone()])?;
+                coeffs_new[pos] = plus_ast(&[coeffs_new[pos].clone(), prod])?;
+              }
+            }
+          }
+          (nmin_new, nmax_new, coeffs_new, 1)
+        }
+      });
+    }
+  }
+  let (mut nmin_f, nmax_f, mut coeffs_f, _) = acc.unwrap();
+  // Trim leading zeros (advancing nmin) and trailing zeros (keeping nmax),
+  // matching wolframscript — e.g. a Cauchy product whose top-order term cancels.
+  while !coeffs_f.is_empty() && matches!(&coeffs_f[0], Expr::Integer(0)) {
+    coeffs_f.remove(0);
+    nmin_f += 1;
+  }
+  while !coeffs_f.is_empty()
+    && matches!(coeffs_f.last(), Some(Expr::Integer(0)))
+  {
+    coeffs_f.pop();
+  }
+  let data = vec![
+    var0,
+    x0_0,
+    Expr::List(coeffs_f.into()),
+    Expr::Integer(nmin_f),
+    Expr::Integer(nmax_f),
+    Expr::Integer(common_denom),
+  ];
+  let merged = call("SeriesData", data);
+
+  let series_idx_set: std::collections::HashSet<usize> =
+    series_indices.iter().copied().collect();
+  let other: Vec<Expr> = args
+    .iter()
+    .enumerate()
+    .filter(|(i, _)| !series_idx_set.contains(i))
+    .map(|(_, a)| a.clone())
+    .collect();
+  if other.is_empty() {
+    Ok(Some(merged))
+  } else {
+    let mut new_args = vec![merged];
+    new_args.extend(other);
+    Ok(Some(times_ast(&new_args)?))
+  }
+}
+
+/// Does this expression contain any named Wolfram numeric constant
+/// (Pi, E, Degree, EulerGamma, Catalan, GoldenRatio, Glaisher, Khinchin)?
+/// Used by `plus_ast` to decide whether a symbolic summand should have
+/// its constants numerified when a machine Real is present in the sum.
+fn contains_named_numeric_constant(e: &Expr) -> bool {
+  match e {
+    Expr::Identifier(s) => matches!(
+      s.as_str(),
+      "Pi"
+        | "E"
+        | "Degree"
+        | "EulerGamma"
+        | "Catalan"
+        | "GoldenRatio"
+        | "Glaisher"
+        | "Khinchin"
+    ),
+    Expr::FunctionCall { args, .. } => {
+      args.iter().any(contains_named_numeric_constant)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      contains_named_numeric_constant(left)
+        || contains_named_numeric_constant(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_named_numeric_constant(operand),
+    _ => false,
+  }
+}
+
+/// Plus[args...] - Sum of arguments, with list threading
+/// Which listable operation a `Threaded` broadcast is threading through.
+#[derive(Clone, Copy)]
+pub enum ThreadedOp {
+  Plus,
+  Times,
+}
+
+/// View `e` as the inner expression of a `Threaded[x]` wrapper.
+fn as_threaded(e: &Expr) -> Option<&Expr> {
+  match e {
+    Expr::FunctionCall { name, args }
+      if name == "Threaded" && args.len() == 1 =>
+    {
+      Some(&args[0])
+    }
+    _ => None,
+  }
+}
+
+fn make_threaded(inner: Expr) -> Expr {
+  call1("Threaded", inner)
+}
+
+/// Array nesting depth: 0 for an atom, 1 + max child depth for a list.
+fn list_rank(e: &Expr) -> usize {
+  match e {
+    Expr::List(items) => 1 + items.iter().map(list_rank).max().unwrap_or(0),
+    _ => 0,
+  }
+}
+
+fn apply_threaded_op(
+  op: ThreadedOp,
+  a: &Expr,
+  b: &Expr,
+) -> Result<Expr, InterpreterError> {
+  match op {
+    ThreadedOp::Plus => plus_ast(&[a.clone(), b.clone()]),
+    ThreadedOp::Times => times_ast(&[a.clone(), b.clone()]),
+  }
+}
+
+/// Broadcast `inner` (the content of a `Threaded[...]`) against the trailing
+/// axes of `plain`. Returns `Ok(None)` when `plain` is shallower than `inner`
+/// (WL's `Threaded::thrdts` "too shallow" error).
+fn broadcast_threaded(
+  plain: &Expr,
+  inner: &Expr,
+  op: ThreadedOp,
+) -> Result<Option<Expr>, InterpreterError> {
+  let dp = list_rank(plain);
+  let di = list_rank(inner);
+  if dp == 0 {
+    // A scalar keeps the wrapper: Threaded[scalar op inner].
+    return Ok(Some(make_threaded(apply_threaded_op(op, plain, inner)?)));
+  }
+  if dp < di {
+    return Ok(None); // too shallow for the requested threading
+  }
+  if dp == di {
+    // Same rank: combine element-wise and drop the wrapper.
+    return Ok(Some(apply_threaded_op(op, plain, inner)?));
+  }
+  // Deeper: map over the outer axis, broadcasting into each sub-array.
+  let Expr::List(items) = plain else {
+    return Ok(None);
+  };
+  let mut out = Vec::with_capacity(items.len());
+  for it in items {
+    match broadcast_threaded(it, inner, op)? {
+      Some(r) => out.push(r),
+      None => return Ok(None),
+    }
+  }
+  Ok(Some(Expr::List(out.into())))
+}
+
+/// Combine two operands of a `Threaded`-aware operation. Returns `Ok(None)` if
+/// the broadcast is too shallow.
+fn threaded_binary(
+  a: &Expr,
+  b: &Expr,
+  op: ThreadedOp,
+) -> Result<Option<Expr>, InterpreterError> {
+  match (as_threaded(a), as_threaded(b)) {
+    // Two Threaded operands combine their contents and keep the wrapper.
+    (Some(ia), Some(ib)) => {
+      Ok(Some(make_threaded(apply_threaded_op(op, ia, ib)?)))
+    }
+    (Some(ia), None) => broadcast_threaded(b, ia, op),
+    (None, Some(ib)) => broadcast_threaded(a, ib, op),
+    (None, None) => Ok(Some(apply_threaded_op(op, a, b)?)),
+  }
+}
+
+/// Handle a `Plus`/`Times` whose arguments include at least one `Threaded[...]`
+/// wrapper, applying right-aligned (trailing-axis) broadcasting. Returns `None`
+/// when no argument is `Threaded`, so callers fall through to normal threading.
+pub fn try_threaded_op(
+  args: &[Expr],
+  op: ThreadedOp,
+) -> Option<Result<Expr, InterpreterError>> {
+  if !args.iter().any(|a| as_threaded(a).is_some()) {
+    return None;
+  }
+  let mut acc = args[0].clone();
+  for b in &args[1..] {
+    match threaded_binary(&acc, b, op) {
+      Ok(Some(r)) => acc = r,
+      Ok(None) => {
+        // "Too shallow" — emit the message and leave the operation
+        // unevaluated as a left-folded BinaryOp (which is not re-evaluated).
+        let bin_op = match op {
+          ThreadedOp::Plus => BinaryOperator::Plus,
+          ThreadedOp::Times => BinaryOperator::Times,
+        };
+        let mut folded = args[0].clone();
+        for a in &args[1..] {
+          folded = Expr::BinaryOp {
+            op: bin_op,
+            left: Box::new(folded),
+            right: Box::new(a.clone()),
+          };
+        }
+        let pos = args
+          .iter()
+          .position(|a| as_threaded(a).is_some())
+          .map_or(0, |i| i + 1);
+        crate::emit_message(&format!(
+          "Threaded::thrdts: The level specified for threading the argument \
+           at position {} in {} is too shallow.",
+          pos,
+          expr_to_string(&folded)
+        ));
+        return Some(Ok(folded));
+      }
+      Err(e) => return Some(Err(e)),
+    }
+  }
+  Some(Ok(acc))
+}
+
+/// Numeric literal usable as a Complex[re, im] component.
+fn is_numeric_literal_part(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_)
+    | Expr::BigInteger(_)
+    | Expr::Real(_)
+    | Expr::BigFloat(_, _) => true,
+    Expr::FunctionCall { name, args } => {
+      name == "Rational"
+        && args.len() == 2
+        && matches!(args[0], Expr::Integer(_) | Expr::BigInteger(_))
+        && matches!(args[1], Expr::Integer(_) | Expr::BigInteger(_))
+    }
+    _ => false,
+  }
+}
+
+/// Split a numeric-complex `re - im*I` summand (the BinaryOp Minus shape
+/// built by `build_complex_float_expr` for complex Times/Power results) into
+/// `(re, (-im)*I)` so plus_ast can fold it with other complex terms. Symbolic
+/// differences return None and keep their opaque shape.
+fn split_numeric_complex_minus(e: &Expr) -> Option<(Expr, Expr)> {
+  let Expr::BinaryOp {
+    op: BinaryOperator::Minus,
+    left,
+    right,
+  } = e
+  else {
+    return None;
+  };
+  // Only numeric complex literals; the negation below keeps exact components
+  // exact (no float coercion happens).
+  try_extract_complex_float(e)?;
+  let is_i = |x: &Expr| matches!(x, Expr::Identifier(s) if s == "I");
+  let neg_imag = match right.as_ref() {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left: coeff,
+      right: i,
+    } if is_i(i) => {
+      let neg_coeff = match coeff.as_ref() {
+        Expr::Real(f) => Expr::Real(-f),
+        Expr::Integer(n) => Expr::Integer(-n),
+        _ => return None,
+      };
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left: Box::new(neg_coeff),
+        right: i.clone(),
+      }
+    }
+    i if is_i(i) => times2(Expr::Integer(-1), id_expr("I")),
+    _ => return None,
+  };
+  Some(((**left).clone(), neg_imag))
+}
+
+/// Wolfram's machine-precision fold: the operands combine as a balanced
+/// divide-and-conquer tree with ceil split (left half gets the extra
+/// element), not left-to-right. Total[Table[0.1, 10]] is exactly 1.
+/// (a left-to-right fold gives 0.9999999999999999) and
+/// Plus[22, -59, 34, 14.6] is 11.600000000000001 because 22-59 and
+/// 34+14.6 combine first. The same tree shape applies to Times
+/// (Times[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7] → 0.000504).
+fn machine_tree_fold(xs: &[f64], op: fn(f64, f64) -> f64) -> f64 {
+  match xs.len() {
+    1 => xs[0],
+    2 => op(xs[0], xs[1]),
+    n => {
+      let m = n.div_ceil(2);
+      op(
+        machine_tree_fold(&xs[..m], op),
+        machine_tree_fold(&xs[m..], op),
+      )
+    }
+  }
+}
+
+/// Machine-precision Plus over the numeric terms, in input order, as the
+/// balanced machine tree (see `coeff_tree_fold`): Plus[2^60, 1, -2^60, 0.5]
+/// is 0. and Plus[22, -59, 34, 14.6] is 11.600000000000001, not
+/// (-3 + 14.6) = 11.6, while adjacent exact terms combine exactly
+/// (Plus[19/27, 49/3, 0.1, 0.2] is 17.33703703703704, one ulp away from
+/// the per-term f64 sum).
+fn machine_sum(terms: &[Coeff]) -> f64 {
+  if terms.is_empty() {
+    return 0.0;
+  }
+  coeff_tree_fold(terms, Coeff::add).to_f64()
+}
+
+/// Balanced machine tree fold over numeric Plus/Times operands in input
+/// order: the left half takes ceil(n/2) operands. A node whose two sides
+/// are both exact combines exactly (with BigInt promotion); a node mixing
+/// exact and Real converts the exact side to f64. Mirrors wolframscript's
+/// n-ary numeric folding (verified over random batches by the
+/// differential fuzzer).
+fn coeff_tree_fold(xs: &[Coeff], op: fn(&Coeff, &Coeff) -> Coeff) -> Coeff {
+  match xs.len() {
+    1 => xs[0].clone(),
+    2 => op(&xs[0], &xs[1]),
+    n => {
+      let m = n.div_ceil(2);
+      op(
+        &coeff_tree_fold(&xs[..m], op),
+        &coeff_tree_fold(&xs[m..], op),
+      )
+    }
+  }
+}
+
+pub fn plus_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Ok(Expr::Integer(0));
+  }
+
+  // Threaded[...] broadcasting takes precedence over ordinary list threading.
+  if let Some(result) = try_threaded_op(args, ThreadedOp::Plus) {
+    return result;
+  }
+
+  // Handle DateObject subtraction: DateObject[...] - DateObject[...] → Quantity[n, "Days"]
+  if let Some(result) = try_date_object_subtraction(args) {
+    return result;
+  }
+
+  // Handle DateObject + Quantity[n, unit]: shift the date by the time span
+  // (commutatively, and for any number of calendar-unit quantities).
+  if let Some(result) = try_date_object_plus_quantity(args) {
+    return result;
+  }
+
+  // Handle TimeObject + Quantity[n, time-unit]: shift the time of day.
+  if let Some(result) = try_time_object_plus_quantity(args) {
+    return result;
+  }
+
+  // Combine multiple `SeriesData[var, x0, …]` summands sharing the same
+  // (var, x0) into a single SeriesData. Truncates to the minimum order.
+  if let Some(result) = try_series_data_plus(args)? {
+    return Ok(result);
+  }
+
+  // A time-series operand keeps the series, combining the values.
+  if let Some(result) =
+    crate::functions::timeseries_ast::try_series_arithmetic("Plus", args)
+  {
+    return Ok(result);
+  }
+
+  // A SparseArray summand keeps the sum sparse (the background shifts).
+  if let Some(result) =
+    crate::functions::list_helpers_ast::try_sparse_array_arithmetic(
+      "Plus", args,
+    )
+  {
+    return Ok(result);
+  }
+
+  // Handle Quantity arithmetic before anything else
+  if let Some(result) = crate::functions::quantity_ast::try_quantity_plus(args)
+  {
+    return result;
+  }
+
+  // Handle Interval arithmetic
+  if let Some(result) = crate::functions::interval_ast::try_interval_plus(args)
+  {
+    return result;
+  }
+
+  // Handle MusicChord transposition (WL 15): `MusicChord[{…}] + MusicInterval[…]`
+  // shifts every chord tone by the interval span. Checked before the pitch sum
+  // since a chord summand is not itself a pitch.
+  if let Some(result) =
+    crate::functions::music_ast::try_music_chord_plus_interval(args)
+  {
+    return Ok(result);
+  }
+
+  // Handle music container/event transposition (WL 15): adding a MusicInterval
+  // to a MusicNote/MusicMeasure/MusicVoice/MusicScore/MusicScale shifts every
+  // pitch it contains by the interval span.
+  if let Some(result) =
+    crate::functions::music_ast::try_music_container_plus_interval(args)
+  {
+    return Ok(result);
+  }
+
+  // Handle MusicPitch arithmetic (WL 15): adding/subtracting pitch objects
+  // combines them along the diatonic-position and MIDI-number axes; adding a
+  // MusicInterval transposes the pitch.
+  if let Some(result) = crate::functions::music_ast::try_music_pitch_plus(args)
+  {
+    return Ok(result);
+  }
+
+  // Handle MusicDuration arithmetic (WL 15): a sum of (scaled) durations
+  // combines their rhythmic values, e.g. `3 MusicDuration[1/2] + MusicDuration[1/4]`
+  // → `MusicDuration[<|"Duration" -> 7/4|>]`.
+  if let Some(products) =
+    crate::functions::music_ast::music_duration_plus_terms(args)
+  {
+    // Evaluate each `Times[coeff, value]` product before summing, then add the
+    // resulting rhythmic values exactly.
+    let values: Result<Vec<Expr>, _> = products
+      .iter()
+      .map(crate::evaluator::evaluate_expr_to_expr)
+      .collect();
+    let total = crate::evaluator::evaluate_function_call_ast("Plus", &values?)?;
+    return Ok(crate::functions::music_ast::music_duration_from_value(
+      total,
+    ));
+  }
+
+  // Around (uncertain-value) error propagation.
+  if let Some(result) = try_around_plus(args) {
+    return Ok(result);
+  }
+
+  // Flatten nested Plus arguments (recursive to handle deeply nested Plus).
+  // Both `FunctionCall { name: "Plus", … }` and `BinaryOp::Plus` are
+  // unwrapped so that, for example, `Plus[1., Plus[0., 0.*I]]` (the
+  // second summand built as a BinaryOp by `times_ast` for `0. I`)
+  // collapses to `Plus[1., 0., 0.*I]` rather than leaving the inner
+  // BinaryOp intact and printing `1. + (0. + 0.*I)`.
+  let mut flat_args: Vec<Expr> = Vec::new();
+  let mut stack: Vec<Expr> = args.iter().rev().cloned().collect();
+  while let Some(arg) = stack.pop() {
+    match arg {
+      Expr::FunctionCall {
+        ref name,
+        args: ref inner_args,
+      } if name == "Plus" => {
+        for inner in inner_args.iter().rev() {
+          stack.push(inner.clone());
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        ref left,
+        ref right,
+      } => {
+        stack.push((**right).clone());
+        stack.push((**left).clone());
+      }
+      // Split a numeric `Complex[re, im]` summand (as produced by complex
+      // Times/Power results) into `re + im*I` so the ordinary
+      // real/imaginary-term combining below folds it with other terms;
+      // otherwise `(1.5 + 2.5 I) + Complex[2., -3.75]` stays uncombined.
+      Expr::FunctionCall {
+        ref name,
+        args: ref cargs,
+      } if name == "Complex"
+        && cargs.len() == 2
+        && cargs.iter().all(is_numeric_literal_part) =>
+      {
+        flat_args.push(cargs[0].clone());
+        stack.push(times2(cargs[1].clone(), id_expr("I")));
+      }
+      other => {
+        if let Some((re, imag)) = split_numeric_complex_minus(&other) {
+          flat_args.push(re);
+          flat_args.push(imag);
+        } else {
+          flat_args.push(other);
+        }
+      }
+    }
+  }
+
+  // Propagate Indeterminate through addition.
+  for arg in &flat_args {
+    if matches!(arg, Expr::Identifier(n) if n == "Indeterminate") {
+      return Ok(id_expr("Indeterminate"));
+    }
+  }
+
+  // An infinite term swallows every finite one. Two infinities in the same
+  // direction collapse to that direction, exactly opposite ones (and any
+  // ComplexInfinity meeting another infinity) are Indeterminate, and two
+  // different-but-not-opposite directions stay unevaluated — wolframscript
+  // does not choose between them.
+  {
+    let infinite: Vec<Option<Expr>> =
+      flat_args.iter().filter_map(infinity_direction).collect();
+    if !infinite.is_empty() {
+      let complex_inf = infinite.iter().any(std::option::Option::is_none);
+      let mut directions: Vec<Expr> = Vec::new();
+      for dir in infinite.iter().flatten() {
+        let shown = expr_to_string(dir);
+        if !directions.iter().any(|d| expr_to_string(d) == shown) {
+          directions.push(dir.clone());
+        }
+      }
+      // ComplexInfinity alone (with finite terms) keeps its direction.
+      if complex_inf && directions.is_empty() && infinite.len() == 1 {
+        return Ok(id_expr("ComplexInfinity"));
+      }
+      let opposite = directions.len() == 2
+        && matches!(
+          crate::evaluator::evaluate_expr_to_expr(&call(
+            "Plus",
+            vec![directions[0].clone(), directions[1].clone()]
+          )),
+          Ok(Expr::Integer(0))
+        );
+      if complex_inf || opposite {
+        crate::emit_message(
+          "Infinity::indet: Indeterminate expression -Infinity + Infinity \
+           encountered.",
+        );
+        return Ok(id_expr("Indeterminate"));
+      }
+      if directions.len() == 1 {
+        return crate::evaluator::evaluate_expr_to_expr(&call1(
+          "DirectedInfinity",
+          directions[0].clone(),
+        ));
+      }
+      // Several unrelated directions: leave the sum alone.
+      if directions.len() > 1 {
+        return Ok(unevaluated("Plus", &flat_args));
+      }
+    }
+  }
+
+  // Check for list threading
+  let has_list = flat_args.iter().any(|a| matches!(a, Expr::List(_)));
+  if has_list {
+    let result = thread_binary_over_lists(&flat_args, |a, b| {
+      // Delegate to plus_ast so rationals, bigints, symbolic terms,
+      // etc. are handled consistently with the non-list path.
+      plus_ast(&[a.clone(), b.clone()])
+    });
+    // Adding two lists of unequal length surfaces as an internal error;
+    // turn it into Thread::tdlen and leave `a + b` unevaluated, matching the
+    // infix path and wolframscript (e.g. Plus[{1, 2}, {3, 4, 5}]).
+    if let Err(InterpreterError::EvaluationError(ref m)) = result
+      && m == "Lists must have the same length"
+      && flat_args.len() == 2
+    {
+      let unevaluated = plus2(flat_args[0].clone(), flat_args[1].clone());
+      crate::emit_message(&format!(
+        "Thread::tdlen: Objects of unequal length in {} cannot be combined.",
+        expr_to_string(&unevaluated)
+      ));
+      return Ok(unevaluated);
+    }
+    return result;
+  }
+
+  // Check if any argument needs BigInt arithmetic (BigInteger or large Integer exceeding f64 precision)
+  let has_bigint = flat_args.iter().any(needs_bigint_arithmetic);
+
+  // The integer-only fast path below cannot combine Rational terms (it would
+  // drop them into the symbolic list). When any rational is present, fall
+  // through to the general exact path, which is BigInt-aware via expr_to_coeff.
+  let has_rational = flat_args.iter().any(|a| {
+    matches!(a, Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2)
+  });
+  // Likewise a machine Real forces the general machine fold (which is
+  // BigInt-aware via expr_to_coeff): Plus[2^60, 1, -2^60, 0.5] is 0.
+  // because every term converts to f64 individually — the fast path
+  // would sum the integers exactly and leave `1 + 0.5` uncombined.
+  let has_real_arg = flat_args.iter().any(|a| matches!(a, Expr::Real(_)));
+
+  if has_bigint && !has_rational && !has_real_arg {
+    let mut big_sum = BigInt::from(0);
+    let mut all_int = true;
+    let mut symbolic_args: Vec<Expr> = Vec::new();
+
+    for arg in &flat_args {
+      match arg {
+        Expr::Integer(n) => big_sum += BigInt::from(*n),
+        Expr::BigInteger(n) => big_sum += n,
+        _ => {
+          all_int = false;
+          symbolic_args.push(arg.clone());
+        }
+      }
+    }
+
+    if all_int {
+      return Ok(bigint_to_expr(big_sum));
+    }
+
+    let mut final_args: Vec<Expr> = Vec::new();
+    if big_sum != BigInt::from(0) {
+      final_args.push(bigint_to_expr(big_sum));
+    }
+    final_args.extend(symbolic_args);
+    if final_args.len() == 1 {
+      return Ok(final_args.remove(0));
+    }
+    return Ok(call("Plus", final_args));
+  }
+
+  // Classify arguments: exact (Integer/Rational), real (Real), bigfloat, or symbolic
+  let mut has_real = false;
+  let mut has_bigfloat = false;
+  let mut all_numeric = true;
+  for arg in &flat_args {
+    match arg {
+      Expr::Real(_) => has_real = true,
+      Expr::BigFloat(_, _) => has_bigfloat = true,
+      Expr::Integer(_) | Expr::BigInteger(_) => {}
+      // Rational with Integer or BigInteger numerator/denominator (the
+      // BigInteger case arises once denominators exceed i128, e.g. Egyptian
+      // fraction expansions). expr_to_coeff handles both exactly.
+      Expr::FunctionCall { name, args: rargs }
+        if name == "Rational"
+          && rargs.len() == 2
+          && matches!(rargs[0], Expr::Integer(_) | Expr::BigInteger(_))
+          && matches!(rargs[1], Expr::Integer(_) | Expr::BigInteger(_)) => {}
+      _ => {
+        all_numeric = false;
+      }
+    }
+  }
+
+  // If all numeric and no Reals/BigFloats, use exact rational arithmetic.
+  // Uses Coeff::add which transparently promotes to BigInt on i128 overflow.
+  if all_numeric && !has_real && !has_bigfloat {
+    let mut sum = Coeff::Exact(0, 1);
+    for arg in &flat_args {
+      if let Some(c) = expr_to_coeff(arg) {
+        sum = sum.add(&c);
+      }
+    }
+    return Ok(sum.to_expr());
+  }
+
+  // If all numeric with BigFloat (no machine Real), use precision-tracked arithmetic
+  if all_numeric && has_bigfloat && !has_real {
+    return Ok(bigfloat_plus(&flat_args));
+  }
+
+  // If all numeric but has Reals, fold to f64 as the balanced machine
+  // tree over the terms in input order (see machine_sum).
+  if all_numeric && !has_bigfloat {
+    let mut terms: Vec<Coeff> = Vec::new();
+    for arg in &flat_args {
+      if let Expr::Real(f) = arg {
+        terms.push(Coeff::Real(*f));
+      } else if let Some(c) = expr_to_coeff(arg) {
+        terms.push(c);
+      }
+    }
+    return Ok(Expr::Real(machine_sum(&terms)));
+  }
+  if all_numeric {
+    let mut sum = 0.0;
+    for arg in &flat_args {
+      if let Some(n) = expr_to_num(arg) {
+        sum += n;
+      }
+    }
+    return Ok(Expr::Real(sum));
+  }
+
+  {
+    // Separate numeric and symbolic terms. numeric_terms keeps every
+    // numeric operand as f64 in input order (for the machine tree fold
+    // when a Real is present); exact_sum keeps the exact rational sum
+    // (used when NO Real is present, so 1 + 1/2 + x stays 3/2 + x).
+    let mut symbolic_args: Vec<Expr> = Vec::new();
+    let mut has_exact = false;
+    let mut exact_sum = Coeff::Exact(0, 1);
+    let mut numeric_terms: Vec<Coeff> = Vec::new();
+    let mut has_real_term = false;
+
+    for arg in &flat_args {
+      if let Some(c) = expr_to_coeff(arg) {
+        // Coeff::add promotes to BigInt on i128 overflow.
+        exact_sum = exact_sum.add(&c);
+        has_exact = true;
+        numeric_terms.push(c);
+      } else if let Expr::Real(f) = arg {
+        numeric_terms.push(Coeff::Real(*f));
+        has_real_term = true;
+      } else {
+        symbolic_args.push(arg.clone());
+      }
+    }
+
+    // Numeric contagion: if any term is a machine Real, fold each
+    // symbolic numeric-constant term (Pi, E, etc.) to a Real, and
+    // numerify the numeric constants embedded inside otherwise non-real
+    // terms like `Pi*I` so `2. + Pi*I` → `2. + 3.14159…*I`. Matches
+    // wolframscript: `2. + Pi` → `5.14159…`, `2. + Pi*I` →
+    // `2. + 3.14159…*I`, but `2. + (x-3)^2` stays `2. + (-3 + x)^2`
+    // because the symbolic summand contains no numeric constants.
+    // The numerified constants fold AFTER the literal terms, one at a
+    // time in input order — Wolfram's machine fold never combines the
+    // symbolic terms first (Plus[0.1, 0.2, Pi, -Pi] →
+    // 0.2999999999999998, Plus[1.*10^16, Pi, -1.*10^16] → 3.14159…).
+    let mut numerified_tail: Vec<f64> = Vec::new();
+    if has_real_term {
+      let mut remaining_symbolic: Vec<Expr> = Vec::new();
+      for arg in symbolic_args.drain(..) {
+        if let Some(f) = try_eval_to_f64(&arg) {
+          // Whole term reduces to a Real (e.g. Pi, E, Sqrt[2]).
+          numerified_tail.push(f);
+        } else if contains_named_numeric_constant(&arg)
+          && let Ok(n_val) = n_eval(&arg)
+        {
+          remaining_symbolic.push(n_val);
+        } else {
+          remaining_symbolic.push(arg);
+        }
+      }
+      symbolic_args = remaining_symbolic;
+    }
+
+    // Build final args: numeric sum first (if non-zero), then symbolic terms sorted
+    let mut final_args: Vec<Expr> = Vec::new();
+
+    // Detect any `Times[Real, I]` symbolic summand. When present, the
+    // sum is in the machine-precision Complex form (`Complex[r, im]`)
+    // and we keep a leading `0.` real coefficient when real_sum is 0
+    // so the output reads `0. + r*I` rather than dropping the `0.`.
+    // This covers both `0. + 0. I` and `0. + 1. I`.
+    let has_inexact_zero_imag = symbolic_args.iter().any(|e| {
+      matches!(
+        e,
+        Expr::FunctionCall { name, args }
+          if name == "Times"
+            && args.len() == 2
+            && matches!(args[0], Expr::Real(_))
+            && matches!(&args[1], Expr::Identifier(s) if s == "I")
+      ) || matches!(
+        e,
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left,
+          right,
+        } if matches!(left.as_ref(), Expr::Real(_))
+          && matches!(right.as_ref(), Expr::Identifier(s) if s == "I")
+      )
+    });
+
+    // With any machine Real present, fold to f64 in Wolfram's order: the
+    // literal numeric terms (exact and real alike, each converted to f64
+    // individually) combine as the balanced machine tree, then the
+    // numerified constants fold one at a time.
+    if has_real_term {
+      let mut total = machine_sum(&numeric_terms);
+      for f in &numerified_tail {
+        total += f;
+      }
+      if total != 0.0 || has_inexact_zero_imag {
+        final_args.push(Expr::Real(total));
+      }
+    } else if has_exact && !exact_sum.is_zero() {
+      final_args.push(exact_sum.to_expr());
+    }
+
+    // wolframscript's canonical Plus order treats a pure-imaginary numeric
+    // term as a number, sorting it ahead of the symbolic terms — e.g.
+    // `x + 3*I` → `3*I + x`, `a + b + 3*I` → `3*I + a + b`. Woxi keeps the
+    // imaginary term in its native `k*I` form (so the renderer stays happy)
+    // but reorders it to the front. Only when there is no real numeric
+    // prefix: with a nonzero real part wolframscript folds both into a single
+    // Complex atom `(re + im*I)`, which Woxi cannot represent inside a Plus.
+    let hoist_imaginary = !has_real_term
+      && exact_sum.is_zero()
+      && !flat_args.iter().any(|a| matches!(a, Expr::BigFloat(_, _)));
+
+    // When the sum has any Real (or BigFloat) component, promote the
+    // integer/rational coefficient of any imaginary symbolic term to a
+    // Real. Wolfram's `1. + 2 I` evaluates to `Complex[1., 2.]`, not
+    // `Plus[1., Times[2, I]]`; the closest we can get without a Complex
+    // node is `Plus[1., Times[2., I]]`.
+    let needs_complex_promotion = (has_real_term
+      || flat_args.iter().any(|a| matches!(a, Expr::BigFloat(_, _))))
+      && symbolic_args.iter().any(is_integer_times_i);
+    let symbolic_args = if needs_complex_promotion {
+      symbolic_args
+        .into_iter()
+        .map(promote_integer_times_i_to_real)
+        .collect()
+    } else {
+      symbolic_args
+    };
+
+    // Collect like terms: group symbolic terms by their base expression
+    // e.g. E + E → 2*E, 3*x + 2*x → 5*x
+    let collected = collect_like_terms(&symbolic_args);
+
+    // Sort symbolic terms: polynomial-like terms first, then transcendental functions
+    // This gives Mathematica-like ordering where x^2 comes before Sin[x].
+    // For alphabetical comparison, strip the leading "-" from negated terms
+    // so that -x sorts next to x rather than before everything.
+    let mut sorted_symbolic = collected;
+    // `compare_plus_terms` is, in rare cases involving deeply nested mixed-
+    // priority expressions, not strictly transitive — Rust's sort then panics
+    // with "comparison function does not correctly implement a total order".
+    // Catch the panic and fall back to a stable string-based sort instead, so
+    // these inputs simply lose the fine-grained Wolfram-flavoured ordering
+    // rather than aborting the program.
+    let fallback_order: Vec<usize> = {
+      let mut idx: Vec<usize> = (0..sorted_symbolic.len()).collect();
+      idx.sort_by_cached_key(|&i| term_sort_key(&sorted_symbolic[i]));
+      idx
+    };
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let sort_result =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut clone = sorted_symbolic.clone();
+        clone.sort_by(compare_plus_terms);
+        clone
+      }));
+    std::panic::set_hook(prev_hook);
+    sorted_symbolic = match sort_result {
+      Ok(v) => v,
+      Err(_) => fallback_order
+        .into_iter()
+        .map(|i| sorted_symbolic[i].clone())
+        .collect(),
+    };
+
+    // Hoist a pure-imaginary numeric term to the front so it sorts like the
+    // number it is (`x + 3*I` → `3*I + x`). See `hoist_imaginary` above.
+    if hoist_imaginary
+      && let Some(idx) = sorted_symbolic.iter().position(|t| {
+        let (c, base) = decompose_term(t);
+        matches!(&base, Expr::Identifier(s) if s == "I")
+          && !matches!(c, Coeff::Real(_))
+      })
+      && idx != 0
+    {
+      let term = sorted_symbolic.remove(idx);
+      sorted_symbolic.insert(0, term);
+    }
+
+    // Underflow[] floats ahead of the numeric coefficient too — Wolfram
+    // prints `1 - Underflow[]` as `Underflow[] + 1`. Splice any Underflow[]
+    // term out of the symbolic list and prepend it to final_args before
+    // the numeric coefficient lands.
+    if let Some(idx) = sorted_symbolic.iter().position(is_underflow_term) {
+      let term = sorted_symbolic.remove(idx);
+      final_args.insert(0, term);
+    }
+
+    final_args.extend(sorted_symbolic);
+
+    if final_args.is_empty() {
+      Ok(Expr::Integer(0))
+    } else if final_args.len() == 1 {
+      Ok(final_args.remove(0))
+    } else {
+      Ok(call("Plus", final_args))
+    }
+  }
+}
+
+/// Recognise an exact-coefficient imaginary term that should be promoted
+/// to Real form when combined with an inexact value via Plus.
+/// Matches `I`, `Times[Integer|Rational, I]` (FunctionCall or BinaryOp),
+/// `Complex[Integer|Rational, Integer|Rational]`.
+fn is_integer_times_i(e: &Expr) -> bool {
+  let exact_numeric = |x: &Expr| -> bool {
+    match x {
+      Expr::Integer(_) | Expr::BigInteger(_) => true,
+      Expr::FunctionCall { name: n, args: r }
+        if n == "Rational" && r.len() == 2 =>
+      {
+        true
+      }
+      _ => false,
+    }
+  };
+  match e {
+    Expr::Identifier(s) if s == "I" => true,
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut has_i = false;
+      for a in args {
+        match a {
+          Expr::Identifier(s) if s == "I" => has_i = true,
+          Expr::Integer(_) | Expr::BigInteger(_) => {}
+          Expr::FunctionCall { name: n, args: r }
+            if n == "Rational" && r.len() == 2 => {}
+          _ => return false,
+        }
+      }
+      has_i
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let is_i = |x: &Expr| matches!(x, Expr::Identifier(s) if s == "I");
+      (is_i(left) && exact_numeric(right))
+        || (is_i(right) && exact_numeric(left))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Complex" && args.len() == 2 =>
+    {
+      exact_numeric(&args[0]) && exact_numeric(&args[1])
+    }
+    _ => false,
+  }
+}
+
+/// Convert exact (Integer/Rational) coefficients in a `Times[…, I]` or
+/// `Complex[a, b]` term to Real. Used when combining with an inexact
+/// Real/BigFloat in Plus.
+fn promote_integer_times_i_to_real(e: Expr) -> Expr {
+  let to_real = |x: &Expr| -> Option<Expr> {
+    match x {
+      Expr::Integer(n) => Some(Expr::Real(*n as f64)),
+      Expr::BigInteger(n) => {
+        use num_traits::ToPrimitive;
+        Some(Expr::Real(n.to_f64().unwrap_or(f64::INFINITY)))
+      }
+      Expr::FunctionCall { name: n, args: r }
+        if n == "Rational" && r.len() == 2 =>
+      {
+        if let (Expr::Integer(num), Expr::Integer(den)) = (&r[0], &r[1]) {
+          Some(Expr::Real(*num as f64 / *den as f64))
+        } else {
+          None
+        }
+      }
+      _ => None,
+    }
+  };
+  if matches!(&e, Expr::Identifier(s) if s == "I") {
+    return call("Times", vec![Expr::Real(1.0), id_expr("I")]);
+  }
+  if let Expr::FunctionCall { name, args } = &e
+    && name == "Times"
+  {
+    let mut new_args: Vec<Expr> = Vec::with_capacity(args.len());
+    for a in args {
+      if let Some(r) = to_real(a) {
+        new_args.push(r);
+      } else {
+        new_args.push(a.clone());
+      }
+    }
+    return call("Times", new_args);
+  }
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Times,
+    left,
+    right,
+  } = &e
+  {
+    let left_new = to_real(left).unwrap_or((**left).clone());
+    let right_new = to_real(right).unwrap_or((**right).clone());
+    return call("Times", vec![left_new, right_new]);
+  }
+  // Complex[a, b] → Times[Real(b), I] is an oversimplification when a != 0;
+  // for the simple `Complex[0, n]` case we expand to `Times[Real(n), I]`,
+  // and for general Complex we replace the components with their Real
+  // equivalents so downstream code can fold them with the leading Real.
+  if let Expr::FunctionCall { name, args } = &e
+    && name == "Complex"
+    && args.len() == 2
+  {
+    let to_real = |x: &Expr| -> Expr {
+      match x {
+        Expr::Integer(n) => Expr::Real(*n as f64),
+        Expr::BigInteger(n) => {
+          use num_traits::ToPrimitive;
+          Expr::Real(n.to_f64().unwrap_or(f64::INFINITY))
+        }
+        Expr::FunctionCall { name: n, args: r }
+          if n == "Rational" && r.len() == 2 =>
+        {
+          if let (Expr::Integer(num), Expr::Integer(den)) = (&r[0], &r[1]) {
+            Expr::Real(*num as f64 / *den as f64)
+          } else {
+            x.clone()
+          }
+        }
+        _ => x.clone(),
+      }
+    };
+    let re = to_real(&args[0]);
+    let im = to_real(&args[1]);
+    let zero_re = matches!(&re, Expr::Real(f) if *f == 0.0)
+      || matches!(&re, Expr::Integer(0));
+    if zero_re {
+      return call("Times", vec![im, id_expr("I")]);
+    }
+    return call("Plus", vec![re, call("Times", vec![im, id_expr("I")])]);
+  }
+  e
+}
+
+/// Coefficient: either exact rational (i128 or BigInt) or approximate real
+#[derive(Clone)]
+pub enum Coeff {
+  Exact(i128, i128),        // (numer, denom)
+  BigExact(BigInt, BigInt), // (numer, denom)
+  Real(f64),
+}
+
+impl Coeff {
+  fn is_zero(&self) -> bool {
+    match self {
+      Self::Exact(n, _) => *n == 0,
+      Self::BigExact(n, _) => n.sign() == Sign::NoSign,
+      Self::Real(f) => *f == 0.0,
+    }
+  }
+  fn is_one(&self) -> bool {
+    match self {
+      Self::Exact(n, d) => *n == 1 && *d == 1,
+      Self::BigExact(n, d) => {
+        use num_traits::One;
+        n.is_one() && d.is_one()
+      }
+      Self::Real(f) => *f == 1.0,
+    }
+  }
+  fn is_negative(&self) -> bool {
+    match self {
+      Self::Exact(n, d) => (*n < 0) != (*d < 0),
+      Self::BigExact(n, d) => {
+        (n.sign() == Sign::Minus) != (d.sign() == Sign::Minus)
+      }
+      Self::Real(f) => *f < 0.0,
+    }
+  }
+  fn to_f64(&self) -> f64 {
+    match self {
+      Self::Exact(n, d) => *n as f64 / *d as f64,
+      Self::BigExact(n, d) => {
+        use num_traits::ToPrimitive;
+        n.to_f64().unwrap_or(f64::INFINITY) / d.to_f64().unwrap_or(1.0)
+      }
+      Self::Real(f) => *f,
+    }
+  }
+  fn to_big(n: i128, d: i128) -> (BigInt, BigInt) {
+    (BigInt::from(n), BigInt::from(d))
+  }
+  fn add(&self, other: &Self) -> Self {
+    match (self, other) {
+      (Self::Exact(n1, d1), Self::Exact(n2, d2)) => {
+        // Try i128 first; on overflow, promote to BigInt
+        if let (Some(a), Some(b), Some(c)) = (
+          n1.checked_mul(*d2),
+          n2.checked_mul(*d1),
+          d1.checked_mul(*d2),
+        ) && let Some(sn) = a.checked_add(b)
+        {
+          let (sn, sd) = rat_reduce(sn, c);
+          return Self::Exact(sn, sd);
+        }
+        // Overflow: promote to BigInt
+        let (n1, d1) = Self::to_big(*n1, *d1);
+        let (n2, d2) = Self::to_big(*n2, *d2);
+        let (mut sn, mut sd) = (&n1 * &d2 + &n2 * &d1, d1 * d2);
+        (sn, sd) = rat_reduce_bigint(&sn, &sd);
+        Self::BigExact(sn, sd)
+      }
+      (Self::BigExact(n1, d1), Self::BigExact(n2, d2)) => {
+        let (mut sn, mut sd) = (n1 * d2 + n2 * d1, d1 * d2);
+        (sn, sd) = rat_reduce_bigint(&sn, &sd);
+        Self::BigExact(sn, sd)
+      }
+      (Self::Exact(n, d), Self::BigExact(..))
+      | (Self::BigExact(..), Self::Exact(n, d)) => {
+        let big_self;
+        let big_other;
+        if let Self::BigExact(bn, bd) = self {
+          big_self = Self::BigExact(bn.clone(), bd.clone());
+          big_other = Self::BigExact(BigInt::from(*n), BigInt::from(*d));
+        } else {
+          let (bn, bd) = Self::to_big(*n, *d);
+          big_self = Self::BigExact(bn, bd);
+          big_other = other.clone();
+        }
+        big_self.add(&big_other)
+      }
+      _ => Self::Real(self.to_f64() + other.to_f64()),
+    }
+  }
+  fn mul(&self, other: &Self) -> Self {
+    match (self, other) {
+      (Self::Exact(n1, d1), Self::Exact(n2, d2)) => {
+        if let (Some(sn), Some(sd)) = (n1.checked_mul(*n2), d1.checked_mul(*d2))
+        {
+          let (sn, sd) = rat_reduce(sn, sd);
+          return Self::Exact(sn, sd);
+        }
+        let (n1, d1) = Self::to_big(*n1, *d1);
+        let (n2, d2) = Self::to_big(*n2, *d2);
+        let (mut sn, mut sd) = (&n1 * &n2, d1 * d2);
+        (sn, sd) = rat_reduce_bigint(&sn, &sd);
+        Self::BigExact(sn, sd)
+      }
+      (Self::BigExact(n1, d1), Self::BigExact(n2, d2)) => {
+        let (mut sn, mut sd) = (n1 * n2, d1 * d2);
+        (sn, sd) = rat_reduce_bigint(&sn, &sd);
+        Self::BigExact(sn, sd)
+      }
+      (Self::Exact(n, d), Self::BigExact(..))
+      | (Self::BigExact(..), Self::Exact(n, d)) => {
+        let big_self;
+        let big_other;
+        if let Self::BigExact(bn, bd) = self {
+          big_self = Self::BigExact(bn.clone(), bd.clone());
+          big_other = Self::BigExact(BigInt::from(*n), BigInt::from(*d));
+        } else {
+          let (bn, bd) = Self::to_big(*n, *d);
+          big_self = Self::BigExact(bn, bd);
+          big_other = other.clone();
+        }
+        big_self.mul(&big_other)
+      }
+      _ => Self::Real(self.to_f64() * other.to_f64()),
+    }
+  }
+  fn negate(&self) -> Self {
+    match self {
+      Self::Exact(n, d) => Self::Exact(-n, *d),
+      Self::BigExact(n, d) => Self::BigExact(-n, d.clone()),
+      Self::Real(f) => Self::Real(-f),
+    }
+  }
+  fn to_expr(&self) -> Expr {
+    match self {
+      Self::Exact(n, d) => make_rational(*n, *d),
+      Self::BigExact(n, d) => {
+        use num_traits::{One, ToPrimitive};
+        if d.is_one() {
+          bigint_to_expr(n.clone())
+        } else if let (Some(ni), Some(di)) = (n.to_i128(), d.to_i128()) {
+          make_rational(ni, di)
+        } else {
+          call(
+            "Rational",
+            vec![bigint_to_expr(n.clone()), bigint_to_expr(d.clone())],
+          )
+        }
+      }
+      Self::Real(f) => Expr::Real(*f),
+    }
+  }
+}
+
+/// Extract an exact `Coeff` (BigInt-aware) from a numeric expression:
+/// `Integer`, `BigInteger`, or `Rational[…]` whose parts are Integer or
+/// BigInteger. Unlike `expr_to_rational` (which is limited to i128) this
+/// preserves rationals whose numerator/denominator exceed i128, so Plus and
+/// friends can combine them instead of leaving them as symbolic summands.
+fn expr_to_coeff(arg: &Expr) -> Option<Coeff> {
+  match arg {
+    Expr::Integer(n) => Some(Coeff::Exact(*n, 1)),
+    Expr::BigInteger(n) => Some(Coeff::BigExact(n.clone(), BigInt::from(1))),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+        Some(Coeff::Exact(*n, *d))
+      } else {
+        let n = expr_to_bigint(&args[0])?;
+        let d = expr_to_bigint(&args[1])?;
+        Some(Coeff::BigExact(n, d))
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Decompose a term into (coefficient, base_expression).
+/// E.g. `3*x` → (Exact(3,1), x), `x` → (Exact(1,1), x), `-x` → (Exact(-1,1), x),
+/// `1.5*x` → (Real(1.5), x), `Rational[3,4]*x` → (Exact(3,4), x).
+fn decompose_term(e: &Expr) -> (Coeff, Expr) {
+  match e {
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      let base_from = |args: &[Expr]| -> Expr {
+        if args.len() == 2 {
+          args[1].clone()
+        } else {
+          call("Times", args[1..].to_vec())
+        }
+      };
+      // Check if first arg is a numeric coefficient (integer/rational)
+      if let Some((n, d)) = expr_to_rational(&args[0]) {
+        let (inner_c, inner_base) = decompose_term(&base_from(args));
+        let outer_c = Coeff::Exact(n, d);
+        return (outer_c.mul(&inner_c), inner_base);
+      }
+      // Check if first arg is a BigInteger coefficient
+      if let Expr::BigInteger(n) = &args[0] {
+        let (inner_c, inner_base) = decompose_term(&base_from(args));
+        let outer_c = Coeff::BigExact(n.clone(), BigInt::from(1));
+        return (outer_c.mul(&inner_c), inner_base);
+      }
+      // Check if first arg is a Real coefficient
+      if let Expr::Real(f) = &args[0] {
+        let (inner_c, inner_base) = decompose_term(&base_from(args));
+        let outer_c = Coeff::Real(*f);
+        return (outer_c.mul(&inner_c), inner_base);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      if let Some((n, d)) = expr_to_rational(left) {
+        let (inner_c, inner_base) = decompose_term(right);
+        let outer_c = Coeff::Exact(n, d);
+        return (outer_c.mul(&inner_c), inner_base);
+      }
+      if let Expr::BigInteger(n) = left.as_ref() {
+        let (inner_c, inner_base) = decompose_term(right);
+        let outer_c = Coeff::BigExact(n.clone(), BigInt::from(1));
+        return (outer_c.mul(&inner_c), inner_base);
+      }
+      if let Expr::Real(f) = left.as_ref() {
+        let (inner_c, inner_base) = decompose_term(right);
+        let outer_c = Coeff::Real(*f);
+        return (outer_c.mul(&inner_c), inner_base);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      // expr / integer → coefficient 1/d, recursively decompose expr
+      if let Some((n, d)) = expr_to_rational(right)
+        && n != 0
+      {
+        let (inner_c, inner_base) = decompose_term(left);
+        // Multiply inner coefficient by (d/n) since we're dividing by (n/d)
+        let divisor = Coeff::Exact(d, n);
+        return (inner_c.mul(&divisor), inner_base);
+      }
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let (c, base) = decompose_term(operand);
+      return (c.negate(), base);
+    }
+    _ => {}
+  }
+  (Coeff::Exact(1, 1), e.clone())
+}
+
+/// Collect like terms: group symbolic terms by their base expression
+/// and sum their coefficients. E.g. [E, E] → [2*E], [3*x, 2*x] → [5*x].
+fn collect_like_terms(terms: &[Expr]) -> Vec<Expr> {
+  use std::collections::BTreeMap;
+
+  // Group by string representation of base → sum of coefficients
+  // Also track the original expression and count for groups with a single term
+  let mut groups: Vec<(String, Expr, Coeff, Option<Expr>, usize)> = Vec::new();
+  let mut index: BTreeMap<String, usize> = BTreeMap::new();
+
+  for term in terms {
+    let (c, base) = decompose_term(term);
+    let key = expr_to_string(&base);
+    if let Some(&idx) = index.get(&key) {
+      let entry = &mut groups[idx];
+      entry.2 = entry.2.add(&c);
+      entry.3 = None; // Multiple terms combined, can't preserve original
+      entry.4 += 1;
+    } else {
+      index.insert(key.clone(), groups.len());
+      groups.push((key, base, c, Some(term.clone()), 1));
+    }
+  }
+
+  let mut result = Vec::new();
+  for (_, base, c, original, count) in groups {
+    if c.is_zero() {
+      // Preserve `Real(0.0) * I` as the imaginary marker of an inexact
+      // Complex form *only when it came from a single un-combined term*.
+      // Wolfram's `1. + 0. I` evaluates to `Complex[1., 0.]` displayed
+      // as `1. + 0.*I`; without keeping the `0.*I` here, the imaginary
+      // component would silently disappear after Plus flattening of the
+      // BinaryOp::Plus form produced by `times_ast` for `0. I`.
+      // Restrict to count == 1 so genuine cancellations (e.g. the
+      // `I + (-I)` that arises when Sum bounds drop their imaginary
+      // part) still collapse to 0 rather than leaving a stray `0.*I`.
+      if count == 1
+        && matches!(&c, Coeff::Real(_))
+        && matches!(&base, Expr::Identifier(s) if s == "I")
+      {
+        result.push(call("Times", vec![c.to_expr(), base]));
+      }
+      continue;
+    }
+    // If only one term contributed and wasn't combined, AND the coefficient is the same
+    // as what decompose_term extracted (meaning no simplification happened), preserve original form.
+    // This avoids changing e.g. BinaryOp::Divide(x, 2) to Times[Rational[1,2], x] which
+    // would affect sorting and display.
+    // But if coefficient is 1 and base differs from original (e.g. Times[1, I] → I),
+    // we should still simplify.
+    if count == 1
+      && !c.is_one()
+      && let Some(orig) = original
+    {
+      result.push(orig);
+      continue;
+    }
+    // `Coeff::Real(1.0)` is the inexact one — keep it as `1.*base` (just
+    // like `times_ast` preserves `1.*x` for the same precision-tracking
+    // reason). Without this, `0. + 1. I` would collapse to `I` instead
+    // of `Complex[0., 1.]` ≡ `0. + 1.*I`.
+    if matches!(&c, Coeff::Real(_)) && c.is_one() {
+      result.push(call("Times", vec![c.to_expr(), base]));
+      continue;
+    }
+    if c.is_one() {
+      result.push(base);
+    } else {
+      // Reconstruct as flat Times[coefficient, base_args...] to preserve formatting
+      let coeff = c.to_expr();
+      let mut times_args = vec![coeff];
+      // Flatten base if it's already a Times
+      match &base {
+        Expr::FunctionCall { name, args: bargs } if name == "Times" => {
+          times_args.extend(bargs.clone());
+        }
+        _ => {
+          times_args.push(base);
+        }
+      }
+      result.push(call("Times", times_args));
+    }
+  }
+  result
+}
+
+/// Extract the earliest (alphabetically first) variable name from an expression.
+/// True if `e` contains any transcendental-typed sub-expression (Sin, Cos,
+/// Log, Exp, …) anywhere — including inside Plus/Times/Power. Used as a
+/// guard in `compare_plus_terms` to detect hybrid terms whose
+/// `term_priority` would otherwise misclassify the whole product as
+/// algebraic when only one of its factors is a Plus of transcendentals.
+fn has_transcendental_subexpr(e: &Expr) -> bool {
+  if term_priority(e) >= 1 {
+    return true;
+  }
+  match e {
+    Expr::FunctionCall { args, .. } => {
+      args.iter().any(has_transcendental_subexpr)
+    }
+    Expr::List(items) => items.iter().any(has_transcendental_subexpr),
+    Expr::BinaryOp { left, right, .. } => {
+      has_transcendental_subexpr(left) || has_transcendental_subexpr(right)
+    }
+    Expr::UnaryOp { operand, .. } => has_transcendental_subexpr(operand),
+    _ => false,
+  }
+}
+
+fn extract_earliest_variable(e: &Expr) -> Option<String> {
+  match e {
+    Expr::Identifier(s)
+      if !matches!(
+        s.as_str(),
+        "Pi"
+          | "E"
+          | "I"
+          | "Infinity"
+          | "True"
+          | "False"
+          | "Null"
+          | "None"
+          | "All"
+          | "Automatic"
+          | "ComplexInfinity"
+          | "Indeterminate"
+          | "EulerGamma"
+          | "GoldenRatio"
+          | "Degree"
+          | "Catalan"
+      ) && s.chars().next().is_some_and(char::is_alphabetic) =>
+    {
+      Some(s.clone())
+    }
+    Expr::FunctionCall { args, .. } => {
+      args.iter().filter_map(extract_earliest_variable).min()
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      let l = extract_earliest_variable(left);
+      let r = extract_earliest_variable(right);
+      match (l, r) {
+        (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+      }
+    }
+    Expr::UnaryOp { operand, .. } => extract_earliest_variable(operand),
+    _ => None,
+  }
+}
+
+/// Count distinct free (symbolic) variables in an expression.
+fn count_free_variables(e: &Expr) -> usize {
+  collect_free_vars(e).len()
+}
+
+/// Collect the set of free symbolic variables in an expression. Excludes
+/// known math constants (`Pi`, `E`, etc.) and non-alphabetic identifiers.
+fn collect_free_vars(e: &Expr) -> std::collections::BTreeSet<String> {
+  fn collect(e: &Expr, vars: &mut std::collections::BTreeSet<String>) {
+    match e {
+      Expr::Identifier(s)
+        if !matches!(
+          s.as_str(),
+          "Pi"
+            | "E"
+            | "I"
+            | "Infinity"
+            | "True"
+            | "False"
+            | "Null"
+            | "None"
+            | "All"
+            | "Automatic"
+            | "ComplexInfinity"
+            | "Indeterminate"
+            | "EulerGamma"
+            | "GoldenRatio"
+            | "Degree"
+            | "Catalan"
+        ) && s.chars().next().is_some_and(char::is_alphabetic) =>
+      {
+        vars.insert(s.clone());
+      }
+      Expr::FunctionCall { args, .. } => {
+        for arg in args {
+          collect(arg, vars);
+        }
+      }
+      Expr::BinaryOp { left, right, .. } => {
+        collect(left, vars);
+        collect(right, vars);
+      }
+      Expr::UnaryOp { operand, .. } => collect(operand, vars),
+      _ => {}
+    }
+  }
+  let mut vars = std::collections::BTreeSet::new();
+  collect(e, &mut vars);
+  vars
+}
+
+/// Extract the latest (alphabetically greatest) free variable in an expression.
+fn extract_latest_variable(e: &Expr) -> Option<String> {
+  match e {
+    Expr::Identifier(s)
+      if !matches!(
+        s.as_str(),
+        "Pi"
+          | "E"
+          | "I"
+          | "Infinity"
+          | "True"
+          | "False"
+          | "Null"
+          | "None"
+          | "All"
+          | "Automatic"
+          | "ComplexInfinity"
+          | "Indeterminate"
+          | "EulerGamma"
+          | "GoldenRatio"
+          | "Degree"
+          | "Catalan"
+      ) && s.chars().next().is_some_and(char::is_alphabetic) =>
+    {
+      Some(s.clone())
+    }
+    Expr::FunctionCall { args, .. } => {
+      args.iter().filter_map(extract_latest_variable).max()
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      let l = extract_latest_variable(left);
+      let r = extract_latest_variable(right);
+      match (l, r) {
+        (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+      }
+    }
+    Expr::UnaryOp { operand, .. } => extract_latest_variable(operand),
+    _ => None,
+  }
+}
+
+/// Extract sort key for a Plus term (fallback for non-polynomial terms).
+/// Strip the numeric coefficient so that e.g. `3*Sin[x]` and `5*Cos[x]` sort by
+/// their base rather than by the coefficient digits.
+fn term_sort_key(e: &Expr) -> String {
+  let (_, base) = decompose_term(e);
+  let s = expr_to_string(&base);
+  s.strip_prefix('-').unwrap_or(&s).to_string()
+}
+
+/// Check if an expression is purely numeric (no symbolic variables).
+/// E.g. `5`, `Rational[1,2]`, `Power[5, Rational[-1, 2]]` are all numeric.
+fn is_numeric_factor(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_) | Expr::Real(_) => true,
+    Expr::FunctionCall { name, args } if name == "Rational" => {
+      args.iter().all(is_numeric_factor)
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      is_numeric_factor(&args[0]) && is_numeric_factor(&args[1])
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => is_numeric_factor(left) && is_numeric_factor(right),
+    _ => false,
+  }
+}
+
+/// Extract (variable_name, exponent) pairs from a polynomial-like expression base.
+/// Returns None if the expression is not a simple polynomial term.
+/// E.g. `x` → [(x, 1.0)], `x^2` → [(x, 2.0)], `a*b` → [(a, 1.0), (b, 1.0)]
+/// Numeric factors in Times (like `5^(-1/2)` in `x/Sqrt[5]`) are skipped.
+/// Whether a FunctionCall behaves like an indexed variable (x[1], f[2], ...)
+/// for Plus-ordering purposes: an unknown (non-builtin) head applied to
+/// atomic arguments. Builtin heads (Sin, Log, ...) keep their existing
+/// transcendental-priority ordering.
+fn is_indexed_variable(e: &Expr) -> bool {
+  if let Expr::FunctionCall { name, args } = e
+    && !args.is_empty()
+    && crate::evaluator::dispatch::arg_count::get_arg_count_range(name)
+      .is_none()
+    && !matches!(
+      name.as_str(),
+      "Times"
+        | "Plus"
+        | "Power"
+        | "Rational"
+        | "Complex"
+        | "List"
+        | "Sequence"
+        | "Slot"
+        | "Cycles"
+        | "Missing"
+        | "Span"
+        | "DirectedInfinity"
+        | "Overflow"
+        | "Underflow"
+    )
+  {
+    // Numeric/string arguments only (x[1], f[2], C[1]): symbol arguments
+    // like h[c] keep the pre-existing opaque ordering rules.
+    args
+      .iter()
+      .all(|a| matches!(a, Expr::Integer(_) | Expr::Real(_) | Expr::String(_)))
+  } else {
+    false
+  }
+}
+
+/// Plus-ordering key for an indexed variable: integer arguments are
+/// zero-padded so that plain lexicographic comparison sorts them
+/// numerically (x[2] < x[10]), matching Wolfram. Symbol names themselves
+/// stay plainly lexicographic (x10 < x2).
+fn indexed_var_key(e: &Expr) -> String {
+  if let Expr::FunctionCall { name, args } = e {
+    let parts: Vec<String> = args
+      .iter()
+      .map(|a| match a {
+        Expr::Integer(n) if *n >= 0 => format!("{n:020}"),
+        other => expr_to_string(other),
+      })
+      .collect();
+    format!("{}[{}]", name, parts.join(", "))
+  } else {
+    expr_to_string(e)
+  }
+}
+
+fn extract_var_exp_pairs(e: &Expr) -> Option<Vec<(String, f64)>> {
+  match e {
+    Expr::Identifier(s) => Some(vec![(s.clone(), 1.0)]),
+    // Indexed variables (x[1], f[2], ...) sort as polynomial variables
+    // keyed by their padded string form, matching wolframscript.
+    e if is_indexed_variable(e) => Some(vec![(indexed_var_key(e), 1.0)]),
+    // Named constants (Pi, E, EulerGamma, …) sort alphabetically among the
+    // ordinary (lowercase) variables, matching Wolfram: `a - Pi/6` but
+    // `Pi/8 - x`, `a + E` but `E + x`. The lowercase key gives the
+    // case-insensitive order under the byte-wise pair comparison.
+    Expr::Constant(c) => Some(vec![(c.to_lowercase(), 1.0)]),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      if let Expr::Identifier(s) = left.as_ref() {
+        // Symbolic exponent (e.g. `a^n`): sort as a polynomial in `a` with
+        // a sentinel exponent above any concrete one, so `a < a^2 < a^n`
+        // and the term sits next to other powers of `a`. Final disambiguation
+        // among differing symbolic exponents falls through to term_sort_key.
+        let exp = expr_to_f64(right).unwrap_or(f64::INFINITY);
+        return Some(vec![(s.clone(), exp)]);
+      }
+      if let Expr::Constant(c) = left.as_ref()
+        && let Some(exp) = expr_to_f64(right)
+      {
+        // Named numeric constants (Pi, E, …) raised to a *concrete*
+        // numeric exponent sort like polynomial variables so
+        // `Pi^2 + 3*Pi` lands as `3*Pi + Pi^2`, matching
+        // wolframscript. Symbolic exponents (e.g. `E^x`) fall
+        // through to the term-sort-key path so their existing
+        // ordering rules apply.
+        return Some(vec![(c.to_lowercase(), exp)]);
+      }
+      if is_indexed_variable(left) {
+        let exp = expr_to_f64(right).unwrap_or(f64::INFINITY);
+        return Some(vec![(indexed_var_key(left), exp)]);
+      }
+      None
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      if let Expr::Identifier(s) = &args[0] {
+        let exp = expr_to_f64(&args[1]).unwrap_or(f64::INFINITY);
+        return Some(vec![(s.clone(), exp)]);
+      }
+      if let Expr::Constant(c) = &args[0]
+        && let Some(exp) = expr_to_f64(&args[1])
+      {
+        return Some(vec![(c.to_lowercase(), exp)]);
+      }
+      if is_indexed_variable(&args[0]) {
+        let exp = expr_to_f64(&args[1]).unwrap_or(f64::INFINITY);
+        return Some(vec![(indexed_var_key(&args[0]), exp)]);
+      }
+      None
+    }
+    expr if is_sqrt(expr).is_some() => {
+      let sqrt_arg = is_sqrt(expr).unwrap();
+      if let Expr::Identifier(s) = sqrt_arg {
+        return Some(vec![(s.clone(), 0.5)]);
+      }
+      None
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      // left / right = left * right^(-1)
+      let mut pairs = Vec::new();
+      if !is_numeric_factor(left) {
+        pairs.extend(extract_var_exp_pairs(left)?);
+      }
+      if !is_numeric_factor(right) {
+        let mut right_pairs = extract_var_exp_pairs(right)?;
+        for pair in &mut right_pairs {
+          pair.1 = -pair.1;
+        }
+        pairs.extend(right_pairs);
+      }
+      Some(pairs)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let mut pairs = Vec::new();
+      if !is_numeric_factor(left) {
+        pairs.extend(extract_var_exp_pairs(left)?);
+      }
+      if !is_numeric_factor(right) {
+        pairs.extend(extract_var_exp_pairs(right)?);
+      }
+      Some(pairs)
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut pairs = Vec::new();
+      for arg in args {
+        if !is_numeric_factor(arg) {
+          pairs.extend(extract_var_exp_pairs(arg)?);
+        }
+      }
+      Some(pairs)
+    }
+    _ => None,
+  }
+}
+
+/// Convert an expression to an f64 if it represents a number.
+/// Returns true if `e` contains free variables (identifiers that are not
+/// well-known constants like I, Infinity).  Used to distinguish transcendental
+/// expressions-of-variables (e.g. Sin[2*x]) from pure numeric constants
+/// (e.g. Log[15], Sqrt[6]) when sorting Plus terms.
+fn has_free_variables(e: &Expr) -> bool {
+  match e {
+    Expr::Identifier(name) => {
+      // I and Infinity are well-known constants, not free variables
+      name != "I" && name != "Infinity"
+    }
+    Expr::Constant(_) => false,
+    Expr::Integer(_) | Expr::Real(_) => false,
+    Expr::FunctionCall { args, .. } => args.iter().any(has_free_variables),
+    Expr::BinaryOp { left, right, .. } => {
+      has_free_variables(left) || has_free_variables(right)
+    }
+    Expr::UnaryOp { operand, .. } => has_free_variables(operand),
+    _ => false,
+  }
+}
+
+/// Returns true if `e` contains a non-standard function call (not in the common
+/// algebraic/transcendental set) that has at least one non-numeric argument.
+/// This identifies expressions like `Dt[y, x]` or `Derivative[1][f][x]` that
+/// represent unevaluated derivatives or opaque functions with free variables.
+fn contains_opaque_fn_call(e: &Expr) -> bool {
+  match e {
+    Expr::FunctionCall { name, args } => {
+      let is_known = matches!(
+        name.as_str(),
+        "Times"
+          | "Plus"
+          | "Minus"
+          | "Power"
+          | "Rational"
+          | "Sqrt"
+          | "Abs"
+          | "Sin"
+          | "Cos"
+          | "Tan"
+          | "Cot"
+          | "Sec"
+          | "Csc"
+          | "Sinh"
+          | "Cosh"
+          | "Tanh"
+          | "Coth"
+          | "Sech"
+          | "Csch"
+          | "ArcSin"
+          | "ArcCos"
+          | "ArcTan"
+          | "ArcCot"
+          | "ArcSec"
+          | "ArcCsc"
+          | "ArcSinh"
+          | "ArcCosh"
+          | "ArcTanh"
+          | "ArcCoth"
+          | "ArcSech"
+          | "ArcCsch"
+          | "Exp"
+          | "Log"
+          | "Erf"
+          | "Erfc"
+          | "InverseErf"
+          | "Factorial"
+          | "Binomial"
+          | "Re"
+          | "Im"
+          | "Conjugate"
+          | "Floor"
+          | "Ceiling"
+          | "Round"
+          | "Sign"
+          | "Gamma"
+          | "Beta"
+      );
+      if !is_known && args.iter().any(|a| !is_numeric_factor(a)) {
+        return true;
+      }
+      args.iter().any(contains_opaque_fn_call)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      contains_opaque_fn_call(left) || contains_opaque_fn_call(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_opaque_fn_call(operand),
+    _ => false,
+  }
+}
+
+/// Returns true if `e` is a purely numeric/known-constant expression with
+/// no symbolic function calls. Unlike `has_free_variables`, this treats
+/// `f[0]` as non-numeric (it is a symbolic call even though its argument
+/// is numeric). Used for Plus term sorting to identify true constants like
+/// `512 * Rational[-1, 24]` or `(1 + Pi) / 2`.
+fn is_numeric_constant(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_) => true,
+    Expr::BigFloat(_, _) => true,
+    Expr::Constant(_) => true,
+    Expr::Identifier(name) => {
+      matches!(name.as_str(), "I" | "Infinity")
+    }
+    Expr::FunctionCall { name, args } => {
+      matches!(
+        name.as_str(),
+        "Rational"
+          | "Complex"
+          | "Times"
+          | "Plus"
+          | "Power"
+          | "Sqrt"
+          | "Log"
+          | "Exp"
+          | "DirectedInfinity"
+      ) && args.iter().all(is_numeric_constant)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      is_numeric_constant(left) && is_numeric_constant(right)
+    }
+    Expr::UnaryOp { operand, .. } => is_numeric_constant(operand),
+    _ => false,
+  }
+}
+
+/// If `base` (already coefficient-stripped) is a named symbolic constant
+/// (Pi, E, EulerGamma, Degree, …) or a power of one, return its name.
+/// Wolfram sorts such Plus terms alphabetically among the polynomial
+/// monomials (`a - Pi/6` but `Pi/8 - x`), not as leading numeric constants.
+/// The imaginary unit is excluded — complex terms keep their own ordering.
+fn constant_symbol_name(base: &Expr) -> Option<&str> {
+  match base {
+    Expr::Constant(name) if name != "I" => Some(name),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => constant_symbol_name(left),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      constant_symbol_name(&args[0])
+    }
+    _ => None,
+  }
+}
+
+/// True if `e`'s base (sign-stripped) is exactly `Underflow[]`, which
+/// Wolfram floats to the front of any Plus regardless of the other terms'
+/// shape (e.g. `1 - Underflow[]` prints as `Underflow[] + 1`).
+fn is_underflow_term(e: &Expr) -> bool {
+  let (_, base) = decompose_term(e);
+  matches!(&base, Expr::FunctionCall { name, args } if name == "Underflow" && args.is_empty())
+}
+
+/// Drop a pure-imaginary literal factor (`I` or `Complex[0, n]`) from a `Times`
+/// term, leaving the rest of the product. Returns `None` when the term carries
+/// no such factor, or when nothing but the imaginary literal is left (a bare
+/// imaginary number, which the numeric ordering rules already handle).
+fn strip_imaginary_literal_coeff(e: &Expr) -> Option<Expr> {
+  fn is_imaginary_literal(f: &Expr) -> bool {
+    match f {
+      Expr::Identifier(s) | Expr::Constant(s) => s == "I",
+      Expr::FunctionCall { name, args }
+        if name == "Complex" && args.len() == 2 =>
+      {
+        matches!(&args[0], Expr::Integer(0))
+          || matches!(&args[0], Expr::Real(v) if *v == 0.0)
+      }
+      _ => false,
+    }
+  }
+  let Expr::FunctionCall { name, args } = e else {
+    return None;
+  };
+  if name != "Times" {
+    return None;
+  }
+  let mut rest: Vec<Expr> = Vec::with_capacity(args.len());
+  let mut found = false;
+  for f in args {
+    if !found && is_imaginary_literal(f) {
+      found = true;
+    } else {
+      rest.push(f.clone());
+    }
+  }
+  if !found || rest.is_empty() {
+    return None;
+  }
+  Some(if rest.len() == 1 {
+    rest.into_iter().next().unwrap()
+  } else {
+    call("Times", rest)
+  })
+}
+
+/// Whether `e` is a sum, or a power of one (`1 + x`, `Sqrt[1 - x^(-2)]`).
+fn is_sum_based(e: &Expr) -> bool {
+  let is_plus = |x: &Expr| {
+    matches!(x, Expr::FunctionCall { name, .. } if name == "Plus")
+      || matches!(
+        x,
+        Expr::BinaryOp {
+          op: BinaryOperator::Plus | BinaryOperator::Minus,
+          ..
+        }
+      )
+  };
+  if is_plus(e) {
+    return true;
+  }
+  match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => is_plus(left),
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => {
+      is_plus(&args[0])
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      is_plus(&args[0])
+    }
+    _ => false,
+  }
+}
+
+/// Compare two Plus terms using Wolfram-compatible canonical ordering.
+/// For polynomial-like terms, sorts by (variable, exponent) pairs in reverse-lex order:
+/// each term's pairs are sorted by variable name descending, then compared
+/// lexicographically (variable ascending, exponent ascending, shorter first).
+fn compare_plus_terms(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  // Underflow[] always sorts to the front of a Plus, ahead of constants
+  // and every other term shape.
+  match (is_underflow_term(a), is_underflow_term(b)) {
+    (true, false) => return std::cmp::Ordering::Less,
+    (false, true) => return std::cmp::Ordering::Greater,
+    _ => {}
+  }
+
+  // Pure-imaginary symbolic Times terms sort to the END of a Plus when both
+  // terms have the same `term_priority` — Wolfram's
+  // `Cosh[y] Sin[x] + I Cos[x] Sinh[y]` displays the real product first, the
+  // imaginary product second. We restrict to "same priority" so that
+  // priority-driven cases like `Log[-2]` → `I*Pi + Log[2]` (priority 0 vs 1)
+  // keep their natural ordering — Log[2] (transcendental, priority 1) comes
+  // after the polynomial-priority `I*Pi` term.
+  fn is_i_factor(f: &Expr) -> bool {
+    if matches!(f, Expr::Identifier(s) if s == "I") {
+      return true;
+    }
+    if let Expr::FunctionCall { name, args } = f
+      && name == "Complex"
+      && args.len() == 2
+    {
+      let re_zero = matches!(&args[0], Expr::Integer(0))
+        || matches!(&args[0], Expr::Real(v) if *v == 0.0);
+      return re_zero;
+    }
+    false
+  }
+  fn has_complex_i_factor(e: &Expr) -> bool {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        args.iter().any(is_i_factor)
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        is_i_factor(left)
+          || is_i_factor(right)
+          || has_complex_i_factor(left)
+          || has_complex_i_factor(right)
+      }
+      _ => false,
+    }
+  }
+  // A pure-imaginary literal (`I`, `2 I`, `Complex[0, n]`) is as much a
+  // coefficient as a real one, and Wolfram orders a Plus by the terms with
+  // their coefficients stripped: `x + 2 Pi I` prints as `(2*I)*Pi + x`, and
+  // `y + I x` as `I*x + y`. Compare the stripped terms first; the
+  // "imaginary product sorts last" rule below only decides the leftovers.
+  let stripped_a = strip_imaginary_literal_coeff(a);
+  let stripped_b = strip_imaginary_literal_coeff(b);
+  if stripped_a.is_some() || stripped_b.is_some() {
+    let sa = stripped_a.as_ref().unwrap_or(a);
+    let sb = stripped_b.as_ref().unwrap_or(b);
+    // Terms built on a sum (`Sqrt[1 - x^(-2)]`) are left to the rule below:
+    // Woxi's ordering of a reciprocal monomial against a power of a sum does
+    // not yet match Wolfram, and the stripped comparison would surface that.
+    if !is_sum_based(sa) && !is_sum_based(sb) {
+      let cmp = compare_plus_terms(sa, sb);
+      if cmp != std::cmp::Ordering::Equal {
+        return cmp;
+      }
+    }
+  }
+
+  if term_priority(a) == term_priority(b) {
+    match (has_complex_i_factor(a), has_complex_i_factor(b)) {
+      (true, false) => return std::cmp::Ordering::Greater,
+      (false, true) => return std::cmp::Ordering::Less,
+      _ => {}
+    }
+  }
+
+  let pa = term_priority(a);
+  let pb = term_priority(b);
+  // Two call-led terms order by head name whatever their priority class,
+  // then from their last factor: `Log[c] + Subst[a, b]`, `f[c] + Gamma[y]`,
+  // `Log[c] + x*Zeta[y]`, `Cos[b]*Sin[a] + Sin[a]^2`.
+  if let Some(ord) = call_led_order(a, b) {
+    return ord;
+  }
+  {
+    // A term built only from numbers, symbols, sums, products and powers
+    // sorts before a call-led term: `E^y + f[c]`,
+    // `E^(-t) + Derivative[1][f][t]`, `(x*Sqrt[1 + x^2])/2 + ArcSinh[x]/2`.
+    // (A sum that hides calls, `d^e*(Log[b] + Log[c])`, is not algebraic
+    // and keeps the leading-variable rule below.)
+    let (_, base_a) = decompose_term(a);
+    let (_, base_b) = decompose_term(b);
+    match (
+      is_purely_algebraic(&base_a) && plus_term_call_head(&base_b).is_some(),
+      is_purely_algebraic(&base_b) && plus_term_call_head(&base_a).is_some(),
+    ) {
+      (true, false) => return std::cmp::Ordering::Less,
+      (false, true) => return std::cmp::Ordering::Greater,
+      _ => {}
+    }
+  }
+  if pa != pb {
+    // Different priorities normally means transcendental terms (priority 1)
+    // sort after polynomial-like ones (priority 0). However, when one term
+    // is a Times product whose `Plus` factor hides transcendental sub-
+    // expressions (e.g. `d^e*(Log[b] + Log[c])`), our `term_priority`
+    // returns 0 for that whole product even though it's logically a
+    // transcendental term. wolframscript orders such hybrid terms by
+    // leading variable rather than priority class — `Log[a] +
+    // d^e*(Log[b]+Log[c]) + Log[f]` keeps `Log[a]` first because `a < b`.
+    // Detect this hybrid by checking whether the lower-priority term has
+    // a transcendental sub-expression and, if so, defer to leading-variable
+    // ordering before falling back to the priority gap.
+    let lower = if pa < pb { a } else { b };
+    if has_transcendental_subexpr(lower) {
+      let av = extract_earliest_variable(a);
+      let bv = extract_earliest_variable(b);
+      if let (Some(av), Some(bv)) = (av, bv) {
+        let cmp = av.cmp(&bv);
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+      }
+    }
+    return pa.cmp(&pb);
+  }
+
+  // A reciprocal-of-a-sum term orders against other univariate terms in
+  // the same variable by base polynomial (see the helper).
+  if let Some(ord) = sum_recip_vs_univar_order(a, b) {
+    return ord;
+  }
+
+  // Two rational terms over reciprocal-sum denominators (the quotient-rule
+  // shape C/Q + A*B/Q^2) compare by exponent vectors (see the helper).
+  if let Some(ord) = quotient_sum_terms_vector_order(a, b) {
+    return ord;
+  }
+
+  let (_, base_a) = decompose_term(a);
+  let (_, base_b) = decompose_term(b);
+
+  let pairs_a = extract_var_exp_pairs(&base_a);
+  let pairs_b = extract_var_exp_pairs(&base_b);
+  // Indexed-variable-only pair sets (f[0], C[1], x[1]^2*x[2]^2 — recognized
+  // by the zero-padded key) participate in polynomial ordering only when
+  // BOTH terms have pairs; against pair-less terms they keep the
+  // pre-existing opaque ordering rules (wolframscript puts e.g.
+  // GeneratingFunction[f[n], n, x] before -f[0]).
+  let only_indexed = |ps: &Option<Vec<(String, f64)>>| {
+    ps.as_ref().is_some_and(|v| {
+      !v.is_empty() && v.iter().all(|p| p.0.contains("[0000000000"))
+    })
+  };
+  let (pairs_a, pairs_b) = if pairs_a.is_some() == pairs_b.is_some() {
+    (pairs_a, pairs_b)
+  } else if only_indexed(&pairs_a) {
+    (None, pairs_b)
+  } else if only_indexed(&pairs_b) {
+    (pairs_a, None)
+  } else {
+    (pairs_a, pairs_b)
+  };
+  let a_has_pairs = pairs_a.is_some();
+  let b_has_pairs = pairs_b.is_some();
+
+  if let (Some(mut va), Some(mut vb)) = (pairs_a, pairs_b) {
+    // A term built from "real" variables (bare symbols and their powers)
+    // always sorts before an all-indexed term (`C[1]`, `x[3]`), regardless
+    // of head name: wolframscript gives `x + C[1]`, `x^2 + C[1]`,
+    // `y + x[3]`, `x + x[2]`, `z + a[1]`. Indexed-vs-indexed and
+    // real-vs-real fall through to the usual pair comparison.
+    let all_indexed =
+      |v: &[(String, f64)]| v.iter().all(|p| p.0.contains("[0000000000"));
+    match (all_indexed(&va), all_indexed(&vb)) {
+      (true, false) => return std::cmp::Ordering::Greater,
+      (false, true) => return std::cmp::Ordering::Less,
+      _ => {}
+    }
+    // Sort each term's pairs by variable name descending
+    va.sort_by(|x, y| y.0.cmp(&x.0));
+    vb.sort_by(|x, y| y.0.cmp(&x.0));
+    // Compare pair-by-pair: variable ascending, then exponent ascending
+    for (ap, bp) in va.iter().zip(vb.iter()) {
+      let cmp = ap.0.cmp(&bp.0);
+      if cmp != std::cmp::Ordering::Equal {
+        return cmp;
+      }
+      let cmp = ap.1.partial_cmp(&bp.1).unwrap_or(std::cmp::Ordering::Equal);
+      if cmp != std::cmp::Ordering::Equal {
+        return cmp;
+      }
+    }
+    // If all compared pairs equal, shorter comes first
+    let cmp = va.len().cmp(&vb.len());
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    // Tiebreaker: positive coefficients before negative
+    let (coeff_a, _) = decompose_term(a);
+    let (coeff_b, _) = decompose_term(b);
+    coeff_a.is_negative().cmp(&coeff_b.is_negative())
+  } else {
+    // If exactly one term has polynomial pairs and the other doesn't,
+    // sort the polynomial term first when the non-polynomial term is a
+    // transcendental function (priority 1), e.g.
+    // Sin[2*x] (sort after x/2), Times[-1, Sin[x]/4], or
+    // numeric transcendental constants like Log[15], Sqrt[6].
+    // For compound algebraic terms like 4*(3+2*x) vs 8*x, compare by
+    // earliest variable: same variable → monomial first.
+    if a_has_pairs != b_has_pairs {
+      let pair_term = if a_has_pairs { a } else { b };
+      let none_term = if b_has_pairs { a } else { b };
+      let (_, none_base) = decompose_term(none_term);
+      // Symbolic powers of numeric bases ((-1)^n, 2^b) sort before any
+      // polynomial-like term — wolframscript: (-1)^n + C[1], 2^b + x[3].
+      if is_numeric_base_symbolic_power(&none_base) {
+        return if a_has_pairs {
+          std::cmp::Ordering::Greater
+        } else {
+          std::cmp::Ordering::Less
+        };
+      }
+      if contains_opaque_fn_call(none_term)
+        || term_priority(&none_base) >= 1
+        || plus_term_call_head(&none_base).is_some()
+      {
+        return if a_has_pairs {
+          std::cmp::Ordering::Less
+        } else {
+          std::cmp::Ordering::Greater
+        };
+      }
+      // A named-constant monomial (Pi, E, EulerGamma, or a power of one)
+      // sorts ALPHABETICALLY among the polynomial monomials, matching
+      // Wolfram: `a - Pi/6` but `Pi/8 - x`, `a + E` but `E + x`.
+      if let Some(cname) = constant_symbol_name(&none_base) {
+        let (_, pair_base) = decompose_term(pair_term);
+        if let Some(pv) = extract_earliest_variable(&pair_base) {
+          let ord = crate::functions::list_helpers_ast::wolfram_string_order(
+            cname, &pv,
+          );
+          if ord != 0 {
+            let const_first = ord > 0;
+            return if const_first == a_has_pairs {
+              std::cmp::Ordering::Greater
+            } else {
+              std::cmp::Ordering::Less
+            };
+          }
+        }
+      }
+      // Purely numeric constant non-pair term sorts before pair terms
+      // (e.g. (1+Pi)/2 comes before x, matching Wolfram).
+      // Uses is_numeric_constant (not just !has_free_variables) so that
+      // symbolic function calls like f[0] are not treated as constants.
+      if is_numeric_constant(&none_base) {
+        return if a_has_pairs {
+          std::cmp::Ordering::Greater
+        } else {
+          std::cmp::Ordering::Less
+        };
+      }
+      // When the non-pair term's base is a Plus (e.g. `c*(5+a+b)` after
+      // stripping the numeric coefficient) AND the two terms have
+      // different free-variable sets, defer to canonical Order. This
+      // matches Wolfram's `Times[2, Plus[…]]` vs `Times[a, q]` →
+      // `Plus[…]` first (its sorted args put `2` before `a`).
+      // We restrict the check to differing variable sets so cases like
+      // `8*x + 4*(3+2*x)` (same variables) still hit the monomial-first
+      // rule below — that ordering matches Wolfram for shared-variable
+      // pairs.
+      let none_base_is_plus = matches!(&none_base,
+        Expr::FunctionCall { name, .. } if name == "Plus")
+        || matches!(
+          &none_base,
+          Expr::BinaryOp {
+            op: BinaryOperator::Plus | BinaryOperator::Minus,
+            ..
+          }
+        );
+      if none_base_is_plus {
+        let (_, pair_base) = decompose_term(pair_term);
+        let pair_vars = collect_free_vars(&pair_base);
+        let none_vars = collect_free_vars(&none_base);
+        if pair_vars != none_vars {
+          let cmp = crate::functions::list_helpers_ast::compare_exprs(
+            pair_term, none_term,
+          );
+          if cmp != 0 {
+            return if cmp > 0 {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+        }
+      }
+      // For compound algebraic terms with free variables, compare by
+      // latest variable relative to the monomial's variable:
+      //   latest > monomial → monomial first (e.g. b + Sqrt[a*c])
+      //   latest < monomial → compound first (e.g. Sqrt[a] + b)
+      //   latest == monomial → monomial first if compound has extra
+      //     variables (e.g. b + Sqrt[a+b]), compound first otherwise
+      //     (e.g. Sqrt[x] + x)
+      if has_free_variables(&none_base) {
+        let (_, pair_base) = decompose_term(pair_term);
+        let pair_earliest = extract_earliest_variable(&pair_base);
+        let none_latest = extract_latest_variable(&none_base);
+        if let (Some(pv), Some(nlv)) = (&pair_earliest, &none_latest) {
+          if nlv > pv {
+            // Non-pair has a later variable → monomial first
+            return if a_has_pairs {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+          if nlv == pv && count_free_variables(&none_base) > 1 {
+            // Same latest variable but compound has extra vars → monomial first
+            return if a_has_pairs {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+        }
+        let none_earliest = extract_earliest_variable(&none_base);
+        if let (Some(pv), Some(nv)) = (&pair_earliest, &none_earliest)
+          && nv < pv
+        {
+          // All non-pair variables < monomial's → non-pair first
+          return if a_has_pairs {
+            std::cmp::Ordering::Greater
+          } else {
+            std::cmp::Ordering::Less
+          };
+        }
+      }
+      // Fall back: pair term sorts first (before the non-pair term).
+      // This is consistent with the "no free vars → non-pair first"
+      // early return above: constants are the only terms that sort
+      // before polynomials; all other non-pair terms sort after.
+      // Using a simple consistent rule here prevents transitivity
+      // violations that occur when canonical comparison disagrees
+      // with the early returns above.
+      return if a_has_pairs {
+        std::cmp::Ordering::Less
+      } else {
+        std::cmp::Ordering::Greater
+      };
+    }
+    // When both terms lack polynomial pairs, sort purely numeric
+    // constants before non-constant terms. This mirrors the
+    // asymmetric block's "numeric constant → non-pair first" rule
+    // and prevents transitivity cycles: without it, a constant C,
+    // a polynomial P, and a non-pair term T with free vars can form
+    // C < P (asymmetric), T > P (asymmetric fallback), C > T
+    // (canonical), violating C < P < T ↔ C < T.
+    if !a_has_pairs && !b_has_pairs && pa == 0 {
+      let a_const = is_numeric_constant(&base_a);
+      let b_const = is_numeric_constant(&base_b);
+      // Named-constant monomials (Pi, E, …) sort alphabetically against
+      // free-variable terms instead of leading unconditionally.
+      if a_const != b_const {
+        let (cbase, obase, a_is_const) = if a_const {
+          (&base_a, &base_b, true)
+        } else {
+          (&base_b, &base_a, false)
+        };
+        if let Some(cname) = constant_symbol_name(cbase)
+          && let Some(ov) = extract_earliest_variable(obase)
+        {
+          let ord = crate::functions::list_helpers_ast::wolfram_string_order(
+            cname, &ov,
+          );
+          if ord != 0 {
+            let const_first = ord > 0;
+            return if const_first == a_is_const {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+        }
+      }
+      if a_const && !b_const {
+        return std::cmp::Ordering::Less;
+      }
+      if b_const && !a_const {
+        return std::cmp::Ordering::Greater;
+      }
+    }
+    // When both terms lack polynomial pairs, are algebraic (priority 0),
+    // and have free variables, compare by earliest variable name
+    // (Wolfram sorts by leading variable). Skip for transcendental
+    // functions where function-name ordering takes priority.
+    // Also skip when both bases are function calls with the same name
+    // (e.g. f[x] vs f[h+x]) — structural comparison is more accurate there.
+    let same_fn_head = matches!(
+      (&base_a, &base_b),
+      (Expr::FunctionCall { name: na, .. }, Expr::FunctionCall { name: nb, .. }) if na == nb
+    );
+    if !a_has_pairs && !b_has_pairs && pa == 0 && pb == 0 && !same_fn_head {
+      let a_var = extract_earliest_variable(&base_a);
+      let b_var = extract_earliest_variable(&base_b);
+      if let (Some(av), Some(bv)) = (&a_var, &b_var) {
+        let cmp = av.cmp(bv);
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+      }
+    }
+    // When both terms are transcendental (priority >= 1) and lack polynomial pairs,
+    // compare by primary function name. With matching primary names,
+    // sort by:
+    // (a) number of distinct transcendental factors (ascending — `Cos[x]^2`
+    //     before `Cos[x]*Sin[x]`),
+    // (b) exponent of the primary function (ascending — `2*a*Sin[x]`
+    //     before `Sin[x]^2`),
+    // (c) polynomial degree among the non-transcendental factors.
+    if !a_has_pairs && !b_has_pairs && pa >= 1 && pb >= 1 {
+      let fn_a = extract_primary_fn_name(&base_a);
+      let fn_b = extract_primary_fn_name(&base_b);
+      if let (Some(ref na), Some(ref nb)) = (fn_a, fn_b) {
+        let cmp = match crate::functions::list_helpers_ast::wolfram_string_order(
+          na, nb,
+        ) {
+          0 => std::cmp::Ordering::Equal,
+          ord if ord > 0 => std::cmp::Ordering::Less,
+          _ => std::cmp::Ordering::Greater,
+        };
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+        // Tie-break by number of distinct trig factors (fewer first).
+        let trig_a = count_distinct_trig_factors(&base_a);
+        let trig_b = count_distinct_trig_factors(&base_b);
+        let cmp = trig_a.cmp(&trig_b);
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+        // Same trig-factor count: compare exponents reverse-lex over trig
+        // function names (Wolfram treats trig functions like polynomial
+        // variables). Use the alphabetically-last trig present, ascending.
+        // Examples:
+        //   `a*Sin[x]` (Sin^1) before `Sin[x]^2` (Sin^2) — same single trig.
+        //   `Cos[x]^3*Sin[x]` (Sin^1) before `Cos[x]*Sin[x]^3` (Sin^3) —
+        //   sorted by Sin exponent ascending despite higher Cos exponent.
+        let last_trig = {
+          let mut names: Vec<String> = extract_trig_factors(&base_a)
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .chain(extract_trig_factors(&base_b).into_iter().map(|(n, _, _)| n))
+            .collect();
+          names.sort();
+          names.dedup();
+          names.last().cloned()
+        };
+        if let Some(last) = last_trig {
+          let exp_la = extract_primary_fn_exponent(&base_a, &last);
+          let exp_lb = extract_primary_fn_exponent(&base_b, &last);
+          let cmp = exp_la
+            .partial_cmp(&exp_lb)
+            .unwrap_or(std::cmp::Ordering::Equal);
+          if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+          }
+        }
+        // Fallback: primary-fn exponent ascending.
+        let exp_a = extract_primary_fn_exponent(&base_a, na);
+        let exp_b = extract_primary_fn_exponent(&base_b, na);
+        let cmp = exp_a
+          .partial_cmp(&exp_b)
+          .unwrap_or(std::cmp::Ordering::Equal);
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+        // Same function: compare by polynomial degree (lower degree first)
+        let deg_a = extract_poly_degree_in_product(&base_a);
+        let deg_b = extract_poly_degree_in_product(&base_b);
+        let cmp = deg_a
+          .partial_cmp(&deg_b)
+          .unwrap_or(std::cmp::Ordering::Equal);
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+        // For products of transcendental functions (e.g. Cos[b]*Sin[a] vs
+        // Cos[a]*Sin[b]), Wolfram sorts by the highest-alphabetical trig factor
+        // first, then by argument, then by exponent.
+        let cmp = compare_trig_products(&base_a, &base_b);
+        if cmp != std::cmp::Ordering::Equal {
+          return cmp;
+        }
+      }
+    }
+    // For Times terms with complex-number-literal coefficients (e.g. (1+I)*f[x]),
+    // compare by the non-coefficient part first, matching Wolfram's behavior.
+    if let (Some(stripped_a), Some(stripped_b)) = (
+      strip_complex_literal_coeff(&base_a),
+      strip_complex_literal_coeff(&base_b),
+    ) {
+      let cmp = compare_expr_canonical(&stripped_a, &stripped_b);
+      if cmp != std::cmp::Ordering::Equal {
+        return cmp;
+      }
+    }
+    // When one term is a Times-product containing a `FunctionCall[..]`
+    // factor whose head matches the other term's `FunctionCall` head,
+    // compare via that shared FunctionCall factor instead of falling
+    // back to type-tag comparison. Matches Wolfram's `C[1] + a*C[2]`
+    // ordering (C[1] first, since C[1] < C[2]).
+    let cmp = compare_via_shared_fn_call_factor(&base_a, &base_b);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    // Fall back: try structural comparison of function call arguments,
+    // then string comparison for non-polynomial terms.
+    // This ensures e.g. Log[1 - x] sorts before Log[1 + x] to match Wolfram.
+    let cmp = compare_expr_canonical(&base_a, &base_b);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    let sa = term_sort_key(a);
+    let sb = term_sort_key(b);
+    let cmp = sa.cmp(&sb);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    // Tiebreaker: positive coefficients before negative
+    let (coeff_a, _) = decompose_term(a);
+    let (coeff_b, _) = decompose_term(b);
+    coeff_a.is_negative().cmp(&coeff_b.is_negative())
+  }
+}
+
+/// Collect each FunctionCall factor of a Times product (or the expression
+/// itself if it isn't a Times). Used by [`compare_via_shared_fn_call_factor`]
+/// so that `(-1)^n*C[2]` exposes its `C[2]` factor for matching against a
+/// peer `C[1]` term in canonical Plus ordering.
+fn collect_fn_call_factors(e: &Expr) -> Vec<&Expr> {
+  let mut out = Vec::new();
+  fn walk<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for arg in args {
+          walk(arg, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        walk(left, out);
+        walk(right, out);
+      }
+      Expr::FunctionCall { .. } => out.push(e),
+      _ => {}
+    }
+  }
+  walk(e, &mut out);
+  out
+}
+
+/// When one Plus term is a Times-product containing a `FunctionCall[..]`
+/// factor whose head matches the other Plus term's `FunctionCall` head,
+/// compare them via that shared factor. Returns `Equal` if the rule
+/// doesn't apply.
+///
+/// E.g. comparing `a*C[2]` vs `C[1]`: the Times product carries `C[2]`,
+/// and the bare term is `C[1]` — both share head `"C"`, so we recurse on
+/// `C[2]` vs `C[1]` (yielding `Greater`, i.e. `C[1]` sorts first).
+fn compare_via_shared_fn_call_factor(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  fn try_match<'a>(
+    times_term: &'a Expr,
+    bare_call: &'a Expr,
+  ) -> Option<&'a Expr> {
+    let Expr::FunctionCall {
+      name: bare_name, ..
+    } = bare_call
+    else {
+      return None;
+    };
+    let factors = collect_fn_call_factors(times_term);
+    factors.into_iter().find(
+      |f| matches!(f, Expr::FunctionCall { name, .. } if name == bare_name),
+    )
+  }
+  if let Some(matching) = try_match(a, b) {
+    let cmp = compare_expr_canonical(matching, b);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    // The matching factor inside `a` equals the bare term `b`, meaning
+    // `a` is `b` decorated with extra factors. Wolfram sorts the bare
+    // term first: `C[1] + (-1)^n*C[1]` (not the reverse).
+    return std::cmp::Ordering::Greater;
+  }
+  if let Some(matching) = try_match(b, a) {
+    let cmp = compare_expr_canonical(a, matching);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    return std::cmp::Ordering::Less;
+  }
+  std::cmp::Ordering::Equal
+}
+
+/// Strip a leading complex-number-literal factor from a Times expression.
+/// E.g. Times[(1+I), Sqrt[Pi/2], DiracDelta[w]] → Times[Sqrt[Pi/2], DiracDelta[w]]
+/// Returns None if no complex literal is found.
+fn strip_complex_literal_coeff(e: &Expr) -> Option<Expr> {
+  fn is_complex_literal(e: &Expr) -> bool {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Plus" => {
+        args.iter().all(|a| match a {
+          Expr::Integer(_) | Expr::Real(_) => true,
+          Expr::Constant(s) if s == "I" => true,
+          Expr::FunctionCall { name: tn, args: ta } if tn == "Times" => {
+            ta.iter().all(|t| {
+              matches!(t, Expr::Integer(_) | Expr::Real(_))
+                || matches!(t, Expr::Constant(s) if s == "I")
+            })
+          }
+          _ => false,
+        })
+      }
+      _ => false,
+    }
+  }
+
+  if let Expr::FunctionCall { name, args } = e
+    && name == "Times"
+    && args.len() >= 2
+    && is_complex_literal(&args[0])
+  {
+    let rest = &args[1..];
+    return Some(if rest.len() == 1 {
+      rest[0].clone()
+    } else {
+      call("Times", rest.to_vec())
+    });
+  }
+  None
+}
+
+/// Heads that make an expression arithmetic rather than a "function call"
+/// for Plus ordering purposes.
+fn is_arithmetic_head(name: &str) -> bool {
+  matches!(
+    name,
+    "Plus"
+      | "Times"
+      | "Power"
+      | "Sqrt"
+      | "Rational"
+      | "Complex"
+      | "Minus"
+      | "Subtract"
+      | "Divide"
+      | "Pattern"
+      | "Blank"
+      | "BlankSequence"
+      | "BlankNullSequence"
+      | "Optional"
+      | "PatternTest"
+      | "Condition"
+      | "Alternatives"
+      | "HoldPattern"
+      | "List"
+      | "Slot"
+      | "Sequence"
+      | "Underflow"
+      | "Overflow"
+      | "DirectedInfinity"
+      | "Interval"
+  )
+}
+
+/// Head key of a curried call (`Derivative[1][f][x]`) for Plus ordering:
+/// Wolfram sorts them after every symbol-headed call, so the key collates
+/// after any symbol name.
+const CURRIED_HEAD_KEY: &str = "\u{10FFFF}";
+
+/// Wolfram's symbol order on two Plus-term head keys, with curried heads
+/// last.
+fn call_head_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+  match (a == CURRIED_HEAD_KEY, b == CURRIED_HEAD_KEY) {
+    (true, true) => std::cmp::Ordering::Equal,
+    (true, false) => std::cmp::Ordering::Greater,
+    (false, true) => std::cmp::Ordering::Less,
+    (false, false) => {
+      match crate::functions::list_helpers_ast::wolfram_string_order(a, b) {
+        0 => std::cmp::Ordering::Equal,
+        ord if ord > 0 => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Greater,
+      }
+    }
+  }
+}
+
+/// Numbers, symbols and constants combined only by sums, products and
+/// powers — no function call anywhere inside.
+fn is_purely_algebraic(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_)
+    | Expr::BigInteger(_)
+    | Expr::Real(_)
+    | Expr::BigFloat(..)
+    | Expr::Identifier(_)
+    | Expr::Constant(_) => true,
+    Expr::FunctionCall { name, args } => {
+      matches!(
+        name.as_str(),
+        "Plus" | "Times" | "Power" | "Sqrt" | "Rational" | "Complex"
+      ) && args.iter().all(is_purely_algebraic)
+    }
+    Expr::BinaryOp { op, left, right } => {
+      matches!(
+        op,
+        BinaryOperator::Plus
+          | BinaryOperator::Minus
+          | BinaryOperator::Times
+          | BinaryOperator::Divide
+          | BinaryOperator::Power
+      ) && is_purely_algebraic(left)
+        && is_purely_algebraic(right)
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => is_purely_algebraic(operand),
+    _ => false,
+  }
+}
+
+/// `E^x`, `2^n`, `(-1)^k`: a numeric base with a symbolic exponent. Sorts
+/// before polynomial terms and before calls (`E^x + f[x]`, `2^b + x[3]`).
+fn is_numeric_base_symbolic_power(e: &Expr) -> bool {
+  let (base, exp): (&Expr, &Expr) = match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => (left, right),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (&args[0], &args[1])
+    }
+    _ => return false,
+  };
+  (expr_to_f64(base).is_some() || matches!(base, Expr::Constant(_)))
+    && expr_to_f64(exp).is_none()
+}
+
+/// A product's factors, with `a/b` read as `a*b^-1`; a non-product is its
+/// own single factor.
+fn plus_term_factors(e: &Expr) -> Vec<Expr> {
+  fn go(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for a in args {
+          go(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        go(left, out);
+        go(right, out);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left,
+        right,
+      } => {
+        go(left, out);
+        out.push(pow(right.as_ref().clone(), Expr::Integer(-1)));
+      }
+      other => out.push(other.clone()),
+    }
+  }
+  let mut out = Vec::new();
+  go(e, &mut out);
+  out
+}
+
+/// A call (or curried call) that is not an arithmetic form.
+fn is_bare_call(e: &Expr) -> bool {
+  matches!(e, Expr::CurriedCall { .. })
+    || matches!(e, Expr::FunctionCall { name, .. } if !is_arithmetic_head(name))
+}
+
+/// An evaluated `Derivative[1][f][x]` is stored flat as
+/// `Derivative[1, f, x]`; it orders like the curried call it prints as.
+fn is_curried_derivative(e: &Expr) -> bool {
+  matches!(e, Expr::CurriedCall { .. })
+    || matches!(e, Expr::FunctionCall { name, args } if name == "Derivative" && args.len() >= 2)
+}
+
+/// Split a factor into its call and exponent: `Sin[x]` → (`Sin[x]`, 1),
+/// `Sin[x]^n` → (`Sin[x]`, `n`); `None` for factors that are not calls.
+fn call_factor_parts(f: &Expr) -> Option<(Expr, Expr)> {
+  match f {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => is_bare_call(left)
+      .then(|| (left.as_ref().clone(), right.as_ref().clone())),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      is_bare_call(&args[0]).then(|| (args[0].clone(), args[1].clone()))
+    }
+    Expr::FunctionCall { name, .. } if !is_arithmetic_head(name) => {
+      Some((f.clone(), Expr::Integer(1)))
+    }
+    Expr::CurriedCall { .. } => Some((f.clone(), Expr::Integer(1))),
+    _ => None,
+  }
+}
+
+/// Coarse class of an expression in Wolfram's canonical order: numbers,
+/// then strings, then symbols, then everything else.
+fn wl_order_rank(e: &Expr) -> u8 {
+  match e {
+    Expr::Integer(_)
+    | Expr::BigInteger(_)
+    | Expr::Real(_)
+    | Expr::BigFloat(..) => 0,
+    Expr::FunctionCall { name, args }
+      if (name == "Rational" || name == "Complex") && args.len() == 2 =>
+    {
+      0
+    }
+    Expr::String(_) => 1,
+    Expr::Identifier(_) | Expr::Constant(_) => 2,
+    _ => 3,
+  }
+}
+
+/// Sums, products, powers and their atoms: the expressions Wolfram
+/// compares as polynomials.
+fn wl_poly_like(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_)
+    | Expr::BigInteger(_)
+    | Expr::Real(_)
+    | Expr::BigFloat(..)
+    | Expr::Identifier(_)
+    | Expr::Constant(_) => true,
+    Expr::FunctionCall { name, args } => {
+      matches!(name.as_str(), "Plus" | "Times" | "Power")
+        || ((name == "Rational" || name == "Complex") && args.len() == 2)
+    }
+    Expr::BinaryOp { op, .. } => matches!(
+      op,
+      BinaryOperator::Plus
+        | BinaryOperator::Minus
+        | BinaryOperator::Times
+        | BinaryOperator::Divide
+        | BinaryOperator::Power
+    ),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      ..
+    } => true,
+    _ => false,
+  }
+}
+
+/// The summands of a sum (a non-sum is its own single summand).
+fn wl_summands(e: &Expr) -> Vec<Expr> {
+  fn go(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Plus" => {
+        for a in args {
+          go(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => {
+        go(left, out);
+        go(right, out);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        left,
+        right,
+      } => {
+        go(left, out);
+        out.push(times2(Expr::Integer(-1), right.as_ref().clone()));
+      }
+      other => out.push(other.clone()),
+    }
+  }
+  let mut out = Vec::new();
+  go(e, &mut out);
+  out
+}
+
+/// A product's numeric coefficient (as a machine number, for ordering
+/// only) and its remaining non-numeric factors in canonical order; a bare
+/// number has no factors at all. The factors are re-sorted here rather than
+/// taken as stored, so "the last factor" means the same thing on both sides
+/// of a comparison even where Woxi's own `Times` order strays from Wolfram's.
+fn wl_coeff_and_factors(e: &Expr) -> (f64, Vec<Expr>) {
+  let (coeff, base) = decompose_term(e);
+  let mut c = coeff.to_f64();
+  let mut factors = Vec::new();
+  for f in plus_term_factors(&base) {
+    match expr_to_f64(&f) {
+      Some(v) => c *= v,
+      None => factors.push(f),
+    }
+  }
+  factors.sort_by(wl_arg_order);
+  (c, factors)
+}
+
+/// Base and exponent of a factor (`x` → (`x`, 1)).
+fn wl_base_exp(f: &Expr) -> (Expr, Expr) {
+  match f {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => (left.as_ref().clone(), right.as_ref().clone()),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (args[0].clone(), args[1].clone())
+    }
+    other => (other.clone(), Expr::Integer(1)),
+  }
+}
+
+/// Wolfram's canonical order (`Order`, as `Sort` uses it) on two call
+/// arguments, as far as Plus-term ordering needs it: numbers, then strings,
+/// then symbols, then compound expressions. Sums and products compare as
+/// polynomials from their last (highest) term — `a*b < a + b < c`,
+/// `-1 + x < x < 1 + x < x + y`, `x < 2*x < x^2` — and calls by head, then
+/// arity, then arguments left to right (`f[x] < f[y] < f[x, x]`). All
+/// wolframscript-verified (`h[a*b] + h[c]`, `Log[-1 + x] + Log[x]`,
+/// `f[2*x] + f[1 + x]`, `Conjugate[a*b] + 2*Conjugate[c]`).
+fn wl_arg_order(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  wl_arg_order_pass(a, b, false)
+}
+
+fn wl_arg_order_pass(
+  a: &Expr,
+  b: &Expr,
+  shape_only: bool,
+) -> std::cmp::Ordering {
+  use std::cmp::Ordering;
+  let (ra, rb) = (wl_order_rank(a), wl_order_rank(b));
+  let compound_poly = |e: &Expr| wl_order_rank(e) == 3 && wl_poly_like(e);
+  // A sum, product or power against anything but a number compares as a
+  // polynomial, with calls as atoms: `-x < x`, `a*b < c`, `Log[x] < 1 + Log[x]`.
+  if ra.min(rb) >= 2 && (compound_poly(a) || compound_poly(b)) {
+    let o = wl_shape_order(a, b);
+    if o != Ordering::Equal || shape_only {
+      return o;
+    }
+    return wl_full_order(a, b);
+  }
+  if ra != rb {
+    return ra.cmp(&rb);
+  }
+  let by_name = |x: &str, y: &str| -> Ordering {
+    match crate::functions::list_helpers_ast::wolfram_string_order(x, y) {
+      0 => Ordering::Equal,
+      o if o > 0 => Ordering::Less,
+      _ => Ordering::Greater,
+    }
+  };
+  let args_order = |xa: &[Expr], xb: &[Expr]| -> Ordering {
+    xa.len().cmp(&xb.len()).then_with(|| {
+      xa.iter()
+        .zip(xb.iter())
+        .map(|(x, y)| wl_arg_order_pass(x, y, shape_only))
+        .find(|o| *o != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+    })
+  };
+  match ra {
+    0 => {
+      let (Some(x), Some(y)) = (expr_to_f64(a), expr_to_f64(b)) else {
+        return compare_expr_canonical(a, b);
+      };
+      x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+    }
+    1 | 2 => by_name(&expr_to_string(a), &expr_to_string(b)),
+    _ => match (a, b) {
+      (
+        Expr::FunctionCall { name: na, args: xa },
+        Expr::FunctionCall { name: nb, args: xb },
+      ) => by_name(na, nb).then_with(|| args_order(xa, xb)),
+      (Expr::FunctionCall { .. }, Expr::CurriedCall { .. }) => Ordering::Less,
+      (Expr::CurriedCall { .. }, Expr::FunctionCall { .. }) => {
+        Ordering::Greater
+      }
+      (
+        Expr::CurriedCall { func: fa, args: xa },
+        Expr::CurriedCall { func: fb, args: xb },
+      ) => {
+        wl_arg_order_pass(fa, fb, shape_only).then_with(|| args_order(xa, xb))
+      }
+      (Expr::List(xa), Expr::List(xb)) => args_order(xa, xb),
+      _ => compare_expr_canonical(a, b),
+    },
+  }
+}
+
+/// Numeric exponent of a factor's base, if concrete.
+fn wl_poly_exponent(f: &Expr) -> Expr {
+  wl_base_exp(f).1
+}
+
+/// First pass of the polynomial comparison behind `wl_arg_order`: the
+/// *shapes* of two polynomials — summands from the last, then the bases of
+/// a monomial's factors from the last — ignoring exponents and numeric
+/// coefficients. A leftover summand on the longer side sorts it first only
+/// when that summand is a negative number (`-1 + x < x < 1 + x`,
+/// `b + c < a + b + c`, `2*x < 1 + x`, `x^2 < 1 + x`).
+fn wl_shape_order(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  use std::cmp::Ordering;
+  let sa = wl_summands(a);
+  let sb = wl_summands(b);
+  if sa.len() > 1 || sb.len() > 1 {
+    // A product whose factors are exactly the other side's summands sorts
+    // first: `a*b < a + b`, `a*x < a + x`.
+    let product_of_summands = |prod: &Expr, terms: &[Expr]| -> bool {
+      let (coeff, factors) = wl_coeff_and_factors(prod);
+      coeff == 1.0
+        && factors.len() == terms.len()
+        && factors
+          .iter()
+          .zip(terms.iter())
+          .all(|(f, t)| wl_arg_order(f, t) == Ordering::Equal)
+    };
+    if sa.len() == 1 && product_of_summands(&sa[0], &sb) {
+      return Ordering::Less;
+    }
+    if sb.len() == 1 && product_of_summands(&sb[0], &sa) {
+      return Ordering::Greater;
+    }
+    for (x, y) in sa.iter().rev().zip(sb.iter().rev()) {
+      let o = wl_shape_order(x, y);
+      if o != Ordering::Equal {
+        return o;
+      }
+    }
+    return match sa.len().cmp(&sb.len()) {
+      Ordering::Equal => Ordering::Equal,
+      Ordering::Less => {
+        let leftover = &sb[sb.len() - sa.len() - 1];
+        if expr_to_f64(leftover).is_some_and(|v| v < 0.0) {
+          Ordering::Greater
+        } else {
+          Ordering::Less
+        }
+      }
+      Ordering::Greater => {
+        let leftover = &sa[sa.len() - sb.len() - 1];
+        if expr_to_f64(leftover).is_some_and(|v| v < 0.0) {
+          Ordering::Less
+        } else {
+          Ordering::Greater
+        }
+      }
+    };
+  }
+  let (ca, fa) = wl_coeff_and_factors(a);
+  let (cb, fb) = wl_coeff_and_factors(b);
+  for (x, y) in fa.iter().rev().zip(fb.iter().rev()) {
+    let (base_x, _) = wl_base_exp(x);
+    let (base_y, _) = wl_base_exp(y);
+    let o = wl_base_order(&base_x, &base_y, wl_shape_order);
+    if o != Ordering::Equal {
+      return o;
+    }
+  }
+  let o = fa.len().cmp(&fb.len());
+  if o != Ordering::Equal {
+    return o;
+  }
+  // The sign of a monomial is part of its shape (`1 - x < x`, `-x < x`);
+  // its magnitude is not (`2*x < 1 + x`, but `x < 2*x`).
+  (ca < 0.0).cmp(&(cb < 0.0)).reverse()
+}
+
+/// Second pass: two polynomials of the same shape order by exponents from
+/// the last factor, then by numeric coefficient (`x < x^2`, `-x < x < 2*x`).
+fn wl_full_order(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  use std::cmp::Ordering;
+  let sa = wl_summands(a);
+  let sb = wl_summands(b);
+  if sa.len() > 1 || sb.len() > 1 {
+    for (x, y) in sa.iter().rev().zip(sb.iter().rev()) {
+      let o = wl_full_order(x, y);
+      if o != Ordering::Equal {
+        return o;
+      }
+    }
+    return Ordering::Equal;
+  }
+  let (ca, fa) = wl_coeff_and_factors(a);
+  let (cb, fb) = wl_coeff_and_factors(b);
+  for (x, y) in fa.iter().rev().zip(fb.iter().rev()) {
+    let (base_x, _) = wl_base_exp(x);
+    let (base_y, _) = wl_base_exp(y);
+    let o = wl_base_order(&base_x, &base_y, wl_full_order);
+    if o != Ordering::Equal {
+      return o;
+    }
+    let o = compare_call_exponents(&wl_poly_exponent(x), &wl_poly_exponent(y));
+    if o != Ordering::Equal {
+      return o;
+    }
+  }
+  ca.partial_cmp(&cb).unwrap_or(Ordering::Equal)
+}
+
+/// Order two factor bases: compound polynomials by the given pass, atoms
+/// and calls by `wl_arg_order`.
+fn wl_base_order(
+  a: &Expr,
+  b: &Expr,
+  poly_pass: fn(&Expr, &Expr) -> std::cmp::Ordering,
+) -> std::cmp::Ordering {
+  let compound_poly = |e: &Expr| wl_order_rank(e) == 3 && wl_poly_like(e);
+  if compound_poly(a) || compound_poly(b) {
+    if wl_order_rank(a).min(wl_order_rank(b)) < 2 {
+      return wl_order_rank(a).cmp(&wl_order_rank(b));
+    }
+    poly_pass(a, b)
+  } else {
+    wl_arg_order(a, b)
+  }
+}
+
+/// Exponents compare numerically, numeric before symbolic, symbolic ones
+/// canonically: `Sin[x] + Sin[x]^2 + Sin[x]^m + Sin[x]^n`.
+fn compare_call_exponents(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  match (expr_to_f64(a), expr_to_f64(b)) {
+    (Some(x), Some(y)) => {
+      x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+    }
+    (Some(_), None) => std::cmp::Ordering::Less,
+    (None, Some(_)) => std::cmp::Ordering::Greater,
+    (None, None) => wl_arg_order(a, b),
+  }
+}
+
+/// Order two call factors as Wolfram's canonical `Times` does: by head,
+/// then by the call itself (its arguments), then by exponent.
+fn compare_call_factors(
+  (ca, ea): &(Expr, Expr),
+  (cb, eb): &(Expr, Expr),
+) -> std::cmp::Ordering {
+  let ha = plus_term_call_head(ca).unwrap_or_default();
+  let hb = plus_term_call_head(cb).unwrap_or_default();
+  call_head_cmp(&ha, &hb)
+    .then_with(|| wl_arg_order(ca, cb))
+    .then_with(|| compare_call_exponents(ea, eb))
+}
+
+/// Split a call-led term base into its last call factor (call, exponent)
+/// and the product of the remaining factors, if any.
+fn split_last_call_factor(base: &Expr) -> Option<((Expr, Expr), Option<Expr>)> {
+  let factors = plus_term_factors(base);
+  let mut last: Option<(usize, (Expr, Expr))> = None;
+  for (i, f) in factors.iter().enumerate() {
+    if let Some(parts) = call_factor_parts(f)
+      && !last
+        .as_ref()
+        .is_some_and(|(_, l)| compare_call_factors(&parts, l).is_lt())
+    {
+      last = Some((i, parts));
+    }
+  }
+  let (idx, parts) = last?;
+  let rest: Vec<Expr> = factors
+    .into_iter()
+    .enumerate()
+    .filter_map(|(i, f)| (i != idx).then_some(f))
+    .collect();
+  let rest = match rest.len() {
+    0 => None,
+    1 => rest.into_iter().next(),
+    _ => Some(call("Times", rest)),
+  };
+  Some((parts, rest))
+}
+
+/// Wolfram orders two call-led Plus terms (`Sin[x]`, `x*Log[x]`,
+/// `f[x]^2*g[x]`, `Derivative[1][f][x]`) from their last factor: by head
+/// name, then by that call's arguments, then by its exponent, and only
+/// then by the remaining factors — `Cos[b]*Sin[a] + Sin[a]^2`,
+/// `Sin[a] + x*Sin[b]`, `x*Sin[a] + y*Sin[a]`, `Sin[x] + Sin[x]/x`.
+/// `None` when either term is not call-led or the two are tied.
+fn call_led_order(a: &Expr, b: &Expr) -> Option<std::cmp::Ordering> {
+  let (_, base_a) = decompose_term(a);
+  let (_, base_b) = decompose_term(b);
+  let ha = plus_term_call_head(&base_a)?;
+  let hb = plus_term_call_head(&base_b)?;
+  let ord = call_head_cmp(&ha, &hb);
+  if ord != std::cmp::Ordering::Equal {
+    return Some(ord);
+  }
+  let (fa, rest_a) = split_last_call_factor(&base_a)?;
+  let (fb, rest_b) = split_last_call_factor(&base_b)?;
+  let ord = compare_call_factors(&fa, &fb);
+  if ord != std::cmp::Ordering::Equal {
+    return Some(ord);
+  }
+  match (rest_a, rest_b) {
+    (None, None) => None,
+    (None, Some(_)) => Some(std::cmp::Ordering::Less),
+    (Some(_), None) => Some(std::cmp::Ordering::Greater),
+    (Some(ra), Some(rb)) => {
+      let ord = wl_arg_order(&ra, &rb);
+      (ord != std::cmp::Ordering::Equal).then_some(ord)
+    }
+  }
+}
+
+/// The function call a Plus term is "led" by: the call itself, the base of
+/// a power of a call, or — for a product — the call factor that sorts last
+/// in canonical `Times` order (Wolfram compares products from their last
+/// factor, and `Times` puts calls in symbol order). `None` for purely
+/// arithmetic terms.
+///
+/// Wolfram sorts every such term after the symbols, powers and products
+/// (`z^2 + ArcTanh[y]`, `x + C[1]`) and orders the calls among themselves
+/// by head name in symbol order (`Log[c] + Subst[a, b]`, `f[c] + Gamma[y]`).
+fn plus_term_call_head(e: &Expr) -> Option<String> {
+  fn later(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+      (Some(a), Some(b)) => {
+        Some(if call_head_cmp(&a, &b).is_gt() { a } else { b })
+      }
+      (a, None) => a,
+      (None, b) => b,
+    }
+  }
+  match e {
+    Expr::FunctionCall { name, args } if name == "Times" => args
+      .iter()
+      .fold(None, |acc, arg| later(acc, plus_term_call_head(arg))),
+    Expr::FunctionCall { name, args }
+      if name == "Power" && !args.is_empty() =>
+    {
+      plus_term_call_head(&args[0])
+    }
+    e if is_curried_derivative(e) => Some(CURRIED_HEAD_KEY.to_string()),
+    Expr::FunctionCall { name, .. } if !is_arithmetic_head(name) => {
+      Some(name.clone())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times | BinaryOperator::Divide,
+      left,
+      right,
+    } => later(plus_term_call_head(left), plus_term_call_head(right)),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => plus_term_call_head(left),
+    _ => None,
+  }
+}
+
+/// Extract the primary transcendental function name from a term.
+/// For `Sin[x]` → Some("Sin"), for `x*Cos[x]` → Some("Cos") (looking inside Times).
+/// Returns None for non-transcendental terms.
+fn extract_primary_fn_name(e: &Expr) -> Option<String> {
+  match e {
+    // Look inside Times products for the transcendental factor that sorts
+    // last in canonical `Times` order — Wolfram compares products from
+    // their last factor: `Cosh[y]*Sin[x]` is a `Sin` term, so it precedes
+    // `Cos[x]*Sinh[y]`, a `Sinh` term.
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut best: Option<String> = None;
+      for arg in args {
+        if let Some(n) = extract_primary_fn_name(arg) {
+          best = Some(match best {
+            Some(b)
+              if crate::functions::list_helpers_ast::wolfram_string_order(
+                &b, &n,
+              ) < 0 =>
+            {
+              b
+            }
+            _ => n,
+          });
+        }
+      }
+      best
+    }
+    // Power[f, n] — look inside the base
+    Expr::FunctionCall { name, args }
+      if name == "Power" && !args.is_empty() =>
+    {
+      extract_primary_fn_name(&args[0])
+    }
+    // Bare transcendental function
+    Expr::FunctionCall { name, .. } if term_priority(e) >= 1 => {
+      Some(name.clone())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let l = extract_primary_fn_name(left);
+      let r = extract_primary_fn_name(right);
+      match (l, r) {
+        (Some(a), Some(b)) => Some(
+          if crate::functions::list_helpers_ast::wolfram_string_order(&a, &b)
+            < 0
+          {
+            a
+          } else {
+            b
+          },
+        ),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => extract_primary_fn_name(left),
+    _ => None,
+  }
+}
+
+/// Extract the exponent of the named transcendental function within a
+/// term. For `Sin[x]^2` returns 2; for `2*a*Sin[x]` returns 1; for any
+/// term that doesn't contain `name` as a function call returns 0.
+fn extract_primary_fn_exponent(e: &Expr, name: &str) -> f64 {
+  match e {
+    Expr::FunctionCall { name: n, .. } if n == name => 1.0,
+    Expr::FunctionCall { name: n, args } if n == "Power" && args.len() == 2 => {
+      if let Expr::FunctionCall { name: inner, .. } = &args[0]
+        && inner == name
+      {
+        match &args[1] {
+          Expr::Integer(k) => *k as f64,
+          Expr::Real(f) => *f,
+          _ => 1.0,
+        }
+      } else {
+        0.0
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      if let Expr::FunctionCall { name: inner, .. } = left.as_ref()
+        && inner == name
+      {
+        match right.as_ref() {
+          Expr::Integer(k) => *k as f64,
+          Expr::Real(f) => *f,
+          _ => 1.0,
+        }
+      } else {
+        0.0
+      }
+    }
+    Expr::FunctionCall { name: tn, args } if tn == "Times" => {
+      let mut total = 0.0;
+      for a in args {
+        total += extract_primary_fn_exponent(a, name);
+      }
+      total
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      extract_primary_fn_exponent(left, name)
+        + extract_primary_fn_exponent(right, name)
+    }
+    _ => 0.0,
+  }
+}
+
+/// Count the number of distinct transcendental function names in a term.
+/// `Cos[x]^2` → 1, `Cos[x]*Sin[x]` → 2, `Cos[x]^2*Sin[x]` → 2, `a*Sin[x]` → 1.
+fn count_distinct_trig_factors(e: &Expr) -> usize {
+  let factors = extract_trig_factors(e);
+  let mut names: Vec<String> = factors.into_iter().map(|(n, _, _)| n).collect();
+  names.sort();
+  names.dedup();
+  names.len()
+}
+
+/// Extract (function_name, argument, exponent) triples from a product of transcendental
+/// functions. For `Cos[x]^2*Sin[x]` → [("Cos", x, 2), ("Sin", x, 1)].
+fn extract_trig_factors(e: &Expr) -> Vec<(String, Expr, i64)> {
+  let mut factors = Vec::new();
+  let extract_one = |e: &Expr, factors: &mut Vec<(String, Expr, i64)>| match e {
+    Expr::FunctionCall { name, args }
+      if term_priority(e) >= 1 && args.len() == 1 =>
+    {
+      factors.push((name.clone(), args[0].clone(), 1));
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      if let Expr::FunctionCall {
+        name: fn_name,
+        args: fn_args,
+      } = &args[0]
+        && term_priority(&args[0]) >= 1
+        && fn_args.len() == 1
+      {
+        let exp = match &args[1] {
+          Expr::Integer(n) => *n as i64,
+          _ => 0,
+        };
+        factors.push((fn_name.clone(), fn_args[0].clone(), exp));
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      if let Expr::FunctionCall {
+        name: fn_name,
+        args: fn_args,
+      } = left.as_ref()
+        && term_priority(left) >= 1
+        && fn_args.len() == 1
+      {
+        let exp = match right.as_ref() {
+          Expr::Integer(n) => *n as i64,
+          _ => 0,
+        };
+        factors.push((fn_name.clone(), fn_args[0].clone(), exp));
+      }
+    }
+    _ => {}
+  };
+  match e {
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      for arg in args {
+        extract_one(arg, &mut factors);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      extract_one(left, &mut factors);
+      extract_one(right, &mut factors);
+    }
+    _ => extract_one(e, &mut factors),
+  }
+  // Sort by function name descending (highest-alphabetical first)
+  factors.sort_by(|a, b| b.0.cmp(&a.0));
+  factors
+}
+
+/// Compare two transcendental product terms by their trig factors.
+/// Wolfram sorts by the highest-alphabetical function factor first (e.g., Sin before Cos),
+/// then by argument, then by exponent.
+fn compare_trig_products(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  let fa = extract_trig_factors(a);
+  let fb = extract_trig_factors(b);
+  if fa.is_empty() || fb.is_empty() {
+    return std::cmp::Ordering::Equal;
+  }
+  for (ta, tb) in fa.iter().zip(fb.iter()) {
+    // Compare function name (descending sort means we compare in ascending for position)
+    let cmp = ta.0.cmp(&tb.0);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    // Compare argument
+    let cmp = compare_expr_canonical(&ta.1, &tb.1);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+    // Compare exponent (lower first)
+    let cmp = ta.2.cmp(&tb.2);
+    if cmp != std::cmp::Ordering::Equal {
+      return cmp;
+    }
+  }
+  fa.len().cmp(&fb.len())
+}
+
+/// Extract the maximum polynomial degree from a Times product's variable factors.
+/// For `x*Cos[x]` → 1.0, `x^2*Sin[x]` → 2.0, `Sin[x]` → 0.0.
+fn extract_poly_degree_in_product(e: &Expr) -> f64 {
+  match e {
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut max_deg = 0.0f64;
+      for arg in args {
+        if let Some(pairs) = extract_var_exp_pairs(arg) {
+          for (_, exp) in pairs {
+            max_deg = max_deg.max(exp);
+          }
+        }
+      }
+      max_deg
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let mut deg: f64 = 0.0;
+      if let Some(pairs) = extract_var_exp_pairs(left) {
+        for (_, exp) in pairs {
+          deg = deg.max(exp);
+        }
+      }
+      if let Some(pairs) = extract_var_exp_pairs(right) {
+        for (_, exp) in pairs {
+          deg = deg.max(exp);
+        }
+      }
+      deg
+    }
+    _ => 0.0,
+  }
+}
+
+/// Compare two expressions using Wolfram-compatible canonical ordering.
+/// Used as a tie-breaker when Plus term sorting can't distinguish terms
+/// via polynomial structure alone.
+///
+/// Rules:
+///   - Integers: by value
+///   - Identifiers: alphabetically
+///   - FunctionCall with same name: compare arguments element by element
+///   - BinaryOp::Plus/Times: compare left then right
+///   - UnaryOp::Minus(x) < x (negative sorts before positive)
+///   - Fall back to string comparison
+///     Factor is a call-like expression (opaque function call, pure function)
+///     that overrides the shared-denominator exponent ordering rules.
+fn cmp_is_call_like(e: &Expr) -> bool {
+  match e {
+    Expr::FunctionCall { name, args } => {
+      !matches!(
+        name.as_str(),
+        "Power" | "Plus" | "Times" | "Rational" | "Complex"
+      ) || args.iter().any(cmp_is_call_like)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      cmp_is_call_like(left) || cmp_is_call_like(right)
+    }
+    Expr::UnaryOp { operand, .. } => cmp_is_call_like(operand),
+    Expr::Function { .. } | Expr::NamedFunction { .. } => true,
+    _ => false,
+  }
+}
+
+/// `Power[base, n]` with a negative integer exponent, in either the
+/// FunctionCall or BinaryOp representation.
+/// A reciprocal-of-a-sum term (2/(-1+x), (1+x)^(-1)) orders against
+/// another univariate term in the same variable by comparing the BASE
+/// polynomials: lower degree first, then coefficients from the LEADING
+/// term down by signed value (missing coefficients count as 0), a bare
+/// `x^m` base flattening to the coefficients of plain `x`. All
+/// wolframscript-verified: `(-1+x)^(-1) + x` and `(1-2*x)^(-1) + x` keep
+/// the reciprocal first (negative constant / leading term sorts early),
+/// `x + (1+x)^(-1)` and `x + (-5+2*x)^(-1)` keep x first (positive
+/// constant, larger leading coefficient), `2/(-1+x) + x^2` leads with the
+/// reciprocal while `x^2/2 + 15/(8(1+2x))` trails it, and any degree-≥2
+/// base ((1+x^2)^(-1)) trails every monomial. Equal bases return None so
+/// the existing shared-denominator exponent rules decide.
+/// Order two univariate rational Plus terms that BOTH carry a
+/// reciprocal-sum factor — the quotient-rule shape `C/Q + A*B/Q^2` — by
+/// their exponent vectors over the canonically ordered bases (the bare
+/// variable and every sum factor), comparing the LAST (canonically
+/// greatest) base first with exponents ascending. wolframscript-verified:
+/// (-2+8x)/(-5-4x+4x^2) precedes ((-4+8x)*(5-2x+4x^2))/(-5-4x+4x^2)^2
+/// (the greatest base 5-2x+4x^2 carries exponent 0 vs 1) while
+/// (-4+8x)/(-5-4x+4x^2)^2 precedes (-2+8x)/(-5-4x+4x^2) (that base is
+/// absent from both, so the denominator exponents -2 < -1 decide) —
+/// differential fuzzer, seed 4040222378236757762. Returns None when the
+/// shapes don't fit or every exponent ties.
+fn quotient_sum_terms_vector_order(
+  a: &Expr,
+  b: &Expr,
+) -> Option<std::cmp::Ordering> {
+  use std::cmp::Ordering;
+  fn collect_factors(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for x in args {
+          collect_factors(x, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        collect_factors(left, out);
+        collect_factors(right, out);
+      }
+      other => out.push(other.clone()),
+    }
+  }
+  // (variable, per-base [ascending coeffs → exponent], saw a negative-exp
+  // sum base).
+  type BaseVec = Vec<(Vec<i128>, i128)>;
+  fn term_vector(e: &Expr) -> Option<(String, BaseVec, bool)> {
+    let (_, base) = decompose_term(e);
+    let mut factors = Vec::new();
+    collect_factors(&base, &mut factors);
+    let mut var: Option<String> = None;
+    let mut items: BaseVec = Vec::new();
+    let mut has_neg_sum = false;
+    for f in &factors {
+      let (fb, n): (&Expr, i128) = match f {
+        Expr::FunctionCall { name, args }
+          if name == "Power"
+            && args.len() == 2
+            && matches!(&args[1], Expr::Integer(_)) =>
+        {
+          match &args[1] {
+            Expr::Integer(n) => (&args[0], *n),
+            _ => unreachable!(),
+          }
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Power,
+          left,
+          right,
+        } if matches!(right.as_ref(), Expr::Integer(_)) => match right.as_ref()
+        {
+          Expr::Integer(n) => (left.as_ref(), *n),
+          _ => unreachable!(),
+        },
+        other => (other, 1),
+      };
+      let (v, coeffs, is_sum) = if let Some(v) = sym_var_name(fb) {
+        (v.to_string(), vec![0, 1], false)
+      } else if cmp_is_sum_base(fb) {
+        let (v, c) = univar_int_coeffs(fb)?;
+        (v, c, true)
+      } else {
+        return None;
+      };
+      match &var {
+        None => var = Some(v),
+        Some(v0) if *v0 == v => {}
+        _ => return None,
+      }
+      if is_sum && n < 0 {
+        has_neg_sum = true;
+      }
+      if let Some(entry) = items.iter_mut().find(|(k, _)| *k == coeffs) {
+        entry.1 += n;
+      } else {
+        items.push((coeffs, n));
+      }
+    }
+    Some((var?, items, has_neg_sum))
+  }
+  let (va, ia, na) = term_vector(a)?;
+  let (vb, ib, nb) = term_vector(b)?;
+  if va != vb || !na || !nb {
+    return None;
+  }
+  // Canonical base order: degree ascending, then the PRESENT terms from
+  // the leading one down as (degree, coefficient) pairs — smaller term
+  // degree first, then coefficient ascending, zero coefficients skipped.
+  // 1+x^2 precedes 3-x+x^2 (its second term is the constant, degree 0,
+  // vs -x at degree 1), while -5-4x+4x^2 precedes 5-2x+4x^2 on the
+  // shared-slot coefficients -4 < -2 (wolframscript-verified).
+  let base_cmp = |x: &Vec<i128>, y: &Vec<i128>| -> Ordering {
+    let deg = |c: &Vec<i128>| c.iter().rposition(|&k| k != 0).unwrap_or(0);
+    let (dx, dy) = (deg(x), deg(y));
+    if dx != dy {
+      return dx.cmp(&dy);
+    }
+    let terms = |c: &Vec<i128>| -> Vec<(usize, i128)> {
+      (0..c.len())
+        .rev()
+        .filter(|&i| c[i] != 0)
+        .map(|i| (i, c[i]))
+        .collect()
+    };
+    let (tx, ty) = (terms(x), terms(y));
+    for (a, b) in tx.iter().zip(ty.iter()) {
+      match a.0.cmp(&b.0) {
+        Ordering::Equal => {}
+        o => return o,
+      }
+      match a.1.cmp(&b.1) {
+        Ordering::Equal => {}
+        o => return o,
+      }
+    }
+    tx.len().cmp(&ty.len())
+  };
+  let mut bases: Vec<Vec<i128>> = Vec::new();
+  for (k, _) in ia.iter().chain(ib.iter()) {
+    if !bases.contains(k) {
+      bases.push(k.clone());
+    }
+  }
+  bases.sort_by(|x, y| base_cmp(x, y));
+  // Walk the bases from the canonically GREATEST down. The term whose
+  // greatest base is smaller comes first — a zero exponent (base absent)
+  // beats any nonzero one — and on a shared leading base the exponents
+  // compare ascending (1/Q^2 before 1/Q, x before x^2).
+  for key in bases.iter().rev() {
+    let ea = ia.iter().find(|(k, _)| k == key).map_or(0, |(_, n)| *n);
+    let eb = ib.iter().find(|(k, _)| k == key).map_or(0, |(_, n)| *n);
+    if ea == eb {
+      continue;
+    }
+    if ea == 0 {
+      return Some(Ordering::Less);
+    }
+    if eb == 0 {
+      return Some(Ordering::Greater);
+    }
+    return Some(ea.cmp(&eb));
+  }
+  None
+}
+
+fn sum_recip_vs_univar_order(a: &Expr, b: &Expr) -> Option<std::cmp::Ordering> {
+  use std::cmp::Ordering;
+  // (var, ascending base-polynomial coeffs, is_sum_reciprocal).
+  fn base_info(e: &Expr) -> Option<(String, Vec<(i128, i128)>, bool)> {
+    let (_, base) = decompose_term(e);
+    if let Some((inner, _)) = cmp_neg_pow(&base) {
+      if cmp_is_sum_base(inner) {
+        let (v, c) = univar_rat_coeffs(inner)?;
+        return Some((v, c, true));
+      }
+      if let Some(v) = sym_var_name(inner) {
+        return Some((v.to_string(), vec![(0, 1), (1, 1)], false));
+      }
+      return None;
+    }
+    let var_power = |b: &Expr, e: &Expr| -> Option<String> {
+      match (sym_var_name(b), e) {
+        (Some(v), Expr::Integer(n)) if *n > 0 => Some(v.to_string()),
+        _ => None,
+      }
+    };
+    if let Some(v) = sym_var_name(&base) {
+      return Some((v.to_string(), vec![(0, 1), (1, 1)], false));
+    }
+    match &base {
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        var_power(&args[0], &args[1]).map(|v| (v, vec![(0, 1), (1, 1)], false))
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => var_power(left, right).map(|v| (v, vec![(0, 1), (1, 1)], false)),
+      _ => None,
+    }
+  }
+  let (va, ca, ra) = base_info(a)?;
+  let (vb, cb, rb) = base_info(b)?;
+  if (!ra && !rb) || va != vb {
+    return None;
+  }
+  let degree =
+    |c: &[(i128, i128)]| c.iter().rposition(|&(n, _)| n != 0).unwrap_or(0);
+  let (da, db) = (degree(&ca), degree(&cb));
+  if da != db {
+    return Some(da.cmp(&db));
+  }
+  for i in (0..=da).rev() {
+    let x = ca.get(i).copied().unwrap_or((0, 1));
+    let y = cb.get(i).copied().unwrap_or((0, 1));
+    match rat_cmp(x, y) {
+      Ordering::Equal => {}
+      ord => return Some(ord),
+    }
+  }
+  None
+}
+
+/// Orders two shared-sum-base terms with pure-power numerators of the SAME
+/// variable, `x^αs/Q^s` (shallow) vs `x^αd/Q^d` (deep, d > s), by comparing
+/// the leading monomials over the common denominator Q^d: the shallow term's
+/// key is x^αs · (leading addend of Q)^(d-s), the deep term's is x^αd.
+/// Smaller total degree first; on a degree tie a key in a LATER variable is
+/// larger, and same-monomial keys compare by signed coefficient (deep first
+/// on a coefficient tie). All wolframscript-verified:
+/// x/(1+x) + x^2/(1+x)^2 reorders deep-first while x/(1-x) + x^2/(1-x)^2
+/// stays put (negative leading coefficient), p1/(1-p1-p2) trails
+/// p1^2/(1-p1-p2)^2 but p2/(1-p1-p2) leads p2^2/(1-p1-p2)^2 (p2 is the
+/// base's last variable), x^2/(1-x) leads x^3/(1-x)^2, and
+/// x/(1+x^2) + x^2/(1+x^2)^2 reorders deep-first (squared leading addend).
+/// Returns None when the shapes don't fit so the caller falls back to the
+/// plain ascending-exponent rule.
+fn same_var_sum_base_order(
+  num_a: &Expr,
+  ea: i128,
+  num_b: &Expr,
+  eb: i128,
+  base: &Expr,
+) -> Option<std::cmp::Ordering> {
+  use std::cmp::Ordering;
+  // A numerator factor as (var, positive degree).
+  fn var_power(e: &Expr) -> Option<(&str, i128)> {
+    match e {
+      Expr::Identifier(v) => Some((v, 1)),
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        match (&args[0], &args[1]) {
+          (Expr::Identifier(v), Expr::Integer(k)) if *k > 0 => Some((v, *k)),
+          _ => None,
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(v), Expr::Integer(k)) if *k > 0 => Some((v, *k)),
+        _ => None,
+      },
+      _ => None,
+    }
+  }
+  // The last addend of the sum base with its accumulated sign.
+  fn last_addend(e: &Expr) -> (i128, &Expr) {
+    match e {
+      Expr::FunctionCall { name, args }
+        if name == "Plus" && !args.is_empty() =>
+      {
+        last_addend(args.last().unwrap())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        right,
+        ..
+      } => last_addend(right),
+      Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        right,
+        ..
+      } => {
+        let (s, t) = last_addend(right);
+        (-s, t)
+      }
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } => {
+        let (s, t) = last_addend(operand);
+        (-s, t)
+      }
+      _ => (1, e),
+    }
+  }
+  // An addend as (integer coefficient, var, positive degree).
+  fn monom(e: &Expr) -> Option<(i128, &str, i128)> {
+    if let Some((v, k)) = var_power(e) {
+      return Some((1, v, k));
+    }
+    let (c, inner) = match e {
+      Expr::FunctionCall { name, args }
+        if name == "Times" && args.len() == 2 =>
+      {
+        match &args[0] {
+          Expr::Integer(c) => (*c, &args[1]),
+          _ => return None,
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => match left.as_ref() {
+        Expr::Integer(c) => (*c, right.as_ref()),
+        _ => return None,
+      },
+      _ => return None,
+    };
+    var_power(inner).map(|(v, k)| (c, v, k))
+  }
+
+  let (va, da) = var_power(num_a)?;
+  let (vb, db) = var_power(num_b)?;
+  if va != vb || ea == eb {
+    return None;
+  }
+  // Shallow = exponent closer to 0 (both are negative).
+  let ((alpha_s, es, a_is_shallow), (alpha_d, ed)) = if ea > eb {
+    ((da, ea, true), (db, eb))
+  } else {
+    ((db, eb, false), (da, ea))
+  };
+  let delta = es - ed;
+  if delta > 8 {
+    return None;
+  }
+  let (sign, term) = last_addend(base);
+  let (c, vl, m) = monom(term)?;
+  let c = c.checked_mul(sign)?;
+  let shallow_first = |sf: bool| {
+    Some(if sf == a_is_shallow {
+      Ordering::Less
+    } else {
+      Ordering::Greater
+    })
+  };
+  let deg_s = alpha_s + m * delta;
+  if deg_s != alpha_d {
+    return shallow_first(deg_s < alpha_d);
+  }
+  if vl != va {
+    // The shallow key ends in a later variable, so it is larger.
+    return shallow_first(false);
+  }
+  let c_key = c.checked_pow(u32::try_from(delta).ok()?)?;
+  if c_key == 1 {
+    return shallow_first(false);
+  }
+  shallow_first(c_key < 1)
+}
+
+fn cmp_neg_pow(f: &Expr) -> Option<(&Expr, i128)> {
+  match f {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      match &args[1] {
+        Expr::Integer(e) if *e < 0 => Some((&args[0], *e)),
+        _ => None,
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => match right.as_ref() {
+      Expr::Integer(e) if *e < 0 => Some((left.as_ref(), *e)),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+fn cmp_is_sum_base(e: &Expr) -> bool {
+  matches!(e, Expr::FunctionCall { name, .. } if name == "Plus")
+    || matches!(
+      e,
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus | BinaryOperator::Minus,
+        ..
+      }
+    )
+}
+
+/// The name of a symbol-like atom for univariate polynomial ordering: a
+/// bare Identifier or a named constant (Pi, E, …), which Wolfram orders
+/// exactly like a symbol (`Pi + (1 + Pi)^(-1)` keeps Pi first just as
+/// `x + (1 + x)^(-1)` keeps x first). The imaginary unit is excluded —
+/// sums containing I are complex numbers, not univariate polynomials.
+fn sym_var_name(e: &Expr) -> Option<&str> {
+  match e {
+    Expr::Identifier(v) => Some(v),
+    Expr::Constant(v) if v != "I" => Some(v),
+    _ => None,
+  }
+}
+
+/// A rational number literal as (numerator, denominator > 0), covering
+/// Integer and evaluated Rational[a, b] atoms.
+fn rat_literal(e: &Expr) -> Option<(i128, i128)> {
+  match e {
+    Expr::Integer(n) => Some((*n, 1)),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(a), Expr::Integer(b)) if *b != 0 => {
+          Some(if *b < 0 { (-a, -b) } else { (*a, *b) })
+        }
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Ascending rational coefficients (numerator, denominator > 0, reduced) of
+/// a univariate polynomial with number coefficients (sums of number /
+/// k*var / k*var^n terms, or a bare monomial). Returns (var, coeffs) or
+/// None for anything else.
+fn univar_rat_coeffs(e: &Expr) -> Option<(String, Vec<(i128, i128)>)> {
+  fn monomial(e: &Expr) -> Option<(Option<String>, usize, (i128, i128))> {
+    if let Some(c) = rat_literal(e) {
+      return Some((None, 0, c));
+    }
+    match e {
+      _ if sym_var_name(e).is_some() => {
+        Some((Some(sym_var_name(e)?.to_string()), 1, (1, 1)))
+      }
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        match (sym_var_name(&args[0]), &args[1]) {
+          (Some(v), Expr::Integer(n)) if *n > 0 => {
+            Some((Some(v.to_string()), *n as usize, (1, 1)))
+          }
+          _ => None,
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => match (sym_var_name(left), right.as_ref()) {
+        (Some(v), Expr::Integer(n)) if *n > 0 => {
+          Some((Some(v.to_string()), *n as usize, (1, 1)))
+        }
+        _ => None,
+      },
+      Expr::FunctionCall { name, args }
+        if name == "Times" && args.len() == 2 =>
+      {
+        match (rat_literal(&args[0]), monomial(&args[1])) {
+          (Some((kn, kd)), Some((v, d, (cn, cd)))) => {
+            Some((v, d, (kn.checked_mul(cn)?, kd.checked_mul(cd)?)))
+          }
+          _ => None,
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => match (rat_literal(left), monomial(right)) {
+        (Some((kn, kd)), Some((v, d, (cn, cd)))) => {
+          Some((v, d, (kn.checked_mul(cn)?, kd.checked_mul(cd)?)))
+        }
+        _ => None,
+      },
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } => {
+        let (v, d, (cn, cd)) = monomial(operand)?;
+        Some((v, d, (cn.checked_neg()?, cd)))
+      }
+      _ => None,
+    }
+  }
+  fn gcd(mut a: i128, mut b: i128) -> i128 {
+    while b != 0 {
+      (a, b) = (b, a % b);
+    }
+    a.abs().max(1)
+  }
+  // Reduced form with denominator > 0, so coefficient vectors compare
+  // consistently by value.
+  fn rat_norm((n, d): (i128, i128)) -> (i128, i128) {
+    let g = gcd(n, d);
+    let (n, d) = (n / g, d / g);
+    if d < 0 { (-n, -d) } else { (n, d) }
+  }
+  fn rat_add(a: (i128, i128), b: (i128, i128)) -> Option<(i128, i128)> {
+    Some(rat_norm((
+      a.0.checked_mul(b.1)?.checked_add(b.0.checked_mul(a.1)?)?,
+      a.1.checked_mul(b.1)?,
+    )))
+  }
+  let terms: Vec<&Expr> = match e {
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      args.iter().collect()
+    }
+    other => vec![other],
+  };
+  let mut var: Option<String> = None;
+  let mut coeffs: Vec<(i128, i128)> = Vec::new();
+  for t in terms {
+    let (v, d, c) = monomial(t)?;
+    if let Some(v) = v {
+      match &var {
+        None => var = Some(v),
+        Some(existing) if *existing == v => {}
+        _ => return None,
+      }
+    }
+    if coeffs.len() <= d {
+      coeffs.resize(d + 1, (0, 1));
+    }
+    coeffs[d] = rat_add(coeffs[d], rat_norm(c))?;
+  }
+  Some((var?, coeffs))
+}
+
+/// Compare two rationals in (numerator, denominator > 0) form by value.
+fn rat_cmp(a: (i128, i128), b: (i128, i128)) -> std::cmp::Ordering {
+  (a.0 * b.1).cmp(&(b.0 * a.1))
+}
+
+/// Ascending integer coefficients of a univariate polynomial with number
+/// coefficients (sums of Integer / k*var / k*var^n terms, or a bare
+/// monomial). Returns (var, coeffs) or None for anything else (including
+/// polynomials with non-integer rational coefficients).
+fn univar_int_coeffs(e: &Expr) -> Option<(String, Vec<i128>)> {
+  let (var, rats) = univar_rat_coeffs(e)?;
+  let ints: Option<Vec<i128>> = rats
+    .iter()
+    .map(|&(n, d)| if d == 1 { Some(n) } else { None })
+    .collect();
+  Some((var, ints?))
+}
+
+/// WL polynomial term order for two univariate polynomials in the same
+/// variable: higher degree sorts larger; equal degrees compare
+/// coefficients ascending from the top monomial down ((5-4x) < (1+4x),
+/// (2+x) < (3+x), (1-2x) < x). Returns None when the polynomials aren't
+/// comparable this way.
+fn compare_univar_polys(a: &Expr, b: &Expr) -> Option<std::cmp::Ordering> {
+  use std::cmp::Ordering;
+  let (va, ca) = univar_int_coeffs(a)?;
+  let (vb, cb) = univar_int_coeffs(b)?;
+  if va != vb {
+    return None;
+  }
+  let dc = ca.len().cmp(&cb.len());
+  if dc != Ordering::Equal {
+    return Some(dc);
+  }
+  for i in (0..ca.len()).rev() {
+    let c = ca[i].cmp(&cb[i]);
+    if c != Ordering::Equal {
+      return Some(c);
+    }
+  }
+  Some(Ordering::Equal)
+}
+
+/// Bare `Power[sum, -n]` vs a product containing `Power[sum, -m]` with the
+/// same sum base: WL orders by ascending exponent when the product-side
+/// numerator N sorts below the base (1/(1+x) + x/(1+x)^2 → x-term first,
+/// (1+x)^-2 + x/(1+x) and (1+x)^-2 + (2+x)/(3+x) keep the bare power
+/// first), but the BARE side leads outright when N sorts above the base
+/// ((5-4x)^(-1) + (1+4x)/(5-4x)^2, (1-2x)^(-1) + x/(1-2x)^2 — decoded
+/// from the intra-Times sort + trailing-factor scan). Both input orders
+/// canonicalize. Returns None when the shape doesn't apply.
+fn cross_shape_shared_denom_order(
+  a: &Expr,
+  b: &Expr,
+) -> Option<std::cmp::Ordering> {
+  use std::cmp::Ordering;
+  fn is_product(e: &Expr) -> bool {
+    matches!(e, Expr::FunctionCall { name, .. } if name == "Times")
+      || matches!(
+        e,
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          ..
+        }
+      )
+  }
+  fn collect_factors<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        args.iter().for_each(|x| collect_factors(x, out));
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        collect_factors(left, out);
+        collect_factors(right, out);
+      }
+      _ => out.push(e),
+    }
+  }
+  let (pow_expr, prod_expr, pow_is_a) = if !is_product(a) && is_product(b) {
+    (a, b, true)
+  } else if is_product(a) && !is_product(b) {
+    (b, a, false)
+  } else {
+    return None;
+  };
+  let (base_p, ep) = cmp_neg_pow(pow_expr)?;
+  if !cmp_is_sum_base(base_p) || cmp_is_call_like(prod_expr) {
+    return None;
+  }
+  let mut factors = Vec::new();
+  collect_factors(prod_expr, &mut factors);
+  for f in &factors {
+    if let Some((base_t, et)) = cmp_neg_pow(f)
+      && et != ep
+      && compare_expr_canonical(base_p, base_t) == Ordering::Equal
+    {
+      // The product's single non-numeric numerator sorting ABOVE the base
+      // puts the bare power first regardless of exponents.
+      let numerators: Vec<&&Expr> = factors
+        .iter()
+        .filter(|g| cmp_neg_pow(g).is_none() && !is_numeric_literal_part(g))
+        .collect();
+      if numerators.len() == 1
+        && compare_univar_polys(numerators[0], base_p)
+          == Some(Ordering::Greater)
+      {
+        return Some(if pow_is_a {
+          Ordering::Less
+        } else {
+          Ordering::Greater
+        });
+      }
+      return Some(if pow_is_a { ep.cmp(&et) } else { et.cmp(&ep) });
+    }
+  }
+  None
+}
+
+/// The value of a plain number — Integer, BigInteger, Real or Rational — for
+/// canonical ordering. Anything else (a numeric radical, say) is excluded:
+/// those have their own base-then-exponent rule.
+fn plain_number_value(e: &Expr) -> Option<f64> {
+  use num_traits::ToPrimitive;
+  match e {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(v) => Some(*v),
+    Expr::BigInteger(n) => n.to_f64(),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(n), Expr::Integer(d)) if *d != 0 => {
+          Some(*n as f64 / *d as f64)
+        }
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+fn compare_expr_canonical(a: &Expr, b: &Expr) -> std::cmp::Ordering {
+  use std::cmp::Ordering;
+
+  // Two compatible Quantities sort by their physical value (converting to a
+  // common unit), so Sort[{3 m, 100 cm, 2 m}] -> {100 cm, 2 m, 3 m}. A tie in
+  // value falls through to the structural comparison below.
+  if let Some(ord) = crate::functions::quantity_ast::try_quantity_compare(a, b)
+    && ord != Ordering::Equal
+  {
+    return ord;
+  }
+
+  if let Some(ord) = cross_shape_shared_denom_order(a, b) {
+    return ord;
+  }
+
+  // Numeric radicals compare by base ascending, then exponent ascending —
+  // Sqrt[5/3] + Sqrt[3] keeps Sqrt[5/3] first because 5/3 < 3
+  // (wolframscript-verified). The type-tag/argument comparison below would
+  // order the Integer-based Sqrt[3] ahead of the Rational-based Sqrt[5/3].
+  if let Some(ord) =
+    crate::functions::list_helpers_ast::sorting::numeric_base_power_cmp(a, b)
+    && ord != Ordering::Equal
+  {
+    return ord;
+  }
+
+  // Assign a type tag for top-level ordering
+  fn type_tag(e: &Expr) -> u8 {
+    match e {
+      Expr::Integer(_) => 0,
+      Expr::Real(_) => 1,
+      Expr::Constant(_) => 2,
+      Expr::Identifier(_) => 3,
+      Expr::UnaryOp { .. } => 4,
+      Expr::BinaryOp { .. } => 5,
+      Expr::FunctionCall { .. } => 6,
+      _ => 7,
+    }
+  }
+
+  // Wolfram's canonical Order treats `Pattern[name, Blank[]]` etc. as
+  // FunctionCalls with head "Pattern" (or "Optional"/"PatternTest"), so
+  // these compound atoms sort against other compound terms by alphabetical
+  // head name. Return the implied head when `e` is a pattern-like atom.
+  fn pattern_compound_head(e: &Expr) -> Option<&'static str> {
+    match e {
+      Expr::Pattern { .. } => Some("Pattern"),
+      Expr::PatternOptional { .. } => Some("Optional"),
+      Expr::PatternTest { .. } => Some("PatternTest"),
+      _ => None,
+    }
+  }
+
+  // Normalize a top-level BinaryOp head to the canonical FunctionCall name.
+  fn binop_head(op: BinaryOperator) -> &'static str {
+    match op {
+      BinaryOperator::Plus | BinaryOperator::Minus => "Plus",
+      BinaryOperator::Times | BinaryOperator::Divide => "Times",
+      BinaryOperator::Power => "Power",
+      BinaryOperator::And => "And",
+      BinaryOperator::Or => "Or",
+      BinaryOperator::StringJoin => "StringJoin",
+      BinaryOperator::Alternatives => "Alternatives",
+    }
+  }
+
+  // Cross-type rule: pattern atoms compare against any compound term
+  // (BinaryOp / FunctionCall) by alphabetical head, matching Wolfram's
+  // `Order[a_, b_*c_] = 1` (Pattern < Times) and
+  // `Order[a_, B[c_]] = -1` (Pattern > B) results.
+  let cross_head = |x: &Expr| -> Option<&'static str> {
+    if let Some(h) = pattern_compound_head(x) {
+      return Some(h);
+    }
+    match x {
+      Expr::FunctionCall { name, .. } => {
+        // Static-string ergonomics: compare via Box::leak isn't safe for our
+        // closure return — fall back to None and let the regular FunctionCall
+        // branch handle these cases.
+        let _ = name;
+        None
+      }
+      Expr::BinaryOp { op, .. } => Some(binop_head(*op)),
+      _ => None,
+    }
+  };
+  match (pattern_compound_head(a), pattern_compound_head(b)) {
+    (Some(ha), None) => {
+      if let Some(hb) = cross_head(b) {
+        let cmp = ha.cmp(hb);
+        if cmp != Ordering::Equal {
+          return cmp;
+        }
+      } else if let Expr::FunctionCall { name: nb, .. } = b {
+        let cmp = ha.cmp(nb.as_str());
+        if cmp != Ordering::Equal {
+          return cmp;
+        }
+      }
+    }
+    (None, Some(hb)) => {
+      if let Some(ha) = cross_head(a) {
+        let cmp = ha.cmp(hb);
+        if cmp != Ordering::Equal {
+          return cmp;
+        }
+      } else if let Expr::FunctionCall { name: na, .. } = a {
+        let cmp = na.as_str().cmp(hb);
+        if cmp != Ordering::Equal {
+          return cmp;
+        }
+      }
+    }
+    _ => {}
+  }
+
+  // Sum vs non-sum: Wolfram compares the term sequences from the highest
+  // (last) canonical term backwards, so `Gamma[a - s]` sorts before
+  // `Gamma[s]` (last term -s < s by coefficient) while `Gamma[s]` sorts
+  // before `Gamma[-s + x]` (last term x > s). When the compared suffix
+  // ties, the operand with FEWER terms sorts first (`s < 2 + s`).
+  if pattern_compound_head(a).is_none() && pattern_compound_head(b).is_none() {
+    let a_terms = sum_term_list(a);
+    let b_terms = sum_term_list(b);
+    if a_terms.is_some() != b_terms.is_some() {
+      let av = a_terms.unwrap_or_else(|| vec![a.clone()]);
+      let bv = b_terms.unwrap_or_else(|| vec![b.clone()]);
+      for (x, y) in av.iter().rev().zip(bv.iter().rev()) {
+        let cmp = compare_expr_canonical(x, y);
+        if cmp != Ordering::Equal {
+          return cmp;
+        }
+      }
+      return av.len().cmp(&bv.len());
+    }
+  }
+
+  // Two plain numbers compare by value, whatever type they are written as:
+  // `Order[2, 3/2]` is -1 because 3/2 < 2, where the type tags below would
+  // put the Integer before the Rational. This is what makes
+  // `Log[5/4] + Log[3/2] + Log[2]` ascend in the argument rather than in its
+  // spelling.
+  if let (Some(x), Some(y)) = (plain_number_value(a), plain_number_value(b))
+    && let Some(ord) = x.partial_cmp(&y)
+    && ord != Ordering::Equal
+  {
+    return ord;
+  }
+
+  let ta = type_tag(a);
+  let tb = type_tag(b);
+
+  match (a, b) {
+    (Expr::Integer(x), Expr::Integer(y)) => x.cmp(y),
+    (Expr::Real(x), Expr::Real(y)) => {
+      x.partial_cmp(y).unwrap_or(Ordering::Equal)
+    }
+    (Expr::Identifier(x), Expr::Identifier(y)) => {
+      let ord = crate::functions::list_helpers_ast::wolfram_string_order(x, y);
+      if ord > 0 {
+        Ordering::Less
+      } else if ord < 0 {
+        Ordering::Greater
+      } else {
+        Ordering::Equal
+      }
+    }
+    (Expr::Constant(x), Expr::Constant(y)) => {
+      let ord = crate::functions::list_helpers_ast::wolfram_string_order(x, y);
+      if ord > 0 {
+        Ordering::Less
+      } else if ord < 0 {
+        Ordering::Greater
+      } else {
+        Ordering::Equal
+      }
+    }
+    // Cross-compare Constants and Identifiers using case-insensitive ordering
+    // (Wolfram doesn't separate these by type in Times ordering)
+    (Expr::Constant(x), Expr::Identifier(y))
+    | (Expr::Identifier(x), Expr::Constant(y)) => {
+      let ord = crate::functions::list_helpers_ast::wolfram_string_order(x, y);
+      if ord > 0 {
+        Ordering::Less
+      } else if ord < 0 {
+        Ordering::Greater
+      } else {
+        Ordering::Equal
+      }
+    }
+    (
+      Expr::FunctionCall { name: na, args: aa },
+      Expr::FunctionCall { name: nb, args: ab },
+    ) => {
+      // `Derivative[n, f, x]` and similar 3+-arg `Derivative` forms are
+      // really the flattened representation of the curried call
+      // `Derivative[n][f][x]`. In Wolfram's canonical Times ordering, this
+      // 3-level curried call sorts AFTER any single-level FunctionCall like
+      // `g[w]`, regardless of head-name comparison. Detect the curried form
+      // (Derivative with at least one non-integer arg) and treat it as
+      // higher-priority (sorts later) than non-Derivative FunctionCalls.
+      let is_curried_derivative = |n: &str, args: &[Expr]| -> bool {
+        n == "Derivative"
+          && args.len() >= 3
+          && args.iter().any(|a| !matches!(a, Expr::Integer(_)))
+      };
+      let a_curried = is_curried_derivative(na, aa);
+      let b_curried = is_curried_derivative(nb, ab);
+      if a_curried && !b_curried && nb != "Derivative" {
+        return Ordering::Greater;
+      }
+      if b_curried && !a_curried && na != "Derivative" {
+        return Ordering::Less;
+      }
+      let cmp = na.cmp(nb);
+      if cmp != Ordering::Equal {
+        return cmp;
+      }
+      // For Plus and Times (both Orderless), Wolfram's canonical ordering
+      // compares the highest-key argument first (the last argument, since
+      // args are stored in ascending canonical order). When lengths differ
+      // and all compared terms match, the one with MORE terms sorts FIRST.
+      //
+      // Example (Plus): Order[1+n, -1+3*n+3*n^2] = 1 (1+n first), because
+      // the leading term `n` of `1+n` has lower degree than `3*n^2`.
+      //
+      // Example (Times): Order[x^2*(1+x^2)^-1, x^4*(1+x^2)^-2] = -1
+      // (the x^4*(1+x^2)^-2 term sorts first, because the trailing factor
+      // (1+x^2)^-2 has a smaller exponent than (1+x^2)^-1).
+      // Times terms sharing a denominator base order by ascending exponent
+      // regardless of the other polynomial factors: Order puts
+      // (c+d)*(1+x)^-2 before (a+b)*(1+x)^-1 ((a+b)/(1+x) + (c+d)/(1+x)^2
+      // → (c+d)/(1+x)^2 + (a+b)/(1+x)), which the trailing-factor scan
+      // below misses because the sum numerators sort after the Power
+      // factors and get compared first. Function-call factors override the
+      // exponent rule (f[x]/y + g[x]/y^2 and Dt[x]/y - (x*Dt[y])/y^2 keep
+      // the call order), so the rule only fires for call-free terms.
+      if na == "Times" {
+        fn contains_expr(hay: &Expr, needle: &Expr) -> bool {
+          if compare_expr_canonical(hay, needle) == Ordering::Equal {
+            return true;
+          }
+          match hay {
+            Expr::FunctionCall { args, .. } => {
+              args.iter().any(|a| contains_expr(a, needle))
+            }
+            Expr::List(items) => items.iter().any(|a| contains_expr(a, needle)),
+            Expr::BinaryOp { left, right, .. } => {
+              contains_expr(left, needle) || contains_expr(right, needle)
+            }
+            Expr::UnaryOp { operand, .. } => contains_expr(operand, needle),
+            _ => false,
+          }
+        }
+        fn collect_symbols(e: &Expr, out: &mut Vec<String>) {
+          match e {
+            Expr::Identifier(s) => {
+              if !out.contains(s) {
+                out.push(s.clone());
+              }
+            }
+            Expr::FunctionCall { args, .. } => {
+              args.iter().for_each(|a| collect_symbols(a, out));
+            }
+            Expr::List(items) => {
+              items.iter().for_each(|a| collect_symbols(a, out));
+            }
+            Expr::BinaryOp { left, right, .. } => {
+              collect_symbols(left, out);
+              collect_symbols(right, out);
+            }
+            Expr::UnaryOp { operand, .. } => collect_symbols(operand, out),
+            _ => {}
+          }
+        }
+        if !aa.iter().any(cmp_is_call_like) && !ab.iter().any(cmp_is_call_like)
+        {
+          for fa in aa {
+            if let Some((base_a, ea)) = cmp_neg_pow(fa) {
+              for fb in ab {
+                if let Some((base_b, eb)) = cmp_neg_pow(fb)
+                  && ea != eb
+                  && compare_expr_canonical(base_a, base_b) == Ordering::Equal
+                {
+                  if cmp_is_sum_base(base_a) {
+                    // Sum bases: a numerator sharing a variable with the
+                    // base sorts before one that doesn't; two sharing
+                    // numerators compare as polynomials (the generic
+                    // highest-term-first scan); ties and non-sharing
+                    // pairs order by ascending exponent, e.g.
+                    // (2+x)/(3+x) - (5+x)/(3+x)^2 but
+                    // (c+d)/(1+x)^2 + (a+b)/(1+x).
+                    let mut base_vars: Vec<String> = Vec::new();
+                    collect_symbols(base_a, &mut base_vars);
+                    fn numerators(args: &[Expr]) -> Vec<&Expr> {
+                      args
+                        .iter()
+                        .filter(|f| {
+                          cmp_neg_pow(f).is_none()
+                            && !is_numeric_literal_part(f)
+                        })
+                        .collect()
+                    }
+                    let na_f = numerators(aa);
+                    let nb_f = numerators(ab);
+                    let shares = |fs: &[&Expr]| {
+                      fs.iter().any(|f| {
+                        base_vars.iter().any(|v| {
+                          contains_expr(f, &Expr::Identifier(v.clone()))
+                        })
+                      })
+                    };
+                    // A numeric-only term (no non-numeric numerator, e.g.
+                    // 4/(5-4x)) against a sharing product follows the
+                    // bare-power rule: the numeric side leads when the
+                    // sharing numerator sorts ABOVE the base
+                    // (4/(5-4x) + (4*(1+4x))/(5-4x)^2), ascending
+                    // exponent otherwise ((2+x)/(3+x)^2 + 4/(3+x)).
+                    let numeric_vs_sharing = |shared: &[&Expr]| {
+                      if shared.len() == 1
+                        && compare_univar_polys(shared[0], base_a)
+                          == Some(Ordering::Greater)
+                      {
+                        Some(())
+                      } else {
+                        None
+                      }
+                    };
+                    match (shares(&na_f), shares(&nb_f)) {
+                      (true, false) => {
+                        if nb_f.is_empty()
+                          && numeric_vs_sharing(&na_f).is_some()
+                        {
+                          return Ordering::Greater;
+                        }
+                        if nb_f.is_empty() {
+                          return ea.cmp(&eb);
+                        }
+                        return Ordering::Less;
+                      }
+                      (false, true) => {
+                        if na_f.is_empty()
+                          && numeric_vs_sharing(&nb_f).is_some()
+                        {
+                          return Ordering::Less;
+                        }
+                        if na_f.is_empty() {
+                          return ea.cmp(&eb);
+                        }
+                        return Ordering::Greater;
+                      }
+                      (true, true) => {
+                        if na_f.len() == 1 && nb_f.len() == 1 {
+                          // Two monomial numerators (no sum factor) follow
+                          // the leading-monomial-over-common-denominator
+                          // rule (ascending exponent when the shapes don't
+                          // fit it): x/(1+x) + x^2/(1+x)^2 reorders to
+                          // x^2/(1+x)^2 + x/(1+x). Only sum numerators
+                          // compare as polynomials ((2+x)/(3+x) stays
+                          // before (5+x)/(3+x)^2).
+                          if !cmp_is_sum_base(na_f[0])
+                            && !cmp_is_sum_base(nb_f[0])
+                          {
+                            if let Some(ord) = same_var_sum_base_order(
+                              na_f[0], ea, nb_f[0], eb, base_a,
+                            ) {
+                              return ord;
+                            }
+                            return ea.cmp(&eb);
+                          }
+                          let cmp = compare_expr_canonical(na_f[0], nb_f[0]);
+                          if cmp != Ordering::Equal {
+                            return cmp;
+                          }
+                        }
+                        return ea.cmp(&eb);
+                      }
+                      (false, false) => return ea.cmp(&eb),
+                    }
+                  }
+                  // Numerators containing the base itself are like-powers
+                  // of it; WL keeps their input order instead of applying
+                  // the exponent rule ((1-4x)/(5x) + (x-2x^2)/(5x^2) both
+                  // input orders stay put).
+                  let other_contains_base = aa
+                    .iter()
+                    .chain(ab.iter())
+                    .filter(|f| cmp_neg_pow(f).is_none())
+                    .any(|f| contains_expr(f, base_a));
+                  if !other_contains_base {
+                    return ea.cmp(&eb);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      if na == "Plus" || na == "Times" {
+        let mut ia = aa.iter().rev();
+        let mut ib = ab.iter().rev();
+        loop {
+          match (ia.next(), ib.next()) {
+            (Some(x), Some(y)) => {
+              let cmp = compare_expr_canonical(x, y);
+              if cmp != Ordering::Equal {
+                return cmp;
+              }
+            }
+            (Some(_), None) => return Ordering::Less, // more terms = first
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+          }
+        }
+      }
+      // Compare arguments element by element
+      for (arg_a, arg_b) in aa.iter().zip(ab.iter()) {
+        let cmp = compare_expr_canonical(arg_a, arg_b);
+        if cmp != Ordering::Equal {
+          return cmp;
+        }
+      }
+      aa.len().cmp(&ab.len())
+    }
+    (
+      Expr::BinaryOp {
+        op: op_a,
+        left: la,
+        right: ra,
+      },
+      Expr::BinaryOp {
+        op: op_b,
+        left: lb,
+        right: rb,
+      },
+    ) => {
+      // Normalize Minus→Plus and Divide→Times for comparison,
+      // matching Wolfram's canonical form.
+      let (norm_op_a, norm_ra) = if *op_a == BinaryOperator::Minus {
+        (
+          BinaryOperator::Plus,
+          Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            operand: ra.clone(),
+          },
+        )
+      } else if *op_a == BinaryOperator::Divide {
+        (
+          BinaryOperator::Times,
+          Expr::BinaryOp {
+            op: BinaryOperator::Power,
+            left: ra.clone(),
+            right: Box::new(Expr::Integer(-1)),
+          },
+        )
+      } else {
+        (*op_a, *ra.clone())
+      };
+      let (norm_op_b, norm_rb) = if *op_b == BinaryOperator::Minus {
+        (
+          BinaryOperator::Plus,
+          Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            operand: rb.clone(),
+          },
+        )
+      } else if *op_b == BinaryOperator::Divide {
+        (
+          BinaryOperator::Times,
+          Expr::BinaryOp {
+            op: BinaryOperator::Power,
+            left: rb.clone(),
+            right: Box::new(Expr::Integer(-1)),
+          },
+        )
+      } else {
+        (*op_b, *rb.clone())
+      };
+      // Compare by canonical operator name (alphabetical) rather than
+      // enum discriminant, so Power sorts before Times, matching Wolfram.
+      let op_name = |op: &BinaryOperator| -> &str {
+        match op {
+          BinaryOperator::Plus => "Plus",
+          BinaryOperator::Minus => "Plus",
+          BinaryOperator::Times => "Times",
+          BinaryOperator::Divide => "Times",
+          BinaryOperator::Power => "Power",
+          BinaryOperator::And => "And",
+          BinaryOperator::Or => "Or",
+          BinaryOperator::StringJoin => "StringJoin",
+          BinaryOperator::Alternatives => "Alternatives",
+        }
+      };
+      let cmp = op_name(&norm_op_a).cmp(op_name(&norm_op_b));
+      if cmp != Ordering::Equal {
+        return cmp;
+      }
+      let cmp = compare_expr_canonical(la, lb);
+      if cmp != Ordering::Equal {
+        return cmp;
+      }
+      compare_expr_canonical(&norm_ra, &norm_rb)
+    }
+    (
+      Expr::UnaryOp { op: _, operand: oa },
+      Expr::UnaryOp { op: _, operand: ob },
+    ) => compare_expr_canonical(oa, ob),
+    // Negated vs non-negated: -x sorts before x
+    // Handle both UnaryOp::Minus and Times[-1, x] / Times[negative, x]
+    _ if is_negated_form(a) && !is_negated_form(b) => {
+      let inner_a = strip_negation(a);
+      let inner_cmp = compare_expr_canonical(&inner_a, b);
+      if inner_cmp == Ordering::Equal {
+        Ordering::Less // -x < x
+      } else {
+        inner_cmp
+      }
+    }
+    _ if !is_negated_form(a) && is_negated_form(b) => {
+      let inner_b = strip_negation(b);
+      let inner_cmp = compare_expr_canonical(a, &inner_b);
+      if inner_cmp == Ordering::Equal {
+        Ordering::Greater // x > -x
+      } else {
+        inner_cmp
+      }
+    }
+    _ => {
+      // When one side is a Power and the other is its base, treat the bare
+      // base as `Power[base, 1]` so they compare consistently by exponent.
+      // This matters for Times canonical ordering where e.g. `K2` (bare)
+      // and `K2^2` appear side-by-side in different Times products.
+      if let Some((b_base, b_exp)) = extract_power_base_exp(b)
+        && exprs_equal_canonically(a, &b_base)
+      {
+        let exp_cmp = compare_expr_canonical(&Expr::Integer(1), &b_exp);
+        if exp_cmp != Ordering::Equal {
+          return exp_cmp;
+        }
+      }
+      if let Some((a_base, a_exp)) = extract_power_base_exp(a)
+        && exprs_equal_canonically(&a_base, b)
+      {
+        let exp_cmp = compare_expr_canonical(&a_exp, &Expr::Integer(1));
+        if exp_cmp != Ordering::Equal {
+          return exp_cmp;
+        }
+      }
+      if ta == tb {
+        // Fall back to string comparison
+        let sa = expr_to_string(a);
+        let sb = expr_to_string(b);
+        sa.cmp(&sb)
+      } else {
+        ta.cmp(&tb)
+      }
+    }
+  }
+}
+
+/// Flatten a sum expression (FunctionCall "Plus" or BinaryOp Plus/Minus
+/// chains) into its term list, preserving the stored (canonical) order.
+/// Returns None when `e` is not a sum.
+fn sum_term_list(e: &Expr) -> Option<Vec<Expr>> {
+  fn collect(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args }
+        if name == "Plus" && args.len() >= 2 =>
+      {
+        for a in args {
+          collect(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => {
+        collect(left, out);
+        collect(right, out);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        left,
+        right,
+      } => {
+        collect(left, out);
+        out.push(Expr::UnaryOp {
+          op: UnaryOperator::Minus,
+          operand: right.clone(),
+        });
+      }
+      _ => out.push(e.clone()),
+    }
+  }
+  match e {
+    Expr::FunctionCall { name, args } if name == "Plus" && args.len() >= 2 => {
+      let mut out = Vec::new();
+      collect(e, &mut out);
+      Some(out)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus | BinaryOperator::Minus,
+      ..
+    } => {
+      let mut out = Vec::new();
+      collect(e, &mut out);
+      Some(out)
+    }
+    _ => None,
+  }
+}
+
+/// Extract (base, exponent) from a Power expression. Returns None for non-Powers.
+fn extract_power_base_exp(e: &Expr) -> Option<(Expr, Expr)> {
+  match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => Some(((**left).clone(), (**right).clone())),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      Some((args[0].clone(), args[1].clone()))
+    }
+    _ => None,
+  }
+}
+
+/// Structural equality check using canonical comparison.
+fn exprs_equal_canonically(a: &Expr, b: &Expr) -> bool {
+  compare_expr_canonical(a, b) == std::cmp::Ordering::Equal
+}
+
+/// Check if an expression is a negated form: UnaryOp::Minus(x), Times[-1, x],
+/// Times[negative_integer, x], or BinaryOp::Times with -1.
+fn is_negated_form(e: &Expr) -> bool {
+  match e {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      ..
+    } => true,
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      matches!(&args[0], Expr::Integer(n) if *n < 0)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      ..
+    } => matches!(left.as_ref(), Expr::Integer(n) if *n < 0),
+    _ => false,
+  }
+}
+
+/// Strip negation from a negated form, returning the positive inner expression.
+fn strip_negation(e: &Expr) -> Expr {
+  match e {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => *operand.clone(),
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      if let Expr::Integer(n) = &args[0] {
+        let pos_n = -n;
+        if pos_n == 1 && args.len() == 2 {
+          args[1].clone()
+        } else {
+          let mut new_args = args.clone();
+          new_args[0] = Expr::Integer(pos_n);
+          Expr::FunctionCall {
+            name: "Times".to_string(),
+            args: new_args,
+          }
+        }
+      } else {
+        e.clone()
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      if let Expr::Integer(n) = left.as_ref() {
+        let pos_n = -n;
+        if pos_n == 1 {
+          *right.clone()
+        } else {
+          Expr::BinaryOp {
+            op: BinaryOperator::Times,
+            left: Box::new(Expr::Integer(pos_n)),
+            right: right.clone(),
+          }
+        }
+      } else {
+        e.clone()
+      }
+    }
+    _ => e.clone(),
+  }
+}
+
+/// Sort symbolic factors in Times using the same ordering as Wolfram:
+/// polynomial-like terms first (variables, powers), then transcendental functions,
+/// with alphabetical ordering within each group.
+/// Compute term priority for sorting: 0 = polynomial-like, 1 = transcendental.
+/// The head of a plain function call — one that is not an arithmetic or
+/// pattern structure, whose ordering rules live elsewhere.
+fn plain_call_head(e: &Expr) -> Option<&str> {
+  match e {
+    Expr::FunctionCall { name, .. }
+      if !matches!(
+        name.as_str(),
+        "Plus" | "Times" | "Power" | "Rational" | "Complex" | "List"
+          // Derivative[n][f][x] is stored flat here, but its head is really
+          // the compound Derivative[n][f], which orders after a symbol-headed
+          // call: wolframscript gives `g[w]*Derivative[1][f][0]`.
+          | "Derivative"
+      ) =>
+    {
+      Some(name.as_str())
+    }
+    _ => None,
+  }
+}
+
+pub fn term_priority(e: &Expr) -> i32 {
+  match e {
+    Expr::Identifier(_) => 0,
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => term_priority(left),
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      ..
+    } => term_priority(left),
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => term_priority(left).max(term_priority(right)),
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Times" => args.iter().map(term_priority).max().unwrap_or(0),
+      "Power" if !args.is_empty() => term_priority(&args[0]),
+      "Plus" | "Rational" => 0,
+      "Sin" | "Cos" | "Tan" | "Cot" | "Sec" | "Csc" | "Sinh" | "Cosh"
+      | "Tanh" | "Coth" | "Sech" | "Csch" | "ArcSin" | "ArcCos" | "ArcTan"
+      | "ArcCot" | "ArcSec" | "ArcCsc" | "Exp" | "Log" | "Factorial"
+      | "Gamma" | "Erf" | "Erfc" | "Erfi" | "PolyLog" | "LogIntegral"
+      | "SinIntegral" | "CosIntegral" | "SinhIntegral" | "CoshIntegral"
+      | "ExpIntegralEi" | "ExpIntegralE" | "FresnelS" | "FresnelC" => 1,
+      _ => 0,
+    },
+    Expr::UnaryOp { operand, .. } => term_priority(operand),
+    // CurriedCall like Derivative[1][f][x] — treat as algebraic (priority 0)
+    Expr::CurriedCall { .. } => 0,
+    _ => 0,
+  }
+}
+
+/// Sub-priority for Times factor ordering: identifiers before compound expressions.
+/// This ensures simple symbols sort before sums/products, matching Wolfram behavior.
+fn times_factor_subpriority(e: &Expr) -> i32 {
+  match e {
+    // Arbitrary-precision numerics survive in `symbolic_args` rather
+    // than being absorbed into the integer coefficient, so they pass
+    // through the Times canonical sort. Wolfram puts them BEFORE the
+    // imaginary unit (e.g. `N[Pi, 30]*I` displays as `<BigFloat>*I`,
+    // not `I*<BigFloat>`), hence the priority below `I`'s −2.
+    Expr::BigFloat(_, _) | Expr::BigInteger(_) => -3,
+    // Imaginary unit I sorts before all other symbolic factors
+    Expr::Identifier(name) if name == "I" => -2,
+    Expr::Identifier(_) | Expr::Constant(_) => 0,
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => {
+      let base_sp = times_factor_subpriority(left);
+      // Power[Plus[...], n] sorts alongside identifiers (subpriority 0),
+      // not after them (subpriority 1). Wolfram puts (1+x)^2 before plain s.
+      // Power[func_call, n] (e.g. Sin[x]^2) keeps the function call subpriority
+      // so it sorts alongside other function calls.
+      if base_sp == 1 { 0 } else { base_sp }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus | BinaryOperator::Minus,
+      ..
+    } => 1,
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Times" => args.iter().map(times_factor_subpriority).max().unwrap_or(0),
+      "Rational" => 0,
+      // Complex number literals (1 + I, 1 - I, etc.) sort like numeric constants
+      "Plus"
+        if args.iter().all(|a| match a {
+          Expr::Integer(_) | Expr::Real(_) => true,
+          Expr::Constant(s) if s == "I" => true,
+          Expr::FunctionCall { name: tn, args: ta } if tn == "Times" => {
+            ta.iter().all(|t| {
+              matches!(t, Expr::Integer(_) | Expr::Real(_))
+                || matches!(t, Expr::Constant(s) if s == "I")
+            })
+          }
+          _ => false,
+        }) =>
+      {
+        -1
+      }
+      "Plus" => 1,
+      // Power[base, exp] and Sqrt[base] sort like their base (same as BinaryOp::Power)
+      "Sqrt" if args.len() == 1 => {
+        let base_sp = times_factor_subpriority(&args[0]);
+        if base_sp == 1 { 0 } else { base_sp }
+      }
+      "Power" if args.len() == 2 => {
+        let base_sp = times_factor_subpriority(&args[0]);
+        if base_sp == 1 { 0 } else { base_sp }
+      }
+      // Numeric-constant function calls (e.g. Log[2], Sqrt[3]) sort before variables
+      // but after the imaginary unit I. Only applies to known math functions.
+      "Log" | "Sqrt" | "Sin" | "Cos" | "Tan" | "Exp" | "Abs"
+        if args.iter().all(|a| {
+          matches!(a, Expr::Integer(_) | Expr::Real(_) | Expr::Constant(_))
+        }) =>
+      {
+        -1
+      }
+      _ => 2,
+    },
+    // CurriedCall (e.g. Derivative[1][y][x]) sorts after regular function
+    // calls — except curried `Derivative[n][expr]`, which gets the same
+    // subpriority as the equivalent flat `Derivative[n, expr]` form
+    // (FunctionCall, subpriority 2). Without this, mixed `Derivative[1][f]`
+    // (flat) and `Derivative[1][string]` (curried) factors don't share
+    // a sort bucket and can't be compared structurally for canonical Times
+    // ordering.
+    Expr::CurriedCall { func, .. }
+      if matches!(func.as_ref(),
+        Expr::FunctionCall { name, .. } if name == "Derivative") =>
+    {
+      2
+    }
+    Expr::CurriedCall { .. } => 3,
+    _ => 0,
+  }
+}
+
+/// Base and numeric exponent of a Times/Plus term for canonical-order
+/// comparisons: sees through unary minus and numeric Times coefficients
+/// (`-2*f[x]^3` → base `f[x]`, exponent 3). A symbolic exponent
+/// (e.g. `E^(2*mu + sigma^2)`) yields None.
+fn times_term_base_exp(e: &Expr) -> (Expr, Option<f64>) {
+  match e {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => times_term_base_exp(operand),
+    Expr::FunctionCall { name, args }
+      if name == "Times" && !args.is_empty() =>
+    {
+      times_term_base_exp(args.last().unwrap())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      right,
+      ..
+    } => times_term_base_exp(right),
+    _ => {
+      let (base, exp) = extract_base_exponent(e);
+      let exp_num = match &exp {
+        Expr::Integer(n) => Some(*n as f64),
+        Expr::Real(r) => Some(*r),
+        Expr::FunctionCall { name, args }
+          if name == "Rational" && args.len() == 2 =>
+        {
+          if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+            Some(*n as f64 / *d as f64)
+          } else {
+            None
+          }
+        }
+        _ => None,
+      };
+      (base, exp_num)
+    }
+  }
+}
+
+/// If `e` is a canonical `Plus[...]` function call, return its args.
+fn plus_call_args(e: &Expr) -> Option<&[Expr]> {
+  match e {
+    Expr::FunctionCall { name, args } if name == "Plus" && !args.is_empty() => {
+      Some(args)
+    }
+    _ => None,
+  }
+}
+
+/// The additive base of a positive power, for factors like `Sqrt[1 + x]` and
+/// `(1 + x)^2` whose ordering follows the sum they wrap. A negative exponent
+/// puts the factor in a denominator, where the existing reciprocal-power
+/// comparison already has Wolfram's ordering decoded, so those are excluded.
+fn power_additive_base(e: &Expr) -> Option<&Expr> {
+  let is_positive_exp = |x: &Expr| match x {
+    Expr::Integer(n) => *n > 0,
+    Expr::Real(r) => *r > 0.0,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      matches!(&args[0], Expr::Integer(n) if *n > 0)
+        && matches!(&args[1], Expr::Integer(d) if *d > 0)
+    }
+    _ => false,
+  };
+  let base = match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } if is_positive_exp(right) => left.as_ref(),
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => {
+      &args[0]
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Power" && args.len() == 2 && is_positive_exp(&args[1]) =>
+    {
+      &args[0]
+    }
+    _ => return None,
+  };
+  plus_call_args(base).is_some().then_some(base)
+}
+
+/// Order a non-additive Times factor against an additive (Plus) factor
+/// the way Wolfram does: compare the factor's base with the base of the
+/// Plus's highest (last) term — the smaller base sorts first, so
+/// `f[x]*(1 + g[x])` but `(1 + f[x])*g[x]`. When the bases tie, the
+/// factor sorts first (`f[x]*(1 + f[x])`, `x*(-3 + x^2)`) unless its
+/// exponent is >= the top term's and the Plus starts with a negative
+/// number or ends in a negated term (`(-1 + x)*x^2`, `(2 - f[x])*f[x]`).
+/// Returns Less when the factor sorts first.
+fn order_factor_vs_additive(
+  factor: &Expr,
+  plus_args: &[Expr],
+) -> std::cmp::Ordering {
+  use std::cmp::Ordering;
+  let top = plus_args.last().unwrap();
+  let (fb, fe) = times_term_base_exp(factor);
+  // A variable-power factor against a univariate polynomial sum in the
+  // SAME variable compares by coefficient vector, the factor flattening
+  // to plain-x coefficients [0, 1] whatever its positive exponent:
+  // degree ascending, then coefficients from the leading term down, a
+  // full tie keeping the factor first. All wolframscript-verified:
+  // x^2*(1 + x), x^3*(-1 + x^2), (-1 + x)*x^2, x^2*(-1 + x^2),
+  // (-2 + x)*x^2, x^2*(-1 + 2*x), (-1/2 + x)*x^2, Pi^2*(-1 + Pi^2).
+  if let Some(v) = sym_var_name(&fb)
+    && fe.is_some_and(|e| e > 0.0)
+  {
+    let sum_expr = call("Plus", plus_args.to_vec());
+    if let Some((sv, coeffs)) = univar_rat_coeffs(&sum_expr)
+      && sv == v
+    {
+      let deg = coeffs.iter().rposition(|&(n, _)| n != 0).unwrap_or(0);
+      match 1.cmp(&deg) {
+        Ordering::Equal => {}
+        ord => return ord,
+      }
+      let fvec = [(0i128, 1i128), (1, 1)];
+      for i in (0..=deg).rev() {
+        let x = fvec.get(i).copied().unwrap_or((0, 1));
+        let y = coeffs.get(i).copied().unwrap_or((0, 1));
+        match rat_cmp(x, y) {
+          Ordering::Equal => {}
+          ord => return ord,
+        }
+      }
+      return Ordering::Less;
+    }
+  }
+  let (hb, he) = times_term_base_exp(top);
+  // Atom bases compare by name only — compare_exprs would evaluate
+  // constants numerically and order Pi (numeric) before I (non-numeric),
+  // but Wolfram writes `(2 + I)*Pi`.
+  let ord = if matches!(fb, Expr::Identifier(_) | Expr::Constant(_))
+    && matches!(hb, Expr::Identifier(_) | Expr::Constant(_))
+  {
+    crate::functions::list_helpers_ast::wolfram_string_order(
+      &expr_to_string(&fb),
+      &expr_to_string(&hb),
+    )
+  } else {
+    crate::functions::list_helpers_ast::compare_exprs(&fb, &hb)
+  };
+  if ord > 0 {
+    return Ordering::Less;
+  }
+  if ord < 0 {
+    return Ordering::Greater;
+  }
+  if let (Some(f), Some(h)) = (fe, he)
+    && f < h
+  {
+    return Ordering::Less;
+  }
+  if is_negated_form(top) {
+    return Ordering::Greater;
+  }
+  // A negative leading constant pulls the additive forward only in the
+  // exact `Plus[negative number, base^n]` shape with numeric exponents:
+  // `(-3 + x)*x` and `(-1 + x)*x^2`, but `x*(-4 + 11*x)` (coefficient on
+  // the top term), `b*(-1 + a + b)` (extra terms), and
+  // `E^(2*mu + sigma^2)*(-1 + E^sigma^2)` (symbolic exponents).
+  let neg_leading = match plus_args.first() {
+    Some(Expr::Integer(n)) => *n < 0,
+    Some(Expr::Real(r)) => *r < 0.0,
+    Some(Expr::FunctionCall { name, args }) if name == "Rational" => {
+      matches!(args.first(), Some(Expr::Integer(n)) if *n < 0)
+    }
+    _ => false,
+  };
+  let top_is_bare = !matches!(
+    top,
+    Expr::UnaryOp { .. }
+      | Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        ..
+      }
+  ) && !matches!(top, Expr::FunctionCall { name, .. } if name == "Times");
+  if neg_leading
+    && top_is_bare
+    && plus_args.len() == 2
+    && fe.is_some()
+    && he.is_some()
+  {
+    Ordering::Greater
+  } else {
+    Ordering::Less
+  }
+}
+
+/// The decoded WL ordering of an identifier-based factor against a
+/// canonical Plus factor in a Times product, or None when the pair is not
+/// of that shape. Lets Factor put its display factors in canonical order
+/// without a full re-sort (which would disturb sum-vs-sum order).
+pub fn order_monomial_vs_sum(
+  factor: &Expr,
+  sum: &Expr,
+) -> Option<std::cmp::Ordering> {
+  // Factored displays build sums as BinaryOp Plus chains, which
+  // plus_call_args does not see; flatten both representations. Minus
+  // chains are left alone (their construction order already matches).
+  fn flatten_plus(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Plus" => {
+        for a in args {
+          flatten_plus(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => {
+        flatten_plus(left, out);
+        flatten_plus(right, out);
+      }
+      other => out.push(other.clone()),
+    }
+  }
+  let is_plus = matches!(sum, Expr::FunctionCall { name, .. } if name == "Plus")
+    || matches!(
+      sum,
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        ..
+      }
+    );
+  if !is_plus {
+    return None;
+  }
+  let mut terms = Vec::new();
+  flatten_plus(sum, &mut terms);
+  if terms.len() < 2 {
+    return None;
+  }
+  if power_const_base(factor).is_some() {
+    return None;
+  }
+  if !matches!(
+    times_term_base_exp(factor).0,
+    Expr::Identifier(_) | Expr::Constant(_)
+  ) {
+    return None;
+  }
+  Some(order_factor_vs_additive(factor, &terms))
+}
+
+pub fn sort_symbolic_factors(symbolic_args: &mut [Expr]) {
+  // `#n` orders as the `Slot[n]` call it is (`a*#1`, `f[x]*#1`), so slots
+  // take part in the sort in that form and are put back afterwards.
+  let has_slot = symbolic_args
+    .iter()
+    .any(|e| matches!(e, Expr::Slot(_) | Expr::SlotSequence(_)));
+  if has_slot {
+    for e in symbolic_args.iter_mut() {
+      if let Some(c) =
+        crate::functions::list_helpers_ast::sorting::slot_as_call(e)
+      {
+        *e = c;
+      }
+    }
+  }
+  sort_symbolic_factors_inner(symbolic_args);
+  if has_slot {
+    for e in symbolic_args.iter_mut() {
+      if let Expr::FunctionCall { name, args } = e
+        && args.len() == 1
+        && let Expr::Integer(n) = &args[0]
+        && *n >= 0
+      {
+        match name.as_str() {
+          "Slot" => *e = Expr::Slot(*n as usize),
+          "SlotSequence" => *e = Expr::SlotSequence(*n as usize),
+          _ => {}
+        }
+      }
+    }
+  }
+}
+
+fn sort_symbolic_factors_inner(symbolic_args: &mut [Expr]) {
+  // Radicals of integer bases where at least one base is negative — the
+  // shape left behind by `(-2)^(1/3) (-1)^(2/3)`, which wolframscript keeps
+  // unmerged. They order by base ascending, then exponent ascending, the
+  // same rule canonical Sort uses.
+  let signed_radical_parts = |e: &Expr| -> Option<(i128, (i128, i128))> {
+    let (base, exp) = match e {
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => (left.as_ref(), right.as_ref()),
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        (&args[0], &args[1])
+      }
+      _ => return None,
+    };
+    let Expr::Integer(b) = base else { return None };
+    let Expr::FunctionCall { name, args } = exp else {
+      return None;
+    };
+    if name != "Rational" || args.len() != 2 {
+      return None;
+    }
+    let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1]) else {
+      return None;
+    };
+    Some((*b, (*p, *q)))
+  };
+  // A complex number is a number: it leads the product like any other
+  // numeric coefficient — `(1 + 2*I)*Sqrt[2]`, `(1 + 2*I)*E`.
+  // (Pure imaginary factors keep their own subpriority below.)
+  let is_complex_number = |e: &Expr| matches!(try_extract_complex_exact(e), Some(((re_n, _), (im_n, _))) if re_n != 0 && im_n != 0);
+  // A power of an integer or rational sorts by that number, i.e. ahead of
+  // every symbolic factor: `Sqrt[3/2]*E^x`, `(3/2)^x*E^y`. Only the numbers
+  // themselves (the imaginary unit, a BigFloat) come first.
+  let is_number_base_power = |e: &Expr| {
+    let (base, exp) = extract_base_exponent(e);
+    !matches!(exp, Expr::Integer(1))
+      && (matches!(base, Expr::Integer(_))
+        || matches!(&base, Expr::FunctionCall { name, .. } if name == "Rational"))
+  };
+  let is_number = |e: &Expr| {
+    matches!(
+      e,
+      Expr::Integer(_)
+        | Expr::BigInteger(_)
+        | Expr::Real(_)
+        | Expr::BigFloat(..)
+    ) || matches!(e, Expr::Identifier(s) | Expr::Constant(s) if s == "I")
+      || try_extract_complex_exact(e).is_some()
+  };
+  symbolic_args.sort_by(|a, b| {
+    match (is_complex_number(a), is_complex_number(b)) {
+      (true, false) => return std::cmp::Ordering::Less,
+      (false, true) => return std::cmp::Ordering::Greater,
+      _ => {}
+    }
+    match (is_number_base_power(a), is_number_base_power(b)) {
+      (true, false) if !is_number(b) => return std::cmp::Ordering::Less,
+      (false, true) if !is_number(a) => return std::cmp::Ordering::Greater,
+      _ => {}
+    }
+    if let (Some((ba, (pa, qa))), Some((bb, (pb, qb)))) =
+      (signed_radical_parts(a), signed_radical_parts(b))
+      && (ba < 0 || bb < 0)
+    {
+      if ba != bb {
+        return ba.cmp(&bb);
+      }
+      let left = pa as f64 / qa as f64;
+      let right = pb as f64 / qb as f64;
+      if let Some(ord) = left.partial_cmp(&right)
+        && ord != std::cmp::Ordering::Equal
+      {
+        return ord;
+      }
+    }
+    // Two plain function calls with different heads are ordered by those
+    // heads, the way canonical order does: `Gamma[x]*Zeta[x]`, `f[x]*Zeta[x]`,
+    // `Erf[x]*LogGamma[x]`. Without this they fall into the priority buckets
+    // below, which only coincidentally agree with the head order — every head
+    // outside the transcendental list sorted first, however late its name.
+    if let (Some(na), Some(nb)) = (plain_call_head(a), plain_call_head(b))
+      && na != nb
+    {
+      // wolfram_string_order returns 1 when the first name comes first.
+      let ord = crate::functions::list_helpers_ast::wolfram_string_order(na, nb);
+      if ord > 0 {
+        return std::cmp::Ordering::Less;
+      }
+      if ord < 0 {
+        return std::cmp::Ordering::Greater;
+      }
+    }
+    // A Plus factor takes the max priority of its terms (like Times) so a
+    // transcendental sum such as (Cos[x]+Sin[x]) shares the bucket with
+    // Sin[x] and gets ordered by the top-term rule below. term_priority
+    // itself keeps Plus at 0 because other callers rely on that.
+    let eff_priority = |e: &Expr| match plus_call_args(e) {
+      Some(args) => args.iter().map(term_priority).max().unwrap_or(0),
+      None => term_priority(e),
+    };
+    let pa = eff_priority(a);
+    let pb = eff_priority(b);
+    if pa != pb {
+      return pa.cmp(&pb);
+    }
+    // Within same priority, identifiers before function calls
+    let sa = times_factor_subpriority(a);
+    let sb = times_factor_subpriority(b);
+    if sa != sb {
+      // Special case: an additive expression sorts BEFORE an identifier when:
+      // 1. The identifier appears with a negative coefficient: (x-y)*y not y*(x-y)
+      // 2. The additive is Plus[n, var] where n < 0 and var is the same identifier:
+      //    (-3+x)*x not x*(-3+x)   (monic linear factor with negative constant)
+      // This matches Wolfram's canonical ordering.
+      let is_bare_identifier =
+        |e: &Expr| matches!(e, Expr::Identifier(_) | Expr::Constant(_));
+      // An identifier (or power of one) vs a canonical Plus: order by the
+      // Plus's top term. This takes precedence over the negated-containment
+      // checks below because Wolfram gives `x*(-x + f[x])` — the negated -x
+      // inside the sum doesn't matter when the top term is a function call.
+      // Powers with a constant base (E^a) keep their dedicated sort-key
+      // comparison below.
+      let ident_base_factor = |e: &Expr| {
+        power_const_base(e).is_none()
+          && matches!(
+            times_term_base_exp(e).0,
+            Expr::Identifier(_) | Expr::Constant(_)
+          )
+      };
+      if sa == 0 && sb == 1
+        && let Some(pargs) = plus_call_args(b)
+        && ident_base_factor(a)
+      {
+        return order_factor_vs_additive(a, pargs);
+      }
+      if sa == 1 && sb == 0
+        && let Some(pargs) = plus_call_args(a)
+        && ident_base_factor(b)
+      {
+        return order_factor_vs_additive(b, pargs).reverse();
+      }
+      // Plain function-call factors (and their powers / curried calls) vs a
+      // canonical Plus: same top-term rule, so `f[x]*(1 + f[x])` keeps f[x]
+      // first while `(1 + f[x])*g[x]` stays additive-first.
+      if (sa == 2 || sa == 3) && sb == 1
+        && let Some(pargs) = plus_call_args(b)
+      {
+        return order_factor_vs_additive(a, pargs);
+      }
+      if sa == 1 && (sb == 2 || sb == 3)
+        && let Some(pargs) = plus_call_args(a)
+      {
+        return order_factor_vs_additive(b, pargs).reverse();
+      }
+      if sa == 0 && sb == 1 {
+        // a is Identifier, b is additive
+        if additive_contains_negated(b, a) || additive_is_neg_const_plus_ident(b, a) {
+          return std::cmp::Ordering::Greater; // b (additive) before a (identifier)
+        }
+        // Power with constant base (e.g. E^a) vs additive polynomial:
+        // compare by sort key so polynomial sorts before E^a when its
+        // variable comes before 'E' alphabetically (case-insensitive).
+        // Only applies when the Power base is a constant (E, Pi, etc.)
+        // and the additive has free variables (is a polynomial, not numeric).
+        if let Some(base) = power_const_base(a)
+          && has_free_variables(b)
+        {
+          let bk = crate::functions::list_helpers_ast::sorting::expr_sort_key(b);
+          let ord = crate::functions::list_helpers_ast::wolfram_string_order(&base, &bk);
+          if ord != 0 {
+            return if ord > 0 {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+        }
+        // Bare identifier vs additive: the additive sorts BEFORE the
+        // identifier when its highest-key arg is alphabetically smaller
+        // (matches Wolfram `Order[Plus[2,a,b], z] = 1`). Only applies
+        // for true bare identifiers — Power[x, n] keeps its existing
+        // comparison behaviour against additives.
+        if is_bare_identifier(a) {
+          let ak =
+            crate::functions::list_helpers_ast::sorting::expr_sort_key(a);
+          let bk =
+            crate::functions::list_helpers_ast::sorting::expr_sort_key(b);
+          let ord =
+            crate::functions::list_helpers_ast::wolfram_string_order(&bk, &ak);
+          if ord > 0 {
+            return std::cmp::Ordering::Greater; // additive first
+          }
+          if ord < 0 {
+            return std::cmp::Ordering::Less; // identifier first
+          }
+        }
+      } else if sa == 1 && sb == 0 {
+        // a is additive, b is Identifier
+        if additive_contains_negated(a, b) || additive_is_neg_const_plus_ident(a, b) {
+          return std::cmp::Ordering::Less; // a (additive) before b (identifier)
+        }
+        // Additive polynomial vs Power with constant base (e.g. E^a):
+        // compare by sort key.
+        if let Some(base) = power_const_base(b)
+          && has_free_variables(a)
+        {
+          let ak = crate::functions::list_helpers_ast::sorting::expr_sort_key(a);
+          let ord = crate::functions::list_helpers_ast::wolfram_string_order(&ak, &base);
+          if ord != 0 {
+            return if ord > 0 {
+              std::cmp::Ordering::Less
+            } else {
+              std::cmp::Ordering::Greater
+            };
+          }
+        }
+        // Mirror of the (identifier, additive) case above — only applies
+        // when b is a bare identifier so Power factors keep their
+        // existing comparison behaviour.
+        if is_bare_identifier(b) {
+          let ak =
+            crate::functions::list_helpers_ast::sorting::expr_sort_key(a);
+          let bk =
+            crate::functions::list_helpers_ast::sorting::expr_sort_key(b);
+          let ord =
+            crate::functions::list_helpers_ast::wolfram_string_order(&ak, &bk);
+          if ord > 0 {
+            return std::cmp::Ordering::Less; // additive first
+          }
+          if ord < 0 {
+            return std::cmp::Ordering::Greater; // identifier first
+          }
+        }
+      }
+      return sa.cmp(&sb);
+    }
+    // A power of a sum (`Sqrt[1 + x]`, `(1 + x)^2`) deliberately shares the
+    // identifier sub-priority, so the additive top-term rule above never sees
+    // it. Apply that same rule here, against the sum inside the power:
+    // `x*Sqrt[1 + x]` and `x*(1 + x)^2`, but `Sqrt[1 - x]*x` and `(1 + x)^2*y`.
+    if sa == 0 && sb == 0 {
+      // A sum holding the negation of the other factor's base (`(x - y)^-1`
+      // against `y^-1`) has its own rule further down; leave it to that.
+      let applies = |factor: &Expr, base: &Expr| {
+        power_const_base(factor).is_none()
+          && matches!(
+            times_term_base_exp(factor).0,
+            Expr::Identifier(_) | Expr::Constant(_)
+          )
+          && !additive_contains_negated(base, &times_term_base_exp(factor).0)
+      };
+      match (power_additive_base(a), power_additive_base(b)) {
+        (None, Some(base)) if applies(a, base) => {
+          if let Some(pargs) = plus_call_args(base) {
+            return order_factor_vs_additive(a, pargs);
+          }
+        }
+        (Some(base), None) if applies(b, base) => {
+          if let Some(pargs) = plus_call_args(base) {
+            return order_factor_vs_additive(b, pargs).reverse();
+          }
+        }
+        _ => {}
+      }
+    }
+    // For FunctionCall with same head, compare arguments structurally
+    if let (
+      Expr::FunctionCall { name: na, args: aa },
+      Expr::FunctionCall { name: nb, args: ab },
+    ) = (a, b)
+      && na == nb
+    {
+      // For Power, use sort-key comparison on bases to match Wolfram's
+      // Times ordering (e.g. Power[Plus[a,b],-2] before Power[s,-1]
+      // because sort key "b" < "s")
+      if na == "Power" && aa.len() == 2 && ab.len() == 2 {
+        let ak = crate::functions::list_helpers_ast::sorting::expr_sort_key(&aa[0]);
+        let bk = crate::functions::list_helpers_ast::sorting::expr_sort_key(&ab[0]);
+        let ord = crate::functions::list_helpers_ast::wolfram_string_order(&ak, &bk);
+        if ord > 0 {
+          return std::cmp::Ordering::Less;
+        }
+        if ord < 0 {
+          return std::cmp::Ordering::Greater;
+        }
+        // Equal sort keys: tie-break with full base string comparison
+        // e.g. Plus[-1, x] vs Plus[1, x] both have sort key "x"
+        // but "-1 + x" < "1 + x" lexicographically
+        let full_a = expr_to_string(&aa[0]);
+        let full_b = expr_to_string(&ab[0]);
+        let full_ord = crate::functions::list_helpers_ast::wolfram_string_order(&full_a, &full_b);
+        if full_ord > 0 {
+          return std::cmp::Ordering::Less;
+        }
+        if full_ord < 0 {
+          return std::cmp::Ordering::Greater;
+        }
+        // Equal bases: compare exponents
+        let exp_ord = crate::functions::list_helpers_ast::compare_exprs(&aa[1], &ab[1]);
+        if exp_ord > 0 {
+          return std::cmp::Ordering::Less;
+        }
+        if exp_ord < 0 {
+          return std::cmp::Ordering::Greater;
+        }
+        return std::cmp::Ordering::Equal;
+      }
+      // Same head: compare arguments using Wolfram canonical ordering.
+      // For Plus (Orderless), Wolfram compares the highest-degree term first.
+      // Since Plus args are stored in ascending-degree order, we iterate in
+      // reverse. When one Plus runs out of terms, it sorts AFTER (the Plus
+      // with more terms comes first).
+      if na == "Plus" {
+        let mut ia = aa.iter().rev();
+        let mut ib = ab.iter().rev();
+        loop {
+          match (ia.next(), ib.next()) {
+            (Some(x), Some(y)) => {
+              let ord = crate::functions::list_helpers_ast::compare_exprs(x, y);
+              if ord > 0 {
+                return std::cmp::Ordering::Less;
+              }
+              if ord < 0 {
+                return std::cmp::Ordering::Greater;
+              }
+            }
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (None, None) => return std::cmp::Ordering::Equal,
+          }
+        }
+      }
+      for (arg_a, arg_b) in aa.iter().zip(ab.iter()) {
+        let ord =
+          crate::functions::list_helpers_ast::compare_exprs(arg_a, arg_b);
+        if ord > 0 {
+          return std::cmp::Ordering::Less;
+        }
+        if ord < 0 {
+          return std::cmp::Ordering::Greater;
+        }
+      }
+      return aa.len().cmp(&ab.len());
+    }
+    // For power-like expressions, use sort-key comparison on bases
+    // to match Wolfram's Times ordering. This handles both same-variant
+    // (e.g. both BinaryOp::Power) and cross-variant (BinaryOp vs FunctionCall) cases.
+    let is_power_like = |e: &Expr| -> bool {
+      matches!(e, Expr::BinaryOp { op: BinaryOperator::Power, .. })
+        || matches!(e, Expr::FunctionCall { name, args } if (name == "Power" && args.len() == 2))
+        || is_sqrt(e).is_some()
+    };
+    if is_power_like(a) && is_power_like(b) {
+      // If both bases are integers, compare them numerically (not lexically).
+      // Wolfram orders Power[2, 1/4] before Power[15, 1/2], but lex string
+      // order treats "2" > "15" because '2' > '1'.
+      let (base_a_pre, _) = extract_base_exponent(a);
+      let (base_b_pre, _) = extract_base_exponent(b);
+      if let (Expr::Integer(ia), Expr::Integer(ib)) = (&base_a_pre, &base_b_pre)
+      {
+        match ia.cmp(ib) {
+          std::cmp::Ordering::Less => return std::cmp::Ordering::Less,
+          std::cmp::Ordering::Greater => return std::cmp::Ordering::Greater,
+          std::cmp::Ordering::Equal => {}
+        }
+      }
+      let ak = crate::functions::list_helpers_ast::sorting::expr_sort_key(a);
+      let bk = crate::functions::list_helpers_ast::sorting::expr_sort_key(b);
+      let ord = crate::functions::list_helpers_ast::wolfram_string_order(&ak, &bk);
+      if ord > 0 {
+        return std::cmp::Ordering::Less;
+      } else if ord < 0 {
+        return std::cmp::Ordering::Greater;
+      }
+      // Equal sort keys: when both bases are function calls with the same head
+      // (e.g. f[1] vs f[2]), compare structurally to disambiguate.
+      // This matches Wolfram's ordering where Power[f[1], -2] sorts before
+      // Power[f[2], 2] (base argument 1 < 2).
+      let (base_a, exp_a) = extract_base_exponent(a);
+      let (base_b, exp_b) = extract_base_exponent(b);
+      let same_fn_base = matches!(
+        (&base_a, &base_b),
+        (Expr::FunctionCall { name: na, .. }, Expr::FunctionCall { name: nb, .. })
+          if na == nb && na != "Plus" && na != "Times"
+      );
+      // For Plus bases with the same arity, compare structurally.
+      // e.g. Plus[-1, x] vs Plus[1, x]: both have sort key "x" and same
+      // arg count, but -1 < 1 so (-1+x)^(-1/2) should sort before (1+x)^(-1/2).
+      // Don't do this for different arities — let string-length fallback handle
+      // e.g. Plus[a, b] vs Plus[1, a, b] where shorter is "simpler".
+      let same_arity_plus_base = matches!(
+        (&base_a, &base_b),
+        (Expr::FunctionCall { name: na, args: aa }, Expr::FunctionCall { name: nb, args: ab })
+          if na == "Plus" && nb == "Plus" && aa.len() == ab.len()
+      ) || matches!(
+        (&base_a, &base_b),
+        (Expr::BinaryOp { op: BinaryOperator::Plus, .. },
+         Expr::BinaryOp { op: BinaryOperator::Plus, .. })
+      );
+      if same_fn_base || same_arity_plus_base {
+        let base_cmp = compare_expr_canonical(&base_a, &base_b);
+        if base_cmp != std::cmp::Ordering::Equal {
+          return base_cmp;
+        }
+        // Same base: compare exponents
+        let exp_ord = crate::functions::list_helpers_ast::compare_exprs(&exp_a, &exp_b);
+        if exp_ord > 0 {
+          return std::cmp::Ordering::Less;
+        } else if exp_ord < 0 {
+          return std::cmp::Ordering::Greater;
+        }
+      }
+      // Tiebreak when one Power-like factor's base is an Identifier and the
+      // other's base is an additive expression that contains the negation of
+      // that identifier (or has the form Plus[neg_const, ident]). Wolfram
+      // sorts the additive base FIRST so e.g. `(x-y)^-1 * y^-1` displays as
+      // `1/((x-y)*y)`, not `1/(y*(x-y))`. Without this rule, the two factors
+      // share sort key "y" and string-length fallback puts the shorter one
+      // (y^-1) first, which is wrong.
+      let base_a_is_ident =
+        matches!(&base_a, Expr::Identifier(_) | Expr::Constant(_));
+      let base_b_is_ident =
+        matches!(&base_b, Expr::Identifier(_) | Expr::Constant(_));
+      let is_additive = |e: &Expr| -> bool {
+        matches!(
+          e,
+          Expr::BinaryOp {
+            op: BinaryOperator::Plus
+              | BinaryOperator::Minus,
+            ..
+          }
+        ) || matches!(e, Expr::FunctionCall { name, .. } if name == "Plus")
+      };
+      let base_a_is_additive = is_additive(&base_a);
+      let base_b_is_additive = is_additive(&base_b);
+      if base_a_is_ident
+        && base_b_is_additive
+        && (additive_contains_negated(&base_b, &base_a)
+          || additive_is_neg_const_plus_ident(&base_b, &base_a))
+      {
+        return std::cmp::Ordering::Greater; // additive base first
+      }
+      if base_b_is_ident
+        && base_a_is_additive
+        && (additive_contains_negated(&base_a, &base_b)
+          || additive_is_neg_const_plus_ident(&base_a, &base_b))
+      {
+        return std::cmp::Ordering::Less; // additive base first
+      }
+      // Fall back to string length then alphabetical
+      let as_str = expr_to_string(a);
+      let bs_str = expr_to_string(b);
+      let len_cmp = as_str.len().cmp(&bs_str.len());
+      if len_cmp != std::cmp::Ordering::Equal {
+        return len_cmp;
+      }
+      let str_ord = crate::functions::list_helpers_ast::wolfram_string_order(&as_str, &bs_str);
+      if str_ord > 0 {
+        return std::cmp::Ordering::Less;
+      } else if str_ord < 0 {
+        return std::cmp::Ordering::Greater;
+      }
+      // Exactly equal: fall through
+    }
+    if std::mem::discriminant(a) == std::mem::discriminant(b) {
+      compare_expr_canonical(a, b)
+    } else {
+      // Use sort-key based comparison with wolfram_string_order (case-insensitive)
+      // to avoid ASCII case artifacts (e.g. 'S' < 'a' in ASCII would incorrectly
+      // put Sqrt[x] before identifier a).
+      let ak = crate::functions::list_helpers_ast::sorting::expr_sort_key(a);
+      let bk = crate::functions::list_helpers_ast::sorting::expr_sort_key(b);
+      let ord = crate::functions::list_helpers_ast::wolfram_string_order(&ak, &bk);
+      if ord > 0 {
+        std::cmp::Ordering::Less
+      } else if ord < 0 {
+        std::cmp::Ordering::Greater
+      } else {
+        // Equal sort keys: fall back to full string comparison
+        expr_to_string(a).cmp(&expr_to_string(b))
+      }
+    }
+  });
+}
+
+/// If the expression is a Power with a constant base (e.g. E^a, Pi^x, 2^n),
+/// return the sort key of the base. Returns None if the base is a variable.
+fn power_const_base(e: &Expr) -> Option<String> {
+  let base = match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => left.as_ref(),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      &args[0]
+    }
+    _ => return None,
+  };
+  match base {
+    Expr::Constant(c) => Some(c.clone()),
+    Expr::Integer(_) | Expr::Real(_) => Some(expr_to_string(base)),
+    _ => None,
+  }
+}
+
+/// Check if an additive expression contains a given identifier with a negative coefficient.
+/// For example, `(x - y)` contains `y` negated, but `(x + y)` does not.
+fn additive_contains_negated(additive: &Expr, ident: &Expr) -> bool {
+  let ident_name = match ident {
+    Expr::Identifier(name) => name.as_str(),
+    Expr::Constant(name) => name.as_str(),
+    _ => return false,
+  };
+  match additive {
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      right,
+      ..
+    } => {
+      // a - b: check if b == ident
+      matches!(right.as_ref(), Expr::Identifier(name) if name == ident_name)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      // Check if either side is -ident (UnaryMinus(ident) or Times(-1, ident))
+      has_negated_ident(left, ident_name)
+        || has_negated_ident(right, ident_name)
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      args.iter().any(|arg| has_negated_ident(arg, ident_name))
+    }
+    _ => false,
+  }
+}
+
+/// Check if an expression is a negated form of the given identifier.
+fn has_negated_ident(expr: &Expr, ident_name: &str) -> bool {
+  match expr {
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      matches!(operand.as_ref(), Expr::Identifier(name) if name == ident_name)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      (matches!(left.as_ref(), Expr::Integer(n) if *n < 0)
+        && matches!(right.as_ref(), Expr::Identifier(name) if name == ident_name))
+        || (matches!(right.as_ref(), Expr::Integer(n) if *n < 0)
+          && matches!(left.as_ref(), Expr::Identifier(name) if name == ident_name))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Times"
+        && args.len() == 2
+        && args.iter().any(|a| matches!(a, Expr::Integer(n) if *n < 0))
+        && args
+          .iter()
+          .any(|a| matches!(a, Expr::Identifier(n) if n == ident_name)) =>
+    {
+      true
+    }
+    _ => false,
+  }
+}
+
+/// Check if `additive` is Plus[n, var] where n is a negative number
+/// and var is the same identifier as `ident`.
+/// This handles the case (-3 + x)*x where the constant is negative
+/// but x itself is not negated in the Plus.
+pub fn additive_is_neg_const_plus_ident(additive: &Expr, ident: &Expr) -> bool {
+  let ident_name = match ident {
+    Expr::Identifier(name) | Expr::Constant(name) => name.as_str(),
+    _ => return false,
+  };
+
+  let is_same_ident = |a: &Expr| -> bool {
+    matches!(a, Expr::Identifier(n) | Expr::Constant(n) if n == ident_name)
+  };
+
+  // Negative rationals and reals count like negative integers:
+  // wolframscript writes (-67/2 + x)*x and (-17.5 + x)*x, sum first,
+  // while positive constants keep the factor first (x*(17/2 + x)).
+  let is_neg_num = |a: &Expr| -> bool {
+    match a {
+      Expr::Integer(n) => *n < 0,
+      Expr::Real(r) => *r < 0.0,
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        matches!(&args[0], Expr::Integer(n) if *n < 0)
+      }
+      _ => false,
+    }
+  };
+
+  // Check for FunctionCall Plus with exactly 2 args: negative number and same variable
+  if let Expr::FunctionCall { name, args } = additive
+    && name == "Plus"
+    && args.len() == 2
+  {
+    let has_neg_num = args.iter().any(is_neg_num);
+    let has_ident = args.iter().any(&is_same_ident);
+    return has_neg_num && has_ident;
+  }
+
+  // Check for BinaryOp Plus with negative number and same variable
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Plus,
+    left,
+    right,
+  } = additive
+  {
+    let (l, r) = (left.as_ref(), right.as_ref());
+    let has_neg_num = is_neg_num(l) || is_neg_num(r);
+    let has_ident = is_same_ident(l) || is_same_ident(r);
+    return has_neg_num && has_ident;
+  }
+
+  false
+}
+
+/// Multiply two exponent expressions, simplifying common cases.
+/// E.g. Rational[1,2] * Integer(-1) → Rational[-1,2]
+fn multiply_exponents(a: &Expr, b: &Expr) -> Expr {
+  match (a, b) {
+    (Expr::Integer(x), Expr::Integer(y)) => Expr::Integer(x * y),
+    (Expr::FunctionCall { name, args }, Expr::Integer(m))
+    | (Expr::Integer(m), Expr::FunctionCall { name, args })
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+        make_rational(n * m, *d)
+      } else {
+        times2(a.clone(), b.clone())
+      }
+    }
+    _ => times2(a.clone(), b.clone()),
+  }
+}
+
+/// Extract (base, exponent) from an expression for power combining in Times.
+/// Check if an expression is "numeric-like" — consists only of integers,
+/// constants (E, Pi), rationals, and products/powers thereof.
+/// Used to decide whether Sqrt merging is safe (avoids merging Sqrt[x]*Sqrt[y]).
+fn is_numeric_like(expr: &Expr) -> bool {
+  match expr {
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => true,
+    Expr::Constant(_) => true,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      true
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      args.iter().all(is_numeric_like)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => is_numeric_like(left) && is_numeric_like(right),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => is_numeric_like(left) && is_numeric_like(right),
+    _ => false,
+  }
+}
+
+/// x → (x, 1), x^n → (x, n), Sqrt[x] → (x, 1/2)
+/// Power[Sqrt[x], n] → (x, n/2), Power[x^a, b] → (x, a*b)
+fn extract_base_exponent(expr: &Expr) -> (Expr, Expr) {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      // Only recurse into nested powers when the outer exponent is an integer.
+      // For symbolic exponents like (x^(-1))^(1+n/2), keep the inner Power
+      // as the base to match Wolfram's canonical form.
+      if matches!(right.as_ref(), Expr::Integer(_)) {
+        let (inner_base, inner_exp) = extract_base_exponent(left);
+        if matches!(inner_exp, Expr::Integer(1)) {
+          (*left.clone(), *right.clone())
+        } else {
+          (inner_base, multiply_exponents(&inner_exp, right))
+        }
+      } else {
+        (*left.clone(), *right.clone())
+      }
+    }
+    expr if is_sqrt(expr).is_some() => {
+      (is_sqrt(expr).unwrap().clone(), make_rational(1, 2))
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      // Only recurse when outer exponent is integer
+      if matches!(&args[1], Expr::Integer(_)) {
+        let (inner_base, inner_exp) = extract_base_exponent(&args[0]);
+        if matches!(inner_exp, Expr::Integer(1)) {
+          (args[0].clone(), args[1].clone())
+        } else {
+          (inner_base, multiply_exponents(&inner_exp, &args[1]))
+        }
+      } else {
+        (args[0].clone(), args[1].clone())
+      }
+    }
+    _ => (expr.clone(), Expr::Integer(1)),
+  }
+}
+
+/// Reciprocal trig/hyperbolic head → its primary partner (Csc → Sin, …).
+fn reciprocal_trig_primary(head: &str) -> Option<&'static str> {
+  Some(match head {
+    "Csc" => "Sin",
+    "Sec" => "Cos",
+    "Cot" => "Tan",
+    "Csch" => "Sinh",
+    "Sech" => "Cosh",
+    "Coth" => "Tanh",
+    _ => return None,
+  })
+}
+
+/// Primary trig/hyperbolic head → its reciprocal partner (Sin → Csc, …).
+fn primary_trig_reciprocal(head: &str) -> Option<&'static str> {
+  Some(match head {
+    "Sin" => "Csc",
+    "Cos" => "Sec",
+    "Tan" => "Cot",
+    "Sinh" => "Csch",
+    "Cosh" => "Sech",
+    "Tanh" => "Coth",
+    _ => return None,
+  })
+}
+
+/// A trig or hyperbolic head → the head of its reciprocal (both ways).
+fn trig_reciprocal_partner(head: &str) -> Option<&'static str> {
+  reciprocal_trig_primary(head).or_else(|| primary_trig_reciprocal(head))
+}
+
+/// Wolfram's automatic reductions of two trig (or hyperbolic) factors of
+/// the same argument in a product: the pair on the left combines into the
+/// head on the right (`None` cancels to 1), one power at a time —
+/// `Cos[x]*Csc[x]` is `Cot[x]`, `Cos[x]^2*Csc[x]` is `Cos[x]*Cot[x]`,
+/// `Sin[x]*Csc[x]` is 1. wolframscript-verified for every pair.
+const TRIG_PAIR_RULES: &[(&str, &str, Option<&str>)] = &[
+  ("Sin", "Csc", None),
+  ("Cos", "Sec", None),
+  ("Tan", "Cot", None),
+  ("Cos", "Csc", Some("Cot")),
+  ("Sin", "Sec", Some("Tan")),
+  ("Tan", "Csc", Some("Sec")),
+  ("Cot", "Sec", Some("Csc")),
+  ("Tan", "Cos", Some("Sin")),
+  ("Cot", "Sin", Some("Cos")),
+  ("Sinh", "Csch", None),
+  ("Cosh", "Sech", None),
+  ("Tanh", "Coth", None),
+  ("Cosh", "Csch", Some("Coth")),
+  ("Sinh", "Sech", Some("Tanh")),
+  ("Tanh", "Csch", Some("Sech")),
+  ("Coth", "Sech", Some("Csch")),
+  ("Tanh", "Cosh", Some("Sinh")),
+  ("Coth", "Sinh", Some("Cosh")),
+];
+
+/// Apply `TRIG_PAIR_RULES` to the factors of a product: trig factors with
+/// positive integer exponents are grouped by argument and reduced until no
+/// rule applies (`Cos[x]^2/Sin[x]^3` → `Cot[x]^2*Csc[x]`,
+/// `Tan[x]*Cos[x]*Csc[x]` → 1). Everything else passes through untouched.
+fn combine_trig_pairs(args: Vec<Expr>) -> Vec<Expr> {
+  const TRIG_HEADS: &[&str] = &[
+    "Sin", "Cos", "Tan", "Cot", "Sec", "Csc", "Sinh", "Cosh", "Tanh", "Coth",
+    "Sech", "Csch",
+  ];
+  // (argument key, argument, head → exponent)
+  let mut groups: Vec<(String, Expr, Vec<(&'static str, i128)>)> = Vec::new();
+  let mut passthrough: Vec<Expr> = Vec::new();
+  for arg in &args {
+    let (base, exp) = extract_base_exponent(arg);
+    let entry = match (&base, &exp) {
+      (Expr::FunctionCall { name, args: fa }, Expr::Integer(n))
+        if fa.len() == 1 && *n > 0 =>
+      {
+        TRIG_HEADS
+          .iter()
+          .find(|h| **h == name.as_str())
+          .map(|h| (*h, fa[0].clone(), *n))
+      }
+      _ => None,
+    };
+    let Some((head, farg, n)) = entry else {
+      passthrough.push(arg.clone());
+      continue;
+    };
+    let key = expr_to_string(&farg);
+    let group = if let Some(g) = groups.iter_mut().find(|g| g.0 == key) {
+      g
+    } else {
+      groups.push((key, farg, Vec::new()));
+      groups.last_mut().unwrap()
+    };
+    match group.2.iter_mut().find(|(h, _)| *h == head) {
+      Some(slot) => slot.1 += n,
+      None => group.2.push((head, n)),
+    }
+  }
+  if groups.iter().all(|g| g.2.len() < 2) {
+    return args;
+  }
+  let mut out = passthrough;
+  for (_, farg, mut heads) in groups {
+    let mut changed = true;
+    while changed {
+      changed = false;
+      for (x, y, z) in TRIG_PAIR_RULES {
+        let ex = heads.iter().find(|(h, _)| h == x).map(|(_, n)| *n);
+        let ey = heads.iter().find(|(h, _)| h == y).map(|(_, n)| *n);
+        let (Some(ex), Some(ey)) = (ex, ey) else {
+          continue;
+        };
+        let m = ex.min(ey);
+        if m <= 0 {
+          continue;
+        }
+        for (h, n) in &mut heads {
+          if h == x || h == y {
+            *n -= m;
+          }
+        }
+        if let Some(z) = z {
+          match heads.iter_mut().find(|(h, _)| h == z) {
+            Some(slot) => slot.1 += m,
+            None => heads.push((z, m)),
+          }
+        }
+        heads.retain(|(_, n)| *n != 0);
+        changed = true;
+      }
+    }
+    for (head, n) in heads {
+      let f = call(head, vec![farg.clone()]);
+      out.push(if n == 1 { f } else { pow(f, Expr::Integer(n)) });
+    }
+  }
+  out
+}
+
+/// Primary trig/hyperbolic head → itself as a 'static string.
+fn primary_trig_self(head: &str) -> Option<&'static str> {
+  Some(match head {
+    "Sin" => "Sin",
+    "Cos" => "Cos",
+    "Tan" => "Tan",
+    "Sinh" => "Sinh",
+    "Cosh" => "Cosh",
+    "Tanh" => "Tanh",
+    _ => return None,
+  })
+}
+
+/// Combine a trig/hyperbolic function with its own reciprocal in a product:
+/// Sin[x]^a Csc[x]^b → Sin[x]^(a-b), rendered as Csc[x]^(b-a) when the net
+/// power is a negative integer. This mirrors Wolfram's automatic reduction
+/// (e.g. Sin[x] Csc[x] → 1, Sin[x]^2 Csc[x] → Sin[x], Csc[x]/Sin[x] → Csc[x]^2).
+///
+/// Only a genuine reciprocal PAIR is touched: a family group must hold at
+/// least two factors and at least one reciprocal head. Lone factors
+/// (Csc[x], 1/Sin[x]) and cross-function quotients (Cos[x]/Sin[x] → Cot[x])
+/// are deliberately left as-is — Wolfram's broader trig-power canonicalization
+/// is a separate, form-divergent concern.
+fn combine_reciprocal_trig(
+  args: Vec<Expr>,
+) -> Result<Vec<Expr>, InterpreterError> {
+  struct Grp {
+    primary: &'static str,
+    arg: Expr,
+    key: String,
+    count: usize,
+    exps: Vec<Expr>,
+    has_recip: bool,
+  }
+  let negate_exp = |e: &Expr| -> Expr {
+    match e {
+      Expr::Integer(n) => Expr::Integer(-n),
+      _ => call("Times", vec![Expr::Integer(-1), e.clone()]),
+    }
+  };
+
+  let mut groups: Vec<Grp> = Vec::new();
+  let mut group_of: Vec<Option<usize>> = vec![None; args.len()];
+  for (i, arg) in args.iter().enumerate() {
+    let (base, exp) = extract_base_exponent(arg);
+    let (head, farg) = match &base {
+      Expr::FunctionCall { name, args: fargs } if fargs.len() == 1 => {
+        (name.as_str(), &fargs[0])
+      }
+      _ => continue,
+    };
+    let (primary, is_recip) = if let Some(p) = reciprocal_trig_primary(head) {
+      (p, true)
+    } else if let Some(p) = primary_trig_self(head) {
+      (p, false)
+    } else {
+      continue;
+    };
+    let signed = if is_recip { negate_exp(&exp) } else { exp };
+    let key = format!("{}|{}", primary, expr_to_string(farg));
+    if let Some(gi) = groups.iter().position(|g| g.key == key) {
+      groups[gi].count += 1;
+      groups[gi].exps.push(signed);
+      groups[gi].has_recip |= is_recip;
+      group_of[i] = Some(gi);
+    } else {
+      group_of[i] = Some(groups.len());
+      groups.push(Grp {
+        primary,
+        arg: farg.clone(),
+        key,
+        count: 1,
+        exps: vec![signed],
+        has_recip: is_recip,
+      });
+    }
+  }
+
+  // A group qualifies for combining only with ≥2 factors and a reciprocal head.
+  let qualifies: Vec<bool> =
+    groups.iter().map(|g| g.count >= 2 && g.has_recip).collect();
+  if !qualifies.iter().any(|q| *q) {
+    return Ok(args);
+  }
+
+  let mut combined: Vec<Expr> = Vec::new();
+  for (gi, g) in groups.iter().enumerate() {
+    if !qualifies[gi] {
+      continue;
+    }
+    let net = plus_ast(&g.exps)?;
+    match &net {
+      Expr::Integer(0) => {} // Sin[x]^0 = 1, contributes nothing
+      Expr::Integer(n) if *n < 0 => {
+        let recip = primary_trig_reciprocal(g.primary).unwrap();
+        let f = call1(recip, g.arg.clone());
+        combined.push(if *n == -1 {
+          f
+        } else {
+          power_two(&f, &Expr::Integer(-n))?
+        });
+      }
+      _ => {
+        let f = call1(g.primary, g.arg.clone());
+        combined.push(if matches!(&net, Expr::Integer(1)) {
+          f
+        } else {
+          power_two(&f, &net)?
+        });
+      }
+    }
+  }
+
+  let mut out: Vec<Expr> = Vec::new();
+  for (i, a) in args.into_iter().enumerate() {
+    let keep = match group_of[i] {
+      Some(gi) => !qualifies[gi],
+      None => true,
+    };
+    if keep {
+      out.push(a);
+    }
+  }
+  out.extend(combined);
+  Ok(out)
+}
+
+/// Combine like bases in a list of symbolic factors: x^a * x^b → x^(a+b)
+/// The standard Wolfram symbols that denote a positive real constant.
+pub fn is_pos_real_const(name: &str) -> bool {
+  matches!(
+    name,
+    "Pi"
+      | "E"
+      | "EulerGamma"
+      | "GoldenRatio"
+      | "Catalan"
+      | "Degree"
+      | "Glaisher"
+      | "Khinchin"
+  )
+}
+
+/// A positive exact value split into its rational part and the named positive
+/// constants multiplying it: `2 Pi` → `(2, 1, [Pi])`, `Pi/18` → `(1, 18,
+/// [Pi])`, `3/2` → `(3, 2, [])`.
+///
+/// Radical canonicalisation uses this to fold a rational coefficient into a
+/// radicand while leaving the constants inside, the way wolframscript prints
+/// `Sqrt[2 Pi]/2` as `Sqrt[Pi/2]`. Only named constants qualify: for a free
+/// symbol wolframscript splits the radical instead (the Sqrt product-split
+/// divergence), so rewriting those here would drift further from it.
+fn split_positive_rational_and_constants(
+  expr: &Expr,
+) -> Option<(i128, i128, Vec<Expr>)> {
+  fn rational_part(e: &Expr) -> Option<(i128, i128)> {
+    match e {
+      Expr::Integer(n) if *n > 0 => Some((*n, 1i128)),
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        match (&args[0], &args[1]) {
+          (Expr::Integer(n), Expr::Integer(d)) if *n > 0 && *d > 0 => {
+            Some((*n, *d))
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+  if let Some((n, d)) = rational_part(expr) {
+    return Some((n, d, Vec::new()));
+  }
+  let Expr::FunctionCall { name, args } = expr else {
+    return None;
+  };
+  if name != "Times" {
+    return None;
+  }
+  let (mut n, mut d) = (1i128, 1i128);
+  let mut constants: Vec<Expr> = Vec::new();
+  for factor in args {
+    if let Some((fnum, fden)) = rational_part(factor) {
+      n = n.checked_mul(fnum)?;
+      d = d.checked_mul(fden)?;
+    } else if matches!(factor,
+      Expr::Identifier(name) | Expr::Constant(name)
+        if is_pos_real_const(name))
+      || reciprocal_pos_real_const(factor).is_some()
+    {
+      constants.push(factor.clone());
+    } else {
+      return None;
+    }
+  }
+  (!constants.is_empty()).then_some((n, d, constants))
+}
+
+/// The constant `c` of a reciprocal `c^-1` of a named positive constant
+/// (`1/Pi`).
+fn reciprocal_pos_real_const(e: &Expr) -> Option<&Expr> {
+  let (base, exp) = match e {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (&args[0], &args[1])
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => (left.as_ref(), right.as_ref()),
+    _ => return None,
+  };
+  (matches!(exp, Expr::Integer(-1))
+    && matches!(base, Expr::Identifier(n) | Expr::Constant(n) if is_pos_real_const(n)))
+  .then_some(base)
+}
+
+/// A radicand that is a unit fraction times reciprocal constants,
+/// `c^-1/q`, as the `q c` a root of it flips to: `(1/(2 Pi))^(n/d)` is
+/// `(2 Pi)^(-n/d)`, so `Sqrt[1/(2 Pi)]` is `1/Sqrt[2 Pi]` the way
+/// `Sqrt[1/2]` is `1/Sqrt[2]`.
+pub fn flip_unit_fraction_radicand(
+  base: &Expr,
+) -> Result<Option<Expr>, InterpreterError> {
+  let Some((1, q, constants)) = split_positive_rational_and_constants(base)
+  else {
+    return Ok(None);
+  };
+  if q <= 1
+    || constants.is_empty()
+    || !constants
+      .iter()
+      .all(|c| reciprocal_pos_real_const(c).is_some())
+  {
+    return Ok(None);
+  }
+  let mut factors = vec![Expr::Integer(q)];
+  for c in &constants {
+    factors.extend(reciprocal_pos_real_const(c).cloned());
+  }
+  Ok(Some(times_ast(&factors)?))
+}
+
+/// A value known to be a positive real: a positive integer or rational, one of
+/// the standard positive real constants (Pi, E, …), or a positive product or
+/// power of those. Free symbols are excluded, since nothing is known about
+/// their sign. Identities that need a positive base — `Sqrt[a]/Sqrt[b]` =
+/// `Sqrt[a/b]`, `(a^p)^q` = `a^(p q)` — are gated on this.
+pub fn is_pos_numeric(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(n) => *n > 0,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      matches!(&args[0], Expr::Integer(n) if *n > 0)
+        && matches!(&args[1], Expr::Integer(d) if *d > 0)
+    }
+    Expr::Constant(c) | Expr::Identifier(c) => is_pos_real_const(c),
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      args.iter().all(is_pos_numeric)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => is_pos_numeric(left) && is_pos_numeric(right),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      is_pos_numeric(&args[0])
+    }
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => {
+      is_pos_numeric(&args[0])
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      ..
+    } => is_pos_numeric(left),
+    _ => false,
+  }
+}
+
+/// The factors of a product, flattened; a non-product is its own only factor.
+fn product_factors_of(expr: &Expr) -> Vec<Expr> {
+  let mut out = Vec::new();
+  fn walk(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for a in args {
+          walk(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        walk(left, out);
+        walk(right, out);
+      }
+      _ => out.push(e.clone()),
+    }
+  }
+  walk(expr, &mut out);
+  out
+}
+
+fn combine_like_bases(args: Vec<Expr>) -> Result<Vec<Expr>, InterpreterError> {
+  combine_like_bases_depth(args, 0)
+}
+
+/// How often the grouping may re-run after a merged power splits back into
+/// factors. Each round strictly simplifies a product base into its parts, so
+/// a handful of rounds is plenty; the cap only guards against a `power_two`
+/// that hands back a product the grouping would rebuild.
+const COMBINE_LIKE_BASES_MAX_ROUNDS: usize = 4;
+
+fn combine_like_bases_depth(
+  args: Vec<Expr>,
+  depth: usize,
+) -> Result<Vec<Expr>, InterpreterError> {
+  if args.len() <= 1 {
+    return Ok(args);
+  }
+  let args = combine_reciprocal_trig(args)?;
+  let args = combine_trig_pairs(args);
+  if args.len() <= 1 {
+    return Ok(args);
+  }
+
+  // Use string representation of base as grouping key
+  let mut groups: Vec<(String, Expr, Vec<Expr>)> = Vec::new(); // (base_key, base, exponents)
+  let mut non_combinable: Vec<Expr> = Vec::new();
+
+  // I counts as (-1)^(1/2) while powers of one base are collected, which is
+  // how wolframscript folds I (-1)^(1/4) into (-1)^(3/4). Only alongside
+  // another power of -1 though: I I^n stays I^(1 + n), not (-1)^(1/2 + n/2).
+  let rational_exponent = |exp: &Expr| matches!(exp, Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2);
+  let merges_with_neg_one = args.iter().any(|arg| {
+    let (base, exp) = extract_base_exponent(arg);
+    matches!(&base, Expr::Integer(-1)) && rational_exponent(&exp)
+  });
+  for arg in &args {
+    // Don't combine Plus, Times, or complex expressions - only identifiers, constants, and powers thereof
+    let (base, exp) = extract_base_exponent(arg);
+    let (base, exp) = if merges_with_neg_one
+      && matches!(&base, Expr::Identifier(s) | Expr::Constant(s) if s == "I")
+      && (matches!(&exp, Expr::Integer(_)) || rational_exponent(&exp))
+    {
+      (
+        Expr::Integer(-1),
+        multiply_exponents(&exp, &make_rational(1, 2)),
+      )
+    } else {
+      (base, exp)
+    };
+    let combinable = match &base {
+      Expr::Identifier(_) | Expr::Constant(_) => true,
+      // Exact numbers too: b^r b^s = b^(r+s) holds for a fixed base whatever
+      // its sign, so (-1)^(1/3) (-1)^(2/3) folds to -1 and 2^(1/3) 2^(1/2)
+      // to 2^(5/6). Merging different bases under one exponent is a separate,
+      // branch-sensitive rule handled in the second pass.
+      Expr::Integer(_) | Expr::BigInteger(_) => true,
+      Expr::FunctionCall { .. } => true,
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        ..
+      }
+      | Expr::BinaryOp {
+        op: BinaryOperator::Minus,
+        ..
+      } => true,
+      _ => false,
+    };
+    if !combinable {
+      non_combinable.push(arg.clone());
+      continue;
+    }
+    let base_key = expr_to_string(&base);
+    if let Some(group) = groups.iter_mut().find(|(k, _, _)| *k == base_key) {
+      group.2.push(exp);
+    } else {
+      groups.push((base_key, base, vec![exp]));
+    }
+  }
+
+  let mut result: Vec<Expr> = Vec::new();
+  // Merging a power of a PRODUCT base can hand back a product of its own:
+  // `(2 Pi)^(-1/2) (2 Pi)^(-1/2)` merges to `(2 Pi)^-1`, which distributes
+  // into `1/2 · Pi^-1`. Those new factors have bases of their own that may
+  // merge with groups already formed (here `Pi^(1/2)`), so the grouping has
+  // to run again over the spliced factors — otherwise
+  // `Sqrt[Pi]/(2 Pi)` and even the unreduced `Pi/(2 Pi)` survive.
+  let mut split_into_factors = false;
+  for (_key, base, exponents) in groups {
+    if exponents.len() == 1 {
+      // Single occurrence — no combining needed, reconstruct original form
+      if matches!(&exponents[0], Expr::Integer(1)) {
+        result.push(base);
+      } else {
+        result.push(power_two(&base, &exponents[0])?);
+      }
+    } else {
+      // Multiple occurrences — add exponents
+      let combined_exp = plus_ast(&exponents)?;
+      if matches!(&combined_exp, Expr::Integer(0)) {
+        // x^0 = 1, skip (will be absorbed into coefficient)
+        // But Infinity^0 and ComplexInfinity^0 are Indeterminate
+        let is_inf = matches!(&base, Expr::Identifier(s) if s == "Infinity" || s == "ComplexInfinity");
+        if is_inf {
+          return Ok(vec![id_expr("Indeterminate")]);
+        }
+        continue;
+      }
+      let merged = power_two(&base, &combined_exp)?;
+      // Only a PRODUCT base can split into factors with bases the grouping
+      // has not already seen. A plain base must not be spliced: `2^(3/2)`
+      // comes back as `2 Sqrt[2]`, which would regroup straight back into
+      // `2^(3/2)` and spin forever.
+      let merged_factors = product_factors_of(&merged);
+      if merged_factors.len() > 1
+        && product_factors_of(&base).len() > 1
+        && depth < COMBINE_LIKE_BASES_MAX_ROUNDS
+      {
+        split_into_factors = true;
+        result.extend(merged_factors);
+      } else {
+        result.push(merged);
+      }
+    }
+  }
+  result.extend(non_combinable);
+  if split_into_factors {
+    return combine_like_bases_depth(result, depth + 1);
+  }
+
+  // Second pass: combine bases with the same fractional exponent
+  // e.g. Sqrt[2] * Sqrt[3] = 2^(1/2) * 3^(1/2) → 6^(1/2) = Sqrt[6]
+  // Also handles Sqrt[E] * Sqrt[2] → Sqrt[2*E], etc.
+  let mut combined: Vec<Expr> = Vec::new();
+  let mut used = vec![false; result.len()];
+  for i in 0..result.len() {
+    if used[i] {
+      continue;
+    }
+    let (base_i, exp_i) = extract_base_exponent(&result[i]);
+    let is_negative_exp = matches!(
+      &exp_i,
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2
+          && matches!(&args[0], Expr::Integer(n) if *n < 0)
+    );
+    // Numeric-like base products of identifier constants (Pi as an
+    // Identifier rather than Constant). wolframscript merges these when
+    // they sit in a DENOMINATOR (1/(Sqrt[Pi] Sqrt[4 Pi]) → 1/(2 Pi)),
+    // but numerator radicals prefer the coefficient-folding route
+    // (Sqrt[2] Sqrt[Pi]/2 stays for Sqrt[Pi/2]).
+    fn numeric_like_with_idents(e: &Expr) -> bool {
+      match e {
+        Expr::Identifier(name) => matches!(
+          name.as_str(),
+          "Pi"
+            | "E"
+            | "EulerGamma"
+            | "GoldenRatio"
+            | "Catalan"
+            | "Degree"
+            | "Glaisher"
+            | "Khinchin"
+        ),
+        Expr::FunctionCall { name, args } if name == "Times" => {
+          args.iter().all(numeric_like_with_idents)
+        }
+        other => is_numeric_like(other),
+      }
+    }
+    // Only combine bases that are numeric-like (integers, constants, or products thereof)
+    // This avoids combining purely symbolic expressions like Sqrt[x]*Sqrt[y]
+    let is_combinable_base = is_numeric_like(&base_i)
+      || (is_negative_exp && numeric_like_with_idents(&base_i));
+    let is_rational_exp = matches!(
+      &exp_i,
+      Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2
+    );
+    if !is_combinable_base || !is_rational_exp {
+      combined.push(result[i].clone());
+      continue;
+    }
+    let exp_key = expr_to_string(&exp_i);
+    // a^r b^r = (a b)^r only holds while the arguments of the principal
+    // values still add up inside (-Pi, Pi], so at most one of the bases may
+    // be negative. (-1)^(1/3) (-1)^(1/3) is (-1)^(2/3), not 1^(1/3).
+    let mut negative_bases =
+      usize::from(negative_number_magnitude(&base_i).is_some());
+    let mut bases_to_multiply = vec![base_i];
+    for j in (i + 1)..result.len() {
+      if used[j] {
+        continue;
+      }
+      let (base_j, exp_j) = extract_base_exponent(&result[j]);
+      let combinable_j = is_numeric_like(&base_j)
+        || (is_negative_exp && numeric_like_with_idents(&base_j));
+      if combinable_j && expr_to_string(&exp_j) == exp_key {
+        if negative_number_magnitude(&base_j).is_some() {
+          if negative_bases > 0 {
+            continue;
+          }
+          negative_bases += 1;
+        }
+        bases_to_multiply.push(base_j);
+        used[j] = true;
+      }
+    }
+    if bases_to_multiply.len() == 1 {
+      combined.push(result[i].clone());
+    } else {
+      let product = times_ast(&bases_to_multiply)?;
+      // A merged radicand that is a perfect square (integer square times
+      // even powers of named constants, e.g. 4 Pi^2) extracts fully:
+      // 1/(Sqrt[Pi] Sqrt[4 Pi]) → 1/Sqrt[4 Pi^2] → 1/(2 Pi).
+      let extracted = (|| -> Option<Expr> {
+        let half = match &exp_i {
+          Expr::FunctionCall { name, args }
+            if name == "Rational" && args.len() == 2 =>
+          {
+            match (&args[0], &args[1]) {
+              (Expr::Integer(n), Expr::Integer(2)) if n.abs() == 1 => *n,
+              _ => return None,
+            }
+          }
+          _ => return None,
+        };
+        let mut int_part: i128 = 1;
+        let mut const_pows: Vec<(String, i128)> = Vec::new();
+        let mut stack = vec![product.clone()];
+        while let Some(f) = stack.pop() {
+          match &f {
+            Expr::Integer(n) if *n > 0 => {
+              int_part = int_part.checked_mul(*n)?;
+            }
+            Expr::Identifier(name) | Expr::Constant(name) => {
+              match const_pows.iter_mut().find(|(n, _)| n == name) {
+                Some((_, k)) => *k += 1,
+                None => const_pows.push((name.clone(), 1)),
+              }
+            }
+            Expr::FunctionCall { name, args } if name == "Times" => {
+              stack.extend(args.iter().cloned());
+            }
+            Expr::FunctionCall { name, args }
+              if name == "Power"
+                && args.len() == 2
+                && matches!(&args[1], Expr::Integer(k) if *k > 0) =>
+            {
+              let Expr::Integer(k) = args[1] else {
+                return None;
+              };
+              match &args[0] {
+                Expr::Identifier(name) | Expr::Constant(name) => {
+                  match const_pows.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, kk)) => *kk += k,
+                    None => const_pows.push((name.clone(), k)),
+                  }
+                }
+                _ => return None,
+              }
+            }
+            Expr::BinaryOp {
+              op: BinaryOperator::Times,
+              left,
+              right,
+            } => {
+              stack.push(left.as_ref().clone());
+              stack.push(right.as_ref().clone());
+            }
+            Expr::BinaryOp {
+              op: BinaryOperator::Power,
+              left,
+              right,
+            } if matches!(right.as_ref(), Expr::Integer(k) if *k > 0) => {
+              let Expr::Integer(k) = right.as_ref() else {
+                return None;
+              };
+              match left.as_ref() {
+                Expr::Identifier(name) | Expr::Constant(name) => {
+                  match const_pows.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, kk)) => *kk += k,
+                    None => const_pows.push((name.clone(), *k)),
+                  }
+                }
+                _ => return None,
+              }
+            }
+            _ => return None,
+          }
+        }
+        let root = (int_part as f64).sqrt().round() as i128;
+        if root * root != int_part || const_pows.iter().any(|(_, k)| k % 2 != 0)
+        {
+          return None;
+        }
+        let mut factors: Vec<Expr> = Vec::new();
+        if root != 1 {
+          factors.push(Expr::Integer(root));
+        }
+        for (name, k) in const_pows {
+          let base = Expr::Identifier(name);
+          factors.push(if k == 2 {
+            base
+          } else {
+            power_two(&base, &Expr::Integer(k / 2)).ok()?
+          });
+        }
+        let extracted = match factors.len() {
+          0 => Expr::Integer(1),
+          1 => factors.into_iter().next().unwrap(),
+          _ => times_ast(&factors).ok()?,
+        };
+        if half > 0 {
+          Some(extracted)
+        } else {
+          power_two(&extracted, &Expr::Integer(-1)).ok()
+        }
+      })();
+      // A negative merged radicand goes through the shared negative-base rule
+      // rather than power_two, which would split the sign back off and hand
+      // the pieces straight back to this merge.
+      let merged_negative =
+        match (negative_number_magnitude(&product), rational_parts(&exp_i)) {
+          (Some(magnitude), Some((p, q))) => {
+            Some(negative_base_rational_power(&magnitude, p, q)?)
+          }
+          _ => None,
+        };
+      match (extracted, merged_negative) {
+        (Some(e), _) => combined.push(e),
+        (None, Some(e)) => combined.push(e),
+        (None, None) => combined.push(power_two(&product, &exp_i)?),
+      }
+    }
+  }
+
+  // Third pass: pair Power[a, e] with Power[b, -e] for positive numeric a, b
+  // and rational e — merging into Power[a/b, e]. E.g. Sqrt[2]/Sqrt[6] →
+  // Sqrt[2/6] = Sqrt[1/3] = 1/Sqrt[3]. Avoids leaving the expression in
+  // the unsimplified Times[Sqrt[a], Power[Sqrt[b], -1]] form.
+  // A base for which Sqrt[a]/Sqrt[b] = Sqrt[a/b] holds: positive integers,
+  // positive rationals, the standard positive real constants (Pi, E, …), and
+  // positive products/powers of those. wolframscript combines
+  // Sqrt[2]/Sqrt[Pi] → Sqrt[2/Pi] and Sqrt[Pi]/Sqrt[2] → Sqrt[Pi/2], so the
+  // constants must be admitted here (not just plain numbers). Free symbols are
+  // excluded, leaving Sqrt[x]/Sqrt[y] split like wolframscript.
+  // First scan for pairs (i positive, j negative) and mark consumed.
+  let mut consumed = vec![false; combined.len()];
+  let mut pairs: Vec<(usize, usize)> = Vec::new(); // (pos_idx, neg_idx)
+  for i in 0..combined.len() {
+    if consumed[i] {
+      continue;
+    }
+    let (base_i, exp_i) = extract_base_exponent(&combined[i]);
+    let exp_i_is_pos_rat = matches!(
+      &exp_i,
+      Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2
+        && matches!(&args[0], Expr::Integer(n) if *n > 0)
+    );
+    if !is_pos_numeric(&base_i) || !exp_i_is_pos_rat {
+      continue;
+    }
+    let neg_exp_i = times_ast(&[Expr::Integer(-1), exp_i.clone()])?;
+    let neg_exp_key = expr_to_string(&neg_exp_i);
+    for j in 0..combined.len() {
+      if j == i || consumed[j] {
+        continue;
+      }
+      let (base_j, exp_j) = extract_base_exponent(&combined[j]);
+      if is_pos_numeric(&base_j) && expr_to_string(&exp_j) == neg_exp_key {
+        pairs.push((i, j));
+        consumed[i] = true;
+        consumed[j] = true;
+        break;
+      }
+    }
+  }
+  // Build merged: keep original order, replacing each pair's pos-index slot
+  // with the merged Sqrt[a/b] and skipping the neg-index slot.
+  let mut merged: Vec<Expr> = Vec::new();
+  let mut neg_indices: std::collections::HashSet<usize> =
+    std::collections::HashSet::new();
+  let mut pos_replacements: std::collections::HashMap<usize, Expr> =
+    std::collections::HashMap::new();
+  for (pi, ni) in &pairs {
+    let (base_p, exp_p) = extract_base_exponent(&combined[*pi]);
+    let (base_n, _) = extract_base_exponent(&combined[*ni]);
+    // Normalise the radicand: divide_two leaves a base like 2/Pi over 5 as the
+    // unreduced (2*Pi^(-1))/5, so re-evaluate it to the canonical 2/(5*Pi)
+    // before wrapping it back up — matching wolframscript's Sqrt[2/(5*Pi)].
+    // The bases are positive numerics/constants here, so this never recurses
+    // back into a Sqrt-product.
+    let ratio =
+      crate::evaluator::evaluate_expr_to_expr(&divide_two(&base_p, &base_n)?)?;
+    pos_replacements.insert(*pi, power_two(&ratio, &exp_p)?);
+    neg_indices.insert(*ni);
+  }
+  for i in 0..combined.len() {
+    if neg_indices.contains(&i) {
+      continue;
+    }
+    if let Some(replacement) = pos_replacements.remove(&i) {
+      merged.push(replacement);
+    } else {
+      merged.push(combined[i].clone());
+    }
+  }
+
+  Ok(merged)
+}
+
+/// `SeriesData[var, x0, coeffs, nmin, nmax, denom] * var^k` →
+/// shift the series's exponent range by `k`. `k` may be Integer,
+/// `Rational[p, q]`, or `BinaryOp Divide` of two integers. Returns
+/// `None` if `series` isn't a SeriesData, `power` isn't a recognised
+/// `var^k` form, or the variables don't match.
+fn try_series_data_times_var_power(
+  series: &Expr,
+  power: &Expr,
+) -> std::option::Option<Expr> {
+  // Match a SeriesData head.
+  let (var, x0, coeffs, nmin, nmax, denom) = match series {
+    Expr::FunctionCall { name, args }
+      if name == "SeriesData" && args.len() == 6 =>
+    {
+      let nmin = match &args[3] {
+        Expr::Integer(n) => *n,
+        _ => return None,
+      };
+      let nmax = match &args[4] {
+        Expr::Integer(n) => *n,
+        _ => return None,
+      };
+      let denom = match &args[5] {
+        Expr::Integer(d) if *d > 0 => *d,
+        _ => return None,
+      };
+      let coeffs = match &args[2] {
+        Expr::List(items) => items.clone(),
+        _ => return None,
+      };
+      (args[0].clone(), args[1].clone(), coeffs, nmin, nmax, denom)
+    }
+    _ => return None,
+  };
+
+  // Match `var^k`. Accept the bare variable (k = 1), Power[var, Integer],
+  // Power[var, Rational], or Power[var, BinaryOp Divide of integers].
+  let var_name = match &var {
+    Expr::Identifier(n) => n.clone(),
+    _ => return None,
+  };
+  let same_var = |e: &Expr| matches!(e, Expr::Identifier(n) if *n == var_name);
+  let extract_pq = |exp: &Expr| -> Option<(i128, i128)> {
+    match exp {
+      Expr::Integer(n) => Some((*n, 1)),
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        if let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1])
+          && *q > 0
+        {
+          Some((*p, *q))
+        } else {
+          None
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left,
+        right,
+      } => {
+        if let (Expr::Integer(p), Expr::Integer(q)) =
+          (left.as_ref(), right.as_ref())
+          && *q > 0
+        {
+          Some((*p, *q))
+        } else {
+          None
+        }
+      }
+      _ => None,
+    }
+  };
+  let (p, q) = match power {
+    e if same_var(e) => (1i128, 1i128),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } if same_var(left) => extract_pq(right)?,
+    Expr::FunctionCall { name, args }
+      if name == "Power" && args.len() == 2 && same_var(&args[0]) =>
+    {
+      extract_pq(&args[1])?
+    }
+    _ => return None,
+  };
+
+  // Lift to the common denominator d = lcm(denom, q).
+  let g = gcd_i128(denom, q);
+  if g == 0 {
+    return None;
+  }
+  let d = (denom / g).saturating_mul(q);
+  let scale_old = d / denom;
+  let shift = p * (d / q);
+  let new_nmin = nmin * scale_old + shift;
+
+  // For an integer-power shift (q == 1), keep all original coefficients
+  // and shift `nmax` by `p` directly. For a fractional shift the
+  // resulting series loses one term of precision: wolframscript
+  // truncates exactly at the new slot of the original's last
+  // coefficient, dropping it. So `len(coefs)` shrinks by one and
+  // `nmax = (orig_nmax - 1) * scale + new-denom shift`.
+  let (new_nmax, new_coeffs) = if q == 1 {
+    let mut out: Vec<Expr> = Vec::new();
+    for (i, c) in coeffs.iter().enumerate() {
+      if i > 0 {
+        for _ in 0..(scale_old - 1) {
+          out.push(Expr::Integer(0));
+        }
+      }
+      out.push(c.clone());
+    }
+    (nmax * scale_old + shift, out)
+  } else {
+    // Drop the last original coefficient, then lift the rest.
+    let trunc_nmax = (nmax - 1) * scale_old + shift;
+    if coeffs.is_empty() {
+      return None;
+    }
+    let kept: Vec<Expr> = coeffs[..coeffs.len() - 1].to_vec();
+    let mut out: Vec<Expr> = Vec::new();
+    for (i, c) in kept.iter().enumerate() {
+      if i > 0 {
+        for _ in 0..(scale_old - 1) {
+          out.push(Expr::Integer(0));
+        }
+      }
+      out.push(c.clone());
+    }
+    (trunc_nmax, out)
+  };
+  let data = vec![
+    var,
+    x0,
+    Expr::List(new_coeffs.into()),
+    Expr::Integer(new_nmin),
+    Expr::Integer(new_nmax),
+    Expr::Integer(d),
+  ];
+  Some(call("SeriesData", data))
+}
+
+/// Times[args...] - Product of arguments, with list threading
+/// Machine fold for a Times whose arguments include a machine Real and a
+/// NESTED exact-times-constant product (Times[-35, Pi]): wolframscript
+/// keeps the nested product out of the outer coefficient pool —
+/// Times[39, Times[-35, Pi], r] = ((39 * r) * -35) * N[Pi], one ulp away
+/// from the flat Times[39, -35, Pi, r] = (-1365 * r) * N[Pi]
+/// (wolframscript-verified; differential fuzzer, seed
+/// 4134943276941009607). Returns None unless the argument list is exactly
+/// this shape: only machine reals, exact numbers, numeric-constant
+/// expressions, and at least one real-free nested product carrying both an
+/// exact coefficient and a constant part.
+pub fn nested_exact_const_machine_times(args: &[Expr]) -> Option<Expr> {
+  fn exact_val(e: &Expr) -> Option<(i128, i128)> {
+    match e {
+      Expr::Integer(n) => Some((*n, 1)),
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        match (&args[0], &args[1]) {
+          (Expr::Integer(n), Expr::Integer(d)) if *d != 0 => {
+            if *d < 0 {
+              Some((-n, -d))
+            } else {
+              Some((*n, *d))
+            }
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+  fn contains_real(e: &Expr) -> bool {
+    match e {
+      Expr::Real(_) | Expr::BigFloat(..) => true,
+      Expr::BinaryOp { left, right, .. } => {
+        contains_real(left) || contains_real(right)
+      }
+      Expr::UnaryOp { operand, .. } => contains_real(operand),
+      Expr::FunctionCall { args, .. } | Expr::List(args) => {
+        args.iter().any(contains_real)
+      }
+      _ => false,
+    }
+  }
+  fn times_factors(e: &Expr) -> Option<Vec<Expr>> {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        Some(args.to_vec())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        let mut v =
+          times_factors(left).unwrap_or_else(|| vec![(**left).clone()]);
+        v.extend(
+          times_factors(right).unwrap_or_else(|| vec![(**right).clone()]),
+        );
+        Some(v)
+      }
+      _ => None,
+    }
+  }
+  let mul_exact = |a: (i128, i128), b: (i128, i128)| -> Option<(i128, i128)> {
+    let n = a.0.checked_mul(b.0)?;
+    let d = a.1.checked_mul(b.1)?;
+    let g = {
+      let (mut x, mut y) = (n.abs(), d.abs());
+      while y != 0 {
+        let t = x % y;
+        x = y;
+        y = t;
+      }
+      x.max(1)
+    };
+    Some((n / g, d / g))
+  };
+
+  let mut outer_exact: Option<(i128, i128)> = None;
+  let mut first_numeric_exact: Option<bool> = None;
+  let mut reals: Vec<f64> = Vec::new();
+  let mut nested_coeffs: Vec<f64> = Vec::new();
+  let mut const_tail: Vec<f64> = Vec::new();
+  let mut has_nested = false;
+
+  for arg in args {
+    if let Some(v) = exact_val(arg) {
+      first_numeric_exact.get_or_insert(true);
+      outer_exact = Some(mul_exact(outer_exact.unwrap_or((1, 1)), v)?);
+    } else if let Expr::Real(r) = arg {
+      first_numeric_exact.get_or_insert(false);
+      reals.push(*r);
+    } else if let Some(factors) = times_factors(arg) {
+      if contains_real(arg) {
+        return None;
+      }
+      let mut exact: Option<(i128, i128)> = None;
+      let mut consts: Vec<f64> = Vec::new();
+      for f in &factors {
+        if let Some(v) = exact_val(f) {
+          exact = Some(mul_exact(exact.unwrap_or((1, 1)), v)?);
+        } else {
+          consts.push(try_eval_to_f64(f)?);
+        }
+      }
+      if consts.is_empty() {
+        return None;
+      }
+      has_nested = true;
+      if let Some(e) = exact {
+        nested_coeffs.push(e.0 as f64 / e.1 as f64);
+        const_tail.extend(consts);
+      } else {
+        let is_reciprocal = |e: &Expr| -> bool {
+          let exp = match e {
+            Expr::BinaryOp {
+              op: BinaryOperator::Power,
+              right,
+              ..
+            } => Some(right.as_ref()),
+            Expr::FunctionCall { name, args }
+              if name == "Power" && args.len() == 2 =>
+            {
+              Some(&args[1])
+            }
+            _ => None,
+          };
+          exp.and_then(try_eval_to_f64).is_some_and(|v| v < 0.0)
+        };
+        let mut main: Vec<f64> = Vec::new();
+        let mut recip: Vec<f64> = Vec::new();
+        for (f, v) in factors.iter().zip(consts.iter()) {
+          if is_reciprocal(f) {
+            recip.push(*v);
+          } else {
+            main.push(*v);
+          }
+        }
+        const_tail.extend(main);
+        const_tail.extend(recip);
+      }
+    } else if !contains_real(arg)
+      && let Some(v) = try_eval_to_f64(arg)
+    {
+      const_tail.push(v);
+    } else {
+      return None;
+    }
+  }
+  if reals.is_empty() || !has_nested {
+    return None;
+  }
+
+  let exact_f = outer_exact.map_or(1.0, |(n, d)| n as f64 / d as f64);
+  let mut fold: Vec<f64> = Vec::new();
+  if outer_exact.is_some() && first_numeric_exact == Some(true) {
+    fold.push(exact_f);
+  }
+  fold.extend_from_slice(&reals);
+  let mut total = machine_tree_fold(&fold, |a, b| a * b);
+  if outer_exact.is_some() && first_numeric_exact != Some(true) {
+    total *= exact_f;
+  }
+  for c in &nested_coeffs {
+    total *= c;
+  }
+  for c in &const_tail {
+    total *= c;
+  }
+  Some(Expr::Real(total))
+}
+
+pub fn times_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  Ok(flip_unit_negative_rational_product(times_ast_inner(args)?))
+}
+
+fn times_ast_inner(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Ok(Expr::Integer(1));
+  }
+
+  // Threaded[...] broadcasting takes precedence over ordinary list threading.
+  if let Some(result) = try_threaded_op(args, ThreadedOp::Times) {
+    return result;
+  }
+
+  // Times is Flat: a factor that is itself a product splices into the outer
+  // one. Nested products reach here whenever a factor simplifies into a
+  // product of its own, and a `Times[-1/2, Times[I, Sqrt[21]]]` that
+  // survived would go on to print (and compare, and sort) as something no
+  // canonical product ever is.
+  if args.iter().any(|a| {
+    matches!(a, Expr::FunctionCall { name, .. } if name == "Times")
+      || matches!(
+        a,
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          ..
+        }
+      )
+  }) {
+    let mut flat: Vec<Expr> = Vec::with_capacity(args.len() + 2);
+    fn splice(e: &Expr, out: &mut Vec<Expr>) {
+      match e {
+        Expr::FunctionCall { name, args } if name == "Times" => {
+          for a in args {
+            splice(a, out);
+          }
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left,
+          right,
+        } => {
+          splice(left, out);
+          splice(right, out);
+        }
+        other => out.push(other.clone()),
+      }
+    }
+    for a in args {
+      splice(a, &mut flat);
+    }
+    return times_ast(&flat);
+  }
+
+  // Exact numeric product: when every factor is an Integer, BigInteger, or
+  // Rational, multiply them with BigInt-aware Coeff arithmetic and return a
+  // single reduced number. Without this, a product of rationals whose parts
+  // exceed i128 was left as an unreduced Times — both wrong and a formatter
+  // panic (denominator_form on a non-Power factor). Mirrors plus_ast.
+  if args.iter().all(|a| expr_to_coeff(a).is_some()) {
+    let mut prod = Coeff::Exact(1, 1);
+    for a in args {
+      if let Some(c) = expr_to_coeff(a) {
+        prod = prod.mul(&c);
+      }
+    }
+    return Ok(prod.to_expr());
+  }
+
+  // Integer-1 factors are the identity: return the remaining factor
+  // structurally unchanged. Rebuilding it would re-normalize forms the
+  // formatter treats specially (1*Cos[Pi/4] used to print (Sqrt[2])^(-1)
+  // instead of 1/Sqrt[2]).
+  {
+    let non_unit: Vec<&Expr> = args
+      .iter()
+      .filter(|a| !matches!(a, Expr::Integer(1)))
+      .collect();
+    if non_unit.len() == 1 && args.len() > 1 {
+      return Ok(non_unit[0].clone());
+    }
+  }
+
+  // SeriesData[var, x0, coeffs, nmin, nmax, denom] times var^k (k integer
+  // or rational): shift the series exponent range by k. With k = p/q,
+  // pick a common denominator d = lcm(denom, q) and scale all exponents
+  // and the coefficient slots accordingly.
+  // E.g. `Series[Exp[x], {x, 0, 2}] * x^(1/3)` →
+  // `SeriesData[x, 0, {1, 0, 0, 1}, 1, 7, 3]`.
+  if args.len() == 2 {
+    if let Some(result) = try_series_data_times_var_power(&args[0], &args[1]) {
+      return Ok(result);
+    }
+    if let Some(result) = try_series_data_times_var_power(&args[1], &args[0]) {
+      return Ok(result);
+    }
+  }
+
+  // Combine two-or-more `SeriesData[var, x0, …]` factors sharing the same
+  // (var, x0) into a single SeriesData via Cauchy product. Truncates to the
+  // tightest achievable order. Runs before the one-SeriesData distribution
+  // path below.
+  if let Some(result) = try_series_data_times(args)? {
+    return Ok(result);
+  }
+
+  // Distribute a constant factor into a SeriesData expansion. When `args`
+  // contains exactly one `SeriesData[var, x0, {coeffs...}, nmin, nmax, denom]`
+  // and all other factors are constant w.r.t. `var`, fold the product of
+  // those factors into each coefficient. Matches wolframscript:
+  // `Series[f[x],{x,0,2}] * g[w]` →
+  // `SeriesData[x, 0, {f[0]*g[w], g[w]*Derivative[1][f][0],
+  //                    (g[w]*Derivative[2][f][0])/2}, 0, 3, 1]`.
+  if args.len() >= 2 {
+    let series_idx = args.iter().position(|a| {
+      matches!(
+        a,
+        Expr::FunctionCall { name, args }
+          if name == "SeriesData" && args.len() == 6
+      )
+    });
+    if let Some(idx) = series_idx
+      && let Expr::FunctionCall { args: sd_args, .. } = &args[idx]
+      && let Expr::Identifier(var_name) = &sd_args[0]
+    {
+      let other_factors: Vec<&Expr> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, a)| a)
+        .collect();
+      let all_indep = other_factors
+        .iter()
+        .all(|f| crate::functions::calculus_ast::is_constant_wrt(f, var_name));
+      if all_indep && !other_factors.is_empty() {
+        let coeff_list = match &sd_args[2] {
+          Expr::List(items) => items.clone(),
+          _ => Vec::new().into(),
+        };
+        if !coeff_list.is_empty() {
+          let mut product = other_factors[0].clone();
+          for f in &other_factors[1..] {
+            product = times_ast(&[product, (*f).clone()])?;
+          }
+          let new_coeffs: Result<Vec<Expr>, _> = coeff_list
+            .iter()
+            .map(|c| times_ast(&[product.clone(), c.clone()]))
+            .collect();
+          let new_coeffs = new_coeffs?;
+          let data = vec![
+            sd_args[0].clone(),
+            sd_args[1].clone(),
+            Expr::List(new_coeffs.into()),
+            sd_args[3].clone(),
+            sd_args[4].clone(),
+            sd_args[5].clone(),
+          ];
+          return Ok(call("SeriesData", data));
+        }
+      }
+    }
+  }
+
+  // A time-series operand keeps the series, combining the values.
+  if let Some(result) =
+    crate::functions::timeseries_ast::try_series_arithmetic("Times", args)
+  {
+    return Ok(result);
+  }
+
+  // A SparseArray factor keeps the product sparse.
+  if let Some(result) =
+    crate::functions::list_helpers_ast::try_sparse_array_arithmetic(
+      "Times", args,
+    )
+  {
+    return Ok(result);
+  }
+
+  // Handle Quantity arithmetic before anything else
+  if let Some(result) = crate::functions::quantity_ast::try_quantity_times(args)
+  {
+    return result;
+  }
+
+  // Handle Interval arithmetic
+  if let Some(result) = crate::functions::interval_ast::try_interval_times(args)
+  {
+    return result;
+  }
+
+  // Around (uncertain-value) error propagation.
+  if let Some(result) = try_around_times(args) {
+    return Ok(result);
+  }
+
+  // A NESTED exact-times-constant product multiplying a machine Real does
+  // not flatten into the outer coefficient pool: wolframscript computes
+  // Times[39, Times[-35, Pi], -51.3 + Pi] as ((39 * real) * -35) * N[Pi]
+  // — the outer exacts fold with the reals first, each nested product's
+  // exact coefficient multiplies next, and the symbolic constants convert
+  // last — while the flat Times[39, -35, Pi, -51.3 + Pi] folds
+  // (-1365 * real) * N[Pi]. One ulp apart; wolframscript-verified
+  // (differential fuzzer, seed 4134943276941009607).
+  if let Some(result) = nested_exact_const_machine_times(args) {
+    return Ok(result);
+  }
+
+  // Flatten nested Times arguments (including BinaryOp forms)
+  let mut flat_args: Vec<Expr> = Vec::new();
+  fn flatten_times(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+      Expr::FunctionCall {
+        name,
+        args: inner_args,
+      } if name == "Times" => {
+        for a in inner_args {
+          flatten_times(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        flatten_times(left, out);
+        flatten_times(right, out);
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left,
+        right,
+      } => {
+        // a/b → a * b^(-1)
+        flatten_times(left, out);
+        out.push(Expr::BinaryOp {
+          op: BinaryOperator::Power,
+          left: right.clone(),
+          right: Box::new(Expr::Integer(-1)),
+        });
+      }
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } => {
+        // -x → (-1) * x
+        out.push(Expr::Integer(-1));
+        flatten_times(operand, out);
+      }
+      _ => out.push(expr.clone()),
+    }
+  }
+  for arg in args {
+    flatten_times(arg, &mut flat_args);
+  }
+
+  // Propagate Indeterminate and ComplexInfinity through multiplication
+  for arg in &flat_args {
+    if matches!(arg, Expr::Identifier(n) if n == "Indeterminate") {
+      return Ok(id_expr("Indeterminate"));
+    }
+  }
+
+  // Times[…, ConditionalExpression[v1, c1], ConditionalExpression[v2, c2], …]
+  // collapses each pair into ConditionalExpression[v1·v2, c1 && c2]. wolframscript:
+  //   `CE[1, a>0] CE[1, b>0]`  →  `CE[1, a>0 && b>0]`.
+  // We pull every CE factor out of `flat_args`, multiply the remaining
+  // factors with the values, and AND the conditions.
+  if flat_args
+    .iter()
+    .filter(|a| matches!(a, Expr::FunctionCall { name, args } if name == "ConditionalExpression" && args.len() == 2))
+    .count()
+    >= 2
+  {
+    let mut ce_values: Vec<Expr> = Vec::new();
+    let mut ce_conds: Vec<Expr> = Vec::new();
+    let mut other: Vec<Expr> = Vec::new();
+    for a in &flat_args {
+      if let Expr::FunctionCall { name, args } = a
+        && name == "ConditionalExpression"
+        && args.len() == 2
+      {
+        ce_values.push(args[0].clone());
+        ce_conds.push(args[1].clone());
+      } else {
+        other.push(a.clone());
+      }
+    }
+    let mut combined_value_args = other;
+    combined_value_args.extend(ce_values);
+    let combined_value = times_ast(&combined_value_args)?;
+    let combined_cond = if ce_conds.len() == 1 {
+      ce_conds.into_iter().next().unwrap()
+    } else {
+      call("And", ce_conds)
+    };
+    let combined_cond =
+      crate::evaluator::evaluate_expr_to_expr(&combined_cond)?;
+    return Ok(call("ConditionalExpression", vec![combined_value, combined_cond]));
+  }
+  // ComplexInfinity * 0 = Indeterminate, ComplexInfinity * x = ComplexInfinity
+  let has_complex_inf = flat_args
+    .iter()
+    .any(|a| matches!(a, Expr::Identifier(n) if n == "ComplexInfinity"));
+  if has_complex_inf {
+    let has_zero = flat_args.iter().any(|a| matches!(a, Expr::Integer(0)));
+    if has_zero {
+      crate::emit_message(
+        "Infinity::indet: Indeterminate expression 0 ComplexInfinity \
+         encountered.",
+      );
+      return Ok(id_expr("Indeterminate"));
+    }
+    return Ok(id_expr("ComplexInfinity"));
+  }
+
+  // Times[…, complex_number, Infinity-like, …] → fold the complex factor
+  // into the Infinity direction and let `DirectedInfinity[…]` normalize the
+  // result. Without this, a complex literal multiplied by `Infinity` stayed
+  // as the unevaluated `Times[<complex>, Infinity]` form. wolframscript:
+  //   (-1 + 2 I) Infinity  →  DirectedInfinity[(-1 + 2*I)/Sqrt[5]]
+  // Triggers for both numeric complex factors (`-1 + 2 I`) and symbolic
+  // ones with real-valued components (`-1 + 2 Pi I` → magnitude `Sqrt[1
+  // + 4 Pi^2]`). Real-coefficient × Infinity is handled by the existing
+  // numeric coefficient path further down.
+  // A DirectedInfinity with a general (non-real) direction absorbs the other
+  // factors: their product multiplies into the direction, which
+  // `DirectedInfinity` then re-normalizes. Two directed infinities multiply
+  // their directions the same way (`DirectedInfinity[I]^2` is `-Infinity`).
+  // Plain ±Infinity with real factors keeps the dedicated paths below.
+  {
+    let mut dirs: Vec<Expr> = Vec::new();
+    let mut rest: Vec<Expr> = Vec::new();
+    let mut complex_inf = false;
+    for a in &flat_args {
+      match infinity_direction(a) {
+        Some(Some(d)) => dirs.push(d),
+        Some(None) => complex_inf = true,
+        None => rest.push(a.clone()),
+      }
+    }
+    let general = dirs.len() > 1
+      || dirs.iter().any(
+        |d| !matches!(try_eval_to_f64(d), Some(v) if v == 1.0 || v == -1.0),
+      );
+    let rest_is_nonzero_numeric = rest.iter().all(|r| {
+      matches!(try_extract_complex_float(r), Some((re, im)) if re != 0.0 || im != 0.0)
+    });
+    if !complex_inf
+      && !dirs.is_empty()
+      && general
+      && (dirs.len() > 1 || !rest.is_empty())
+      && rest_is_nonzero_numeric
+    {
+      let mut factors = dirs;
+      factors.extend(rest);
+      let combined = times_ast(&factors)?;
+      return crate::evaluator::evaluate_function_call_ast(
+        "DirectedInfinity",
+        &[combined],
+      );
+    }
+  }
+
+  let complex_idx = flat_args.iter().position(|a| {
+    if let Some(((_re_n, _re_d), (im_n, _im_d))) = try_extract_complex_exact(a)
+    {
+      return im_n != 0;
+    }
+    // Symbolic complex: `Plus[real, Times[real, I]]` or similar.
+    if let Some((_re, im)) =
+      crate::evaluator::dispatch::complex_and_special::split_real_imag_symbolic(
+        a,
+      )
+      && !matches!(im, Expr::Integer(0))
+    {
+      return true;
+    }
+    false
+  });
+  let inf_idx = flat_args.iter().position(|a| {
+    matches!(a, Expr::Identifier(n) if n == "Infinity")
+      || matches!(a, Expr::UnaryOp {
+          op: UnaryOperator::Minus,
+          operand,
+        } if matches!(operand.as_ref(), Expr::Identifier(n) if n == "Infinity"))
+      || matches!(a, Expr::FunctionCall { name, args } if name == "DirectedInfinity" && args.len() == 1)
+  });
+  if let (Some(ci), Some(ii)) = (complex_idx, inf_idx)
+    && ci != ii
+  {
+    let direction: Expr = match &flat_args[ii] {
+      Expr::Identifier(_) => Expr::Integer(1),
+      Expr::UnaryOp { .. } => Expr::Integer(-1),
+      Expr::FunctionCall { args, .. } => args[0].clone(),
+      _ => unreachable!(),
+    };
+    let complex_factor = flat_args[ci].clone();
+    let combined = times_ast(&[complex_factor, direction])?;
+    let new_inf = crate::evaluator::evaluate_function_call_ast(
+      "DirectedInfinity",
+      &[combined],
+    )?;
+    let mut rest: Vec<Expr> = flat_args
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| *i != ci && *i != ii)
+      .map(|(_, a)| a.clone())
+      .collect();
+    rest.push(new_inf);
+    return times_ast(&rest);
+  }
+
+  // Real-signed scalar × (±Infinity) collapses to ±Infinity. wolframscript:
+  //   2.5 Infinity → Infinity,  Pi Infinity → Infinity,  Sqrt[2] Infinity →
+  //   Infinity,  -2.5 Infinity → -Infinity. Only fires when every non-Infinity
+  //   factor has a known real sign (numeric, positive named constants, and
+  //   their products / negations), so symbolic factors like `x Infinity` are
+  //   left untouched. Integer/rational coefficients already collapsed above;
+  //   this extends the same rule to reals and positive constants.
+  {
+    // Known real sign of a factor: Some(1) positive, Some(-1) negative,
+    // None when the sign can't be determined (symbolic).
+    fn real_factor_sign(e: &Expr) -> Option<i8> {
+      if is_strictly_positive_real(e) {
+        return Some(1);
+      }
+      match e {
+        Expr::Integer(n) if *n < 0 => Some(-1),
+        Expr::Real(f) if *f < 0.0 => Some(-1),
+        Expr::BigInteger(n) => {
+          use num_traits::Signed;
+          if n.is_negative() { Some(-1) } else { None }
+        }
+        Expr::FunctionCall { name, args }
+          if name == "Rational" && args.len() == 2 =>
+        {
+          match (&args[0], &args[1]) {
+            (Expr::Integer(n), Expr::Integer(d)) if (*n < 0) ^ (*d < 0) => {
+              Some(-1)
+            }
+            _ => None,
+          }
+        }
+        Expr::UnaryOp {
+          op: UnaryOperator::Minus,
+          operand,
+        } => real_factor_sign(operand).map(|s| -s),
+        Expr::FunctionCall { name, args } if name == "Times" => {
+          let mut sign = 1i8;
+          for a in args {
+            sign *= real_factor_sign(a)?;
+          }
+          Some(sign)
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left,
+          right,
+        } => Some(real_factor_sign(left)? * real_factor_sign(right)?),
+        _ => None,
+      }
+    }
+    let is_plain_infinity = |a: &Expr| -> Option<i8> {
+      match a {
+        Expr::Identifier(n) if n == "Infinity" => Some(1),
+        Expr::UnaryOp {
+          op: UnaryOperator::Minus,
+          operand,
+        } if matches!(operand.as_ref(), Expr::Identifier(n) if n == "Infinity") => {
+          Some(-1)
+        }
+        _ => None,
+      }
+    };
+    let inf_positions: Vec<(usize, i8)> = flat_args
+      .iter()
+      .enumerate()
+      .filter_map(|(i, a)| is_plain_infinity(a).map(|s| (i, s)))
+      .collect();
+    if inf_positions.len() == 1 {
+      let (ii, inf_sign) = inf_positions[0];
+      let others: Vec<&Expr> = flat_args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != ii)
+        .map(|(_, a)| a)
+        .collect();
+      if !others.is_empty()
+        && let Some(mut sign) = others
+          .iter()
+          .try_fold(inf_sign, |acc, a| real_factor_sign(a).map(|s| acc * s))
+      {
+        if sign == 0 {
+          sign = 1; // defensive; real_factor_sign never yields 0
+        }
+        let inf = id_expr("Infinity");
+        return Ok(if sign > 0 { inf } else { neg1(inf) });
+      }
+    }
+  }
+
+  // Underflow[] / Overflow[] absorb non-zero numeric factors (Wolfram
+  // keeps them symbolic when multiplied by symbols). 0 * Underflow[] = 0.
+  let is_underflow = |a: &Expr| matches!(a, Expr::FunctionCall { name, args } if name == "Underflow" && args.is_empty());
+  let is_overflow = |a: &Expr| matches!(a, Expr::FunctionCall { name, args } if name == "Overflow" && args.is_empty());
+  if flat_args.iter().any(|a| is_underflow(a) || is_overflow(a)) {
+    let has_zero = flat_args.iter().any(|a| matches!(a, Expr::Integer(0)));
+    if has_zero {
+      return Ok(Expr::Integer(0));
+    }
+    let all_numeric_or_flag = flat_args.iter().all(|a| {
+      is_underflow(a)
+        || is_overflow(a)
+        || matches!(
+          a,
+          Expr::Integer(_)
+            | Expr::Real(_)
+            | Expr::BigInteger(_)
+            | Expr::BigFloat(_, _)
+        )
+        || matches!(a, Expr::FunctionCall { name, args: ra }
+          if name == "Rational" && ra.len() == 2)
+    });
+    if all_numeric_or_flag {
+      let tag = if flat_args.iter().any(&is_overflow) {
+        "Overflow"
+      } else {
+        "Underflow"
+      };
+      return Ok(call0(tag));
+    }
+  }
+
+  // ProductLog identity: W(z) · E^W(z) ≡ z. When `Times[…]` contains
+  // matching `ProductLog[z]` and `Power[E, ProductLog[z]]` factors (for
+  // identical `z`), drop both and substitute `z` in their place. The
+  // pair check tolerates the optional 2-arg form `ProductLog[k, z]` too,
+  // matching wolframscript's reduction.
+  {
+    fn extract_product_log(e: &Expr) -> Option<Expr> {
+      if let Expr::FunctionCall { name, args } = e
+        && name == "ProductLog"
+      {
+        match args.len() {
+          1 => return Some(args[0].clone()),
+          2 => return Some(args[1].clone()),
+          _ => {}
+        }
+      }
+      None
+    }
+    fn extract_e_to_product_log(e: &Expr) -> Option<Expr> {
+      let exp_arg = match e {
+        Expr::FunctionCall { name, args }
+          if name == "Power"
+            && args.len() == 2
+            && (matches!(args[0], Expr::Identifier(ref s) if s == "E")
+              || matches!(args[0], Expr::Constant(ref s) if s == "E")) =>
+        {
+          &args[1]
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Power,
+          left,
+          right,
+        } if matches!(left.as_ref(), Expr::Identifier(s) if s == "E")
+          || matches!(left.as_ref(), Expr::Constant(s) if s == "E") =>
+        {
+          right.as_ref()
+        }
+        _ => return None,
+      };
+      extract_product_log(exp_arg)
+    }
+    if flat_args.len() >= 2 {
+      let pl_z: Vec<(usize, Expr)> = flat_args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| extract_product_log(e).map(|z| (i, z)))
+        .collect();
+      let exp_pl_z: Vec<(usize, Expr)> = flat_args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| extract_e_to_product_log(e).map(|z| (i, z)))
+        .collect();
+      let mut consumed: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+      let mut replacements: Vec<Expr> = Vec::new();
+      for (pi, pz) in &pl_z {
+        if consumed.contains(pi) {
+          continue;
+        }
+        for (ei, ez) in &exp_pl_z {
+          if pi == ei || consumed.contains(ei) {
+            continue;
+          }
+          if expr_to_string(pz) == expr_to_string(ez) {
+            consumed.insert(*pi);
+            consumed.insert(*ei);
+            replacements.push(pz.clone());
+            break;
+          }
+        }
+      }
+      if !consumed.is_empty() {
+        let mut new_args: Vec<Expr> = flat_args
+          .iter()
+          .enumerate()
+          .filter(|(i, _)| !consumed.contains(i))
+          .map(|(_, e)| e.clone())
+          .collect();
+        new_args.extend(replacements);
+        if new_args.len() == flat_args.len() {
+          // No-op (shouldn't happen), fall through
+        } else {
+          return times_ast(&new_args);
+        }
+      }
+    }
+  }
+
+  let args = &flat_args;
+
+  // Try complex multiplication: if all args can be extracted as exact complex
+  // numbers (and at least one has nonzero imaginary part), multiply them.
+  if args.len() >= 2 {
+    let complex_parts: Vec<_> =
+      args.iter().map(try_extract_complex_exact).collect();
+    if complex_parts.iter().all(std::option::Option::is_some) {
+      let has_imaginary = complex_parts.iter().any(|c| {
+        if let Some((_, (im, _))) = c {
+          *im != 0
+        } else {
+          false
+        }
+      });
+      if has_imaginary {
+        // Multiply all complex parts
+        let mut re_n: i128 = complex_parts[0].unwrap().0.0;
+        let mut re_d: i128 = complex_parts[0].unwrap().0.1;
+        let mut im_n: i128 = complex_parts[0].unwrap().1.0;
+        let mut im_d: i128 = complex_parts[0].unwrap().1.1;
+        let mut ok = true;
+        for cp in &complex_parts[1..] {
+          let ((cn, cd), (dn, dd)) = cp.unwrap();
+          // (re + im*i) * (cn/cd + dn/dd*i)
+          let new_re = (|| {
+            let a = re_n.checked_mul(cn)?.checked_mul(im_d)?.checked_mul(dd)?;
+            let b = im_n.checked_mul(dn)?.checked_mul(re_d)?.checked_mul(cd)?;
+            let num = a.checked_sub(b)?;
+            let den =
+              re_d.checked_mul(cd)?.checked_mul(im_d)?.checked_mul(dd)?;
+            Some((num, den))
+          })();
+          let new_im = (|| {
+            let a = re_n.checked_mul(dn)?.checked_mul(im_d)?.checked_mul(cd)?;
+            let b = im_n.checked_mul(cn)?.checked_mul(re_d)?.checked_mul(dd)?;
+            let num = a.checked_add(b)?;
+            let den =
+              re_d.checked_mul(dd)?.checked_mul(im_d)?.checked_mul(cd)?;
+            Some((num, den))
+          })();
+          if let (Some((rn, rd)), Some((in_, id))) = (new_re, new_im) {
+            re_n = rn;
+            re_d = rd;
+            im_n = in_;
+            im_d = id;
+          } else {
+            ok = false;
+            break;
+          }
+        }
+        if ok {
+          return Ok(complex_rational_to_expr(re_n, re_d, im_n, im_d));
+        }
+      }
+    }
+  }
+
+  // Float complex multiplication: when every factor extracts as a machine
+  // complex number, at least one factor is inexact (Real/BigFloat), and at
+  // least one factor has a nonzero imaginary part, fold into a single machine
+  // complex number. The exact path above handles purely exact complex
+  // products; this covers the inexact case wolframscript also collapses:
+  //   2.*(3 + 4 I) → 6. + 8. I,  Pi*(2. + I) → 6.283… + 3.141…*I.
+  // Symbolic factors (e.g. `x`) make try_extract_complex_float return None, so
+  // `x*(2. + I)` is left untouched; an all-exact product like `Pi*(2 + I)`
+  // lacks an inexact factor and stays symbolic.
+  if args.len() >= 2 {
+    let float_parts: Vec<Option<(f64, f64)>> =
+      args.iter().map(try_extract_complex_float).collect();
+    if float_parts.iter().all(std::option::Option::is_some) {
+      let any_imag = float_parts.iter().any(|c| c.unwrap().1 != 0.0);
+      // Trigger on a machine Real (so the product is genuinely machine
+      // precision), but bail if any factor carries a precision-tagged
+      // BigFloat — collapsing those to f64 would silently drop precision
+      // (e.g. ArcCosh[0``38.] = high-precision Pi/2 * I).
+      fn has_machine_real(e: &Expr) -> bool {
+        match e {
+          Expr::Real(_) => true,
+          Expr::UnaryOp { operand, .. } => has_machine_real(operand),
+          Expr::BinaryOp { left, right, .. } => {
+            has_machine_real(left) || has_machine_real(right)
+          }
+          Expr::FunctionCall { args, .. } => args.iter().any(has_machine_real),
+          _ => false,
+        }
+      }
+      fn has_bigfloat(e: &Expr) -> bool {
+        match e {
+          Expr::BigFloat(_, _) => true,
+          Expr::UnaryOp { operand, .. } => has_bigfloat(operand),
+          Expr::BinaryOp { left, right, .. } => {
+            has_bigfloat(left) || has_bigfloat(right)
+          }
+          Expr::FunctionCall { args, .. } => args.iter().any(has_bigfloat),
+          _ => false,
+        }
+      }
+      let any_machine_real = args.iter().any(has_machine_real);
+      let any_bigfloat = args.iter().any(has_bigfloat);
+      if any_imag && any_machine_real && !any_bigfloat {
+        let (mut re, mut im) = float_parts[0].unwrap();
+        for cp in &float_parts[1..] {
+          let (c, d) = cp.unwrap();
+          let (a, b) = (re, im);
+          re = a * c - b * d;
+          im = a * d + b * c;
+        }
+        // Only collapse when the product has a nonzero real part. A pure
+        // imaginary product (re == 0) is left as the `c*I` monomial so it
+        // still merges inside an enclosing Plus (`2. + Pi I` stays
+        // `2. + 3.14…*I`, not `2. + (0. + 3.14…*I)`). When re != 0 keep both
+        // parts as machine reals, matching wolframscript's `6. + 8.*I` and
+        // `-2. + 0.*I`.
+        if re != 0.0 {
+          return Ok(build_complex_float_expr_keep_real(re, im));
+        }
+      }
+    }
+  }
+
+  // Check for list threading
+  let has_list = args.iter().any(|a| matches!(a, Expr::List(_)));
+  if has_list {
+    return thread_binary_over_lists(args, |a, b| {
+      // Delegate to times_ast so rationals, bigints, symbolic factors,
+      // etc. are handled consistently with the non-list path.
+      times_ast(&[a.clone(), b.clone()])
+    });
+  }
+
+  // Times is exempt from the dispatch Orderless pre-sort so the machine
+  // fold below sees the original argument order (it is order-sensitive:
+  // Times[3, 1/7, 0.1, 0.2, 0.3] ≠ Times[0.1, 0.2, 3, 1/7, 0.3]).
+  // Without a machine Real the product is order-insensitive (exact
+  // arithmetic commutes), so restore the canonical order here — the
+  // exact/symbolic paths below rely on canonically sorted input. This
+  // runs AFTER the container handlers above (Quantity, SeriesData, …),
+  // which pick their result forms from the original order.
+  let sorted_storage;
+  let args: &[Expr] = if args.iter().any(|a| matches!(a, Expr::Real(_))) {
+    args
+  } else {
+    let mut sorted = args.clone();
+    sorted.sort_by(|a, b| {
+      let ord = crate::functions::list_helpers_ast::compare_exprs(a, b);
+      if ord > 0 {
+        std::cmp::Ordering::Less
+      } else if ord < 0 {
+        std::cmp::Ordering::Greater
+      } else {
+        std::cmp::Ordering::Equal
+      }
+    });
+    sorted_storage = sorted;
+    &sorted_storage
+  };
+
+  // BigFloat-aware product. When any factor is a precision-tagged
+  // BigFloat and every factor evaluates to a BigFloat (via expr_to_bigfloat
+  // — Integer, Rational, BigFloat, or one of the math constants E / Pi /
+  // Degree / GoldenRatio / EulerGamma / Catalan / Glaisher / Khinchin),
+  // compute the product with astro-float so e.g. `N[Pi, 30] * E` returns
+  // a single high-precision BigFloat instead of a symbolic Times.
+  let has_bigfloat = args.iter().any(|a| matches!(a, Expr::BigFloat(_, _)));
+  if has_bigfloat && args.iter().all(is_bigfloat_evaluable_factor) {
+    return bigfloat_times(args);
+  }
+  // Any other exact numeric factor (`Sqrt[2]`, `Log[3]`) is numericized to
+  // the BigFloat's precision first, so `N[Pi, 30] Sqrt[2]` is one number.
+  if has_bigfloat
+    && let Some(precision) = args
+      .iter()
+      .filter_map(|a| match a {
+        Expr::BigFloat(_, p) => Some(*p),
+        _ => None,
+      })
+      .reduce(f64::min)
+    && args.iter().all(|a| {
+      is_bigfloat_evaluable_factor(a)
+        || (crate::functions::predicate_ast::is_numeric_q(a)
+          && !contains_imaginary_unit(a))
+    })
+  {
+    // An exact factor has no error of its own: it is numericized with
+    // guard digits, and the product keeps the precision the inexact
+    // factors alone give it.
+    let numericized: Vec<Expr> = args
+      .iter()
+      .map(|a| {
+        if is_bigfloat_evaluable_factor(a) {
+          Ok(a.clone())
+        } else {
+          crate::functions::math_ast::n_ast(&[
+            a.clone(),
+            Expr::Real(precision + 20.0),
+          ])
+        }
+      })
+      .collect::<Result<_, _>>()?;
+    if numericized.iter().all(is_bigfloat_evaluable_factor) {
+      let total_rel_err: f64 = args
+        .iter()
+        .filter_map(factor_precision_contribution)
+        .map(|p| 10f64.powf(-p))
+        .sum();
+      let product = bigfloat_times(&numericized)?;
+      return Ok(match &product {
+        Expr::BigFloat(digits, _) if total_rel_err > 0.0 => {
+          Expr::BigFloat(digits.clone(), -total_rel_err.log10())
+        }
+        _ => product,
+      });
+    }
+  }
+
+  // Check if any argument needs BigInt arithmetic (BigInteger or large Integer exceeding f64 precision)
+  let has_bigint = args.iter().any(needs_bigint_arithmetic);
+
+  if has_bigint {
+    use num_traits::ToPrimitive;
+    // Track the numeric coefficient as an exact BigInt fraction so that a
+    // Rational factor's denominator cancels against a large integer (e.g.
+    // `Times[3*10^16, Rational[1, 10^16], x]` → `(3*x)/2`, not the unreduced
+    // `(3*10^16 x)/10^16`). Folding Rationals here was previously skipped —
+    // they fell through to `symbolic_args`, leaving the fraction unreduced.
+    let mut big_numer = BigInt::from(1);
+    let mut big_denom = BigInt::from(1);
+    let mut all_int = true;
+    let mut real_product: f64 = 1.0;
+    let mut has_real = false;
+    let mut symbolic_args: Vec<Expr> = Vec::new();
+
+    // Pull (p, q) out of a Rational[p, q] whose parts are Integer/BigInteger.
+    let rational_parts = |e: &Expr| -> Option<(BigInt, BigInt)> {
+      if let Expr::FunctionCall { name, args: ra } = e
+        && name == "Rational"
+        && ra.len() == 2
+      {
+        let to_big = |x: &Expr| -> Option<BigInt> {
+          match x {
+            Expr::Integer(v) => Some(BigInt::from(*v)),
+            Expr::BigInteger(v) => Some(v.clone()),
+            _ => None,
+          }
+        };
+        if let (Some(p), Some(q)) = (to_big(&ra[0]), to_big(&ra[1])) {
+          return Some((p, q));
+        }
+      }
+      None
+    };
+
+    for arg in args {
+      match arg {
+        Expr::Integer(n) => big_numer *= BigInt::from(*n),
+        Expr::BigInteger(n) => big_numer *= n,
+        Expr::Real(f) => {
+          real_product *= *f;
+          has_real = true;
+          all_int = false;
+        }
+        // Power[Integer|BigInteger base, Integer exponent] folds into the exact
+        // coefficient fraction — a negative exponent (a reciprocal such as
+        // `(10^40)^(-1)`) is otherwise left symbolic and never cancels against a
+        // large integer numerator (the BigInteger analogue of the Rational case).
+        Expr::BinaryOp {
+          op: BinaryOperator::Power,
+          left: base,
+          right: exp,
+        } if matches!(
+          base.as_ref(),
+          Expr::Integer(_) | Expr::BigInteger(_)
+        ) && matches!(exp.as_ref(), Expr::Integer(_)) =>
+        {
+          let base_big = match base.as_ref() {
+            Expr::Integer(v) => BigInt::from(*v),
+            Expr::BigInteger(v) => v.clone(),
+            _ => unreachable!(),
+          };
+          let e = match exp.as_ref() {
+            Expr::Integer(v) => *v,
+            _ => unreachable!(),
+          };
+          if e >= 0 {
+            big_numer *= base_big.pow(e as u32);
+          } else {
+            big_denom *= base_big.pow((-e) as u32);
+          }
+          all_int = false;
+        }
+        _ => {
+          if let Some((p, q)) = rational_parts(arg) {
+            big_numer *= p;
+            big_denom *= q;
+            all_int = false;
+          } else {
+            all_int = false;
+            symbolic_args.push(arg.clone());
+          }
+        }
+      }
+    }
+
+    // Symbolic power factors sharing a base can collapse into a pure number
+    // (e.g. `2^(-1/2)*2^(-1/2) → 1/2`, `Sqrt[2]*Sqrt[2] → 2`). Combine them
+    // now and fold any resulting exact number back into the coefficient
+    // fraction, so a product like `-1 * 2^(-1/2) * 2^(-1/2)` reduces to
+    // `Rational[-1, 2]` rather than the unfolded `Times[-1, 1/2]`.
+    if symbolic_args.len() >= 2 {
+      symbolic_args = combine_like_bases(symbolic_args)?;
+      symbolic_args.retain(|a| match a {
+        Expr::Integer(n) => {
+          big_numer *= BigInt::from(*n);
+          false
+        }
+        Expr::BigInteger(n) => {
+          big_numer *= n;
+          false
+        }
+        _ => {
+          if let Some((p, q)) = rational_parts(a) {
+            big_numer *= p;
+            big_denom *= q;
+            false
+          } else {
+            true
+          }
+        }
+      });
+    }
+
+    // Reduce the fraction by gcd and fix the sign onto the numerator.
+    (big_numer, big_denom) = rat_reduce_bigint(&big_numer, &big_denom);
+    let coeff_is_int = big_denom == BigInt::from(1);
+
+    if all_int && coeff_is_int {
+      return Ok(bigint_to_expr(big_numer));
+    }
+
+    // 0 * anything = 0
+    if big_numer == BigInt::from(0) {
+      return Ok(Expr::Integer(0));
+    }
+
+    // Build the exact coefficient expression (Integer or reduced Rational).
+    let coeff_expr = if coeff_is_int {
+      bigint_to_expr(big_numer.clone())
+    } else {
+      call(
+        "Rational",
+        vec![
+          bigint_to_expr(big_numer.clone()),
+          bigint_to_expr(big_denom.clone()),
+        ],
+      )
+    };
+
+    // If any Real factor is present, collapse the exact coefficient × Real to a
+    // single Real (matches wolframscript: 2.5 * 10^20 → 2.5*^20).
+    if has_real {
+      let coeff_f = big_numer.to_f64().unwrap_or(f64::INFINITY)
+        / big_denom.to_f64().unwrap_or(f64::INFINITY);
+      let numeric = Expr::Real(coeff_f * real_product);
+      if symbolic_args.is_empty() {
+        return Ok(numeric);
+      }
+      symbolic_args = combine_like_bases(symbolic_args)?;
+      sort_symbolic_factors(&mut symbolic_args);
+      let mut final_args: Vec<Expr> = vec![numeric];
+      final_args.extend(symbolic_args);
+      return Ok(call("Times", final_args));
+    }
+
+    if symbolic_args.is_empty() {
+      return Ok(coeff_expr);
+    }
+
+    symbolic_args = combine_like_bases(symbolic_args)?;
+    sort_symbolic_factors(&mut symbolic_args);
+    let mut final_args: Vec<Expr> = Vec::new();
+    if !(coeff_is_int && big_numer == BigInt::from(1)) {
+      final_args.push(coeff_expr);
+    }
+    final_args.extend(symbolic_args);
+    if final_args.len() == 1 {
+      return Ok(final_args.remove(0));
+    }
+    return Ok(call("Times", final_args));
+  }
+
+  // Separate into: integers, rationals, reals, and symbolic arguments.
+  // num_factors keeps EVERY numeric factor in input order (exact ones as
+  // exact Coeffs) — when a machine Real is present the product folds as
+  // the balanced machine tree over these factors (see coeff_tree_fold):
+  // Times[68, 63.599999999999994, 57] is (68*63.6)*57 =
+  // 246513.59999999995, one ulp away from the coalesced (68*57)*63.6
+  // (wolframscript-verified; differential fuzzer).
+  let mut int_product: i128 = 1;
+  let mut int_overflow = false;
+  let mut has_int = false;
+  let mut rat_numer: i128 = 1;
+  let mut rat_denom: i128 = 1;
+  let mut has_rational = false;
+  let mut any_real = false;
+  let mut num_factors: Vec<Coeff> = Vec::new();
+  let mut symbolic_args: Vec<Expr> = Vec::new();
+
+  // Pre-check: is there an explicit Rational or non-unity Integer coefficient among the args?
+  // If so, we can absorb integer denominators from (expr/d) terms into the coefficient.
+  // This simplifies e.g. Times[Rational(-1,2), x^3/3] → Rational(-1,6)*x^3
+  // but leaves Times[I, Pi/2] intact (no explicit rational coefficient).
+  let has_rational_coeff_in_args = args.iter().any(|a| {
+    matches!(a, Expr::FunctionCall { name, .. } if name == "Rational")
+      || matches!(a, Expr::Integer(n) if *n != 1)
+  });
+
+  for arg in args {
+    match arg {
+      Expr::Integer(n) => {
+        if let Some(result) = int_product.checked_mul(*n) {
+          int_product = result;
+        } else {
+          int_overflow = true;
+        }
+        has_int = true;
+        num_factors.push(Coeff::Exact(*n, 1));
+      }
+      Expr::Real(f) => {
+        any_real = true;
+        num_factors.push(Coeff::Real(*f));
+      }
+      Expr::FunctionCall { name, args: rargs }
+        if name == "Rational" && rargs.len() == 2 =>
+      {
+        if let (Expr::Integer(n), Expr::Integer(d)) = (&rargs[0], &rargs[1]) {
+          if let (Some(rn), Some(rd)) =
+            (rat_numer.checked_mul(*n), rat_denom.checked_mul(*d))
+          {
+            rat_numer = rn;
+            rat_denom = rd;
+          } else {
+            int_overflow = true;
+          }
+          has_rational = true;
+          num_factors.push(Coeff::Exact(*n, *d));
+        } else {
+          symbolic_args.push(arg.clone());
+        }
+      }
+      // Power[Integer(n), Integer(neg)] → absorb into rational coefficient
+      // e.g. 2^(-1) → rat_denom *= 2, or 3^(-2) → rat_denom *= 9
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: base,
+        right: exp,
+      } if matches!(base.as_ref(), Expr::Integer(n) if *n != 0)
+        && matches!(exp.as_ref(), Expr::Integer(e) if *e < 0) =>
+      {
+        if let (Expr::Integer(n), Expr::Integer(e)) =
+          (base.as_ref(), exp.as_ref())
+        {
+          let abs_e = (-e) as u32;
+          if let Some(pow) = n.checked_pow(abs_e) {
+            if let Some(rd) = rat_denom.checked_mul(pow) {
+              rat_denom = rd;
+              has_rational = true;
+              num_factors.push(Coeff::Exact(1, pow));
+            } else {
+              int_overflow = true;
+            }
+          } else {
+            symbolic_args.push(arg.clone());
+          }
+        }
+      }
+      _ => {
+        // If arg is (symbolic_expr / Integer(d)) AND there is already a rational or
+        // non-unity integer coefficient among the args, absorb d into the coefficient.
+        // E.g. Times[Rational(-1,2), x^3/3] → Rational(-1,6)*x^3
+        // But leave Times[I, Pi/2] unchanged (no explicit rational coefficient).
+        if has_rational_coeff_in_args
+          && let Expr::BinaryOp {
+            op: BinaryOperator::Divide,
+            left: num_expr,
+            right: den_expr,
+          } = arg
+          && let Expr::Integer(d) = den_expr.as_ref()
+          && *d != 0
+          && expr_to_num(num_expr).is_none()
+        {
+          if let Some(rd) = rat_denom.checked_mul(*d) {
+            rat_denom = rd;
+            has_rational = true;
+            num_factors.push(Coeff::Exact(1, *d));
+            symbolic_args.push(*num_expr.clone());
+          } else {
+            symbolic_args.push(arg.clone());
+          }
+        } else if let Some(n) = expr_to_num(arg) {
+          any_real = true;
+          num_factors.push(Coeff::Real(n));
+        } else {
+          symbolic_args.push(arg.clone());
+        }
+      }
+    }
+  }
+
+  // If overflow detected, fall back to BigInt arithmetic
+  if int_overflow {
+    let mut big_product = BigInt::from(1);
+    let mut sym_args: Vec<Expr> = Vec::new();
+    for arg in args {
+      match arg {
+        Expr::Integer(n) => big_product *= BigInt::from(*n),
+        Expr::BigInteger(n) => big_product *= n,
+        _ => sym_args.push(arg.clone()),
+      }
+    }
+    if sym_args.is_empty() {
+      return Ok(bigint_to_expr(big_product));
+    }
+    if big_product == BigInt::from(0) {
+      return Ok(Expr::Integer(0));
+    }
+    sym_args = combine_like_bases(sym_args)?;
+    sort_symbolic_factors(&mut sym_args);
+    let mut final_args: Vec<Expr> = Vec::new();
+    if big_product != BigInt::from(1) {
+      final_args.push(bigint_to_expr(big_product));
+    }
+    final_args.extend(sym_args);
+    if final_args.len() == 1 {
+      return Ok(final_args.remove(0));
+    }
+    return Ok(call("Times", final_args));
+  }
+
+  // If any Real, try to convert symbolic constants (Pi, E, etc.) to floats.
+  // They fold LAST, one at a time (Times[0.1, Pi, 0.3, -Pi] multiplies
+  // 0.1*0.3 first) — mirroring the numerified-constant tail in Plus.
+  if any_real {
+    let mut numerified_tail: Vec<f64> = Vec::new();
+    let mut remaining_symbolic: Vec<Expr> = Vec::new();
+    for arg in symbolic_args.drain(..) {
+      if let Some(f) = try_eval_to_f64(&arg) {
+        numerified_tail.push(f);
+      } else {
+        remaining_symbolic.push(arg);
+      }
+    }
+    symbolic_args = remaining_symbolic;
+
+    // Machine fold in Wolfram's order: the balanced machine tree over
+    // every numeric factor in input order (exact subtrees combine
+    // exactly — see coeff_tree_fold); the numerified constants come
+    // last, one at a time.
+    let mut total = if num_factors.is_empty() {
+      1.0
+    } else {
+      coeff_tree_fold(&num_factors, Coeff::mul).to_f64()
+    };
+    for f in &numerified_tail {
+      total *= f;
+    }
+    if symbolic_args.is_empty() {
+      return Ok(Expr::Real(total));
+    }
+    if total == 0.0 {
+      // Check if any remaining symbolic arg involves I (imaginary unit)
+      let has_imag = symbolic_args
+        .iter()
+        .any(|a| matches!(a, Expr::Identifier(s) if s == "I"));
+      if has_imag {
+        // 0.0 * I → 0. + 0.*I (Complex form)
+        return Ok(plus2(
+          Expr::Real(0.0),
+          times2(Expr::Real(0.0), id_expr("I")),
+        ));
+      }
+      // 0.0 * x → 0. (approximate zero, not exact)
+      return Ok(Expr::Real(0.0));
+    }
+    symbolic_args = combine_like_bases(symbolic_args)?;
+    sort_symbolic_factors(&mut symbolic_args);
+    let mut final_args: Vec<Expr> = Vec::new();
+    // Keep the Real coefficient even when it equals 1.0, so `1. * a` stays
+    // as `1.*a` rather than collapsing to `a`. Wolfram preserves the
+    // `1.*x` form because the multiplication carries machine-precision
+    // information that affects downstream Real promotion (e.g. an
+    // Inverse over a matrix with one Real entry should produce `1./a`,
+    // not `a^(-1)`). The only exception: when there are no symbolic
+    // factors, return the bare `total`.
+    if !symbolic_args.is_empty() || total != 1.0 {
+      final_args.push(Expr::Real(total));
+    }
+    final_args.extend(symbolic_args);
+    return if final_args.len() == 1 {
+      Ok(final_args.remove(0))
+    } else {
+      Ok(call("Times", final_args))
+    };
+  }
+
+  // Exact arithmetic: combine integer * rational
+  // Result is (int_product * rat_numer) / rat_denom.
+  // Fall back to BigInt arithmetic if the final multiply overflows.
+  let Some(combined_numer) = int_product.checked_mul(rat_numer) else {
+    let big_numer = BigInt::from(int_product) * BigInt::from(rat_numer);
+    let big_denom = BigInt::from(rat_denom);
+    let (sn, sd) = rat_reduce_bigint(&big_numer, &big_denom);
+    let coeff_expr = {
+      use num_traits::One;
+      if sd.is_one() {
+        bigint_to_expr(sn)
+      } else {
+        call("Rational", vec![bigint_to_expr(sn), bigint_to_expr(sd)])
+      }
+    };
+    if symbolic_args.is_empty() {
+      return Ok(coeff_expr);
+    }
+    let mut final_args = vec![coeff_expr];
+    symbolic_args = combine_like_bases(symbolic_args)?;
+    sort_symbolic_factors(&mut symbolic_args);
+    final_args.extend(symbolic_args);
+    if final_args.len() == 1 {
+      return Ok(final_args.remove(0));
+    }
+    return Ok(call("Times", final_args));
+  };
+  let combined_denom = rat_denom;
+  let mut coeff = if has_rational || (has_int && combined_denom != 1) {
+    make_rational(combined_numer, combined_denom)
+  } else {
+    Expr::Integer(int_product)
+  };
+
+  // If all arguments are numeric, return the product
+  if symbolic_args.is_empty() {
+    return Ok(coeff);
+  }
+
+  // 0 * Infinity = Indeterminate (check before the general 0 * anything = 0 rule)
+  if combined_numer == 0 && symbolic_args.iter().any(is_infinity_like) {
+    crate::emit_message(
+      "Infinity::indet: Indeterminate expression 0 Infinity encountered.",
+    );
+    return Ok(id_expr("Indeterminate"));
+  }
+
+  // 0 * anything = 0
+  if combined_numer == 0 {
+    return Ok(Expr::Integer(0));
+  }
+
+  // Handle Infinity in symbolic args: n * Infinity = ±Infinity
+  if symbolic_args.len() == 1 {
+    let is_pos_inf =
+      matches!(&symbolic_args[0], Expr::Identifier(s) if s == "Infinity");
+    let is_neg_inf = match &symbolic_args[0] {
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } => matches!(operand.as_ref(), Expr::Identifier(s) if s == "Infinity"),
+      _ => false,
+    };
+    if is_pos_inf || is_neg_inf {
+      let coeff_positive = combined_numer > 0;
+      // Positive * Infinity or Negative * (-Infinity) → Infinity
+      // Negative * Infinity or Positive * (-Infinity) → -Infinity
+      let result_positive = coeff_positive == is_pos_inf;
+      if result_positive {
+        return Ok(id_expr("Infinity"));
+      }
+      return Ok(neg1(id_expr("Infinity")));
+    }
+  }
+
+  // Times[-1, Plus[args...]] distributes: -1*(a+b+c) → (-a)+(-b)+(-c)
+  // This only applies when coefficient is exactly -1 and the sole symbolic arg is Plus
+  if matches!(&coeff, Expr::Integer(-1))
+    && symbolic_args.len() == 1
+    && matches!(&symbolic_args[0], Expr::FunctionCall { name, .. } if name == "Plus")
+    && let Expr::FunctionCall {
+      name: _,
+      args: plus_args,
+    } = &symbolic_args[0]
+  {
+    let negated: Result<Vec<Expr>, InterpreterError> = plus_args
+      .iter()
+      .map(|a| times_ast(&[Expr::Integer(-1), a.clone()]))
+      .collect();
+    return plus_ast(&negated?);
+  }
+
+  // Combine like bases: x^a * x^b → x^(a+b)
+  symbolic_args = combine_like_bases(symbolic_args)?;
+
+  // combine_like_bases can collapse symbolic powers into a pure number
+  // (`2^(-1/2)*2^(-1/2) → 1/2`, `Sqrt[2]*Sqrt[2] → 2`). Fold any such exact
+  // factor back into the coefficient so e.g. `-1*2^(-1/2)*2^(-1/2)` reduces to
+  // `Rational[-1, 2]` and `3*Sqrt[2]*Sqrt[2]` to `6`, rather than the unfolded
+  // `Times[-1, 1/2]` / `Times[3, 2]`. All-or-nothing: if any multiply would
+  // overflow i128 the fold is abandoned and every factor stays in place.
+  {
+    let as_int_rational = |a: &Expr| -> Option<(i128, i128)> {
+      match a {
+        Expr::Integer(n) => Some((*n, 1)),
+        Expr::FunctionCall { name, args: ra }
+          if name == "Rational" && ra.len() == 2 =>
+        {
+          match (&ra[0], &ra[1]) {
+            (Expr::Integer(p), Expr::Integer(q)) => Some((*p, *q)),
+            _ => None,
+          }
+        }
+        _ => None,
+      }
+    };
+    // A merged factor can itself be a product carrying a numeric
+    // coefficient (Sqrt[46]*Sqrt[10/3] → Times[2, Sqrt[115/3]] via the
+    // square extraction in sqrt_ast). Splice those inline so the numeric
+    // fold below absorbs the coefficient and the product stays flat
+    // (otherwise `3*Sqrt[46]*Sqrt[10/3]` printed as `3*2*Sqrt[115/3]`).
+    let mut i = 0;
+    while i < symbolic_args.len() {
+      let inner: Option<Vec<Expr>> = match &symbolic_args[i] {
+        Expr::FunctionCall { name, args: ta }
+          if name == "Times"
+            && ta.iter().any(|a| as_int_rational(a).is_some()) =>
+        {
+          Some(ta.iter().cloned().collect())
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left,
+          right,
+        } if as_int_rational(left).is_some()
+          || as_int_rational(right).is_some() =>
+        {
+          Some(vec![left.as_ref().clone(), right.as_ref().clone()])
+        }
+        _ => None,
+      };
+      if let Some(inner) = inner {
+        symbolic_args.splice(i..=i, inner);
+      } else {
+        i += 1;
+      }
+    }
+    let mut fold_num = combined_numer;
+    let mut fold_den = combined_denom;
+    let mut any = false;
+    let mut overflow = false;
+    for a in &symbolic_args {
+      if let Some((p, q)) = as_int_rational(a) {
+        if let (Some(nn), Some(dd)) =
+          (fold_num.checked_mul(p), fold_den.checked_mul(q))
+        {
+          fold_num = nn;
+          fold_den = dd;
+          any = true;
+        } else {
+          overflow = true;
+          break;
+        }
+      }
+    }
+    if any && !overflow {
+      symbolic_args.retain(|a| as_int_rational(a).is_none());
+      coeff = make_rational(fold_num, fold_den);
+    }
+  }
+
+  // Try to combine integer coefficient with same-base power in symbolic args.
+  // Only absorb one factor of the base so the result stays in canonical form:
+  // E.g. 2 * 2^(-1/2) → 1 * 2^(1/2) = Sqrt[2]
+  // E.g. -2 * 2^(-1/2) → -1 * Sqrt[2]
+  // E.g. 4 * 2^(-1/2) → 2 * Sqrt[2]  (absorb one factor of 2)
+  if let Expr::Integer(c) = &coeff {
+    let cv = *c;
+    let abs_cv = cv.unsigned_abs();
+    if abs_cv > 1 {
+      for i in 0..symbolic_args.len() {
+        let (base, exp) = extract_base_exponent(&symbolic_args[i]);
+        if let Expr::Integer(b) = &base {
+          let bv = *b;
+          // Only absorb when exponent is negative — this converts e.g.
+          // 2 * 2^(-1/2) → Sqrt[2], 4 * 2^(-1/2) → 2*Sqrt[2]
+          // but leaves 2 * Sqrt[2] (exp=1/2) alone to avoid cycles.
+          let exp_is_negative = match &exp {
+            Expr::Integer(n) => *n < 0,
+            Expr::FunctionCall { name, args: rargs }
+              if name == "Rational" && rargs.len() == 2 =>
+            {
+              matches!(&rargs[0], Expr::Integer(n) if *n < 0)
+            }
+            _ => false,
+          };
+          if bv > 1 && abs_cv % (bv as u128) == 0 && exp_is_negative {
+            // Only absorb one factor of base into the power
+            let new_exp = plus_ast(&[Expr::Integer(1), exp])?;
+            if matches!(&new_exp, Expr::Integer(0)) {
+              symbolic_args.remove(i);
+            } else if matches!(&new_exp, Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2 && matches!((&args[0], &args[1]), (Expr::Integer(1), Expr::Integer(2))))
+            {
+              symbolic_args[i] = sqrt_ast(&[base])?;
+            } else if matches!(&new_exp, Expr::Integer(1)) {
+              symbolic_args[i] = base;
+            } else {
+              symbolic_args[i] = pow2(base, new_exp);
+            }
+            let sign = if cv < 0 { -1i128 } else { 1i128 };
+            let remainder = (abs_cv / bv as u128) as i128;
+            coeff = Expr::Integer(sign * remainder);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Try to combine Rational coefficient with same-base positive power in symbolic args.
+  // This absorbs the base factor from the denominator, converting positive exponent to negative.
+  // E.g. Rational[1,6] * 2^(1/2) → Rational[1,3] * 2^(-1/2)  (since 6 = 2*3)
+  // E.g. Rational[1,2] * 2^(1/2) → 2^(-1/2)
+  if let Expr::FunctionCall {
+    name: rname,
+    args: rargs,
+  } = &coeff
+    && rname == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(cn), Expr::Integer(cd)) = (&rargs[0], &rargs[1])
+  {
+    let cd_abs = cd.unsigned_abs();
+    if cd_abs > 1 {
+      for i in 0..symbolic_args.len() {
+        let (base, exp) = extract_base_exponent(&symbolic_args[i]);
+        if let Expr::Integer(bv) = &base {
+          let bv_abs = bv.unsigned_abs();
+          // Only for positive fractional exponents and when denominator is divisible by base
+          let exp_is_positive_frac = match &exp {
+            Expr::FunctionCall { name: en, args: ea }
+              if en == "Rational" && ea.len() == 2 =>
+            {
+              matches!(&ea[0], Expr::Integer(n) if *n > 0)
+            }
+            _ => false,
+          };
+          if bv_abs > 1 && exp_is_positive_frac && cd_abs % bv_abs == 0 {
+            // Absorb one factor of base from denominator into the power
+            let new_exp = plus_ast(&[Expr::Integer(-1), exp])?;
+            if matches!(&new_exp, Expr::Integer(0)) {
+              symbolic_args.remove(i);
+            } else {
+              symbolic_args[i] = power_two(&base, &new_exp)?;
+            }
+            let new_cd = *cd / *bv;
+            coeff = make_rational(*cn, new_cd);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // If all symbolic args canceled (e.g. x^2 * x^(-2)), return coefficient
+  if symbolic_args.is_empty() {
+    return Ok(coeff);
+  }
+
+  // Build final args: coefficient (if not 1) + sorted symbolic terms
+  sort_symbolic_factors(&mut symbolic_args);
+
+  // Final-pass canonicalization: a rational coefficient times a square root
+  // of a positive rational merges into one canonical radical, wolframscript
+  // style — square the coefficient into the radicand, reduce the fraction,
+  // then pull the largest square factor back out of the numerator and the
+  // denominator separately:
+  //   30*Sqrt[23/15] → 2*Sqrt[345]      2/Sqrt[30]        → Sqrt[2/15]
+  //   6*Sqrt[5/3]    → 2*Sqrt[15]       (1/3)*Sqrt[15/11] → Sqrt[5/33]
+  //   (2/5)/Sqrt[14] → Sqrt[2/7]/5     (13/35)*Sqrt[35/6] → 13/Sqrt[210]
+  // Already-canonical shapes are fixed points (2*Sqrt[3], 2/Sqrt[3],
+  // Sqrt[5/3]/2, (1/3)*Sqrt[5/11] all reproduce themselves) and are left
+  // untouched to avoid rewrite recursion. Other factors ride along
+  // unchanged: `Sqrt[6] x/4` → `(Sqrt[3/2] x)/2`.
+  let radical_positions: Vec<usize> = symbolic_args
+    .iter()
+    .enumerate()
+    .filter(|(_, f)| {
+      let (base, exp) = extract_base_exponent(f);
+      matches!(&exp, Expr::FunctionCall { name, args }
+        if name == "Rational"
+          && args.len() == 2
+          && matches!(&args[0], Expr::Integer(1 | -1))
+          && matches!(&args[1], Expr::Integer(2)))
+        && split_positive_rational_and_constants(&base).is_some()
+    })
+    .map(|(i, _)| i)
+    .collect();
+  if let [radical_idx] = radical_positions[..]
+    && let Some((cn, cd)) = (match &coeff {
+      Expr::Integer(n) => Some((*n, 1i128)),
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        match (&args[0], &args[1]) {
+          (Expr::Integer(n), Expr::Integer(d)) if *d > 0 => Some((*n, *d)),
+          _ => None,
+        }
+      }
+      _ => None,
+    })
+    && cn != 0
+  {
+    let others: Vec<Expr> = symbolic_args
+      .iter()
+      .enumerate()
+      .filter(|&(i, _)| i != radical_idx)
+      .map(|(_, f)| f.clone())
+      .collect();
+    let with_others =
+      |mut factors: Vec<Expr>| -> Result<Expr, InterpreterError> {
+        if others.is_empty() && factors.len() == 1 {
+          return Ok(factors.remove(0));
+        }
+        factors.extend(others.iter().cloned());
+        times_ast(&factors)
+      };
+    let (base, exp) = extract_base_exponent(&symbolic_args[radical_idx]);
+    let half = match &exp {
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        match (&args[0], &args[1]) {
+          (Expr::Integer(1), Expr::Integer(2)) => Some(1),
+          (Expr::Integer(-1), Expr::Integer(2)) => Some(-1),
+          _ => None,
+        }
+      }
+      _ => None,
+    };
+    if let (Some(half), Some((bn, bd, rest))) =
+      (half, split_positive_rational_and_constants(&base))
+    {
+      // Radicand of the whole product squared: cn^2*bn / (cd^2*bd), with
+      // the base fraction inverted for a -1/2 exponent.
+      let (rn, rd) = if half > 0 { (bn, bd) } else { (bd, bn) };
+      let merged = cn
+        .checked_mul(cn)
+        .and_then(|c2| c2.checked_mul(rn))
+        .zip(cd.checked_mul(cd).and_then(|d2| d2.checked_mul(rd)));
+      if let Some((mut num, mut den)) = merged {
+        (num, den) = rat_reduce(num, den);
+        let (s, p1) = extract_square_factor_i128(num.abs());
+        let (t, q1) = extract_square_factor_i128(den);
+        let sign = if cn < 0 { -1 } else { 1 };
+        let new_coeff = make_rational(sign * s, t);
+        if p1 == 1 && q1 == 1 && rest.is_empty() {
+          // The radical vanished entirely — c*Sqrt[r] is exactly rational.
+          return with_others(vec![new_coeff]);
+        }
+        // A radicand that would come out a pure reciprocal keeps the
+        // reciprocal-radical spelling instead: wolframscript writes
+        // `3/Sqrt[2 Pi]`, not `3 Sqrt[1/(2 Pi)]`, and only flips once the
+        // numerator carries something (`6/Sqrt[2 Pi]` → `3 Sqrt[2/Pi]`).
+        let pure_reciprocal = !rest.is_empty() && half < 0 && p1 == 1 && q1 > 1;
+        if !pure_reciprocal {
+          let radicand: Expr = if q1 == 1 {
+            Expr::Integer(p1)
+          } else {
+            make_rational(p1, q1)
+          };
+          let rebuilt: Expr = if rest.is_empty() {
+            sqrt_ast(&[radicand])?
+          } else {
+            // A -1/2 exponent inverted the rational part above; the constants
+            // that rode along with it invert here, so `4/Sqrt[2 Pi]` reaches
+            // wolframscript's `2 Sqrt[2/Pi]`.
+            let mut factors: Vec<Expr> = rest
+              .into_iter()
+              .map(|c| {
+                if half > 0 {
+                  c
+                } else {
+                  power_two(&c, &Expr::Integer(-1)).unwrap_or(c)
+                }
+              })
+              .collect();
+            if !matches!(radicand, Expr::Integer(1)) {
+              factors.insert(0, radicand);
+            }
+            sqrt_ast(&[times_ast(&factors)?])?
+          };
+          // Only rewrite when something actually changed; canonical inputs
+          // are fixed points and must return through the generic path.
+          let coeff_str = expr_to_string(&coeff);
+          let new_coeff_str = expr_to_string(&new_coeff);
+          let factor_str = expr_to_string(&symbolic_args[radical_idx]);
+          let rebuilt_str = expr_to_string(&rebuilt);
+          if coeff_str != new_coeff_str || factor_str != rebuilt_str {
+            if matches!(&new_coeff, Expr::Integer(1)) {
+              return with_others(vec![rebuilt]);
+            }
+            return with_others(vec![new_coeff, rebuilt]);
+          }
+        }
+      }
+    }
+  }
+
+  // Drop multiplicative-identity factors left behind by radical cancellation,
+  // e.g. Sqrt[1/3]*Sqrt[3] collapses to Sqrt[1] = 1 in combine_like_bases. Left
+  // in place it survives into the product as a stray factor, so
+  // `(-1/2)*Sqrt[1/3]*Sqrt[3]` printed `-1/2*1` instead of `-1/2`.
+  symbolic_args.retain(|f| !matches!(f, Expr::Integer(1)));
+
+  let mut final_args: Vec<Expr> = Vec::new();
+  let is_unit = matches!(&coeff, Expr::Integer(1));
+  if !is_unit {
+    final_args.push(coeff);
+  }
+  final_args.extend(symbolic_args);
+
+  if final_args.is_empty() {
+    return Ok(Expr::Integer(1));
+  }
+
+  if final_args.len() == 1 {
+    Ok(final_args.remove(0))
+  } else {
+    Ok(call("Times", final_args))
+  }
+}
+
+/// Minus[a] - Unary negation only
+/// Note: Minus with 2 arguments is not valid in Wolfram Language
+/// (use Subtract for that)
+pub fn minus_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() == 1 {
+    // Minus[a] = -1 * a; user-defined rules on Times apply first.
+    if let Some(result) =
+      crate::evaluator::expand_arith_shorthand("Minus", args)
+    {
+      return result;
+    }
+    // Use times_ast for proper distribution: -(a+b) → -a - b
+    times_ast(&[Expr::Integer(-1), args[0].clone()])
+  } else {
+    // Return unevaluated (like Wolfram) — error message emitted by centralized arg_count check
+    Ok(unevaluated("Minus", args))
+  }
+}
+
+/// Divide[a, b] - Division with list threading
+pub fn divide_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Divide expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // Divide[a, b] = a * b^-1; user-defined rules on Times/Power win over the
+  // built-in quotient handling.
+  if let Some(result) = crate::evaluator::expand_arith_shorthand("Divide", args)
+  {
+    return result;
+  }
+
+  // Check for list threading
+  let has_list = args.iter().any(|a| matches!(a, Expr::List(_)));
+  if has_list {
+    return thread_binary_over_lists(args, divide_two);
+  }
+
+  divide_two(&args[0], &args[1])
+}
+
+/// Evaluate the explicit `Divide[a, b]` head. This differs from the `/`
+/// operator only when dividing a *numeric* numerator by zero: wolframscript
+/// then reports the message tagged `Divide::infy` / `Divide::indet`, keeping
+/// the literal numerator in the rendered fraction (e.g. `Divide[5, 0]` → `5/0`,
+/// `Divide[0, 0]` → indeterminate). A symbolic numerator (`Divide[x, 0]`)
+/// decays to `x*(1/0)` and emits the `Power::infy` form, so it — like the `/`
+/// operator — falls through to the shared `divide_ast` path.
+pub fn divide_head_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // Evaluate the operands first: quotient rewrites like a/(b/c) -> a*c/b
+  // must see the inner quotient in evaluated (sign-normalized) form, or
+  // Divide[-3, Divide[(Pi + 54)*(-1), -42]] lands on 126/(-54 - Pi)
+  // instead of wolframscript's -126/(54 + Pi).
+  let evaluated: Vec<Expr>;
+  let args = if args.len() == 2 {
+    evaluated = vec![
+      crate::evaluator::evaluate_expr_to_expr(&args[0])?,
+      crate::evaluator::evaluate_expr_to_expr(&args[1])?,
+    ];
+    evaluated.as_slice()
+  } else {
+    args
+  };
+  if args.len() == 2 {
+    let denom_is_zero = matches!(&args[1], Expr::Integer(0))
+      || matches!(&args[1], Expr::Real(z) if *z == 0.0);
+    // Integers and Reals render single-line; Rationals render as a
+    // stacked fraction inside the message box (Divide[-13/2, 0] shows
+    // -(13/2) as a nested 2D fraction, matching wolframscript).
+    let num_is_number = matches!(&args[0], Expr::Integer(_) | Expr::Real(_))
+      || matches!(&args[0], Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2
+          && matches!((&args[0], &args[1]), (Expr::Integer(_), Expr::Integer(_))));
+    if denom_is_zero && num_is_number {
+      let num_lines = numerator_box_lines(&args[0]);
+      let denom = expr_to_string(&args[1]);
+      let num_is_zero = matches!(&args[0], Expr::Integer(0))
+        || matches!(&args[0], Expr::Real(z) if *z == 0.0);
+      if num_is_zero {
+        crate::emit_message(&format_infy_fraction_2d_block(
+          "Divide::indet: Indeterminate expression ",
+          &num_lines,
+          &denom,
+        ));
+        return Ok(id_expr("Indeterminate"));
+      }
+      crate::emit_message(&format_infy_fraction_2d_block(
+        "Divide::infy: Infinite expression ",
+        &num_lines,
+        &denom,
+      ));
+      return Ok(id_expr("ComplexInfinity"));
+    }
+  }
+  // wolframscript compiles the explicit `Divide[a, b]` head over machine
+  // numbers into a single IEEE division. The `/` operator is different: its
+  // Times[a, Power[b, -1]] form multiplies by the rounded reciprocal (see
+  // divide_two), which lands one ULP away for roughly half of all operand
+  // pairs — Divide[37, 1.8] is 20.555555555555554 while 37/1.8 is
+  // 20.555555555555557. Only an explicit Real denominator with a plain
+  // numeric numerator takes the direct path; symbolic numerators and inexact
+  // constants like Pi still evaluate through the reciprocal, and lists
+  // thread element-wise with the same head semantics.
+  if args.len() == 2 {
+    // Divide[a, b] = a * b^-1: user-defined rules on Times/Power apply before
+    // the built-in quotient handling (but after the `Divide::infy` /
+    // `Divide::indet` messages above, which are specific to this head).
+    if let Some(result) =
+      crate::evaluator::expand_arith_shorthand("Divide", args)
+    {
+      return result;
+    }
+    if args.iter().any(|a| matches!(a, Expr::List(_))) {
+      return thread_binary_over_lists(args, divide_two_head);
+    }
+    return divide_two_head(&args[0], &args[1]);
+  }
+  divide_ast(args)
+}
+
+/// Division with explicit-`Divide`-head semantics: a plain-number numerator
+/// over an explicit machine-Real denominator divides directly (single
+/// rounding); everything else shares the operator path in `divide_two`.
+fn divide_two_head(a: &Expr, b: &Expr) -> Result<Expr, InterpreterError> {
+  if let Some(r) = direct_real_divide(a, b) {
+    return Ok(r);
+  }
+  divide_two(a, b)
+}
+
+/// `Divide[number, Real]` as a single IEEE division, or None when the
+/// operands don't qualify for the direct machine path.
+fn direct_real_divide(a: &Expr, b: &Expr) -> Option<Expr> {
+  // An inexact complex numerator divides component-wise, one IEEE division
+  // each: `Divide[3. + 4. I, 5.]` is `0.6 + 0.8 I`, where the reciprocal
+  // multiply the general path takes would make the real part
+  // `0.6000000000000001`. An exact numerator over an exact denominator
+  // stays exact (`(3 + 4 I)/5` is `3/5 + 4/5 I`), so this only applies
+  // once either side carries a machine real.
+  let denom = match b {
+    Expr::Real(y) if *y != 0.0 => Some(*y),
+    Expr::Integer(n) if *n != 0 => Some(*n as f64),
+    _ => None,
+  };
+  if let Some(y) = denom
+    && (contains_real(a) || matches!(b, Expr::Real(_)))
+    && let Some((re, im)) =
+      crate::functions::list_helpers_ast::expr_to_complex_parts(a)
+    && im != 0.0
+    && re.is_finite()
+    && im.is_finite()
+  {
+    return Some(plus2(
+      Expr::Real(re / y),
+      times2(Expr::Real(im / y), id_expr("I")),
+    ));
+  }
+  let Expr::Real(y) = b else { return None };
+  if *y == 0.0 {
+    return None;
+  }
+  let x = match a {
+    Expr::Integer(_) | Expr::Real(_) => expr_to_num(a)?,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      expr_to_num(a)?
+    }
+    Expr::BigInteger(n) => {
+      use num_traits::ToPrimitive;
+      n.to_f64()?
+    }
+    // An EXACT symbolic numeric numerator ((42 + Pi)/(Pi - 10)) folds
+    // through N first, then one IEEE division — wolframscript rounds
+    // once, never through a reciprocal multiply (differential fuzzer,
+    // seed 15033838239546239488). N of the exact part is correctly
+    // rounded: 25 digits is comfortably past double precision, so the
+    // final parse rounds once to the true machine value (10π(84+π)/(π-10)
+    // differs by 1 ulp when folded structurally in doubles).
+    _ => {
+      if contains_real(a) {
+        return None;
+      }
+      let hi = n_eval_arbitrary(a, 25.0).ok().and_then(|e| match &e {
+        Expr::BigFloat(digits, _) => digits.parse::<f64>().ok(),
+        Expr::Real(x) => Some(*x),
+        _ => None,
+      });
+      match hi {
+        Some(x) if x.is_finite() => x,
+        _ => match n_eval(a) {
+          Ok(Expr::Real(x)) => x,
+          _ => return None,
+        },
+      }
+    }
+  };
+  Some(Expr::Real(x / y))
+}
+
+/// The 2D box lines for a message numerator: one line for integers and
+/// reals, a three-line stacked fraction for rationals — wrapped in
+/// `-(…)` when negative, e.g. -13/2 renders as
+/// ```text
+///   13
+/// -(--)
+///   2
+/// ```
+/// Message bodies display machine Reals in wolframscript's 6-significant-
+/// digit OutputForm (640.2415926535898 shows as 640.242), unlike result
+/// output which keeps full precision. Only the plain-notation magnitude
+/// range is handled; scientific-notation values fall back to the full
+/// form.
+fn message_real_string(v: f64) -> Option<String> {
+  if !v.is_finite() || v == 0.0 {
+    return None;
+  }
+  let magnitude = v.abs().log10().floor() as i32;
+  if !(-5..6).contains(&magnitude) {
+    return None;
+  }
+  let decimals = (5 - magnitude).max(0) as usize;
+  let mut s = format!("{v:.decimals$}");
+  if s.contains('.') {
+    while s.ends_with('0') {
+      s.pop();
+    }
+    // A value that rounds to an integer loses the dot entirely
+    // (Divide[123456.789, 0] shows 123457, not 123457.).
+    if s.ends_with('.') {
+      s.pop();
+    }
+  }
+  Some(s)
+}
+
+fn numerator_box_lines(e: &Expr) -> Vec<String> {
+  if let Expr::Real(v) = e
+    && let Some(s) = message_real_string(*v)
+  {
+    return vec![s];
+  }
+  if let Expr::FunctionCall { name, args } = e
+    && name == "Rational"
+    && args.len() == 2
+    && let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1])
+  {
+    let neg = *n < 0;
+    let ns = n.abs().to_string();
+    let ds = d.to_string();
+    let w = ns.len().max(ds.len());
+    let center =
+      |s: &str| -> String { format!("{}{}", " ".repeat((w - s.len()) / 2), s) };
+    if neg {
+      return vec![
+        format!("  {}", center(&ns)),
+        format!("-({})", "-".repeat(w)),
+        format!("  {}", center(&ds)),
+      ];
+    }
+    return vec![center(&ns), "-".repeat(w), center(&ds)];
+  }
+  vec![expr_to_string(e)]
+}
+
+/// Like `format_infy_fraction_2d`, but the numerator may span several
+/// lines (a stacked-fraction box). The block is centered over the main
+/// fraction bar, whose width is the wider of the block and denominator.
+fn format_infy_fraction_2d_block(
+  prefix: &str,
+  num_lines: &[String],
+  denom: &str,
+) -> String {
+  let base_lead = prefix.len();
+  let block_w = num_lines
+    .iter()
+    .map(|l| l.chars().count())
+    .max()
+    .unwrap_or(0);
+  let width = block_w.max(denom.chars().count());
+  let dashes = "-".repeat(width);
+  let block_off = base_lead + (width - block_w) / 2;
+  let denom_pad = base_lead + (width - denom.chars().count()) / 2;
+  let mut out = String::new();
+  for l in num_lines {
+    out.push_str(&" ".repeat(block_off));
+    out.push_str(l);
+    out.push('\n');
+  }
+  out.push_str(prefix);
+  out.push_str(&dashes);
+  out.push_str(" encountered.\n");
+  out.push_str(&" ".repeat(denom_pad));
+  out.push_str(denom);
+  out
+}
+
+/// Check if an expression represents an infinite quantity
+fn is_infinity_like(expr: &Expr) -> bool {
+  match expr {
+    Expr::Identifier(name) => name == "Infinity" || name == "ComplexInfinity",
+    Expr::FunctionCall { name, .. } => name == "DirectedInfinity",
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => matches!(operand.as_ref(), Expr::Identifier(n) if n == "Infinity"),
+    _ => false,
+  }
+}
+
+/// Render a `num/denom` "Infinite/Indeterminate expression" warning in
+/// wolframscript's 2D layout, e.g. `Divide[5, 0]` produces:
+///
+/// ```text
+///                                   5
+/// Divide::infy: Infinite expression - encountered.
+///                                   0
+/// ```
+///
+/// `prefix` is the full leading text up to (and including) the trailing space
+/// before the box, e.g. `"Power::infy: Infinite expression "`. The numerator
+/// and denominator are centered within a box whose width is the longer of the
+/// two, and the dash run spans that width.
+fn format_infy_fraction_2d(prefix: &str, num: &str, denom: &str) -> String {
+  let base_lead = prefix.len();
+  let width = num.chars().count().max(denom.chars().count());
+  let dashes = "-".repeat(width);
+  let num_pad = base_lead + (width - num.chars().count()) / 2;
+  let denom_pad = base_lead + (width - denom.chars().count()) / 2;
+  format!(
+    "{}{}\n{}{} encountered.\n{}{}",
+    " ".repeat(num_pad),
+    num,
+    prefix,
+    dashes,
+    " ".repeat(denom_pad),
+    denom,
+  )
+}
+
+/// Result of dividing a value by zero in the shared `/`-operator / Divide path.
+/// wolframscript treats `x/0` as `x*(1/0)`, so it emits the Power::infy message
+/// for the reciprocal `1/0` sub-expression (rendered as a 2D fraction) and
+/// returns ComplexInfinity — or Indeterminate for `0/0`, with an additional
+/// Infinity::indet message naming the dividend (`0` or `0.`).
+fn divide_by_zero_result(a: &Expr) -> Expr {
+  crate::emit_message(
+    "                                 1\n\
+     Power::infy: Infinite expression - encountered.\n\
+     \x20                                0",
+  );
+  let a_is_zero =
+    matches!(a, Expr::Integer(0)) || matches!(a, Expr::Real(z) if *z == 0.0);
+  if a_is_zero {
+    let zero = if matches!(a, Expr::Real(_)) {
+      "0."
+    } else {
+      "0"
+    };
+    crate::emit_message(&format!(
+      "Infinity::indet: Indeterminate expression {zero} ComplexInfinity \
+       encountered."
+    ));
+    return id_expr("Indeterminate");
+  }
+  id_expr("ComplexInfinity")
+}
+
+/// Helper for division of two arguments
+/// Machine value of `x / b` for an exact symbolic divisor `b` carrying
+/// numeric content, following wolframscript's fold: the divisor's integer
+/// and rational factors combine with its denominator into ONE exact
+/// rational whose machine value multiplies `x` first, and each remaining
+/// symbolic factor contributes a reciprocal — 19.6/((145*(63+Pi))/86) is
+/// (19.6*N[86/145])*(1/N[63+Pi]). None when `b` has no symbolic factor or
+/// no numeric content to fold (those keep the plain reciprocal path), or
+/// when the exact fraction overflows.
+fn real_over_exact_quotient(x: f64, b: &Expr) -> Option<f64> {
+  use crate::functions::polynomial_ast::together::{
+    extract_num_den, flatten_times_args,
+  };
+  let (bn, bd) = extract_num_den(b);
+  let frac_of = |e: &Expr| -> Option<(i128, i128)> {
+    match e {
+      Expr::Integer(n) => Some((*n, 1)),
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        if let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1]) {
+          Some((*p, *q))
+        } else {
+          None
+        }
+      }
+      _ => None,
+    }
+  };
+  let (bd_n, bd_d) = frac_of(&bd)?;
+  let mut num_n: i128 = 1;
+  let mut num_d: i128 = 1;
+  let mut syms: Vec<Expr> = Vec::new();
+  for f in flatten_times_args(std::slice::from_ref(&bn)) {
+    match frac_of(&f) {
+      Some((p, q)) => {
+        num_n = num_n.checked_mul(p)?;
+        num_d = num_d.checked_mul(q)?;
+      }
+      None => syms.push(f),
+    }
+  }
+  if syms.is_empty() || num_n == 0 {
+    return None;
+  }
+  // 1/b = (bd/1) * (num_d/num_n) * (1/S): fold the exact rational.
+  let r_n = bd_n.checked_mul(num_d)?;
+  let r_d = bd_d.checked_mul(num_n)?;
+  if r_n == 1 && r_d == 1 {
+    return None;
+  }
+  let r = (r_n as f64) / (r_d as f64);
+  let mut s = 1.0f64;
+  for f in &syms {
+    s *= try_eval_to_f64(f)?;
+  }
+  if s == 0.0 {
+    return None;
+  }
+  Some(x * r * (1.0 / s))
+}
+
+pub fn divide_two(a: &Expr, b: &Expr) -> Result<Expr, InterpreterError> {
+  // 0 / expr → 0 (Real if either operand is Real, else Integer).
+  let b_is_zero =
+    matches!(b, Expr::Integer(0)) || matches!(b, Expr::Real(z) if *z == 0.0);
+  if !b_is_zero {
+    let a_is_int_zero = matches!(a, Expr::Integer(0));
+    let a_is_real_zero = matches!(a, Expr::Real(f) if *f == 0.0);
+    if a_is_int_zero || a_is_real_zero {
+      // Promote to Real(0.) when either side carries a Real anywhere in the
+      // expression — including symbolic mixtures like `Times[-4., a]` from
+      // an Inverse over a matrix with Real entries. Without this, a Real
+      // determinant divided into an Integer-zero cofactor produced
+      // Integer(0) and broke Wolfram-canonical Real-promotion.
+      let either_real = a_is_real_zero || contains_real(b);
+      return Ok(if either_real {
+        Expr::Real(0.0)
+      } else {
+        Expr::Integer(0)
+      });
+    }
+  }
+
+  // Infinity / Infinity → Indeterminate (the indeterminate 0 Infinity form)
+  if is_infinity_like(a) && is_infinity_like(b) {
+    crate::emit_message(
+      "Infinity::indet: Indeterminate expression 0 Infinity encountered.",
+    );
+    return Ok(id_expr("Indeterminate"));
+  }
+
+  // finite / Infinity or finite / DirectedInfinity[z] → 0
+  if is_infinity_like(b) && !is_infinity_like(a) {
+    return Ok(Expr::Integer(0));
+  }
+
+  // Infinity / positive_finite → Infinity. Wolfram absorbs any
+  // known-positive scalar divisor; if we can prove the divisor is
+  // positive (numeric, named constants like Pi/E, or Log[c>1]), the
+  // result is Infinity. Negative divisors flip to -Infinity.
+  fn is_known_positive_local(e: &Expr) -> Option<bool> {
+    match e {
+      Expr::Integer(n) => Some(*n > 0),
+      Expr::Real(f) => Some(*f > 0.0),
+      Expr::Constant(c) => match c.as_str() {
+        "Pi" | "E" | "Degree" => Some(true),
+        _ => None,
+      },
+      Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2 =>
+      {
+        if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+          Some((*n > 0 && *d > 0) || (*n < 0 && *d < 0))
+        } else {
+          None
+        }
+      }
+      Expr::FunctionCall { name, args } if name == "Log" && args.len() == 1 => {
+        match &args[0] {
+          Expr::Integer(n) => Some(*n > 1),
+          Expr::Real(f) => Some(*f > 1.0),
+          Expr::Constant(c) if c == "E" || c == "Pi" => Some(true),
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+  if is_infinity_like(a) && !is_infinity_like(b) {
+    if let Some(true) = is_known_positive_local(b) {
+      return Ok(a.clone());
+    }
+    if let Some(false) = is_known_positive_local(b) {
+      // Negative divisor flips Infinity → -Infinity. Use UnaryOp Minus
+      // so the formatter prints `-Infinity` consistently.
+      return Ok(neg1(a.clone()));
+    }
+  }
+
+  // A time-series operand keeps the series, combining the values.
+  if let Some(result) = crate::functions::timeseries_ast::try_series_arithmetic(
+    "Divide",
+    &[a.clone(), b.clone()],
+  ) {
+    return Ok(result);
+  }
+
+  // A SparseArray dividend/divisor divides elementwise and stays sparse.
+  if let Some(result) =
+    crate::functions::list_helpers_ast::try_sparse_array_divide(a, b)
+  {
+    return Ok(result);
+  }
+
+  // Handle Quantity division
+  if let Some(result) =
+    crate::functions::quantity_ast::try_quantity_divide(a, b)
+  {
+    return result;
+  }
+
+  // Handle Interval division
+  if let Some(result) =
+    crate::functions::interval_ast::try_interval_divide(a, b)
+  {
+    return result;
+  }
+
+  // expr / 1 → expr
+  if matches!(b, Expr::Integer(1)) {
+    return Ok(a.clone());
+  }
+
+  // x / 0 → ComplexInfinity (or Indeterminate for 0/0), for any dividend type
+  // (Integer, Real, Rational, symbolic). Handled uniformly here so reals no
+  // longer raise a hard "Division by zero" error.
+  if b_is_zero {
+    return Ok(divide_by_zero_result(a));
+  }
+
+  // For two integers, keep as Rational (fraction)
+  if let (Expr::Integer(numer), Expr::Integer(denom)) = (a, b) {
+    return Ok(make_rational(*numer, *denom));
+  }
+
+  // For BigInteger / BigInteger (or mixed Integer/BigInteger), reduce by GCD
+  {
+    let a_big = expr_to_bigint(a);
+    let b_big = expr_to_bigint(b);
+    if let (Some(numer), Some(denom)) = (a_big, b_big) {
+      use num_traits::Zero;
+      if denom.is_zero() {
+        return Ok(divide_by_zero_result(a));
+      }
+      let (rn, rd) = rat_reduce_bigint(&numer, &denom);
+      if rd == BigInt::from(1) {
+        return Ok(bigint_to_expr(rn));
+      }
+      return Ok(call(
+        "Rational",
+        vec![bigint_to_expr(rn), bigint_to_expr(rd)],
+      ));
+    }
+  }
+
+  // Simplify (n * expr) / d where n, d are integers → simplify coefficient
+  if let Expr::Integer(d) = b
+    && *d != 0
+  {
+    // BinaryOp form
+    if let Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } = a
+    {
+      // (Integer * expr) / Integer → (n/d) * expr
+      if let Expr::Integer(n) = left.as_ref() {
+        let coeff = make_rational(*n, *d);
+        return multiply_scalar_by_expr(&coeff, right);
+      }
+      // (expr * Integer) / Integer → expr * (n/d)
+      if let Expr::Integer(n) = right.as_ref() {
+        let coeff = make_rational(*n, *d);
+        return multiply_scalar_by_expr(&coeff, left);
+      }
+    }
+    // FunctionCall("Times", ...) form
+    if let Expr::FunctionCall { name, args: targs } = a
+      && name == "Times"
+    {
+      for (i, arg) in targs.iter().enumerate() {
+        if let Expr::Integer(n) = arg {
+          let coeff = make_rational(*n, *d);
+          let mut rest: Vec<Expr> = targs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, e)| e.clone())
+            .collect();
+          if rest.len() == 1 {
+            return multiply_scalar_by_expr(&coeff, &rest.remove(0));
+          }
+          let rest_expr = call("Times", rest);
+          return multiply_scalar_by_expr(&coeff, &rest_expr);
+        }
+      }
+    }
+  }
+
+  // n / Sqrt[m] → delegate to times_ast so coefficient combining works
+  // E.g. 2/Sqrt[2] → Sqrt[2], 4/Sqrt[2] → 2*Sqrt[2]
+  // Skip for |n|<=1 since 1/Sqrt[m] is already the canonical display form
+  if let Expr::Integer(n) = a
+    && n.unsigned_abs() > 1
+    && is_sqrt(b).is_some()
+    && matches!(is_sqrt(b).unwrap(), Expr::Integer(m) if *m > 0)
+  {
+    let b_inv = pow2(b.clone(), Expr::Integer(-1));
+    return times_ast(&[Expr::Integer(*n), b_inv]);
+  }
+
+  // Sqrt[n] / d → Sqrt[n/d^2] for integer n and d
+  // E.g. Sqrt[6]/2 → Sqrt[3/2], matching Wolfram's canonical form
+  // Only apply when the reduced denominator has no perfect square factors,
+  // to avoid infinite loops (e.g. Sqrt[3]/4 would loop through Sqrt[3/16] → (1/4)*Sqrt[3] → ...)
+  if let Expr::Integer(d) = b
+    && *d != 0
+    && is_sqrt(a).is_some()
+    && let Expr::Integer(n) = is_sqrt(a).unwrap()
+    && *n > 0
+  {
+    let denom = d * d;
+    let g = gcd_i128(*n, denom);
+    let reduced_d = (denom / g) as u64;
+    // Check that the reduced denominator has no perfect square factors
+    let mut has_sq_factor = false;
+    {
+      let val = reduced_d;
+      let mut f = 2u64;
+      while f * f <= val {
+        if val.is_multiple_of(f * f) {
+          has_sq_factor = true;
+          break;
+        }
+        f += 1;
+      }
+    }
+    if !has_sq_factor {
+      return sqrt_ast(&[make_rational(*n, denom)]);
+    }
+  }
+
+  // Sqrt[p/q] / d → Sqrt[p/(q*d^2)] for positive rational p/q and integer d
+  // E.g. Sqrt[15/11]/3 → Sqrt[15/99] = Sqrt[5/33]
+  if let Expr::Integer(d) = b
+    && *d != 0
+    && is_sqrt(a).is_some()
+    && let Expr::FunctionCall {
+      name: rname,
+      args: rargs,
+    } = is_sqrt(a).unwrap()
+    && rname == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(p), Expr::Integer(q)) = (&rargs[0], &rargs[1])
+    && *p > 0
+    && *q > 0
+  {
+    let new_q = q.checked_mul(*d).and_then(|v| v.checked_mul(*d));
+    if let Some(new_q) = new_q {
+      return sqrt_ast(&[make_rational(*p, new_q)]);
+    }
+  }
+
+  // c*Sqrt[n] / d → (c/d)*Sqrt[n] → absorbed form via times_ast
+  if let Expr::Integer(d) = b
+    && *d != 0
+    && let Expr::FunctionCall { name, args: targs } = a
+    && name == "Times"
+    && targs.len() == 2
+  {
+    let has_sqrt_int = is_sqrt(&targs[1]).is_some()
+      && matches!(is_sqrt(&targs[1]).unwrap(), Expr::Integer(n) if *n > 0);
+    let has_numeric_coeff = matches!(&targs[0], Expr::Integer(_))
+      || matches!(&targs[0], Expr::FunctionCall { name: rn, .. } if rn == "Rational");
+    if has_sqrt_int && has_numeric_coeff {
+      let coeff = make_rational(1, *d);
+      return times_ast(&[targs[0].clone(), coeff, targs[1].clone()]);
+    }
+  }
+
+  // Complex number division: (a + b*I) / integer → simplify
+  if let Expr::Integer(d) = b
+    && *d != 0
+    && let Some(((re_n, re_d), (im_n, im_d))) = try_extract_complex_exact(a)
+    && im_n != 0
+  {
+    // (re + im*I) / d = re/d + (im/d)*I
+    let new_re_n = re_n;
+    let new_re_d = re_d * *d;
+    let new_im_n = im_n;
+    let new_im_d = im_d * *d;
+    return Ok(complex_rational_to_expr(
+      new_re_n, new_re_d, new_im_n, new_im_d,
+    ));
+  }
+
+  // Complex / complex division: (a + b*I) / (c + d*I)
+  // Multiply by conjugate: ((a+bi)(c-di)) / (c² + d²)
+  if let (Some(((an, ad), (bn, bd))), Some(((cn, cd), (dn, dd)))) =
+    (try_extract_complex_exact(a), try_extract_complex_exact(b))
+  {
+    // Only proceed if denominator has nonzero imaginary part
+    if dn != 0 {
+      // Compute denominator magnitude squared: c² + d² (as rational)
+      // |denom|² = (cn/cd)² + (dn/dd)² = (cn²·dd² + dn²·cd²) / (cd²·dd²)
+      if let (Some(cn2), Some(cd2), Some(dn2), Some(dd2)) = (
+        cn.checked_mul(cn),
+        cd.checked_mul(cd),
+        dn.checked_mul(dn),
+        dd.checked_mul(dd),
+      ) && let (Some(t1), Some(t2), Some(mag_den)) = (
+        cn2.checked_mul(dd2),
+        dn2.checked_mul(cd2),
+        cd2.checked_mul(dd2),
+      ) && let Some(mag_num) = t1.checked_add(t2)
+        && mag_num != 0
+      {
+        // Real part of result: (an·cn·bd·dd + bn·dn·ad·cd) / (ad·bd·mag)
+        // Actually, let's compute properly:
+        // num_real = (an/ad)*(cn/cd) + (bn/bd)*(dn/dd)
+        //          = (an*cn*bd*dd + bn*dn*ad*cd) / (ad*cd*bd*dd)
+        // num_imag = (bn/bd)*(cn/cd) - (an/ad)*(dn/dd)
+        //          = (bn*cn*ad*dd - an*dn*bd*cd) / (ad*cd*bd*dd)
+        // result = (num_real + num_imag*I) / (mag_num / mag_den)
+        //        = (num_real * mag_den + num_imag * mag_den * I) / (common_den * mag_num)
+        if let (Some(nr1), Some(nr2)) = (
+          an.checked_mul(cn)
+            .and_then(|v| v.checked_mul(bd))
+            .and_then(|v| v.checked_mul(dd)),
+          bn.checked_mul(dn)
+            .and_then(|v| v.checked_mul(ad))
+            .and_then(|v| v.checked_mul(cd)),
+        ) && let (Some(ni1), Some(ni2)) = (
+          bn.checked_mul(cn)
+            .and_then(|v| v.checked_mul(ad))
+            .and_then(|v| v.checked_mul(dd)),
+          an.checked_mul(dn)
+            .and_then(|v| v.checked_mul(bd))
+            .and_then(|v| v.checked_mul(cd)),
+        ) && let (Some(num_re), Some(num_im)) =
+          (nr1.checked_add(nr2), ni1.checked_sub(ni2))
+        {
+          let common_den = ad
+            .checked_mul(cd)
+            .and_then(|v| v.checked_mul(bd))
+            .and_then(|v| v.checked_mul(dd));
+          if let Some(cden) = common_den {
+            // result = (num_re / cden + num_im / cden * I) / (mag_num / mag_den)
+            //        = (num_re * mag_den) / (cden * mag_num) + (num_im * mag_den) / (cden * mag_num) * I
+            if let (Some(final_re_n), Some(final_im_n), Some(final_den)) = (
+              num_re.checked_mul(mag_den),
+              num_im.checked_mul(mag_den),
+              cden.checked_mul(mag_num),
+            ) {
+              return Ok(complex_rational_to_expr(
+                final_re_n, final_den, final_im_n, final_den,
+              ));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Exact rational division: Rational/Rational, Rational/Integer, Integer/Rational
+  // (a_n/a_d) / (b_n/b_d) = (a_n * b_d) / (a_d * b_n)
+  if let (Some((a_n, a_d)), Some((b_n, b_d))) =
+    (try_as_rational(a), try_as_rational(b))
+  {
+    if let (Some(n), Some(d)) = (a_n.checked_mul(b_d), a_d.checked_mul(b_n)) {
+      if d == 0 {
+        // A zero rational divisor: same as x/0.
+        return Ok(divide_by_zero_result(a));
+      }
+      return Ok(make_rational(n, d));
+    }
+    use num_traits::Zero;
+    let numer = BigInt::from(a_n) * BigInt::from(b_d);
+    let denom = BigInt::from(a_d) * BigInt::from(b_n);
+    if denom.is_zero() {
+      return Ok(divide_by_zero_result(a));
+    }
+    let (rn, rd) = rat_reduce_bigint(&numer, &denom);
+    if rd == BigInt::from(1) {
+      return Ok(bigint_to_expr(rn));
+    }
+    return Ok(call(
+      "Rational",
+      vec![bigint_to_expr(rn), bigint_to_expr(rd)],
+    ));
+  }
+
+  // For reals, perform floating-point division
+  // Use try_eval_to_f64 when at least one operand is Real to handle constants like Pi/4.0
+  let has_real = matches!(a, Expr::Real(_)) || matches!(b, Expr::Real(_));
+  let eval_fn = if has_real {
+    |e: &Expr| try_eval_to_f64(e)
+  } else {
+    |e: &Expr| expr_to_num(e)
+  };
+  if let (Some(x), Some(y)) = (eval_fn(a), eval_fn(b)) {
+    if y == 0.0 {
+      Ok(divide_by_zero_result(a))
+    } else {
+      // Wolfram evaluates division a/b as Times[a, Power[b, -1]]. When the
+      // denominator is an exact number (Integer/Rational) its reciprocal is an
+      // exact rational, so the product is single-rounded — identical to a
+      // direct IEEE division (e.g. CentralMoment's sum/n). But when the
+      // denominator is inexact — a machine Real, or an irrational constant like
+      // Pi or Sqrt[2] whose reciprocal must itself be rounded to a machine real
+      // first — the reciprocal introduces a second rounding, landing one ULP
+      // away from `x / y` for roughly half of all operand pairs. Mirror that
+      // multiply-by-reciprocal so results match wolframscript byte-for-byte
+      // (e.g. 15.9/Pi, 13.52.../84.75...) without perturbing exact-denominator
+      // divisions.
+      let den_is_exact = matches!(b, Expr::Integer(_))
+        || matches!(b, Expr::FunctionCall { name, .. } if name == "Rational");
+      if den_is_exact {
+        Ok(Expr::Real(x / y))
+      } else if matches!(a, Expr::Real(_))
+        && !contains_real(b)
+        && let Some(r) = real_over_exact_quotient(x, b)
+      {
+        // A machine-Real dividend over an EXACT symbolic quotient folds
+        // the divisor's numeric content into one exact rational and
+        // multiplies through left-to-right:
+        // 19.6/((145*(63+Pi))/86) is (19.6*N[86/145])*(1/N[63+Pi]) =
+        // 0.17575669287388962, matching wolframscript (differential
+        // fuzzer, seed 14911319143061223866; wolframscript-verified).
+        Ok(Expr::Real(r))
+      } else {
+        // An exact QUOTIENT dividend folds its symbolic denominator with
+        // the machine divisor and divides ONCE:
+        // ((42+Pi)/(Pi-10))/(-92.7) is N[42+Pi]/(N[Pi-10]*(-92.7)) =
+        // 0.07100253709778288, never the reciprocal-multiply ...287.
+        // Non-quotient dividends keep the reciprocal path (Sqrt[2]/1.8,
+        // 37/1.8 land one ULP from the direct division, matching
+        // wolframscript). Differential fuzzer, seed
+        // 15033838239546199922; wolframscript-verified.
+        if matches!(b, Expr::Real(_)) {
+          let (p, q) =
+            crate::functions::polynomial_ast::together::extract_num_den(a);
+          let q_is_number = matches!(
+            &q,
+            Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_)
+          ) || matches!(&q, Expr::FunctionCall { name, .. } if name == "Rational");
+          if !q_is_number
+            && let (Some(xp), Some(xq)) =
+              (try_eval_to_f64(&p), try_eval_to_f64(&q))
+            && xq != 0.0
+          {
+            return Ok(Expr::Real(xp / (xq * y)));
+          }
+        }
+        Ok(Expr::Real(x * (1.0 / y)))
+      }
+    }
+  } else {
+    // Indeterminate does not cancel against itself: Indeterminate /
+    // Indeterminate stays Indeterminate, not 1.
+    if matches!(a, Expr::Identifier(s) if s == "Indeterminate")
+      || matches!(b, Expr::Identifier(s) if s == "Indeterminate")
+    {
+      return Ok(id_expr("Indeterminate"));
+    }
+
+    // x / x → 1 for identical symbolic expressions
+    if expr_to_string(a) == expr_to_string(b) {
+      return Ok(Expr::Integer(1));
+    }
+
+    // When both numerator and denominator are Times products containing integer
+    // factors, convert to Times[num_factors..., Power[den_factors, -1]...] and let
+    // times_ast handle coefficient simplification and canonical ordering.
+    // E.g. (2*Sqrt[2]*E^(-6)) / (12*BesselK[...]) → Sqrt[2]/(6*E^6*BesselK[...])
+    if let Expr::FunctionCall {
+      name: dn,
+      args: dargs,
+    } = b
+      && dn == "Times"
+    {
+      let num_factors = match a {
+        Expr::FunctionCall { name, args } if name == "Times" => args.clone(),
+        _ => vec![a.clone()].into(),
+      };
+      let den_factors = dargs.clone();
+      let has_int_num = num_factors.iter().any(|f| {
+        matches!(f, Expr::Integer(_))
+          || matches!(f, Expr::FunctionCall { name, .. } if name == "Rational")
+      });
+      let has_int_den = den_factors.iter().any(|f| {
+        matches!(f, Expr::Integer(_))
+          || matches!(f, Expr::FunctionCall { name, .. } if name == "Rational")
+      });
+      if has_int_num && has_int_den {
+        // Only apply when integer factors have GCD > 1 (can actually simplify)
+        let num_int = num_factors
+          .iter()
+          .find_map(|f| match f {
+            Expr::Integer(n) => Some(n.unsigned_abs()),
+            _ => None,
+          })
+          .unwrap_or(1);
+        let den_int = den_factors
+          .iter()
+          .find_map(|f| match f {
+            Expr::Integer(n) => Some(n.unsigned_abs()),
+            _ => None,
+          })
+          .unwrap_or(1);
+        if gcd_i128(num_int as i128, den_int as i128) > 1 {
+          let mut all_factors = num_factors;
+          for df in den_factors {
+            all_factors.push(power_two(&df, &Expr::Integer(-1))?);
+          }
+          return times_ast(&all_factors);
+        }
+      }
+    }
+
+    // Canonicalize: a/b → Times[a, Power[b, -1]]
+    let den_inv = power_two(b, &Expr::Integer(-1))?;
+    times_ast(&[a.clone(), den_inv])
+  }
+}
+
+/// Rewrite `Times[Rational[-1, d], sum]` into `Times[Rational[1, d], -sum]`
+/// (each term negated); anything else passes through unchanged.
+///
+/// A numeric factor whose numerator is exactly `-1` carries its sign into the
+/// sum in Wolfram — `-(1/5)*(1 - 2 x)` is `Times[Rational[1, 5], Plus[-1,
+/// 2 x]]` — while any other negative coefficient stays where it is
+/// (`-3*(1 - 2 x)` and `-(3/5)*(1 - 2 x)` keep theirs). A product with more
+/// than the two factors is left alone, which is what keeps the `Rational[-1,
+/// 2]` in a normal distribution's PDF where the sum sits inside a `Power`.
+fn flip_unit_negative_rational_product(expr: Expr) -> Expr {
+  let is_additive = |e: &Expr| {
+    matches!(e, Expr::FunctionCall { name, .. } if name == "Plus")
+      || matches!(
+        e,
+        Expr::BinaryOp {
+          op: BinaryOperator::Plus | BinaryOperator::Minus,
+          ..
+        }
+      )
+  };
+  let Expr::FunctionCall { name, args } = &expr else {
+    return expr;
+  };
+  if name != "Times" || args.len() != 2 {
+    return expr;
+  }
+  let Expr::FunctionCall {
+    name: cname,
+    args: cargs,
+  } = &args[0]
+  else {
+    return expr;
+  };
+  if cname != "Rational"
+    || cargs.len() != 2
+    || !matches!(&cargs[0], Expr::Integer(-1))
+  {
+    return expr;
+  }
+  let Expr::Integer(cd) = &cargs[1] else {
+    return expr;
+  };
+  if !is_additive(&args[1]) {
+    return expr;
+  }
+  let Ok(negated) = times_ast_inner(&[Expr::Integer(-1), args[1].clone()])
+  else {
+    return expr;
+  };
+  if !is_additive(&negated) {
+    return expr;
+  }
+  call("Times", vec![make_rational(1, *cd), negated])
+}
+
+/// Build the canonical form of `a / b` structurally (without evaluation).
+/// Returns `Times[a, Power[b, -1]]` as a FunctionCall.
+/// Use this when constructing symbolic results; for evaluated division use `divide_two`.
+pub fn make_divide(a: Expr, b: Expr) -> Expr {
+  // a / 1 → a
+  if matches!(&b, Expr::Integer(1)) {
+    return a;
+  }
+  // 0 / b → 0
+  if matches!(&a, Expr::Integer(0)) {
+    return Expr::Integer(0);
+  }
+  // 1 / b → Power[b, -1]
+  if matches!(&a, Expr::Integer(1)) {
+    // 1 / (c * rest) → (1/c) * rest^(-1): the integer content shows as a
+    // rational coefficient rather than staying inside the reciprocal base.
+    // Wolfram never displays (2*(-1+2*x))^(-1); it is 1/(2*(-1+2*x)) — the
+    // same form the evaluator yields for Power[c*rest, -1]. Cancel/Together
+    // build this quotient directly (via make_divide) without re-evaluating,
+    // so the split has to happen here.
+    if let Expr::FunctionCall { name, args } = &b
+      && name == "Times"
+    {
+      let mut int_prod: i128 = 1;
+      let mut rest: Vec<Expr> = Vec::new();
+      for f in args {
+        match f {
+          Expr::Integer(n) => int_prod = int_prod.saturating_mul(*n),
+          other => rest.push(other.clone()),
+        }
+      }
+      if int_prod != 0 && int_prod.unsigned_abs() != 1 && !rest.is_empty() {
+        let rest_expr = if rest.len() == 1 {
+          rest.remove(0)
+        } else {
+          call("Times", rest)
+        };
+        let rest_inv = pow(rest_expr, Expr::Integer(-1));
+        // Sign is carried on the rational's numerator (Rational[-1, |c|]).
+        let coeff = call(
+          "Rational",
+          vec![
+            Expr::Integer(int_prod.signum()),
+            Expr::Integer(int_prod.abs()),
+          ],
+        );
+        return call("Times", vec![coeff, rest_inv]);
+      }
+    }
+    return pow(b, Expr::Integer(-1));
+  }
+  let b_inv = pow(b, Expr::Integer(-1));
+  // Flatten: if a is already Times, merge b_inv into its args
+  if let Expr::FunctionCall { name, args } = &a
+    && name == "Times"
+  {
+    let mut new_args = args.clone();
+    new_args.push(b_inv);
+    return Expr::FunctionCall {
+      name: "Times".to_string(),
+      args: new_args,
+    };
+  }
+  call("Times", vec![a, b_inv])
+}
+
+/// True iff `exp` is a numeric constant whose absolute value is strictly
+/// less than 1. Used to decide whether `(a^p)^q` with Real `q` may combine
+/// exponents under Wolfram's branch-safety rule.
+pub fn inner_exp_abs_lt_one(exp: &Expr) -> bool {
+  match exp {
+    Expr::Integer(0) => true,
+    Expr::Real(f) => f.abs() < 1.0,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1]) {
+        *q != 0 && p.abs() < q.abs()
+      } else {
+        false
+      }
+    }
+    _ => false,
+  }
+}
+
+/// Power[a, b] - Exponentiation with list threading
+/// The two-line `<tag>::indet` report wolframscript prints for an
+/// indeterminate power: the exponent is set above the baseline where it would
+/// be typeset, e.g. `0^0` gives
+/// ```text
+///                                         0
+/// Power::indet: Indeterminate expression 0  encountered.
+/// ```
+fn emit_power_indet(tag: &str, base: &str, exp: &str) {
+  // A base that is not a single positive atom is parenthesized, the way it
+  // would be typeset: `(-1)^Infinity`, not `-1^Infinity`.
+  let needs_parens = base.starts_with('-')
+    || base.contains(' ')
+    || base.contains('+')
+    || base.contains('*')
+    || base.contains('/');
+  let base = if needs_parens {
+    format!("({base})")
+  } else {
+    base.to_string()
+  };
+  let prefix = format!("{tag}::indet: Indeterminate expression ");
+  let width = prefix.len() + base.len() + exp.len();
+  crate::emit_message(&format!(
+    "{exp:>width$}\n{prefix}{base}{} encountered.",
+    " ".repeat(exp.len())
+  ));
+}
+
+/// The direction of an infinite expression: `Some(dir)` for a `DirectedInfinity`
+/// with that direction (`Infinity` is 1, `-Infinity` is -1), `None` for
+/// `ComplexInfinity` (an infinity of unknown direction), and no result at all
+/// for a finite expression.
+fn infinity_direction(expr: &Expr) -> Option<Option<Expr>> {
+  if matches!(expr, Expr::Identifier(n) | Expr::Constant(n) if n == "Infinity")
+  {
+    return Some(Some(Expr::Integer(1)));
+  }
+  if is_neg_infinity(expr) {
+    return Some(Some(Expr::Integer(-1)));
+  }
+  if matches!(expr, Expr::Identifier(n) if n == "ComplexInfinity") {
+    return Some(None);
+  }
+  match expr {
+    Expr::FunctionCall { name, args } if name == "DirectedInfinity" => {
+      match args.len() {
+        0 => Some(None),
+        1 => Some(Some(args[0].clone())),
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// `base^exp` when either side is infinite, following wolframscript:
+///
+/// * an infinite base with a finite exponent `p` raises its direction,
+///   `DirectedInfinity[d]^p` = `DirectedInfinity[d^p]` for real `p > 0` and `0`
+///   for real `p < 0`; a genuinely complex `p` gives `Indeterminate` when it is
+///   purely imaginary and `ComplexInfinity` / `0` as its real part is positive /
+///   negative;
+/// * a finite base with an infinite exponent depends on the modulus: `|z| > 1`
+///   diverges (to `Infinity` for a positive real `z`, else `ComplexInfinity`),
+///   `|z| < 1` vanishes, and any unit-modulus base (including `1`) is
+///   `Indeterminate`; a negative exponent direction swaps the two divergent
+///   cases;
+/// * both infinite gives `ComplexInfinity` for a positive and `0` for a
+///   negative exponent direction.
+fn infinite_power(base: &Expr, exp: &Expr) -> Option<Expr> {
+  let complex_inf = || id_expr("ComplexInfinity");
+  let indet = || id_expr("Indeterminate");
+  let directed = |dir: Expr| {
+    crate::evaluator::evaluate_expr_to_expr(&call1("DirectedInfinity", dir))
+      .ok()
+  };
+  let base_dir = infinity_direction(base);
+  let exp_dir = infinity_direction(exp);
+
+  // Both sides infinite: only the exponent's direction matters.
+  if base_dir.is_some() && exp_dir.is_some() {
+    return match exp_dir? {
+      Some(d) => match try_eval_to_f64(&d) {
+        Some(v) if v > 0.0 => Some(complex_inf()),
+        Some(v) if v < 0.0 => Some(Expr::Integer(0)),
+        _ => None,
+      },
+      None => None,
+    };
+  }
+
+  // Infinite base, finite exponent.
+  if let Some(dir) = base_dir {
+    let (re, im) = try_extract_complex_float(exp)?;
+    if im != 0.0 {
+      if re == 0.0 {
+        emit_power_indet(
+          "Infinity",
+          &expr_to_string(base),
+          &expr_to_string(exp),
+        );
+        return Some(indet());
+      }
+      return Some(if re > 0.0 {
+        complex_inf()
+      } else {
+        Expr::Integer(0)
+      });
+    }
+    if re < 0.0 {
+      return Some(Expr::Integer(0));
+    }
+    if re == 0.0 {
+      return None; // x^0 is handled (as Indeterminate) by the caller
+    }
+    return match dir {
+      // ComplexInfinity keeps its unknown direction.
+      None => Some(complex_inf()),
+      Some(d) => directed(power_two(&d, exp).ok()?),
+    };
+  }
+
+  // Finite base, infinite exponent.
+  let dir = exp_dir?;
+  // z^ComplexInfinity is handled by the caller.
+  let d = dir.as_ref()?;
+  let sign = match try_eval_to_f64(d) {
+    Some(v) if v > 0.0 => 1.0,
+    Some(v) if v < 0.0 => -1.0,
+    // A complex exponent direction is left alone.
+    _ => return None,
+  };
+  let (re, im) = try_extract_complex_float(base)?;
+  let modulus = (re * re + im * im).sqrt();
+  let positive_real = im == 0.0 && re > 0.0;
+  if modulus == 0.0 {
+    return Some(if sign > 0.0 {
+      Expr::Integer(0)
+    } else {
+      complex_inf()
+    });
+  }
+  // Every unit-modulus base — 1 included — is Indeterminate: the power keeps
+  // circling the unit circle without settling.
+  if (modulus - 1.0).abs() < f64::EPSILON {
+    emit_power_indet("Infinity", &expr_to_string(base), &expr_to_string(exp));
+    return Some(indet());
+  }
+  let diverges = (modulus > 1.0) == (sign > 0.0);
+  Some(if !diverges {
+    Expr::Integer(0)
+  } else if positive_real {
+    id_expr("Infinity")
+  } else {
+    complex_inf()
+  })
+}
+
+pub fn power_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // Power[] = 1, Power[x] = x, and Power[a, b, c, ...] folds right-
+  // associatively to a^(b^(c^...)) (e.g. Power[2, 3, 2] = 2^(3^2) = 512).
+  match args.len() {
+    0 => return Ok(Expr::Integer(1)),
+    1 => return Ok(args[0].clone()),
+    2 => {}
+    _ => {
+      let tail = power_ast(&args[1..])?;
+      if matches!(&args[0], Expr::List(_)) || matches!(&tail, Expr::List(_)) {
+        return thread_binary_over_lists(&[args[0].clone(), tail], power_two);
+      }
+      return power_two(&args[0], &tail);
+    }
+  }
+
+  // Check for list threading
+  let has_list = args.iter().any(|a| matches!(a, Expr::List(_)));
+  if has_list {
+    return thread_binary_over_lists(args, power_two);
+  }
+
+  power_two(&args[0], &args[1])
+}
+
+/// The value of a literal real number as an `f64`, or `None` when the
+/// expression is not one. Only used to size a power against `$MaxNumber`, so
+/// an approximation — including an `inf` for a bignum past `f64`'s range — is
+/// exactly what is wanted.
+fn literal_real_f64(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::BigInteger(n) => n.to_string().parse::<f64>().ok(),
+    Expr::Real(f) => Some(*f),
+    Expr::BigFloat(digits, _) => digits.parse::<f64>().ok(),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      Some(literal_real_f64(&args[0])? / literal_real_f64(&args[1])?)
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => Some(-literal_real_f64(operand)?),
+    _ => None,
+  }
+}
+
+/// `Overflow[]`/`Underflow[]` for a numeric power whose magnitude leaves the
+/// representable range, matching wolframscript's `$MaxNumber` of about
+/// `1.605*10^1355718576299609` (and, by symmetry, `$MinNumber`).
+fn try_power_overflow(base: &Expr, exp: &Expr) -> Option<Expr> {
+  const MAX_LOG10: f64 = 1.3557185762996092e15;
+  let b = literal_real_f64(base)?;
+  let e = literal_real_f64(exp)?;
+  if b == 0.0 || !b.is_finite() || e.is_nan() {
+    return None;
+  }
+  // `|b| == 1` never leaves the range however large the exponent — and with
+  // an `inf` exponent that product is `NaN`, which the negated comparison
+  // (rather than `<=`) correctly treats as "not an overflow".
+  let magnitude = e * b.abs().log10();
+  #[allow(clippy::neg_cmp_op_on_partial_ord)]
+  if !(magnitude.abs() > MAX_LOG10) {
+    return None;
+  }
+  let (head, message) = if magnitude > 0.0 {
+    (
+      "Overflow",
+      "General::ovfl: Overflow occurred in computation.",
+    )
+  } else {
+    (
+      "Underflow",
+      "General::unfl: Underflow occurred in computation.",
+    )
+  };
+  crate::emit_message(message);
+  Some(call0(head))
+}
+
+/// Helper for Power of two arguments
+pub fn power_two(base: &Expr, exp: &Expr) -> Result<Expr, InterpreterError> {
+  // A negative integer power of a trig or hyperbolic function is its
+  // reciprocal partner raised to the positive power: `Sin[x]^-1` is
+  // `Csc[x]`, `Cot[x]^-2` is `Tan[x]^2`, `Sech[x]^-1` is `Cosh[x]`
+  // (wolframscript-verified; fractional, real and symbolic exponents stay).
+  if let Expr::Integer(n) = exp
+    && *n < 0
+    && let Expr::FunctionCall { name, args } = base
+    && args.len() == 1
+    && let Some(partner) = trig_reciprocal_partner(name)
+  {
+    return power_two(&call(partner, args.to_vec()), &Expr::Integer(-n));
+  }
+
+  // A time-series operand keeps the series, combining the values.
+  if let Some(result) = crate::functions::timeseries_ast::try_series_arithmetic(
+    "Power",
+    &[base.clone(), exp.clone()],
+  ) {
+    return Ok(result);
+  }
+
+  // A SparseArray base (or exponent) raises elementwise and stays sparse.
+  if let Some(result) =
+    crate::functions::list_helpers_ast::try_sparse_array_arithmetic(
+      "Power",
+      &[base.clone(), exp.clone()],
+    )
+  {
+    return Ok(result);
+  }
+
+  // Handle Quantity^n
+  if let Some(result) =
+    crate::functions::quantity_ast::try_quantity_power(base, exp)
+  {
+    return result;
+  }
+
+  // Handle Interval^n
+  if let Some(result) =
+    crate::functions::interval_ast::try_interval_power(base, exp)
+  {
+    return result;
+  }
+
+  // Around[a, δ]^n error propagation.
+  if let Some(result) = try_around_power(base, exp) {
+    return Ok(result);
+  }
+
+  // x^1 -> x
+  if matches!(exp, Expr::Integer(1)) {
+    return Ok(base.clone());
+  }
+
+  // A power past what wolframscript can represent is `Overflow[]` (or
+  // `Underflow[]` on the way to zero), with a message — not a symbolic
+  // result, and certainly not an attempt to materialise a number with 10^17
+  // digits. `2^(10^18/3)` used to stay symbolic and `2^(10^20)` used to hang.
+  if let Some(result) = try_power_overflow(base, exp) {
+    return Ok(result);
+  }
+
+  // Arbitrary-precision base (BigFloat) raised to a real power: compute the
+  // value and track precision, instead of leaving `2.`30.^2` unevaluated.
+  if let Some(result) = try_bigfloat_power(base, exp) {
+    return result;
+  }
+  // E raised to an arbitrary-precision exponent: E^N[1,30] = Exp[N[1,30]].
+  if matches!(base, Expr::Constant(c) if c == "E")
+    && matches!(exp, Expr::BigFloat(_, _))
+  {
+    return exp_ast(std::slice::from_ref(exp));
+  }
+
+  // An inexact complex base (a machine float with a nonzero imaginary part)
+  // raised to a non-integer power numericizes, matching wolframscript:
+  // `Sqrt[2.0 + 3.0 I]` gives `1.674… + 0.896… I`, not a symbolic `Sqrt`.
+  // Without this the many exact-radical rewrites below would intercept a
+  // rational exponent like 1/2 and leave the machine-complex base wrapped in
+  // `Sqrt[…]`, so plots of e.g. `Im[Sqrt[…]]` sampled nothing (all-white).
+  // Exact bases (`Sqrt[2 + 3 I]`) lack a Real component and stay symbolic;
+  // positive integer exponents fall through to the more precise
+  // repeated-multiplication path further down.
+  if !matches!(exp, Expr::Integer(_))
+    && let Some((a, b)) = try_extract_complex_float(base)
+    && b != 0.0
+    && contains_real(base)
+    && let Some((c, d)) = try_extract_complex_float(exp)
+  {
+    // z^w = exp(w * log z), with log z = ln|z| + i*arg(z).
+    let abs_z = (a * a + b * b).sqrt();
+    if abs_z != 0.0 {
+      let ln_abs = abs_z.ln();
+      let arg_z = b.atan2(a);
+      let re_exp = c * ln_abs - d * arg_z;
+      let im_exp = d * ln_abs + c * arg_z;
+      let mag = re_exp.exp();
+      let re = mag * im_exp.cos();
+      let im = mag * im_exp.sin();
+      let re = if re.abs() < 1e-15 { 0.0 } else { re };
+      let im = if im.abs() < 1e-15 { 0.0 } else { im };
+      return Ok(build_complex_float_expr(re, im));
+    }
+  }
+
+  // SeriesData ^ n (positive integer n): repeated Cauchy product, so e.g.
+  // (Series[…])^2 squares the series. A pure O-term (empty coefficients) just
+  // scales its order: O[x^(a/d)]^n = O[x^(n*a/d)].
+  if let Expr::FunctionCall { name, args: sa } = base
+    && name == "SeriesData"
+    && sa.len() == 6
+    && let Expr::Integer(n) = exp
+    && (2..=1024).contains(n)
+  {
+    if let (Expr::List(coeffs), Expr::Integer(nmin), Expr::Integer(nmax)) =
+      (&sa[2], &sa[3], &sa[4])
+      && coeffs.is_empty()
+    {
+      let data = vec![
+        sa[0].clone(),
+        sa[1].clone(),
+        Expr::List(vec![].into()),
+        Expr::Integer(nmin * n),
+        Expr::Integer(nmax * n),
+        sa[5].clone(),
+      ];
+      return Ok(call("SeriesData", data));
+    }
+    let copies: Vec<Expr> =
+      std::iter::repeat_n(base.clone(), *n as usize).collect();
+    let product = call("Times", copies);
+    return crate::evaluator::evaluate_expr_to_expr(&product);
+  }
+
+  // Rational[n, d] ^ integer k — compute exactly with big integers so it works
+  // for BigInteger components. Without this, `(1/big)^(-1)` (a reciprocal with
+  // a large denominator) stayed unevaluated, so e.g. IntegerQ[1/(1/big)] was
+  // wrongly False. k < 0 takes the reciprocal.
+  if let Expr::FunctionCall { name, args: rargs } = base
+    && name == "Rational"
+    && rargs.len() == 2
+    && let Expr::Integer(k) = exp
+    && let (Some(n), Some(d)) =
+      (expr_to_bigint(&rargs[0]), expr_to_bigint(&rargs[1]))
+  {
+    let absk = k.unsigned_abs() as u32;
+    let np = n.pow(absk);
+    let dp = d.pow(absk);
+    return Ok(if *k >= 0 {
+      make_rational_expr(&np, &dp)
+    } else {
+      make_rational_expr(&dp, &np)
+    });
+  }
+
+  // (-I)^(p/q) → -(-1)^((2q - p)/(2q) mod 2). Wolfram canonicalises a
+  // negative-imaginary base raised to a rational power into a sign · (-1)^y
+  // form by lining up the principal branch
+  //   (-I)^x  = e^(-iπx/2)
+  //   -(-1)^y = e^(iπ(1 + y))
+  // which gives y ≡ 1 − x/2 (mod 2).
+  let is_neg_i = match base {
+    Expr::FunctionCall { name, args: cargs }
+      if name == "Complex"
+        && cargs.len() == 2
+        && matches!(cargs[0], Expr::Integer(0))
+        && matches!(cargs[1], Expr::Integer(-1)) =>
+    {
+      true
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } if matches!(operand.as_ref(), Expr::Identifier(s) if s == "I") => true,
+    _ => false,
+  };
+  if is_neg_i
+    && let Expr::FunctionCall {
+      name: rn,
+      args: rargs,
+    } = exp
+    && rn == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(p), Expr::Integer(q)) = (&rargs[0], &rargs[1])
+    && *q > 0
+  {
+    let p = *p;
+    let q = *q;
+    // y_num/y_den = 1 - p/(2q) = (2q - p) / (2q), reduced mod 2.
+    let two_q = 2 * q;
+    let mut y_num = two_q - p;
+    let y_den = two_q;
+    // Reduce mod 2*y_den (since y mod 2 means y_num mod 2*y_den).
+    let modulus = 2 * y_den;
+    y_num = y_num.rem_euclid(modulus);
+    let (yn, yd) = rat_reduce(y_num, y_den);
+    // Build -(-1)^Rational[yn, yd]. If yn == 0, (-1)^0 = 1, so result = -1.
+    if yn == 0 {
+      return Ok(Expr::Integer(-1));
+    }
+    let y_expr = if yd == 1 {
+      Expr::Integer(yn)
+    } else {
+      make_rational(yn, yd)
+    };
+    let neg_one_pow = pow(Expr::Integer(-1), y_expr);
+    return crate::evaluator::evaluate_function_call_ast(
+      "Times",
+      &[Expr::Integer(-1), neg_one_pow],
+    );
+  }
+
+  // I^(p/q) → (-1)^(p/(2q)). Since I = (-1)^(1/2), Wolfram canonicalises a
+  // non-integer rational power of the imaginary unit into a (-1)^y form,
+  // pulling out a sign when y lands in [1, 2):  (-1)^y = -(-1)^(y-1).
+  if matches!(base, Expr::Identifier(s) if s == "I")
+    && let Expr::FunctionCall {
+      name: rn,
+      args: rargs,
+    } = exp
+    && rn == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(p), Expr::Integer(q)) = (&rargs[0], &rargs[1])
+    && *q > 0
+  {
+    let (p, q) = (*p, *q);
+    // y = p / (2q), reduced mod 2 into [0, 2).
+    let y_den = 2 * q;
+    let y_num = p.rem_euclid(2 * y_den);
+    let (mut yn, mut yd) = rat_reduce(y_num, y_den);
+    let mut sign = 1i128;
+    if yn >= yd {
+      // y in [1, 2): (-1)^y = -(-1)^(y-1).
+      yn -= yd;
+      sign = -1;
+      (yn, yd) = rat_reduce(yn, yd);
+    }
+    if yn == 0 {
+      return Ok(Expr::Integer(sign)); // (-1)^0 = 1
+    }
+    let y_expr = if yd == 1 {
+      Expr::Integer(yn)
+    } else {
+      make_rational(yn, yd)
+    };
+    let neg_one_pow = pow(Expr::Integer(-1), y_expr);
+    return if sign == 1 {
+      Ok(neg_one_pow)
+    } else {
+      crate::evaluator::evaluate_function_call_ast(
+        "Times",
+        &[Expr::Integer(-1), neg_one_pow],
+      )
+    };
+  }
+
+  // Reciprocals of Underflow[] / Overflow[] swap to the other:
+  //   1 / Underflow[] -> Overflow[]
+  //   1 / Overflow[]  -> Underflow[]
+  if matches!(exp, Expr::Integer(-1))
+    && let Expr::FunctionCall { name, args: inner } = base
+    && inner.is_empty()
+  {
+    if name == "Underflow" {
+      return Ok(call0("Overflow"));
+    }
+    if name == "Overflow" {
+      return Ok(call0("Underflow"));
+    }
+  }
+
+  // E^(Plus[terms]) with at least one Log term: pull out E^Log[z] = z and
+  // E^(c Log[z]) = z^c as factors, leaving the remaining terms together under
+  // E^(rest). E.g. E^(Log[x] + Log[y]) = x y, E^(Log[2] + 1) = 2 E. A Plus
+  // with no Log term is left untouched (E^(a + b) stays). Matches wolframscript.
+  if matches!(base, Expr::Identifier(s) if s == "E")
+    || matches!(base, Expr::Constant(s) if s == "E")
+  {
+    fn term_has_log(term: &Expr) -> bool {
+      match term {
+        Expr::FunctionCall { name, args }
+          if name == "Log" && args.len() == 1 =>
+        {
+          true
+        }
+        Expr::FunctionCall { name, args } if name == "Times" => {
+          args.iter().any(term_has_log)
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left,
+          right,
+        } => term_has_log(left) || term_has_log(right),
+        Expr::UnaryOp {
+          op: UnaryOperator::Minus,
+          operand,
+        } => term_has_log(operand),
+        _ => false,
+      }
+    }
+    let terms: Option<Vec<&Expr>> = match exp {
+      Expr::FunctionCall { name, args } if name == "Plus" => {
+        Some(args.iter().collect())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => Some(vec![left.as_ref(), right.as_ref()]),
+      _ => None,
+    };
+    if let Some(terms) = terms
+      && terms.iter().any(|t| term_has_log(t))
+    {
+      let e = const_expr("E");
+      let mut factors: Vec<Expr> = Vec::new();
+      let mut rest: Vec<Expr> = Vec::new();
+      for t in &terms {
+        if term_has_log(t) {
+          factors.push(power_two(&e, t)?);
+        } else {
+          rest.push((*t).clone());
+        }
+      }
+      if !rest.is_empty() {
+        let rest_sum = if rest.len() == 1 {
+          rest.into_iter().next().unwrap()
+        } else {
+          call("Plus", rest)
+        };
+        factors.push(power_two(&e, &rest_sum)?);
+      }
+      let result = if factors.len() == 1 {
+        factors.into_iter().next().unwrap()
+      } else {
+        call("Times", factors)
+      };
+      return crate::evaluator::evaluate_expr_to_expr(&result);
+    }
+  }
+
+  // E^Log[x] -> x (inverse function identity)
+  if (matches!(base, Expr::Identifier(s) if s == "E")
+    || matches!(base, Expr::Constant(s) if s == "E"))
+    && let Expr::FunctionCall {
+      name,
+      args: log_args,
+    } = exp
+    && name == "Log"
+    && log_args.len() == 1
+  {
+    return Ok(log_args[0].clone());
+  }
+
+  // E^(n*Log[x]) -> x^n (generalized inverse)
+  if (matches!(base, Expr::Identifier(s) if s == "E")
+    || matches!(base, Expr::Constant(s) if s == "E"))
+  {
+    // Extract coefficient and Log argument from Times[..., Log[x]]
+    let factors: Option<Vec<&Expr>> = match exp {
+      Expr::FunctionCall { name, args: targs } if name == "Times" => {
+        Some(targs.iter().collect())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => Some(vec![left.as_ref(), right.as_ref()]),
+      _ => None,
+    };
+    if let Some(factors) = factors {
+      // Find the Log[x] factor
+      let mut log_arg = None;
+      let mut coeff_factors: Vec<&Expr> = Vec::new();
+      for f in &factors {
+        if log_arg.is_none()
+          && let Expr::FunctionCall { name, args: la } = f
+          && name == "Log"
+          && la.len() == 1
+        {
+          log_arg = Some(&la[0]);
+          continue;
+        }
+        coeff_factors.push(f);
+      }
+      if let Some(x) = log_arg {
+        let coeff = if coeff_factors.len() == 1 {
+          coeff_factors[0].clone()
+        } else {
+          Expr::FunctionCall {
+            name: "Times".to_string(),
+            args: coeff_factors.iter().map(|e| (*e).clone()).collect(),
+          }
+        };
+        return power_two(x, &coeff);
+      }
+    }
+  }
+
+  // 1^x -> 1 for any finite x (1^Infinity and 1^Indeterminate are
+  // Indeterminate, handled below)
+  if matches!(base, Expr::Integer(1))
+    && !matches!(exp, Expr::Identifier(s) if s == "Infinity"
+      || s == "ComplexInfinity"
+      || s == "Indeterminate")
+    && !is_neg_infinity(exp)
+  {
+    return Ok(Expr::Integer(1));
+  }
+
+  // x^0 -> 1 (for non-zero finite x; 0^0, Infinity^0 and Indeterminate^0 are
+  // Indeterminate)
+  if matches!(exp, Expr::Integer(0))
+    && !matches!(base, Expr::Integer(0))
+    && !matches!(base, Expr::Real(f) if *f == 0.0)
+    && !matches!(base, Expr::Identifier(s) if s == "Infinity"
+      || s == "ComplexInfinity"
+      || s == "Indeterminate")
+    && !is_neg_infinity(base)
+  {
+    // A raw inexact numeric base gives an inexact 1: 2.0^0 -> 1. and an
+    // inexact complex -> 1. + 0.*I. Symbolic expressions merely
+    // containing inexact numbers still give the exact 1 ((2.0*x)^0 -> 1),
+    // matching wolframscript.
+    if matches!(base, Expr::Real(_)) {
+      return Ok(Expr::Real(1.0));
+    }
+    if contains_real(base)
+      && matches!(
+        try_extract_complex_float(base),
+        Some((_, im)) if im != 0.0
+      )
+    {
+      return crate::evaluator::evaluate_expr_to_expr(&call(
+        "Complex",
+        vec![Expr::Real(1.0), Expr::Real(0.0)],
+      ));
+    }
+    return Ok(Expr::Integer(1));
+  }
+
+  // Handle Power with Infinity in base or exponent
+  let base_is_pos_inf = matches!(base, Expr::Identifier(s) if s == "Infinity");
+  let base_is_neg_inf = is_neg_infinity(base);
+  let exp_is_pos_inf = matches!(exp, Expr::Identifier(s) if s == "Infinity");
+  let exp_is_neg_inf = is_neg_infinity(exp);
+  let base_is_complex_inf =
+    matches!(base, Expr::Identifier(s) if s == "ComplexInfinity");
+  let exp_is_complex_inf =
+    matches!(exp, Expr::Identifier(s) if s == "ComplexInfinity");
+
+  // Infinity^0 and ComplexInfinity^0 → Indeterminate
+  if matches!(exp, Expr::Integer(0))
+    && (base_is_pos_inf || base_is_neg_inf || base_is_complex_inf)
+  {
+    emit_power_indet("Infinity", &expr_to_string(base), "0");
+    return Ok(id_expr("Indeterminate"));
+  }
+
+  // Any Indeterminate operand makes the whole power Indeterminate — including
+  // Indeterminate^0 and 1^Indeterminate, which are not 1.
+  if matches!(base, Expr::Identifier(s) if s == "Indeterminate")
+    || matches!(exp, Expr::Identifier(s) if s == "Indeterminate")
+  {
+    return Ok(id_expr("Indeterminate"));
+  }
+
+  // The general rules for an infinite base or exponent.
+  if let Some(result) = infinite_power(base, exp) {
+    return Ok(result);
+  }
+
+  // E^Infinity → Infinity, E^(-Infinity) → 0
+  let base_is_e = matches!(base, Expr::Constant(c) if c == "E")
+    || matches!(base, Expr::Identifier(s) if s == "E");
+  if base_is_e {
+    if exp_is_pos_inf {
+      return Ok(id_expr("Infinity"));
+    }
+    if exp_is_neg_inf {
+      return Ok(Expr::Integer(0));
+    }
+    // E^Real → numeric Real (matches Wolfram behavior: a machine-precision
+    // exponent forces numeric evaluation). Does not apply to integer or
+    // symbolic exponents, which stay symbolic (e.g. E^2, E^x).
+    if let Expr::Real(r) = exp {
+      return Ok(Expr::Real(r.exp()));
+    }
+  }
+
+  // n^ComplexInfinity → Indeterminate for most cases
+  if exp_is_complex_inf {
+    return Ok(id_expr("Indeterminate"));
+  }
+
+  // (-x)^n → (-1)^n * x^n for integer n. A `UnaryOp` minus base (e.g. the
+  // `-Sin[t]` that D produces for the Cos derivative) is otherwise not picked
+  // up by the Times-distribution below, so `(-Sin[t])^2` would mis-evaluate to
+  // `-Sin[t]^2` instead of `Sin[t]^2`.
+  if let Expr::Integer(n) = exp
+    && let Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } = base
+  {
+    let inner_pow = power_two(operand, &Expr::Integer(*n))?;
+    let sign = if n.rem_euclid(2) == 0 {
+      Expr::Integer(1)
+    } else {
+      Expr::Integer(-1)
+    };
+    return times_ast(&[sign, inner_pow]);
+  }
+
+  // (a * b * ...)^n → Times[a^n, b^n, ...] for integer n
+  // This matches Wolfram's normalization: Power[Times[...], n] distributes
+  if let Expr::Integer(n) = exp {
+    let factors: Option<Vec<&Expr>> = match base {
+      Expr::FunctionCall { name, args: targs }
+        if name == "Times" && targs.len() >= 2 =>
+      {
+        Some(targs.iter().collect())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => Some(vec![left.as_ref(), right.as_ref()]),
+      _ => None,
+    };
+    if let Some(factors) = factors {
+      let pow_factors: Result<Vec<Expr>, InterpreterError> = factors
+        .into_iter()
+        .map(|f| power_two(f, &Expr::Integer(*n)))
+        .collect();
+      return times_ast(&pow_factors?);
+    }
+  }
+
+  // (c * rest)^(p/q) → c^(p/q) * rest^(p/q) when c is a positive numeric
+  // factor (Integer ≥ 2 or positive Rational) and `rest` contains at least
+  // one non-numeric factor. This matches Wolfram's behavior of pulling
+  // positive numeric factors out of radicals, e.g.
+  //   (2*x)^(3/2) → 2*Sqrt[2]*x^(3/2)
+  //   (8*x)^(1/3) → 2*x^(1/3)
+  //   ((1/2)*x)^(3/2) → x^(3/2)/(2*Sqrt[2])
+  // The non-numeric guard is critical: `(2*Pi)^(1/2)` stays as `Sqrt[2*Pi]`
+  // (otherwise `Sqrt[2]*Sqrt[Pi]` recombines back via the Times Sqrt-merge
+  // pass, looping). Negative numeric factors are left alone (branch-cut
+  // sensitive).
+  if let Expr::FunctionCall {
+    name: rname,
+    args: rargs,
+  } = exp
+    && rname == "Rational"
+    && rargs.len() == 2
+    && matches!(&rargs[0], Expr::Integer(_))
+    && matches!(&rargs[1], Expr::Integer(_))
+  {
+    let factors: Option<Vec<&Expr>> = match base {
+      Expr::FunctionCall { name, args: targs }
+        if name == "Times" && targs.len() >= 2 =>
+      {
+        Some(targs.iter().collect())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => Some(vec![left.as_ref(), right.as_ref()]),
+      _ => None,
+    };
+    if let Some(factors) = factors {
+      // Find a positive numeric factor (Integer ≥ 2 or positive Rational).
+      let is_positive_numeric = |e: &Expr| -> bool {
+        match e {
+          Expr::Integer(n) => *n >= 2,
+          Expr::FunctionCall { name, args } if name == "Rational" => {
+            args.len() == 2
+              && matches!(&args[0], Expr::Integer(p) if *p > 0)
+              && matches!(&args[1], Expr::Integer(q) if *q > 0)
+          }
+          _ => false,
+        }
+      };
+      if let Some(idx) = factors.iter().position(|f| is_positive_numeric(f)) {
+        let numeric = factors[idx].clone();
+        let rest: Vec<Expr> = factors
+          .iter()
+          .enumerate()
+          .filter(|(i, _)| *i != idx)
+          .map(|(_, f)| (*f).clone())
+          .collect();
+        let pow_numeric = power_two(&numeric, exp)?;
+        // To avoid infinite recursion via the Sqrt-merge pass when ALL the
+        // remaining factors are numeric-like (e.g. `(2*Pi)^(1/2)` or
+        // `(2/Pi)^(1/2)` = Times[2, Power[Pi,-1]]^(1/2)), only distribute
+        // when either the rest contains a non-numeric factor OR when
+        // `c^(p/q)` produces a non-radical coefficient (so the distributed
+        // form is a real simplification rather than a renaming).
+        // `is_numeric_like` doesn't cover Power-as-FunctionCall or
+        // Identifier("Pi"/"E"/...), so check those locally too. Some code
+        // paths (e.g. half-integer Bessel) build constants as Identifier
+        // rather than Constant.
+        fn is_numeric_like_extended(e: &Expr) -> bool {
+          match e {
+            Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => true,
+            Expr::Constant(_) => true,
+            Expr::Identifier(s) => matches!(
+              s.as_str(),
+              "Pi"
+                | "E"
+                | "EulerGamma"
+                | "Degree"
+                | "GoldenRatio"
+                | "Catalan"
+                | "Glaisher"
+                | "Khinchin"
+                | "I"
+            ),
+            Expr::FunctionCall { name, args }
+              if name == "Rational" && args.len() == 2 =>
+            {
+              true
+            }
+            Expr::FunctionCall { name, args } if name == "Times" => {
+              args.iter().all(is_numeric_like_extended)
+            }
+            Expr::FunctionCall { name, args }
+              if name == "Power" && args.len() == 2 =>
+            {
+              is_numeric_like_extended(&args[0])
+                && is_numeric_like_extended(&args[1])
+            }
+            Expr::BinaryOp {
+              op: BinaryOperator::Times,
+              left,
+              right,
+            } => {
+              is_numeric_like_extended(left) && is_numeric_like_extended(right)
+            }
+            Expr::BinaryOp {
+              op: BinaryOperator::Power,
+              left,
+              right,
+            } => {
+              is_numeric_like_extended(left) && is_numeric_like_extended(right)
+            }
+            _ => false,
+          }
+        }
+        // A fully numeric radicand containing a sum (e.g. 5*(5 + 2*Sqrt[5]))
+        // does not distribute under Sqrt: wolframscript only extracts the
+        // perfect-square part of the numeric factor and keeps the residue
+        // merged inside the radical — Sqrt[12*(1 + Sqrt[2])] gives
+        // 2*Sqrt[3*(1 + Sqrt[2])] and Sqrt[5*(5 + 2*Sqrt[5])] stays put,
+        // while (2*(1 + Sqrt[2]))^(3/2) still distributes fully.
+        fn is_numeric_with_sums(e: &Expr) -> bool {
+          match e {
+            Expr::FunctionCall { name, args }
+              if matches!(name.as_str(), "Plus" | "Sqrt") =>
+            {
+              args.iter().all(is_numeric_with_sums)
+            }
+            Expr::BinaryOp {
+              op: BinaryOperator::Plus | BinaryOperator::Minus,
+              left,
+              right,
+            } => is_numeric_with_sums(left) && is_numeric_with_sums(right),
+            Expr::UnaryOp {
+              op: UnaryOperator::Minus,
+              operand,
+            } => is_numeric_with_sums(operand),
+            _ => is_numeric_like_extended(e),
+          }
+        }
+        fn contains_sum(e: &Expr) -> bool {
+          match e {
+            Expr::FunctionCall { name, args } => {
+              name == "Plus" || args.iter().any(contains_sum)
+            }
+            Expr::BinaryOp {
+              op: BinaryOperator::Plus | BinaryOperator::Minus,
+              ..
+            } => true,
+            Expr::BinaryOp { left, right, .. } => {
+              contains_sum(left) || contains_sum(right)
+            }
+            Expr::UnaryOp { operand, .. } => contains_sum(operand),
+            _ => false,
+          }
+        }
+        let numeric_sum_radicand = matches!(
+          (&rargs[0], &rargs[1]),
+          (Expr::Integer(1), Expr::Integer(2))
+        ) && matches!(&numeric, Expr::Integer(_))
+          && rest.iter().all(is_numeric_with_sums)
+          && rest.iter().any(contains_sum);
+        if numeric_sum_radicand
+          && let Expr::Integer(c) = &numeric
+          && *c <= 1_000_000_000_000
+        {
+          // Largest s with s^2 | c.
+          let mut s: i128 = 1;
+          let mut k: i128 = 2;
+          let mut m = *c;
+          while k * k <= m {
+            while m % (k * k) == 0 {
+              m /= k * k;
+              s *= k;
+            }
+            k += 1;
+          }
+          if s == 1 {
+            // Nothing to extract: keep the radical merged (skip the
+            // distribution below and every later rewrite of this power).
+            return Ok(call1("Sqrt", base.clone()));
+          }
+          let r = *c / (s * s);
+          let mut radicand_factors: Vec<Expr> = Vec::new();
+          if r != 1 {
+            radicand_factors.push(Expr::Integer(r));
+          }
+          radicand_factors.extend(rest.iter().cloned());
+          let radicand = if radicand_factors.len() == 1 {
+            radicand_factors.into_iter().next().unwrap()
+          } else {
+            call("Times", radicand_factors)
+          };
+          return times_ast(&[Expr::Integer(s), call1("Sqrt", radicand)]);
+        }
+        let rest_has_nonnumeric =
+          rest.iter().any(|f| !is_numeric_like_extended(f));
+        let pow_numeric_has_coeff = match &pow_numeric {
+          Expr::Integer(n) => n.abs() > 1,
+          Expr::FunctionCall { name, args }
+            if name == "Times" && !args.is_empty() =>
+          {
+            matches!(
+              &args[0],
+              Expr::Integer(n) if n.abs() > 1
+            ) || matches!(
+              &args[0],
+              Expr::FunctionCall { name: rn, args: ra }
+                if rn == "Rational" && ra.len() == 2
+            )
+          }
+          _ => false,
+        };
+        if rest_has_nonnumeric || pow_numeric_has_coeff {
+          let rest_expr = if rest.len() == 1 {
+            rest.into_iter().next().unwrap()
+          } else {
+            call("Times", rest)
+          };
+          let pow_rest = power_two(&rest_expr, exp)?;
+          return times_ast(&[pow_numeric, pow_rest]);
+        }
+      }
+    }
+  }
+
+  // Sqrt[x]^n → x^(n/2)
+  if is_sqrt(base).is_some()
+    && let Expr::Integer(n) = exp
+  {
+    let sqrt_arg = is_sqrt(base).unwrap();
+    if *n == 2 {
+      return Ok(sqrt_arg.clone());
+    }
+    // Sqrt[x]^n = x^(n/2)
+    return power_two(sqrt_arg, &make_rational(*n, 2));
+  }
+
+  // (base^exp1)^exp2 -> base^(exp1*exp2) when outer exponent is integer
+  // Handles both BinaryOp::Power and FunctionCall Power forms
+  if let Expr::Integer(e2) = exp {
+    let inner = match base {
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => Some((left.as_ref(), right.as_ref())),
+      Expr::FunctionCall { name, args: fargs }
+        if name == "Power" && fargs.len() == 2 =>
+      {
+        Some((&fargs[0], &fargs[1]))
+      }
+      _ => None,
+    };
+    if let Some((inner_base, inner_exp)) = inner {
+      match inner_exp {
+        Expr::Integer(e1) => {
+          let combined = *e1 * *e2;
+          return power_two(inner_base, &Expr::Integer(combined));
+        }
+        // (base^(p/q))^n → base^(p*n/q)
+        Expr::FunctionCall { name, args: ra }
+          if name == "Rational"
+            && ra.len() == 2
+            && matches!(&ra[0], Expr::Integer(_))
+            && matches!(&ra[1], Expr::Integer(_)) =>
+        {
+          if let (Expr::Integer(p), Expr::Integer(q)) = (&ra[0], &ra[1]) {
+            let new_p = p * e2;
+            let new_exp = make_rational(new_p, *q);
+            return power_two(inner_base, &new_exp);
+          }
+        }
+        // (base^symbolic_exp)^n → base^(symbolic_exp * n)
+        // Wolfram combines whenever the outer exponent is an integer,
+        // regardless of the inner exponent or base.
+        _ => {
+          let new_exp = times_ast(&[inner_exp.clone(), Expr::Integer(*e2)])?;
+          return power_two(inner_base, &new_exp);
+        }
+      }
+    }
+  }
+
+  // (base^inner_exp)^outer_exp where the outer exponent is a machine Real or an
+  // exact non-integer rational, and the inner exponent is numeric with absolute
+  // value strictly less than 1. Wolfram only combines exponents under these
+  // conditions so the result stays on the principal branch of the complex
+  // power: `Sqrt[Sqrt[z]]` → `z^(1/4)` and `(z^(-3/4))^(1/2)` → `z^(-3/8)`,
+  // while inner exponents with |p| ≥ 1 are left as-is (`(a^2)^3.` stays
+  // `(a^2)^3.`, `Sqrt[z^(5/4)]` stays `Sqrt[z^(5/4)]`).
+  if matches!(exp, Expr::Real(_))
+    || matches!(exp, Expr::FunctionCall { name, .. } if name == "Rational")
+  {
+    let inner = match base {
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => Some((left.as_ref(), right.as_ref())),
+      Expr::FunctionCall { name, args: fargs }
+        if name == "Power" && fargs.len() == 2 =>
+      {
+        Some((&fargs[0], &fargs[1]))
+      }
+      _ => None,
+    };
+    // `Sqrt[x]` is stored as its own head, so expose its 1/2 exponent too.
+    let half = make_rational(1, 2);
+    let inner = inner.or_else(|| is_sqrt(base).map(|arg| (arg, &half)));
+    // A base known to be a positive real has a single real power, so the
+    // exponents always combine there (`Sqrt[Pi^(-1)]` = `Pi^(-1/2)`,
+    // `Sqrt[Pi^2]` = `Pi`) — the |p| < 1 restriction only guards bases whose
+    // sign is unknown.
+    if let Some((inner_base, inner_exp)) = inner
+      && (inner_exp_abs_lt_one(inner_exp) || is_pos_numeric(inner_base))
+    {
+      let new_exp = times_ast(&[inner_exp.clone(), exp.clone()])?;
+      return power_two(inner_base, &new_exp);
+    }
+  }
+
+  // (Power[-1, Rational[p,q]])^n → simplify (-1)^(p*n/q)
+  // Handles both FunctionCall and BinaryOp representations of Power
+  if let Expr::Integer(n) = exp {
+    let (inner_base, inner_exp) = match base {
+      Expr::FunctionCall { name, args: fargs }
+        if name == "Power" && fargs.len() == 2 =>
+      {
+        (Some(&fargs[0]), Some(&fargs[1]))
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => (Some(left.as_ref()), Some(right.as_ref())),
+      _ => (None, None),
+    };
+    if let (Some(ib), Some(ie)) = (inner_base, inner_exp)
+      && matches!(ib, Expr::Integer(-1))
+      && let Some((p, q)) = expr_to_rational(ie)
+    {
+      let new_p = p * n;
+      let new_q = q;
+      return simplify_neg1_rational_power(new_p, new_q);
+    }
+  }
+
+  // (Times[-1, Power[-1, Rational[p,q]]])^n or (UnaryMinus[Power[-1, Rational[p,q]]])^n
+  // → (-1)^n * ((-1)^(p/q))^n = (-1)^(n + n*p/q) = (-1)^(n*(q+p)/q)
+  // Handles both FunctionCall and BinaryOp representations of the inner Power
+  if let Expr::Integer(n) = exp {
+    let inner_power = match base {
+      Expr::FunctionCall { name, args: targs }
+        if name == "Times"
+          && targs.len() == 2
+          && matches!(&targs[0], Expr::Integer(-1)) =>
+      {
+        Some(&targs[1])
+      }
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } => Some(operand.as_ref()),
+      _ => None,
+    };
+    if let Some(inner) = inner_power {
+      let (inner_base, inner_exp) = match inner {
+        Expr::FunctionCall {
+          name: pname,
+          args: pargs,
+        } if pname == "Power" && pargs.len() == 2 => {
+          (Some(&pargs[0]), Some(&pargs[1]))
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Power,
+          left,
+          right,
+        } => (Some(left.as_ref()), Some(right.as_ref())),
+        _ => (None, None),
+      };
+      if let (Some(ib), Some(ie)) = (inner_base, inner_exp)
+        && matches!(ib, Expr::Integer(-1))
+        && let Some((p, q)) = expr_to_rational(ie)
+      {
+        let new_p = n * (q + p);
+        let new_q = q;
+        return simplify_neg1_rational_power(new_p, new_q);
+      }
+    }
+  }
+
+  // I^n cycles with period 4: I^0=1, I^1=I, I^2=-1, I^3=-I
+  if let Expr::Identifier(name) = base
+    && name == "I"
+    && let Expr::Integer(n) = exp
+  {
+    let r = ((*n % 4) + 4) % 4; // always non-negative mod
+    return Ok(match r {
+      0 => Expr::Integer(1),
+      1 => id_expr("I"),
+      2 => Expr::Integer(-1),
+      3 => negate_expr(id_expr("I")),
+      _ => unreachable!(),
+    });
+  }
+
+  // (a + b*I)^n for an exact complex base and an integer exponent. A
+  // negative exponent raises |n| here and hands the reciprocal to
+  // `divide_two`, which owns the exact complex division — the reason
+  // `1/(1 + I)` evaluated long before `(1 + I)^(-1)` did.
+  if let Expr::Integer(n) = exp
+    && (*n >= 2 || *n <= -1)
+    && let Some(((re_n, re_d), (im_n, im_d))) = try_extract_complex_exact(base)
+    && im_n != 0
+  {
+    use num_traits::{ToPrimitive, Zero};
+
+    // Normalize denominators to be positive
+    let (re_n, re_d) = if re_d < 0 {
+      (-re_n, -re_d)
+    } else {
+      (re_n, re_d)
+    };
+    let (im_n, im_d) = if im_d < 0 {
+      (-im_n, -im_d)
+    } else {
+      (im_n, im_d)
+    };
+
+    // Common denominator: k = lcm(re_d, im_d)
+    let g = gcd_i128(re_d, im_d);
+    let k_val = re_d / g * im_d;
+    let a = re_n * (k_val / re_d);
+    let b_val = im_n * (k_val / im_d);
+
+    // Compute (a + b*I)^n using BigInt exponentiation by squaring
+    let a_big = BigInt::from(a);
+    let b_big = BigInt::from(b_val);
+    let mut result_re = BigInt::from(1);
+    let mut result_im = BigInt::from(0);
+    let mut sq_re = a_big.clone();
+    let mut sq_im = b_big.clone();
+    let magnitude = n.unsigned_abs();
+    let mut remaining = magnitude;
+    while remaining > 0 {
+      if remaining & 1 == 1 {
+        let new_re = &result_re * &sq_re - &result_im * &sq_im;
+        let new_im = &result_re * &sq_im + &result_im * &sq_re;
+        result_re = new_re;
+        result_im = new_im;
+      }
+      remaining >>= 1;
+      if remaining > 0 {
+        let new_re = &sq_re * &sq_re - &sq_im * &sq_im;
+        let new_im = BigInt::from(2) * &sq_re * &sq_im;
+        sq_re = new_re;
+        sq_im = new_im;
+      }
+    }
+
+    // Result = result_re / k^|n| + (result_im / k^|n|) * I
+    let k_big = BigInt::from(k_val);
+    let k_n = num_traits::pow::pow(k_big, magnitude as usize);
+
+    // Reduce fractions
+    let (final_re_n, final_re_d) = rat_reduce_bigint(&result_re, &k_n);
+    let (final_im_n, final_im_d) = rat_reduce_bigint(&result_im, &k_n);
+
+    // Try to convert back to i128
+    let raised = if let (Some(rn), Some(rd), Some(imn), Some(imd)) = (
+      final_re_n.to_i128(),
+      final_re_d.to_i128(),
+      final_im_n.to_i128(),
+      final_im_d.to_i128(),
+    ) {
+      Some(complex_rational_to_expr(rn, rd, imn, imd))
+    } else if final_re_d == BigInt::from(1) && final_im_d == BigInt::from(1) {
+      // BigInt result: build expression for integer denominators
+      let re_expr = bigint_to_expr(final_re_n);
+      let i_expr = id_expr("I");
+      if result_im.is_zero() {
+        Some(re_expr)
+      } else {
+        let im_expr = bigint_to_expr(final_im_n);
+        let imag_term = if matches!(&im_expr, Expr::Integer(1)) {
+          i_expr.clone()
+        } else if matches!(&im_expr, Expr::Integer(-1)) {
+          negate_expr(i_expr.clone())
+        } else {
+          times2(im_expr, i_expr)
+        };
+        if result_re.is_zero() {
+          Some(imag_term)
+        } else {
+          Some(plus2(re_expr, imag_term))
+        }
+      }
+    } else {
+      None
+    };
+
+    if let Some(raised) = raised {
+      return if *n < 0 {
+        divide_two(&Expr::Integer(1), &raised)
+      } else {
+        Ok(raised)
+      };
+    }
+  }
+
+  // E^(k*I*Pi) → Cos[k*Pi] + I*Sin[k*Pi] for integer and half-integer multiples of Pi.
+  // Wolfram only evaluates Exp[I*k*Pi] using Euler's formula when k has denominator 1 or 2
+  // (i.e., multiples of Pi or Pi/2). For other rational multiples like Pi/3, Pi/4, Pi/6,
+  // the expression is left unevaluated.
+  if matches!(base, Expr::Constant(c) if c == "E")
+    && let Some((numer, denom)) = try_extract_i_pi_rational_multiple(exp)
+    && (denom == 1 || denom == 2)
+  {
+    // Build the symbolic argument k*Pi
+    let k_pi = make_rational_times_pi(numer, denom);
+    // Evaluate Cos[k*Pi] and Sin[k*Pi] symbolically
+    let cos_val = cos_ast(std::slice::from_ref(&k_pi))?;
+    let sin_val = sin_ast(&[k_pi])?;
+    // Build result: cos_val + I*sin_val
+    let sin_is_zero = matches!(&sin_val, Expr::Integer(0));
+    let cos_is_zero = matches!(&cos_val, Expr::Integer(0));
+    if sin_is_zero {
+      return Ok(cos_val);
+    }
+    let i_expr = id_expr("I");
+    let imag_term = if matches!(&sin_val, Expr::Integer(1)) {
+      i_expr
+    } else if matches!(&sin_val, Expr::Integer(-1)) {
+      negate_expr(i_expr)
+    } else {
+      call("Times", vec![sin_val, i_expr])
+    };
+    if cos_is_zero {
+      return Ok(imag_term);
+    }
+    return Ok(call("Plus", vec![cos_val, imag_term]));
+  }
+
+  // E^(a + k*I*Pi) → E^a * E^(k*I*Pi), when k*I*Pi appears as a Plus term
+  // and has denominator 1 or 2 (so E^(k*I*Pi) evaluates to ±1 or ±I).
+  // This keeps the non-Pi part symbolic rather than forcing a numeric f64 value
+  // (e.g. E^(3 + I*Pi) → -E^3 instead of ≈ -20.0855 + 2.46e-15 I).
+  // When the exponent contains a Real, skip this split so the numeric complex
+  // Euler path below can fully evaluate (e.g. E^(log2 + I*Pi) → -2.).
+  if matches!(base, Expr::Constant(c) if c == "E") && !contains_real(exp) {
+    let plus_args: Option<Vec<&Expr>> = match exp {
+      Expr::FunctionCall { name, args }
+        if name == "Plus" && args.len() >= 2 =>
+      {
+        Some(args.iter().collect())
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus,
+        left,
+        right,
+      } => Some(vec![left.as_ref(), right.as_ref()]),
+      _ => None,
+    };
+    if let Some(terms) = plus_args {
+      let mut i_pi_term: Option<&Expr> = None;
+      let mut other_terms: Vec<&Expr> = Vec::new();
+      for t in &terms {
+        if i_pi_term.is_none()
+          && let Some((_, d)) = try_extract_i_pi_rational_multiple(t)
+          && (d == 1 || d == 2)
+        {
+          i_pi_term = Some(*t);
+        } else {
+          other_terms.push(*t);
+        }
+      }
+      if let Some(ipi) = i_pi_term
+        && !other_terms.is_empty()
+        // Only split when the remaining terms are fully numeric (matches
+        // Wolfram): e.g. E^(2+I*Pi)→-E^2 but E^(a+I*Pi) stays unevaluated.
+        && other_terms.iter().all(|t| is_numeric_constant(t))
+      {
+        let rest_exp = if other_terms.len() == 1 {
+          other_terms[0].clone()
+        } else {
+          Expr::FunctionCall {
+            name: "Plus".to_string(),
+            args: other_terms.into_iter().cloned().collect(),
+          }
+        };
+        let e_sym = base.clone();
+        let e_rest = power_two(&e_sym, &rest_exp)?;
+        let e_ipi = power_two(&e_sym, ipi)?;
+        return crate::functions::times_ast(&[e_rest, e_ipi]);
+      }
+    }
+  }
+
+  // E^(complex) → Euler's formula: E^(a + b*I) = E^a * (Cos[b] + I*Sin[b])
+  // Only apply for purely numeric exponents that contain at least one inexact
+  // (Real/BigFloat) component. For exact symbolic complex exponents like `I`
+  // or `I*Pi/3`, leave the expression symbolic (Wolfram does the same).
+  if matches!(base, Expr::Constant(c) if c == "E")
+    && try_extract_i_pi_rational_multiple(exp).is_none()
+    && contains_real(exp)
+  {
+    // Try float complex extraction for the exponent
+    if let Some((re, im)) = try_extract_complex_float(exp)
+      && im != 0.0
+    {
+      let mag = re.exp();
+      let cos_val = im.cos();
+      let sin_val = im.sin();
+      let real_part = mag * cos_val;
+      let imag_part = mag * sin_val;
+      if imag_part == 0.0 {
+        return Ok(Expr::Real(real_part));
+      }
+      if real_part == 0.0 {
+        return Ok(times2(Expr::Real(imag_part), id_expr("I")));
+      }
+      return Ok(plus2(
+        Expr::Real(real_part),
+        times2(Expr::Real(imag_part), id_expr("I")),
+      ));
+    }
+  }
+
+  // Special case: 0^0 is Indeterminate (matches Wolfram)
+  let base_is_zero = matches!(base, Expr::Integer(0))
+    || matches!(base, Expr::Real(f) if *f == 0.0);
+  let exp_is_zero = matches!(exp, Expr::Integer(0))
+    || matches!(exp, Expr::Real(f) if *f == 0.0);
+  if base_is_zero && exp_is_zero {
+    emit_power_indet("Power", &expr_to_string(base), &expr_to_string(exp));
+    return Ok(id_expr("Indeterminate"));
+  }
+
+  // Special case: 0^(negative) = ComplexInfinity (with warning).
+  // wolframscript renders the warning two different ways: `0^-1` (exponent
+  // exactly -1) is the reciprocal `1/0`, shown as a stacked fraction, while
+  // `0^-n` for any other negative exponent is shown as `0` with a superscript
+  // exponent.
+  if base_is_zero
+    && let Some(e) = expr_to_num(exp)
+    && e < 0.0
+  {
+    let base_str = expr_to_string(base);
+    if e == -1.0 {
+      crate::emit_message(&format_infy_fraction_2d(
+        "Power::infy: Infinite expression ",
+        "1",
+        &base_str,
+      ));
+    } else {
+      let exp_str = expr_to_string(exp);
+      crate::emit_message(&format_power_infy_2d(&base_str, &exp_str));
+    }
+    return Ok(id_expr("ComplexInfinity"));
+  }
+
+  // Special case: integer base with negative integer exponent -> Rational
+  if let (Expr::Integer(b), Expr::Integer(e)) = (base, exp)
+    && *e < 0
+  {
+    // b^(-n) = 1 / b^n = Rational[1, b^n]
+    let pos_exp = (-*e) as u32;
+    if let Some(denom) = b.checked_pow(pos_exp) {
+      return Ok(make_rational(1, denom));
+    }
+  }
+
+  // BigInteger base with negative integer exponent -> Rational. Mirrors the
+  // Integer case above so a reciprocal like `Power[BigInteger(6), -1]` folds to
+  // `1/6` rather than lingering as an unevaluated Power. Without this, a
+  // polynomial-over-factorial such as LaguerreL[3, x] (denominator built as a
+  // BigInteger) left a `Power[6, -1]` factor that failed to cancel after a
+  // numeric substitution, e.g. `LaguerreL[3, x] /. x -> 3` printing `6/6`.
+  if let (Expr::BigInteger(b), Expr::Integer(e)) = (base, exp)
+    && *e < 0
+    && *b != BigInt::from(0)
+  {
+    let pos_exp = (-*e) as u32;
+    let denom = num_traits::pow::pow(b.clone(), pos_exp as usize);
+    return Ok(make_rational_expr(&BigInt::from(1), &denom));
+  }
+
+  // Special case: Rational^Integer -> exact rational result
+  if let Expr::FunctionCall {
+    name: rname,
+    args: rargs,
+  } = base
+    && rname == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(num), Expr::Integer(den)) = (&rargs[0], &rargs[1])
+    && let Expr::Integer(e) = exp
+  {
+    if *e > 0 {
+      let pe = *e as u32;
+      if let (Some(new_num), Some(new_den)) =
+        (num.checked_pow(pe), den.checked_pow(pe))
+      {
+        return Ok(make_rational(new_num, new_den));
+      }
+    } else if *e < 0 {
+      // (a/b)^(-n) = (b/a)^n = b^n / a^n
+      let pe = (-*e) as u32;
+      if let (Some(new_num), Some(new_den)) =
+        (den.checked_pow(pe), num.checked_pow(pe))
+      {
+        return Ok(make_rational(new_num, new_den));
+      }
+    }
+  }
+
+  // `(r c)^(-n/d)` for a positive rational `r` and named positive constants
+  // `c` flips to `(c^-1/r)^(n/d)`, the same rule the plain-rational base
+  // takes below: `1/Sqrt[Pi/2]` prints as `Sqrt[2/Pi]`. Only a base that is a
+  // genuine fraction flips — wolframscript leaves `1/Sqrt[2 Pi]` alone, just
+  // as it leaves `1/Sqrt[3]` alone, and flipping it would bounce against the
+  // reciprocal normalisation forever.
+  if let Expr::FunctionCall {
+    name: ename,
+    args: eargs,
+  } = exp
+    && ename == "Rational"
+    && eargs.len() == 2
+    && let (Expr::Integer(n), Expr::Integer(d)) = (&eargs[0], &eargs[1])
+    && *n < 0
+    && *d > 0
+    && let Some((p, q, constants)) = split_positive_rational_and_constants(base)
+    && q > 1
+  {
+    let mut factors = vec![make_rational(q, p)];
+    for c in constants {
+      factors.push(power_two(&c, &Expr::Integer(-1))?);
+    }
+    let flipped_base = times_ast(&factors)?;
+    return power_two(&flipped_base, &make_rational(-*n, *d));
+  }
+
+  // A unit-fraction base flips to its denominator: `(1/2)^x` is `2^(-x)`,
+  // `(1/4)^(1/3)` is `2^(-2/3)`. Integer exponents compute directly, and a
+  // complex number exponent keeps the fraction (`(1/2)^I`, though
+  // `(1/2)^(I x)` is `2^(-I x)`).
+  if let Expr::FunctionCall { name, args: rargs } = base
+    && name == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(1), Expr::Integer(q)) = (&rargs[0], &rargs[1])
+    && *q > 1
+    && !matches!(
+      exp,
+      Expr::Integer(_)
+        | Expr::BigInteger(_)
+        | Expr::Real(_)
+        | Expr::BigFloat(..)
+    )
+    && !(matches!(exp, Expr::Identifier(i) if i == "I")
+      || matches!(try_extract_complex_exact(exp), Some((_, (im_n, _))) if im_n != 0))
+  {
+    let negated = times_ast(&[Expr::Integer(-1), exp.clone()])?;
+    return power_two(&Expr::Integer(*q), &negated);
+  }
+
+  // `(c^-1/q)^(n/d)` — see `flip_unit_fraction_radicand`.
+  if let Expr::FunctionCall {
+    name: ename,
+    args: eargs,
+  } = exp
+    && ename == "Rational"
+    && eargs.len() == 2
+    && let (Expr::Integer(n), Expr::Integer(d)) = (&eargs[0], &eargs[1])
+    && *n > 0
+    && *d > 0
+    && let Some(flipped_base) = flip_unit_fraction_radicand(base)?
+  {
+    return power_two(&flipped_base, &make_rational(-*n, *d));
+  }
+
+  // Special case: Rational^Rational — keep the result exact/symbolic
+  // rather than falling through to numeric evaluation.
+  if let Expr::FunctionCall {
+    name: rname,
+    args: rargs,
+  } = base
+    && rname == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(p), Expr::Integer(q)) = (&rargs[0], &rargs[1])
+    && *q > 0
+    && let Expr::FunctionCall {
+      name: ename,
+      args: eargs,
+    } = exp
+    && ename == "Rational"
+    && eargs.len() == 2
+    && let (Expr::Integer(n), Expr::Integer(d)) = (&eargs[0], &eargs[1])
+    && *d > 0
+  {
+    // Negative rational base: route through the shared negative-base rule so
+    // (-1/8)^(1/3) stays exact as (-1)^(1/3)/2 instead of going numeric.
+    if *p < 0 {
+      return negative_base_rational_power(&make_rational(-*p, *q), *n, *d);
+    }
+    // For a negative exponent, flip the base: (p/q)^(-n/d) = (q/p)^(n/d).
+    // Only do this flip when p > 0 so the flipped base is still a plain
+    // positive rational (handling signs of p is tricky and uncommon).
+    if *n < 0 && *p > 0 {
+      let flipped_base = make_rational(*q, *p);
+      let flipped_exp = make_rational(-*n, *d);
+      return power_two(&flipped_base, &flipped_exp);
+    }
+    // Positive rational exponent with p > 0 and n > 1: rewrite as
+    // ((p/q)^n)^(1/d). (p/q)^n is an exact rational, then raising to
+    // 1/d delegates to the Integer^Rational / Sqrt simplifier.
+    if *n > 1 && *p > 0 {
+      let base_to_n = power_two(base, &Expr::Integer(*n))?;
+      // Only recurse further if the integer power actually simplified
+      // down to a plain rational/integer (otherwise we risk recursion).
+      let simplified =
+        matches!(&base_to_n, Expr::Integer(_) | Expr::BigInteger(_))
+          || matches!(
+            &base_to_n,
+            Expr::FunctionCall { name, .. } if name == "Rational"
+          );
+      if simplified {
+        let one_over_d = make_rational(1, *d);
+        return power_two(&base_to_n, &one_over_d);
+      }
+    }
+    // n == 1 with d == 2: delegate to sqrt_ast for exact simplification.
+    if *n == 1 && *d == 2 && *p > 0 {
+      return crate::functions::sqrt_ast(std::slice::from_ref(base));
+    }
+    // n == 1 with d > 2 (e.g. (8/27)^(1/3)): try to extract the d-th root
+    // of the numerator and denominator separately. If both simplify to
+    // plain integers/rationals, the quotient is the exact answer;
+    // otherwise keep the expression unevaluated.
+    if *n == 1 && *d > 2 && *p > 0 {
+      let exp_1d = make_rational(1, *d);
+      let p_root = power_two(&Expr::Integer(*p), &exp_1d)?;
+      let q_root = power_two(&Expr::Integer(*q), &exp_1d)?;
+      let is_plain = |e: &Expr| -> bool {
+        matches!(e, Expr::Integer(_) | Expr::BigInteger(_))
+          || matches!(e,
+            Expr::FunctionCall { name, .. } if name == "Rational")
+      };
+      if is_plain(&p_root) && is_plain(&q_root) {
+        return divide_ast(&[p_root, q_root]);
+      }
+      return Ok(pow2(base.clone(), exp.clone()));
+    }
+  }
+
+  // Perfect rational root for an integer/BigInteger base, handling bases
+  // beyond i128: with gcd(numer, denom) == 1, b^(numer/denom) is an integer
+  // iff b is a perfect denom-th power r^denom, giving r^numer. Covers e.g.
+  // (10^60)^(1/2) = 10^30 and GeometricMean[{10^20, 10^20, 10^20}] = 10^20.
+  if let Expr::FunctionCall { name, args: rargs } = exp
+    && name == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(numer), Expr::Integer(denom)) = (&rargs[0], &rargs[1])
+    && *numer > 0
+    && *denom > 0
+    && *denom <= u32::MAX as i128
+    && *numer <= u32::MAX as i128
+  {
+    // b >= 0 so 0^(p/q) = 0 and 1^(p/q) = 1 are also simplified (nth_root(0)
+    // = 0 and nth_root(1) = 1 are perfect powers of themselves).
+    let bb_opt: Option<BigInt> = match base {
+      Expr::Integer(b) if *b >= 0 => Some(BigInt::from(*b)),
+      Expr::BigInteger(b) if *b >= BigInt::from(0) => Some(b.clone()),
+      _ => None,
+    };
+    if let Some(bb) = bb_opt {
+      let r = bb.nth_root(*denom as u32);
+      if r.pow(*denom as u32) == bb {
+        return Ok(bigint_to_expr(r.pow(*numer as u32)));
+      }
+    }
+  }
+
+  // Negative BigInteger base with a rational exponent: same sign-splitting
+  // rule as the Integer case below, for bases beyond i128.
+  if let Expr::BigInteger(b) = base
+    && *b < BigInt::from(0)
+    && let Expr::FunctionCall { name, args: rargs } = exp
+    && name == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(numer), Expr::Integer(denom)) = (&rargs[0], &rargs[1])
+    && *denom > 0
+  {
+    let magnitude = bigint_to_expr(-b.clone());
+    return negative_base_rational_power(&magnitude, *numer, *denom);
+  }
+
+  // Special case: Integer^Rational — keep symbolic unless result is exact integer
+  if let Expr::Integer(b) = base
+    && let Expr::FunctionCall { name, args: rargs } = exp
+    && name == "Rational"
+    && rargs.len() == 2
+    && let (Expr::Integer(numer), Expr::Integer(denom)) = (&rargs[0], &rargs[1])
+  {
+    // (Exact perfect-power roots are handled by the unified BigInt block
+    // above, before reaching here.)
+    // (-1)^(p/q) → simplify via simplify_neg1_rational_power
+    if *b == -1 {
+      return simplify_neg1_rational_power(*numer, *denom);
+    }
+    // Negative base (other than -1): (-n)^(p/q) = (-1)^(p/q) * n^(p/q),
+    // re-merged into the radicand where wolframscript keeps it merged.
+    if *b < -1 && *denom > 0 {
+      return negative_base_rational_power(&Expr::Integer(-*b), *numer, *denom);
+    }
+    // Handle negative rational exponents for integer bases: b^(-p/q) = 1 / b^(p/q)
+    // This allows the positive prime factorization code below to simplify the radical.
+    // Only applies when base is a positive integer (not symbolic expressions).
+    if *numer < 0 && *denom > 0 && *b > 1 {
+      let pos_exp = make_rational(-*numer, *denom);
+      let pos_result = power_two(base, &pos_exp)?;
+      // Only simplify if the positive power actually reduced
+      // (avoid infinite recursion when the positive power stays symbolic)
+      if !matches!(
+        &pos_result,
+        Expr::BinaryOp {
+          op: BinaryOperator::Power,
+          ..
+        }
+      ) && !matches!(&pos_result, Expr::FunctionCall { name, .. } if name == "Power")
+        && is_sqrt(&pos_result).is_none()
+      {
+        return divide_ast(&[Expr::Integer(1), pos_result]);
+      }
+      // A perfect-power base reduced to a single smaller power
+      // (`4^(1/3)` → `2^(2/3)`): the reciprocal is that power negated,
+      // `4^(-1/3)` → `2^(-2/3)`.
+      let (new_base, new_exp) = extract_base_exponent(&pos_result);
+      if let (Expr::Integer(nb), Expr::FunctionCall { name, args: ea }) =
+        (&new_base, &new_exp)
+        && *nb != *b
+        && name == "Rational"
+        && ea.len() == 2
+        && let (Expr::Integer(en), Expr::Integer(ed)) = (&ea[0], &ea[1])
+      {
+        return Ok(pow2(new_base.clone(), make_rational(-*en, *ed)));
+      }
+    }
+    // Simplify n^(p/q) by prime factorization
+    // n = p1^k1 * p2^k2 * ...
+    // n^(p/q) = product of p_i^(k_i*p/q)
+    // Each p_i^(k_i*p/q) = p_i^floor_i * p_i^(rem_i/q)
+    // The prime factorization of the base works in u64, so only run it when
+    // the base fits in u64 (perfect powers of larger bases are already handled
+    // exactly above). Casting a larger i128 to u64 truncates and corrupts the
+    // factorization (e.g. 2^90 as u64 == 0). The *exponent* stays i128 — a
+    // numerator past u64::MAX used to wrap, so `2^(29904177082838066039/10^18)`
+    // simplified as if the exponent were 11.457… instead of 29.904… — and the
+    // extracted integer part is a BigInt, because it outgrows i128 quickly
+    // (`2^(1000/7)` pulls out 2^142 and used to panic on overflow).
+    if *numer > 0 && *denom > 0 && *b > 0 && *b <= u64::MAX as i128 {
+      // Above this the extracted factor is too large to be worth
+      // materialising; the power stays symbolic instead.
+      const MAX_EXTRACTED_EXPONENT: i128 = 100_000;
+      let d = *denom;
+      let n = *numer;
+      let mut outside = BigInt::from(1);
+      // Collect (prime, remainder_exponent) pairs for the radical part
+      let mut radical_factors: Vec<(i128, i128)> = Vec::new();
+      let mut remaining = *b as u64;
+      let mut factor = 2u64;
+      let mut too_large = false;
+      let extract = |count: i128,
+                     prime: u64,
+                     outside: &mut BigInt,
+                     radical_factors: &mut Vec<(i128, i128)>|
+       -> bool {
+        let Some(total) = count.checked_mul(n) else {
+          return false;
+        };
+        let extracted = total / d;
+        let leftover = total % d;
+        if extracted > MAX_EXTRACTED_EXPONENT {
+          return false;
+        }
+        if extracted > 0 {
+          *outside *= BigInt::from(prime).pow(extracted as u32);
+        }
+        if leftover > 0 {
+          radical_factors.push((i128::from(prime), leftover));
+        }
+        true
+      };
+      // Trial division is bounded: a base whose remaining cofactor has no
+      // factor below this is left whole. `(10^19 - 1)^(1/19)` is
+      // 3^2 * 1111111111111111111, and grinding the second (prime) factor out
+      // by trial division takes ~3*10^9 steps for a result that is the same
+      // either way — a cofactor kept whole splits into the identical
+      // extracted and radical parts.
+      const TRIAL_DIVISION_BOUND: u64 = 1_000_000;
+      while factor <= TRIAL_DIVISION_BOUND && factor * factor <= remaining {
+        let mut count: i128 = 0;
+        while remaining.is_multiple_of(factor) {
+          remaining /= factor;
+          count += 1;
+        }
+        if count > 0
+          && !extract(count, factor, &mut outside, &mut radical_factors)
+        {
+          too_large = true;
+          break;
+        }
+        factor += 1;
+      }
+      if !too_large
+        && remaining > 1
+        && !extract(1, remaining, &mut outside, &mut radical_factors)
+      {
+        too_large = true;
+      }
+      if too_large {
+        return Ok(pow2(base.clone(), exp.clone()));
+      }
+
+      let has_radical = !radical_factors.is_empty();
+      let has_outside = outside > BigInt::from(1);
+
+      if !has_radical {
+        // Fully simplified
+        return Ok(bigint_to_expr(outside));
+      }
+
+      // Only simplify if we actually extracted something outside,
+      // OR the prime factors' reduced exponents differ.
+      // If all factors share the same reduced (leftover/d), splitting them
+      // and recombining would just reproduce the original (e.g. 6^(1/3)
+      // would loop as 2^(1/3)*3^(1/3) → 6^(1/3) → ...).
+      let mut reduced: Vec<(i128, i128)> = radical_factors
+        .iter()
+        .map(|(_, rem_exp)| rat_reduce(*rem_exp, d))
+        .collect();
+      reduced.sort_unstable();
+      reduced.dedup();
+      let all_same_reduced_exp = reduced.len() == 1;
+      if !has_outside && radical_factors.len() > 1 && all_same_reduced_exp {
+        // Every radical prime shares one reduced exponent rn/rd, so the radical
+        // part is ∏ p_i^(rn/rd) = (∏ p_i)^(rn/rd). When the combined base equals
+        // the original (e.g. squarefree `6^(1/3)` → `2^(1/3)*3^(1/3)` →
+        // `6^(1/3)`), keep the original to avoid an infinite simplification
+        // loop. When the original base was a perfect power its primes collapse
+        // to a smaller base (e.g. `100 = 2^2*5^2` → `10`), which IS a real
+        // simplification: `100^(1/3)` → `10^(2/3)`, `100^(1/4)` → `Sqrt[10]`.
+        let combined_base: i128 =
+          radical_factors.iter().map(|(p, _)| *p).product();
+        if combined_base == *b {
+          return Ok(pow2(base.clone(), exp.clone()));
+        }
+        let (rn, rd) = reduced[0];
+        if rn == 1 && rd == 2 {
+          return Ok(make_sqrt(Expr::Integer(combined_base)));
+        }
+        return Ok(pow2(Expr::Integer(combined_base), make_rational(rn, rd)));
+      }
+
+      // Build radical part: product of p_i^(rem_i/q)
+      let mut rad_parts: Vec<Expr> = Vec::new();
+      for (prime, rem_exp) in &radical_factors {
+        let (reduced_num, reduced_den) = rat_reduce(*rem_exp, d);
+        if reduced_den == 1 {
+          // Integer power
+          rad_parts
+            .push(bigint_to_expr(BigInt::from(*prime).pow(reduced_num as u32)));
+        } else if reduced_num == 1 && reduced_den == 2 {
+          rad_parts.push(make_sqrt(Expr::Integer(*prime)));
+        } else {
+          rad_parts.push(pow2(
+            Expr::Integer(*prime),
+            make_rational(reduced_num, reduced_den),
+          ));
+        }
+      }
+
+      // Combine: outside * rad_parts
+      let mut all_factors: Vec<Expr> = Vec::new();
+      if has_outside {
+        all_factors.push(bigint_to_expr(outside));
+      }
+      all_factors.extend(rad_parts);
+
+      if all_factors.len() == 1 {
+        return Ok(all_factors.remove(0));
+      }
+      return times_ast(&all_factors);
+    }
+
+    // Not exact — keep symbolic
+    return Ok(pow2(base.clone(), exp.clone()));
+  }
+
+  // Integer^Integer with non-negative exponent: use exact BigInt arithmetic
+  if let (Expr::Integer(b), Expr::Integer(e)) = (base, exp)
+    && *e >= 0
+  {
+    let base_big = BigInt::from(*b);
+    let result = num_traits::pow::pow(base_big, *e as usize);
+    return Ok(bigint_to_expr(result));
+  }
+
+  // BigInteger base with integer exponent
+  if let (Expr::BigInteger(b), Expr::Integer(e)) = (base, exp)
+    && *e >= 0
+  {
+    let result = num_traits::pow::pow(b.clone(), *e as usize);
+    return Ok(bigint_to_expr(result));
+  }
+
+  // An integer raised to a negative power is the exact reciprocal. Without
+  // this the call fell through to the f64 path, which held exactness only
+  // while the denominator fitted in an i128: `10^-50` came back as the
+  // machine real `1.*^-50`, and `10^-400` underflowed all the way to the
+  // integer `0`, making `10^-400 == 0` answer True.
+  {
+    let big_base = match base {
+      Expr::Integer(b) => Some(BigInt::from(*b)),
+      Expr::BigInteger(b) => Some(b.clone()),
+      _ => None,
+    };
+    if let (Some(b), Expr::Integer(e)) = (big_base, exp)
+      && *e < 0
+      && !num_traits::Zero::is_zero(&b)
+    {
+      let den = num_traits::pow::pow(b, e.unsigned_abs() as usize);
+      return Ok(make_rational_expr(&BigInt::from(1), &den));
+    }
+  }
+
+  // x^(1/2) → delegate to sqrt_ast for symbolic simplification
+  // This must come before the numeric evaluation to preserve exact results.
+  if is_half(exp) {
+    return crate::functions::sqrt_ast(std::slice::from_ref(base));
+  }
+
+  // A real-valued symbolic constant base (Pi, GoldenRatio, EulerGamma, …)
+  // raised to an inexact (machine-real) exponent numericizes under contagion,
+  // matching wolframscript (`Pi^0.5` = 1.7724…, `Pi^2.0` = 9.8696…). The numeric
+  // path below uses `expr_to_num`, which does not resolve named constants, so
+  // substitute the base's value here. E is handled by the exp/BigFloat paths.
+  if matches!(exp, Expr::Real(_))
+    && matches!(base, Expr::Constant(_) | Expr::Identifier(_))
+    && !matches!(base, Expr::Constant(c) if c == "E")
+    && let Some(bv) = try_eval_to_f64(base)
+  {
+    return power_two(&Expr::Real(bv), exp);
+  }
+
+  // If either operand is Real, result is Real (even if whole number)
+  let has_real = matches!(base, Expr::Real(_)) || matches!(exp, Expr::Real(_));
+
+  if let (Some(a), Some(b)) = (expr_to_num(base), expr_to_num(exp)) {
+    // A machine-real base with an exact Integer exponent must use
+    // wolframscript's multiplication chains rather than libm pow — the
+    // two round differently in the last ULP.
+    let result = if let (true, Expr::Integer(e)) = (has_real, exp) {
+      wolfram_powi(a, *e)
+    } else {
+      a.powf(b)
+    };
+    if result.is_nan() && a < 0.0 {
+      // Negative base with fractional exponent: use complex arithmetic
+      // (-x)^r = x^r * e^(i*pi*r) = x^r * (cos(pi*r) + i*sin(pi*r))
+      let pos_base = a.abs();
+      let magnitude = pos_base.powf(b);
+      let angle = std::f64::consts::PI * b;
+      let re = magnitude * angle.cos();
+      let im = magnitude * angle.sin();
+      // Round near-zero components to avoid floating-point noise
+      let re = if re.abs() < 1e-15 { 0.0 } else { re };
+      let im = if im.abs() < 1e-15 { 0.0 } else { im };
+      if im == 0.0 {
+        Ok(Expr::Real(re))
+      } else {
+        // Return re + im*I as a complex expression
+        let im_part = if im == 1.0 {
+          id_expr("I")
+        } else if im == -1.0 {
+          call("Times", vec![Expr::Integer(-1), id_expr("I")])
+        } else {
+          call("Times", vec![Expr::Real(im), id_expr("I")])
+        };
+        if re == 0.0 {
+          Ok(im_part)
+        } else {
+          Ok(call("Plus", vec![Expr::Real(re), im_part]))
+        }
+      }
+    } else if has_real {
+      Ok(Expr::Real(result))
+    } else {
+      // Both were integers - use num_to_expr to get Integer when result is whole
+      Ok(num_to_expr(result))
+    }
+  } else {
+    // Exact Integer exponent on a complex float: wolframscript uses the
+    // same multiplication chains as for real bases (and a scaled fused
+    // reciprocal for negative exponents), which the log/exp path below
+    // misses by a ULP.
+    if let Expr::Integer(n) = exp
+      && *n != 0
+      && *n != 1
+      && let Some((a, b)) = try_extract_complex_float(base)
+      && b != 0.0
+      && contains_real(base)
+    {
+      let (re, im) = wolfram_powi_complex(a, b, *n);
+      return Ok(build_complex_float_expr(re, im));
+    }
+    // Try complex float evaluation: z^w = exp(w * log(z))
+    // Only apply when at least one operand contains an actual Real (float),
+    // to avoid prematurely converting exact symbolic forms like E^(I*Pi/3).
+    if let (Some((a, b)), Some((c, d))) = (
+      try_extract_complex_float(base),
+      try_extract_complex_float(exp),
+    ) && (b != 0.0
+      || d != 0.0
+      || contains_imaginary_unit(base)
+      || contains_imaginary_unit(exp))
+      && (contains_real(base) || contains_real(exp))
+    {
+      // log(z) = ln|z| + i*arg(z)
+      let abs_z = (a * a + b * b).sqrt();
+      if abs_z == 0.0 {
+        // 0^w with complex w: return 0 if Re(w)>0, else Indeterminate
+        return if c > 0.0 {
+          Ok(Expr::Integer(0))
+        } else {
+          Ok(id_expr("Indeterminate"))
+        };
+      }
+      let ln_abs = abs_z.ln();
+      let arg_z = b.atan2(a);
+      // w * log(z) = (c + di)(ln|z| + i*arg(z))
+      //            = (c*ln|z| - d*arg(z)) + i*(d*ln|z| + c*arg(z))
+      let re_exp = c * ln_abs - d * arg_z;
+      let im_exp = d * ln_abs + c * arg_z;
+      // exp(re_exp + i*im_exp) = e^re_exp * (cos(im_exp) + i*sin(im_exp))
+      let mag = re_exp.exp();
+      let re = mag * im_exp.cos();
+      let im = mag * im_exp.sin();
+      // Round near-zero components to avoid floating-point noise
+      let re = if re.abs() < 1e-15 { 0.0 } else { re };
+      let im = if im.abs() < 1e-15 { 0.0 } else { im };
+      return Ok(build_complex_float_expr(re, im));
+    }
+    Ok(pow2(base.clone(), exp.clone()))
+  }
+}
+
+/// Numeric payload of an `Around`: the central value together with the
+/// downward/upward uncertainties. A symmetric `Around[v, d]` has
+/// `minus == plus`; the asymmetric `Around[v, {δ₋, δ₊}]` form sets `asym` so
+/// propagated results stay in list form.
+struct AroundNum {
+  value: f64,
+  minus: f64,
+  plus: f64,
+  asym: bool,
+}
+
+fn as_around(e: &Expr) -> Option<AroundNum> {
+  let Expr::FunctionCall { name, args } = e else {
+    return None;
+  };
+  if name != "Around" || args.len() != 2 {
+    return None;
+  }
+  let value = around_literal(&args[0])?;
+  match &args[1] {
+    Expr::List(items) if items.len() == 2 => {
+      let minus = around_literal(&items[0])?;
+      let plus = around_literal(&items[1])?;
+      Some(AroundNum {
+        value,
+        minus,
+        plus,
+        asym: true,
+      })
+    }
+    d => {
+      let d = around_literal(d)?;
+      Some(AroundNum {
+        value,
+        minus: d,
+        plus: d,
+        asym: false,
+      })
+    }
+  }
+}
+
+/// f64 value of a literal number (Integer/Real/Rational), excluding symbolic
+/// constants like Pi so they don't get numerically folded into an Around.
+fn around_literal(e: &Expr) -> Option<f64> {
+  match e {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(n), Expr::Integer(d)) if *d != 0 => {
+          Some(*n as f64 / *d as f64)
+        }
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+fn make_around(value: f64, uncertainty: f64) -> Expr {
+  // A zero uncertainty collapses to the bare value (matching wolframscript,
+  // e.g. Cos[Around[0, 0.1]] -> 1. since the propagated uncertainty is 0).
+  if uncertainty == 0.0 {
+    return Expr::Real(value);
+  }
+  call("Around", vec![Expr::Real(value), Expr::Real(uncertainty)])
+}
+
+/// Assemble a propagated result: list-form uncertainty iff any input was
+/// asymmetric, and a vanishing uncertainty collapses to the bare value.
+fn make_around_general(value: f64, minus: f64, plus: f64, asym: bool) -> Expr {
+  if !asym {
+    return make_around(value, minus);
+  }
+  if minus == 0.0 && plus == 0.0 {
+    return Expr::Real(value);
+  }
+  call(
+    "Around",
+    vec![
+      Expr::Real(value),
+      Expr::List(vec![Expr::Real(minus), Expr::Real(plus)].into()),
+    ],
+  )
+}
+
+/// Contribution of one argument to the (minus, plus) sides of a result,
+/// through the partial derivative `c`: a positive coefficient keeps the
+/// sides aligned, a negative one swaps them (the value's downward excursion
+/// pushes the result upward).
+fn side_contributions(c: f64, a: &AroundNum) -> (f64, f64) {
+  if c >= 0.0 {
+    (c * a.minus, c * a.plus)
+  } else {
+    (-c * a.plus, -c * a.minus)
+  }
+}
+
+/// Around[a, δa] + Around[b, δb] + c = Around[a+b+c, Sqrt[δa²+δb²]] —
+/// first-order error propagation treating each Around as independent. Returns
+/// None unless at least one argument is an Around and every other argument is a
+/// literal number (a symbolic term leaves the sum unevaluated).
+fn try_around_plus(args: &[Expr]) -> Option<Expr> {
+  if !args.iter().any(|a| as_around(a).is_some()) {
+    return None;
+  }
+  let mut value = 0.0;
+  let mut var_minus = 0.0;
+  let mut var_plus = 0.0;
+  let mut asym = false;
+  for a in args {
+    if let Some(ar) = as_around(a) {
+      value += ar.value;
+      var_minus += ar.minus * ar.minus;
+      var_plus += ar.plus * ar.plus;
+      asym |= ar.asym;
+    } else {
+      value += around_literal(a)?;
+    }
+  }
+  Some(make_around_general(
+    value,
+    var_minus.sqrt(),
+    var_plus.sqrt(),
+    asym,
+  ))
+}
+
+/// Product of Around values and literal scalars, with the absolute partial
+/// uncertainties added in quadrature: Sqrt[Σ ((Π/a_i)·δ_i)²]. Computing the
+/// absolute partials (rather than scaling a relative sum) keeps the float
+/// result aligned with wolframscript, e.g. Around[5,1]*Around[3,1] gives
+/// exactly Sqrt[34].
+fn try_around_times(args: &[Expr]) -> Option<Expr> {
+  if !args.iter().any(|a| as_around(a).is_some()) {
+    return None;
+  }
+  let mut value = 1.0;
+  let mut arounds: Vec<AroundNum> = Vec::new();
+  let mut asym = false;
+  for a in args {
+    if let Some(ar) = as_around(a) {
+      if ar.value == 0.0 {
+        return None; // partial (Π/a_i) undefined at 0
+      }
+      value *= ar.value;
+      asym |= ar.asym;
+      arounds.push(ar);
+    } else {
+      value *= around_literal(a)?;
+    }
+  }
+  let mut var_minus = 0.0;
+  let mut var_plus = 0.0;
+  for ar in &arounds {
+    let (m, p) = side_contributions(value / ar.value, ar);
+    var_minus += m * m;
+    var_plus += p * p;
+  }
+  Some(make_around_general(
+    value,
+    var_minus.sqrt(),
+    var_plus.sqrt(),
+    asym,
+  ))
+}
+
+/// Around[a, δ]^n = Around[a^n, |n·a^(n-1)|·δ] for a literal exponent n.
+/// Unlike Plus/Times, wolframscript does not swap the asymmetric sides for a
+/// negative derivative here — it scales both sides by the absolute partial and
+/// keeps their `{minus, plus}` order.
+fn try_around_power(base: &Expr, exp: &Expr) -> Option<Expr> {
+  let ar = as_around(base)?;
+  let n = around_literal(exp)?;
+  let value = ar.value.powf(n);
+  let c = (n * ar.value.powf(n - 1.0)).abs();
+  let (m, p) = (c * ar.minus, c * ar.plus);
+  if !value.is_finite() || !m.is_finite() || !p.is_finite() {
+    return None;
+  }
+  Some(make_around_general(value, m, p, ar.asym))
+}
+
+/// (f(a), f'(a)) for an elementary unary function, used to propagate an
+/// Around through it. None for functions without a smooth real derivative here.
+fn around_func_and_deriv(name: &str, a: f64) -> Option<(f64, f64)> {
+  let v = match name {
+    // |a| with derivative Sign(a); at a == 0 the slope is 0 (Sign[0] == 0), so
+    // the uncertainty collapses: Abs[Around[0, δ]] -> Around[0, 0].
+    "Abs" | "RealAbs" => (a.abs(), if a == 0.0 { 0.0 } else { a.signum() }),
+    "Sqrt" => (a.sqrt(), 0.5 / a.sqrt()),
+    "Exp" => (a.exp(), a.exp()),
+    "Log" => (a.ln(), 1.0 / a),
+    "Sin" => (a.sin(), a.cos()),
+    "Cos" => (a.cos(), -a.sin()),
+    "Tan" => (a.tan(), 1.0 / (a.cos() * a.cos())),
+    "Cot" => (1.0 / a.tan(), -1.0 / (a.sin() * a.sin())),
+    "Sinh" => (a.sinh(), a.cosh()),
+    "Cosh" => (a.cosh(), a.sinh()),
+    "Tanh" => (a.tanh(), 1.0 - a.tanh() * a.tanh()),
+    "ArcSin" => (a.asin(), 1.0 / (1.0 - a * a).sqrt()),
+    "ArcCos" => (a.acos(), -1.0 / (1.0 - a * a).sqrt()),
+    "ArcTan" => (a.atan(), 1.0 / (1.0 + a * a)),
+    "ArcSinh" => (a.asinh(), 1.0 / (a * a + 1.0).sqrt()),
+    "ArcCosh" => (a.acosh(), 1.0 / (a * a - 1.0).sqrt()),
+    "ArcTanh" => (a.atanh(), 1.0 / (1.0 - a * a)),
+    _ => return None,
+  };
+  Some(v)
+}
+
+/// f[Around[a, δ]] = Around[f(a), |f'(a)|·δ] for an elementary unary f.
+/// Returns None unless `args` is a single Around and `name` is supported, so
+/// normal dispatch handles everything else.
+pub fn try_around_unary(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  if args.len() != 1 {
+    return None;
+  }
+  let ar = as_around(&args[0])?;
+  let (fa, fpa) = around_func_and_deriv(name, ar.value)?;
+  if !fa.is_finite() || !fpa.is_finite() {
+    return None;
+  }
+  let (m, p) = side_contributions(fpa, &ar);
+  Some(Ok(make_around_general(fa, m, p, ar.asym)))
+}
+
+/// Structurally complex: the expression mentions the imaginary unit, even
+/// when its numeric imaginary part works out to `0.` (as in `0.5 + 0.*I`).
+/// Such operands must still numericize in the complex power path of
+/// `power_two` — the zero imaginary part alone is no reason to leave
+/// `E^(0.5 + 0.*I)` symbolic.
+fn contains_imaginary_unit(e: &Expr) -> bool {
+  match e {
+    Expr::Identifier(name) => name == "I",
+    Expr::BinaryOp { left, right, .. } => {
+      contains_imaginary_unit(left) || contains_imaginary_unit(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_imaginary_unit(operand),
+    Expr::FunctionCall { args, .. } | Expr::List(args) => {
+      args.iter().any(contains_imaginary_unit)
+    }
+    _ => false,
+  }
+}
+
+/// Try to extract rational coefficient k = numer/denom from an expression
+/// of the form `k * I * Pi`.
+///
+/// Recognizes these internal forms:
+/// - `Times[I, Pi]`              → k = 1/1
+/// - `Times[n, I, Pi]`           → k = n/1
+/// - `Times[Rational[p,q], I, Pi]` → k = p/q
+/// - `Times[k, Times[I, Pi]]`    → recursive
+/// - `Times[-1, I, Pi]`          → k = -1/1
+fn try_extract_i_pi_rational_multiple(expr: &Expr) -> Option<(i128, i128)> {
+  // Flatten nested Times so that left-associative parses such as
+  // `2 Pi I` → Times[Times[2, Pi], I] are handled the same as the already-
+  // flattened `2 I Pi` → Times[Complex[0, 2], Pi].
+  fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for a in args {
+          flatten(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        flatten(left, out);
+        flatten(right, out);
+      }
+      _ => out.push(e),
+    }
+  }
+  let is_times = matches!(expr, Expr::FunctionCall { name, .. } if name == "Times")
+    || matches!(
+      expr,
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        ..
+      }
+    );
+  if !is_times {
+    return None;
+  }
+  let mut factors: Vec<&Expr> = Vec::new();
+  flatten(expr, &mut factors);
+
+  let mut has_i = false;
+  let mut has_pi = false;
+  // Coefficients accumulate by multiplication so the factor order doesn't
+  // matter and a numeric coefficient can ride alongside a Complex `I` factor.
+  let mut coeff_numer: i128 = 1;
+  let mut coeff_denom: i128 = 1;
+
+  for factor in &factors {
+    match factor {
+      Expr::Identifier(s) if s == "I" => {
+        if has_i {
+          return None;
+        } // Two I factors
+        has_i = true;
+      }
+      // Pi may arrive as either a Constant or an Identifier depending on the
+      // parse order (e.g. `2 I Pi` stores Constant("Pi") but `2 Pi I` stores
+      // Identifier("Pi")); accept both spellings.
+      Expr::Constant(s) | Expr::Identifier(s) if s == "Pi" => {
+        if has_pi {
+          return None;
+        } // Two Pi factors
+        has_pi = true;
+      }
+      Expr::Integer(n) => {
+        coeff_numer *= n;
+      }
+      Expr::FunctionCall { name, args }
+        if name == "Rational"
+          && args.len() == 2
+          && matches!(&args[0], Expr::Integer(_))
+          && matches!(&args[1], Expr::Integer(_)) =>
+      {
+        if let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1]) {
+          coeff_numer *= *p;
+          coeff_denom *= *q;
+        }
+      }
+      // Pure imaginary `Complex[0, b] = b*I`. Woxi folds an integer coefficient
+      // of I into a Complex atom (e.g. `2 I` → Complex[0, 2]), so `2 Pi I`
+      // arrives as Times[Complex[0, 2], Pi] with no standalone I factor.
+      Expr::FunctionCall { name, args }
+        if name == "Complex"
+          && args.len() == 2
+          && matches!(&args[0], Expr::Integer(0)) =>
+      {
+        if has_i {
+          return None;
+        }
+        has_i = true;
+        match &args[1] {
+          Expr::Integer(n) => coeff_numer *= *n,
+          Expr::FunctionCall { name: rn, args: ra }
+            if rn == "Rational" && ra.len() == 2 =>
+          {
+            if let (Expr::Integer(p), Expr::Integer(q)) = (&ra[0], &ra[1]) {
+              coeff_numer *= *p;
+              coeff_denom *= *q;
+            } else {
+              return None;
+            }
+          }
+          _ => return None,
+        }
+      }
+      // Nested Times (e.g., Times[Rational[2,3], Times[I, Pi]])
+      nested => {
+        if let Some((n, d)) = try_extract_i_pi_rational_multiple(nested) {
+          if has_i || has_pi {
+            return None;
+          }
+          has_i = true;
+          has_pi = true;
+          coeff_numer *= n;
+          coeff_denom *= d;
+        } else {
+          return None; // Unknown factor
+        }
+      }
+    }
+  }
+
+  if has_i && has_pi {
+    Some((coeff_numer, coeff_denom))
+  } else {
+    None
+  }
+}
+
+/// Simplify (-1)^(p/q) where p and q are integers.
+/// Reduces p mod 2q to the canonical range, then builds the expression.
+fn simplify_neg1_rational_power(
+  p: i128,
+  q: i128,
+) -> Result<Expr, InterpreterError> {
+  let (mut p, q) = rat_reduce(p, q);
+  // Reduce p mod 2q to canonical range [0, 2q)
+  let period = 2 * q;
+  p = ((p % period) + period) % period;
+
+  // (-1)^0 = 1
+  if p == 0 {
+    return Ok(Expr::Integer(1));
+  }
+  // (-1)^1 = -1
+  if p == q {
+    return Ok(Expr::Integer(-1));
+  }
+  // If p > q, factor out (-1)^1 = -1: (-1)^(p/q) = -(-1)^((p-q)/q).
+  // The remainder goes back through this function so that a half-integer
+  // leftover still collapses to I, e.g. (-1)^(3/2) = -I rather than
+  // -Sqrt[-1].
+  if p > q {
+    let inner = simplify_neg1_rational_power(p - q, q)?;
+    return Ok(negate_expr(inner));
+  }
+  // (-1)^(1/2) = I
+  if p == 1 && q == 2 {
+    return Ok(id_expr("I"));
+  }
+  // 0 < p < q: return (-1)^(p/q)
+  Ok(pow(Expr::Integer(-1), make_rational(p, q)))
+}
+
+/// Numerator and denominator of a `Rational[p, q]` expression.
+fn rational_parts(expr: &Expr) -> Option<(i128, i128)> {
+  match expr {
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(p), Expr::Integer(q)) => Some((*p, *q)),
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Magnitude of a negative exact number, or `None` when the expression is not
+/// a negative Integer/BigInteger/Rational.
+fn negative_number_magnitude(expr: &Expr) -> Option<Expr> {
+  match expr {
+    Expr::Integer(n) if *n < 0 => Some(Expr::Integer(-*n)),
+    Expr::BigInteger(n) if *n < BigInt::from(0) => {
+      Some(bigint_to_expr(-n.clone()))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Rational"
+        && args.len() == 2
+        && matches!(&args[0], Expr::Integer(n) if *n < 0) =>
+    {
+      let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) else {
+        return None;
+      };
+      Some(make_rational(-*n, *d))
+    }
+    _ => None,
+  }
+}
+
+/// Canonical form of `(-m)^(p/q)` for a positive `magnitude`.
+///
+/// wolframscript splits the sign off as `(-1)^(p/q)` and then lets the
+/// equal-exponent radical merge fold it back into the radicand. Both steps
+/// happen here so that the two rules cannot bounce an expression between each
+/// other forever: `(-2)^(1/3)` stays put, `(-8)^(1/3)` becomes
+/// `2 (-1)^(1/3)` because the positive part is exact, `(-12)^(1/3)` becomes
+/// `(-3)^(1/3) 2^(2/3)` because only the leftover cube root can absorb the
+/// sign, and `(-2)^(5/3)` becomes `-2 (-2)^(2/3)`.
+fn negative_base_rational_power(
+  magnitude: &Expr,
+  p: i128,
+  q: i128,
+) -> Result<Expr, InterpreterError> {
+  fn flatten(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+      Expr::FunctionCall { name, args } if name == "Times" => {
+        for a in args {
+          flatten(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        flatten(left, out);
+        flatten(right, out);
+      }
+      other => out.push(other.clone()),
+    }
+  }
+
+  let (p, q) = rat_reduce(p, q);
+  if q == 1 {
+    let negated = negate_expr(magnitude.clone());
+    return power_two(&negated, &Expr::Integer(p));
+  }
+  // (-1)^(p/q) = outer * (-1)^(rp/rq) with 0 <= rp/rq < 1.
+  let period = 2 * q;
+  let mut pn = ((p % period) + period) % period;
+  let mut outer = 1i128;
+  if pn >= q {
+    pn -= q;
+    outer = -1;
+  }
+  let (rp, rq) = rat_reduce(pn, q);
+
+  let pos_part = power_two(magnitude, &make_rational(p, q))?;
+  let mut factors = Vec::new();
+  flatten(&pos_part, &mut factors);
+
+  if rp != 0 {
+    if rq == 2 {
+      // (-1)^(1/2) is I, which never merges into a radicand.
+      factors.push(id_expr("I"));
+    } else {
+      let root_exp = make_rational(rp, rq);
+      let root_key = expr_to_string(&root_exp);
+      let mut merged = false;
+      for factor in &mut factors {
+        let (fbase, fexp) = extract_base_exponent(factor);
+        let positive_int = match &fbase {
+          Expr::Integer(n) => *n > 1,
+          Expr::BigInteger(n) => *n > BigInt::from(1),
+          _ => false,
+        };
+        if positive_int && expr_to_string(&fexp) == root_key {
+          *factor = pow(negate_expr(fbase), root_exp.clone());
+          merged = true;
+          break;
+        }
+      }
+      if !merged {
+        factors.push(pow(Expr::Integer(-1), root_exp));
+      }
+    }
+  }
+  if outer < 0 {
+    factors.insert(0, Expr::Integer(-1));
+  }
+  match factors.len() {
+    0 => Ok(Expr::Integer(1)),
+    1 => Ok(factors.remove(0)),
+    _ => times_ast(&factors),
+  }
+}
+
+/// Thread a binary operation over lists
+fn thread_binary_over_lists<F>(
+  args: &[Expr],
+  op: F,
+) -> Result<Expr, InterpreterError>
+where
+  F: Fn(&Expr, &Expr) -> Result<Expr, InterpreterError>,
+{
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Binary operation expects 2 arguments".into(),
+    ));
+  }
+
+  match (&args[0], &args[1]) {
+    (Expr::List(left), Expr::List(right)) => {
+      // List + List: element-wise operation
+      if left.len() != right.len() {
+        return Err(InterpreterError::EvaluationError(
+          "Lists must have the same length".into(),
+        ));
+      }
+      let results: Result<Vec<Expr>, _> = left
+        .iter()
+        .zip(right.iter())
+        .map(|(l, r)| op(l, r))
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    (Expr::List(items), scalar) => {
+      // List + scalar: broadcast scalar
+      let results: Result<Vec<Expr>, _> =
+        items.iter().map(|item| op(item, scalar)).collect();
+      Ok(Expr::List(results?.into()))
+    }
+    (scalar, Expr::List(items)) => {
+      // scalar + List: broadcast scalar
+      let results: Result<Vec<Expr>, _> =
+        items.iter().map(|item| op(scalar, item)).collect();
+      Ok(Expr::List(results?.into()))
+    }
+    _ => op(&args[0], &args[1]),
+  }
+}
+
+/// Subtract[a, b] - Returns a - b
+pub fn subtract_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("Subtract", args));
+  }
+  // Subtract[a, b] = a + (-1 * b)
+  if let Some(result) =
+    crate::evaluator::expand_arith_shorthand("Subtract", args)
+  {
+    return result;
+  }
+  let negated_b = times_ast(&[Expr::Integer(-1), args[1].clone()])?;
+  plus_ast(&[args[0].clone(), negated_b])
+}
+
+/// Recursively flatten all List arguments for Max/Min
+fn flatten_lists(args: &[Expr]) -> Vec<&Expr> {
+  let mut result = Vec::new();
+  for arg in args {
+    match arg {
+      Expr::List(items) => result.extend(flatten_lists(items)),
+      Expr::Association(pairs) => {
+        for (_, v) in pairs {
+          result.push(v);
+        }
+      }
+      _ => result.push(arg),
+    }
+  }
+  result
+}
+
+/// Like try_eval_to_f64 but also handles Infinity/-Infinity (for Max/Min)
+pub fn try_eval_to_f64_with_infinity(expr: &Expr) -> Option<f64> {
+  // Check by string representation for Infinity forms
+  let s = expr_to_string(expr);
+  if s == "Infinity" {
+    return Some(f64::INFINITY);
+  }
+  if s == "-Infinity" {
+    return Some(f64::NEG_INFINITY);
+  }
+  try_eval_to_f64(expr)
+}
+
+/// Max[args...] or Max[list] - Maximum value
+/// If any argument is a SparseArray, return the argument list with every
+/// SparseArray replaced by its dense form (so Max/Min compare over the
+/// expanded elements). Returns `None` when no argument is a SparseArray.
+fn densify_sparse_args(args: &[Expr]) -> Option<Vec<Expr>> {
+  if !args.iter().any(
+    |a| matches!(a, Expr::FunctionCall { name, .. } if name == "SparseArray"),
+  ) {
+    return None;
+  }
+  let mut out = Vec::with_capacity(args.len());
+  let mut changed = false;
+  for a in args {
+    match crate::functions::list_helpers_ast::densify_sparse_array(a) {
+      Some(dense) => {
+        out.push(dense);
+        changed = true;
+      }
+      None => out.push(a.clone()),
+    }
+  }
+  changed.then_some(out)
+}
+
+/// Is `expr` `Indeterminate`, or a list containing it at any depth?
+fn contains_indeterminate(expr: &Expr) -> bool {
+  match expr {
+    Expr::Identifier(s) | Expr::Constant(s) => s == "Indeterminate",
+    Expr::List(items) => items.iter().any(contains_indeterminate),
+    _ => false,
+  }
+}
+
+pub fn max_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // An Indeterminate argument (at any depth, since lists are flattened)
+  // makes the extremum Indeterminate: it cannot be ordered against anything.
+  if args.iter().any(contains_indeterminate) {
+    return Ok(id_expr("Indeterminate"));
+  }
+  if args.is_empty() {
+    return Ok(id_expr("-Infinity"));
+  }
+
+  // Any SparseArray argument is compared over its dense elements.
+  if let Some(dense) = densify_sparse_args(args) {
+    return max_ast(&dense);
+  }
+
+  // Handle Interval in Max
+  if let Some(result) = crate::functions::interval_ast::try_interval_max(args) {
+    return result;
+  }
+
+  // Flatten all nested lists
+  let items = flatten_lists(args);
+  if items.is_empty() {
+    return Ok(id_expr("-Infinity"));
+  }
+
+  // All-Quantity case: compare magnitudes after unit conversion and return the
+  // larger quantity in its original unit.
+  if let Some(result) =
+    crate::functions::quantity_ast::try_quantity_extreme(&items, true)
+  {
+    return Ok(result);
+  }
+
+  // Separate numeric and symbolic arguments
+  let mut best_val: Option<f64> = None;
+  let mut best_expr: Option<&Expr> = None;
+  let mut symbolic: Vec<Expr> = Vec::new();
+  for item in &items {
+    if let Some(n) = try_eval_to_f64_with_infinity(item) {
+      match best_val {
+        Some(m) if n > m => {
+          best_val = Some(n);
+          best_expr = Some(item);
+        }
+        None => {
+          best_val = Some(n);
+          best_expr = Some(item);
+        }
+        _ => {}
+      }
+    } else {
+      symbolic.push((*item).clone());
+    }
+  }
+
+  // Max is idempotent: Max[a, a] == a. Drop duplicate symbolic arguments
+  // (numeric duplicates already collapse into the single best value).
+  {
+    let mut seen = std::collections::HashSet::new();
+    symbolic.retain(|e| seen.insert(expr_to_string(e)));
+  }
+
+  if symbolic.is_empty() {
+    // All numeric
+    match best_expr {
+      Some(expr) => Ok((*expr).clone()),
+      None => Ok(num_to_expr(f64::NEG_INFINITY)),
+    }
+  } else {
+    // Mixed: keep max numeric and all symbolic args
+    let mut result_args: Vec<Expr> = Vec::new();
+    if let Some(expr) = best_expr {
+      result_args.push((*expr).clone());
+    }
+    result_args.extend(symbolic);
+    if result_args.len() == 1 {
+      Ok(result_args.remove(0))
+    } else {
+      Ok(call("Max", result_args))
+    }
+  }
+}
+
+/// Min[args...] or Min[list] - Minimum value
+pub fn min_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // An Indeterminate argument (at any depth, since lists are flattened)
+  // makes the extremum Indeterminate: it cannot be ordered against anything.
+  if args.iter().any(contains_indeterminate) {
+    return Ok(id_expr("Indeterminate"));
+  }
+  if args.is_empty() {
+    return Ok(id_expr("Infinity"));
+  }
+
+  // Any SparseArray argument is compared over its dense elements.
+  if let Some(dense) = densify_sparse_args(args) {
+    return min_ast(&dense);
+  }
+
+  // Handle Interval in Min
+  if let Some(result) = crate::functions::interval_ast::try_interval_min(args) {
+    return result;
+  }
+
+  // Flatten all nested lists
+  let items = flatten_lists(args);
+  if items.is_empty() {
+    return Ok(id_expr("Infinity"));
+  }
+
+  // All-Quantity case: compare magnitudes after unit conversion and return the
+  // smaller quantity in its original unit.
+  if let Some(result) =
+    crate::functions::quantity_ast::try_quantity_extreme(&items, false)
+  {
+    return Ok(result);
+  }
+
+  // Separate numeric and symbolic arguments
+  let mut best_val: Option<f64> = None;
+  let mut best_expr: Option<&Expr> = None;
+  let mut symbolic: Vec<Expr> = Vec::new();
+  for item in &items {
+    if let Some(n) = try_eval_to_f64_with_infinity(item) {
+      match best_val {
+        Some(m) if n < m => {
+          best_val = Some(n);
+          best_expr = Some(item);
+        }
+        None => {
+          best_val = Some(n);
+          best_expr = Some(item);
+        }
+        _ => {}
+      }
+    } else {
+      symbolic.push((*item).clone());
+    }
+  }
+
+  // Min is idempotent: Min[a, a] == a. Drop duplicate symbolic arguments.
+  {
+    let mut seen = std::collections::HashSet::new();
+    symbolic.retain(|e| seen.insert(expr_to_string(e)));
+  }
+
+  if symbolic.is_empty() {
+    // All numeric
+    match best_expr {
+      Some(expr) => Ok((*expr).clone()),
+      None => Ok(num_to_expr(f64::INFINITY)),
+    }
+  } else {
+    // Mixed: keep min numeric and all symbolic args
+    let mut result_args: Vec<Expr> = Vec::new();
+    if let Some(expr) = best_expr {
+      result_args.push((*expr).clone());
+    }
+    result_args.extend(symbolic);
+    if result_args.len() == 1 {
+      Ok(result_args.remove(0))
+    } else {
+      Ok(call("Min", result_args))
+    }
+  }
+}
+
+/// Sum BigFloat (precision-tagged) numbers with precision tracking.
+/// Handles BigFloat + BigFloat and BigFloat + Integer/Rational.
+fn bigfloat_plus(args: &[Expr]) -> Expr {
+  // Extract (f64_value, precision) for each argument
+  // BigFloat: use stored precision; Integer/Rational: infinite precision
+  let mut sum_val: f64 = 0.0;
+  let mut sum_error: f64 = 0.0;
+
+  for arg in args {
+    match arg {
+      Expr::BigFloat(digits, prec) => {
+        let v: f64 = digits.parse().unwrap_or(0.0);
+        let p = *prec;
+        sum_val += v;
+        sum_error += v.abs() * 10f64.powf(-p);
+      }
+      Expr::Integer(n) => {
+        sum_val += *n as f64;
+        // Integer has infinite precision, contributes 0 error
+      }
+      Expr::FunctionCall { name, args: rargs }
+        if name == "Rational" && rargs.len() == 2 =>
+      {
+        if let (Expr::Integer(n), Expr::Integer(d)) = (&rargs[0], &rargs[1]) {
+          sum_val += *n as f64 / *d as f64;
+        }
+      }
+      _ => {}
+    }
+  }
+
+  // Compute result precision
+  let result_prec: f64 = if sum_val.abs() < 1e-300 || sum_error <= 0.0 {
+    // Fallback: use min finite precision among BigFloat args
+    args
+      .iter()
+      .filter_map(|a| {
+        if let Expr::BigFloat(_, p) = a {
+          Some(*p)
+        } else {
+          None
+        }
+      })
+      .fold(None, |acc: Option<f64>, p| {
+        Some(acc.map_or(p, |a: f64| a.min(p)))
+      })
+      .unwrap_or(1.0)
+  } else {
+    let p = sum_val.abs().log10() - sum_error.log10();
+    p.max(1.0)
+  };
+
+  // Compute the value itself. When every summand can be evaluated to an
+  // astro-float BigFloat (numeric literals, exact constants), sum in
+  // arbitrary precision so digits past the machine-double limit are correct
+  // (e.g. N[Pi,30] - 3 keeps ~28 accurate digits, not just 16). Otherwise fall
+  // back to the f64 approximation.
+  if args.iter().all(is_bigfloat_evaluable_factor) {
+    use astro_float::{BigFloat, Consts, RoundingMode};
+    let rm = RoundingMode::ToEven;
+    // Use enough bits to represent the least-precise summand's digits with
+    // margin, and at least the result precision.
+    let max_prec = args
+      .iter()
+      .filter_map(|a| {
+        if let Expr::BigFloat(_, p) = a {
+          Some(*p)
+        } else {
+          None
+        }
+      })
+      .fold(0.0f64, f64::max)
+      .max(result_prec);
+    let bits = nominal_bits(max_prec.ceil() as usize);
+    if let Ok(mut cc) = Consts::new() {
+      let mut sum = BigFloat::from_i32(0, bits);
+      let mut ok = true;
+      for arg in args {
+        if let Ok(v) = expr_to_bigfloat(arg, bits, rm, &mut cc) {
+          sum = sum.add(&v, bits, rm);
+        } else {
+          ok = false;
+          break;
+        }
+      }
+      if ok {
+        let max_fraction_digits =
+          ((bits as f64 + 1.0) * std::f64::consts::LOG10_2).floor() as usize;
+        if let Ok(s) =
+          bigfloat_to_string(&sum, Some(max_fraction_digits), rm, &mut cc)
+        {
+          return Expr::BigFloat(s, result_prec);
+        }
+      }
+    }
+  }
+
+  // Fallback: format the f64 approximation to the result precision.
+  let display_prec = (result_prec.round() as usize).max(1);
+  let result_str = format_bigfloat_value(sum_val, display_prec);
+  Expr::BigFloat(result_str, result_prec)
+}
+
+/// True if `e` can be evaluated to an `astro_float::BigFloat` via
+/// [`expr_to_bigfloat`] for use in [`bigfloat_times`]. Mirrors the input
+/// shapes that `expr_to_bigfloat` accepts: numeric literals, the math
+/// constants Wolfram tracks at arbitrary precision, and a sign-only
+/// `UnaryOp::Minus` wrapper.
+fn is_bigfloat_evaluable_factor(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => true,
+    Expr::BigFloat(_, _) => true,
+    Expr::Constant(name) => {
+      matches!(name.as_str(), "Pi" | "-Pi" | "E" | "Degree")
+    }
+    Expr::Identifier(name) => matches!(
+      name.as_str(),
+      "GoldenRatio" | "EulerGamma" | "Catalan" | "Glaisher" | "Khinchin"
+    ),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      args.iter().all(is_bigfloat_evaluable_factor)
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      is_bigfloat_evaluable_factor(&args[0])
+        && bigfloat_int_exponent(&args[1]).is_some()
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      is_bigfloat_evaluable_factor(left)
+        && bigfloat_int_exponent(right).is_some()
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => is_bigfloat_evaluable_factor(operand),
+    _ => false,
+  }
+}
+
+/// Extract a small signed integer exponent (`Integer(n)` or `-Integer(n)`).
+/// Used to recognise `Power[base, integer]` factors as bigfloat-evaluable.
+fn bigfloat_int_exponent(e: &Expr) -> Option<i128> {
+  match e {
+    Expr::Integer(n) => Some(*n),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      if let Expr::Integer(n) = operand.as_ref() {
+        Some(-n)
+      } else {
+        None
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Relative-error contribution of a [`bigfloat_times`] factor, expressed as
+/// `-log10(rel_err)` so contributions can be combined via the
+/// log-sum-exp formula. Returns `None` for exact (infinite-precision) factors.
+fn factor_precision_contribution(e: &Expr) -> Option<f64> {
+  match e {
+    Expr::BigFloat(_, p) if *p > 0.0 => Some(*p),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => factor_precision_contribution(operand),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      let p = factor_precision_contribution(&args[0])?;
+      let n = bigfloat_int_exponent(&args[1])?;
+      let abs_n = (n.unsigned_abs() as f64).max(1.0);
+      Some(p - abs_n.log10())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      let p = factor_precision_contribution(left)?;
+      let n = bigfloat_int_exponent(right)?;
+      let abs_n = (n.unsigned_abs() as f64).max(1.0);
+      Some(p - abs_n.log10())
+    }
+    _ => None,
+  }
+}
+
+/// Numeric value of an exponent expression as f64, for the precision formula
+/// `result_prec = base_prec - log10(|exp|)`. Handles the exact-number shapes a
+/// Power exponent can take (Integer, BigInteger, Rational, Real, BigFloat).
+fn exponent_f64(exp: &Expr) -> Option<f64> {
+  match exp {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::BigInteger(n) => n.to_string().parse::<f64>().ok(),
+    Expr::Real(f) => Some(*f),
+    Expr::BigFloat(s, _) => s.parse::<f64>().ok(),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      let a = exponent_f64(&args[0])?;
+      let b = exponent_f64(&args[1])?;
+      if b == 0.0 { None } else { Some(a / b) }
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => exponent_f64(operand).map(|v| -v),
+    _ => None,
+  }
+}
+
+/// `base^exp` where `base` is a precision-tagged BigFloat and `exp` is a real
+/// number. Computes the value in astro-float and tracks the result precision as
+/// `base_prec - log10(|exp|)` (matching wolframscript: N[2,30]^2 has precision
+/// 30 - log10(2), Sqrt[N[2,30]] has 30 - log10(1/2)). Returns None (deferring to
+/// the symbolic/complex path) when the exponent is not a plain real, or the
+/// base is negative with a non-integer exponent (a complex result).
+fn try_bigfloat_power(
+  base: &Expr,
+  exp: &Expr,
+) -> Option<Result<Expr, InterpreterError>> {
+  use astro_float::{Consts, RoundingMode};
+
+  let base_prec = match base {
+    Expr::BigFloat(_, p) if *p > 0.0 => *p,
+    _ => return None,
+  };
+  let exp_val = exponent_f64(exp)?;
+  if exp_val == 0.0 {
+    return Some(Ok(Expr::Integer(1)));
+  }
+  let int_exp = match exp {
+    Expr::Integer(n) => Some(*n),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => match operand.as_ref() {
+      Expr::Integer(n) => Some(-n),
+      _ => None,
+    },
+    _ => None,
+  };
+
+  let rm = RoundingMode::ToEven;
+  let bits = nominal_bits(base_prec.ceil() as usize);
+  let mut cc = match Consts::new() {
+    Ok(c) => c,
+    Err(e) => {
+      return Some(Err(InterpreterError::EvaluationError(format!("{e}"))));
+    }
+  };
+  let base_bf = match expr_to_bigfloat(base, bits, rm, &mut cc) {
+    Ok(b) => b,
+    Err(e) => return Some(Err(e)),
+  };
+
+  let result = if let Some(n) = int_exp {
+    bigfloat_powi(&base_bf, n, bits, rm)
+  } else {
+    // Non-integer exponent on a negative base is complex — defer.
+    if base_bf.is_negative() {
+      return None;
+    }
+    let exp_bf = match expr_to_bigfloat(exp, bits, rm, &mut cc) {
+      Ok(e) => e,
+      Err(e) => return Some(Err(e)),
+    };
+    base_bf.pow(&exp_bf, bits, rm, &mut cc)
+  };
+
+  let result_prec = base_prec - exp_val.abs().log10();
+  let max_fraction_digits =
+    ((bits as f64 + 1.0) * std::f64::consts::LOG10_2).floor() as usize;
+  let result_str =
+    match bigfloat_to_string(&result, Some(max_fraction_digits), rm, &mut cc) {
+      Ok(s) => s,
+      Err(e) => return Some(Err(e)),
+    };
+  Some(Ok(Expr::BigFloat(result_str, result_prec)))
+}
+
+/// Multiply BigFloat-tagged numbers with precision tracking. Mirrors
+/// [`bigfloat_plus`] but for products: the value is computed in
+/// astro-float at the full bit budget, and the result precision is
+/// tracked via the per-factor relative-error formula
+/// `1/p_result = sum 1/p_i`.
+fn bigfloat_times(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  use astro_float::{BigFloat, Consts, RoundingMode};
+
+  // Combine per-factor relative errors. Each finite-precision factor
+  // contributes `10^(-p)` to the result's total relative error; the
+  // result precision is `-log10(Σ 10^(-p_i))`. Exact factors (Integer,
+  // Rational, exact constants) contribute zero error and don't bound
+  // the result. Power[bf, n] contributes `|n|·10^(-p)` because the
+  // relative error of `x^n` scales linearly with `|n|`.
+  let contribs: Vec<f64> = args
+    .iter()
+    .filter_map(factor_precision_contribution)
+    .collect();
+  if contribs.is_empty() {
+    return Err(InterpreterError::EvaluationError(
+      "bigfloat_times called without any BigFloat operand".into(),
+    ));
+  }
+  let min_contrib = contribs.iter().copied().fold(f64::INFINITY, f64::min);
+  let total_rel_err: f64 = contribs.iter().map(|p| 10f64.powf(-p)).sum();
+  let result_prec = if total_rel_err > 0.0 {
+    -total_rel_err.log10()
+  } else {
+    min_contrib
+  };
+
+  let bits = nominal_bits(min_contrib.ceil() as usize);
+  let rm = RoundingMode::ToEven;
+  let mut cc = Consts::new()
+    .map_err(|e| InterpreterError::EvaluationError(format!("{e}")))?;
+
+  let mut product = BigFloat::from_i32(1, bits);
+  for arg in args {
+    let factor = expr_to_bigfloat(arg, bits, rm, &mut cc)?;
+    product = product.mul(&factor, bits, rm);
+  }
+
+  let max_fraction_digits =
+    ((bits as f64 + 1.0) * std::f64::consts::LOG10_2).floor() as usize;
+  let result_str =
+    bigfloat_to_string(&product, Some(max_fraction_digits), rm, &mut cc)?;
+  Ok(Expr::BigFloat(result_str, result_prec))
+}
+
+/// Check if Plus args represent DateObject subtraction (d1 - d2) and handle it.
+/// Returns Some(Ok(Quantity[n, "Days"])) if applicable.
+fn try_date_object_subtraction(
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  if args.len() != 2 {
+    return None;
+  }
+
+  fn is_date_object(e: &Expr) -> bool {
+    matches!(e, Expr::FunctionCall { name, .. } if name == "DateObject")
+  }
+
+  fn extract_negated_date(e: &Expr) -> Option<&Expr> {
+    // Matches Times[-1, DateObject[...]] or UnaryOp(Minus, DateObject[...])
+    match e {
+      Expr::BinaryOp {
+        op: BinaryOperator::Times,
+        left,
+        right,
+      } => {
+        if matches!(left.as_ref(), Expr::Integer(-1)) && is_date_object(right) {
+          Some(right)
+        } else if matches!(right.as_ref(), Expr::Integer(-1))
+          && is_date_object(left)
+        {
+          Some(left)
+        } else {
+          None
+        }
+      }
+      Expr::FunctionCall { name, args: fargs }
+        if name == "Times" && fargs.len() == 2 =>
+      {
+        if matches!(&fargs[0], Expr::Integer(-1)) && is_date_object(&fargs[1]) {
+          Some(&fargs[1])
+        } else if matches!(&fargs[1], Expr::Integer(-1))
+          && is_date_object(&fargs[0])
+        {
+          Some(&fargs[0])
+        } else {
+          None
+        }
+      }
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } if is_date_object(operand) => Some(operand),
+      _ => None,
+    }
+  }
+
+  // Pattern: DateObject[...] + Times[-1, DateObject[...]]
+  // i.e. d1 - d2
+  if is_date_object(&args[0])
+    && let Some(d2) = extract_negated_date(&args[1])
+  {
+    return Some(crate::functions::datetime_ast::date_difference_ast(&[
+      d2.clone(),
+      args[0].clone(),
+    ]));
+  }
+  if is_date_object(&args[1])
+    && let Some(d1) = extract_negated_date(&args[0])
+  {
+    return Some(crate::functions::datetime_ast::date_difference_ast(&[
+      args[1].clone(),
+      d1.clone(),
+    ]));
+  }
+
+  None
+}
+
+/// Adds one or more calendar-unit `Quantity` time spans to a single
+/// `TimeObject[{h, m, s}, ...] + Quantity[n, unit]` shifts the time of day by
+/// the given duration (Seconds/Minutes/Hours/Days), wrapping around a 24-hour
+/// day. Subtraction arrives as a negated quantity. The result keeps the input's
+/// granularity (from its field count) and carries a `0.` time-zone field, e.g.
+/// `TimeObject[{14, 30, 0}, ...] + Quantity[90, "Minutes"]` ->
+/// `TimeObject[{16, 0, 0}, Instant, 0.]`.
+fn try_time_object_plus_quantity(
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  if args.len() < 2 {
+    return None;
+  }
+  // (total seconds since midnight, number of fields) for a TimeObject.
+  fn time_object_seconds(e: &Expr) -> Option<(f64, usize)> {
+    if let Expr::FunctionCall { name, args } = e
+      && name == "TimeObject"
+      && !args.is_empty()
+      && let Expr::List(items) = &args[0]
+      && (1..=3).contains(&items.len())
+    {
+      let mut comps = Vec::with_capacity(items.len());
+      for it in items {
+        match it {
+          Expr::Integer(n) => comps.push(*n as f64),
+          Expr::Real(r) => comps.push(*r),
+          _ => return None,
+        }
+      }
+      let total = comps.first().copied().unwrap_or(0.0) * 3600.0
+        + comps.get(1).copied().unwrap_or(0.0) * 60.0
+        + comps.get(2).copied().unwrap_or(0.0);
+      return Some((total, comps.len()));
+    }
+    None
+  }
+  // A time-valued Quantity (possibly negated via Times[-1, ...]) in seconds.
+  fn time_quantity_seconds(e: &Expr) -> Option<f64> {
+    if let Expr::FunctionCall { name, args: ta } = e
+      && name == "Times"
+      && ta.len() == 2
+      && matches!(&ta[0], Expr::Integer(-1))
+    {
+      return time_quantity_seconds(&ta[1]).map(|s| -s);
+    }
+    if let Expr::FunctionCall { name, args: qa } = e
+      && name == "Quantity"
+      && qa.len() == 2
+      && let Expr::String(unit) = &qa[1]
+    {
+      let val = match &qa[0] {
+        Expr::Integer(n) => *n as f64,
+        Expr::Real(r) => *r,
+        _ => return None,
+      };
+      let factor = match unit.as_str() {
+        "Seconds" | "Second" => 1.0,
+        "Minutes" | "Minute" => 60.0,
+        "Hours" | "Hour" => 3600.0,
+        "Days" | "Day" => 86400.0,
+        _ => return None,
+      };
+      return Some(val * factor);
+    }
+    None
+  }
+
+  let mut to_idx = None;
+  for (i, a) in args.iter().enumerate() {
+    if matches!(a, Expr::FunctionCall { name, .. } if name == "TimeObject") {
+      if to_idx.is_some() {
+        return None; // more than one TimeObject
+      }
+      to_idx = Some(i);
+    }
+  }
+  let to_idx = to_idx?;
+  let (base, fields) = time_object_seconds(&args[to_idx])?;
+  let mut delta = 0.0;
+  for (i, a) in args.iter().enumerate() {
+    if i == to_idx {
+      continue;
+    }
+    delta += time_quantity_seconds(a)?; // any non-time summand aborts
+  }
+  let total = (base + delta).rem_euclid(86400.0);
+
+  let field = |v: f64| -> Expr {
+    if v.fract() == 0.0 {
+      Expr::Integer(v as i128)
+    } else {
+      Expr::Real(v)
+    }
+  };
+  let (comps, granularity): (Vec<Expr>, &str) = match fields {
+    1 => (
+      vec![Expr::Integer((total / 3600.0).floor() as i128)],
+      "Hour",
+    ),
+    2 => {
+      let tm = (total / 60.0).floor();
+      let h = (tm / 60.0).floor();
+      (
+        vec![
+          Expr::Integer(h as i128),
+          Expr::Integer((tm - h * 60.0) as i128),
+        ],
+        "Minute",
+      )
+    }
+    _ => {
+      let h = (total / 3600.0).floor();
+      let rem = total - h * 3600.0;
+      let m = (rem / 60.0).floor();
+      (
+        vec![
+          Expr::Integer(h as i128),
+          Expr::Integer(m as i128),
+          field(rem - m * 60.0),
+        ],
+        "Instant",
+      )
+    }
+  };
+  Some(Ok(call(
+    "TimeObject",
+    vec![
+      Expr::List(comps.into()),
+      Expr::String(granularity.to_string()),
+      Expr::Real(0.0),
+    ],
+  )))
+}
+
+/// `DateObject`: e.g. `DateObject[{2024, 7, 4}] + Quantity[1, "Days"]` shifts
+/// the date to July 5. Subtraction arrives here as a negated quantity
+/// (`Quantity[-n, unit]`). Only the calendar units Days/Weeks/Months/Years are
+/// handled (the ones DatePlus resolves correctly); other units, or symbolic
+/// summands, leave the sum for ordinary Plus handling.
+fn try_date_object_plus_quantity(
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  if args.len() < 2 {
+    return None;
+  }
+
+  fn is_date_object(e: &Expr) -> bool {
+    matches!(e, Expr::FunctionCall { name, .. } if name == "DateObject")
+  }
+  fn is_calendar_quantity(e: &Expr) -> bool {
+    if let Expr::FunctionCall { name, args: qa } = e
+      && name == "Quantity"
+      && qa.len() == 2
+      && let Expr::String(unit) = &qa[1]
+    {
+      matches!(
+        unit.as_str(),
+        "Days"
+          | "Day"
+          | "Weeks"
+          | "Week"
+          | "Months"
+          | "Month"
+          | "Years"
+          | "Year"
+      )
+    } else {
+      false
+    }
+  }
+
+  // Exactly one DateObject summand; every other summand a calendar quantity.
+  let mut date_idx = None;
+  for (i, a) in args.iter().enumerate() {
+    if is_date_object(a) {
+      if date_idx.is_some() {
+        return None; // more than one DateObject: not a simple shift
+      }
+      date_idx = Some(i);
+    }
+  }
+  let date_idx = date_idx?;
+  let quantities: Vec<&Expr> = args
+    .iter()
+    .enumerate()
+    .filter(|(i, _)| *i != date_idx)
+    .map(|(_, a)| a)
+    .collect();
+  if quantities.is_empty()
+    || !quantities.iter().all(|q| is_calendar_quantity(q))
+  {
+    return None;
+  }
+
+  // Fold the shifts through DatePlus, one quantity at a time.
+  let mut date = args[date_idx].clone();
+  for q in quantities {
+    match crate::functions::datetime_ast::date_plus_ast(&[
+      date.clone(),
+      (*q).clone(),
+    ]) {
+      Ok(next) if is_date_object(&next) => date = next,
+      _ => return None, // DatePlus did not yield a date: leave for Plus
+    }
+  }
+  Some(Ok(date))
+}

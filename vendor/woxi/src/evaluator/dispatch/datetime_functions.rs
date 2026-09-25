@@ -1,0 +1,746 @@
+#[allow(unused_imports)]
+use super::*;
+
+/// How many date components a granularity keeps: `"Month"` names a year and a
+/// month, `"Hour"` everything down to the hour, and so on. `None` for a
+/// granularity that is not one of the plain calendar levels.
+fn granularity_component_count(granularity: &str) -> Option<usize> {
+  Some(match granularity {
+    "Year" => 1,
+    "Month" => 2,
+    "Day" => 3,
+    "Hour" => 4,
+    "Minute" => 5,
+    "Second" | "Instant" => 6,
+    _ => return None,
+  })
+}
+
+pub fn dispatch_datetime_functions(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  match name {
+    "AbsoluteTime" => {
+      return Some(crate::functions::datetime_ast::absolute_time_ast(args));
+    }
+    "DateList" => {
+      return Some(crate::functions::datetime_ast::date_list_ast(args));
+    }
+    "TimeZoneConvert" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::time_zone_convert_ast(args));
+    }
+    "DatePlus" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::date_plus_ast(args));
+    }
+    "DateBounds" if args.len() == 1 => {
+      return Some(crate::functions::datetime_ast::date_bounds_ast(args));
+    }
+    "MaxDate" if args.len() == 1 => {
+      return Some(crate::functions::datetime_ast::max_min_date_ast(
+        args, true,
+      ));
+    }
+    "MinDate" if args.len() == 1 => {
+      return Some(crate::functions::datetime_ast::max_min_date_ast(
+        args, false,
+      ));
+    }
+    "DayPlus" if args.len() >= 2 && args.len() <= 3 => {
+      return Some(crate::functions::datetime_ast::day_plus_ast(args));
+    }
+    "DayRange" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::datetime_ast::day_range_ast(args));
+    }
+    "DateRange" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::datetime_ast::date_range_ast(args));
+    }
+    "TimeObject" if args.len() == 1 => {
+      return Some(crate::functions::datetime_ast::time_object_ast(args));
+    }
+    "DateDifference" if args.len() >= 2 => {
+      return Some(crate::functions::datetime_ast::date_difference_ast(args));
+    }
+    "MidDate" if !args.is_empty() && args.len() <= 3 => {
+      return Some(crate::functions::datetime_ast::mid_date_ast(args));
+    }
+    "DateString" => {
+      return Some(crate::functions::datetime_ast::date_string_ast(args));
+    }
+    "CalendarConvert" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::calendar_convert_ast(args));
+    }
+    "SessionTime" if args.is_empty() => {
+      return Some(Ok(Expr::Real(crate::session_time())));
+    }
+    "TimeUsed" if args.is_empty() => {
+      return Some(Ok(Expr::Real(crate::functions::memory::cpu_time_used())));
+    }
+    "DayName" => {
+      return Some(crate::functions::datetime_ast::day_name_ast(args));
+    }
+    "DateValue" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::date_value_ast(args));
+    }
+    "DateWithinQ" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::date_within_q_ast(args));
+    }
+    "DateOverlapsQ" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::date_overlaps_q_ast(args));
+    }
+    "DateSelect" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::date_select_ast(args));
+    }
+    "FromJulianDate" if args.len() == 1 => {
+      return Some(crate::functions::datetime_ast::from_julian_date_ast(args));
+    }
+    "MoonPhase" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::moon_phase_ast(args));
+    }
+    "NewMoon" if args.len() <= 1 => {
+      return Some(crate::functions::astronomy_ast::new_moon_ast(args));
+    }
+    "FullMoon" if args.len() <= 1 => {
+      return Some(crate::functions::astronomy_ast::full_moon_ast(args));
+    }
+    "MoonPhaseDate" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::moon_phase_date_ast(args));
+    }
+    "SunPosition" if args.len() <= 3 => {
+      return Some(crate::functions::astronomy_ast::sun_position_ast(args));
+    }
+    "MoonPosition" if args.len() <= 3 => {
+      return Some(crate::functions::astronomy_ast::moon_position_ast(args));
+    }
+    "SiderealTime" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::sidereal_time_ast(args));
+    }
+    "AstronomicalData" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::astronomy_ast::astronomical_data_ast(
+        args,
+      ));
+    }
+    "Sunrise" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::sunrise_ast(args));
+    }
+    "Sunset" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::sunset_ast(args));
+    }
+    "DaylightQ" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::daylight_q_ast(args));
+    }
+    "SolarEclipse" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::solar_eclipse_ast(args));
+    }
+    "LunarEclipse" if args.len() <= 2 => {
+      return Some(crate::functions::astronomy_ast::lunar_eclipse_ast(args));
+    }
+    // TimeZoneOffset[] → $TimeZone; TimeZoneOffset[tz] → the zone's UTC
+    // offset (numeric zones pass through); TimeZoneOffset[tz1, tz2(, date)]
+    // → tz1 - tz2 (the date only matters for named zones, which need a tz
+    // database and stay unevaluated). Non-numeric, non-string zones emit
+    // ::zone.
+    "TimeZoneOffset" if args.len() <= 3 => {
+      let numeric = |e: &Expr| {
+        matches!(e, Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_))
+          || matches!(e, Expr::FunctionCall { name, args }
+          if name == "Rational" && args.len() == 2)
+          || matches!(
+            e,
+            Expr::UnaryOp {
+              op: UnaryOperator::Minus,
+              ..
+            }
+          )
+      };
+      let unevaluated = || Some(Ok(unevaluated("TimeZoneOffset", args)));
+      if args.is_empty() {
+        return Some(Ok(Expr::Real(0.0)));
+      }
+      // Resolve the first two zone specs. Named IANA zones resolve
+      // through chrono-tz (CLI builds) at the reference date (3rd
+      // argument) or the current instant, yielding a Real offset.
+      let mut zones: Vec<Expr> = Vec::new();
+      for zone in args.iter().take(2) {
+        if let Expr::String(name) = zone {
+          if let Some(off) =
+            crate::functions::datetime_ast::named_zone_offset_at(
+              name,
+              args.get(2),
+            )
+          {
+            zones.push(Expr::Real(off));
+          } else {
+            if crate::functions::datetime_ast::zone_name_invalid(name) {
+              for head in ["DateObject", "TimeZoneOffset"] {
+                crate::emit_message(&format!(
+                  "{head}::zone: Time zone specification {name} should be a real number, integer or time zone string."
+                ));
+              }
+            }
+            return unevaluated();
+          }
+        } else if numeric(zone) {
+          zones.push(zone.clone());
+        } else {
+          crate::emit_message(&format!(
+            "TimeZoneOffset::zone: Time zone specification {} should be a real number, integer or time zone string.",
+            expr_to_output(zone)
+          ));
+          return unevaluated();
+        }
+      }
+      if args.len() == 1 {
+        return Some(Ok(zones[0].clone()));
+      }
+      return Some(crate::evaluator::evaluate_expr_to_expr(&minus2(
+        zones[0].clone(),
+        zones[1].clone(),
+      )));
+    }
+    "DayMatchQ" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::day_match_q_ast(args));
+    }
+    "NextDate" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::next_date_ast(args));
+    }
+    "PreviousDate" if args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::previous_date_ast(args));
+    }
+    "DayRound" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::datetime_ast::day_round_ast(args));
+    }
+    // The canonical form DateInterval[{{d1, d2}, ...}, granularity, calendar,
+    // timezone] evaluates to itself, like wolframscript.
+    "DateInterval" if args.len() == 4 => {
+      return Some(Ok(unevaluated("DateInterval", args)));
+    }
+    // DateInterval[{date1, date2}] — create a date interval
+    "DateInterval" if args.len() == 1 => {
+      if let Expr::List(dates) = &args[0]
+        && dates.len() == 2
+      {
+        let d1 =
+          crate::functions::datetime_ast::resolve_date_to_list(&dates[0]);
+        let d2 =
+          crate::functions::datetime_ast::resolve_date_to_list(&dates[1]);
+        if let (Some(start), Some(end)) = (d1, d2) {
+          return Some(Ok(Expr::FunctionCall {
+            name: "DateInterval".to_string(),
+            args: vec![
+              Expr::List(vec![Expr::List(vec![start, end].into())].into()),
+              Expr::String("Day".to_string()),
+              Expr::String("Gregorian".to_string()),
+              id_expr("None"),
+            ]
+            .into(),
+          }));
+        }
+      }
+      crate::emit_message(&format!(
+        "DateInterval::arg: Argument {} cannot be interpreted as a date or time input.",
+        expr_to_string(&args[0])
+      ));
+      return Some(Ok(unevaluated("DateInterval", args)));
+    }
+    // DateObjectQ[expr] — True iff expr is a well-formed DateObject: the
+    // head is DateObject and the first argument is a list of 1–6 numeric
+    // components. Anything else (TimeObject, strings, echoes of failed
+    // constructions) is False.
+    "DateObjectQ" if args.len() == 1 => {
+      let valid = if let Expr::FunctionCall { name, args: dargs } = &args[0]
+        && name == "DateObject"
+        && !dargs.is_empty()
+        && let Expr::List(items) = &dargs[0]
+      {
+        (1..=6).contains(&items.len())
+          && items.iter().all(|c| {
+            matches!(c, Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_))
+              || matches!(c, Expr::FunctionCall { name, args }
+              if name == "Rational" && args.len() == 2)
+          })
+      } else {
+        false
+      };
+      return Some(Ok(bool_expr(valid)));
+    }
+    // DateObject is a data container — normalize granularity
+    // FromDateString["string"] gives the DateObject for a date string. For the
+    // common single-argument forms it is equivalent to DateObject["string"].
+    "FromDateString"
+      if args.len() == 1 && matches!(&args[0], Expr::String(_)) =>
+    {
+      return Some(crate::evaluator::evaluate_function_call_ast(
+        "DateObject",
+        args,
+      ));
+    }
+    "DateObject" => {
+      // DateObject[] → current instant (same shape as `Now`)
+      if args.is_empty() {
+        return Some(crate::evaluator::evaluate_expr_to_expr(&id_expr("Now")));
+      }
+      // `DateObject[date, granularity]` re-tags a date that is already a
+      // `DateObject`: `DateObject[Now, "Hour"]` is the hour `Now` falls in,
+      // which is what a package memoising once an hour keys its cache on.
+      if let Expr::FunctionCall {
+        name: inner_name,
+        args: inner_args,
+      } = &args[0]
+        && inner_name == "DateObject"
+        && let Some(Expr::List(components)) = inner_args.first()
+      {
+        if args.len() == 1 {
+          return Some(Ok(args[0].clone()));
+        }
+        if let Expr::String(granularity) = &args[1]
+          && let Some(width) = granularity_component_count(granularity)
+        {
+          let mut rebuilt: Vec<Expr> = Vec::with_capacity(width);
+          for index in 0..width {
+            rebuilt.push(match components.get(index) {
+              // `"Second"` drops the fraction `"Instant"` keeps.
+              Some(Expr::Real(seconds))
+                if index == 5 && granularity == "Second" =>
+              {
+                Expr::Integer(seconds.trunc() as i128)
+              }
+              Some(component) => component.clone(),
+              // Days and months count from 1, the clock parts from 0.
+              None if index < 3 => Expr::Integer(1),
+              None => Expr::Integer(0),
+            });
+          }
+          let mut new_args = vec![Expr::List(rebuilt.into()), args[1].clone()];
+          // The calendar and offset travel with the date. A date that
+          // carries neither only grows them when the new granularity is
+          // fine enough to need them, and then the offset is `None`.
+          if width >= 4 || inner_args.len() > 2 {
+            new_args.push(
+              inner_args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| Expr::String("Gregorian".to_string())),
+            );
+            new_args.push(
+              inner_args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| id_expr("None")),
+            );
+          }
+          return Some(Ok(call("DateObject", new_args)));
+        }
+      }
+      // DateObject[n] — n is absolute seconds since Wolfram's epoch
+      // (1900-01-01 00:00:00 UTC). Convert to a calendar instant.
+      #[cfg(feature = "cli")]
+      if args.len() == 1
+        && let Some(secs) = match &args[0] {
+          Expr::Integer(n) => Some(*n as f64),
+          Expr::Real(r) => Some(*r),
+          _ => None,
+        }
+      {
+        let (y, mo, d, h, mi, s) = wolfram_seconds_to_ymdhms(secs);
+        let date_list = Expr::List(
+          vec![
+            Expr::Integer(y as i128),
+            Expr::Integer(mo as i128),
+            Expr::Integer(d as i128),
+            Expr::Integer(h as i128),
+            Expr::Integer(mi as i128),
+            Expr::Integer(s as i128),
+          ]
+          .into(),
+        );
+        return Some(Ok(Expr::FunctionCall {
+          name: "DateObject".to_string(),
+          args: vec![
+            date_list,
+            Expr::String("Instant".to_string()),
+            Expr::String("Gregorian".to_string()),
+            Expr::Real(0.0),
+          ]
+          .into(),
+        }));
+      }
+      // DateObject["2024-03-15"] — parse an ISO date/time string into a
+      // component list and let the list logic below tag the granularity.
+      // Natural-language forms like "July 4, 1776" or "Jan 1 2000" fall back
+      // to the month-name parser.
+      if args.len() == 1
+        && let Expr::String(s) = &args[0]
+      {
+        let components =
+          crate::functions::datetime_ast::parse_iso_date_components(s).or_else(
+            || {
+              crate::functions::datetime_ast::parse_date_string(s).map(
+                |(y, m, d)| {
+                  vec![
+                    Expr::Integer(y as i128),
+                    Expr::Integer(m as i128),
+                    Expr::Integer(d as i128),
+                  ]
+                },
+              )
+            },
+          );
+        if let Some(components) = components {
+          return Some(crate::evaluator::evaluate_function_call_ast(
+            "DateObject",
+            &[Expr::List(components.into())],
+          ));
+        }
+        crate::emit_message(&format!(
+          "DateObject::str: String {s} cannot be interpreted as a date."
+        ));
+        return Some(Ok(unevaluated("DateObject", args)));
+      }
+
+      // DateObject[{y, ...}] adds a granularity tag based on list length.
+      //   1 → Year, 2 → Month, 3 → Day
+      //   4 → Hour, Gregorian, 0., 5 → Minute, Gregorian, 0.,
+      //   6 → Instant, Gregorian, 0.
+      // Out-of-range components carry into the next-larger unit first
+      // ({2026, 13, 45} → {2027, 2, 14}), like wolframscript.
+      if args.len() == 1
+        && let Expr::List(items) = &args[0]
+      {
+        let normalized =
+          crate::functions::datetime_ast::normalize_date_components(items)
+            .map_or_else(|| args[0].clone(), |c| Expr::List(c.into()));
+        let mut extra: Vec<Expr> = Vec::new();
+        match items.len() {
+          1 => extra.push(Expr::String("Year".to_string())),
+          2 => extra.push(Expr::String("Month".to_string())),
+          3 => extra.push(Expr::String("Day".to_string())),
+          4..=6 => {
+            let gran = match items.len() {
+              4 => "Hour",
+              5 => "Minute",
+              _ => "Instant",
+            };
+            extra.push(Expr::String(gran.to_string()));
+            extra.push(Expr::String("Gregorian".to_string()));
+            extra.push(Expr::Real(0.0));
+          }
+          _ => {
+            return Some(Ok(unevaluated("DateObject", args)));
+          }
+        }
+        let mut new_args = vec![normalized];
+        new_args.extend(extra);
+        return Some(Ok(call("DateObject", new_args)));
+      }
+      // DateObject[{…}, granularity] keeps only the components that
+      // granularity names — `DateObject[{2024, 2, 29}, "Month"]` is the whole
+      // of February 2024, so its component list is {2024, 2} — padding a
+      // short list with the first day / zero hour instead.
+      if args.len() >= 2
+        && let Expr::List(items) = &args[0]
+        && let Expr::String(granularity) = &args[1]
+        && let Some(width) = granularity_component_count(granularity)
+      {
+        let normalized =
+          crate::functions::datetime_ast::normalize_date_components(items)
+            .unwrap_or_else(|| items.to_vec());
+        // Rebuilt when the components have to change, and also when a
+        // sub-day granularity is still missing its calendar and offset.
+        let needs_calendar_suffix = width >= 4 && args.len() < 4;
+        if normalized.len() != width || needs_calendar_suffix {
+          let mut components: Vec<Expr> = Vec::with_capacity(width);
+          for i in 0..width {
+            components.push(match normalized.get(i) {
+              Some(c) => c.clone(),
+              // Days and months count from 1, the clock parts from 0.
+              None if i < 3 => Expr::Integer(1),
+              None => Expr::Integer(0),
+            });
+          }
+          let mut new_args = vec![Expr::List(components.into())];
+          new_args.push(args[1].clone());
+          // Only the sub-day granularities carry the calendar and offset.
+          if width >= 4 {
+            new_args.push(Expr::String("Gregorian".to_string()));
+            new_args.push(Expr::Real(0.0));
+          }
+          return Some(Ok(call("DateObject", new_args)));
+        }
+      }
+      // Explicit-granularity forms (and evaluated DateObjects passing
+      // through again) still normalize their component list; the helper is
+      // idempotent, so canonical DateObjects stay fixed points.
+      if args.len() >= 2
+        && let Expr::List(items) = &args[0]
+        && let Some(normalized) =
+          crate::functions::datetime_ast::normalize_date_components(items)
+        && expr_to_string(&Expr::List(normalized.clone().into()))
+          != expr_to_string(&args[0])
+      {
+        let mut new_args = vec![Expr::List(normalized.into())];
+        new_args.extend(args[1..].iter().cloned());
+        return Some(Ok(call("DateObject", new_args)));
+      }
+      return Some(Ok(unevaluated("DateObject", args)));
+    }
+    // DayCount[date1, date2] — number of days between two dates
+    "DayCount" if args.len() == 3 => {
+      // DayCount[d1, d2, weekday]: count occurrences of a specific weekday.
+      if let Some(result) =
+        crate::functions::datetime_ast::day_count_weekday_ast(
+          &args[0], &args[1], &args[2],
+        )
+      {
+        return Some(Ok(result));
+      }
+      return Some(Ok(unevaluated("DayCount", args)));
+    }
+    "DayCount" if args.len() == 2 => {
+      // Report un-interpretable date arguments under the DayCount head before
+      // delegating (otherwise the DateDifference conversion would leak).
+      if let Some(unevaluated) =
+        crate::functions::datetime_ast::date_spec_error("DayCount", args, args)
+      {
+        return Some(Ok(unevaluated));
+      }
+      // Use DateDifference which returns Quantity[n, "Days"]
+      let result = crate::functions::datetime_ast::date_difference_ast(args);
+      if let Ok(Expr::FunctionCall {
+        name: ref qname,
+        args: ref qargs,
+      }) = result
+        && qname == "Quantity"
+        && qargs.len() == 2
+      {
+        return Some(Ok(qargs[0].clone()));
+      }
+      return Some(result);
+    }
+    "UnixTime" if args.is_empty() => {
+      use web_time::{SystemTime, UNIX_EPOCH};
+      let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+      return Some(Ok(Expr::Integer(secs as i128)));
+    }
+    // UnixTime[date] — seconds since the Unix epoch for a date list or a
+    // DateObject. A DateObject's embedded time-zone offset (its last element,
+    // when a Real) shifts the calendar time back to UTC. Computed from
+    // AbsoluteTime (Wolfram epoch is 2_208_988_800 s before the Unix epoch).
+    "UnixTime" if args.len() == 1 => {
+      const WOLFRAM_EPOCH_TO_UNIX: f64 = 2_208_988_800.0;
+      // Resolve the date spec and any time-zone offset (in hours).
+      let (date_spec, tz) = match &args[0] {
+        Expr::FunctionCall { name, args: dargs }
+          if name == "DateObject" && !dargs.is_empty() =>
+        {
+          let tz = match dargs.last() {
+            Some(Expr::Real(r)) => *r,
+            Some(Expr::Integer(n)) => *n as f64,
+            _ => 0.0,
+          };
+          (dargs[0].clone(), tz)
+        }
+        other => (other.clone(), 0.0),
+      };
+      let abs = crate::functions::datetime_ast::absolute_time_ast(
+        std::slice::from_ref(&date_spec),
+      );
+      let abs_secs = match abs {
+        Ok(Expr::Integer(n)) => Some(n as f64),
+        Ok(Expr::Real(r)) => Some(r),
+        _ => None,
+      };
+      if let Some(abs_secs) = abs_secs {
+        let unix = abs_secs - WOLFRAM_EPOCH_TO_UNIX - tz * 3600.0;
+        return Some(Ok(Expr::Integer(unix.round() as i128)));
+      }
+      return Some(Ok(unevaluated("UnixTime", args)));
+    }
+    // FromUnixTime[n] / FromUnixTime[n, TimeZone -> tz] — the instant `n`
+    // seconds after the Unix epoch, as a DateObject. The displayed calendar
+    // time is shifted by the time-zone offset (in hours); without the option
+    // the local offset is used.
+    "FromUnixTime" if args.len() == 1 || args.len() == 2 => {
+      let Some(unix_secs) = (match &args[0] {
+        Expr::Integer(n) => Some(*n as f64),
+        Expr::Real(r) => Some(*r),
+        _ => None,
+      }) else {
+        return Some(Ok(unevaluated("FromUnixTime", args)));
+      };
+      // Resolve the time-zone offset in hours.
+      let tz = if args.len() == 2 {
+        match parse_timezone_option(&args[1]) {
+          Some(tz) => tz,
+          None => {
+            return Some(Ok(unevaluated("FromUnixTime", args)));
+          }
+        }
+      } else {
+        local_timezone_offset_hours()
+      };
+      #[cfg(feature = "cli")]
+      {
+        const WOLFRAM_EPOCH_TO_UNIX: f64 = 2_208_988_800.0;
+        let wolfram_secs = unix_secs + WOLFRAM_EPOCH_TO_UNIX + tz * 3600.0;
+        let (y, mo, d, h, mi, s) = wolfram_seconds_to_ymdhms(wolfram_secs);
+        let date_list = Expr::List(
+          vec![
+            Expr::Integer(y as i128),
+            Expr::Integer(mo as i128),
+            Expr::Integer(d as i128),
+            Expr::Integer(h as i128),
+            Expr::Integer(mi as i128),
+            Expr::Integer(s as i128),
+          ]
+          .into(),
+        );
+        return Some(Ok(Expr::FunctionCall {
+          name: "DateObject".to_string(),
+          args: vec![
+            date_list,
+            Expr::String("Instant".to_string()),
+            Expr::String("Gregorian".to_string()),
+            Expr::Real(tz),
+          ]
+          .into(),
+        }));
+      }
+      #[cfg(not(feature = "cli"))]
+      {
+        let _ = (unix_secs, tz);
+        return Some(Ok(unevaluated("FromUnixTime", args)));
+      }
+    }
+    // FromAbsoluteTime[n] — the instant `n` seconds after the Wolfram epoch
+    // (1900-01-01 00:00:00), as a DateObject. Unlike FromUnixTime there is no
+    // time-zone shift: the absolute time maps directly to the UTC calendar
+    // date and the DateObject carries a zero offset.
+    "FromAbsoluteTime" if args.len() == 1 => {
+      let Some(wolfram_secs) = (match &args[0] {
+        Expr::Integer(n) => Some(*n as f64),
+        Expr::Real(r) => Some(*r),
+        _ => None,
+      }) else {
+        return Some(Ok(unevaluated("FromAbsoluteTime", args)));
+      };
+      #[cfg(feature = "cli")]
+      {
+        let (y, mo, d, h, mi, s) = wolfram_seconds_to_ymdhms(wolfram_secs);
+        let date_list = Expr::List(
+          vec![
+            Expr::Integer(y as i128),
+            Expr::Integer(mo as i128),
+            Expr::Integer(d as i128),
+            Expr::Integer(h as i128),
+            Expr::Integer(mi as i128),
+            Expr::Integer(s as i128),
+          ]
+          .into(),
+        );
+        return Some(Ok(Expr::FunctionCall {
+          name: "DateObject".to_string(),
+          args: vec![
+            date_list,
+            Expr::String("Instant".to_string()),
+            Expr::String("Gregorian".to_string()),
+            Expr::Real(0.0),
+          ]
+          .into(),
+        }));
+      }
+      #[cfg(not(feature = "cli"))]
+      {
+        let _ = wolfram_secs;
+        return Some(Ok(unevaluated("FromAbsoluteTime", args)));
+      }
+    }
+    "JulianDate" if args.len() <= 1 => {
+      return Some(crate::functions::datetime_ast::julian_date_ast(args));
+    }
+    _ => {}
+  }
+  None
+}
+
+/// Convert Wolfram's absolute-seconds count (seconds since
+/// 1900-01-01 00:00:00 UTC, no leap seconds) to a calendar
+/// `(year, month, day, hour, minute, second)` tuple in UTC. Uses
+/// `chrono` via the Unix-epoch offset (Wolfram epoch is 70 calendar
+/// years and 17 leap days before Unix epoch — 2_208_988_800 seconds).
+#[cfg(feature = "cli")]
+fn wolfram_seconds_to_ymdhms(secs: f64) -> (i64, u32, u32, u32, u32, u32) {
+  use chrono::{Datelike, TimeZone, Timelike, Utc};
+  const WOLFRAM_EPOCH_TO_UNIX: f64 = 2_208_988_800.0;
+  let unix_secs = secs - WOLFRAM_EPOCH_TO_UNIX;
+  let total = unix_secs.round() as i64;
+  let dt = Utc
+    .timestamp_opt(total, 0)
+    .single()
+    .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap());
+  (
+    dt.year() as i64,
+    dt.month(),
+    dt.day(),
+    dt.hour(),
+    dt.minute(),
+    dt.second(),
+  )
+}
+
+/// Parse a `TimeZone -> tz` option, returning the offset in hours. Accepts the
+/// `Expr::Rule` and `Rule[...]`/`RuleDelayed[...]` forms with an Integer, Real,
+/// or Rational right-hand side.
+fn parse_timezone_option(opt: &Expr) -> Option<f64> {
+  let (lhs, rhs) = match opt {
+    Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => (pattern.as_ref(), replacement.as_ref()),
+    Expr::FunctionCall { name, args }
+      if (name == "Rule" || name == "RuleDelayed") && args.len() == 2 =>
+    {
+      (&args[0], &args[1])
+    }
+    _ => return None,
+  };
+  if !matches!(lhs, Expr::Identifier(s) if s == "TimeZone") {
+    return None;
+  }
+  match rhs {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(r) => Some(*r),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(p), Expr::Integer(q)) if *q != 0 => {
+          Some(*p as f64 / *q as f64)
+        }
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// The local system time-zone offset in hours, used as FromUnixTime's default.
+/// Falls back to 0 (UTC) outside the `cli` feature.
+fn local_timezone_offset_hours() -> f64 {
+  #[cfg(feature = "cli")]
+  {
+    use chrono::{Local, Offset};
+    Local::now().offset().fix().local_minus_utc() as f64 / 3600.0
+  }
+  #[cfg(not(feature = "cli"))]
+  {
+    0.0
+  }
+}

@@ -1,0 +1,15059 @@
+use super::*;
+
+mod string_length_arg_errors {
+  use super::*;
+
+  #[test]
+  fn non_string_identifier_returns_unevaluated() {
+    // Matches wolframscript: StringLength[x] stays unevaluated with a
+    // StringLength::string message; it does NOT return the length of the
+    // identifier's name.
+    assert_eq!(interpret("StringLength[x]").unwrap(), "StringLength[x]");
+  }
+
+  #[test]
+  fn plain_string_still_works() {
+    assert_eq!(interpret(r#"StringLength["abc"]"#).unwrap(), "3");
+  }
+
+  #[test]
+  fn list_of_strings_threads() {
+    assert_eq!(
+      interpret(r#"StringLength[{"a", "bb", "ccc"}]"#).unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+}
+
+mod backslash_space_escape {
+  use super::*;
+
+  // `\ ` (a backslash immediately followed by a space) is part of the same
+  // linear-syntax escape family as `\(`, `\)`, `\!` and `\*`: inside
+  // `\!\(…\)` embedded box syntax a bare space separates tokens (implicit
+  // multiplication) rather than standing for itself, so the FrontEnd
+  // escapes an actual space character as `\ ` when it needs one preserved
+  // literally — e.g. a Manipulate control label that pads a subscript's
+  // digits with trailing spaces for visual alignment,
+  // `SubscriptBox["m", "2\(\ \ \)"]`. It unescapes to a single plain space.
+
+  #[test]
+  fn unescapes_to_a_plain_space() {
+    assert_eq!(interpret(r#"StringLength["a\ b"]"#).unwrap(), "3");
+    assert_eq!(
+      interpret(r#"ToCharacterCode["a\ b"]"#).unwrap(),
+      "{97, 32, 98}"
+    );
+  }
+
+  #[test]
+  fn repeated_escapes_each_become_one_space() {
+    assert_eq!(interpret(r#"StringLength["2\ \ \ "]"#).unwrap(), "4");
+    assert_eq!(interpret(r#""2\ \ \ " === "2   ""#).unwrap(), "True");
+  }
+
+  #[test]
+  fn bare_top_level_literal_echoes_the_unescaped_space() {
+    // The CLI's fast path for a lone string literal must not shortcut past
+    // this escape and echo the raw `\ ` bytes back verbatim.
+    assert_eq!(interpret(r#""a\ b""#).unwrap(), "a b");
+  }
+}
+
+mod string_join_arg_errors {
+  use super::*;
+
+  #[test]
+  fn non_string_operand_returns_unevaluated() {
+    // Matches wolframscript: "Debian" <> 6 emits StringJoin::string and
+    // returns StringJoin[Debian, 6]. Previously Woxi coerced and produced
+    // "Debian6".
+    assert_eq!(
+      interpret(r#""Debian" <> 6"#).unwrap(),
+      "StringJoin[Debian, 6]"
+    );
+  }
+
+  #[test]
+  fn non_string_operand_message_points_at_bad_arg() {
+    // Regression: the StringJoin::string warning must name the 1-based
+    // position of the first non-string argument and render the call in
+    // infix form — matching wolframscript's `position 2 in U<>2`.
+    let _ = interpret(r#""U" <> 2"#).unwrap();
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringJoin::string: String expected at position 2 in U<>2."
+      )),
+      "expected infix `U<>2` message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn plain_string_chain_still_works() {
+    assert_eq!(interpret(r#""a" <> "b" <> "c""#).unwrap(), "abc");
+  }
+
+  #[test]
+  fn flat_chain_returns_flat_unevaluated() {
+    // StringJoin is Flat: a <> b <> c is StringJoin[a, b, c], not the nested
+    // StringJoin[StringJoin[a, b], c] the parser builds. Matches wolframscript.
+    assert_eq!(interpret("a <> b <> c").unwrap(), "StringJoin[a, b, c]");
+    assert_eq!(
+      interpret("a <> b <> c <> d").unwrap(),
+      "StringJoin[a, b, c, d]"
+    );
+  }
+
+  #[test]
+  fn one_message_per_non_string_leaf() {
+    // wolframscript emits one StringJoin::string message per non-string leaf,
+    // numbered by position in the flat chain (not one message for the first).
+    let _ = interpret("x <> b <> y").unwrap();
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringJoin::string: String expected at position 2 in x<>b<>y."
+      )),
+      "expected position-2 message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn all_non_string_leaves_report_positions() {
+    let _ = interpret("StringJoin[1, 2]").unwrap();
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringJoin::string: String expected at position 1 in 1<>2."
+      )),
+      "missing position-1 message, got {msgs:?}"
+    );
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringJoin::string: String expected at position 2 in 1<>2."
+      )),
+      "missing position-2 message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn general_stop_after_three_messages() {
+    // A four-symbol chain emits three per-leaf messages then General::stop.
+    let _ = interpret("a <> b <> c <> d").unwrap();
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "General::stop: Further output of StringJoin::string will be \
+         suppressed during this calculation."
+      )),
+      "expected General::stop, got {msgs:?}"
+    );
+  }
+}
+
+mod string_replace_arg_errors {
+  use super::*;
+
+  #[test]
+  fn non_string_subject_symbol_returns_unevaluated() {
+    // Matches wolframscript: StringReplace[xyz, "a" -> "x"] emits
+    // StringReplace::strse and returns the call unevaluated. Previously Woxi
+    // coerced the symbol to its name and produced "xyz".
+    assert_eq!(
+      interpret(r#"StringReplace[xyz, "a" -> "x"]"#).unwrap(),
+      "StringReplace[xyz, a -> x]"
+    );
+  }
+
+  #[test]
+  fn non_string_subject_integer_returns_unevaluated() {
+    assert_eq!(
+      interpret(r#"StringReplace[123, "1" -> "x"]"#).unwrap(),
+      "StringReplace[123, 1 -> x]"
+    );
+  }
+
+  #[test]
+  fn list_with_non_string_returns_unevaluated() {
+    // A list whose elements are not all strings is rejected as a whole.
+    assert_eq!(
+      interpret(r#"StringReplace[{1, 2}, "1" -> "x"]"#).unwrap(),
+      "StringReplace[{1, 2}, 1 -> x]"
+    );
+    assert_eq!(
+      interpret(r#"StringReplace[{"a", 2}, "a" -> "x"]"#).unwrap(),
+      "StringReplace[{a, 2}, a -> x]"
+    );
+  }
+
+  #[test]
+  fn strse_message_emitted() {
+    let _ = interpret(r#"StringReplace[xyz, "a" -> "x"]"#).unwrap();
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringReplace::strse: A string or list of strings is expected at \
+         position 1 in StringReplace[xyz, a -> x]."
+      )),
+      "expected StringReplace::strse message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn plain_string_still_works() {
+    assert_eq!(
+      interpret(r#"StringReplace["abc", "a" -> "x"]"#).unwrap(),
+      "xbc"
+    );
+  }
+
+  #[test]
+  fn list_of_strings_threads() {
+    assert_eq!(
+      interpret(r#"StringReplace[{"a", "b"}, "a" -> "x"]"#).unwrap(),
+      "{x, b}"
+    );
+  }
+}
+
+mod string_join_with_list {
+  use super::*;
+
+  #[test]
+  fn string_join_list_of_strings() {
+    assert_eq!(
+      interpret("StringJoin[{\"a\", \"b\", \"c\"}]").unwrap(),
+      "abc"
+    );
+  }
+
+  #[test]
+  fn string_join_empty_list() {
+    assert_eq!(interpret("StringJoin[{}]").unwrap(), "");
+  }
+
+  #[test]
+  fn string_join_no_args() {
+    // StringJoin[] is the empty string (matches wolframscript); this also
+    // lets `StringJoin @@ {}` fold to "" instead of erroring.
+    assert_eq!(interpret("StringJoin[]").unwrap(), "");
+    assert_eq!(interpret("StringJoin @@ {}").unwrap(), "");
+  }
+
+  #[test]
+  fn string_join_multiple_args() {
+    assert_eq!(
+      interpret("StringJoin[\"hello\", \" \", \"world\"]").unwrap(),
+      "hello world"
+    );
+  }
+
+  #[test]
+  fn string_join_infix_then_input_form() {
+    // Infix <> and postfix // InputForm — InputForm stays unevaluated and
+    // wraps the concatenated string.
+    assert_eq!(
+      interpret(r#""a" <> "b" <> "c" // InputForm"#).unwrap(),
+      "InputForm[abc]"
+    );
+  }
+
+  #[test]
+  fn string_join_with_table_result() {
+    // StringJoin with a Table that returns strings
+    assert_eq!(
+      interpret("StringJoin[Table[\"x\", {i, 3}]]").unwrap(),
+      "xxx"
+    );
+  }
+
+  #[test]
+  fn string_join_flattens_lists_in_multi_arg() {
+    // StringJoin should flatten list arguments when mixed with strings
+    assert_eq!(
+      interpret(r#"StringJoin["x", {"a", "b"}, "y"]"#).unwrap(),
+      "xaby"
+    );
+  }
+
+  #[test]
+  fn string_join_flattens_nested_lists() {
+    assert_eq!(
+      interpret(r#"StringJoin[{"a", {"b", "c"}}, "d"]"#).unwrap(),
+      "abcd"
+    );
+  }
+
+  #[test]
+  fn string_join_hello_world_with_nested_list_and_tail() {
+    assert_eq!(
+      interpret(r#"StringJoin[{"Hello", " ", {"world"}}, "!"]"#).unwrap(),
+      "Hello world!"
+    );
+  }
+
+  #[test]
+  fn string_join_in_rule_rhs() {
+    // StringJoin (<>) must parse correctly in the RHS of Rule inside a list
+    assert_eq!(
+      interpret(r#"StringReplace["hello", "ello" -> "i" <> " there"]"#)
+        .unwrap(),
+      "hi there"
+    );
+  }
+
+  #[test]
+  fn string_join_in_rule_delayed_rhs() {
+    // StringJoin (<>) must parse correctly in the RHS of RuleDelayed inside a list
+    assert_eq!(
+      interpret(r#"{"abc"} /. x_String :> "(" <> x <> ")""#).unwrap(),
+      "{(abc)}"
+    );
+  }
+}
+
+mod string_split_list_delimiters {
+  use super::*;
+
+  #[test]
+  fn multiple_delimiters() {
+    assert_eq!(
+      interpret("StringSplit[\"a!===b=!=c\", {\"==\", \"!=\", \"=\"}]")
+        .unwrap(),
+      "{a, , b, , c}"
+    );
+  }
+
+  #[test]
+  fn single_delimiter_in_list() {
+    assert_eq!(
+      interpret("StringSplit[\"a,b,c\", {\",\"}]").unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  // Like the single-delimiter form, a list of delimiters drops the empty
+  // pieces at the very start and end while keeping interior empties.
+  #[test]
+  fn drops_leading_and_trailing_empties() {
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", {\"1\", \"2\", \"3\"}]").unwrap(),
+      "{a, b, c}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"1a2b3\", {\"1\", \"2\", \"3\"}]").unwrap(),
+      "{a, b}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"xayb\", {\"x\", \"y\"}]").unwrap(),
+      "{a, b}"
+    );
+  }
+
+  #[test]
+  fn keeps_interior_empties() {
+    assert_eq!(
+      interpret("StringSplit[\"a1b22c3\", {\"1\", \"2\", \"3\"}]").unwrap(),
+      "{a, b, , c}"
+    );
+  }
+}
+
+// When an explicit maximum number of pieces is given, StringSplit does NOT
+// drop empty pieces, and the final piece keeps the original remainder
+// verbatim (the un-split tail of the string).
+mod string_split_max_parts {
+  use super::*;
+
+  #[test]
+  fn single_delimiter_keeps_empties() {
+    assert_eq!(
+      interpret("StringSplit[\",a,b,\", \",\", 5]").unwrap(),
+      "{, a, b, }"
+    );
+    assert_eq!(
+      interpret("StringSplit[\",a,b,\", \",\", 2]").unwrap(),
+      "{, a,b,}"
+    );
+  }
+
+  #[test]
+  fn single_delimiter_remainder_unsplit() {
+    assert_eq!(
+      interpret("StringSplit[\"a,b,c,d\", \",\", 2]").unwrap(),
+      "{a, b,c,d}"
+    );
+  }
+
+  #[test]
+  fn multiple_delimiters_remainder_keeps_original() {
+    // The tail "b2c3" must keep its original delimiters, not be rejoined
+    // with the first delimiter of the list.
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", {\"1\", \"2\", \"3\"}, 2]").unwrap(),
+      "{a, b2c3}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"1a2b3c\", {\"1\", \"2\", \"3\"}, 2]").unwrap(),
+      "{, a2b3c}"
+    );
+  }
+
+  #[test]
+  fn multiple_delimiters_exact_count_keeps_trailing_empty() {
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", {\"1\", \"2\", \"3\"}, 4]").unwrap(),
+      "{a, b, c, }"
+    );
+  }
+
+  // Without a max-parts argument the trailing empty is still dropped.
+  #[test]
+  fn no_max_parts_still_trims() {
+    assert_eq!(
+      interpret("StringSplit[\",a,b,\", \",\"]").unwrap(),
+      "{a, b}"
+    );
+  }
+}
+
+mod string_split_rule_delimiters {
+  use super::*;
+
+  #[test]
+  fn replace_fixed_string() {
+    assert_eq!(
+      interpret("StringSplit[\"a-b-c\", \"-\" -> \"+\"]").unwrap(),
+      "{a, +, b, +, c}"
+    );
+  }
+
+  #[test]
+  fn replace_rule_delayed() {
+    assert_eq!(
+      interpret("StringSplit[\"aXbXc\", \"X\" :> \"Y\"]").unwrap(),
+      "{a, Y, b, Y, c}"
+    );
+  }
+
+  #[test]
+  fn leading_and_trailing_delimiters() {
+    // Leading/trailing empty text segments are dropped, the replaced
+    // delimiters are kept.
+    assert_eq!(
+      interpret("StringSplit[\"-a-b-\", \"-\" -> \"+\"]").unwrap(),
+      "{+, a, +, b, +}"
+    );
+  }
+
+  #[test]
+  fn adjacent_delimiters_keep_inner_empty() {
+    assert_eq!(
+      interpret("StringSplit[\"a--b\", \"-\" -> \"+\"]").unwrap(),
+      "{a, +, , +, b}"
+    );
+  }
+
+  #[test]
+  fn no_match_returns_whole_string() {
+    assert_eq!(
+      interpret("StringSplit[\"abc\", \"-\" -> \"+\"]").unwrap(),
+      "{abc}"
+    );
+  }
+
+  #[test]
+  fn list_of_delimiters() {
+    assert_eq!(
+      interpret("StringSplit[\"a,b;c\", {\",\", \";\"} -> \"|\"]").unwrap(),
+      "{a, |, b, |, c}"
+    );
+  }
+
+  #[test]
+  fn character_class_delimiter() {
+    assert_eq!(
+      interpret("StringSplit[\"a1b22c\", DigitCharacter -> \"X\"]").unwrap(),
+      "{a, X, b, X, , X, c}"
+    );
+  }
+
+  #[test]
+  fn max_parts_limits_splits() {
+    assert_eq!(
+      interpret("StringSplit[\"a-b-c\", \"-\" -> \"+\", 2]").unwrap(),
+      "{a, +, b-c}"
+    );
+  }
+
+  #[test]
+  fn captured_delimiter_identity() {
+    assert_eq!(
+      interpret("StringSplit[\"aXbYc\", x : {\"X\", \"Y\"} :> x]").unwrap(),
+      "{a, X, b, Y, c}"
+    );
+  }
+
+  #[test]
+  fn captured_delimiter_transformed() {
+    assert_eq!(
+      interpret(
+        "StringSplit[\"a1b2c\", d : DigitCharacter :> \"<\" <> d <> \">\"]"
+      )
+      .unwrap(),
+      "{a, <1>, b, <2>, c}"
+    );
+  }
+
+  #[test]
+  fn threads_over_list_of_strings() {
+    assert_eq!(
+      interpret("StringSplit[{\"a-b\", \"c-d\"}, \"-\" -> \"/\"]").unwrap(),
+      "{{a, /, b}, {c, /, d}}"
+    );
+  }
+
+  // `x_`, `x__` and `x_?test` name their match just like `x : patt` does, so
+  // the right-hand side sees the delimiter text rather than a bare symbol.
+  #[test]
+  fn implicitly_named_blank_binds_the_delimiter() {
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", x_?LetterQ :> x]").unwrap(),
+      "{a, 1, b, 2, c, 3}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c\", x_?LetterQ :> ToUpperCase[x]]")
+        .unwrap(),
+      "{A, 1, B, 2, C}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b2\", x_?DigitQ :> \"[\" <> x <> \"]\"]")
+        .unwrap(),
+      "{a, [1], b, [2]}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b2\", x_ :> f[x]]").unwrap(),
+      "{f[a], , f[1], , f[b], , f[2]}"
+    );
+  }
+
+  #[test]
+  fn implicitly_named_blank_sequence_binds_the_whole_run() {
+    assert_eq!(
+      interpret("StringSplit[\"a1b22c\", x__?DigitQ :> {x}]").unwrap(),
+      "{a, {1}, b, {22}, c}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"ab12cd\", x__?DigitQ :> ToExpression[x]]")
+        .unwrap(),
+      "{ab, 12, cd}"
+    );
+  }
+
+  // A list may mix rules with bare delimiters; a bare delimiter inserts
+  // nothing between the pieces.
+  #[test]
+  fn list_of_rules() {
+    assert_eq!(
+      interpret("StringSplit[\"a-b_c\", {\"-\" -> \"+\", \"_\" -> \"=\"}]")
+        .unwrap(),
+      "{a, +, b, =, c}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"xaybz\", {\"a\" -> 1, \"b\" -> 2}]").unwrap(),
+      "{x, 1, y, 2, z}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b2\", {x_?DigitQ :> x, \"a\" -> \"A\"}]")
+        .unwrap(),
+      "{A, , 1, b, 2}"
+    );
+    assert_eq!(
+      interpret(
+        "StringSplit[\"a1b2c3\", {DigitCharacter :> \"D\", \"b\" -> \"B\"}]"
+      )
+      .unwrap(),
+      "{a, D, , B, , D, c, D}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a-b_c\", {\"-\", \"_\" -> \"=\"}]").unwrap(),
+      "{a, b, =, c}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b\", {DigitCharacter, \"a\" -> \"A\"}]")
+        .unwrap(),
+      "{A, , b}"
+    );
+  }
+
+  // Where two delimiters match at the same place the earlier rule wins, even
+  // when a later one would match more text.
+  #[test]
+  fn earlier_rule_wins_over_a_longer_later_match() {
+    assert_eq!(
+      interpret("StringSplit[\"ab\", {\"a\" -> 1, \"ab\" -> 2}]").unwrap(),
+      "{1, b}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"ab\", {\"ab\" -> 2, \"a\" -> 1}]").unwrap(),
+      "{2}"
+    );
+  }
+
+  // With an explicit maximum number of pieces, empty text segments at the
+  // ends survive — just as they do for plain delimiters.
+  #[test]
+  fn max_parts_keeps_the_edge_empties() {
+    assert_eq!(
+      interpret("StringSplit[\",a,b\", \",\" -> \"|\"]").unwrap(),
+      "{|, a, |, b}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\",a,b\", \",\" -> \"|\", 2]").unwrap(),
+      "{, |, a,b}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a,b,\", \",\" -> \"|\"]").unwrap(),
+      "{a, |, b, |}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a,b,\", \",\" -> \"|\", 5]").unwrap(),
+      "{a, |, b, |, }"
+    );
+    assert_eq!(
+      interpret("StringSplit[\",a,\", \",\" -> \"|\", 9]").unwrap(),
+      "{, |, a, |, }"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", x_?LetterQ :> x, 2]").unwrap(),
+      "{, a, 1b2c3}"
+    );
+    // A maximum larger than the number of pieces changes nothing.
+    assert_eq!(
+      interpret("StringSplit[\"a1b\", {x_?DigitQ :> x}, 5]").unwrap(),
+      "{a, 1, b}"
+    );
+  }
+}
+
+mod string_split_single_arg {
+  use super::*;
+
+  #[test]
+  fn split_by_whitespace() {
+    assert_eq!(
+      interpret("StringSplit[\"Wolfram Language is incredible\"]").unwrap(),
+      "{Wolfram, Language, is, incredible}"
+    );
+  }
+
+  #[test]
+  fn split_multiple_spaces() {
+    assert_eq!(
+      interpret("StringSplit[\"  hello   world  \"]").unwrap(),
+      "{hello, world}"
+    );
+  }
+
+  #[test]
+  fn split_single_word() {
+    assert_eq!(interpret("StringSplit[\"hello\"]").unwrap(), "{hello}");
+  }
+
+  #[test]
+  fn split_empty_string() {
+    assert_eq!(interpret("StringSplit[\"\"]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn split_with_tabs_and_newlines() {
+    assert_eq!(
+      interpret("StringSplit[\"a\\tb\\nc\"]").unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  #[test]
+  fn split_by_whitespace_character_keeps_empty_runs() {
+    assert_eq!(
+      interpret("StringSplit[\"  abc    123  \", WhitespaceCharacter]")
+        .unwrap(),
+      "{abc, , , , 123}"
+    );
+  }
+
+  #[test]
+  fn map_string_reverse_over_split() {
+    assert_eq!(
+      interpret(
+        "StringReverse /@ StringSplit[\"Wolfram Language is incredible\"]"
+      )
+      .unwrap(),
+      "{marfloW, egaugnaL, si, elbidercni}"
+    );
+  }
+
+  #[test]
+  fn string_reverse_threads_list() {
+    assert_eq!(
+      interpret(r#"StringReverse[{"abc", "def"}]"#).unwrap(),
+      "{cba, fed}"
+    );
+  }
+
+  #[test]
+  fn string_reverse_threads_nested_list() {
+    assert_eq!(
+      interpret(r#"StringReverse[{{"ab", "cd"}, {"ef"}}]"#).unwrap(),
+      "{{ba, dc}, {fe}}"
+    );
+  }
+
+  #[test]
+  fn string_reverse_non_string_emits_string_message() {
+    // A non-string argument stays unevaluated and emits StringReverse::string;
+    // it must NOT be coerced to a string (regression: used to return 5 / x).
+    let r = woxi::interpret_with_stdout("StringReverse[5]").unwrap();
+    assert_eq!(r.result, "StringReverse[5]");
+    assert!(
+      r.warnings.iter().any(|w| w.contains(
+        "StringReverse::string: String expected at position 1 in StringReverse[5]."
+      )),
+      "expected StringReverse::string, got {:?}",
+      r.warnings
+    );
+
+    let r = woxi::interpret_with_stdout("StringReverse[x]").unwrap();
+    assert_eq!(r.result, "StringReverse[x]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "StringReverse::string: String expected at position 1 in StringReverse[x]."
+    )));
+  }
+
+  #[test]
+  fn string_reverse_mixed_list_reports_per_element() {
+    // Listable: string elements reverse, non-string elements stay wrapped and
+    // each emits its own message referencing StringReverse[value].
+    let r = woxi::interpret_with_stdout(r#"StringReverse[{"ab", 5}]"#).unwrap();
+    assert_eq!(r.result, "{ba, StringReverse[5]}");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "StringReverse::string: String expected at position 1 in StringReverse[5]."
+    )));
+
+    let r = woxi::interpret_with_stdout("StringReverse[{5, 6}]").unwrap();
+    assert_eq!(r.result, "{StringReverse[5], StringReverse[6]}");
+    assert!(r.warnings.iter().any(|w| w.contains("StringReverse[5]")));
+    assert!(r.warnings.iter().any(|w| w.contains("StringReverse[6]")));
+  }
+
+  #[test]
+  fn characters_single_string() {
+    assert_eq!(interpret(r#"Characters["abc"]"#).unwrap(), "{a, b, c}");
+  }
+
+  #[test]
+  fn characters_threads_list() {
+    assert_eq!(
+      interpret(r#"Characters[{"abc", "de"}]"#).unwrap(),
+      "{{a, b, c}, {d, e}}"
+    );
+  }
+
+  #[test]
+  fn characters_empty_string() {
+    assert_eq!(interpret(r#"Characters[""]"#).unwrap(), "{}");
+  }
+
+  // Only a string (or list of strings) yields characters; any other
+  // expression stays unevaluated, matching wolframscript.
+  #[test]
+  fn characters_nonstring_stays_unevaluated() {
+    assert_eq!(interpret("Characters[123]").unwrap(), "Characters[123]");
+    assert_eq!(interpret("Characters[1.5]").unwrap(), "Characters[1.5]");
+    assert_eq!(interpret("Characters[a]").unwrap(), "Characters[a]");
+    assert_eq!(interpret("Characters[x + y]").unwrap(), "Characters[x + y]");
+  }
+
+  // List threading leaves non-string elements as unevaluated Characters[...].
+  #[test]
+  fn characters_threads_with_nonstring_element() {
+    assert_eq!(
+      interpret(r#"Characters[{"ab", 5}]"#).unwrap(),
+      "{{a, b}, Characters[5]}"
+    );
+  }
+
+  #[test]
+  fn to_upper_case_single_string() {
+    assert_eq!(interpret(r#"ToUpperCase["abc"]"#).unwrap(), "ABC");
+  }
+
+  #[test]
+  fn to_upper_case_threads_list() {
+    assert_eq!(
+      interpret(r#"ToUpperCase[{"abc", "def"}]"#).unwrap(),
+      "{ABC, DEF}"
+    );
+  }
+
+  #[test]
+  fn to_lower_case_single_string() {
+    assert_eq!(interpret(r#"ToLowerCase["ABC"]"#).unwrap(), "abc");
+  }
+
+  #[test]
+  fn to_lower_case_threads_list() {
+    assert_eq!(
+      interpret(r#"ToLowerCase[{"ABC", "Def"}]"#).unwrap(),
+      "{abc, def}"
+    );
+  }
+
+  #[test]
+  fn to_upper_case_threads_nested_list() {
+    assert_eq!(
+      interpret(r#"ToUpperCase[{{"ab", "cd"}, "ef"}]"#).unwrap(),
+      "{{AB, CD}, EF}"
+    );
+  }
+
+  #[test]
+  fn to_upper_case_non_string_stays_unevaluated() {
+    // Only strings are transformed. A symbol must NOT have its name uppercased
+    // (regression: ToUpperCase[x] used to return X); numbers and reals echo.
+    assert_eq!(interpret("ToUpperCase[x]").unwrap(), "ToUpperCase[x]");
+    assert_eq!(interpret("ToUpperCase[5]").unwrap(), "ToUpperCase[5]");
+    assert_eq!(interpret("ToUpperCase[3.5]").unwrap(), "ToUpperCase[3.5]");
+    assert_eq!(interpret("ToLowerCase[x]").unwrap(), "ToLowerCase[x]");
+    assert_eq!(interpret("ToLowerCase[5]").unwrap(), "ToLowerCase[5]");
+  }
+
+  #[test]
+  fn to_upper_case_threads_over_mixed_list() {
+    // Non-string elements stay wrapped per element, matching Wolfram.
+    assert_eq!(
+      interpret("ToUpperCase[{1, 2}]").unwrap(),
+      "{ToUpperCase[1], ToUpperCase[2]}"
+    );
+    assert_eq!(
+      interpret(r#"ToUpperCase[{"a", 1}]"#).unwrap(),
+      "{A, ToUpperCase[1]}"
+    );
+  }
+}
+
+mod string_split_regex {
+  use super::*;
+
+  #[test]
+  fn split_by_regex_whitespace() {
+    assert_eq!(
+      interpret(
+        r#"StringSplit["hello  world  foo", RegularExpression["\\s+"]]"#
+      )
+      .unwrap(),
+      "{hello, world, foo}"
+    );
+  }
+
+  #[test]
+  fn split_by_regex_non_word() {
+    assert_eq!(
+      interpret(
+        r#"StringSplit["Four score and seven", RegularExpression["\\W+"]]"#
+      )
+      .unwrap(),
+      "{Four, score, and, seven}"
+    );
+  }
+
+  #[test]
+  fn split_by_regex_with_ignore_case() {
+    assert_eq!(
+      interpret(r#"StringSplit["helloXworldxfoo", RegularExpression["x"], IgnoreCase -> True]"#).unwrap(),
+      "{hello, world, foo}"
+    );
+  }
+
+  #[test]
+  fn split_by_regex_ignore_case_false() {
+    assert_eq!(
+      interpret(r#"StringSplit["helloXworldxfoo", RegularExpression["x"], IgnoreCase -> False]"#).unwrap(),
+      "{helloXworld, foo}"
+    );
+  }
+
+  #[test]
+  fn split_by_regex_digits() {
+    assert_eq!(
+      interpret(r#"StringSplit["abc123def456ghi", RegularExpression["\\d+"]]"#)
+        .unwrap(),
+      "{abc, def, ghi}"
+    );
+  }
+
+  #[test]
+  fn gettysburg_example() {
+    assert_eq!(
+      interpret(r#"SortBy[StringSplit["Four score and seven years ago our fathers brought forth", RegularExpression["\\W+"]], StringLength]"#).unwrap(),
+      "{ago, and, our, Four, forth, score, seven, years, brought, fathers}"
+    );
+  }
+
+  // StartOfLine and EndOfLine are zero-width anchors — splitting by them
+  // produces segments that start / end with a newline depending on which
+  // side of the anchor the newline falls on.
+  #[test]
+  fn split_by_end_of_line() {
+    assert_eq!(
+      interpret("StringSplit[\"abc\\ndef\\nhij\", EndOfLine]").unwrap(),
+      "{abc, \ndef, \nhij}"
+    );
+  }
+
+  #[test]
+  fn split_by_start_of_line() {
+    assert_eq!(
+      interpret("StringSplit[\"abc\\ndef\\nhij\", StartOfLine]").unwrap(),
+      "{abc\n, def\n, hij}"
+    );
+  }
+}
+
+mod string_replace {
+  use super::*;
+
+  // A replacement that produces a non-string value yields a StringExpression
+  // (mixed content), not a coerced string. Adjacent string segments coalesce.
+  // Verified against wolframscript:
+  //   StringReplace["abc", "b" -> 5]                = StringExpression[a, 5, c]
+  //   StringReplace["12:34", n:DigitCharacter.. :> StringLength[n]]
+  //                                                 = StringExpression[2, :, 2]
+  #[test]
+  fn non_string_replacement_yields_string_expression() {
+    // Immediate rule with a non-string RHS.
+    assert_eq!(
+      interpret(r#"StringReplace["abc", "b" -> 5]"#).unwrap(),
+      "StringExpression[a, 5, c]"
+    );
+    assert_eq!(
+      interpret(r#"Head[StringReplace["abc", "b" -> 5]]"#).unwrap(),
+      "StringExpression"
+    );
+    // Adjacent literal + string replacement coalesce (Z and d -> "Zd").
+    assert_eq!(
+      interpret(r#"StringReplace["abcd", {"b" -> 5, "c" -> "Z"}]"#).unwrap(),
+      "StringExpression[a, 5, Zd]"
+    );
+    // Two non-strings with nothing between them stay separate.
+    assert_eq!(
+      interpret(r#"StringReplace["aa", "a" -> 5]"#).unwrap(),
+      "StringExpression[5, 5]"
+    );
+    // Delayed rule whose RHS evaluates to an integer.
+    assert_eq!(
+      interpret(
+        r#"StringReplace["12:34", n:DigitCharacter.. :> StringLength[n]]"#
+      )
+      .unwrap(),
+      "StringExpression[2, :, 2]"
+    );
+    // A single non-string segment is still wrapped in StringExpression.
+    assert_eq!(
+      interpret(
+        r#"StringReplace["12", n:DigitCharacter.. :> StringLength[n]]"#
+      )
+      .unwrap(),
+      "StringExpression[2]"
+    );
+    // An all-string replacement still returns a plain String (unchanged).
+    assert_eq!(
+      interpret(r#"StringReplace["abc", "b" -> "X"]"#).unwrap(),
+      "aXc"
+    );
+    // InputForm of a single-element StringExpression keeps the head literal
+    // (there is no infix `~~` form for a lone operand); 2+ elements use `~~`.
+    assert_eq!(
+      interpret("ToString[StringExpression[2], InputForm]").unwrap(),
+      "StringExpression[2]"
+    );
+    assert_eq!(
+      interpret("ToString[StringExpression[2, 3], InputForm]").unwrap(),
+      "2~~3"
+    );
+  }
+
+  // A delayed rule (:>) must evaluate its RHS for each match, even when the
+  // RHS is a constant expression that does not reference the matched text.
+  #[test]
+  fn delayed_constant_rhs_is_evaluated() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["aAbB", LetterCharacter :> ToUpperCase["x"]]"#
+      )
+      .unwrap(),
+      "XXXX"
+    );
+    assert_eq!(
+      interpret(r#"StringReplace["a1b2", DigitCharacter :> ToString[1 + 1]]"#)
+        .unwrap(),
+      "a2b2"
+    );
+    // Same for a literal-string pattern with a delayed RHS.
+    assert_eq!(
+      interpret(r#"StringReplace["aa", "a" :> ToString[1 + 1]]"#).unwrap(),
+      "22"
+    );
+  }
+
+  // A delayed rule whose RHS references the matched pattern variable.
+  #[test]
+  fn delayed_rhs_uses_match() {
+    assert_eq!(
+      interpret(r#"StringReplace["abc", c_ :> ToUpperCase[c]]"#).unwrap(),
+      "ABC"
+    );
+    assert_eq!(
+      interpret(r#"StringReplace["abc", x_ :> x <> x]"#).unwrap(),
+      "aabbcc"
+    );
+  }
+
+  // A delayed rule whose RHS is already a string stays literal.
+  #[test]
+  fn delayed_literal_string_rhs() {
+    assert_eq!(
+      interpret(r#"StringReplace["aaa", "a" :> "b"]"#).unwrap(),
+      "bbb"
+    );
+  }
+
+  // RegularExpression replacements expand $0/$1/… to capture groups.
+  #[test]
+  fn regex_capture_group_backreferences() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["2024-01-15", RegularExpression["(\\d+)-(\\d+)-(\\d+)"] -> "$3/$2/$1"]"#
+      )
+      .unwrap(),
+      "15/01/2024"
+    );
+    assert_eq!(
+      interpret(
+        r#"StringReplace["John Smith", RegularExpression["(\\w+) (\\w+)"] -> "$2, $1"]"#
+      )
+      .unwrap(),
+      "Smith, John"
+    );
+    assert_eq!(
+      interpret(
+        r#"StringReplace["hello", RegularExpression["(l+)"] -> "[$1]"]"#
+      )
+      .unwrap(),
+      "he[ll]o"
+    );
+  }
+
+  // A delayed rule (:>) with a plain-string replacement expands $n
+  // backreferences just like an immediate rule (->) — the constant RHS
+  // makes the delayed/immediate distinction irrelevant.
+  #[test]
+  fn regex_backreferences_with_delayed_rule() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["abc", RegularExpression["(a)(b)"] :> "$2$1"]"#
+      )
+      .unwrap(),
+      "bac"
+    );
+    assert_eq!(
+      interpret(
+        r#"StringReplace["2024-01-15", RegularExpression["(\\d+)-(\\d+)-(\\d+)"] :> "$3/$2/$1"]"#
+      )
+      .unwrap(),
+      "15/01/2024"
+    );
+    // A delayed rule whose RHS must be evaluated per match still works.
+    assert_eq!(
+      interpret(
+        r#"StringReplace["hello", RegularExpression["l"] :> ToUpperCase["l"]]"#
+      )
+      .unwrap(),
+      "heLLo"
+    );
+  }
+
+  #[test]
+  fn regex_dollar_zero_is_whole_match() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["abc", RegularExpression["(a)(b)(c)"] -> "$0"]"#
+      )
+      .unwrap(),
+      "abc"
+    );
+  }
+
+  // A lone `$` (and `$$`) is literal; a missing group expands to nothing.
+  #[test]
+  fn regex_dollar_edge_cases() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["price: 100", RegularExpression["(\\d+)"] -> "$$$1"]"#
+      )
+      .unwrap(),
+      "price: $$100"
+    );
+    assert_eq!(
+      interpret(r#"StringReplace["abc", RegularExpression["b"] -> "X$1Y"]"#)
+        .unwrap(),
+      "aXYc"
+    );
+  }
+
+  // A literal (non-RegularExpression) pattern keeps `$n` verbatim.
+  #[test]
+  fn literal_pattern_keeps_dollar_verbatim() {
+    assert_eq!(
+      interpret(r#"StringReplace["abc", "b" -> "$1"]"#).unwrap(),
+      "a$1c"
+    );
+    assert_eq!(
+      interpret(r#"StringReplace["aaa", "a" -> "$0"]"#).unwrap(),
+      "$0$0$0"
+    );
+  }
+
+  #[test]
+  fn shortest_in_string_expression_is_lazy() {
+    // Shortest[___] in the middle of a StringExpression must match lazily, so
+    // each /*…*/ is stripped separately (not first /* to last */).
+    assert_eq!(
+      interpret(
+        "StringReplace[\"x/*a*/y/*b*/z\", \"/*\" ~~ Shortest[___] ~~ \"*/\" -> \"\"]"
+      )
+      .unwrap(),
+      "xyz"
+    );
+  }
+
+  #[test]
+  fn literal_star_inside_string_expression() {
+    // `*` is a wildcard only in a bare string; inside `~~` it is literal.
+    // "xAAy" has no literal `*`, so nothing is replaced.
+    assert_eq!(
+      interpret("StringReplace[\"xAAy\", \"x\" ~~ \"*\" ~~ \"y\" -> \"Z\"]")
+        .unwrap(),
+      "xAAy"
+    );
+    // A bare string keeps the `*` wildcard shorthand.
+    assert_eq!(
+      interpret("StringMatchQ[\"aXXb\", \"a*b\"]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn blank_pattern_matches_across_newlines() {
+    // Blanks (`___`/`__`/`_`) in string patterns match newlines too (dotall),
+    // matching Wolfram — e.g. a block comment spanning lines.
+    assert_eq!(
+      interpret(
+        "StringReplace[\"a/*x\\ny*/b\", \"/*\" ~~ ___ ~~ \"*/\" -> \"\"]"
+      )
+      .unwrap(),
+      "ab"
+    );
+  }
+
+  #[test]
+  fn single_rule() {
+    assert_eq!(
+      interpret(r#"StringReplace["hello world", "world" -> "planet"]"#)
+        .unwrap(),
+      "hello planet"
+    );
+  }
+
+  #[test]
+  fn list_of_rules() {
+    assert_eq!(
+        interpret(r#"StringReplace["hello world", {"hello" -> "goodbye", "world" -> "planet"}]"#)
+          .unwrap(),
+        "goodbye planet"
+      );
+  }
+
+  #[test]
+  fn alternatives_pattern() {
+    // "1" | "2" matches either "1" or "2" — replace each with "X".
+    assert_eq!(
+      interpret(r#"StringReplace["0123 3210", "1" | "2" -> "X"]"#).unwrap(),
+      "0XX3 3XX0"
+    );
+  }
+
+  #[test]
+  fn replace_all_occurrences() {
+    assert_eq!(
+      interpret(r#"StringReplace["abcabc", "a" -> "x"]"#).unwrap(),
+      "xbcxbc"
+    );
+  }
+
+  #[test]
+  fn replace_with_empty() {
+    assert_eq!(
+      interpret(r#"StringReplace["hello", "l" -> ""]"#).unwrap(),
+      "heo"
+    );
+  }
+
+  #[test]
+  fn no_match() {
+    assert_eq!(
+      interpret(r#"StringReplace["hello", "xyz" -> "abc"]"#).unwrap(),
+      "hello"
+    );
+  }
+
+  #[test]
+  fn named_pattern_rule_delayed() {
+    // RuleDelayed with named pattern variable and function application
+    assert_eq!(
+      interpret(r#"StringReplace["hello world", " " ~~ x_ :> ToUpperCase[x]]"#)
+        .unwrap(),
+      "helloWorld"
+    );
+  }
+
+  #[test]
+  fn named_pattern_rule() {
+    // Rule with named pattern variable — substitutes matched string
+    assert_eq!(
+      interpret(r#"StringReplace["hello world", " " ~~ x_ -> x]"#).unwrap(),
+      "helloworld"
+    );
+  }
+
+  #[test]
+  fn named_pattern_multiple_matches() {
+    // Multiple matches with delayed replacement
+    assert_eq!(
+      interpret(r#"StringReplace["the cat sat", " " ~~ x_ :> ToUpperCase[x]]"#)
+        .unwrap(),
+      "theCatSat"
+    );
+  }
+
+  #[test]
+  fn named_character_in_pattern_and_target() {
+    // \[CirclePlus] is a named character in both the subject and the pattern;
+    // wolframscript rewrites the Unicode ⊕ glyph to the literal "x".
+    assert_eq!(
+      interpret(
+        r#"StringReplace["product: A \[CirclePlus] B", "\[CirclePlus]" -> "x"]"#
+      )
+      .unwrap(),
+      "product: A x B"
+    );
+  }
+
+  /// The slanted comparison family. A Demonstration labels its relation
+  /// with `\[LessSlantEqual]`, which used to survive as the literal escape
+  /// text because the name was missing from the character table. The
+  /// negated pair lives in Wolfram's private use area.
+  #[test]
+  fn slanted_comparison_named_characters() {
+    for (name, code) in [
+      ("LessSlantEqual", 0x2A7D),
+      ("GreaterSlantEqual", 0x2A7E),
+      ("NotLessSlantEqual", 0xF424),
+      ("NotGreaterSlantEqual", 0xF429),
+      ("LessFullEqual", 0x2266),
+      ("GreaterFullEqual", 0x2267),
+      ("NotLessEqual", 0x2270),
+      ("NotGreaterEqual", 0x2271),
+      ("LessTilde", 0x2272),
+      ("GreaterTilde", 0x2273),
+      ("LessEqualGreater", 0x22DA),
+      ("GreaterEqualLess", 0x22DB),
+    ] {
+      assert_eq!(
+        interpret(&format!(r#"ToCharacterCode["\[{name}]"]"#)).unwrap(),
+        format!("{{{code}}}"),
+        "wrong code point for \\[{name}]"
+      );
+      assert_eq!(
+        interpret(&format!(r#""a \[{name}] b""#)).unwrap(),
+        format!("a {} b", char::from_u32(code).unwrap()),
+        "\\[{name}] did not decode in a string"
+      );
+    }
+  }
+
+  #[test]
+  fn named_pattern_rule_valued_rhs() {
+    // The RHS of a `:>` rule may itself be a rule (w -> d); the named
+    // pattern variables must be substituted on both sides of it.
+    assert_eq!(
+      interpret(
+        r#"StringCases["x=1, y=2", w:WordCharacter ~~ "=" ~~ d:DigitCharacter :> w -> d]"#
+      )
+      .unwrap(),
+      "{x -> 1, y -> 2}"
+    );
+  }
+
+  #[test]
+  fn named_pattern_comparison_rhs() {
+    // A comparison RHS likewise has its pattern variables substituted; here
+    // "x" == "1" evaluates to False (unsubstituted it would stay `w == d`).
+    assert_eq!(
+      interpret(
+        r#"StringCases["x=1", w:WordCharacter ~~ "=" ~~ d:DigitCharacter :> w == d]"#
+      )
+      .unwrap(),
+      "{False}"
+    );
+  }
+
+  #[test]
+  fn named_pattern_delayed_rule_valued_rhs() {
+    // A delayed-rule (:>) RHS nested inside the outer rule also substitutes.
+    assert_eq!(
+      interpret(
+        r#"StringCases["x=1, y=2", w:WordCharacter ~~ "=" ~~ d:DigitCharacter :> (w :> d)]"#
+      )
+      .unwrap(),
+      "{x :> 1, y :> 2}"
+    );
+  }
+
+  // IgnoreCase -> True makes a literal pattern match regardless of case.
+  #[test]
+  fn ignore_case_single_rule() {
+    assert_eq!(
+      interpret(r#"StringReplace["aAbB", "a" -> "1", IgnoreCase -> True]"#)
+        .unwrap(),
+      "11bB"
+    );
+  }
+
+  #[test]
+  fn ignore_case_multichar_literal() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["ABC abc", "abc" -> "X", IgnoreCase -> True]"#
+      )
+      .unwrap(),
+      "X X"
+    );
+  }
+
+  #[test]
+  fn ignore_case_multiple_rules() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["aAbB", {"a" -> "1", "b" -> "2"}, IgnoreCase -> True]"#
+      )
+      .unwrap(),
+      "1122"
+    );
+  }
+
+  // IgnoreCase also applies to alternatives and other compound patterns.
+  #[test]
+  fn ignore_case_alternatives() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["abcABC", "b" | "c" -> "_", IgnoreCase -> True]"#
+      )
+      .unwrap(),
+      "a__A__"
+    );
+  }
+
+  // The replacement limit and the IgnoreCase option can be combined.
+  #[test]
+  fn ignore_case_with_limit() {
+    assert_eq!(
+      interpret(r#"StringReplace["aAaA", "a" -> "x", 2, IgnoreCase -> True]"#)
+        .unwrap(),
+      "xxaA"
+    );
+  }
+
+  // IgnoreCase -> False keeps the default case-sensitive behaviour.
+  #[test]
+  fn ignore_case_false_is_case_sensitive() {
+    assert_eq!(
+      interpret(r#"StringReplace["aAbB", "a" -> "1", IgnoreCase -> False]"#)
+        .unwrap(),
+      "1AbB"
+    );
+  }
+}
+
+mod to_character_code {
+  use super::*;
+
+  #[test]
+  fn basic_string() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["Hello"]"#).unwrap(),
+      "{72, 101, 108, 108, 111}"
+    );
+  }
+
+  #[test]
+  fn empty_string() {
+    assert_eq!(interpret(r#"ToCharacterCode[""]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn single_char() {
+    assert_eq!(interpret(r#"ToCharacterCode["A"]"#).unwrap(), "{65}");
+  }
+
+  #[test]
+  fn digits() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["0123"]"#).unwrap(),
+      "{48, 49, 50, 51}"
+    );
+  }
+
+  /// `\[InvisiblePrefixScriptBase]` and `\[InvisiblePostfixScriptBase]` are
+  /// the placeholders the FrontEnd hangs a prefix or postfix script on
+  /// (`\!\(\*SuperscriptBox[\(\[InvisiblePrefixScriptBase]\), \(1\)]\)Σ`
+  /// is `¹Σ`). They draw no glyph, but they are characters like any other:
+  /// they live at U+F3B3 / U+F3B4 and `StringLength` counts them.
+  /// Regression: unrecognised, they printed their own names into a
+  /// Demonstration's control labels.
+  #[test]
+  fn invisible_script_base_chars_are_private_use_characters() {
+    assert_eq!(
+      interpret(
+        r#"ToCharacterCode["\[InvisiblePrefixScriptBase]\[CapitalSigma]\[InvisiblePostfixScriptBase]"]"#
+      )
+      .unwrap(),
+      "{62387, 931, 62388}"
+    );
+    assert_eq!(
+      interpret(r#"StringLength["\[InvisiblePrefixScriptBase]x"]"#).unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn greek_named_chars() {
+    // \[Alpha]\[Beta]\[Gamma] → Unicode code points 945, 946, 947.
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[Alpha]\[Beta]\[Gamma]"]"#).unwrap(),
+      "{945, 946, 947}"
+    );
+  }
+
+  /// Wolfram's pictograph, accidental and astronomical named characters are
+  /// single characters, not the escapes they are written with. A
+  /// Demonstration that warns about a slow option writes `\[WarningSign]`
+  /// into its label, and it has to reach the widget as the sign. Several of
+  /// them are private-use characters rather than the standard Unicode
+  /// look-alike: `\[WarningSign]` is U+F725, not U+26A0 (⚠), and
+  /// `\[Earth]` is U+F3DF, not U+2641 (♁).
+  // A `\[Name]` Wolfram has no character for is reported by the reader and
+  // left in the string exactly as written, so nothing is invented.
+  #[test]
+  fn an_unknown_long_name_is_reported_and_kept_verbatim() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode[{"\[Tab]", "\[RawTab]"}]"#).unwrap(),
+      "{{92, 91, 84, 97, 98, 93}, {9}}"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs
+        .iter()
+        .any(|m| m.contains("Syntax::sntufn: Unknown unicode longname Tab.")),
+      "expected sntufn message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn pictograph_and_astronomical_named_chars() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[WarningSign]\[Checkmark]"]"#).unwrap(),
+      "{63269, 10003}"
+    );
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[Sharp]\[Flat]\[Natural]"]"#).unwrap(),
+      "{9839, 9837, 9838}"
+    );
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[Sun]\[Venus]\[Earth]\[Mars]"]"#).unwrap(),
+      "{9737, 9792, 62431, 9794}"
+    );
+    // `\[Uranus]` is the astronomical ⛢ (U+26E2), not the astrological ♅.
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[Mercury]\[Jupiter]\[Uranus]"]"#).unwrap(),
+      "{9791, 9795, 9954}"
+    );
+    assert_eq!(interpret(r#"StringLength["\[WarningSign]"]"#).unwrap(), "1");
+  }
+
+  /// The script alphabet lives in Wolfram's private use area, except for the
+  /// letters Unicode already has among the letterlike symbols (ℬ, ℯ, ℓ, …).
+  /// It is *not* the Mathematical Alphanumeric Symbols block.
+  #[test]
+  fn script_letters_are_wolframs_own_alphabet() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[ScriptCapitalA]\[ScriptCapitalB]"]"#)
+        .unwrap(),
+      "{63344, 8492}"
+    );
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[ScriptX]\[ScriptL]"]"#).unwrap(),
+      "{63177, 8467}"
+    );
+  }
+
+  /// The typeset operators and the letterlike constants keep the private-use
+  /// code points Wolfram stores them at, so a string built from them
+  /// compares equal to the same string written in a notebook.
+  #[test]
+  fn typeset_operator_named_chars_are_private_use() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[Equal]\[Rule]\[Cross]"]"#).unwrap(),
+      "{62513, 62754, 62624}"
+    );
+    assert_eq!(
+      interpret(
+        r#"ToCharacterCode["\[ExponentialE]\[ImaginaryI]\[ImaginaryJ]\[DifferentialD]"]"#
+      )
+      .unwrap(),
+      "{63309, 63310, 63311, 63308}"
+    );
+    // The double brackets are the ones `ToBoxes` writes a `Part` with.
+    assert_eq!(
+      interpret(
+        r#"ToCharacterCode["\[LeftDoubleBracket]\[RightDoubleBracket]"]"#
+      )
+      .unwrap(),
+      "{12314, 12315}"
+    );
+    assert_eq!(
+      interpret(
+        r#"ToCharacterCode["\[LeftAngleBracket]\[RightAngleBracket]"]"#
+      )
+      .unwrap(),
+      "{9001, 9002}"
+    );
+  }
+
+  /// A name Wolfram has no character for is not invented: the escape stays
+  /// in the string as the characters it is written with. `\[Tab]`,
+  /// `\[Male]`, `\[Female]` and `\[Registered]` are such names — the
+  /// characters they look like are `\[RawTab]`, `\[Mars]`, `\[Venus]` and
+  /// `\[RegisteredTrademark]`.
+  #[test]
+  fn unknown_named_chars_stay_literal() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[Tab]"]"#).unwrap(),
+      "{92, 91, 84, 97, 98, 93}"
+    );
+    assert_eq!(interpret(r#"StringLength["\[Male]"]"#).unwrap(), "7");
+    assert_eq!(
+      interpret(r#"ToCharacterCode["\[RawTab]\[RegisteredTrademark]"]"#)
+        .unwrap(),
+      "{9, 174}"
+    );
+  }
+
+  // With an explicit "UTF8" encoding, multi-byte characters are returned
+  // as their underlying byte sequence (two bytes for ä).
+  #[test]
+  fn utf8_encoding_returns_bytes() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["ä", "UTF8"]"#).unwrap(),
+      "{195, 164}"
+    );
+  }
+
+  // With an ASCII-compatible single-byte encoding like ISO8859-1, the
+  // codepoint itself fits and is returned directly.
+  #[test]
+  fn iso8859_1_encoding_single_byte() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode["ä", "ISO8859-1"]"#).unwrap(),
+      "{228}"
+    );
+  }
+
+  // A list containing a non-string is a type error — wolframscript emits
+  // ToCharacterCode::strse and returns the call unchanged.
+  #[test]
+  fn mixed_list_stays_unevaluated() {
+    assert_eq!(
+      interpret(r#"ToCharacterCode[{"ab", x}]"#).unwrap(),
+      "ToCharacterCode[{ab, x}]"
+    );
+  }
+
+  #[test]
+  fn non_string_single_arg_stays_unevaluated() {
+    assert_eq!(
+      interpret("ToCharacterCode[42]").unwrap(),
+      "ToCharacterCode[42]"
+    );
+  }
+}
+
+mod from_character_code {
+  use super::*;
+
+  #[test]
+  fn list_of_codes() {
+    assert_eq!(
+      interpret("FromCharacterCode[{72, 101, 108, 108, 111}]").unwrap(),
+      "Hello"
+    );
+  }
+
+  #[test]
+  fn single_code() {
+    assert_eq!(interpret("FromCharacterCode[65]").unwrap(), "A");
+  }
+
+  #[test]
+  fn roundtrip() {
+    assert_eq!(
+      interpret(r#"FromCharacterCode[ToCharacterCode["Test"]]"#).unwrap(),
+      "Test"
+    );
+  }
+
+  // A second CharacterEncoding argument is accepted — for ASCII-compatible
+  // encodings like ISO8859-1, the result is identical to the single-arg form
+  // because the codepoints are already Unicode.
+  #[test]
+  fn with_character_encoding_option() {
+    assert_eq!(
+      interpret(r#"FromCharacterCode[228, "ISO8859-1"]"#).unwrap(),
+      "ä"
+    );
+    assert_eq!(
+      interpret(r#"FromCharacterCode[{228, 246}, "UTF-8"]"#).unwrap(),
+      "äö"
+    );
+  }
+
+  #[test]
+  fn utf8_decodes_byte_sequences() {
+    // With a UTF-8 encoding the integers are bytes: a multi-byte sequence
+    // decodes to a single character (not one code point per byte).
+    assert_eq!(
+      interpret(r#"FromCharacterCode[{195, 169}, "UTF8"]"#).unwrap(),
+      "é"
+    );
+    assert_eq!(
+      interpret(r#"FromCharacterCode[{226, 130, 172}, "UTF8"]"#).unwrap(),
+      "€"
+    );
+    // ASCII bytes are unchanged.
+    assert_eq!(
+      interpret(r#"FromCharacterCode[{72, 105}, "UTF8"]"#).unwrap(),
+      "Hi"
+    );
+    // Without an encoding the integers are code points (no decoding).
+    assert_eq!(interpret("FromCharacterCode[{195, 169}]").unwrap(), "Ã©");
+  }
+}
+
+mod character_range {
+  use super::*;
+
+  #[test]
+  fn lowercase() {
+    assert_eq!(
+      interpret(r#"CharacterRange["a", "z"]"#).unwrap(),
+      "{a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z}"
+    );
+  }
+
+  #[test]
+  fn uppercase() {
+    assert_eq!(
+      interpret(r#"CharacterRange["A", "F"]"#).unwrap(),
+      "{A, B, C, D, E, F}"
+    );
+  }
+
+  #[test]
+  fn digits() {
+    assert_eq!(
+      interpret(r#"CharacterRange["0", "9"]"#).unwrap(),
+      "{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}"
+    );
+  }
+
+  #[test]
+  fn empty_range() {
+    assert_eq!(interpret(r#"CharacterRange["z", "a"]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn single_char() {
+    assert_eq!(interpret(r#"CharacterRange["m", "m"]"#).unwrap(), "{m}");
+  }
+
+  // Integer endpoints are character codes (not stringified): CharacterRange
+  // [97, 99] -> {"a", "b", "c"} (regression: it previously gave {"9"}).
+  #[test]
+  fn integer_codes_ascii() {
+    assert_eq!(interpret("CharacterRange[97, 99]").unwrap(), "{a, b, c}");
+    assert_eq!(
+      interpret("CharacterRange[48, 57]").unwrap(),
+      "{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}"
+    );
+  }
+
+  #[test]
+  fn integer_codes_greek() {
+    assert_eq!(
+      interpret("CharacterRange[945, 949]").unwrap(),
+      "{α, β, γ, δ, ε}"
+    );
+  }
+
+  #[test]
+  fn integer_codes_empty_range() {
+    assert_eq!(interpret("CharacterRange[99, 97]").unwrap(), "{}");
+  }
+
+  // wolframscript requires both endpoints to be the same kind; a mixed
+  // string/integer call is left unevaluated.
+  #[test]
+  fn mixed_types_unevaluated() {
+    assert_eq!(
+      interpret(r#"CharacterRange["a", 99]"#).unwrap(),
+      "CharacterRange[a, 99]"
+    );
+    assert_eq!(
+      interpret(r#"CharacterRange[97, "c"]"#).unwrap(),
+      "CharacterRange[97, c]"
+    );
+  }
+}
+
+// CharacterName gives the Wolfram Language name of a character. Values
+// verified against wolframscript.
+mod character_name {
+  use super::*;
+
+  #[test]
+  fn letters() {
+    assert_eq!(
+      interpret(r#"CharacterName["a"]"#).unwrap(),
+      "LatinSmallLetterA"
+    );
+    assert_eq!(
+      interpret(r#"CharacterName["A"]"#).unwrap(),
+      "LatinCapitalLetterA"
+    );
+    assert_eq!(
+      interpret(r#"CharacterName["z"]"#).unwrap(),
+      "LatinSmallLetterZ"
+    );
+  }
+
+  #[test]
+  fn digits() {
+    assert_eq!(interpret(r#"CharacterName["1"]"#).unwrap(), "DigitOne");
+    assert_eq!(interpret(r#"CharacterName["0"]"#).unwrap(), "DigitZero");
+    assert_eq!(interpret(r#"CharacterName["9"]"#).unwrap(), "DigitNine");
+  }
+
+  #[test]
+  fn punctuation() {
+    assert_eq!(interpret(r#"CharacterName[" "]"#).unwrap(), "RawSpace");
+    assert_eq!(
+      interpret(r#"CharacterName["!"]"#).unwrap(),
+      "RawExclamation"
+    );
+    assert_eq!(interpret(r#"CharacterName["+"]"#).unwrap(), "RawPlus");
+    assert_eq!(interpret(r#"CharacterName["@"]"#).unwrap(), "RawAt");
+    assert_eq!(
+      interpret(r#"CharacterName["["]"#).unwrap(),
+      "RawLeftBracket"
+    );
+  }
+
+  #[test]
+  fn character_code_argument() {
+    // An integer is treated as a character code.
+    assert_eq!(interpret("CharacterName[97]").unwrap(), "LatinSmallLetterA");
+  }
+
+  #[test]
+  fn multi_character_string_threads() {
+    assert_eq!(
+      interpret(r#"CharacterName["ab"]"#).unwrap(),
+      "{LatinSmallLetterA, LatinSmallLetterB}"
+    );
+  }
+
+  #[test]
+  fn result_is_a_string() {
+    assert_eq!(interpret(r#"Head[CharacterName["a"]]"#).unwrap(), "String");
+  }
+}
+
+mod letter_q {
+  use super::*;
+
+  #[test]
+  fn all_letters() {
+    assert_eq!(interpret("LetterQ[\"abc\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn with_digits() {
+    assert_eq!(interpret("LetterQ[\"ab3\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn empty_string() {
+    assert_eq!(interpret("LetterQ[\"\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn uppercase() {
+    assert_eq!(interpret("LetterQ[\"ABC\"]").unwrap(), "True");
+  }
+}
+
+mod upper_case_q {
+  use super::*;
+
+  #[test]
+  fn all_upper() {
+    assert_eq!(interpret("UpperCaseQ[\"ABC\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn mixed() {
+    assert_eq!(interpret("UpperCaseQ[\"AbC\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn all_lower() {
+    assert_eq!(interpret("UpperCaseQ[\"abc\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn empty_string() {
+    assert_eq!(interpret("UpperCaseQ[\"\"]").unwrap(), "True");
+  }
+}
+
+mod lower_case_q {
+  use super::*;
+
+  #[test]
+  fn all_lower() {
+    assert_eq!(interpret("LowerCaseQ[\"abc\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn mixed() {
+    assert_eq!(interpret("LowerCaseQ[\"AbC\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn all_upper() {
+    assert_eq!(interpret("LowerCaseQ[\"ABC\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn empty_string() {
+    assert_eq!(interpret("LowerCaseQ[\"\"]").unwrap(), "True");
+  }
+}
+
+mod printable_ascii_q {
+  use super::*;
+
+  #[test]
+  fn printable_strings() {
+    assert_eq!(
+      interpret("PrintableASCIIQ[\"Hello World 123!\"]").unwrap(),
+      "True"
+    );
+    // The empty string and a single space are printable.
+    assert_eq!(interpret("PrintableASCIIQ[\"\"]").unwrap(), "True");
+    assert_eq!(interpret("PrintableASCIIQ[\" \"]").unwrap(), "True");
+    // The full printable range, codes 32..126.
+    assert_eq!(
+      interpret("PrintableASCIIQ[FromCharacterCode[Range[32, 126]]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn non_printable_strings() {
+    // Non-ASCII letters.
+    assert_eq!(interpret("PrintableASCIIQ[\"héllo\"]").unwrap(), "False");
+    // Control characters (tab, newline, DEL, and code 31) are not printable.
+    assert_eq!(interpret("PrintableASCIIQ[\"a\tb\"]").unwrap(), "False");
+    assert_eq!(interpret("PrintableASCIIQ[\"a\nb\"]").unwrap(), "False");
+    assert_eq!(
+      interpret("PrintableASCIIQ[FromCharacterCode[127]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PrintableASCIIQ[FromCharacterCode[31]]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn threads_over_list_of_strings() {
+    assert_eq!(
+      interpret("PrintableASCIIQ[{\"abc\", \"déf\"}]").unwrap(),
+      "{True, False}"
+    );
+    assert_eq!(interpret("PrintableASCIIQ[{}]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn non_string_stays_unevaluated() {
+    // Non-strings, or lists that are not entirely strings, stay unevaluated.
+    assert_eq!(
+      interpret("PrintableASCIIQ[123]").unwrap(),
+      "PrintableASCIIQ[123]"
+    );
+    assert_eq!(
+      interpret("PrintableASCIIQ[x]").unwrap(),
+      "PrintableASCIIQ[x]"
+    );
+    assert_eq!(
+      interpret("PrintableASCIIQ[{\"abc\", 5}]").unwrap(),
+      "PrintableASCIIQ[{abc, 5}]"
+    );
+    assert_eq!(
+      interpret("PrintableASCIIQ[{{\"ab\"}, \"cd\"}]").unwrap(),
+      "PrintableASCIIQ[{{ab}, cd}]"
+    );
+  }
+}
+
+mod digit_q {
+  use super::*;
+
+  #[test]
+  fn all_digits() {
+    assert_eq!(interpret("DigitQ[\"123\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn with_letters() {
+    assert_eq!(interpret("DigitQ[\"12a\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn empty() {
+    assert_eq!(interpret("DigitQ[\"\"]").unwrap(), "True");
+  }
+}
+
+mod alphabet {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    let result = interpret("Alphabet[]").unwrap();
+    assert!(result.starts_with("{a, b, c"));
+    assert!(result.ends_with("x, y, z}"));
+  }
+
+  #[test]
+  fn length() {
+    assert_eq!(interpret("Length[Alphabet[]]").unwrap(), "26");
+  }
+
+  #[test]
+  fn german_is_plain_latin() {
+    // wolframscript's Alphabet["German"] returns the plain 26-letter alphabet
+    // (no ä/ö/ü/ß). Regression for mathics atomic/strings.py:235.
+    assert_eq!(
+      interpret("Alphabet[\"German\"]").unwrap(),
+      "{a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, \
+       x, y, z}"
+    );
+  }
+
+  #[test]
+  fn spanish_has_enye() {
+    assert_eq!(
+      interpret("Alphabet[\"Spanish\"]").unwrap(),
+      "{a, b, c, d, e, f, g, h, i, j, k, l, m, n, ñ, o, p, q, r, s, t, u, v, \
+       w, x, y, z}"
+    );
+  }
+
+  #[test]
+  fn swedish_appends_aaring_aumlaut_oumlaut() {
+    // Swedish adds å, ä, ö after z. Regression for new locale support.
+    assert_eq!(
+      interpret("Alphabet[\"Swedish\"]").unwrap(),
+      "{a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, \
+       x, y, z, å, ä, ö}"
+    );
+  }
+
+  #[test]
+  fn finnish_matches_swedish() {
+    assert_eq!(
+      interpret("Alphabet[\"Finnish\"]").unwrap(),
+      interpret("Alphabet[\"Swedish\"]").unwrap()
+    );
+  }
+
+  #[test]
+  fn norwegian_appends_aelig_oslash_aaring() {
+    assert_eq!(
+      interpret("Alphabet[\"Norwegian\"]").unwrap(),
+      "{a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, \
+       x, y, z, æ, ø, å}"
+    );
+  }
+
+  #[test]
+  fn danish_matches_norwegian() {
+    assert_eq!(
+      interpret("Alphabet[\"Danish\"]").unwrap(),
+      interpret("Alphabet[\"Norwegian\"]").unwrap()
+    );
+  }
+
+  #[test]
+  fn polish_has_diacritic_letters_interleaved() {
+    assert_eq!(
+      interpret("Alphabet[\"Polish\"]").unwrap(),
+      "{a, ą, b, c, ć, d, e, ę, f, g, h, i, j, k, l, ł, m, n, ń, o, ó, p, r, \
+       s, ś, t, u, w, y, z, ź, ż}"
+    );
+  }
+
+  #[test]
+  fn russian_differs_from_cyrillic() {
+    // wolframscript's Cyrillic list is a superset of Russian's (covers
+    // Ukrainian, Serbian, …). Regression for mathics atomic/strings.py:239,
+    // whose "EXPECTED: True" does not match wolframscript.
+    assert_eq!(
+      interpret("Alphabet[\"Russian\"] == Alphabet[\"Cyrillic\"]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("Length[Alphabet[\"Cyrillic\"]]").unwrap(), "49");
+  }
+}
+
+mod from_letter_number {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(interpret("FromLetterNumber[5]").unwrap(), "e");
+  }
+
+  #[test]
+  fn first_letter() {
+    assert_eq!(interpret("FromLetterNumber[1]").unwrap(), "a");
+  }
+
+  #[test]
+  fn last_letter() {
+    assert_eq!(interpret("FromLetterNumber[26]").unwrap(), "z");
+  }
+
+  #[test]
+  fn list_input() {
+    assert_eq!(
+      interpret("FromLetterNumber[{1, 2, 3}]").unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  #[test]
+  fn zero_gives_space() {
+    assert_eq!(interpret("FromLetterNumber[0]").unwrap(), " ");
+  }
+
+  #[test]
+  fn out_of_range_gives_space() {
+    assert_eq!(interpret("FromLetterNumber[27]").unwrap(), " ");
+  }
+
+  #[test]
+  fn negative_wraps() {
+    assert_eq!(interpret("FromLetterNumber[-1]").unwrap(), "z");
+  }
+
+  #[test]
+  fn negative_first() {
+    assert_eq!(interpret("FromLetterNumber[-26]").unwrap(), "a");
+  }
+
+  #[test]
+  fn negative_out_of_range() {
+    assert_eq!(interpret("FromLetterNumber[-27]").unwrap(), " ");
+  }
+
+  #[test]
+  fn full_negative_range() {
+    assert_eq!(
+      interpret("Table[FromLetterNumber[i], {i, -5, -1}]").unwrap(),
+      "{v, w, x, y, z}"
+    );
+  }
+
+  // Two-argument form: index into a named alphabet.
+  #[test]
+  fn greek_alphabet() {
+    assert_eq!(interpret(r#"FromLetterNumber[3, "Greek"]"#).unwrap(), "γ");
+    assert_eq!(interpret(r#"FromLetterNumber[-1, "Greek"]"#).unwrap(), "ω");
+  }
+
+  #[test]
+  fn greek_list() {
+    assert_eq!(
+      interpret(r#"FromLetterNumber[{1, 2, 3}, "Greek"]"#).unwrap(),
+      "{α, β, γ}"
+    );
+  }
+
+  #[test]
+  fn russian_and_spanish() {
+    assert_eq!(interpret(r#"FromLetterNumber[1, "Russian"]"#).unwrap(), "а");
+    assert_eq!(interpret(r#"FromLetterNumber[3, "Spanish"]"#).unwrap(), "c");
+  }
+
+  #[test]
+  fn out_of_range_named() {
+    assert_eq!(interpret(r#"FromLetterNumber[100, "Greek"]"#).unwrap(), " ");
+    assert_eq!(interpret(r#"FromLetterNumber[0, "Greek"]"#).unwrap(), " ");
+  }
+}
+
+mod letter_number {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(interpret("LetterNumber[\"e\"]").unwrap(), "5");
+  }
+
+  #[test]
+  fn first_letter() {
+    assert_eq!(interpret("LetterNumber[\"a\"]").unwrap(), "1");
+  }
+
+  #[test]
+  fn last_letter() {
+    assert_eq!(interpret("LetterNumber[\"z\"]").unwrap(), "26");
+  }
+
+  #[test]
+  fn uppercase() {
+    assert_eq!(interpret("LetterNumber[\"A\"]").unwrap(), "1");
+  }
+
+  #[test]
+  fn non_letter() {
+    assert_eq!(interpret("LetterNumber[\"1\"]").unwrap(), "0");
+  }
+
+  #[test]
+  fn multi_char_string() {
+    assert_eq!(
+      interpret("LetterNumber[\"hello\"]").unwrap(),
+      "{8, 5, 12, 12, 15}"
+    );
+  }
+
+  #[test]
+  fn list_input() {
+    assert_eq!(
+      interpret("LetterNumber[{\"a\", \"z\"}]").unwrap(),
+      "{1, 26}"
+    );
+  }
+
+  #[test]
+  fn greek_beta() {
+    // \[Beta] is the Greek lowercase beta (β). Its position is 2.
+    assert_eq!(
+      interpret("LetterNumber[\"\\[Beta]\", \"Greek\"]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn named_minus_union_intersection_render_to_wolfram_codepoints() {
+    // \[Minus] is the minus sign (U+2212); \[Union]/\[Intersection] are the
+    // n-ary forms ⋃/⋂ (U+22C3/U+22C2), not the binary ∪/∩.
+    assert_eq!(interpret("\"\\[Minus]\"").unwrap(), "\u{2212}");
+    assert_eq!(interpret("\"\\[Union]\"").unwrap(), "\u{22C3}");
+    assert_eq!(interpret("\"\\[Intersection]\"").unwrap(), "\u{22C2}");
+  }
+
+  #[test]
+  fn named_backslash_decodes_to_set_minus() {
+    // `\[Backslash]` is the set-minus glyph ∖ (U+2216), not the ASCII `\`:
+    // `ToCharacterCode["\[Backslash]"]` is `{8726}` in wolframscript.
+    // Regression: a Demonstrations Project notebook used `\[Backslash]`
+    // inside a table header string ("R\[Backslash]D"), and it fell through
+    // unresolved, printing the literal escape text.
+    assert_eq!(interpret("\"\\[Backslash]\"").unwrap(), "\u{2216}");
+    assert_eq!(interpret("StringLength[\"\\[Backslash]\"]").unwrap(), "1");
+    assert_eq!(
+      interpret("ToCharacterCode[\"\\[Backslash]\"]").unwrap(),
+      "{8726}"
+    );
+    assert_eq!(interpret("\"R\\[Backslash]D\"").unwrap(), "R\u{2216}D");
+  }
+
+  #[test]
+  fn greek_alpha_omega() {
+    assert_eq!(interpret("LetterNumber[\"α\", \"Greek\"]").unwrap(), "1");
+    assert_eq!(interpret("LetterNumber[\"ω\", \"Greek\"]").unwrap(), "24");
+  }
+
+  #[test]
+  fn greek_final_sigma_same_as_sigma() {
+    // Both ς (final sigma) and σ (sigma) map to position 18.
+    assert_eq!(interpret("LetterNumber[\"σ\", \"Greek\"]").unwrap(), "18");
+    assert_eq!(interpret("LetterNumber[\"ς\", \"Greek\"]").unwrap(), "18");
+  }
+
+  #[test]
+  fn greek_uppercase_normalizes() {
+    assert_eq!(interpret("LetterNumber[\"Β\", \"Greek\"]").unwrap(), "2");
+    assert_eq!(interpret("LetterNumber[\"Ω\", \"Greek\"]").unwrap(), "24");
+  }
+
+  #[test]
+  fn greek_non_letter_returns_zero() {
+    assert_eq!(interpret("LetterNumber[\"a\", \"Greek\"]").unwrap(), "0");
+  }
+}
+
+mod operator_form {
+  use super::*;
+
+  #[test]
+  fn string_starts_q_curried() {
+    assert_eq!(
+      interpret("StringStartsQ[\"He\"][\"Hello\"]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn string_starts_q_curried_false() {
+    assert_eq!(
+      interpret("StringStartsQ[\"Wo\"][\"Hello\"]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn string_ends_q_curried() {
+    assert_eq!(interpret("StringEndsQ[\"lo\"][\"Hello\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn string_contains_q_curried() {
+    assert_eq!(
+      interpret("StringContainsQ[\"ell\"][\"Hello\"]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn string_match_q_curried() {
+    assert_eq!(
+      interpret("StringMatchQ[\"*G*\"][\"CTG1\"]").unwrap(),
+      "True"
+    );
+  }
+
+  // The bare operator form (not yet applied) stays as an operator, exactly
+  // like Wolfram, instead of erroring on the missing second argument.
+  #[test]
+  fn string_contains_q_operator_unevaluated() {
+    assert_eq!(
+      interpret("StringContainsQ[\"G\"]").unwrap(),
+      "StringContainsQ[G]"
+    );
+  }
+
+  #[test]
+  fn string_starts_q_operator_in_select() {
+    assert_eq!(
+      interpret(
+        "Select[{\"CAC1\", \"CTG1\", \"ACT1\", \"CGA1\", \"CTC1\"}, StringStartsQ[\"C\"]]"
+      )
+      .unwrap(),
+      "{CAC1, CTG1, CGA1, CTC1}"
+    );
+  }
+
+  #[test]
+  fn string_ends_q_operator_in_select() {
+    assert_eq!(
+      interpret(
+        "Select[{\"CAC1\", \"CTG1\", \"ACT1\", \"CGA1\", \"CTC1\"}, StringEndsQ[\"C1\"]]"
+      )
+      .unwrap(),
+      "{CAC1, CTC1}"
+    );
+  }
+
+  #[test]
+  fn member_q_curried() {
+    assert_eq!(interpret("MemberQ[2][{1, 2, 3}]").unwrap(), "True");
+  }
+
+  #[test]
+  fn member_q_curried_false() {
+    assert_eq!(interpret("MemberQ[5][{1, 2, 3}]").unwrap(), "False");
+  }
+
+  #[test]
+  fn member_q_with_blank_pattern() {
+    assert_eq!(interpret("MemberQ[{1, 2, 3}, _Integer]").unwrap(), "True");
+  }
+
+  #[test]
+  fn member_q_with_blank_pattern_no_match() {
+    assert_eq!(interpret("MemberQ[{1, 2, 3}, _String]").unwrap(), "False");
+  }
+
+  #[test]
+  fn member_q_with_string_pattern() {
+    assert_eq!(
+      interpret(r#"MemberQ[{1, "a", 2}, _String]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn member_q_with_head_pattern() {
+    assert_eq!(
+      interpret("MemberQ[{f[1], g[2], h[3]}, _f]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn member_q_with_condition_pattern() {
+    assert_eq!(
+      interpret("MemberQ[{1, 2, 3, 4, 5}, _?(# > 3 &)]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn member_q_with_condition_pattern_no_match() {
+    assert_eq!(
+      interpret("MemberQ[{1, 2, 3}, _?(# > 10 &)]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn select_with_curried_string_starts_q() {
+    assert_eq!(
+      interpret(
+        "Select[{\"apple\", \"avocado\", \"banana\"}, StringStartsQ[\"a\"]]"
+      )
+      .unwrap(),
+      "{apple, avocado}"
+    );
+  }
+}
+
+mod ignore_case {
+  use super::*;
+
+  #[test]
+  fn string_contains_q_ignore_case() {
+    assert_eq!(
+      interpret(
+        "StringContainsQ[\"Hello World\", \"world\", IgnoreCase -> True]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn string_contains_q_case_sensitive() {
+    assert_eq!(
+      interpret("StringContainsQ[\"Hello World\", \"world\"]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn string_starts_q_ignore_case() {
+    assert_eq!(
+      interpret("StringStartsQ[\"Hello\", \"hello\", IgnoreCase -> True]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn string_ends_q_ignore_case() {
+    assert_eq!(
+      interpret("StringEndsQ[\"Hello\", \"ELLO\", IgnoreCase -> True]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn string_starts_q_threads_list() {
+    assert_eq!(
+      interpret(r#"StringStartsQ[{"hello", "world"}, "he"]"#).unwrap(),
+      "{True, False}"
+    );
+  }
+
+  #[test]
+  fn string_ends_q_threads_list() {
+    assert_eq!(
+      interpret(r#"StringEndsQ[{"hello", "world"}, "d"]"#).unwrap(),
+      "{False, True}"
+    );
+  }
+
+  #[test]
+  fn string_contains_q_threads_list() {
+    assert_eq!(
+      interpret(r#"StringContainsQ[{"hello", "world", "xy"}, "o"]"#).unwrap(),
+      "{True, True, False}"
+    );
+  }
+
+  #[test]
+  fn string_starts_q_threads_list_ignore_case() {
+    assert_eq!(
+      interpret(
+        r#"StringStartsQ[{"Hello", "world"}, "HE", IgnoreCase -> True]"#
+      )
+      .unwrap(),
+      "{True, False}"
+    );
+  }
+
+  #[test]
+  fn string_match_q_ignore_case() {
+    assert_eq!(
+      interpret("StringMatchQ[\"Hello\", \"hello\", IgnoreCase -> True]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn string_match_q_threads_over_list() {
+    assert_eq!(
+      interpret(r#"StringMatchQ[{"abc", "ab1", "abcd"}, "abc"]"#).unwrap(),
+      "{True, False, False}"
+    );
+    assert_eq!(
+      interpret(
+        r#"StringMatchQ[{"abc", "ab1", "abcd"}, RegularExpression["[a-z]+"]]"#
+      )
+      .unwrap(),
+      "{True, False, True}"
+    );
+    // IgnoreCase option still threads.
+    assert_eq!(
+      interpret(r#"StringMatchQ[{"ABC", "ab1"}, "abc", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{True, False}"
+    );
+  }
+
+  // StringCases collects every case-insensitive match, returning the actual
+  // matched substrings (which may differ in case from the pattern).
+  #[test]
+  fn string_cases_ignore_case_literal() {
+    assert_eq!(
+      interpret(r#"StringCases["aAbA", "a", IgnoreCase -> True]"#).unwrap(),
+      "{a, A, A}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["ABCabc", "abc", IgnoreCase -> True]"#).unwrap(),
+      "{ABC, abc}"
+    );
+  }
+
+  #[test]
+  fn string_cases_ignore_case_alternatives() {
+    assert_eq!(
+      interpret(r#"StringCases["aAbB", "a" | "b", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{a, A, b, B}"
+    );
+  }
+
+  // The rule (pattern -> replacement) form also honors IgnoreCase.
+  #[test]
+  fn string_cases_ignore_case_rule() {
+    assert_eq!(
+      interpret(r#"StringCases["Hello", "l" -> "L", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{L, L}"
+    );
+  }
+
+  // The match limit and IgnoreCase combine.
+  #[test]
+  fn string_cases_ignore_case_with_limit() {
+    assert_eq!(
+      interpret(r#"StringCases["aAaA", "a", 2, IgnoreCase -> True]"#).unwrap(),
+      "{a, A}"
+    );
+  }
+
+  // IgnoreCase -> False keeps the default case-sensitive behaviour.
+  #[test]
+  fn string_cases_ignore_case_false() {
+    assert_eq!(
+      interpret(r#"StringCases["aAbA", "a", IgnoreCase -> False]"#).unwrap(),
+      "{a}"
+    );
+  }
+
+  // StringPosition reports the span of every case-insensitive match.
+  #[test]
+  fn string_position_ignore_case_literal() {
+    assert_eq!(
+      interpret(r#"StringPosition["aAa", "a", IgnoreCase -> True]"#).unwrap(),
+      "{{1, 1}, {2, 2}, {3, 3}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["ABCabc", "abc", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{{1, 3}, {4, 6}}"
+    );
+  }
+
+  #[test]
+  fn string_position_ignore_case_alternatives() {
+    assert_eq!(
+      interpret(r#"StringPosition["aAbB", "a" | "b", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{{1, 1}, {2, 2}, {3, 3}, {4, 4}}"
+    );
+  }
+
+  // Overlapping case-insensitive multi-character matches are all reported.
+  #[test]
+  fn string_position_ignore_case_overlapping() {
+    assert_eq!(
+      interpret(r#"StringPosition["AbAbAb", "ab", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{{1, 2}, {3, 4}, {5, 6}}"
+    );
+  }
+
+  // The count limit and IgnoreCase combine.
+  #[test]
+  fn string_position_ignore_case_with_limit() {
+    assert_eq!(
+      interpret(r#"StringPosition["aAa", "a", 2, IgnoreCase -> True]"#)
+        .unwrap(),
+      "{{1, 1}, {2, 2}}"
+    );
+  }
+
+  // IgnoreCase -> False keeps the default case-sensitive behaviour.
+  #[test]
+  fn string_position_ignore_case_false() {
+    assert_eq!(
+      interpret(r#"StringPosition["aAa", "a", IgnoreCase -> False]"#).unwrap(),
+      "{{1, 1}, {3, 3}}"
+    );
+  }
+}
+
+mod string_patterns {
+  use super::*;
+
+  // A repeated pattern name in a string pattern (`x_ ~~ x_`) is a
+  // back-reference: both occurrences must match the *same* substring. The Rust
+  // `regex` crate has no native backreferences, so Woxi records the repeated
+  // captures and verifies they compare equal after matching. These must hold
+  // across every string-matching function, matching wolframscript.
+  #[test]
+  fn backreference_string_match_q() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["aa", x_ ~~ x_]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["ab", x_ ~~ x_]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn backreference_string_replace() {
+    assert_eq!(
+      interpret(r#"StringReplace["hello", a_ ~~ a_ -> "!"]"#).unwrap(),
+      "he!o"
+    );
+    assert_eq!(
+      interpret(r#"StringReplace["aabbcc", x_ ~~ x_ -> "*"]"#).unwrap(),
+      "***"
+    );
+  }
+
+  #[test]
+  fn backreference_string_count_and_position() {
+    assert_eq!(interpret(r#"StringCount["abcc", x_ ~~ x_]"#).unwrap(), "1");
+    assert_eq!(
+      interpret(r#"StringPosition["abcc", x_ ~~ x_]"#).unwrap(),
+      "{{3, 4}}"
+    );
+  }
+
+  #[test]
+  fn backreference_string_split() {
+    // Delimiter never matches (no equal adjacent pair) → whole string kept.
+    assert_eq!(
+      interpret(r#"StringSplit["aXbYc", x_ ~~ x_]"#).unwrap(),
+      "{aXbYc}"
+    );
+    assert_eq!(
+      interpret(r#"StringSplit["aXXbYYc", x_ ~~ x_]"#).unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  #[test]
+  fn backreference_string_free_contains_starts_ends() {
+    assert_eq!(interpret(r#"StringFreeQ["ab", x_ ~~ x_]"#).unwrap(), "True");
+    assert_eq!(
+      interpret(r#"StringContainsQ["abcc", x_ ~~ x_]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringStartsQ["aab", x_ ~~ x_]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringStartsQ["abc", x_ ~~ x_]"#).unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(r#"StringEndsQ["abcc", x_ ~~ x_]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn backreference_string_delete_and_trim() {
+    assert_eq!(
+      interpret(r#"StringDelete["abcc", x_ ~~ x_]"#).unwrap(),
+      "ab"
+    );
+    assert_eq!(
+      interpret(r#"StringTrim["aabxyaa", x_ ~~ x_]"#).unwrap(),
+      "bxy"
+    );
+    // Ends aren't equal pairs → nothing trimmed.
+    assert_eq!(
+      interpret(r#"StringTrim["abxyab", x_ ~~ x_]"#).unwrap(),
+      "abxyab"
+    );
+  }
+
+  #[test]
+  fn repeated_parsing() {
+    // Repeated[x] displays as x..
+    assert_eq!(
+      interpret("Repeated[DigitCharacter]").unwrap(),
+      "DigitCharacter.."
+    );
+    // RepeatedNull[x] displays as x...
+    assert_eq!(
+      interpret("RepeatedNull[DigitCharacter]").unwrap(),
+      "DigitCharacter..."
+    );
+  }
+
+  #[test]
+  fn repeated_shorthand_parsing() {
+    // .. parses as Repeated, ... parses as RepeatedNull
+    assert_eq!(interpret("DigitCharacter ..").unwrap(), "DigitCharacter..");
+    assert_eq!(
+      interpret("DigitCharacter ...").unwrap(),
+      "DigitCharacter..."
+    );
+    assert_eq!(
+      interpret("LetterCharacter ..").unwrap(),
+      "LetterCharacter.."
+    );
+  }
+
+  #[test]
+  fn repeated_head() {
+    assert_eq!(interpret("Head[DigitCharacter ..]").unwrap(), "Repeated");
+    assert_eq!(
+      interpret("Head[DigitCharacter ...]").unwrap(),
+      "RepeatedNull"
+    );
+  }
+
+  #[test]
+  fn string_pattern_predicate_tests() {
+    // `_?pred` character-predicate patterns map to regex character classes.
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", x_?LetterQ]").unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("StringSplit[\"a1b2c3\", x__?DigitQ]").unwrap(),
+      "{a, b, c}"
+    );
+    assert_eq!(
+      interpret("StringCases[\"a1b2c3\", _?DigitQ]").unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("StringCases[\"aXbYcZ\", _?UpperCaseQ]").unwrap(),
+      "{X, Y, Z}"
+    );
+    assert_eq!(
+      interpret("StringCases[\"aXbY\", x_?LowerCaseQ -> x]").unwrap(),
+      "{a, b}"
+    );
+    assert_eq!(
+      interpret("StringReplace[\"abcABC\", a_?LowerCaseQ :> ToUpperCase[a]]")
+        .unwrap(),
+      "ABCABC"
+    );
+  }
+
+  #[test]
+  fn string_cases_digit_character_repeated() {
+    assert_eq!(
+      interpret("StringCases[\"The year is 2025\", DigitCharacter ..]")
+        .unwrap(),
+      "{2025}"
+    );
+    assert_eq!(
+      interpret("StringCases[\"abc123def456\", DigitCharacter ..]").unwrap(),
+      "{123, 456}"
+    );
+  }
+
+  // RegularExpression transforms expand $0/$1/... to capture groups.
+  #[test]
+  fn string_cases_regex_capture_groups() {
+    assert_eq!(
+      interpret(
+        r#"StringCases["a1b2", RegularExpression["[a-z](\\d)"] -> "$1"]"#
+      )
+      .unwrap(),
+      "{1, 2}"
+    );
+    assert_eq!(
+      interpret(
+        r#"StringCases["a1b2", RegularExpression["([a-z])(\\d)"] :> "$2$1"]"#
+      )
+      .unwrap(),
+      "{1a, 2b}"
+    );
+    // The transform can be a list of strings.
+    assert_eq!(
+      interpret(
+        r#"StringCases["2024-01", RegularExpression["(\\d+)-(\\d+)"] :> {"$1", "$2"}]"#
+      )
+      .unwrap(),
+      "{{2024, 01}}"
+    );
+    // $0 is the whole match.
+    assert_eq!(
+      interpret(
+        r#"StringCases["a1b2", RegularExpression["([a-z])(\\d)"] -> "$0"]"#
+      )
+      .unwrap(),
+      "{a1, b2}"
+    );
+  }
+
+  #[test]
+  fn string_cases_overlaps() {
+    // Default is non-overlapping.
+    assert_eq!(interpret("StringCases[\"aaa\", \"aa\"]").unwrap(), "{aa}");
+    assert_eq!(
+      interpret("StringCases[\"aaa\", \"aa\", Overlaps -> False]").unwrap(),
+      "{aa}"
+    );
+    // Overlaps -> True emits a match at every start position.
+    assert_eq!(
+      interpret("StringCases[\"aaa\", \"aa\", Overlaps -> True]").unwrap(),
+      "{aa, aa}"
+    );
+    assert_eq!(
+      interpret("StringCases[\"abababab\", \"aba\", Overlaps -> True]")
+        .unwrap(),
+      "{aba, aba, aba}"
+    );
+    // Works with character-class patterns too.
+    assert_eq!(
+      interpret(
+        "StringCases[\"a1b2\", LetterCharacter ~~ DigitCharacter, \
+         Overlaps -> True]"
+      )
+      .unwrap(),
+      "{a1, b2}"
+    );
+  }
+
+  // `Overlaps -> All` reports *every* match at every start position, not just
+  // the preferred one, so a variable-length pattern contributes one match per
+  // length it can take at each start.
+  #[test]
+  fn string_cases_overlaps_all() {
+    assert_eq!(
+      interpret("StringCases[\"abcd\", __, Overlaps -> All]").unwrap(),
+      "{abcd, abc, ab, a, bcd, bc, b, cd, c, d}"
+    );
+    // A greedy pattern reports its longest match first at each start
+    // position; Shortest[…] reverses that order.
+    assert_eq!(
+      interpret("StringCases[\"abcd\", Shortest[__], Overlaps -> All]")
+        .unwrap(),
+      "{a, ab, abc, abcd, b, bc, bcd, c, cd, d}"
+    );
+    // `___` also matches the empty string at every boundary, including the one
+    // past the last character.
+    assert_eq!(
+      interpret("StringCases[\"abc\", ___, Overlaps -> All]").unwrap(),
+      "{abc, ab, a, , bc, b, , c, , }"
+    );
+    // Alternatives are reported in their written order.
+    assert_eq!(
+      interpret(
+        "StringCases[\"abc\", \"a\" | \"ab\" | \"abc\", Overlaps -> All]"
+      )
+      .unwrap(),
+      "{a, ab, abc}"
+    );
+    assert_eq!(
+      interpret(
+        "StringCases[\"abc\", \"abc\" | \"ab\" | \"a\", Overlaps -> All]"
+      )
+      .unwrap(),
+      "{abc, ab, a}"
+    );
+    // A fixed-length pattern has one length per start, so All matches True.
+    assert_eq!(
+      interpret("StringCases[\"ababab\", \"ab\" | \"ba\", Overlaps -> All]")
+        .unwrap(),
+      "{ab, ba, ab, ba, ab}"
+    );
+    // Back-references still have to agree.
+    assert_eq!(
+      interpret("StringCases[\"xaax\", x_ ~~ x_, Overlaps -> All]").unwrap(),
+      "{aa}"
+    );
+    // StartOfString / EndOfString keep pinning the span to the string edges.
+    assert_eq!(
+      interpret("StringCases[\"abcd\", __ ~~ EndOfString, Overlaps -> All]")
+        .unwrap(),
+      "{abcd, bcd, cd, d}"
+    );
+    // The count limit truncates the reported matches, and IgnoreCase applies.
+    assert_eq!(
+      interpret("StringCases[\"abcd\", __, 3, Overlaps -> All]").unwrap(),
+      "{abcd, abc, ab}"
+    );
+    assert_eq!(
+      interpret(
+        "StringCases[\"ABab\", \"a\" ~~ __, Overlaps -> All, \
+         IgnoreCase -> True]"
+      )
+      .unwrap(),
+      "{ABab, ABa, AB, ab}"
+    );
+    // Rules are applied to every reported match.
+    assert_eq!(
+      interpret("StringCases[\"abcd\", x_ ~~ y_ :> x <> y, Overlaps -> All]")
+        .unwrap(),
+      "{ab, bc, cd}"
+    );
+  }
+
+  #[test]
+  fn string_cases_single_digit_character() {
+    assert_eq!(
+      interpret("StringCases[\"abc123\", DigitCharacter]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn string_cases_letter_character_repeated() {
+    assert_eq!(
+      interpret("StringCases[\"abc123def456\", LetterCharacter ..]").unwrap(),
+      "{abc, def}"
+    );
+  }
+
+  #[test]
+  fn string_cases_whitespace_character_repeated() {
+    assert_eq!(
+      interpret("StringCases[\"hello world foo\", WhitespaceCharacter ..]")
+        .unwrap(),
+      "{ ,  }"
+    );
+  }
+
+  #[test]
+  fn string_cases_word_character_repeated() {
+    assert_eq!(
+      interpret("StringCases[\"abc123\", WordCharacter ..]").unwrap(),
+      "{abc123}"
+    );
+  }
+
+  #[test]
+  fn string_cases_no_matches() {
+    assert_eq!(
+      interpret("StringCases[\"hello\", DigitCharacter ..]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn string_cases_literal_still_works() {
+    assert_eq!(
+      interpret("StringCases[\"abcabc\", \"bc\"]").unwrap(),
+      "{bc, bc}"
+    );
+  }
+
+  #[test]
+  fn string_cases_rule() {
+    assert_eq!(interpret(r#"StringCases["abc", "a" -> 1]"#).unwrap(), "{1}");
+  }
+
+  #[test]
+  fn string_cases_shortest_blank_sequence() {
+    assert_eq!(
+      interpret(r#"StringCases["aabaaab", Shortest["a" ~~ __ ~~ "b"]]"#)
+        .unwrap(),
+      "{aab, aaab}"
+    );
+  }
+
+  #[test]
+  fn string_cases_longest_blank_sequence() {
+    assert_eq!(
+      interpret(r#"StringCases["aabaaab", Longest["a" ~~ __ ~~ "b"]]"#)
+        .unwrap(),
+      "{aabaaab}"
+    );
+  }
+
+  #[test]
+  fn string_cases_shortest_regex_quantifier() {
+    // Shortest applied to a regex `+` quantifier makes it non-greedy.
+    assert_eq!(
+      interpret(
+        r#"StringCases["aabaaab", Shortest[RegularExpression["a+b"]]]"#
+      )
+      .unwrap(),
+      "{aab, aaab}"
+    );
+  }
+
+  #[test]
+  fn string_cases_shortest_named_capture() {
+    assert_eq!(
+      interpret(
+        r#"StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]"#
+      )
+      .unwrap(),
+      "{abc, uvw}"
+    );
+  }
+
+  #[test]
+  fn string_cases_rule_list_with_max() {
+    assert_eq!(
+      interpret(r#"StringCases["abba", {"a" -> 10, "b" -> 20}, 2]"#).unwrap(),
+      "{10, 20}"
+    );
+  }
+
+  #[test]
+  fn string_cases_rule_list_all_matches() {
+    assert_eq!(
+      interpret(r#"StringCases["abba", {"a" -> 10, "b" -> 20}]"#).unwrap(),
+      "{10, 20, 20, 10}"
+    );
+  }
+
+  #[test]
+  fn string_cases_rule_list_longest_non_overlapping() {
+    // When rules are tried in order, the first matching rule wins at each
+    // position and the scan advances past the matched text.
+    assert_eq!(
+      interpret(r#"StringCases["aabb", {"aa" -> 100, "bb" -> 200}]"#).unwrap(),
+      "{100, 200}"
+    );
+  }
+
+  #[test]
+  fn string_cases_regular_expression() {
+    assert_eq!(
+      interpret(r#"StringCases["cat bat mat", RegularExpression["[a-z]at"]]"#)
+        .unwrap(),
+      "{cat, bat, mat}"
+    );
+  }
+
+  #[test]
+  fn string_cases_regular_expression_digits() {
+    assert_eq!(
+      interpret(r#"StringCases["abc123def456", RegularExpression["[0-9]+"]]"#)
+        .unwrap(),
+      "{123, 456}"
+    );
+  }
+
+  #[test]
+  fn string_cases_max_count() {
+    assert_eq!(interpret(r#"StringCases["abc", _, 2]"#).unwrap(), "{a, b}");
+  }
+
+  #[test]
+  fn string_cases_max_count_literal() {
+    assert_eq!(
+      interpret(r#"StringCases["aabbbcc", "b", 2]"#).unwrap(),
+      "{b, b}"
+    );
+  }
+
+  #[test]
+  fn string_cases_max_count_one() {
+    assert_eq!(
+      interpret(r#"StringCases["the cat sat on the mat", "at", 1]"#).unwrap(),
+      "{at}"
+    );
+  }
+
+  #[test]
+  fn string_cases_max_count_pattern() {
+    assert_eq!(
+      interpret(r#"StringCases["abc123def456", DigitCharacter.., 1]"#).unwrap(),
+      "{123}"
+    );
+  }
+
+  #[test]
+  fn string_cases_max_count_infinity() {
+    assert_eq!(
+      interpret(r#"StringCases["hello", _, Infinity]"#).unwrap(),
+      "{h, e, l, l, o}"
+    );
+  }
+
+  #[test]
+  fn string_cases_max_count_exceeds_matches() {
+    // When max count exceeds available matches, return all matches
+    assert_eq!(interpret(r#"StringCases["ab", _, 10]"#).unwrap(), "{a, b}");
+  }
+}
+
+mod string_part {
+  use super::*;
+
+  #[test]
+  fn single_index() {
+    assert_eq!(interpret(r#"StringPart["abcdefgh", 3]"#).unwrap(), "c");
+  }
+
+  #[test]
+  fn negative_index() {
+    assert_eq!(interpret(r#"StringPart["abcdefgh", -2]"#).unwrap(), "g");
+  }
+
+  #[test]
+  fn first_char() {
+    assert_eq!(interpret(r#"StringPart["abcdefgh", 1]"#).unwrap(), "a");
+  }
+
+  #[test]
+  fn last_char() {
+    assert_eq!(interpret(r#"StringPart["abcdefgh", -1]"#).unwrap(), "h");
+  }
+
+  #[test]
+  fn list_of_indices() {
+    assert_eq!(
+      interpret(r#"StringPart["abcdefgh", {3, 5}]"#).unwrap(),
+      "{c, e}"
+    );
+  }
+
+  // Out-of-range positions emit ::partw and leave the call unevaluated —
+  // previously this aborted the whole evaluation with a hard error.
+  // All outputs verified against wolframscript 15.0.
+  #[test]
+  fn out_of_range_emits_partw() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringPart["hello", 6]"#).unwrap(),
+      "StringPart[hello, 6]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(
+        |m| m.contains("StringPart::partw: Part 6 of hello does not exist.")
+      ),
+      "got {msgs:?}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringPart["hello", 0]"#).unwrap(),
+      "StringPart[hello, 0]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(
+        |m| m.contains("StringPart::partw: Part 0 of hello does not exist.")
+      ),
+      "got {msgs:?}"
+    );
+    // A bad entry in a position list reports the whole list
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringPart["hello", {1, 6}]"#).unwrap(),
+      "StringPart[hello, {1, 6}]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m
+        .contains("StringPart::partw: Part {1, 6} of hello does not exist.")),
+      "got {msgs:?}"
+    );
+    // Evaluation continues after the message
+    assert_eq!(interpret(r#"StringPart["hello", 6]; 1 + 1"#).unwrap(), "2");
+  }
+
+  #[test]
+  fn list_with_negative() {
+    assert_eq!(
+      interpret(r#"StringPart["abcdefgh", {1, -1}]"#).unwrap(),
+      "{a, h}"
+    );
+  }
+}
+
+mod string_take_drop {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret(r#"StringTakeDrop["Hello World", 5]"#).unwrap(),
+      "{Hello,  World}"
+    );
+  }
+
+  #[test]
+  fn take_all() {
+    assert_eq!(interpret(r#"StringTakeDrop["abc", 3]"#).unwrap(), "{abc, }");
+  }
+
+  #[test]
+  fn negative() {
+    assert_eq!(
+      interpret(r#"StringTakeDrop["Hello World", -5]"#).unwrap(),
+      "{World, Hello }"
+    );
+  }
+}
+
+mod hamming_distance {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret(r#"HammingDistance["karolin", "kathrin"]"#).unwrap(),
+      "3"
+    );
+  }
+
+  // Unequal lengths emit ::idim and leave the call unevaluated instead of
+  // aborting evaluation. Verified against wolframscript 15.0.
+  #[test]
+  fn unequal_lengths_emit_idim() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"HammingDistance["ab", "abc"]"#).unwrap(),
+      "HammingDistance[ab, abc]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "HammingDistance::idim: ab and abc must have the same length."
+      )),
+      "got {msgs:?}"
+    );
+    assert_eq!(
+      interpret(r#"HammingDistance["ab", "abc"]; 1 + 1"#).unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn binary_strings() {
+    assert_eq!(
+      interpret(r#"HammingDistance["1011101", "1001001"]"#).unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn identical() {
+    assert_eq!(interpret(r#"HammingDistance["abc", "abc"]"#).unwrap(), "0");
+  }
+
+  #[test]
+  fn completely_different() {
+    assert_eq!(interpret(r#"HammingDistance["abc", "xyz"]"#).unwrap(), "3");
+  }
+
+  #[test]
+  fn ignore_case_option() {
+    // HammingDistance with IgnoreCase -> True treats cases as equal.
+    // Matches wolframscript.
+    assert_eq!(
+      interpret(r#"HammingDistance["TIME", "dime", IgnoreCase -> True]"#)
+        .unwrap(),
+      "1"
+    );
+    // Without IgnoreCase, all four differ (uppercase vs lowercase).
+    assert_eq!(
+      interpret(r#"HammingDistance["TIME", "dime"]"#).unwrap(),
+      "4"
+    );
+  }
+}
+
+mod character_counts {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret(r#"CharacterCounts["hello"]"#).unwrap(),
+      "<|l -> 2, o -> 1, e -> 1, h -> 1|>"
+    );
+  }
+
+  #[test]
+  fn sorted_by_frequency() {
+    assert_eq!(
+      interpret(r#"CharacterCounts["aababcabcd"]"#).unwrap(),
+      "<|a -> 4, b -> 3, c -> 2, d -> 1|>"
+    );
+  }
+
+  #[test]
+  fn single_char() {
+    assert_eq!(
+      interpret(r#"CharacterCounts["aaa"]"#).unwrap(),
+      "<|a -> 3|>"
+    );
+  }
+
+  // Two-argument form: counts of length-n character n-grams, in
+  // first-occurrence order (not sorted by count, unlike the 1-arg form).
+  #[test]
+  fn ngram_bigrams() {
+    assert_eq!(
+      interpret(r#"CharacterCounts["ababcab", 2]"#).unwrap(),
+      "<|ab -> 3, ba -> 1, bc -> 1, ca -> 1|>"
+    );
+  }
+  #[test]
+  fn ngram_first_occurrence_order() {
+    assert_eq!(
+      interpret(r#"CharacterCounts["banana", 2]"#).unwrap(),
+      "<|ba -> 1, an -> 2, na -> 2|>"
+    );
+  }
+  #[test]
+  fn ngram_trigrams() {
+    assert_eq!(
+      interpret(r#"CharacterCounts["banana", 3]"#).unwrap(),
+      "<|ban -> 1, ana -> 2, nan -> 1|>"
+    );
+  }
+  #[test]
+  fn ngram_too_long_is_empty() {
+    assert_eq!(interpret(r#"CharacterCounts["ab", 3]"#).unwrap(), "<||>");
+  }
+  // A list of strings threads: one association per string (not the list's
+  // own punctuation characters).
+  #[test]
+  fn list_of_strings_threads() {
+    assert_eq!(
+      interpret(r#"CharacterCounts[{"hello", "world"}]"#).unwrap(),
+      "{<|l -> 2, o -> 1, e -> 1, h -> 1|>, \
+       <|d -> 1, l -> 1, r -> 1, o -> 1, w -> 1|>}"
+    );
+  }
+  #[test]
+  fn list_of_strings_ngram_threads() {
+    assert_eq!(
+      interpret(r#"CharacterCounts[{"ab", "cd"}, 2]"#).unwrap(),
+      "{<|ab -> 1|>, <|cd -> 1|>}"
+    );
+  }
+}
+
+mod letter_counts_ngram {
+  use super::*;
+
+  // LetterCounts[s, n]: n-grams within maximal runs of letters; non-letter
+  // characters break the window. First-occurrence order.
+  #[test]
+  fn ngram_breaks_on_non_letters() {
+    assert_eq!(
+      interpret(r#"LetterCounts["ab12cd34ab12", 2]"#).unwrap(),
+      "<|ab -> 2, cd -> 1|>"
+    );
+  }
+  #[test]
+  fn ngram_within_words() {
+    assert_eq!(
+      interpret(r#"LetterCounts["abc def", 2]"#).unwrap(),
+      "<|ab -> 1, bc -> 1, de -> 1, ef -> 1|>"
+    );
+  }
+  #[test]
+  fn ngram_trigrams() {
+    assert_eq!(
+      interpret(r#"LetterCounts["banana", 3]"#).unwrap(),
+      "<|ban -> 1, ana -> 2, nan -> 1|>"
+    );
+  }
+  // A list of strings threads: each string gets its own association.
+  #[test]
+  fn list_of_strings_threads() {
+    assert_eq!(
+      interpret(r#"LetterCounts[{"hello", "world", "!"}]"#).unwrap(),
+      "{<|l -> 2, o -> 1, e -> 1, h -> 1|>, \
+       <|d -> 1, l -> 1, r -> 1, o -> 1, w -> 1|>, <||>}"
+    );
+  }
+  #[test]
+  fn list_of_strings_ngram_threads() {
+    assert_eq!(
+      interpret(r#"LetterCounts[{"ab12", "cdcd"}, 2]"#).unwrap(),
+      "{<|ab -> 1|>, <|cd -> 2, dc -> 1|>}"
+    );
+  }
+}
+
+mod remove_diacritics {
+  use super::*;
+
+  #[test]
+  fn basic_accents() {
+    assert_eq!(
+      interpret("RemoveDiacritics[\"caf\u{00e9}\"]").unwrap(),
+      "cafe"
+    );
+  }
+
+  #[test]
+  fn plain_ascii() {
+    assert_eq!(interpret(r#"RemoveDiacritics["hello"]"#).unwrap(), "hello");
+  }
+
+  #[test]
+  fn umlaut() {
+    assert_eq!(
+      interpret("RemoveDiacritics[\"\u{00fc}ber\"]").unwrap(),
+      "uber"
+    );
+  }
+}
+
+mod transliterate {
+  use super::*;
+
+  #[test]
+  fn greek_to_ascii() {
+    assert_eq!(
+      interpret(r#"Transliterate["Αλφαβητικός"]"#).unwrap(),
+      "Alphabetikos"
+    );
+  }
+
+  #[test]
+  fn greek_digraphs_and_casing() {
+    assert_eq!(interpret(r#"Transliterate["Θεός"]"#).unwrap(), "Theos");
+    assert_eq!(
+      interpret(r#"Transliterate["ΘΑΛΑΣΣΑ"]"#).unwrap(),
+      "THALASSA"
+    );
+    assert_eq!(interpret(r#"Transliterate["Ψάπφω"]"#).unwrap(), "Psappho");
+    assert_eq!(interpret(r#"Transliterate["Χάος"]"#).unwrap(), "Chaos");
+  }
+
+  #[test]
+  fn greek_gamma_nasal_and_diphthongs() {
+    assert_eq!(
+      interpret(r#"Transliterate["Ευαγγέλιο"]"#).unwrap(),
+      "Euangelio"
+    );
+    assert_eq!(
+      interpret(r#"Transliterate["μπουζούκι"]"#).unwrap(),
+      "mpouzouki"
+    );
+    assert_eq!(interpret(r#"Transliterate["άγγελος"]"#).unwrap(), "angelos");
+    assert_eq!(interpret(r#"Transliterate["ΑΥΤΟΣ"]"#).unwrap(), "AUTOS");
+    // η is not part of the u-diphthong set (unlike ISO 843)
+    assert_eq!(interpret(r#"Transliterate["ηυ"]"#).unwrap(), "ey");
+    // Dialytika does not break the diphthong
+    assert_eq!(interpret(r#"Transliterate["αϋ"]"#).unwrap(), "au");
+    // An accent on the preceding vowel blocks the diphthong,
+    // an accent on υ itself does not
+    assert_eq!(interpret(r#"Transliterate["άυ"]"#).unwrap(), "ay");
+    assert_eq!(interpret(r#"Transliterate["ού"]"#).unwrap(), "ou");
+  }
+
+  #[test]
+  fn polytonic_greek() {
+    assert_eq!(
+      interpret("Transliterate[\"\u{1F08}ριστοτέλης\"]").unwrap(),
+      "Aristoteles"
+    );
+  }
+
+  #[test]
+  fn greek_rough_breathing() {
+    // ἁγιος: rough breathing on a vowel adds a leading h
+    assert_eq!(
+      interpret("Transliterate[\"\u{1F01}γιος\"]").unwrap(),
+      "hagios"
+    );
+    // Ἁγιος: uppercase rough breathing capitalizes the h
+    assert_eq!(
+      interpret("Transliterate[\"\u{1F09}γιος\"]").unwrap(),
+      "Hagios"
+    );
+    // ὑπέρ → hyper
+    assert_eq!(
+      interpret("Transliterate[\"\u{1F51}πέρ\"]").unwrap(),
+      "hyper"
+    );
+    // Ῥώμη: rough breathing on rho puts the h after the r
+    assert_eq!(
+      interpret("Transliterate[\"\u{1FEC}ώμη\"]").unwrap(),
+      "Rhome"
+    );
+  }
+
+  #[test]
+  fn cyrillic_to_ascii() {
+    assert_eq!(
+      interpret(r#"Transliterate["алгоритм"]"#).unwrap(),
+      "algoritm"
+    );
+    assert_eq!(interpret(r#"Transliterate["Москва"]"#).unwrap(), "Moskva");
+    assert_eq!(interpret(r#"Transliterate["жизнь"]"#).unwrap(), "zizn'");
+  }
+
+  #[test]
+  fn hiragana_to_ascii() {
+    assert_eq!(
+      interpret(r#"Transliterate["しんばし"]"#).unwrap(),
+      "shinbashi"
+    );
+    assert_eq!(
+      interpret(r#"Transliterate["こんにちは"]"#).unwrap(),
+      "konnichiha"
+    );
+  }
+
+  #[test]
+  fn kana_gemination_and_moraic_n() {
+    assert_eq!(interpret(r#"Transliterate["きっぷ"]"#).unwrap(), "kippu");
+    assert_eq!(interpret(r#"Transliterate["まっちゃ"]"#).unwrap(), "matcha");
+    assert_eq!(
+      interpret(r#"Transliterate["しんいち"]"#).unwrap(),
+      "shin'ichi"
+    );
+  }
+
+  #[test]
+  fn katakana_with_prolonged_sound_mark() {
+    assert_eq!(interpret(r#"Transliterate["シャワー"]"#).unwrap(), "shawa");
+  }
+
+  #[test]
+  fn hangul_to_ascii() {
+    assert_eq!(
+      interpret(r#"Transliterate["안녕하세요"]"#).unwrap(),
+      "annyeonghaseyo"
+    );
+  }
+
+  #[test]
+  fn latin_folding() {
+    assert_eq!(
+      interpret("Transliterate[\"caf\u{00e9} r\u{00e9}sum\u{00e9}\"]").unwrap(),
+      "cafe resume"
+    );
+    assert_eq!(
+      interpret("Transliterate[\"stra\u{00df}e \u{00d8}rsted\"]").unwrap(),
+      "strasse Orsted"
+    );
+  }
+
+  #[test]
+  fn ascii_passes_through() {
+    assert_eq!(interpret(r#"Transliterate["hello"]"#).unwrap(), "hello");
+    assert_eq!(interpret(r#"Transliterate[""]"#).unwrap(), "");
+  }
+
+  #[test]
+  fn maps_over_string_lists() {
+    assert_eq!(
+      interpret(r#"Transliterate[{"Ελλάδα", "Москва"}]"#).unwrap(),
+      "{Ellada, Moskva}"
+    );
+  }
+
+  #[test]
+  fn unsupported_forms_stay_unevaluated() {
+    assert_eq!(
+      interpret(r#"Transliterate["tadaima", "Hiragana"]"#).unwrap(),
+      "Transliterate[tadaima, Hiragana]"
+    );
+    assert_eq!(interpret("Transliterate[5]").unwrap(), "Transliterate[5]");
+  }
+}
+
+mod string_rotate_left {
+  use super::*;
+
+  #[test]
+  fn rotate_by_2() {
+    assert_eq!(
+      interpret(r#"StringRotateLeft["abcdef", 2]"#).unwrap(),
+      "cdefab"
+    );
+  }
+
+  #[test]
+  fn default_rotation() {
+    assert_eq!(
+      interpret(r#"StringRotateLeft["abcdef"]"#).unwrap(),
+      "bcdefa"
+    );
+  }
+
+  #[test]
+  fn rotate_full_cycle() {
+    assert_eq!(
+      interpret(r#"StringRotateLeft["abcdef", 6]"#).unwrap(),
+      "abcdef"
+    );
+  }
+
+  #[test]
+  fn negative_rotation() {
+    // Negative rotation = rotate right
+    assert_eq!(
+      interpret(r#"StringRotateLeft["abcdef", -1]"#).unwrap(),
+      "fabcde"
+    );
+  }
+}
+
+mod string_rotate_right {
+  use super::*;
+
+  #[test]
+  fn rotate_by_2() {
+    assert_eq!(
+      interpret(r#"StringRotateRight["abcdef", 2]"#).unwrap(),
+      "efabcd"
+    );
+  }
+
+  #[test]
+  fn default_rotation() {
+    assert_eq!(
+      interpret(r#"StringRotateRight["abcdef"]"#).unwrap(),
+      "fabcde"
+    );
+  }
+}
+
+mod alphabetic_sort {
+  use super::*;
+
+  #[test]
+  fn case_insensitive() {
+    assert_eq!(
+      interpret(r#"AlphabeticSort[{"Banana", "apple", "Cherry"}]"#).unwrap(),
+      "{apple, Banana, Cherry}"
+    );
+  }
+
+  #[test]
+  fn already_sorted() {
+    assert_eq!(
+      interpret(r#"AlphabeticSort[{"a", "b", "c"}]"#).unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  #[test]
+  fn reverse_order() {
+    assert_eq!(
+      interpret(r#"AlphabeticSort[{"c", "b", "a"}]"#).unwrap(),
+      "{a, b, c}"
+    );
+  }
+}
+
+mod hash {
+  use super::*;
+
+  #[test]
+  fn md5_hex_string() {
+    assert_eq!(
+      interpret(r#"Hash["hello", "MD5", "HexString"]"#).unwrap(),
+      "5d41402abc4b2a76b9719d911017c592"
+    );
+  }
+
+  #[test]
+  fn sha256_hex_string() {
+    assert_eq!(
+      interpret(r#"Hash["hello", "SHA256", "HexString"]"#).unwrap(),
+      "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+  }
+
+  #[test]
+  fn sha1_hex_string() {
+    assert_eq!(
+      interpret(r#"Hash["hello", "SHA", "HexString"]"#).unwrap(),
+      "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+    );
+  }
+
+  #[test]
+  fn md5_integer() {
+    assert_eq!(
+      interpret(r#"Hash["hello", "MD5"]"#).unwrap(),
+      "123957004363873451094272536567338222994"
+    );
+  }
+
+  #[test]
+  fn md2_hex_string() {
+    // RFC 1319 test vector for "abc".
+    assert_eq!(
+      interpret(r#"Hash["abc", "MD2", "HexString"]"#).unwrap(),
+      "da853b0d3f88d99b30283a69e6ded6bb"
+    );
+  }
+
+  #[test]
+  fn md2_empty_hex_string() {
+    // RFC 1319 test vector for the empty string.
+    assert_eq!(
+      interpret(r#"Hash["", "MD2", "HexString"]"#).unwrap(),
+      "8350e5a3e24c153df2275c9f80692773"
+    );
+  }
+
+  #[test]
+  fn md2_integer() {
+    assert_eq!(
+      interpret(r#"Hash["abc", "MD2"]"#).unwrap(),
+      "290463476275092517648070427531620046523"
+    );
+  }
+
+  #[test]
+  fn md2_quick_brown_fox() {
+    assert_eq!(
+      interpret(
+        r#"Hash["The quick brown fox jumps over the lazy dog", "MD2", "HexString"]"#
+      )
+      .unwrap(),
+      "03d85a0d629d2c442e987525319fc471"
+    );
+  }
+
+  #[test]
+  fn default_returns_integer() {
+    // Default Hash uses Expression type (SipHash on InputForm)
+    let result = interpret(r#"Hash["hello"]"#).unwrap();
+    assert!(
+      result.parse::<u64>().is_ok(),
+      "Hash[\"hello\"] should return an integer, got: {result}"
+    );
+  }
+
+  #[test]
+  fn unknown_type_returns_unevaluated() {
+    assert_eq!(
+      interpret(r#"Hash[{a, b, c}, "xyzstr"]"#).unwrap(),
+      "Hash[{a, b, c}, xyzstr]"
+    );
+  }
+
+  // Standard IEEE CRC-32 of the string's bytes.
+  #[test]
+  fn crc32_integer() {
+    assert_eq!(interpret(r#"Hash["abc", "CRC32"]"#).unwrap(), "891568578");
+    assert_eq!(interpret(r#"Hash["", "CRC32"]"#).unwrap(), "0");
+    assert_eq!(
+      interpret(r#"Hash["Hello, World!", "CRC32"]"#).unwrap(),
+      "3964322768"
+    );
+  }
+
+  #[test]
+  fn crc32_hex_string() {
+    assert_eq!(
+      interpret(r#"Hash["abc", "CRC32", "HexString"]"#).unwrap(),
+      "352441c2"
+    );
+  }
+
+  // Adler-32 checksum of the string's bytes.
+  #[test]
+  fn adler32_integer() {
+    assert_eq!(interpret(r#"Hash["abc", "Adler32"]"#).unwrap(), "38600999");
+  }
+
+  // The third argument selects the output format of the digest.
+  #[test]
+  fn hash_output_formats() {
+    // Base64Encoding gives a base64 string of the raw digest bytes.
+    assert_eq!(
+      interpret(r#"Hash["test", "SHA256", "Base64Encoding"]"#).unwrap(),
+      "n4bQgYhMfWWaL+qgxVrQFaO/TxsrC4Is0V1sFbDwCgg="
+    );
+    assert_eq!(
+      interpret(r#"Hash["test", "MD5", "Base64Encoding"]"#).unwrap(),
+      "CY9rzUYh03PK3k6DJie09g=="
+    );
+    assert_eq!(
+      interpret(r#"Hash["test", "CRC32", "Base64Encoding"]"#).unwrap(),
+      "2H9+DA=="
+    );
+    // DecimalString is the integer zero-padded to the digest's fixed width
+    // (39 decimal digits for a 128-bit MD5 digest).
+    assert_eq!(
+      interpret(r#"Hash["test", "MD5", "DecimalString"]"#).unwrap(),
+      "012707736894140473154801792860916528374"
+    );
+    // ByteArray wraps the raw digest bytes.
+    assert_eq!(
+      interpret(r#"Normal[Hash["test", "MD5", "ByteArray"]]"#).unwrap(),
+      "{9, 143, 107, 205, 70, 33, 211, 115, 202, 222, 78, 131, 38, 39, 180, \
+       246}"
+    );
+  }
+
+  // Types beyond MD2/MD5/SHA/SHA256/SHA384/SHA512, all against the published
+  // test vectors for "abc" (which wolframscript agrees with).
+  #[test]
+  fn the_remaining_named_algorithms() {
+    for (algorithm, digest) in [
+      ("MD4", "a448017aaf21d8525fc10ae87aa6729d"),
+      (
+        "SHA224",
+        "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7",
+      ),
+      (
+        "SHA3-224",
+        "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf",
+      ),
+      (
+        "SHA3-256",
+        "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532",
+      ),
+      (
+        "SHA3-384",
+        "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b2\
+         98d88cea927ac7f539f1edf228376d25",
+      ),
+      (
+        "SHA3-512",
+        "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e\
+         10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0",
+      ),
+      // The pre-standard padding Ethereum kept, which differs from SHA3-256.
+      (
+        "Keccak256",
+        "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45",
+      ),
+      ("RIPEMD160", "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"),
+      // RIPEMD160 of the SHA256, the digest a Bitcoin address is built from.
+      (
+        "RIPEMD160SHA256",
+        "bb1be98c142444d7a56aa3981c3942a978e4dc33",
+      ),
+    ] {
+      assert_eq!(
+        interpret(&format!(r#"Hash["abc", "{algorithm}", "HexString"]"#))
+          .unwrap(),
+        digest.replace("         ", ""),
+        "{algorithm}"
+      );
+    }
+  }
+
+  // A ByteArray is hashed over its bytes, so it gives the same digest as the
+  // string those bytes spell.
+  #[test]
+  fn a_byte_array_hashes_its_bytes() {
+    for algorithm in ["MD5", "SHA256", "CRC32", "Adler32", "SHA3-256"] {
+      assert_eq!(
+        interpret(&format!(
+          r#"Hash[ByteArray[{{97, 98, 99}}], "{algorithm}", "HexString"]"#
+        ))
+        .unwrap(),
+        interpret(&format!(r#"Hash["abc", "{algorithm}", "HexString"]"#))
+          .unwrap(),
+        "{algorithm}"
+      );
+    }
+    // Including the empty one, which used to hash its printed form instead.
+    assert_eq!(interpret(r#"Hash[ByteArray[{}], "CRC32"]"#).unwrap(), "0");
+    // Bytes no string could hold hash all the same.
+    assert_eq!(
+      interpret(r#"Hash[ByteArray[{0, 1, 255, 254}], "SHA256", "HexString"]"#)
+        .unwrap(),
+      "5e90fe977790507860b03456633c9ad88ea951cd8a6620d3e37ca43c160c15ae"
+    );
+  }
+
+  // A format Hash does not know is reported rather than quietly replaced by
+  // the default one.
+  #[test]
+  fn an_unknown_format_is_refused() {
+    let result =
+      interpret_with_stdout(r#"Hash["abc", "MD5", "Bogus"]"#).unwrap();
+    assert_eq!(result.result, "Hash[abc, MD5, Bogus]");
+    assert!(
+      result
+        .warnings
+        .iter()
+        .any(|w| w.contains("Hash::uform: Invalid hash format Bogus.")),
+      "expected Hash::uform, got {:?}",
+      result.warnings
+    );
+  }
+
+  #[test]
+  fn an_unknown_algorithm_is_reported() {
+    let result = interpret_with_stdout(r#"Hash["abc", "Bogus"]"#).unwrap();
+    assert_eq!(result.result, "Hash[abc, Bogus]");
+    assert!(
+      result.warnings.iter().any(|w| w
+        .contains("Hash::invhash: Bogus is not a valid Hash specification.")),
+      "expected Hash::invhash, got {:?}",
+      result.warnings
+    );
+  }
+}
+
+mod string_riffle_extended {
+  use super::*;
+
+  #[test]
+  fn left_sep_right() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{"a", "b", "c"}, {"[", "|", "]"}]"#).unwrap(),
+      "[a|b|c]"
+    );
+  }
+
+  #[test]
+  fn braces() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{"a", "b", "c"}, {"{", ", ", "}"}]"#).unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  #[test]
+  fn basic_still_works() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{"a", "b", "c"}, ", "]"#).unwrap(),
+      "a, b, c"
+    );
+  }
+
+  #[test]
+  fn nested_default_separators() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{{"a", "b"}, {"c", "d"}}]"#).unwrap(),
+      "a b\nc d"
+    );
+  }
+
+  #[test]
+  fn nested_explicit_separators() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{{"a", "b"}, {"c", "d"}}, "\n", " "]"#)
+        .unwrap(),
+      "a b\nc d"
+    );
+  }
+
+  #[test]
+  fn nested_three_by_two() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{{"a","b","c"},{"d","e","f"}}, "; ", ", "]"#)
+        .unwrap(),
+      "a, b, c; d, e, f"
+    );
+  }
+
+  #[test]
+  fn nested_with_brackets_on_outer() {
+    assert_eq!(
+      interpret(
+        r#"StringRiffle[{{"a", "b"}, {"c", "d"}}, {"[", "|", "]"}, "-"]"#
+      )
+      .unwrap(),
+      "[a-b|c-d]"
+    );
+  }
+
+  #[test]
+  fn nested_with_integers() {
+    assert_eq!(
+      interpret(r#"StringRiffle[{{1, 2, 3}, {4, 5, 6}}, "\n", " "]"#).unwrap(),
+      "1 2 3\n4 5 6"
+    );
+  }
+
+  #[test]
+  fn triple_nested_default_separators() {
+    assert_eq!(
+      interpret(
+        r#"StringRiffle[{{{"a","b"},{"c","d"}},{{"e","f"},{"g","h"}}}]"#
+      )
+      .unwrap(),
+      "a b\nc d\n\ne f\ng h"
+    );
+  }
+}
+
+mod palindrome_q {
+  use super::*;
+
+  #[test]
+  fn string_palindrome() {
+    assert_eq!(interpret(r#"PalindromeQ["racecar"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn string_not_palindrome() {
+    assert_eq!(interpret(r#"PalindromeQ["hello"]"#).unwrap(), "False");
+  }
+
+  #[test]
+  fn empty_string() {
+    assert_eq!(interpret(r#"PalindromeQ[""]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn single_char_string() {
+    assert_eq!(interpret(r#"PalindromeQ["a"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn list_palindrome() {
+    assert_eq!(interpret("PalindromeQ[{1, 2, 3, 2, 1}]").unwrap(), "True");
+  }
+
+  #[test]
+  fn list_not_palindrome() {
+    assert_eq!(interpret("PalindromeQ[{1, 2, 3}]").unwrap(), "False");
+  }
+
+  #[test]
+  fn empty_list() {
+    assert_eq!(interpret("PalindromeQ[{}]").unwrap(), "True");
+  }
+
+  #[test]
+  fn integer_palindrome() {
+    assert_eq!(interpret("PalindromeQ[12321]").unwrap(), "True");
+  }
+
+  #[test]
+  fn integer_not_palindrome() {
+    assert_eq!(interpret("PalindromeQ[12345]").unwrap(), "False");
+  }
+
+  #[test]
+  fn single_digit() {
+    assert_eq!(interpret("PalindromeQ[7]").unwrap(), "True");
+  }
+
+  #[test]
+  fn list_with_symbols() {
+    assert_eq!(interpret("PalindromeQ[{a, b, a}]").unwrap(), "True");
+  }
+}
+
+mod string_drop_list_spec {
+  use super::*;
+
+  #[test]
+  fn drop_single_char() {
+    assert_eq!(interpret(r#"StringDrop["abcde", {2}]"#).unwrap(), "acde");
+  }
+
+  #[test]
+  fn drop_range() {
+    assert_eq!(interpret(r#"StringDrop["abcde", {2,3}]"#).unwrap(), "ade");
+  }
+
+  #[test]
+  fn drop_reversed_range() {
+    assert_eq!(interpret(r#"StringDrop["abcd",{3,2}]"#).unwrap(), "abcd");
+  }
+
+  #[test]
+  fn drop_zero() {
+    assert_eq!(interpret(r#"StringDrop["abcd",0]"#).unwrap(), "abcd");
+  }
+
+  #[test]
+  fn drop_threads_list() {
+    assert_eq!(
+      interpret(r#"StringDrop[{"abcde", "fghij"}, 2]"#).unwrap(),
+      "{cde, hij}"
+    );
+  }
+
+  #[test]
+  fn drop_threads_list_negative() {
+    assert_eq!(
+      interpret(r#"StringDrop[{"abcde", "fghij"}, -2]"#).unwrap(),
+      "{abc, fgh}"
+    );
+  }
+
+  #[test]
+  fn drop_threads_list_single_index() {
+    assert_eq!(
+      interpret(r#"StringDrop[{"abcde", "fghij"}, {2}]"#).unwrap(),
+      "{acde, fhij}"
+    );
+  }
+}
+
+mod string_take_extended {
+  use super::*;
+
+  #[test]
+  fn take_zero() {
+    assert_eq!(interpret(r#"StringTake["abcde", 0]"#).unwrap(), "");
+  }
+
+  #[test]
+  fn take_with_step() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdefgh", {1, 5, 2}]"#).unwrap(),
+      "ace"
+    );
+  }
+
+  #[test]
+  fn take_list_of_strings() {
+    assert_eq!(
+      interpret(r#"StringTake[{"abcdef", "stuv", "xyzw"}, -2]"#).unwrap(),
+      "{ef, uv, zw}"
+    );
+  }
+
+  #[test]
+  fn take_all() {
+    assert_eq!(interpret(r#"StringTake["abcdef", All]"#).unwrap(), "abcdef");
+  }
+
+  #[test]
+  fn take_single_char() {
+    assert_eq!(interpret(r#"StringTake["abcde", {2}]"#).unwrap(), "b");
+  }
+
+  #[test]
+  fn take_range() {
+    assert_eq!(interpret(r#"StringTake["abcd", {2,3}]"#).unwrap(), "bc");
+  }
+
+  #[test]
+  fn take_up_to_within_length() {
+    assert_eq!(interpret(r#"StringTake["Hello", UpTo[3]]"#).unwrap(), "Hel");
+  }
+
+  #[test]
+  fn take_up_to_exceeds_length() {
+    assert_eq!(
+      interpret(r#"StringTake["Hello", UpTo[10]]"#).unwrap(),
+      "Hello"
+    );
+  }
+
+  #[test]
+  fn take_list_of_ranges() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdef", {{1, 3}, {4, 6}}]"#).unwrap(),
+      "{abc, def}"
+    );
+  }
+
+  #[test]
+  fn take_list_of_mixed_subspecs() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdefghij", {{1, 3}, {5}, {7, 9}}]"#).unwrap(),
+      "{abc, e, ghi}"
+    );
+  }
+
+  #[test]
+  fn take_list_of_one_range() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdefghij", {{2, 4}}]"#).unwrap(),
+      "{bcd}"
+    );
+  }
+
+  #[test]
+  fn take_list_of_negative_range() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdefghij", {{-4, -1}}]"#).unwrap(),
+      "{ghij}"
+    );
+  }
+
+  #[test]
+  fn take_list_of_stepped_range() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdefghij", {{1, 8, 2}}]"#).unwrap(),
+      "{aceg}"
+    );
+  }
+}
+
+// StringTake / StringDrop with a Span (i;;j;;k) spec, equivalent to the
+// {i, j, k} list form.
+mod string_take_drop_span {
+  use super::*;
+
+  #[test]
+  fn take_span() {
+    assert_eq!(interpret(r#"StringTake["hello", ;;3]"#).unwrap(), "hel");
+    assert_eq!(interpret(r#"StringTake["hello", 2;;4]"#).unwrap(), "ell");
+    assert_eq!(interpret(r#"StringTake["hello", 2;;]"#).unwrap(), "ello");
+    assert_eq!(interpret(r#"StringTake["hello", ;;-2]"#).unwrap(), "hell");
+    assert_eq!(interpret(r#"StringTake["hello", ;;]"#).unwrap(), "hello");
+  }
+
+  #[test]
+  fn take_span_with_step() {
+    assert_eq!(
+      interpret(r#"StringTake["hello", 1;;-1;;2]"#).unwrap(),
+      "hlo"
+    );
+  }
+
+  #[test]
+  fn drop_span() {
+    assert_eq!(interpret(r#"StringDrop["hello", ;;2]"#).unwrap(), "llo");
+    assert_eq!(interpret(r#"StringDrop["hello", 2;;3]"#).unwrap(), "hlo");
+    assert_eq!(interpret(r#"StringDrop["hello", ;;-2]"#).unwrap(), "o");
+  }
+}
+
+mod string_match_q_patterns {
+  use super::*;
+
+  #[test]
+  fn digit_character() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["1", DigitCharacter]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn repeated_digit_character() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["123245", Repeated[DigitCharacter]]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn repeated_with_count() {
+    // Repeated["a", 3] means 1 to 3 repetitions
+    assert_eq!(
+      interpret(r#"StringMatchQ["aaa", Repeated["a", 3]]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["aa", Repeated["a", 3]]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["a", Repeated["a", 3]]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["aaaa", Repeated["a", 3]]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn repeated_with_range() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["aaa", Repeated["a", {2, 4}]]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["a", Repeated["a", {2, 4}]]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn repeated_with_list_count() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["aaa", Repeated["a", {3}]]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn word_character_repeated() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["abc123DEF", Repeated[WordCharacter]]"#)
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn number_string() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["1234", NumberString]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["1234.5", NumberString]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn number_string_signed() {
+    // NumberString matches an optional leading sign as part of the number.
+    assert_eq!(
+      interpret(r#"StringCases["2024-03-15", NumberString]"#).unwrap(),
+      "{2024, -03, -15}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["a-5b+3c", NumberString]"#).unwrap(),
+      "{-5, +3}"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["-5", NumberString]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["+5", NumberString]"#).unwrap(),
+      "True"
+    );
+    // Only a single sign is allowed.
+    assert_eq!(
+      interpret(r#"StringMatchQ["--5", NumberString]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn number_string_leading_and_trailing_decimal() {
+    // A leading-decimal form (.5) and a trailing-decimal form (1.) both match.
+    assert_eq!(
+      interpret(r#"StringCases[".5", NumberString]"#).unwrap(),
+      "{.5}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["1.", NumberString]"#).unwrap(),
+      "{1.}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["-.5", NumberString]"#).unwrap(),
+      "{-.5}"
+    );
+    // Greedy decimal stops at a second dot.
+    assert_eq!(
+      interpret(r#"StringCases["3.14.15", NumberString]"#).unwrap(),
+      "{3.14, .15}"
+    );
+    // No exponent: `1e5` is two number strings.
+    assert_eq!(
+      interpret(r#"StringCases["1e5", NumberString]"#).unwrap(),
+      "{1, 5}"
+    );
+  }
+
+  #[test]
+  fn wildcard_star() {
+    assert_eq!(interpret(r#"StringMatchQ["Hello", "H*"]"#).unwrap(), "True");
+    assert_eq!(
+      interpret(r#"StringMatchQ["Hello", "*llo"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["Hello", "H*o"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(interpret(r#"StringMatchQ["Hello", "*"]"#).unwrap(), "True");
+    assert_eq!(
+      interpret(r#"StringMatchQ["Hello", "X*"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn wildcard_at() {
+    assert_eq!(interpret(r#"StringMatchQ["abc", "a@c"]"#).unwrap(), "True");
+    assert_eq!(interpret(r#"StringMatchQ["aXc", "a@c"]"#).unwrap(), "False");
+  }
+}
+
+mod string_expression {
+  use super::*;
+
+  #[test]
+  fn parse_standalone() {
+    assert_eq!(
+      interpret(r#""a" ~~ __"#).unwrap(),
+      r#"StringExpression[a, __]"#
+    );
+  }
+
+  #[test]
+  fn string_match_q_with_prefix_pattern() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["apple", "a" ~~ __]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["banana", "a" ~~ __]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn string_match_q_with_suffix_pattern() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["hello", __ ~~ "lo"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["hello", __ ~~ "xyz"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn string_match_q_with_blank() {
+    // _ matches exactly one character
+    assert_eq!(
+      interpret(r#"StringMatchQ["ab", "a" ~~ _]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["a", "a" ~~ _]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn string_match_q_with_blank_null_sequence() {
+    // ___ matches zero or more characters
+    assert_eq!(
+      interpret(r#"StringMatchQ["a", "a" ~~ ___]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["abc", "a" ~~ ___]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn three_part_pattern() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["abc", "a" ~~ _ ~~ "c"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["axc", "a" ~~ _ ~~ "c"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["axxc", "a" ~~ _ ~~ "c"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn select_with_string_expression() {
+    assert_eq!(
+      interpret(
+        r#"Select[{apple, banana, pear, apricot}, StringMatchQ[ToString[#], "a" ~~ __] &]"#
+      )
+      .unwrap(),
+      "{apple, apricot}"
+    );
+  }
+
+  #[test]
+  fn with_character_classes() {
+    assert_eq!(
+      interpret(r#"StringMatchQ["a1", LetterCharacter ~~ DigitCharacter]"#)
+        .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["1a", LetterCharacter ~~ DigitCharacter]"#)
+        .unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn flat_associativity() {
+    // String literals in ~~ are concatenated (Wolfram behavior)
+    assert_eq!(interpret(r#""a" ~~ "b" ~~ "c""#).unwrap(), r#"abc"#);
+  }
+}
+
+mod string_split_edge {
+  use super::*;
+
+  #[test]
+  fn split_x_by_x() {
+    assert_eq!(interpret(r#"StringSplit["x", "x"]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn split_filters_empty() {
+    assert_eq!(interpret(r#"StringSplit["xxax", "x"]"#).unwrap(), "{a}");
+  }
+
+  #[test]
+  fn split_threads_list_default() {
+    assert_eq!(
+      interpret(r#"StringSplit[{"ab cd", "ef gh"}]"#).unwrap(),
+      "{{ab, cd}, {ef, gh}}"
+    );
+  }
+
+  #[test]
+  fn split_threads_list_with_delim() {
+    assert_eq!(
+      interpret(r#"StringSplit[{"a-b-c", "x-y"}, "-"]"#).unwrap(),
+      "{{a, b, c}, {x, y}}"
+    );
+  }
+
+  #[test]
+  fn non_string_emits_strse() {
+    // A non-string first argument stays unevaluated and emits StringSplit::strse
+    // referencing the whole call (regression: used to return {5} / {x}).
+    let r = woxi::interpret_with_stdout("StringSplit[5]").unwrap();
+    assert_eq!(r.result, "StringSplit[5]");
+    assert!(
+      r.warnings.iter().any(|w| w.contains(
+        "StringSplit::strse: A string or list of strings is expected at position 1 in StringSplit[5]."
+      )),
+      "expected StringSplit::strse, got {:?}",
+      r.warnings
+    );
+
+    let r = woxi::interpret_with_stdout("StringSplit[x]").unwrap();
+    assert_eq!(r.result, "StringSplit[x]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "StringSplit::strse: A string or list of strings is expected at position 1 in StringSplit[x]."
+    )));
+  }
+
+  #[test]
+  fn non_string_with_delimiter_reports_full_call() {
+    // The reported call includes the delimiter, rendered in OutputForm.
+    let r = woxi::interpret_with_stdout(r#"StringSplit[5, ","]"#).unwrap();
+    assert_eq!(r.result, "StringSplit[5, ,]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "StringSplit::strse: A string or list of strings is expected at position 1 in StringSplit[5, ,]."
+    )));
+  }
+
+  #[test]
+  fn list_with_a_non_string_is_rejected_whole() {
+    // A list is only valid when every element is a string; otherwise the whole
+    // first argument is rejected (not threaded element-wise).
+    let r = woxi::interpret_with_stdout(r#"StringSplit[{"a b", 5}]"#).unwrap();
+    assert_eq!(r.result, "StringSplit[{a b, 5}]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "StringSplit::strse: A string or list of strings is expected at position 1 in StringSplit[{a b, 5}]."
+    )));
+  }
+}
+
+mod integer_string_tests {
+  use super::*;
+
+  #[test]
+  fn negative_drops_sign() {
+    assert_eq!(interpret("IntegerString[-500]").unwrap(), "500");
+  }
+
+  #[test]
+  fn truncate_to_length() {
+    assert_eq!(interpret("IntegerString[12345, 10, 3]").unwrap(), "345");
+  }
+
+  #[test]
+  fn bigint_base2() {
+    // Beyond i128 — verifies BigInteger path. Reference value taken from
+    // wolframscript: IntegerString[143207491493571284560146904872817600361573129, 2].
+    assert_eq!(
+      interpret(
+        "IntegerString[143207491493571284560146904872817600361573129, 2]"
+      )
+      .unwrap(),
+      "110011010111111000011111110001111001100111000001111110111010000100011110001111110101101100100110010000011001000110000001111101000101010101100001001"
+    );
+  }
+
+  #[test]
+  fn bigint_negative_drops_sign() {
+    assert_eq!(
+      interpret(
+        "IntegerString[-143207491493571284560146904872817600361573129, 2]"
+      )
+      .unwrap(),
+      "110011010111111000011111110001111001100111000001111110111010000100011110001111110101101100100110010000011001000110000001111101000101010101100001001"
+    );
+  }
+}
+
+mod compress {
+  use super::*;
+
+  #[test]
+  fn compress_returns_string() {
+    let result = interpret("Compress[42]").unwrap();
+    assert!(result.starts_with("1:eJx"));
+  }
+
+  #[test]
+  fn uncompress_roundtrip_integer() {
+    assert_eq!(interpret("Uncompress[Compress[42]]").unwrap(), "42");
+  }
+
+  #[test]
+  fn uncompress_roundtrip_string() {
+    assert_eq!(
+      interpret("Uncompress[Compress[\"hello world\"]]").unwrap(),
+      "hello world"
+    );
+  }
+
+  #[test]
+  fn uncompress_roundtrip_list() {
+    assert_eq!(
+      interpret("Uncompress[Compress[{1, 2, 3}]]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn uncompress_roundtrip_symbolic() {
+    assert_eq!(
+      interpret("Uncompress[Compress[x^2 + y Sin[x] + 10 Log[15]]]").unwrap(),
+      "x^2 + 10*Log[15] + y*Sin[x]"
+    );
+  }
+
+  #[test]
+  fn uncompress_via_variable() {
+    clear_state();
+    assert_eq!(
+      interpret("c = Compress[\"Mathics3 is cool\"]; Uncompress[c]").unwrap(),
+      "Mathics3 is cool"
+    );
+  }
+}
+
+mod sequence_form {
+  use super::*;
+
+  // SequenceForm concatenates the printed forms of its arguments, showing
+  // strings without quotes and rendering numbers as their input-form text.
+  #[test]
+  fn mixed_strings_and_numbers() {
+    assert_eq!(
+      interpret(r#"SequenceForm["[", "x = ", 56, "]"]"#).unwrap(),
+      "[x = 56]"
+    );
+  }
+
+  #[test]
+  fn only_symbols() {
+    assert_eq!(interpret("SequenceForm[a, b, c]").unwrap(), "abc");
+  }
+
+  #[test]
+  fn only_numbers() {
+    assert_eq!(interpret("SequenceForm[1, 2, 3]").unwrap(), "123");
+  }
+}
+
+mod string_form {
+  use super::*;
+
+  #[test]
+  fn display_with_placeholder() {
+    // StringForm at top level renders as the literal wrapper, matching
+    // wolframscript. Substitution only happens via explicit ToString.
+    assert_eq!(
+      interpret("StringForm[\"The value is ``.\", 5]").unwrap(),
+      "StringForm[The value is ``., 5]"
+    );
+  }
+
+  #[test]
+  fn to_string_single_placeholder() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"The value is ``.\", 5]]").unwrap(),
+      "The value is 5."
+    );
+  }
+
+  #[test]
+  fn string_template_fills_slots() {
+    // Named slots from an association.
+    assert_eq!(
+      interpret(r#"StringTemplate["Hi `name`"][<|"name" -> "Bob"|>]"#).unwrap(),
+      "Hi Bob"
+    );
+    // Positional slots from arguments.
+    assert_eq!(
+      interpret(r#"StringTemplate["`1` + `2`"][3, 4]"#).unwrap(),
+      "3 + 4"
+    );
+    // Sequential `` slots.
+    assert_eq!(
+      interpret(r#"StringTemplate["`` and ``"][7, 8]"#).unwrap(),
+      "7 and 8"
+    );
+    // Repeated positional reference.
+    assert_eq!(
+      interpret(r#"StringTemplate["`1`-`1`-`2`"][3, 4]"#).unwrap(),
+      "3-3-4"
+    );
+    // An unfilled slot renders as the empty string.
+    assert_eq!(
+      interpret(r#"StringTemplate["a `x` b `y`"][<|"x" -> 1|>]"#).unwrap(),
+      "a 1 b "
+    );
+  }
+
+  #[test]
+  fn to_string_multiple_placeholders() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"x=`` and y=``.\", 5, 10]]").unwrap(),
+      "x=5 and y=10."
+    );
+  }
+
+  #[test]
+  fn to_string_indexed_placeholders() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"`2` is `1`.\", \"dog\", \"big\"]]")
+        .unwrap(),
+      "big is dog."
+    );
+  }
+
+  #[test]
+  fn to_string_no_placeholders() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"hello\"]]").unwrap(),
+      "hello"
+    );
+  }
+
+  #[test]
+  fn to_string_with_list_arg() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"x=``\", {1, 2, 3}]]").unwrap(),
+      "x={1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn to_string_with_symbolic_arg() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"x=``\", Pi]]").unwrap(),
+      "x=Pi"
+    );
+  }
+
+  #[test]
+  fn to_string_three_sequential() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"`` + `` = ``\", 1, 2, 3]]").unwrap(),
+      "1 + 2 = 3"
+    );
+  }
+
+  // The second argument of ToString must be a format symbol, never a number:
+  // wolframscript rejects a numeric format with ToString::fmtval and returns
+  // the call unevaluated instead of silently stringifying the value.
+  #[test]
+  fn to_string_numeric_format_rejected() {
+    use woxi::interpret_with_stdout;
+    let r = interpret_with_stdout("ToString[255, 2]").unwrap();
+    assert_eq!(r.result, "ToString[255, 2]");
+    assert!(
+      r.warnings[0].contains("ToString::fmtval: 2 is not a valid format type."),
+      "got: {:?}",
+      r.warnings
+    );
+    // A real-valued format is likewise invalid.
+    assert_eq!(
+      interpret_with_stdout("ToString[x + y, 1.5]")
+        .unwrap()
+        .result,
+      "ToString[x + y, 1.5]"
+    );
+    // A genuine format symbol still works.
+    assert_eq!(interpret("ToString[255, InputForm]").unwrap(), "255");
+  }
+
+  // `ToString[expr, TraditionalForm]` typesets rather than prints: it hands
+  // back the boxes in the box-syntax escape notation, the way
+  // `ToString[expr, StandardForm]` does — a String that *displays* as the
+  // typeset expression. A known function takes its roman name and round
+  // brackets, `HoldForm` leaves its `TagBox` mark, `Style` its `StyleBox`
+  // with the directives, a string's box is its quoted source, and a quotient
+  // sets as a `FractionBox`. The escape characters are invisible, so the
+  // assertions compare the `InputForm` of the returned String.
+  #[test]
+  fn to_string_traditional_form_typesets_functions() {
+    assert_eq!(
+      interpret("ToString[ToString[Sin[x], TraditionalForm], InputForm]")
+        .unwrap(),
+      r#""\!\(\*FormBox[RowBox[{\"sin\", \"(\", \"x\", \")\"}], TraditionalForm]\)""#
+    );
+    assert_eq!(
+      interpret(
+        "ToString[ToString[HoldForm[g][HoldForm[x]], TraditionalForm], InputForm]"
+      )
+      .unwrap(),
+      r#""\!\(\*FormBox[RowBox[{TagBox[\"g\", HoldForm], \"(\", TagBox[\"x\", HoldForm], \")\"}], TraditionalForm]\)""#
+    );
+    // A `Style` wrapper carries its directives into the box tree.
+    assert_eq!(
+      interpret(
+        "ToString[ToString[Style[HoldForm[f][HoldForm[x]], Red], TraditionalForm], InputForm]"
+      )
+      .unwrap(),
+      r#""\!\(\*FormBox[StyleBox[RowBox[{TagBox[\"f\", HoldForm], \"(\", TagBox[\"x\", HoldForm], \")\"}], RGBColor[1, 0, 0], Rule[StripOnInput, False]], TraditionalForm]\)""#
+    );
+    // A string's box is its quoted source; it still draws without the quotes.
+    assert_eq!(
+      interpret("ToString[ToString[\" = \", TraditionalForm], InputForm]")
+        .unwrap(),
+      r#""\!\(\*FormBox[\"\\\" = \\\"\", TraditionalForm]\)""#
+    );
+  }
+
+  #[test]
+  fn to_string_traditional_form_stacks_quotients() {
+    assert_eq!(
+      interpret("ToString[ToString[a/b, TraditionalForm], InputForm]").unwrap(),
+      r#""\!\(\*FormBox[FractionBox[\"a\", \"b\"], TraditionalForm]\)""#
+    );
+    // The evaluated `Times[a, Power[b, -1]]` shape sets as a fraction too,
+    // rather than as a factor with a negative exponent.
+    assert_eq!(
+      interpret("ToString[ToString[Sin[x]/2, TraditionalForm], InputForm]")
+        .unwrap(),
+      r#""\!\(\*FormBox[FractionBox[RowBox[{\"sin\", \"(\", \"x\", \")\"}], \"2\"], TraditionalForm]\)""#
+    );
+  }
+
+  #[test]
+  fn to_string_table_form_matrix() {
+    assert_eq!(
+      interpret("ToString[TableForm[{{1, 2}, {3, 4}}]]").unwrap(),
+      "1   2\n\n3   4"
+    );
+  }
+
+  #[test]
+  fn to_string_table_form_column_widths() {
+    // Each column is padded to its widest cell; trailing space is trimmed.
+    assert_eq!(
+      interpret("ToString[TableForm[{{a, bb}, {ccc, d}}]]").unwrap(),
+      "a     bb\n\nccc   d"
+    );
+  }
+
+  #[test]
+  fn to_string_table_form_unequal_cell_widths() {
+    assert_eq!(
+      interpret("ToString[TableForm[{{1, 22}, {3, 4}}]]").unwrap(),
+      "1   22\n\n3   4"
+    );
+  }
+
+  #[test]
+  fn to_string_table_form_vector() {
+    // A flat vector renders one element per row.
+    assert_eq!(
+      interpret("ToString[TableForm[{1, 2, 3}]]").unwrap(),
+      "1\n\n2\n\n3"
+    );
+  }
+
+  #[test]
+  fn to_string_table_form_single_row() {
+    assert_eq!(
+      interpret("ToString[TableForm[{{1, 2, 3}}]]").unwrap(),
+      "1   2   3"
+    );
+  }
+
+  // ToString[Grid[matrix]] renders exactly like TableForm (left-aligned columns
+  // padded to the widest cell, three-space separators, blank line between rows).
+  #[test]
+  fn to_string_grid_matrix() {
+    assert_eq!(
+      interpret("ToString[Grid[{{1, 2}, {3, 4}}]]").unwrap(),
+      "1   2\n\n3   4"
+    );
+    assert_eq!(
+      interpret("ToString[Grid[{{1, 22, 3}, {444, 5, 66}}]]").unwrap(),
+      "1     22   3\n\n444   5    66"
+    );
+    assert_eq!(
+      interpret("ToString[Grid[{{a, bb}, {ccc, d}}]]").unwrap(),
+      "a     bb\n\nccc   d"
+    );
+  }
+
+  #[test]
+  fn to_string_grid_single_column() {
+    assert_eq!(
+      interpret("ToString[Grid[{{1}, {2}, {3}}]]").unwrap(),
+      "1\n\n2\n\n3"
+    );
+  }
+
+  #[test]
+  fn display_indexed_placeholders() {
+    // Top-level StringForm renders as the literal wrapper.
+    assert_eq!(
+      interpret("StringForm[\"`1` plus `2` is `3`\", 1, 2, 3]").unwrap(),
+      "StringForm[`1` plus `2` is `3`, 1, 2, 3]"
+    );
+  }
+
+  // Out-of-range indexed placeholders are kept literal even after ToString
+  // forces substitution (instead of silently blanking them). This is the
+  // wolframscript/mathics behaviour.
+  #[test]
+  fn out_of_range_positive_index_kept_literal() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"`2` bla\", a]]").unwrap(),
+      "`2` bla"
+    );
+  }
+
+  #[test]
+  fn out_of_range_negative_index_kept_literal() {
+    assert_eq!(
+      interpret("ToString[StringForm[\"`-1` bla\", a]]").unwrap(),
+      "`-1` bla"
+    );
+  }
+
+  #[test]
+  fn out_of_range_sequential_placeholder_kept_literal() {
+    // `` with no argument to pull from: keep the two backticks literal.
+    assert_eq!(interpret("ToString[StringForm[\"x=``\"]]").unwrap(), "x=``");
+  }
+
+  #[test]
+  fn sequential_placeholder_resumes_from_last_numbered() {
+    // `` picks up from the most recently used numbered slot + 1, not from
+    // its own independent counter. `1` was the most recent; so `` -> arg 2.
+    assert_eq!(
+      interpret(
+        "ToString[StringForm[\"`2` bla `1` blub `` bla `3`\", a, b, c]]"
+      )
+      .unwrap(),
+      "b bla a blub b bla c"
+    );
+  }
+
+  #[test]
+  fn escaped_backquote_kept_literal() {
+    // \` inside the template is a literal backslash + backtick sequence;
+    // Woxi/wolframscript keep both bytes verbatim in the output.
+    assert_eq!(
+      interpret(r#"ToString[StringForm["`` is Global\`a", a]]"#).unwrap(),
+      "a is Global\\`a"
+    );
+  }
+}
+
+mod tex_form {
+  use super::*;
+
+  #[test]
+  fn simple_addition() {
+    // Wolfram canonical order for same-degree terms
+    assert_eq!(
+      interpret("ToString[x^2 + y^2, TeXForm]").unwrap(),
+      "x^2+y^2"
+    );
+  }
+
+  #[test]
+  fn sqrt() {
+    assert_eq!(
+      interpret("ToString[Sqrt[x], TeXForm]").unwrap(),
+      "\\sqrt{x}"
+    );
+  }
+
+  #[test]
+  fn fraction() {
+    assert_eq!(interpret("ToString[a/b, TeXForm]").unwrap(), "\\frac{a}{b}");
+  }
+
+  #[test]
+  fn rational() {
+    assert_eq!(interpret("ToString[3/4, TeXForm]").unwrap(), "\\frac{3}{4}");
+  }
+
+  // A rational coefficient p/q folds into the fraction: wolframscript renders
+  // `Sqrt[x]/2` as `\frac{\sqrt{x}}{2}`, not `\frac{1}{2}\sqrt{x}`.
+  #[test]
+  fn rational_coefficient_folds_into_fraction() {
+    assert_eq!(interpret("ToString[x/2, TeXForm]").unwrap(), "\\frac{x}{2}");
+    assert_eq!(
+      interpret("ToString[3 x/2, TeXForm]").unwrap(),
+      "\\frac{3 x}{2}"
+    );
+    assert_eq!(
+      interpret("ToString[Sqrt[x]/2, TeXForm]").unwrap(),
+      "\\frac{\\sqrt{x}}{2}"
+    );
+    assert_eq!(
+      interpret("ToString[x y/2, TeXForm]").unwrap(),
+      "\\frac{x y}{2}"
+    );
+    // The rational denominator merges with other denominator factors.
+    assert_eq!(
+      interpret("ToString[2 x/(3 y), TeXForm]").unwrap(),
+      "\\frac{2 x}{3 y}"
+    );
+    // A negative coefficient keeps the sign outside the fraction.
+    assert_eq!(
+      interpret("ToString[-Sqrt[x]/2, TeXForm]").unwrap(),
+      "-\\frac{\\sqrt{x}}{2}"
+    );
+    // A single parenthesised-sum factor still folds (with its parens).
+    assert_eq!(
+      interpret("ToString[3 (a + b)/2, TeXForm]").unwrap(),
+      "\\frac{3 (a+b)}{2}"
+    );
+    // But a product of several factors including a sum keeps the coefficient
+    // separate, matching wolframscript.
+    assert_eq!(
+      interpret("ToString[Sum[i, {i, 1, n}], TeXForm]").unwrap(),
+      "\\frac{1}{2} n (n+1)"
+    );
+  }
+
+  // A Plus factor inside a product must be parenthesized.
+  #[test]
+  fn product_with_plus_factor() {
+    assert_eq!(
+      interpret("ToString[a (b + c), TeXForm]").unwrap(),
+      "a (b+c)"
+    );
+    assert_eq!(
+      interpret("ToString[2 (x + 1), TeXForm]").unwrap(),
+      "2 (x+1)"
+    );
+    assert_eq!(
+      interpret("ToString[(a + b) (c + d), TeXForm]").unwrap(),
+      "(a+b) (c+d)"
+    );
+    assert_eq!(
+      interpret("ToString[x (y + z) w, TeXForm]").unwrap(),
+      "w x (y+z)"
+    );
+    assert_eq!(
+      interpret("ToString[Sum[i, {i, 1, n}], TeXForm]").unwrap(),
+      "\\frac{1}{2} n (n+1)"
+    );
+    // A lone fraction numerator is grouped by its brace, so it keeps no parens.
+    assert_eq!(
+      interpret("ToString[(a + b)/c, TeXForm]").unwrap(),
+      "\\frac{a+b}{c}"
+    );
+    // A plain product without a Plus factor is unchanged.
+    assert_eq!(interpret("ToString[a b c, TeXForm]").unwrap(), "a b c");
+  }
+
+  // Floor/Ceiling/Binomial/Subscript use their TeX-specific notation.
+  #[test]
+  fn floor_ceiling_binomial_subscript() {
+    assert_eq!(
+      interpret("ToString[Floor[x], TeXForm]").unwrap(),
+      "\\lfloor x\\rfloor"
+    );
+    assert_eq!(
+      interpret("ToString[Ceiling[x], TeXForm]").unwrap(),
+      "\\lceil x\\rceil"
+    );
+    assert_eq!(
+      interpret("ToString[Binomial[n, k], TeXForm]").unwrap(),
+      "\\binom{n}{k}"
+    );
+
+    // Tall content (fraction/radical/superscript) uses \left…\right so the
+    // delimiters are sized to the content, matching wolframscript. Simple
+    // content keeps the plain delimiters (the assertions above).
+    assert_eq!(
+      interpret("ToString[Floor[x/2], TeXForm]").unwrap(),
+      "\\left\\lfloor \\frac{x}{2}\\right\\rfloor"
+    );
+    assert_eq!(
+      interpret("ToString[Floor[x^2], TeXForm]").unwrap(),
+      "\\left\\lfloor x^2\\right\\rfloor"
+    );
+    assert_eq!(
+      interpret("ToString[Ceiling[Sqrt[x]], TeXForm]").unwrap(),
+      "\\left\\lceil \\sqrt{x}\\right\\rceil"
+    );
+    // Abs and Norm follow the same rule.
+    assert_eq!(
+      interpret("ToString[Abs[x/y], TeXForm]").unwrap(),
+      "\\left| \\frac{x}{y}\\right|"
+    );
+    assert_eq!(
+      interpret("ToString[Norm[a/b], TeXForm]").unwrap(),
+      "\\left\\| \\frac{a}{b}\\right\\|"
+    );
+    // Subscript renders as x_1 in TeXForm (not the 2D OutputForm layout).
+    assert_eq!(
+      interpret("ToString[Subscript[x, 1], TeXForm]").unwrap(),
+      "x_1"
+    );
+    assert_eq!(
+      interpret("ToString[Subscript[x, 12], TeXForm]").unwrap(),
+      "x_{12}"
+    );
+    // The default (non-TeX) Subscript still renders the 2D layout.
+    assert_eq!(interpret("ToString[Subscript[x, 1]]").unwrap(), "x\n 1");
+  }
+
+  // Hyperbolic and remaining inverse trig functions render with their
+  // LaTeX command names (sech/csch use \text since they are not primitives).
+  #[test]
+  fn hyperbolic_and_inverse_trig() {
+    assert_eq!(
+      interpret("ToString[Sinh[x], TeXForm]").unwrap(),
+      "\\sinh (x)"
+    );
+    assert_eq!(
+      interpret("ToString[Cosh[x], TeXForm]").unwrap(),
+      "\\cosh (x)"
+    );
+    assert_eq!(
+      interpret("ToString[Tanh[x], TeXForm]").unwrap(),
+      "\\tanh (x)"
+    );
+    assert_eq!(
+      interpret("ToString[Coth[x], TeXForm]").unwrap(),
+      "\\coth (x)"
+    );
+    assert_eq!(
+      interpret("ToString[Sech[x], TeXForm]").unwrap(),
+      "\\text{sech}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Csch[x], TeXForm]").unwrap(),
+      "\\text{csch}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[ArcSinh[x], TeXForm]").unwrap(),
+      "\\sinh ^{-1}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[ArcCosh[x], TeXForm]").unwrap(),
+      "\\cosh ^{-1}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[ArcSech[x], TeXForm]").unwrap(),
+      "\\text{sech}^{-1}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[ArcCot[x], TeXForm]").unwrap(),
+      "\\cot ^{-1}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[ArcSec[x], TeXForm]").unwrap(),
+      "\\sec ^{-1}(x)"
+    );
+  }
+
+  // Special functions with dedicated LaTeX notation.
+  #[test]
+  fn special_functions() {
+    assert_eq!(
+      interpret("ToString[Sign[x], TeXForm]").unwrap(),
+      "\\text{sgn}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Gamma[x], TeXForm]").unwrap(),
+      "\\Gamma (x)"
+    );
+    assert_eq!(
+      interpret("ToString[Gamma[a, b], TeXForm]").unwrap(),
+      "\\Gamma (a,b)"
+    );
+    assert_eq!(
+      interpret("ToString[Zeta[s], TeXForm]").unwrap(),
+      "\\zeta (s)"
+    );
+    assert_eq!(interpret("ToString[Re[z], TeXForm]").unwrap(), "\\Re(z)");
+    assert_eq!(interpret("ToString[Im[z], TeXForm]").unwrap(), "\\Im(z)");
+    assert_eq!(
+      interpret("ToString[Erf[x], TeXForm]").unwrap(),
+      "\\text{erf}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Erfc[x], TeXForm]").unwrap(),
+      "\\text{erfc}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Beta[a, b], TeXForm]").unwrap(),
+      "B(a,b)"
+    );
+    // Conjugate: postfix star, parenthesizing compound arguments.
+    assert_eq!(interpret("ToString[Conjugate[z], TeXForm]").unwrap(), "z^*");
+    assert_eq!(
+      interpret("ToString[Conjugate[a b], TeXForm]").unwrap(),
+      "(a b)^*"
+    );
+  }
+
+  // Logical operators render infix with precedence-aware parenthesization,
+  // matching Wolfram: And/Or/Xor at one tier (mixing forces parens), Implies
+  // lowest, Not highest.
+  #[test]
+  fn logical_operators() {
+    assert_eq!(interpret("ToString[a && b, TeXForm]").unwrap(), "a\\land b");
+    assert_eq!(interpret("ToString[a || b, TeXForm]").unwrap(), "a\\lor b");
+    assert_eq!(
+      interpret("ToString[a && b && c, TeXForm]").unwrap(),
+      "a\\land b\\land c"
+    );
+    // Mixing And inside Or (and vice versa) is parenthesized.
+    assert_eq!(
+      interpret("ToString[a || b && c, TeXForm]").unwrap(),
+      "a\\lor (b\\land c)"
+    );
+    assert_eq!(
+      interpret("ToString[(a || b) && c, TeXForm]").unwrap(),
+      "(a\\lor b)\\land c"
+    );
+    assert_eq!(
+      interpret("ToString[(a && b) || (c && d), TeXForm]").unwrap(),
+      "(a\\land b)\\lor (c\\land d)"
+    );
+    // Xor sits at the And/Or tier.
+    assert_eq!(
+      interpret("ToString[Xor[a, b, c], TeXForm]").unwrap(),
+      "a\\veebar b\\veebar c"
+    );
+    assert_eq!(
+      interpret("ToString[a && Xor[b, c], TeXForm]").unwrap(),
+      "a\\land (b\\veebar c)"
+    );
+    // Implies is the lowest-precedence binary operator; nested Implies wraps.
+    assert_eq!(
+      interpret("ToString[Implies[a, b], TeXForm]").unwrap(),
+      "a\\Rightarrow b"
+    );
+    assert_eq!(
+      interpret("ToString[Implies[a, b && c], TeXForm]").unwrap(),
+      "a\\Rightarrow b\\land c"
+    );
+    assert_eq!(
+      interpret("ToString[Implies[Implies[a, b], c], TeXForm]").unwrap(),
+      "(a\\Rightarrow b)\\Rightarrow c"
+    );
+    assert_eq!(
+      interpret("ToString[Implies[a, Implies[b, c]], TeXForm]").unwrap(),
+      "a\\Rightarrow (b\\Rightarrow c)"
+    );
+    // Not is highest precedence; compound operands are parenthesized.
+    assert_eq!(interpret("ToString[Not[a], TeXForm]").unwrap(), "\\neg a");
+    assert_eq!(
+      interpret("ToString[Not[a || b], TeXForm]").unwrap(),
+      "\\neg (a\\lor b)"
+    );
+    assert_eq!(
+      interpret("ToString[a && Not[b], TeXForm]").unwrap(),
+      "a\\land \\neg b"
+    );
+  }
+
+  // Powers of trig/hyperbolic/log functions move the exponent onto the
+  // function name (Sin[x]^2 -> \sin ^2(x)); inverse trig keeps a trailing ^2.
+  #[test]
+  fn powers_of_elementary_functions() {
+    assert_eq!(
+      interpret("ToString[Sin[x]^2, TeXForm]").unwrap(),
+      "\\sin ^2(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Sin[x]^10, TeXForm]").unwrap(),
+      "\\sin ^{10}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Cot[x]^2, TeXForm]").unwrap(),
+      "\\cot ^2(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Sech[x]^2, TeXForm]").unwrap(),
+      "\\text{sech}^2(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Log[x]^2, TeXForm]").unwrap(),
+      "\\log ^2(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Cosh[x]^2, TeXForm]").unwrap(),
+      "\\cosh ^2(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Sin[2 x]^2, TeXForm]").unwrap(),
+      "\\sin ^2(2 x)"
+    );
+    assert_eq!(
+      interpret("ToString[Tan[x]^(a + b), TeXForm]").unwrap(),
+      "\\tan ^{a+b}(x)"
+    );
+    // Inverse trig is NOT merged: the exponent trails the whole expression.
+    assert_eq!(
+      interpret("ToString[ArcSin[x]^2, TeXForm]").unwrap(),
+      "\\sin ^{-1}(x)^2"
+    );
+  }
+
+  // A negative rational pulls the minus sign outside the fraction.
+  #[test]
+  fn negative_rational_fraction() {
+    assert_eq!(
+      interpret("ToString[-3/4, TeXForm]").unwrap(),
+      "-\\frac{3}{4}"
+    );
+    assert_eq!(
+      interpret("ToString[3/(-4), TeXForm]").unwrap(),
+      "-\\frac{3}{4}"
+    );
+  }
+
+  // Max/Min/GCD/LCM/Mod/Norm/Factorial2/KroneckerDelta TeX notation.
+  #[test]
+  fn misc_function_notation() {
+    assert_eq!(
+      interpret("ToString[Max[a, b, c], TeXForm]").unwrap(),
+      "\\max (a,b,c)"
+    );
+    assert_eq!(
+      interpret("ToString[Min[a, b], TeXForm]").unwrap(),
+      "\\min (a,b)"
+    );
+    assert_eq!(
+      interpret("ToString[GCD[a, b], TeXForm]").unwrap(),
+      "\\gcd (a,b)"
+    );
+    assert_eq!(
+      interpret("ToString[LCM[a, b], TeXForm]").unwrap(),
+      "\\text{lcm}(a,b)"
+    );
+    assert_eq!(
+      interpret("ToString[Mod[a, b], TeXForm]").unwrap(),
+      "(a \\bmod b)"
+    );
+    assert_eq!(
+      interpret("ToString[Mod[a + b, c], TeXForm]").unwrap(),
+      "((a+b) \\bmod c)"
+    );
+    assert_eq!(interpret("ToString[Norm[v], TeXForm]").unwrap(), "\\| v\\|");
+    assert_eq!(
+      interpret("ToString[Factorial2[n], TeXForm]").unwrap(),
+      "n\\text{!!}"
+    );
+    assert_eq!(
+      interpret("ToString[Factorial2[a + b], TeXForm]").unwrap(),
+      "(a+b)\\text{!!}"
+    );
+    assert_eq!(
+      interpret("ToString[KroneckerDelta[i, j], TeXForm]").unwrap(),
+      "\\delta _{i,j}"
+    );
+    assert_eq!(
+      interpret("ToString[KroneckerDelta[i, j, k], TeXForm]").unwrap(),
+      "\\delta _{i,j,k}"
+    );
+  }
+
+  // Factorial parenthesizes additive/multiplicative arguments but not powers
+  // (which bind tighter than the postfix operator).
+  #[test]
+  fn factorial_argument_grouping() {
+    assert_eq!(interpret("ToString[Factorial[n], TeXForm]").unwrap(), "n!");
+    assert_eq!(
+      interpret("ToString[Factorial[n + 1], TeXForm]").unwrap(),
+      "(n+1)!"
+    );
+    assert_eq!(
+      interpret("ToString[Factorial[2 x], TeXForm]").unwrap(),
+      "(2 x)!"
+    );
+    assert_eq!(
+      interpret("ToString[Factorial[x^2], TeXForm]").unwrap(),
+      "x^2!"
+    );
+    assert_eq!(
+      interpret("ToString[Factorial2[n + 1], TeXForm]").unwrap(),
+      "(n+1)\\text{!!}"
+    );
+    assert_eq!(
+      interpret("ToString[Factorial2[x^2], TeXForm]").unwrap(),
+      "x^2\\text{!!}"
+    );
+  }
+
+  // Binary relation operators render infix; AngleBracket wraps its arguments
+  // in angle brackets. (Only operators with a working evaluated form.)
+  #[test]
+  fn relation_operators() {
+    assert_eq!(
+      interpret("ToString[AngleBracket[a, b], TeXForm]").unwrap(),
+      "\\langle a,b\\rangle"
+    );
+    assert_eq!(
+      interpret("ToString[AngleBracket[a], TeXForm]").unwrap(),
+      "\\langle a\\rangle"
+    );
+    assert_eq!(
+      interpret("ToString[CircleMinus[a, b], TeXForm]").unwrap(),
+      "a\\ominus b"
+    );
+    assert_eq!(
+      interpret("ToString[Backslash[a, b], TeXForm]").unwrap(),
+      "a\\backslash b"
+    );
+    assert_eq!(
+      interpret("ToString[LeftArrow[a, b], TeXForm]").unwrap(),
+      "a\\leftarrow b"
+    );
+  }
+
+  // Circle/wedge/tilde operators render infix; UnitStep and Sinc get their
+  // dedicated LaTeX notation.
+  #[test]
+  fn infix_operators_and_unitstep() {
+    assert_eq!(
+      interpret("ToString[UnitStep[x], TeXForm]").unwrap(),
+      "\\theta (x)"
+    );
+    assert_eq!(
+      interpret("ToString[UnitStep[x, y], TeXForm]").unwrap(),
+      "\\theta (x,y)"
+    );
+    assert_eq!(
+      interpret("ToString[Sinc[x], TeXForm]").unwrap(),
+      "\\text{sinc}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[CircleTimes[a, b, c], TeXForm]").unwrap(),
+      "a\\otimes b\\otimes c"
+    );
+    assert_eq!(
+      interpret("ToString[CirclePlus[a, b], TeXForm]").unwrap(),
+      "a\\oplus b"
+    );
+    assert_eq!(
+      interpret("ToString[CircleDot[a, b], TeXForm]").unwrap(),
+      "a\\odot b"
+    );
+    assert_eq!(
+      interpret("ToString[Wedge[a, b, c], TeXForm]").unwrap(),
+      "a\\wedge b\\wedge c"
+    );
+    assert_eq!(
+      interpret("ToString[Vee[a, b], TeXForm]").unwrap(),
+      "a\\vee b"
+    );
+    assert_eq!(
+      interpret("ToString[SmallCircle[a, b], TeXForm]").unwrap(),
+      "a\\circ b"
+    );
+    assert_eq!(
+      interpret("ToString[Diamond[a, b], TeXForm]").unwrap(),
+      "a\\diamond b"
+    );
+    assert_eq!(
+      interpret("ToString[Tilde[a, b], TeXForm]").unwrap(),
+      "a\\sim b"
+    );
+    assert_eq!(
+      interpret("ToString[Proportional[a, b], TeXForm]").unwrap(),
+      "a\\propto b"
+    );
+  }
+
+  // Matrix notation, Stirling numbers and Multinomial render with their
+  // conventional LaTeX notation.
+  #[test]
+  fn matrix_stirling_multinomial() {
+    // Transpose/Inverse use superscripts and parenthesize compound bases.
+    assert_eq!(interpret("ToString[Transpose[m], TeXForm]").unwrap(), "m^T");
+    assert_eq!(
+      interpret("ToString[Transpose[a + b], TeXForm]").unwrap(),
+      "(a+b)^T"
+    );
+    assert_eq!(
+      interpret("ToString[Inverse[m], TeXForm]").unwrap(),
+      "m^{-1}"
+    );
+    // Det uses determinant bars (like Abs).
+    assert_eq!(interpret("ToString[Det[m], TeXForm]").unwrap(), "| m|");
+    assert_eq!(
+      interpret("ToString[Det[a + b], TeXForm]").unwrap(),
+      "| a+b|"
+    );
+    assert_eq!(interpret("ToString[Arg[z], TeXForm]").unwrap(), "\\arg (z)");
+    // 2-arg Norm subscripts the order.
+    assert_eq!(
+      interpret("ToString[Norm[v, p], TeXForm]").unwrap(),
+      "\\| v\\| _p"
+    );
+    // Stirling numbers of the first and second kind.
+    assert_eq!(
+      interpret("ToString[StirlingS1[n, k], TeXForm]").unwrap(),
+      "S_n^{(k)}"
+    );
+    assert_eq!(
+      interpret("ToString[StirlingS1[n + 1, k], TeXForm]").unwrap(),
+      "S_{n+1}^{(k)}"
+    );
+    assert_eq!(
+      interpret("ToString[StirlingS2[n, k], TeXForm]").unwrap(),
+      "\\mathcal{S}_n^{(k)}"
+    );
+    // Multinomial of three or more arguments.
+    assert_eq!(
+      interpret("ToString[Multinomial[a, b, c], TeXForm]").unwrap(),
+      "(a+b+c;a,b,c)"
+    );
+  }
+
+  // Accent functions, Airy/Elliptic/PolyLog and Bernoulli/Euler render with
+  // their conventional LaTeX notation.
+  #[test]
+  fn accents_and_more_special_functions() {
+    // Accent wrappers.
+    assert_eq!(
+      interpret("ToString[UnderBar[x], TeXForm]").unwrap(),
+      "\\underline{x}"
+    );
+    assert_eq!(
+      interpret("ToString[OverHat[x], TeXForm]").unwrap(),
+      "\\hat{x}"
+    );
+    assert_eq!(
+      interpret("ToString[OverTilde[x], TeXForm]").unwrap(),
+      "\\tilde{x}"
+    );
+    assert_eq!(
+      interpret("ToString[OverDot[x], TeXForm]").unwrap(),
+      "\\dot{x}"
+    );
+    // Airy functions and their derivatives.
+    assert_eq!(
+      interpret("ToString[AiryAi[x], TeXForm]").unwrap(),
+      "\\text{Ai}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[AiryAiPrime[x], TeXForm]").unwrap(),
+      "\\text{Ai}'(x)"
+    );
+    // Polylogarithm with the order in a subscript.
+    assert_eq!(
+      interpret("ToString[PolyLog[2, x], TeXForm]").unwrap(),
+      "\\text{Li}_2(x)"
+    );
+    // Single-letter functions.
+    assert_eq!(
+      interpret("ToString[EllipticK[m], TeXForm]").unwrap(),
+      "K(m)"
+    );
+    assert_eq!(
+      interpret("ToString[EllipticE[m], TeXForm]").unwrap(),
+      "E(m)"
+    );
+    assert_eq!(
+      interpret("ToString[ProductLog[x], TeXForm]").unwrap(),
+      "W(x)"
+    );
+    assert_eq!(
+      interpret("ToString[HypergeometricU[a, b, x], TeXForm]").unwrap(),
+      "U(a,b,x)"
+    );
+    assert_eq!(
+      interpret("ToString[LerchPhi[z, s, a], TeXForm]").unwrap(),
+      "\\Phi (z,s,a)"
+    );
+    // Inverse error functions.
+    assert_eq!(
+      interpret("ToString[InverseErf[x], TeXForm]").unwrap(),
+      "\\text{erf}^{-1}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Gudermannian[x], TeXForm]").unwrap(),
+      "\\text{gd}(x)"
+    );
+    // Bernoulli/Euler numbers and polynomials.
+    assert_eq!(
+      interpret("ToString[BernoulliB[n], TeXForm]").unwrap(),
+      "B_n"
+    );
+    assert_eq!(
+      interpret("ToString[BernoulliB[n, x], TeXForm]").unwrap(),
+      "B_n(x)"
+    );
+    assert_eq!(interpret("ToString[EulerE[n], TeXForm]").unwrap(), "E_n");
+    assert_eq!(
+      interpret("ToString[EulerE[n, x], TeXForm]").unwrap(),
+      "E_n(x)"
+    );
+  }
+
+  // Subscripted families and integral/error special functions render with
+  // their conventional LaTeX abbreviations.
+  #[test]
+  fn subscripted_and_integral_functions() {
+    // Surd / CubeRoot -> radical with explicit index.
+    assert_eq!(
+      interpret("ToString[Surd[x, 3], TeXForm]").unwrap(),
+      "\\sqrt[3]{x}"
+    );
+    assert_eq!(
+      interpret("ToString[CubeRoot[x], TeXForm]").unwrap(),
+      "\\sqrt[3]{x}"
+    );
+    // Subscripted families, optionally applied.
+    assert_eq!(interpret("ToString[Fibonacci[n], TeXForm]").unwrap(), "F_n");
+    assert_eq!(
+      interpret("ToString[Fibonacci[n, x], TeXForm]").unwrap(),
+      "F_n(x)"
+    );
+    assert_eq!(interpret("ToString[LucasL[n], TeXForm]").unwrap(), "L_n");
+    assert_eq!(
+      interpret("ToString[SphericalBesselJ[1, x], TeXForm]").unwrap(),
+      "j_1(x)"
+    );
+    assert_eq!(
+      interpret("ToString[SphericalBesselY[1, x], TeXForm]").unwrap(),
+      "y_1(x)"
+    );
+    assert_eq!(
+      interpret("ToString[ExpIntegralE[2, x], TeXForm]").unwrap(),
+      "E_2(x)"
+    );
+    assert_eq!(
+      interpret("ToString[HarmonicNumber[n], TeXForm]").unwrap(),
+      "H_n"
+    );
+    assert_eq!(
+      interpret("ToString[HarmonicNumber[n, 2], TeXForm]").unwrap(),
+      "H_n^{(2)}"
+    );
+    assert_eq!(
+      interpret("ToString[Pochhammer[a, n + 1], TeXForm]").unwrap(),
+      "(a)_{n+1}"
+    );
+    // Integral/error functions with conventional abbreviations.
+    assert_eq!(
+      interpret("ToString[Erfi[x], TeXForm]").unwrap(),
+      "\\text{erfi}(x)"
+    );
+    assert_eq!(interpret("ToString[FresnelC[x], TeXForm]").unwrap(), "C(x)");
+    assert_eq!(interpret("ToString[FresnelS[x], TeXForm]").unwrap(), "S(x)");
+    assert_eq!(
+      interpret("ToString[ExpIntegralEi[x], TeXForm]").unwrap(),
+      "\\text{Ei}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[LogIntegral[x], TeXForm]").unwrap(),
+      "\\text{li}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[SinIntegral[x], TeXForm]").unwrap(),
+      "\\text{Si}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[CosIntegral[x], TeXForm]").unwrap(),
+      "\\text{Ci}(x)"
+    );
+  }
+
+  // Bessel/Legendre/PolyGamma and Dirac/Heaviside/vector products render with
+  // their dedicated LaTeX notation.
+  #[test]
+  fn special_function_notation() {
+    assert_eq!(
+      interpret("ToString[BesselJ[0, x], TeXForm]").unwrap(),
+      "J_0(x)"
+    );
+    assert_eq!(
+      interpret("ToString[BesselJ[10, x], TeXForm]").unwrap(),
+      "J_{10}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[BesselY[1, x], TeXForm]").unwrap(),
+      "Y_1(x)"
+    );
+    assert_eq!(
+      interpret("ToString[BesselI[0, x], TeXForm]").unwrap(),
+      "I_0(x)"
+    );
+    assert_eq!(
+      interpret("ToString[BesselK[1, x], TeXForm]").unwrap(),
+      "K_1(x)"
+    );
+    assert_eq!(
+      interpret("ToString[LegendreP[n, x], TeXForm]").unwrap(),
+      "P_n(x)"
+    );
+    assert_eq!(
+      interpret("ToString[PolyGamma[2, x], TeXForm]").unwrap(),
+      "\\psi ^{(2)}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[DiracDelta[x], TeXForm]").unwrap(),
+      "\\delta (x)"
+    );
+    assert_eq!(
+      interpret("ToString[HeavisideTheta[x], TeXForm]").unwrap(),
+      "\\theta (x)"
+    );
+    assert_eq!(
+      interpret("ToString[OverBar[x], TeXForm]").unwrap(),
+      "\\bar{x}"
+    );
+    assert_eq!(
+      interpret("ToString[Cross[a, b, c], TeXForm]").unwrap(),
+      "a\\times b\\times c"
+    );
+    assert_eq!(interpret("ToString[Dot[a, b], TeXForm]").unwrap(), "a.b");
+    assert_eq!(
+      interpret("ToString[CenterDot[a, b], TeXForm]").unwrap(),
+      "a\\cdot b"
+    );
+  }
+
+  // MatrixForm/TableForm/Grid render as LaTeX array environments; only
+  // MatrixForm wraps the array in \left( \right).
+  #[test]
+  fn matrix_and_table_forms() {
+    assert_eq!(
+      interpret("ToString[MatrixForm[{{1, 2}, {3, 4}}], TeXForm]").unwrap(),
+      "\\left(\n\\begin{array}{cc}\n 1 & 2 \\\\\n 3 & 4 \\\\\n\\end{array}\n\\right)"
+    );
+    assert_eq!(
+      interpret("ToString[TableForm[{{1, 2}, {3, 4}}], TeXForm]").unwrap(),
+      "\\begin{array}{cc}\n 1 & 2 \\\\\n 3 & 4 \\\\\n\\end{array}"
+    );
+    assert_eq!(
+      interpret("ToString[Grid[{{1, 2}, {3, 4}}], TeXForm]").unwrap(),
+      "\\begin{array}{cc}\n 1 & 2 \\\\\n 3 & 4 \\\\\n\\end{array}"
+    );
+    // The plain-text 2D form is unaffected by the TeX path.
+    assert_eq!(
+      interpret("ToString[MatrixForm[{{1, 2}, {3, 4}}]]").unwrap(),
+      "1   2\n\n3   4"
+    );
+  }
+
+  // Piecewise renders as a LaTeX cases environment; Wolfram always shows the
+  // catch-all row (the default value, or 0, with a True condition).
+  #[test]
+  fn piecewise() {
+    assert_eq!(
+      interpret("ToString[Piecewise[{{x, x > 0}, {-x, True}}], TeXForm]")
+        .unwrap(),
+      "\\begin{cases}\n x & x>0 \\\\\n -x & \\text{True}\n\\end{cases}"
+    );
+    // A Piecewise without an explicit True case gets a 0 default row.
+    assert_eq!(
+      interpret("ToString[Piecewise[{{1, x > 0}}], TeXForm]").unwrap(),
+      "\\begin{cases}\n 1 & x>0 \\\\\n 0 & \\text{True}\n\\end{cases}"
+    );
+    // Three cases with a chained-inequality condition.
+    assert_eq!(
+      interpret(
+        "ToString[Piecewise[{{x^2, x < 0}, {x, 0 <= x < 1}, {1, True}}], TeXForm]"
+      )
+      .unwrap(),
+      "\\begin{cases}\n x^2 & x<0 \\\\\n x & 0\\leq x<1 \\\\\n 1 & \\text{True}\n\\end{cases}"
+    );
+  }
+
+  // Derivatives render with prime marks (orders 1, 2) or a parenthesized
+  // superscript (order >= 3, or multiple orders for partial derivatives).
+  #[test]
+  fn derivatives() {
+    // The common D[...] form curries into Derivative[1][f][x].
+    assert_eq!(interpret("ToString[D[f[x], x], TeXForm]").unwrap(), "f'(x)");
+    assert_eq!(
+      interpret("ToString[D[f[x], {x, 2}], TeXForm]").unwrap(),
+      "f''(x)"
+    );
+    // Literal Derivative forms, with and without applied arguments.
+    assert_eq!(
+      interpret("ToString[Derivative[1][f], TeXForm]").unwrap(),
+      "f'"
+    );
+    assert_eq!(
+      interpret("ToString[Derivative[2][f][x], TeXForm]").unwrap(),
+      "f''(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Derivative[2][f], TeXForm]").unwrap(),
+      "f''"
+    );
+    // Order >= 3 switches to the superscript notation.
+    assert_eq!(
+      interpret("ToString[Derivative[3][f][x], TeXForm]").unwrap(),
+      "f^{(3)}(x)"
+    );
+    assert_eq!(
+      interpret("ToString[Derivative[4][f], TeXForm]").unwrap(),
+      "f^{(4)}"
+    );
+    // Partial derivatives use a multi-index superscript.
+    assert_eq!(
+      interpret("ToString[Derivative[1, 0][g][x, y], TeXForm]").unwrap(),
+      "g^{(1,0)}(x,y)"
+    );
+    assert_eq!(
+      interpret("ToString[Derivative[1, 1][g][x, y], TeXForm]").unwrap(),
+      "g^{(1,1)}(x,y)"
+    );
+  }
+
+  // Element[x, dom] renders as set membership with blackboard-bold sets.
+  #[test]
+  fn element_set_membership() {
+    assert_eq!(
+      interpret("ToString[Element[x, Reals], TeXForm]").unwrap(),
+      "x\\in \\mathbb{R}"
+    );
+    assert_eq!(
+      interpret("ToString[Element[x, Integers], TeXForm]").unwrap(),
+      "x\\in \\mathbb{Z}"
+    );
+    assert_eq!(
+      interpret("ToString[Element[x, Complexes], TeXForm]").unwrap(),
+      "x\\in \\mathbb{C}"
+    );
+    assert_eq!(
+      interpret("ToString[Element[x, Rationals], TeXForm]").unwrap(),
+      "x\\in \\mathbb{Q}"
+    );
+    assert_eq!(
+      interpret("ToString[Element[x, Primes], TeXForm]").unwrap(),
+      "x\\in \\mathbb{P}"
+    );
+  }
+
+  #[test]
+  fn sin() {
+    assert_eq!(interpret("ToString[Sin[x], TeXForm]").unwrap(), "\\sin (x)");
+  }
+
+  #[test]
+  fn log() {
+    assert_eq!(interpret("ToString[Log[x], TeXForm]").unwrap(), "\\log (x)");
+  }
+
+  #[test]
+  fn pi() {
+    assert_eq!(interpret("ToString[Pi, TeXForm]").unwrap(), "\\pi");
+  }
+
+  #[test]
+  fn infinity() {
+    assert_eq!(interpret("ToString[Infinity, TeXForm]").unwrap(), "\\infty");
+  }
+
+  #[test]
+  fn list() {
+    assert_eq!(
+      interpret("ToString[{a, b, c}, TeXForm]").unwrap(),
+      "\\{a,b,c\\}"
+    );
+  }
+
+  #[test]
+  fn string() {
+    assert_eq!(
+      interpret("ToString[\"hello\", TeXForm]").unwrap(),
+      "\\text{hello}"
+    );
+  }
+
+  #[test]
+  fn real_number() {
+    assert_eq!(interpret("ToString[2.5, TeXForm]").unwrap(), "2.5");
+  }
+
+  #[test]
+  fn power() {
+    // Single-character exponents use no braces (Wolfram behavior)
+    assert_eq!(interpret("ToString[x^n, TeXForm]").unwrap(), "x^n");
+  }
+
+  #[test]
+  fn multiplication() {
+    assert_eq!(interpret("ToString[x*y, TeXForm]").unwrap(), "x y");
+  }
+
+  #[test]
+  fn subtraction() {
+    assert_eq!(interpret("ToString[x - z, TeXForm]").unwrap(), "x-z");
+  }
+
+  #[test]
+  fn negation() {
+    assert_eq!(interpret("ToString[-x, TeXForm]").unwrap(), "-x");
+  }
+
+  #[test]
+  fn abs() {
+    // Wolfram uses simple bar notation for Abs
+    assert_eq!(interpret("ToString[Abs[x], TeXForm]").unwrap(), "| x|");
+  }
+
+  #[test]
+  fn single_letter_function_call_bare() {
+    // Single-letter user functions render bare (not wrapped in \text{}),
+    // matching wolframscript: ToString[f[x], TeXForm] = f(x).
+    assert_eq!(interpret("ToString[f[x], TeXForm]").unwrap(), "f(x)");
+  }
+
+  // A built-in function with no special TeX rule keeps WL square brackets
+  // (Round[x] -> \text{Round}[x]), while an unknown user function uses math
+  // parentheses (myf[x] -> \text{myf}(x)) — matching wolframscript.
+  #[test]
+  fn builtin_uses_square_brackets_unknown_uses_parens() {
+    assert_eq!(
+      interpret("ToString[Round[x], TeXForm]").unwrap(),
+      "\\text{Round}[x]"
+    );
+    assert_eq!(
+      interpret("ToString[Quotient[a, b], TeXForm]").unwrap(),
+      "\\text{Quotient}[a,b]"
+    );
+    assert_eq!(
+      interpret("ToString[IntegerPart[x], TeXForm]").unwrap(),
+      "\\text{IntegerPart}[x]"
+    );
+    // Unknown multi-letter user function keeps parentheses.
+    assert_eq!(
+      interpret("ToString[myf[x], TeXForm]").unwrap(),
+      "\\text{myf}(x)"
+    );
+  }
+
+  #[test]
+  fn integrate_of_user_function() {
+    assert_eq!(
+      interpret("ToString[Integrate[f[x],x], TeXForm]").unwrap(),
+      "\\int f(x) \\, dx"
+    );
+  }
+
+  #[test]
+  fn definite_integrate_single_char_bound() {
+    // Single-character bounds render without braces (\int_a^b) — matches
+    // wolframscript's TeX convention.
+    assert_eq!(
+      interpret("ToString[Integrate[F[x], {x, a, g[b]}], TeXForm]").unwrap(),
+      "\\int_a^{g(b)} F(x) \\, dx"
+    );
+  }
+
+  #[test]
+  fn definite_integrate_multi_char_bound() {
+    // Multi-character bounds still use braces to disambiguate the
+    // sub-/super-script scope. Multi-letter identifiers also pick up
+    // \text{...} for safety against implicit-product confusion.
+    assert_eq!(
+      interpret("ToString[Integrate[F[x], {x, a1, b2}], TeXForm]").unwrap(),
+      "\\int_{\\text{a1}}^{\\text{b2}} F(x) \\, dx"
+    );
+  }
+
+  #[test]
+  fn multi_letter_function_uses_text() {
+    // Multi-letter user functions still use \text{} to avoid ambiguity with products.
+    assert_eq!(
+      interpret("ToString[myFunc[x], TeXForm]").unwrap(),
+      "\\text{myFunc}(x)"
+    );
+  }
+
+  #[test]
+  fn hold_form_is_transparent() {
+    // HoldForm is a display wrapper — TeXForm renders its content directly.
+    assert_eq!(
+      interpret("ToString[TeXForm[HoldForm[Sqrt[a^3]]]]").unwrap(),
+      "\\sqrt{a^3}"
+    );
+  }
+
+  #[test]
+  fn output_form_then_tex_wraps_in_text() {
+    // OutputForm renders its content to a textual form first; TeXForm then
+    // wraps that as \text{…}, matching wolframscript.
+    assert_eq!(
+      interpret("ToString[b // OutputForm // TeXForm]").unwrap(),
+      "\\text{b}"
+    );
+  }
+}
+
+mod to_expression {
+  use super::*;
+
+  #[test]
+  fn single_arg_parses_and_evaluates() {
+    assert_eq!(interpret("ToExpression[\"2+3\"]").unwrap(), "5");
+  }
+
+  #[test]
+  fn two_args_accepts_form() {
+    // Woxi's parser is form-agnostic, so the form arg is accepted but ignored.
+    assert_eq!(interpret("ToExpression[\"2 3\", InputForm]").unwrap(), "6");
+  }
+
+  #[test]
+  fn empty_string_is_null() {
+    // "\0" is the interpreter-level Null sentinel (the CLI renders it "Null").
+    assert_eq!(interpret("ToExpression[\"\"]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn incomplete_input_yields_failed_with_sntxi() {
+    use woxi::interpret_with_stdout;
+    // An incomplete expression must yield $Failed with ToExpression::sntxi,
+    // not leak the internal parser error.
+    let r = interpret_with_stdout("ToExpression[\"2+\"]").unwrap();
+    assert_eq!(r.result, "$Failed");
+    assert!(r.warnings[0].contains(
+      "ToExpression::sntxi: Incomplete expression; more input is needed."
+    ));
+  }
+
+  #[test]
+  fn invalid_syntax_yields_failed_with_sntx() {
+    use woxi::interpret_with_stdout;
+    let r = interpret_with_stdout("ToExpression[\"][\"]").unwrap();
+    assert_eq!(r.result, "$Failed");
+    assert!(
+      r.warnings[0]
+        .contains("ToExpression::sntx: Invalid syntax in or before \"][\".")
+    );
+  }
+
+  #[test]
+  fn evaluation_error_is_not_failed() {
+    // A syntactically valid string that errors at evaluation time keeps its
+    // normal result (ComplexInfinity here), not $Failed.
+    assert_eq!(
+      interpret("ToExpression[\"1/0\"]").unwrap(),
+      "ComplexInfinity"
+    );
+  }
+
+  #[test]
+  fn three_args_applies_head() {
+    // The third argument is applied to the evaluated expression.
+    assert_eq!(
+      interpret("ToExpression[\"{2, 3, 1}\", InputForm, Max]").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn three_args_head_wraps_unevaluated_parse() {
+    // The head is applied to the *parsed* expression before evaluation, so a
+    // holding head keeps its argument unevaluated: Hold[1 + 1], not Hold[2].
+    assert_eq!(
+      interpret("ToExpression[\"1+1\", InputForm, Hold]").unwrap(),
+      "Hold[1 + 1]"
+    );
+    assert_eq!(
+      interpret("ToExpression[\"Sin[0]\", InputForm, Hold]").unwrap(),
+      "Hold[Sin[0]]"
+    );
+    // A non-holding head still evaluates its argument.
+    assert_eq!(
+      interpret("ToExpression[\"2+3\", InputForm, List]").unwrap(),
+      "{5}"
+    );
+  }
+
+  // Multi-statement input — each line or `;`-separated statement is
+  // evaluated in order and the last result is returned.
+  #[test]
+  fn named_newline_splits_statements() {
+    assert_eq!(interpret("ToExpression[\"2\\[NewLine]3\"]").unwrap(), "3");
+  }
+
+  #[test]
+  fn compound_expression_returns_last() {
+    assert_eq!(interpret("ToExpression[\"2; 3\"]").unwrap(), "3");
+  }
+
+  #[test]
+  fn to_string_input_form_wrapper() {
+    // `ToString[InputForm[x]]` ≡ `ToString[x, InputForm]`. Previously the
+    // single-arg form just stringified the unevaluated `InputForm[x]`
+    // FunctionCall as text, producing `"InputForm[2]"` instead of `"2"`.
+    assert_eq!(interpret(r#"ToString[InputForm[2]]"#).unwrap(), "2");
+    assert_eq!(
+      interpret(r#"ToString[InputForm["hello"]]"#).unwrap(),
+      r#""hello""#
+    );
+    assert_eq!(interpret(r#"ToString @ InputForm @ 2"#).unwrap(), "2");
+  }
+
+  #[test]
+  fn to_string_explicit_input_form_keeps_inner_wrapper() {
+    // `ToString[InputForm[expr], InputForm]` asks for the structural
+    // InputForm of the wrapped expression, which keeps the `InputForm[…]`
+    // head visible. Only the single-arg form (OutputForm default) unwraps.
+    // Regression for verify_unit_tests.ts harness reports against
+    // `f'[x] // InputForm`, `2+F[x] // InputForm`, etc.
+    assert_eq!(
+      interpret(r#"ToString[InputForm[a + b], InputForm]"#).unwrap(),
+      "InputForm[a + b]"
+    );
+    assert_eq!(
+      interpret(r#"ToString[(f'[x] // InputForm), InputForm]"#).unwrap(),
+      "InputForm[Derivative[1][f][x]]"
+    );
+  }
+
+  #[test]
+  fn listable_threads_over_list_arg() {
+    // ToExpression has the Listable attribute, so a list of strings becomes
+    // a list of parsed integers. Previously the whole list was stringified
+    // to `{"9", "2"}` and re-parsed back to a list of *strings*.
+    assert_eq!(interpret(r#"ToExpression[{"9", "2"}]"#).unwrap(), "{9, 2}");
+    assert_eq!(
+      interpret(r#"Total[2 * ToExpression[{"9", "2"}]]"#).unwrap(),
+      "22"
+    );
+  }
+}
+
+mod make_expression {
+  use super::*;
+
+  // MakeExpression[string] parses to a held (unevaluated) expression, like
+  // ToExpression[string, InputForm, HoldComplete].
+  #[test]
+  fn string_parses_to_held_expression() {
+    assert_eq!(
+      interpret("MakeExpression[\"1 + 2\"]").unwrap(),
+      "HoldComplete[1 + 2]"
+    );
+    assert_eq!(
+      interpret("MakeExpression[\"f[x, y]\"]").unwrap(),
+      "HoldComplete[f[x, y]]"
+    );
+    // Implicit multiplication is recognised.
+    assert_eq!(
+      interpret("MakeExpression[\"2 3\"]").unwrap(),
+      "HoldComplete[2*3]"
+    );
+  }
+
+  // The parsed expression is held, so an assignment inside it does not fire.
+  #[test]
+  fn assignment_is_held() {
+    clear_state();
+    assert_eq!(
+      interpret("MakeExpression[\"mkx = 5\"]").unwrap(),
+      "HoldComplete[mkx = 5]"
+    );
+    assert_eq!(interpret("mkx").unwrap(), "mkx");
+  }
+}
+
+mod base_form {
+  use super::*;
+
+  #[test]
+  fn binary() {
+    // BaseForm stays as wrapper in OutputForm (matching wolframscript)
+    assert_eq!(interpret("BaseForm[123, 2]").unwrap(), "BaseForm[123, 2]");
+  }
+
+  #[test]
+  fn hexadecimal() {
+    assert_eq!(interpret("BaseForm[255, 16]").unwrap(), "BaseForm[255, 16]");
+  }
+
+  #[test]
+  fn octal() {
+    assert_eq!(interpret("BaseForm[8, 8]").unwrap(), "BaseForm[8, 8]");
+  }
+
+  #[test]
+  fn zero() {
+    assert_eq!(interpret("BaseForm[0, 2]").unwrap(), "BaseForm[0, 2]");
+  }
+
+  #[test]
+  fn negative() {
+    assert_eq!(interpret("BaseForm[-42, 2]").unwrap(), "BaseForm[-42, 2]");
+  }
+
+  /// A real shows its base-`b` expansion to the precision it displays: a
+  /// machine real to the base-`b` equivalent of six decimal digits, an
+  /// arbitrary-precision one to its own precision. Trailing zeros go, so a
+  /// value that terminates in that base prints short.
+  #[test]
+  fn reals_show_their_digits_in_the_base() {
+    // The digit line, without the base subscript on the line below.
+    let digits = |code: &str| interpret(&format!("ToString[{code}]")).unwrap();
+    assert_eq!(digits("BaseForm[3.5, 2]").lines().next().unwrap(), "11.1");
+    assert_eq!(digits("BaseForm[12.25, 8]").lines().next().unwrap(), "14.2");
+    assert_eq!(
+      digits("BaseForm[255.75, 16]").lines().next().unwrap(),
+      "ff.c"
+    );
+    // 0.1 has no finite binary form: 20 significant bits, rounded.
+    assert_eq!(
+      digits("BaseForm[0.1, 2]").lines().next().unwrap(),
+      "0.00011001100110011001101"
+    );
+    // A tail of exactly half a unit in the last place rounds *down*.
+    assert_eq!(
+      digits("BaseForm[1.5, 3]").lines().next().unwrap(),
+      "1.111111111111"
+    );
+    // 20 decimal digits of precision → 66 binary digits, all exact.
+    assert_eq!(
+      digits("BaseForm[N[Sqrt[2], 20], 2]")
+        .lines()
+        .next()
+        .unwrap(),
+      "1.01101010000010011110011001100111111100111011110011001001000010001"
+    );
+    // The base still rides along on the line below.
+    assert_eq!(digits("BaseForm[3.5, 2]").lines().nth(1).unwrap(), "    2");
+  }
+
+  #[test]
+  fn base_36() {
+    assert_eq!(interpret("BaseForm[35, 36]").unwrap(), "BaseForm[35, 36]");
+  }
+
+  #[test]
+  fn real_binary() {
+    assert_eq!(interpret("BaseForm[0.5, 2]").unwrap(), "BaseForm[0.5, 2]");
+  }
+
+  #[test]
+  fn real_integer_part() {
+    assert_eq!(interpret("BaseForm[8., 2]").unwrap(), "BaseForm[8., 2]");
+  }
+
+  #[test]
+  fn large_integer() {
+    assert_eq!(interpret("BaseForm[256, 16]").unwrap(), "BaseForm[256, 16]");
+  }
+
+  #[test]
+  fn unevaluated_symbolic() {
+    assert_eq!(interpret("BaseForm[x, 2]").unwrap(), "BaseForm[x, 2]");
+  }
+
+  // Under ToString, BaseForm renders the digits with the base as a subscript
+  // on the line below (indented by the digit-string width). Base 10 shows no
+  // subscript, and negatives keep their sign on the digit line.
+  #[test]
+  fn to_string_subscript() {
+    assert_eq!(
+      interpret("ToString[BaseForm[255, 16]]").unwrap(),
+      "ff\n  16"
+    );
+    assert_eq!(
+      interpret("ToString[BaseForm[10, 2]]").unwrap(),
+      "1010\n    2"
+    );
+    assert_eq!(
+      interpret("ToString[BaseForm[255, 8]]").unwrap(),
+      "377\n   8"
+    );
+  }
+
+  #[test]
+  fn to_string_base_ten_no_subscript() {
+    assert_eq!(interpret("ToString[BaseForm[255, 10]]").unwrap(), "255");
+  }
+
+  #[test]
+  fn to_string_negative_and_zero() {
+    assert_eq!(
+      interpret("ToString[BaseForm[-255, 16]]").unwrap(),
+      "-ff\n   16"
+    );
+    assert_eq!(interpret("ToString[BaseForm[0, 2]]").unwrap(), "0\n 2");
+  }
+}
+
+mod subscript_superscript {
+  use super::*;
+
+  // Under ToString (default OutputForm), Subscript renders the script on the
+  // line below, indented by the width of the base. Matches wolframscript.
+  #[test]
+  fn to_string_subscript() {
+    assert_eq!(interpret("ToString[Subscript[x, 2]]").unwrap(), "x\n 2");
+    assert_eq!(interpret("ToString[Subscript[xy, 2]]").unwrap(), "xy\n  2");
+    assert_eq!(interpret("ToString[Subscript[x, ab]]").unwrap(), "x\n ab");
+  }
+
+  // Superscript renders the script on the line ABOVE the base, indented by the
+  // width of the base.
+  #[test]
+  fn to_string_superscript() {
+    assert_eq!(interpret("ToString[Superscript[x, 2]]").unwrap(), " 2\nx");
+    assert_eq!(
+      interpret("ToString[Superscript[xy, ab]]").unwrap(),
+      "  ab\nxy"
+    );
+  }
+
+  // The 2-arg InputForm target keeps the head literal (re-parseable text).
+  #[test]
+  fn to_string_input_form_literal() {
+    assert_eq!(
+      interpret("ToString[Subscript[a, b], InputForm]").unwrap(),
+      "Subscript[a, b]"
+    );
+  }
+
+  // The bare top-level echo (script mode) stays literal, like wolframscript.
+  #[test]
+  fn bare_echo_literal() {
+    assert_eq!(interpret("Subscript[x, 2]").unwrap(), "Subscript[x, 2]");
+  }
+}
+
+mod c_form {
+  use super::*;
+
+  #[test]
+  fn polynomial() {
+    // CForm wraps in OutputForm, matching wolframscript
+    assert_eq!(
+      interpret("CForm[x^2 + 2 x + 1]").unwrap(),
+      "CForm[1 + 2*x + x^2]"
+    );
+  }
+
+  #[test]
+  fn trig_functions() {
+    assert_eq!(
+      interpret("CForm[Sin[x] + Cos[y]]").unwrap(),
+      "CForm[Cos[y] + Sin[x]]"
+    );
+  }
+
+  #[test]
+  fn pi_constant() {
+    assert_eq!(interpret("CForm[Pi]").unwrap(), "CForm[Pi]");
+  }
+
+  #[test]
+  fn e_constant() {
+    assert_eq!(interpret("CForm[E]").unwrap(), "CForm[E]");
+  }
+
+  #[test]
+  fn sqrt() {
+    assert_eq!(interpret("CForm[Sqrt[x]]").unwrap(), "CForm[Sqrt[x]]");
+  }
+
+  #[test]
+  fn division() {
+    assert_eq!(interpret("CForm[1/x]").unwrap(), "CForm[x^(-1)]");
+  }
+
+  #[test]
+  fn division_to_string() {
+    // ToString[CForm[1/x], InputForm] produces C division notation
+    assert_eq!(interpret("ToString[CForm[1/x], InputForm]").unwrap(), "1/x");
+  }
+
+  #[test]
+  fn to_string_form() {
+    // ToString[expr, CForm] produces the actual C representation
+    assert_eq!(
+      interpret("ToString[x^2 + 1, CForm]").unwrap(),
+      "1 + Power(x,2)"
+    );
+  }
+
+  #[test]
+  fn exp_function() {
+    // CForm wraps, Exp[x] evaluates to E^x
+    assert_eq!(interpret("CForm[Exp[x]]").unwrap(), "CForm[E^x]");
+  }
+
+  // ToString[expr, CForm] splits products into numerator/denominator with
+  // correct grouping (a/(b c) keeps the denominator together) and renders
+  // exact rationals as machine-precision decimals.
+  #[test]
+  fn division_grouping() {
+    assert_eq!(interpret("ToString[a/b, CForm]").unwrap(), "a/b");
+    assert_eq!(
+      interpret("ToString[x^2/y^2, CForm]").unwrap(),
+      "Power(x,2)/Power(y,2)"
+    );
+    assert_eq!(interpret("ToString[3 x/y, CForm]").unwrap(), "(3*x)/y");
+    // The denominator stays grouped: x/(y*z), NOT the wrong x/y*z.
+    assert_eq!(interpret("ToString[x/(y z), CForm]").unwrap(), "x/(y*z)");
+    assert_eq!(interpret("ToString[1/(x y), CForm]").unwrap(), "1/(x*y)");
+    assert_eq!(interpret("ToString[x/y^2, CForm]").unwrap(), "x/Power(y,2)");
+  }
+
+  #[test]
+  fn rational_decimals_and_signs() {
+    // Exact rationals become decimals.
+    assert_eq!(interpret("ToString[1/2, CForm]").unwrap(), "0.5");
+    assert_eq!(interpret("ToString[x/2, CForm]").unwrap(), "x/2.");
+    assert_eq!(interpret("ToString[(3 x)/4, CForm]").unwrap(), "(3*x)/4.");
+    assert_eq!(interpret("ToString[2/(3 x), CForm]").unwrap(), "2/(3.*x)");
+    // A leading -1 coefficient becomes a unary minus over the rest.
+    assert_eq!(interpret("ToString[-a/b, CForm]").unwrap(), "-(a/b)");
+    assert_eq!(interpret("ToString[-a b, CForm]").unwrap(), "-(a*b)");
+    assert_eq!(interpret("ToString[-2 a, CForm]").unwrap(), "-2*a");
+    assert_eq!(interpret("ToString[-1/x, CForm]").unwrap(), "-(1/x)");
+  }
+}
+
+mod fortran_form_division {
+  use super::*;
+
+  // FortranForm shares the numerator/denominator splitting with CForm but
+  // renders powers with ** and keeps the denominator grouped.
+  #[test]
+  fn division_grouping() {
+    assert_eq!(interpret("ToString[a/b, FortranForm]").unwrap(), "a/b");
+    assert_eq!(
+      interpret("ToString[x^2/y^2, FortranForm]").unwrap(),
+      "x**2/y**2"
+    );
+    assert_eq!(
+      interpret("ToString[3 x/y, FortranForm]").unwrap(),
+      "(3*x)/y"
+    );
+    assert_eq!(
+      interpret("ToString[x/(y z), FortranForm]").unwrap(),
+      "x/(y*z)"
+    );
+    assert_eq!(
+      interpret("ToString[1/(x y), FortranForm]").unwrap(),
+      "1/(x*y)"
+    );
+    assert_eq!(interpret("ToString[x/y^2, FortranForm]").unwrap(), "x/y**2");
+  }
+
+  #[test]
+  fn rationals_and_signs() {
+    assert_eq!(interpret("ToString[1/2, FortranForm]").unwrap(), "0.5");
+    assert_eq!(interpret("ToString[x/2, FortranForm]").unwrap(), "x/2.");
+    assert_eq!(
+      interpret("ToString[2/(3 x), FortranForm]").unwrap(),
+      "2/(3.*x)"
+    );
+    assert_eq!(interpret("ToString[-a/b, FortranForm]").unwrap(), "-(a/b)");
+  }
+}
+
+// ToString's default form is OutputForm, which typesets in 2D: rationals
+// stack as numerator/bar/denominator, exponents ride one line above the
+// base. All strings wolframscript-verified (differential fuzzer, seed
+// 1783530056735545937).
+mod to_string_output_form_2d {
+  use super::*;
+
+  #[test]
+  fn rational_atoms() {
+    assert_eq!(interpret("ToString[3/4]").unwrap(), "3\n-\n4");
+    // The shrunk fuzzer reproducer: a negative rational parenthesizes
+    // with the sign on the bar row.
+    assert_eq!(interpret("ToString[-3/4]").unwrap(), "  3\n-(-)\n  4");
+    assert_eq!(
+      interpret("ToString[{Divide[1, -29]}]").unwrap(),
+      "   1\n{-(--)}\n   29"
+    );
+    assert_eq!(interpret("ToString[75/59]").unwrap(), "75\n--\n59");
+    assert_eq!(interpret("ToString[{1/2, 5}]").unwrap(), " 1\n{-, 5}\n 2");
+  }
+
+  #[test]
+  fn fractions_in_sums() {
+    assert_eq!(interpret("ToString[1/2 + x]").unwrap(), "1\n- + x\n2");
+    assert_eq!(
+      interpret("ToString[1 - x/2]").unwrap(),
+      "    x\n1 - -\n    2"
+    );
+    assert_eq!(
+      interpret("ToString[2/3 + x/5]").unwrap(),
+      "2   x\n- + -\n3   5"
+    );
+    assert_eq!(
+      interpret("ToString[1/2 - 1/(3 x)]").unwrap(),
+      "1    1\n- - ---\n2   3 x"
+    );
+  }
+
+  #[test]
+  fn products_and_quotients() {
+    // Positive rational coefficients merge into one fraction…
+    assert_eq!(interpret("ToString[3 x/4]").unwrap(), "3 x\n---\n 4");
+    assert_eq!(interpret("ToString[Pi/2]").unwrap(), "Pi\n--\n2");
+    assert_eq!(interpret("ToString[x/(2 y)]").unwrap(), " x\n---\n2 y");
+    assert_eq!(interpret("ToString[1/(2 x)]").unwrap(), " 1\n---\n2 x");
+    // …and a numerator of -1 pulls the sign out in front of the parens:
+    // rational coefficients keep the factors outside, integer ones inside.
+    assert_eq!(interpret("ToString[-x/3]").unwrap(), "  1\n-(-) x\n  3");
+    assert_eq!(interpret("ToString[-x/y]").unwrap(), "  x\n-(-)\n  y");
+    assert_eq!(interpret("ToString[-2/x]").unwrap(), "-2\n--\nx");
+    assert_eq!(interpret("ToString[-3 x/4]").unwrap(), "-3 x\n----\n 4");
+    assert_eq!(
+      interpret("ToString[(1 + x)/(1 - x)]").unwrap(),
+      "1 + x\n-----\n1 - x"
+    );
+  }
+
+  // Sum factors in a product row parenthesize — but a lone sum filling
+  // a fraction's numerator or denominator stays bare (differential
+  // fuzzer, seed 1783542791764080894; wolframscript-verified).
+  #[test]
+  fn sum_factors_parenthesize_in_products() {
+    assert_eq!(interpret("ToString[2*(2 + y)]").unwrap(), "2 (2 + y)");
+    assert_eq!(interpret("ToString[3 x (1 + x)]").unwrap(), "3 x (1 + x)");
+    assert_eq!(
+      interpret("ToString[Factor[4 x^2 + 2 y^2 + 4]]").unwrap(),
+      "          2    2\n2 (2 + 2 x  + y )"
+    );
+    assert_eq!(
+      interpret("ToString[1/(x*(4 + 3*x))]").unwrap(),
+      "     1\n-----------\nx (4 + 3 x)"
+    );
+    assert_eq!(
+      interpret("ToString[(1 + x)/(1 - x)]").unwrap(),
+      "1 + x\n-----\n1 - x"
+    );
+  }
+
+  #[test]
+  fn powers() {
+    assert_eq!(interpret("ToString[x^2]").unwrap(), " 2\nx");
+    // Superscripts render one line high, even for rational exponents.
+    assert_eq!(interpret("ToString[x^(2/3)]").unwrap(), " 2/3\nx");
+    assert_eq!(interpret("ToString[x^(a/b)]").unwrap(), " a/b\nx");
+    // Exponent -1 and -1/2 display as fractions; other negative
+    // exponents keep the superscript with the sign.
+    assert_eq!(interpret("ToString[x^-1]").unwrap(), "1\n-\nx");
+    assert_eq!(
+      interpret("ToString[x^(-1/2)]").unwrap(),
+      "   1\n-------\nSqrt[x]"
+    );
+    assert_eq!(interpret("ToString[x^-2]").unwrap(), " -2\nx");
+    assert_eq!(interpret("ToString[x^(-3/2)]").unwrap(), " -(3/2)\nx");
+    // Inside a product every negative power moves into the denominator.
+    assert_eq!(interpret("ToString[3 x^-2]").unwrap(), "3\n--\n 2\nx");
+    assert_eq!(interpret("ToString[Sqrt[x]]").unwrap(), "Sqrt[x]");
+  }
+}
+
+mod to_string_hold_form {
+  use super::*;
+
+  // HoldForm is transparent in OutputForm: ToString strips it recursively.
+  #[test]
+  fn strips_hold_form_in_output_form() {
+    assert_eq!(interpret("ToString[HoldForm[1 + 1]]").unwrap(), "1 + 1");
+    assert_eq!(interpret("ToString[HoldForm[a + b]]").unwrap(), "a + b");
+    assert_eq!(interpret("ToString[HoldForm[Sin[x]]]").unwrap(), "Sin[x]");
+  }
+
+  #[test]
+  fn strips_hold_form_nested() {
+    assert_eq!(
+      interpret("ToString[f[HoldForm[1 + 1]]]").unwrap(),
+      "f[1 + 1]"
+    );
+    assert_eq!(
+      interpret("ToString[{HoldForm[1 + 1], HoldForm[2 + 2]}]").unwrap(),
+      "{1 + 1, 2 + 2}"
+    );
+    assert_eq!(
+      interpret("ToString[HoldForm[1 + 1] + HoldForm[2 + 2]]").unwrap(),
+      "(1 + 1) + (2 + 2)"
+    );
+  }
+
+  #[test]
+  fn explicit_output_form_strips() {
+    assert_eq!(
+      interpret("ToString[HoldForm[1 + 1], OutputForm]").unwrap(),
+      "1 + 1"
+    );
+  }
+
+  // InputForm and the bare echo keep the HoldForm wrapper.
+  #[test]
+  fn input_form_keeps_hold_form() {
+    assert_eq!(
+      interpret("ToString[HoldForm[1 + 1], InputForm]").unwrap(),
+      "HoldForm[1 + 1]"
+    );
+    assert_eq!(interpret("HoldForm[1 + 1]").unwrap(), "HoldForm[1 + 1]");
+    assert_eq!(
+      interpret("f[HoldForm[1 + 1]]").unwrap(),
+      "f[HoldForm[1 + 1]]"
+    );
+  }
+}
+
+mod to_string_machine_reals {
+  use super::*;
+
+  // ToString rounds machine reals to 6 significant digits (OutputForm), but
+  // must not introduce precision artefacts: 15000000000. is exactly 1.5*^10.
+  #[test]
+  fn large_reals_use_clean_scientific() {
+    assert_eq!(interpret("ToString[15000000000.]").unwrap(), "1.5*^10");
+    assert_eq!(interpret("ToString[12000000000.]").unwrap(), "1.2*^10");
+    assert_eq!(interpret("ToString[2.0*^10]").unwrap(), "2.*^10");
+    assert_eq!(interpret("ToString[123456789012.]").unwrap(), "1.23457*^11");
+  }
+
+  #[test]
+  fn ordinary_reals_round_to_six_significant_digits() {
+    assert_eq!(
+      interpret("ToString[15.840646417884168]").unwrap(),
+      "15.8406"
+    );
+    assert_eq!(interpret("ToString[123.456789]").unwrap(), "123.457");
+    assert_eq!(interpret("ToString[2.718281828]").unwrap(), "2.71828");
+    assert_eq!(interpret("ToString[0.0001234567]").unwrap(), "0.000123457");
+  }
+
+  // InputForm keeps full precision.
+  #[test]
+  fn input_form_keeps_full_precision() {
+    assert_eq!(
+      interpret("ToString[123456789012., InputForm]").unwrap(),
+      "1.23456789012*^11"
+    );
+  }
+
+  // Regression: a term with a negative *real* coefficient is a
+  // subtraction, the same as an integer one. `x - 0.5 y` used to come back
+  // as `x + -0.5 y`, which is not how wolframscript writes a sum.
+  #[test]
+  fn negative_real_coefficient_prints_as_subtraction() {
+    assert_eq!(interpret("ToString[x - 0.5 y]").unwrap(), "x - 0.5 y");
+    assert_eq!(interpret("ToString[1.5 - 2.5 x]").unwrap(), "1.5 - 2.5 x");
+    assert_eq!(interpret("ToString[2 x - 3 y]").unwrap(), "2 x - 3 y");
+    // A `-1.` coefficient stays written out, unlike the integer `-1`.
+    assert_eq!(interpret("ToString[x - 1. y]").unwrap(), "x - 1. y");
+    assert_eq!(interpret("ToString[x + 0.5 y]").unwrap(), "x + 0.5 y");
+  }
+}
+
+mod tex_form_standalone {
+  use super::*;
+
+  #[test]
+  fn wraps_in_output_form() {
+    // TeXForm wraps in OutputForm, matching wolframscript
+    assert_eq!(interpret("TeXForm[1 + x^2]").unwrap(), "TeXForm[1 + x^2]");
+  }
+
+  #[test]
+  fn to_string_extracts_tex() {
+    assert_eq!(interpret("ToString[TeXForm[1 + x^2]]").unwrap(), "x^2+1");
+  }
+
+  #[test]
+  fn pi_constant() {
+    assert_eq!(interpret("TeXForm[Pi]").unwrap(), "TeXForm[Pi]");
+  }
+
+  #[test]
+  fn to_string_pi() {
+    assert_eq!(interpret("ToString[TeXForm[Pi]]").unwrap(), "\\pi");
+  }
+
+  #[test]
+  fn sqrt() {
+    assert_eq!(interpret("TeXForm[Sqrt[x]]").unwrap(), "TeXForm[Sqrt[x]]");
+  }
+
+  #[test]
+  fn negative_power_reciprocal() {
+    assert_eq!(
+      interpret("ToString[TeXForm[Power[a,-1]]]").unwrap(),
+      "\\frac{1}{a}"
+    );
+  }
+
+  #[test]
+  fn negative_power_squared() {
+    assert_eq!(
+      interpret("ToString[TeXForm[Power[a,-2]]]").unwrap(),
+      "\\frac{1}{a^2}"
+    );
+  }
+
+  #[test]
+  fn negative_power_compound_base() {
+    assert_eq!(
+      interpret("ToString[TeXForm[Power[x+1,-2]]]").unwrap(),
+      "\\frac{1}{(x+1)^2}"
+    );
+  }
+
+  #[test]
+  fn negative_power_compound_base_reciprocal() {
+    assert_eq!(
+      interpret("ToString[TeXForm[Power[x+1,-1]]]").unwrap(),
+      "\\frac{1}{x+1}"
+    );
+  }
+
+  #[test]
+  fn times_with_negative_power() {
+    assert_eq!(
+      interpret("ToString[TeXForm[2*Power[a,-1]]]").unwrap(),
+      "\\frac{2}{a}"
+    );
+  }
+
+  #[test]
+  fn times_symbolic_over_symbolic() {
+    assert_eq!(
+      interpret("ToString[TeXForm[a*Power[b,-1]]]").unwrap(),
+      "\\frac{a}{b}"
+    );
+  }
+
+  #[test]
+  fn times_multiple_denom_factors() {
+    assert_eq!(
+      interpret("ToString[TeXForm[a*Power[b,-1]*Power[c,-1]]]").unwrap(),
+      "\\frac{a}{b c}"
+    );
+  }
+
+  #[test]
+  fn negative_symbolic_power_unchanged() {
+    assert_eq!(
+      interpret("ToString[TeXForm[Power[a,-n]]]").unwrap(),
+      "a^{-n}"
+    );
+  }
+}
+
+mod fortran_form {
+  use super::*;
+
+  #[test]
+  fn wraps_in_output_form() {
+    // FortranForm wraps in OutputForm, matching wolframscript
+    assert_eq!(
+      interpret("FortranForm[1 + x^2]").unwrap(),
+      "FortranForm[1 + x^2]"
+    );
+  }
+
+  #[test]
+  fn to_string_extracts_fortran() {
+    assert_eq!(
+      interpret("ToString[FortranForm[1 + x^2]]").unwrap(),
+      "1 + x**2"
+    );
+  }
+
+  #[test]
+  fn power() {
+    assert_eq!(interpret("ToString[x^2, FortranForm]").unwrap(), "x**2");
+  }
+
+  #[test]
+  fn multiplication() {
+    assert_eq!(interpret("ToString[x*y, FortranForm]").unwrap(), "x*y");
+  }
+
+  #[test]
+  fn sqrt() {
+    assert_eq!(
+      interpret("ToString[Sqrt[x], FortranForm]").unwrap(),
+      "Sqrt(x)"
+    );
+  }
+
+  #[test]
+  fn trig() {
+    assert_eq!(
+      interpret("ToString[Sin[x], FortranForm]").unwrap(),
+      "Sin(x)"
+    );
+  }
+
+  #[test]
+  fn list() {
+    assert_eq!(
+      interpret("ToString[{1, 2, 3}, FortranForm]").unwrap(),
+      "List(1,2,3)"
+    );
+  }
+
+  #[test]
+  fn rational() {
+    assert_eq!(interpret("ToString[3/4, FortranForm]").unwrap(), "0.75");
+  }
+
+  #[test]
+  fn addition() {
+    assert_eq!(
+      interpret("ToString[x + y + z, FortranForm]").unwrap(),
+      "x + y + z"
+    );
+  }
+
+  #[test]
+  fn negation() {
+    // -x evaluates to Times[-1, x]
+    assert_eq!(interpret("ToString[-x, FortranForm]").unwrap(), "-x");
+  }
+
+  #[test]
+  fn division() {
+    assert_eq!(interpret("ToString[x/y, FortranForm]").unwrap(), "x/y");
+  }
+
+  #[test]
+  fn polynomial() {
+    assert_eq!(
+      interpret("ToString[x^2 + x + 1, FortranForm]").unwrap(),
+      "1 + x + x**2"
+    );
+  }
+
+  #[test]
+  fn to_string_form() {
+    // ToString[expr, FortranForm] produces the Fortran representation
+    assert_eq!(
+      interpret("ToString[x^2 + 1, FortranForm]").unwrap(),
+      "1 + x**2"
+    );
+  }
+
+  #[test]
+  fn exp_function() {
+    assert_eq!(
+      interpret("FortranForm[Exp[x]]").unwrap(),
+      "FortranForm[E^x]"
+    );
+  }
+
+  #[test]
+  fn real_number() {
+    assert_eq!(interpret("ToString[2.5, FortranForm]").unwrap(), "2.5");
+  }
+}
+
+mod to_boxes {
+  use super::*;
+
+  #[test]
+  fn integer() {
+    assert_eq!(interpret("ToBoxes[42]").unwrap(), "42");
+  }
+
+  #[test]
+  fn symbol() {
+    assert_eq!(interpret("ToBoxes[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn string_literal() {
+    assert_eq!(interpret("ToBoxes[\"hello\"]").unwrap(), "\"hello\"");
+  }
+
+  #[test]
+  fn plus() {
+    assert_eq!(interpret("ToBoxes[x + y]").unwrap(), "RowBox[{x, +, y}]");
+  }
+
+  #[test]
+  fn subtraction() {
+    assert_eq!(interpret("ToBoxes[x - y]").unwrap(), "RowBox[{x, -, y}]");
+  }
+
+  #[test]
+  fn negation() {
+    assert_eq!(interpret("ToBoxes[-x]").unwrap(), "RowBox[{-, x}]");
+  }
+
+  #[test]
+  fn times() {
+    assert_eq!(interpret("ToBoxes[x * y]").unwrap(), "RowBox[{x,  , y}]");
+  }
+
+  #[test]
+  fn division() {
+    assert_eq!(interpret("ToBoxes[x / y]").unwrap(), "FractionBox[x, y]");
+  }
+
+  #[test]
+  fn power() {
+    assert_eq!(
+      interpret("ToBoxes[a + b^2]").unwrap(),
+      "RowBox[{a, +, SuperscriptBox[b, 2]}]"
+    );
+  }
+
+  #[test]
+  fn sqrt() {
+    assert_eq!(interpret("ToBoxes[Sqrt[x]]").unwrap(), "SqrtBox[x]");
+  }
+
+  #[test]
+  fn rational() {
+    assert_eq!(interpret("ToBoxes[2/3]").unwrap(), "FractionBox[2, 3]");
+  }
+
+  #[test]
+  fn list() {
+    assert_eq!(
+      interpret("ToBoxes[{1, 2, 3}]").unwrap(),
+      "RowBox[{{, RowBox[{1, ,, 2, ,, 3}], }}]"
+    );
+  }
+
+  #[test]
+  fn function_call() {
+    assert_eq!(
+      interpret("ToBoxes[f[x, y]]").unwrap(),
+      "RowBox[{f, [, RowBox[{x, ,, y}], ]}]"
+    );
+  }
+
+  #[test]
+  fn function_call_single_arg() {
+    assert_eq!(interpret("ToBoxes[f[x]]").unwrap(), "RowBox[{f, [, x, ]}]");
+  }
+
+  #[test]
+  fn function_call_no_args() {
+    assert_eq!(interpret("ToBoxes[f[]]").unwrap(), "RowBox[{f, [, ]}]");
+  }
+
+  #[test]
+  fn boolean() {
+    assert_eq!(interpret("ToBoxes[True]").unwrap(), "True");
+  }
+
+  #[test]
+  fn evaluated_expression() {
+    // ToBoxes evaluates its argument first
+    assert_eq!(interpret("ToBoxes[1 + 2]").unwrap(), "3");
+  }
+
+  #[test]
+  fn subscript_box() {
+    assert_eq!(
+      interpret("ToBoxes[Subscript[x, 0]]").unwrap(),
+      "SubscriptBox[x, 0]"
+    );
+    assert_eq!(
+      interpret("ToBoxes[Subscript[a, b]]").unwrap(),
+      "SubscriptBox[a, b]"
+    );
+  }
+
+  #[test]
+  fn subsuperscript_box() {
+    // Power[Subscript[x, sub], exp] → SubsuperscriptBox
+    assert_eq!(
+      interpret("ToBoxes[Subscript[a, b]^c]").unwrap(),
+      "SubsuperscriptBox[a, b, c]"
+    );
+    assert_eq!(
+      interpret("ToBoxes[Subscript[x, 0]^n]").unwrap(),
+      "SubsuperscriptBox[x, 0, n]"
+    );
+    // Special rational exponents still use SqrtBox/FractionBox with SubscriptBox
+    assert_eq!(
+      interpret("ToBoxes[Subscript[a, b]^(1/2)]").unwrap(),
+      "SqrtBox[SubscriptBox[a, b]]"
+    );
+    assert_eq!(
+      interpret("ToBoxes[Subscript[a, b]^(-1/2)]").unwrap(),
+      "FractionBox[1, SqrtBox[SubscriptBox[a, b]]]"
+    );
+  }
+
+  #[test]
+  fn subsuperscript_box_unevaluated() {
+    // SubsuperscriptBox stays unevaluated as a symbolic head
+    assert_eq!(
+      interpret("SubsuperscriptBox[\"x\", \"0\", \"n\"]").unwrap(),
+      "SubsuperscriptBox[x, 0, n]"
+    );
+    assert_eq!(
+      interpret("Head[SubsuperscriptBox[\"x\", \"0\", \"n\"]]").unwrap(),
+      "SubsuperscriptBox"
+    );
+  }
+
+  // Graphics / Graphics3D get dedicated box wrappers, so Head[ToBoxes[...]]
+  // returns the specific *Box head rather than the generic RowBox.
+  #[test]
+  fn graphics_box_head() {
+    assert_eq!(
+      interpret("Head[ToBoxes[Graphics[{Circle[]}]]]").unwrap(),
+      "GraphicsBox"
+    );
+  }
+
+  #[test]
+  fn graphics3d_box_head() {
+    assert_eq!(
+      interpret("Head[ToBoxes[Graphics3D[{Polygon[]}]]]").unwrap(),
+      "Graphics3DBox"
+    );
+  }
+
+  // Regression tests for issue #135: additive factors in a product must
+  // keep their parentheses in box form so typeset (SVG) output stays
+  // readable — `(-4+n) (-5+n)`, not `-4+n -5+n`.
+  #[test]
+  fn product_of_sums_keeps_parens() {
+    assert_eq!(
+      interpret("ToBoxes[n(n+1)]").unwrap(),
+      "RowBox[{n,  , RowBox[{(, RowBox[{1, +, n}], )}]}]"
+    );
+    // A fraction whose denominator is a product of sums parenthesizes
+    // every factor (Pochhammer[n, -2] = 1/((-2+n)(-1+n))).
+    assert_eq!(
+      interpret("ToBoxes[Pochhammer[n, -2]]").unwrap(),
+      "FractionBox[1, RowBox[{RowBox[{(, RowBox[{RowBox[{-, 2}], +, n}], \
+       )}],  , RowBox[{(, RowBox[{RowBox[{-, 1}], +, n}], )}]}]]"
+    );
+  }
+
+  #[test]
+  fn fraction_numerator_sum_unparenthesized() {
+    // 1/n(n+1) evaluates to (1+n)/n; the numerator needs no parens.
+    assert_eq!(
+      interpret("ToBoxes[1/n(n+1)]").unwrap(),
+      "FractionBox[RowBox[{1, +, n}], n]"
+    );
+  }
+}
+
+mod make_boxes {
+  use super::*;
+
+  #[test]
+  fn make_boxes_integer() {
+    assert_eq!(interpret("MakeBoxes[42]").unwrap(), "42");
+  }
+
+  #[test]
+  fn make_boxes_symbol() {
+    assert_eq!(interpret("MakeBoxes[x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn make_boxes_power() {
+    assert_eq!(interpret("MakeBoxes[x^2]").unwrap(), "SuperscriptBox[x, 2]");
+  }
+
+  #[test]
+  fn make_boxes_plus() {
+    assert_eq!(interpret("MakeBoxes[a + b]").unwrap(), "RowBox[{a, +, b}]");
+  }
+
+  #[test]
+  fn make_boxes_times() {
+    assert_eq!(interpret("MakeBoxes[a b]").unwrap(), "RowBox[{a,  , b}]");
+  }
+
+  #[test]
+  fn make_boxes_fraction() {
+    assert_eq!(interpret("MakeBoxes[a/b]").unwrap(), "FractionBox[a, b]");
+  }
+
+  // TeX rendering of a precision-tagged BigFloat omits the
+  // backtick precision tag and pads with trailing zeros so the
+  // digit count equals the stored precision. wolframscript:
+  // `-14.`3 // TeXForm` → `-14.0`, `3.14`5 // TeXForm` → `3.1400`.
+  // Regression for mathics makeboxes_tests.yaml PrecisionReal
+  // TeXForm row.
+  #[test]
+  fn make_boxes_tex_form_pads_precision_real() {
+    assert_eq!(
+      interpret("MakeBoxes[-14.`3//TeXForm]").unwrap(),
+      r#"InterpretationBox["-14.0", TeXForm[-14.`3.], Editable -> True, AutoDelete -> True]"#
+    );
+  }
+
+  #[test]
+  fn make_boxes_tex_form_pads_precision_real_more_digits() {
+    assert_eq!(
+      interpret("MakeBoxes[3.14`5//TeXForm]").unwrap(),
+      r#"InterpretationBox["3.1400", TeXForm[3.14`5.], Editable -> True, AutoDelete -> True]"#
+    );
+  }
+
+  // Machine-real values in scientific notation place the
+  // backtick precision marker between the mantissa and the `*^`
+  // exponent (`3.4`*^10`), not at the very end (`3.4*^10``).
+  // Regression for mathics makeboxes_tests.yaml
+  // `MakeBoxes[34.*^9]` (Very Large MachineReal) row.
+  #[test]
+  fn make_boxes_real_scientific_backtick_before_exponent() {
+    assert_eq!(interpret("MakeBoxes[34.*^9]").unwrap(), "3.4`*^10");
+  }
+
+  #[test]
+  fn make_boxes_negative_real_scientific() {
+    assert_eq!(
+      interpret("MakeBoxes[-34.*^9]").unwrap(),
+      "RowBox[{-, 3.4`*^10}]"
+    );
+  }
+
+  // `MakeBoxes[OutputForm[Graphics[…]]]` wraps the rendered
+  // placeholder `-Graphics-` (or `-Graphics3D-`) in both the
+  // PaneBox text and the OutputForm 2nd arg, instead of the
+  // full held Graphics expression. Regression for mathics
+  // makeboxes_tests.yaml Graphics rows.
+  #[test]
+  fn make_boxes_output_form_graphics_uses_placeholder() {
+    assert_eq!(
+      interpret("MakeBoxes[Graphics[{Disk[{0,0}, 1]}]//OutputForm]").unwrap(),
+      r#"InterpretationBox[PaneBox["-Graphics-", BaselinePosition -> Baseline], OutputForm[-Graphics-], Editable -> False]"#
+    );
+  }
+
+  #[test]
+  fn make_boxes_output_form_graphics3d_uses_placeholder() {
+    assert_eq!(
+      interpret("MakeBoxes[Graphics3D[{Sphere[{0,0,0}, 1]}]//OutputForm]")
+        .unwrap(),
+      r#"InterpretationBox[PaneBox["-Graphics3D-", BaselinePosition -> Baseline], OutputForm[-Graphics3D-], Editable -> False]"#
+    );
+  }
+
+  // OutputForm trims (or pads) a precision-tagged BigFloat to
+  // exactly its `prec` significant digits and drops the backtick
+  // tag from the rendered text. wolframscript:
+  //   `MakeBoxes[OutputForm[3.142`3]]` → `"3.14"` (truncate)
+  //   `MakeBoxes[OutputForm[3.14`5]]`  → `"3.1400"` (pad)
+  // Regression for mathics makeboxes_tests.yaml
+  // `MakeBoxes[OutputForm[3.142`3]]` (PrecisionReal, Few Digits).
+  #[test]
+  fn make_boxes_output_form_truncates_precision() {
+    assert_eq!(
+      interpret("MakeBoxes[OutputForm[3.142`3]]").unwrap(),
+      r#"InterpretationBox[PaneBox["3.14", BaselinePosition -> Baseline], OutputForm[3.142`3.], Editable -> False]"#
+    );
+  }
+
+  #[test]
+  fn make_boxes_output_form_pads_precision() {
+    assert_eq!(
+      interpret("MakeBoxes[OutputForm[3.14`5]]").unwrap(),
+      r#"InterpretationBox[PaneBox["3.1400", BaselinePosition -> Baseline], OutputForm[3.14`5.], Editable -> False]"#
+    );
+  }
+
+  // Same negative-sign decomposition rule for Real and BigFloat
+  // values: `MakeBoxes[-2.5]` → `RowBox[{-, 2.5`}]`,
+  // `MakeBoxes[-14.`3 // FullForm]` → `TagBox[StyleBox[RowBox[{-,
+  // 14.`3.}], …], FullForm]`. Regression for mathics
+  // makeboxes_tests.yaml PrecisionReal rows.
+  #[test]
+  fn make_boxes_negative_real_decomposes_sign() {
+    assert_eq!(interpret("MakeBoxes[-2.5]").unwrap(), "RowBox[{-, 2.5`}]");
+  }
+
+  #[test]
+  fn make_boxes_negative_precision_real_full_form_decomposes_sign() {
+    assert_eq!(
+      interpret("MakeBoxes[-14.`3//FullForm]").unwrap(),
+      "TagBox[StyleBox[RowBox[{-, 14.`3.}], ShowSpecialCharacters -> False, ShowStringCharacters -> True, NumberMarks -> True], FullForm]"
+    );
+  }
+
+  // `MakeBoxes[a[[i, j, …]]]` (Part extraction) decomposes
+  // into `RowBox[{<head>, 〚, <i> | RowBox[{i, ",", j, …}], 〛}]`
+  // using the Unicode double-bracket glyphs (U+301A `〚` /
+  // U+301B `〛`). A single-index part uses a bare token inside
+  // the outer RowBox; multi-index parts use a nested RowBox.
+  // Regression for mathics test_makeboxes.py `test_part_boxes`.
+  #[test]
+  fn make_boxes_part_single_index() {
+    assert_eq!(
+      interpret("MakeBoxes[a[[1]]]").unwrap(),
+      "RowBox[{a, 〚, 1, 〛}]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_part_multi_index() {
+    assert_eq!(
+      interpret("MakeBoxes[a[[1, 2, 3]]]").unwrap(),
+      "RowBox[{a, 〚, RowBox[{1, ,, 2, ,, 3}], 〛}]"
+    );
+  }
+
+  // Negative integers decompose into `RowBox[{"-", "14"}]` in
+  // wolframscript's MakeBoxes output (the sign is its own token).
+  // Positive integers stay as a single bare String. Regression for
+  // mathics makeboxes_tests.yaml Integer_negative rows.
+  #[test]
+  fn make_boxes_negative_integer_decomposes_sign() {
+    assert_eq!(interpret("MakeBoxes[-14]").unwrap(), "RowBox[{-, 14}]");
+  }
+
+  #[test]
+  fn make_boxes_positive_integer_keeps_single_token() {
+    assert_eq!(interpret("MakeBoxes[14]").unwrap(), "14");
+  }
+
+  // `MakeBoxes[StandardForm[expr]]` and `MakeBoxes[TraditionalForm[expr]]`
+  // wrap the inner box in `TagBox[FormBox[<inner>, <form>], <form>,
+  // Editable -> True]`. TraditionalForm uses `(` / `)` instead of
+  // `[` / `]` for function-call brackets. Regression for mathics
+  // makeboxes_tests.yaml `MakeBoxes[F[x]//TraditionalForm]`.
+  #[test]
+  fn make_boxes_standard_form_wraps_in_tagbox_formbox() {
+    assert_eq!(
+      interpret("MakeBoxes[F[x]//StandardForm]").unwrap(),
+      "TagBox[FormBox[RowBox[{F, [, x, ]}], StandardForm], StandardForm, Editable -> True]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_traditional_form_uses_parentheses() {
+    assert_eq!(
+      interpret("MakeBoxes[F[x]//TraditionalForm]").unwrap(),
+      "TagBox[FormBox[RowBox[{F, (, x, )}], TraditionalForm], TraditionalForm, Editable -> True]"
+    );
+  }
+
+  /// A special function is laid out with its order as a subscript and any
+  /// further index as a superscript, and `Row` simply joins its parts.
+  /// wolframscript defers both to a named front-end template
+  /// (`TemplateBox[{n, x}, "LegendreP"]`, `…, "RowDefault"]`) that its
+  /// FrontEnd knows how to draw; Woxi writes the layout out inline so its
+  /// own box renderer draws the same picture. Only the wrapper is shared,
+  /// so the exact inner box is pinned here rather than in tests/cli.
+  #[test]
+  fn traditional_form_boxes_special_functions_inline() {
+    assert_eq!(
+      interpret("ToBoxes[TraditionalForm[LegendreP[n, x]]]").unwrap(),
+      "TagBox[FormBox[RowBox[{SubscriptBox[P, n], (, x, )}], \
+       TraditionalForm], TraditionalForm, Editable -> True]"
+    );
+    assert_eq!(
+      interpret("ToBoxes[TraditionalForm[LegendreP[n, m, x]]]").unwrap(),
+      "TagBox[FormBox[RowBox[{SubsuperscriptBox[P, n, m], (, x, )}], \
+       TraditionalForm], TraditionalForm, Editable -> True]"
+    );
+    assert_eq!(
+      interpret("ToBoxes[TraditionalForm[Row[{2, x, t}]]]").unwrap(),
+      "TagBox[FormBox[RowBox[{2, x, t}], TraditionalForm], TraditionalForm, \
+       Editable -> True]"
+    );
+  }
+
+  // `MakeBoxes[Format[expr, StandardForm]]` and the 1-arg form
+  // both produce `TagBox[FormBox[<inner>, <form>], <tag>]`,
+  // where the tag is the bare `Format` symbol for the 1-arg
+  // form or `#1 &` for the 2-arg form. Regression for mathics
+  // makeboxes_tests.yaml `MakeBoxes[Format[F[x], StandardForm]]`.
+  #[test]
+  fn make_boxes_format_no_form_uses_format_tag() {
+    assert_eq!(
+      interpret("MakeBoxes[Format[F[x]]]").unwrap(),
+      "TagBox[FormBox[RowBox[{F, [, x, ]}], StandardForm], Format]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_format_standard_uses_identity_tag() {
+    assert_eq!(
+      interpret("MakeBoxes[Format[F[x], StandardForm]]").unwrap(),
+      "TagBox[FormBox[RowBox[{F, [, x, ]}], StandardForm], #1 & ]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_format_traditional_uses_identity_tag() {
+    assert_eq!(
+      interpret("MakeBoxes[Format[F[x], TraditionalForm]]").unwrap(),
+      "TagBox[FormBox[RowBox[{F, [, x, ]}], TraditionalForm], #1 & ]"
+    );
+  }
+
+  // wolframscript wraps `MakeBoxes[TeXForm[expr]]` (and CForm/
+  // FortranForm) in `InterpretationBox["<text>", <Form>[<expr>],
+  // Editable -> True, AutoDelete -> True]` with single-layer
+  // baked-in quotes. Regression for mathics
+  // makeboxes_tests.yaml `MakeBoxes[a-b//TeXForm]`.
+  #[test]
+  fn make_boxes_tex_form_wraps_in_interpretation_box() {
+    assert_eq!(
+      interpret("MakeBoxes[a-b//TeXForm]").unwrap(),
+      r#"InterpretationBox["a-b", TeXForm[a - b], Editable -> True, AutoDelete -> True]"#
+    );
+  }
+
+  #[test]
+  fn make_boxes_c_form_wraps_in_interpretation_box() {
+    assert_eq!(
+      interpret("MakeBoxes[a-b//CForm]").unwrap(),
+      r#"InterpretationBox["a - b", CForm[a - b], Editable -> True, AutoDelete -> True]"#
+    );
+  }
+
+  #[test]
+  fn make_boxes_fortran_form_wraps_in_interpretation_box() {
+    let out = interpret("MakeBoxes[a-b//FortranForm]").unwrap();
+    assert!(
+      out.starts_with("InterpretationBox[\""),
+      "expected InterpretationBox wrapper, got: {out}"
+    );
+    assert!(
+      out.ends_with(
+        ", FortranForm[a - b], Editable -> True, AutoDelete -> True]"
+      ),
+      "expected FortranForm tail, got: {out}"
+    );
+  }
+
+  // `MakeBoxes` is HoldAllComplete, so a postfix arg
+  // `expr // FullForm` arrives as `Expr::Postfix` rather than a
+  // FunctionCall. Without normalisation it produced a plain string
+  // `"FullForm[a - b]"`. Regression: postfix and prefix forms must
+  // yield the same TagBox/StyleBox structure (mathics
+  // makeboxes_tests.yaml `MakeBoxes[a-b//FullForm]`).
+  #[test]
+  fn make_boxes_postfix_full_form_matches_prefix() {
+    let postfix = interpret("MakeBoxes[a-b//FullForm]").unwrap();
+    let prefix = interpret("MakeBoxes[FullForm[a-b]]").unwrap();
+    assert_eq!(postfix, prefix);
+    assert!(
+      postfix.starts_with("TagBox[StyleBox["),
+      "expected TagBox/StyleBox tagged with FullForm, got: {postfix}"
+    );
+    assert!(
+      postfix.ends_with(", FullForm]"),
+      "expected trailing FullForm tag, got: {postfix}"
+    );
+  }
+
+  #[test]
+  fn make_boxes_sqrt() {
+    assert_eq!(interpret("MakeBoxes[Sqrt[x]]").unwrap(), "SqrtBox[x]");
+  }
+
+  #[test]
+  fn make_boxes_list() {
+    assert_eq!(
+      interpret("MakeBoxes[{1, 2, 3}]").unwrap(),
+      "RowBox[{{, RowBox[{1, ,, 2, ,, 3}], }}]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_function_call() {
+    assert_eq!(
+      interpret("MakeBoxes[f[x, y]]").unwrap(),
+      "RowBox[{f, [, RowBox[{x, ,, y}], ]}]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_holds_argument() {
+    // MakeBoxes should NOT evaluate its argument
+    assert_eq!(interpret("MakeBoxes[1 + 2]").unwrap(), "RowBox[{1, +, 2}]");
+  }
+
+  #[test]
+  fn make_boxes_rational() {
+    assert_eq!(interpret("MakeBoxes[2/3]").unwrap(), "FractionBox[2, 3]");
+  }
+
+  #[test]
+  fn make_boxes_subscript() {
+    assert_eq!(
+      interpret("MakeBoxes[Subscript[x, 0]]").unwrap(),
+      "SubscriptBox[x, 0]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_subsuperscript() {
+    assert_eq!(
+      interpret("MakeBoxes[Subscript[a, b]^c]").unwrap(),
+      "SubsuperscriptBox[a, b, c]"
+    );
+  }
+
+  // Number-display forms render as 2D `mantissa × 10^exp` boxes (the form that
+  // the Playground/Studio SVG output draws), wrapped exactly like
+  // wolframscript's TagBox/InterpretationBox/StyleBox layers — not as a literal
+  // `ScientificForm[…]` function call.
+  #[test]
+  fn make_boxes_scientific_form() {
+    assert_eq!(
+      interpret("MakeBoxes[ScientificForm[12345.6]]").unwrap(),
+      "TagBox[InterpretationBox[StyleBox[RowBox[{1.23456,  \u{00d7} , \
+       SuperscriptBox[10, 4]}], ShowStringCharacters -> False], 12345.6, \
+       AutoDelete -> True], ScientificForm]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_engineering_form() {
+    // Exponent forced to a multiple of 3, mantissa in [1, 1000).
+    assert_eq!(
+      interpret("MakeBoxes[EngineeringForm[12345.6]]").unwrap(),
+      "TagBox[InterpretationBox[StyleBox[RowBox[{12.3456,  \u{00d7} , \
+       SuperscriptBox[10, 3]}], ShowStringCharacters -> False], 12345.6, \
+       AutoDelete -> True], EngineeringForm]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_number_form_in_range() {
+    // An in-range real renders as a plain string (no × 10^exp factor).
+    assert_eq!(
+      interpret("MakeBoxes[NumberForm[12345.6]]").unwrap(),
+      "TagBox[InterpretationBox[StyleBox[12345.6, ShowStringCharacters -> \
+       False], 12345.6, AutoDelete -> True], NumberForm]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_number_form_scientific_threshold() {
+    // |x| >= 10^6 switches NumberForm to 2D scientific notation.
+    assert_eq!(
+      interpret("MakeBoxes[NumberForm[1234567.8]]").unwrap(),
+      "TagBox[InterpretationBox[StyleBox[RowBox[{1.23457,  \u{00d7} , \
+       SuperscriptBox[10, 6]}], ShowStringCharacters -> False], \
+       1.2345678*^6, AutoDelete -> True], NumberForm]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_number_form_fixed_decimals() {
+    // NumberForm[x, {n, f}] pads to exactly f decimal places, no exponent.
+    assert_eq!(
+      interpret("MakeBoxes[NumberForm[3.14159, {6, 2}]]").unwrap(),
+      "TagBox[InterpretationBox[StyleBox[3.14, ShowStringCharacters -> \
+       False], 3.14159, AutoDelete -> True], NumberForm]"
+    );
+  }
+
+  #[test]
+  fn make_boxes_scientific_form_list() {
+    // A list argument threads element-wise: each element gets its own
+    // InterpretationBox/StyleBox display box, all collected into a braced,
+    // comma-separated RowBox under a single TagBox (matches wolframscript).
+    let x = "\u{00d7}";
+    let elem = |m: &str, e: i64, v: &str| {
+      format!(
+        "InterpretationBox[StyleBox[RowBox[{{{m},  {x} , \
+         SuperscriptBox[10, {e}]}}], ShowStringCharacters -> False], {v}, \
+         AutoDelete -> True]"
+      )
+    };
+    assert_eq!(
+      interpret("MakeBoxes[ScientificForm[{1.2*^8, 123.45}]]").unwrap(),
+      format!(
+        "TagBox[RowBox[{{{{, RowBox[{{{}, ,, {}}}], }}}}], ScientificForm]",
+        elem("1.2", 8, "1.2*^8"),
+        elem("1.2345", 2, "123.45")
+      )
+    );
+  }
+
+  // ToString of a list argument renders the braced 2D row, with the exponents
+  // raised above their mantissas on the line above — exactly as wolframscript.
+  #[test]
+  fn to_string_scientific_form_list() {
+    assert_eq!(
+      interpret("ToString[ScientificForm[{123450000.0, 0.00012345, 123.45}]]")
+        .unwrap(),
+      "            8             -4             2\n\
+       {1.2345 \u{00d7} 10 , 1.2345 \u{00d7} 10  , 1.2345 \u{00d7} 10 }"
+    );
+  }
+
+  #[test]
+  fn to_string_engineering_form_list() {
+    // The third element has exponent 0 and collapses to a plain number.
+    assert_eq!(
+      interpret("ToString[EngineeringForm[{123450000.0, 0.00012345, 123.45}]]")
+        .unwrap(),
+      "            6             -6\n\
+       {123.45 \u{00d7} 10 , 123.45 \u{00d7} 10  , 123.45}"
+    );
+  }
+
+  #[test]
+  fn to_string_number_form_list() {
+    // Only the >= 10^6 element switches to scientific; the others stay plain.
+    assert_eq!(
+      interpret("ToString[NumberForm[{123450000.0, 0.00012345, 123.45}]]")
+        .unwrap(),
+      "            8\n{1.2345 \u{00d7} 10 , 0.00012345, 123.45}"
+    );
+  }
+
+  #[test]
+  fn number_form_reqsigz_warns_when_precision_below_integer_digits() {
+    // Requesting fewer significant figures than the number has integer digits
+    // pads with zeros and emits NumberForm::reqsigz. The value still renders.
+    let r = woxi::interpret_with_stdout("ToString[NumberForm[123456.789, 5]]")
+      .unwrap();
+    assert_eq!(r.result, "123460.");
+    assert!(
+      r.warnings.iter().any(|w| w.contains(
+        "NumberForm::reqsigz: Requested number precision is lower than number of digits shown; padding with zeros."
+      )),
+      "expected reqsigz warning, got {:?}",
+      r.warnings
+    );
+
+    // 999.9 -> 2 sig figs rounds up to 1000. (3 original integer digits > 2).
+    let r =
+      woxi::interpret_with_stdout("ToString[NumberForm[999.9, 2]]").unwrap();
+    assert_eq!(r.result, "1000.");
+    assert!(r.warnings.iter().any(|w| w.contains("NumberForm::reqsigz")));
+  }
+
+  /// `NumberForm[expr, …]` formats the approximate reals *inside* `expr`,
+  /// not just a bare number: a plane equation written as a symbolic sum
+  /// shows its coefficients at the requested width.
+  #[test]
+  fn to_string_number_form_symbolic_expression() {
+    assert_eq!(
+      interpret(
+        "ToString[NumberForm[0.370991 x - 0.927478 y - 0.0463739 z, {4, 3}]]"
+      )
+      .unwrap(),
+      "0.371 x - 0.927 y - 0.046 z"
+    );
+    assert_eq!(
+      interpret("ToString[NumberForm[1.23456 + x, 3]]").unwrap(),
+      "1.23 + x"
+    );
+    // A list of expressions threads element by element.
+    assert_eq!(
+      interpret("ToString[NumberForm[{1.23456, x + 2.34567}, 3]]").unwrap(),
+      "{1.23, 2.35 + x}"
+    );
+    // A negative coefficient keeps its sign in the product, so a lone
+    // formatted term still reads as a negative number.
+    assert_eq!(
+      interpret("ToString[NumberForm[-1.23456 x, 3]]").unwrap(),
+      "-1.23 x"
+    );
+  }
+
+  /// An expression with no approximate real in it is untouched: the
+  /// wrapper drops away and the value prints as itself.
+  #[test]
+  fn to_string_number_form_symbolic_without_reals() {
+    assert_eq!(interpret("ToString[NumberForm[Pi, 5]]").unwrap(), "Pi");
+    assert_eq!(
+      interpret("ToString[NumberForm[a + b, 3]]").unwrap(),
+      "a + b"
+    );
+  }
+
+  #[test]
+  fn number_form_reqsigz_not_emitted_when_precision_sufficient() {
+    // n >= integer-digit count: no warning.
+    for code in [
+      "ToString[NumberForm[123456.789, 6]]",
+      "ToString[NumberForm[99.9, 2]]",
+      "ToString[NumberForm[123.456, 5]]",
+      "ToString[NumberForm[3.14159, 3]]",
+      // Scientific range (|exponent| >= 6): mantissa fits n, never warns.
+      "ToString[NumberForm[1234567.89, 5]]",
+    ] {
+      let r = woxi::interpret_with_stdout(code).unwrap();
+      assert!(
+        !r.warnings.iter().any(|w| w.contains("NumberForm::reqsigz")),
+        "unexpected reqsigz warning for {code}: {:?}",
+        r.warnings
+      );
+    }
+  }
+}
+
+mod raw_boxes {
+  use super::*;
+
+  #[test]
+  fn raw_boxes_identity() {
+    // RawBoxes wraps its content without modification
+    assert_eq!(
+      interpret(r#"RawBoxes[SuperscriptBox["x", "2"]]"#).unwrap(),
+      "RawBoxes[SuperscriptBox[x, 2]]"
+    );
+  }
+
+  #[test]
+  fn raw_boxes_with_make_boxes() {
+    // RawBoxes[MakeBoxes[...]] should work end-to-end
+    assert_eq!(
+      interpret("RawBoxes[MakeBoxes[x^2]]").unwrap(),
+      "RawBoxes[SuperscriptBox[x, 2]]"
+    );
+  }
+}
+
+mod display_form {
+  use super::*;
+
+  #[test]
+  fn display_form_identity() {
+    // DisplayForm wraps its content without modification
+    assert_eq!(
+      interpret(r#"DisplayForm[SuperscriptBox["x", "2"]]"#).unwrap(),
+      "DisplayForm[SuperscriptBox[x, 2]]"
+    );
+  }
+
+  #[test]
+  fn display_form_head() {
+    assert_eq!(
+      interpret(r#"Head[DisplayForm[SuperscriptBox["x", "2"]]]"#).unwrap(),
+      "DisplayForm"
+    );
+  }
+
+  #[test]
+  fn display_form_with_make_boxes() {
+    assert_eq!(
+      interpret("DisplayForm[MakeBoxes[x^2]]").unwrap(),
+      "DisplayForm[SuperscriptBox[x, 2]]"
+    );
+  }
+
+  #[test]
+  fn display_form_subscript_box() {
+    assert_eq!(
+      interpret(r#"DisplayForm[SubscriptBox["a", "i"]]"#).unwrap(),
+      "DisplayForm[SubscriptBox[a, i]]"
+    );
+  }
+
+  // A string opening with an inline `\!\(\*…\)` box segment displays as
+  // `DisplayForm[<box>]` in OutputForm. Regression: everything after the
+  // segment used to be swallowed into the DisplayForm.
+  #[test]
+  fn inline_box_segment_keeps_the_prose_after_it() {
+    let r = woxi::interpret_with_stdout(
+      r#"Print["\!\(\*SubscriptBox[\(p\), \(0\)]\) b"]"#,
+    )
+    .unwrap();
+    assert_eq!(r.stdout.trim_end(), "DisplayForm[SubscriptBox[p, 0]] b");
+    // The string itself is untouched — the markers are still four
+    // characters of content.
+    assert_eq!(
+      interpret(r#"StringLength["\!\(\*SubscriptBox[\(p\), \(0\)]\) b"]"#)
+        .unwrap(),
+      "28"
+    );
+    // InputForm keeps the raw escapes.
+    assert_eq!(
+      interpret(
+        r#"ToString["\!\(\*SubscriptBox[\(p\), \(0\)]\) b", InputForm]"#
+      )
+      .unwrap(),
+      r#""\!\(\*SubscriptBox[\(p\), \(0\)]\) b""#
+    );
+  }
+
+  #[test]
+  fn display_form_row_box() {
+    assert_eq!(
+      interpret(
+        r#"DisplayForm[RowBox[{SubscriptBox["a", "1"], SubscriptBox["b", "2"]}]]"#
+      )
+      .unwrap(),
+      "DisplayForm[RowBox[{SubscriptBox[a, 1], SubscriptBox[b, 2]}]]"
+    );
+  }
+
+  #[test]
+  fn display_form_fraction_box() {
+    assert_eq!(
+      interpret(r#"DisplayForm[FractionBox["x", "y"]]"#).unwrap(),
+      "DisplayForm[FractionBox[x, y]]"
+    );
+  }
+
+  #[test]
+  fn display_form_sqrt_box() {
+    assert_eq!(
+      interpret(r#"DisplayForm[SqrtBox["x"]]"#).unwrap(),
+      "DisplayForm[SqrtBox[x]]"
+    );
+  }
+
+  #[test]
+  fn display_form_complex_expression() {
+    // RawBoxes[MakeBoxes[...]] // DisplayForm — end-to-end
+    assert_eq!(
+      interpret("DisplayForm[MakeBoxes[a + b]]").unwrap(),
+      "DisplayForm[RowBox[{a, +, b}]]"
+    );
+  }
+}
+
+mod template_apply {
+  use super::*;
+
+  #[test]
+  fn basic_list() {
+    assert_eq!(
+      interpret(r#"TemplateApply["Hello `1`", {"World"}]"#).unwrap(),
+      "Hello World"
+    );
+  }
+
+  #[test]
+  fn multiple_slots() {
+    assert_eq!(
+      interpret(r#"TemplateApply["`1` + `2` = `3`", {1, 2, 3}]"#).unwrap(),
+      "1 + 2 = 3"
+    );
+  }
+
+  #[test]
+  fn repeated_slot() {
+    assert_eq!(
+      interpret(r#"TemplateApply["`1` and `1`", {"x"}]"#).unwrap(),
+      "x and x"
+    );
+  }
+
+  #[test]
+  fn no_slots() {
+    assert_eq!(
+      interpret(r#"TemplateApply["no slots here", {}]"#).unwrap(),
+      "no slots here"
+    );
+  }
+
+  #[test]
+  fn association_args() {
+    assert_eq!(
+      interpret(
+        r#"TemplateApply["Hi `name`, you are `age`", <|"name" -> "Alice", "age" -> 30|>]"#
+      )
+      .unwrap(),
+      "Hi Alice, you are 30"
+    );
+  }
+
+  #[test]
+  fn non_string_template() {
+    assert_eq!(interpret(r#"TemplateApply[42, {1}]"#).unwrap(), "42");
+  }
+
+  #[test]
+  fn positional_slots() {
+    // Double backtick `` is a positional slot
+    assert_eq!(
+      interpret(r#"TemplateApply["Hello ``!", {"World"}]"#).unwrap(),
+      "Hello World!"
+    );
+    assert_eq!(
+      interpret(r#"TemplateApply["`` + `` = ``", {1, 2, 3}]"#).unwrap(),
+      "1 + 2 = 3"
+    );
+  }
+
+  // A StringTemplate object is just a wrapper around the template text.
+  // Values verified against wolframscript.
+  #[test]
+  fn accepts_a_string_template_object() {
+    assert_eq!(
+      interpret(r#"TemplateApply[StringTemplate["a `x`"], <|"x" -> 1|>]"#)
+        .unwrap(),
+      "a 1"
+    );
+    assert_eq!(
+      interpret(
+        r#"TemplateApply[StringTemplate["Hello, my name is ``. I am feeling ``."], {"Bob", "good"}]"#
+      )
+      .unwrap(),
+      "Hello, my name is Bob. I am feeling good."
+    );
+  }
+
+  // `<*expr*>` is an expression slot: it evaluates inline.
+  #[test]
+  fn expression_slots_evaluate() {
+    assert_eq!(interpret(r#"TemplateApply["<*1+1*>"]"#).unwrap(), "2");
+    assert_eq!(
+      interpret(r#"TemplateApply["x <*2^3*> y"]"#).unwrap(),
+      "x 8 y"
+    );
+    // Whitespace inside the slot is ignored, and several may appear.
+    assert_eq!(interpret(r#"TemplateApply["<* 2 + 3 *>"]"#).unwrap(), "5");
+    assert_eq!(
+      interpret(r#"TemplateApply["a<*1*>b<*2*>c"]"#).unwrap(),
+      "a1b2c"
+    );
+    // A non-string value is spliced in its usual rendering.
+    assert_eq!(
+      interpret(r#"TemplateApply["x<*Range[3]*>y"]"#).unwrap(),
+      "x{1, 2, 3}y"
+    );
+    // The result is always a string.
+    assert_eq!(
+      interpret(r#"Head[TemplateApply["<*5*>"]]"#).unwrap(),
+      "String"
+    );
+  }
+
+  // The template's arguments are visible to an expression slot as #1, #2, ….
+  #[test]
+  fn expression_slots_see_the_arguments() {
+    assert_eq!(
+      interpret(r#"TemplateApply["`1` <*#1*>", {5}]"#).unwrap(),
+      "5 5"
+    );
+    assert_eq!(
+      interpret(r#"TemplateApply["a<*1+1*>b", {5}]"#).unwrap(),
+      "a2b"
+    );
+  }
+
+  // The one-argument form fills no parameters but still runs the slots.
+  #[test]
+  fn one_argument_form() {
+    assert_eq!(
+      interpret(r#"TemplateApply["no slots"]"#).unwrap(),
+      "no slots"
+    );
+    assert_eq!(
+      interpret(r#"TemplateApply["<*Range[3]*>"]"#).unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  // A template need not be a string: TemplateApply walks any expression,
+  // filling TemplateSlot and expanding TemplateIf / TemplateSequence.
+  // Values verified against wolframscript.
+  #[test]
+  fn expression_template_slots() {
+    assert_eq!(
+      interpret("TemplateApply[{TemplateSlot[1], TemplateSlot[2]}, {10, 20}]")
+        .unwrap(),
+      "{10, 20}"
+    );
+    assert_eq!(
+      interpret(
+        r#"TemplateApply[{TemplateSlot["a"], TemplateSlot["b"]}, <|"a" -> 1, "b" -> 2|>]"#
+      )
+      .unwrap(),
+      "{1, 2}"
+    );
+    // Slots are filled wherever they sit, not just inside a list.
+    assert_eq!(
+      interpret("TemplateApply[f[TemplateSlot[1]], {3}]").unwrap(),
+      "f[3]"
+    );
+    // An expression with no template elements comes back unchanged.
+    assert_eq!(interpret("TemplateApply[{a, b}]").unwrap(), "{a, b}");
+  }
+
+  #[test]
+  fn template_expression_evaluates_after_filling() {
+    assert_eq!(
+      interpret("TemplateApply[TemplateExpression[1 + 1]]").unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("TemplateApply[TemplateExpression[TemplateSlot[1]*2], {4}]")
+        .unwrap(),
+      "8"
+    );
+  }
+
+  // A false TemplateIf with no else-clause removes the element entirely.
+  #[test]
+  fn template_if_selects_or_removes() {
+    assert_eq!(
+      interpret("TemplateApply[{a, TemplateIf[True, x], c}]").unwrap(),
+      "{a, x, c}"
+    );
+    assert_eq!(
+      interpret("TemplateApply[{a, TemplateIf[False, x], c}]").unwrap(),
+      "{a, c}"
+    );
+    assert_eq!(
+      interpret("TemplateApply[{a, TemplateIf[False, x, y], c}]").unwrap(),
+      "{a, y, c}"
+    );
+    // The condition sees the slots, including through an operator.
+    assert_eq!(
+      interpret(
+        r#"TemplateApply[TemplateIf[TemplateSlot[1] > 0, "pos", "neg"], {5}]"#
+      )
+      .unwrap(),
+      "pos"
+    );
+    assert_eq!(
+      interpret(
+        r#"TemplateApply[{TemplateIf[TemplateSlot[1] > 3, "big"]}, {5}]"#
+      )
+      .unwrap(),
+      "{big}"
+    );
+    assert_eq!(
+      interpret(
+        r#"TemplateApply[{TemplateIf[TemplateSlot[1] > 3, "big"]}, {1}]"#
+      )
+      .unwrap(),
+      "{}"
+    );
+  }
+
+  // TemplateSequence splices one copy of the body per element, with slot 1
+  // bound to that element.
+  #[test]
+  fn template_sequence_splices() {
+    assert_eq!(
+      interpret("TemplateApply[{a, TemplateSequence[b, {1, 2, 3}], c}]")
+        .unwrap(),
+      "{a, b, b, b, c}"
+    );
+    assert_eq!(
+      interpret(
+        "TemplateApply[{a, TemplateSequence[TemplateSlot[1], {1, 2}], c}]"
+      )
+      .unwrap(),
+      "{a, 1, 2, c}"
+    );
+    // An empty list contributes nothing.
+    assert_eq!(
+      interpret("TemplateApply[{a, TemplateSequence[b, {}], c}]").unwrap(),
+      "{a, c}"
+    );
+  }
+
+  // The operator form runs expression slots too.
+  #[test]
+  fn string_template_operator_form_runs_slots() {
+    assert_eq!(
+      interpret(r#"StringTemplate["x <*2^3*> y"][]"#).unwrap(),
+      "x 8 y"
+    );
+    // Here the whole argument is #1, so it is the list itself.
+    assert_eq!(
+      interpret(r#"StringTemplate["<*#1+1*>"][{5}]"#).unwrap(),
+      "{6}"
+    );
+    // An undefined symbol renders as its own name.
+    assert_eq!(interpret(r#"StringTemplate["<*x*>"][]"#).unwrap(), "x");
+  }
+}
+
+mod dictionary_word_q {
+  use super::*;
+
+  #[test]
+  fn common_word() {
+    assert_eq!(interpret(r#"DictionaryWordQ["dolphin"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn nonsense_word() {
+    assert_eq!(
+      interpret(r#"DictionaryWordQ["beltalowda"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn case_insensitive() {
+    assert_eq!(interpret(r#"DictionaryWordQ["Hello"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn all_caps() {
+    assert_eq!(interpret(r#"DictionaryWordQ["HELLO"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn empty_string() {
+    assert_eq!(interpret(r#"DictionaryWordQ[""]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn multi_word_phrase() {
+    assert_eq!(
+      interpret(r#"DictionaryWordQ["ice cream"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn single_letter() {
+    assert_eq!(interpret(r#"DictionaryWordQ["a"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn non_string_argument() {
+    assert_eq!(
+      interpret(r#"DictionaryWordQ[123]"#).unwrap(),
+      "DictionaryWordQ[123]"
+    );
+  }
+}
+
+mod url_encode_tests {
+  use super::*;
+
+  #[test]
+  fn url_encode_simple_string() {
+    assert_eq!(
+      interpret(r#"URLEncode["Hello, World!"]"#).unwrap(),
+      "Hello%2C%20World%21"
+    );
+  }
+
+  #[test]
+  fn url_encode_spaces() {
+    assert_eq!(
+      interpret(r#"URLEncode["hello world"]"#).unwrap(),
+      "hello%20world"
+    );
+  }
+
+  #[test]
+  fn url_encode_special_chars() {
+    assert_eq!(
+      interpret(r#"URLEncode["a=1&b=2"]"#).unwrap(),
+      "a%3D1%26b%3D2"
+    );
+  }
+
+  #[test]
+  fn url_encode_none() {
+    assert_eq!(interpret("URLEncode[None]").unwrap(), "");
+  }
+
+  #[test]
+  fn url_encode_integer() {
+    assert_eq!(interpret("URLEncode[1]").unwrap(), "1");
+  }
+
+  #[test]
+  fn url_encode_real() {
+    assert_eq!(interpret("URLEncode[1.3]").unwrap(), "1.3");
+  }
+
+  #[test]
+  fn url_encode_threads_over_list() {
+    assert_eq!(
+      interpret(r#"URLEncode[{"a", "b c"}]"#).unwrap(),
+      "{a, b%20c}"
+    );
+  }
+
+  #[test]
+  fn url_encode_unreserved_chars() {
+    assert_eq!(
+      interpret(r#"URLEncode["abc123-._~"]"#).unwrap(),
+      "abc123-._~"
+    );
+  }
+}
+
+mod url_decode_tests {
+  use super::*;
+
+  #[test]
+  fn url_decode_simple() {
+    assert_eq!(
+      interpret(r#"URLDecode["Hello%2C%20World%21"]"#).unwrap(),
+      "Hello, World!"
+    );
+  }
+
+  #[test]
+  fn url_decode_special_chars() {
+    assert_eq!(
+      interpret(r#"URLDecode["a%3D1%26b%3D2"]"#).unwrap(),
+      "a=1&b=2"
+    );
+  }
+
+  #[test]
+  fn url_decode_roundtrip() {
+    assert_eq!(
+      interpret(r#"URLDecode[URLEncode["test string!@#"]]"#).unwrap(),
+      "test string!@#"
+    );
+  }
+}
+
+mod url_query_encode_tests {
+  use super::*;
+
+  #[test]
+  fn from_association() {
+    // Spaces become "+"; non-string values render textually.
+    assert_eq!(
+      interpret(r#"URLQueryEncode[<|"a" -> 1, "b" -> "x y"|>]"#).unwrap(),
+      "a=1&b=x+y"
+    );
+  }
+
+  #[test]
+  fn from_rule_list() {
+    assert_eq!(
+      interpret(r#"URLQueryEncode[{"q" -> "hello world", "n" -> 5}]"#).unwrap(),
+      "q=hello+world&n=5"
+    );
+  }
+
+  #[test]
+  fn percent_encodes_reserved_chars() {
+    assert_eq!(
+      interpret(r#"URLQueryEncode[<|"key" -> "a+b/c?d=e&f#g"|>]"#).unwrap(),
+      "key=a%2Bb%2Fc%3Fd%3De%26f%23g"
+    );
+  }
+
+  #[test]
+  fn keeps_unreserved_encodes_the_rest() {
+    // Unreserved set is ALPHA / DIGIT / - _ . ~ ; everything else encoded.
+    assert_eq!(
+      interpret(r#"URLQueryEncode[<|"x" -> "hello world!~-_.*()"|>]"#).unwrap(),
+      "x=hello+world%21~-_.%2A%28%29"
+    );
+  }
+
+  #[test]
+  fn boolean_lowercased() {
+    assert_eq!(
+      interpret(r#"URLQueryEncode[<|"a" -> True|>]"#).unwrap(),
+      "a=true"
+    );
+  }
+
+  #[test]
+  fn empty_association() {
+    assert_eq!(interpret("URLQueryEncode[<||>]").unwrap(), "");
+  }
+
+  #[test]
+  fn non_query_stays_unevaluated() {
+    assert_eq!(
+      interpret(r#"URLQueryEncode["a=b"]"#).unwrap(),
+      "URLQueryEncode[a=b]"
+    );
+  }
+}
+
+mod url_query_decode_tests {
+  use super::*;
+
+  #[test]
+  fn plus_is_space() {
+    assert_eq!(
+      interpret(r#"URLQueryDecode["a=1&b=x+y"]"#).unwrap(),
+      "{a -> 1, b -> x y}"
+    );
+  }
+
+  #[test]
+  fn percent_and_utf8() {
+    assert_eq!(
+      interpret(r#"URLQueryDecode["q=hello%20world&n=5"]"#).unwrap(),
+      "{q -> hello world, n -> 5}"
+    );
+    // %C3%A9 is the UTF-8 encoding of é.
+    assert_eq!(
+      interpret(r#"URLQueryDecode["a=c%C3%A9"]"#).unwrap(),
+      "{a -> cé}"
+    );
+  }
+
+  #[test]
+  fn split_on_first_equals_before_decoding() {
+    // The %3D in the key stays encoded when splitting, then decodes to "=".
+    assert_eq!(
+      interpret(r#"URLQueryDecode["a%3Db=c"]"#).unwrap(),
+      "{a=b -> c}"
+    );
+  }
+
+  #[test]
+  fn missing_value_and_empty() {
+    assert_eq!(
+      interpret(r#"URLQueryDecode["flag"]"#).unwrap(),
+      "{flag -> }"
+    );
+    assert_eq!(interpret(r#"URLQueryDecode[""]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn duplicate_keys_kept() {
+    assert_eq!(
+      interpret(r#"URLQueryDecode["a=1&a=2"]"#).unwrap(),
+      "{a -> 1, a -> 2}"
+    );
+  }
+
+  #[test]
+  fn decoded_values_are_strings() {
+    assert_eq!(
+      interpret(r#"Head[URLQueryDecode["a=1"][[1, 2]]]"#).unwrap(),
+      "String"
+    );
+  }
+}
+
+mod string_trim {
+  use super::*;
+
+  #[test]
+  fn trim_whitespace() {
+    assert_eq!(interpret(r#"StringTrim["  hello  "]"#).unwrap(), "hello");
+  }
+
+  #[test]
+  fn trim_with_pattern_removes_one_occurrence() {
+    // StringTrim removes only one occurrence of the pattern from each end
+    assert_eq!(
+      interpret(r#"StringTrim["xxxhelloxxx", "x"]"#).unwrap(),
+      "xxhelloxx"
+    );
+    assert_eq!(
+      interpret(r#"StringTrim["xxxhelloxxx", "xx"]"#).unwrap(),
+      "xhellox"
+    );
+    assert_eq!(
+      interpret(r#"StringTrim["   hello   ", " "]"#).unwrap(),
+      "  hello  "
+    );
+  }
+
+  #[test]
+  fn trim_with_repeated_pattern() {
+    // StringTrim with Repeated pattern strips all matching from each end
+    assert_eq!(
+      interpret(r#"StringTrim["xxxhelloxxx", "x"..]"#).unwrap(),
+      "hello"
+    );
+  }
+
+  #[test]
+  fn trim_with_whitespace_pattern() {
+    assert_eq!(
+      interpret(r#"StringTrim["  hello  ", Whitespace]"#).unwrap(),
+      "hello"
+    );
+  }
+
+  #[test]
+  fn trim_with_digit_pattern() {
+    assert_eq!(
+      interpret(r#"StringTrim["123hello456", DigitCharacter..]"#).unwrap(),
+      "hello"
+    );
+  }
+
+  #[test]
+  fn trim_threads_list() {
+    assert_eq!(
+      interpret(r#"StringTrim[{"  abc  ", " def "}]"#).unwrap(),
+      "{abc, def}"
+    );
+  }
+
+  #[test]
+  fn trim_threads_list_with_pattern() {
+    assert_eq!(
+      interpret(r#"StringTrim[{"xxhixx", "xyx"}, "x"]"#).unwrap(),
+      "{xhix, y}"
+    );
+  }
+}
+
+mod longest_common_subsequence_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn basic() {
+    // Wolfram's LongestCommonSubsequence finds the longest common substring (contiguous)
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["ABCDE", "ACDBE"]"#).unwrap(),
+      "CD"
+    );
+  }
+
+  #[test]
+  fn identical_strings() {
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["abc", "abc"]"#).unwrap(),
+      "abc"
+    );
+  }
+
+  #[test]
+  fn no_common() {
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["abc", "xyz"]"#).unwrap(),
+      ""
+    );
+  }
+
+  #[test]
+  fn longest_common_substring() {
+    // Wolfram's LongestCommonSubsequence finds contiguous common substring
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["abcdef", "acbcf"]"#).unwrap(),
+      "bc"
+    );
+  }
+
+  // List arguments compare whole elements and return the matching sublist.
+  #[test]
+  fn lists_return_sublist() {
+    assert_eq!(
+      interpret("LongestCommonSubsequence[{1, 2, 3}, {2, 3}]").unwrap(),
+      "{2, 3}"
+    );
+    assert_eq!(
+      interpret(
+        "LongestCommonSubsequence[{1, 2, 3, 4, 1}, {3, 4, 1, 2, 1, 3}]"
+      )
+      .unwrap(),
+      "{3, 4, 1}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSubsequence[{a, b, c, d}, {x, b, c, y}]")
+        .unwrap(),
+      "{b, c}"
+    );
+  }
+
+  #[test]
+  fn lists_identical_and_disjoint() {
+    assert_eq!(
+      interpret("LongestCommonSubsequence[{1, 2, 3}, {1, 2, 3}]").unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSubsequence[{1, 2}, {3, 4}]").unwrap(),
+      "{}"
+    );
+  }
+
+  // Among several maximal-length runs, wolframscript returns the one with the
+  // smallest sum of start positions, then the smallest start in the first
+  // argument. "AGGTAB"/"GXTXAYB" has four length-1 runs (A, G, T, B); the
+  // "G" run (starts at 2 and 1, sum 3) wins over the "A" run (starts 1 and 5).
+  #[test]
+  fn ties_prefer_smallest_start_sum() {
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["AGGTAB", "GXTXAYB"]"#).unwrap(),
+      "G"
+    );
+    // Equal start sums fall back to the smaller first-argument start: "XABY"
+    // vs "YAXB" ties X (starts 1,3) and A (starts 2,2) at sum 4, so X wins.
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["XABY", "YAXB"]"#).unwrap(),
+      "X"
+    );
+    // "ABCD"/"CDAB" ties two length-2 runs (AB and CD) at start sum 4; AB wins
+    // on the smaller first-argument start.
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequence["ABCD", "CDAB"]"#).unwrap(),
+      "AB"
+    );
+    // The same tie-break governs the positions form.
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequencePositions["AGGTAB", "GXTXAYB"]"#)
+        .unwrap(),
+      "{{2, 2}, {1, 1}}"
+    );
+  }
+}
+
+mod longest_common_sequence_tests {
+  use woxi::interpret;
+
+  // LongestCommonSequence finds the longest *noncontiguous* common
+  // subsequence (classic LCS), unlike contiguous LongestCommonSubsequence.
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["abcde", "ace"]"#).unwrap(),
+      "ace"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["banana", "atana"]"#).unwrap(),
+      "aana"
+    );
+  }
+
+  #[test]
+  fn no_common_and_empty() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["abc", "xyz"]"#).unwrap(),
+      ""
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["", "abc"]"#).unwrap(),
+      ""
+    );
+  }
+
+  // Tie-breaking matches Wolfram: on a mismatch the backtrack prefers moving
+  // up (decreasing the first-argument index). The swapped arguments below
+  // therefore yield different equal-length results.
+  #[test]
+  fn tie_breaking_matches_wolfram() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["GAC", "AGCAT"]"#).unwrap(),
+      "GA"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["AGCAT", "GAC"]"#).unwrap(),
+      "AC"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["abcbdab", "bdcaba"]"#).unwrap(),
+      "bcba"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["XMJYAUZ", "MZJAWXU"]"#).unwrap(),
+      "MJAU"
+    );
+  }
+
+  // List inputs compare whole elements and return the matching sublist.
+  #[test]
+  fn lists_return_sublist() {
+    assert_eq!(
+      interpret("LongestCommonSequence[{1, 2, 3, 4, 5}, {2, 4, 6}]").unwrap(),
+      "{2, 4}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSequence[{1, 2, 1, 2}, {2, 1, 2}]").unwrap(),
+      "{2, 1, 2}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSequence[{1, 2, 3, 1}, {3, 1, 2, 1}]").unwrap(),
+      "{1, 2, 1}"
+    );
+  }
+}
+
+mod longest_ordered_sequence_tests {
+  use woxi::interpret;
+
+  // LongestOrderedSequence[list]: longest non-decreasing subsequence.
+  #[test]
+  fn list_default() {
+    // {1, 3, 4} is also length 3; wolframscript returns {1, 2, 4}.
+    assert_eq!(
+      interpret("LongestOrderedSequence[{1, 3, 2, 4}]").unwrap(),
+      "{1, 2, 4}"
+    );
+    assert_eq!(
+      interpret("LongestOrderedSequence[{3, 1, 2, 1, 2, 3}]").unwrap(),
+      "{1, 1, 2, 3}"
+    );
+    // An already-ordered list is returned whole.
+    assert_eq!(
+      interpret("LongestOrderedSequence[{1, 2, 2, 3}]").unwrap(),
+      "{1, 2, 2, 3}"
+    );
+    // A strictly decreasing list keeps the last single element.
+    assert_eq!(
+      interpret("LongestOrderedSequence[{5, 4, 3, 2, 1}]").unwrap(),
+      "{1}"
+    );
+    assert_eq!(interpret("LongestOrderedSequence[{42}]").unwrap(), "{42}");
+    assert_eq!(interpret("LongestOrderedSequence[{}]").unwrap(), "{}");
+  }
+
+  // A string argument is processed character-wise and rebuilt as a string.
+  #[test]
+  fn string_argument() {
+    assert_eq!(
+      interpret(r#"LongestOrderedSequence["BAABCA"]"#).unwrap(),
+      "AABC"
+    );
+    assert_eq!(
+      interpret(r#"LongestOrderedSequence[{"B", "A", "A", "C", "B", "C"}]"#)
+        .unwrap(),
+      "{A, A, B, C}"
+    );
+  }
+
+  // The two-argument form takes an ordering predicate.
+  #[test]
+  fn with_comparator() {
+    // Decreasing order.
+    assert_eq!(
+      interpret("LongestOrderedSequence[{1, 3, 2, 4}, OrderedQ[{#2, #1}] &]")
+        .unwrap(),
+      "{3, 2}"
+    );
+    // Strictly increasing (drops the repeated A).
+    assert_eq!(
+      interpret(
+        r#"LongestOrderedSequence[{"B", "A", "A", "C", "B", "C"}, OrderedQ[{#1, #2}] && #1 =!= #2 &]"#
+      )
+      .unwrap(),
+      "{A, B, C}"
+    );
+  }
+
+  // A non-list (and a string in the two-argument form) is rejected.
+  #[test]
+  fn rejects_non_list() {
+    assert_eq!(
+      interpret("LongestOrderedSequence[5]").unwrap(),
+      "LongestOrderedSequence[5]"
+    );
+  }
+}
+
+mod string_count_patterns {
+  use woxi::interpret;
+
+  // The empty pattern matches at every character boundary
+  // (differential fuzzer, seed 8863040114037283151;
+  // wolframscript-verified).
+  #[test]
+  fn empty_pattern_counts_boundaries() {
+    assert_eq!(interpret(r#"StringCount["", ""]"#).unwrap(), "1");
+    assert_eq!(interpret(r#"StringCount["a", ""]"#).unwrap(), "2");
+    assert_eq!(interpret(r#"StringCount["ab", ""]"#).unwrap(), "3");
+    assert_eq!(interpret(r#"StringCount["", "a"]"#).unwrap(), "0");
+  }
+
+  // Every string contains the empty pattern; none is free of it
+  // (differential fuzzer, seed 11333804031743244357;
+  // wolframscript-verified).
+  #[test]
+  fn empty_pattern_containment() {
+    assert_eq!(interpret(r#"StringContainsQ["", ""]"#).unwrap(), "True");
+    assert_eq!(interpret(r#"StringContainsQ["to1", ""]"#).unwrap(), "True");
+    assert_eq!(interpret(r#"StringFreeQ["", ""]"#).unwrap(), "False");
+    assert_eq!(interpret(r#"StringFreeQ["ab", ""]"#).unwrap(), "False");
+  }
+
+  #[test]
+  fn count_with_regex() {
+    assert_eq!(
+      interpret(r#"StringCount["hello world", RegularExpression["[aeiou]"]]"#)
+        .unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn count_with_digit_character() {
+    assert_eq!(
+      interpret(r#"StringCount["abc123def456", DigitCharacter]"#).unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn count_plain_string() {
+    assert_eq!(interpret(r#"StringCount["abcabc", "a"]"#).unwrap(), "2");
+  }
+
+  #[test]
+  fn count_list_of_patterns_single_chars() {
+    // A list of patterns is treated as Alternatives.
+    assert_eq!(
+      interpret(r#"StringCount["abcabc", {"a", "b"}]"#).unwrap(),
+      "4"
+    );
+  }
+
+  #[test]
+  fn count_list_of_patterns_multi_char() {
+    assert_eq!(
+      interpret(r#"StringCount["abcabcabc", {"ab", "bc"}]"#).unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn count_list_of_patterns_non_overlapping_chars() {
+    assert_eq!(
+      interpret(r#"StringCount["abcabcabc", {"a", "c"}]"#).unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn count_threads_over_list_of_strings() {
+    assert_eq!(
+      interpret(r#"StringCount[{"abc", "abcabc", "xyz"}, "a"]"#).unwrap(),
+      "{1, 2, 0}"
+    );
+  }
+
+  #[test]
+  fn count_threads_over_list_of_strings_with_list_pattern() {
+    assert_eq!(
+      interpret(r#"StringCount[{"abc", "abcabc"}, {"a", "b"}]"#).unwrap(),
+      "{2, 4}"
+    );
+  }
+
+  // Overlaps -> True and Overlaps -> All both count overlapping matches (one
+  // per start position); the default (and Overlaps -> False) does not.
+  #[test]
+  fn count_overlaps_true_and_all() {
+    assert_eq!(
+      interpret(r#"StringCount["aaaa", "aa", Overlaps -> True]"#).unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(r#"StringCount["aaaa", "aa", Overlaps -> All]"#).unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(r#"StringCount["aaa", "aa", Overlaps -> All]"#).unwrap(),
+      "2"
+    );
+    assert_eq!(interpret(r#"StringCount["aaaa", "aa"]"#).unwrap(), "2");
+    assert_eq!(
+      interpret(r#"StringCount["aaaa", "aa", Overlaps -> False]"#).unwrap(),
+      "2"
+    );
+    // Threads over a list of strings.
+    assert_eq!(
+      interpret(r#"StringCount[{"aaa", "aaaa"}, "aa", Overlaps -> All]"#)
+        .unwrap(),
+      "{2, 3}"
+    );
+  }
+
+  // For a variable-length pattern the two settings differ: Overlaps -> True
+  // counts one match per start position, Overlaps -> All counts every length
+  // the pattern can take at each start position.
+  #[test]
+  fn count_overlaps_all_counts_every_length() {
+    assert_eq!(interpret(r#"StringCount["abcd", __]"#).unwrap(), "1");
+    assert_eq!(
+      interpret(r#"StringCount["abcd", __, Overlaps -> True]"#).unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret(r#"StringCount["abcd", __, Overlaps -> All]"#).unwrap(),
+      "10"
+    );
+    assert_eq!(
+      interpret(r#"StringCount["abab", "ab" | "ba" | "aba", Overlaps -> All]"#)
+        .unwrap(),
+      "4"
+    );
+  }
+}
+
+mod string_starts_ends_patterns {
+  use woxi::interpret;
+
+  #[test]
+  fn starts_q_letter_character() {
+    assert_eq!(
+      interpret(r#"StringStartsQ["hello", LetterCharacter]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringStartsQ["123hello", LetterCharacter]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn ends_q_digit_character() {
+    assert_eq!(
+      interpret(r#"StringEndsQ["hello123", DigitCharacter]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringEndsQ["hello", DigitCharacter]"#).unwrap(),
+      "False"
+    );
+  }
+}
+
+mod string_contains_free_patterns {
+  use woxi::interpret;
+
+  #[test]
+  fn contains_q_digit_character() {
+    assert_eq!(
+      interpret(r#"StringContainsQ["hello123", DigitCharacter]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringContainsQ["hello", DigitCharacter]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn free_q_regex() {
+    assert_eq!(
+      interpret(r#"StringFreeQ["hello123", RegularExpression["[0-9]"]]"#)
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(r#"StringFreeQ["hello", RegularExpression["[0-9]"]]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn free_q_threads_over_list() {
+    // StringFreeQ threads over a list of strings (matches wolframscript).
+    assert_eq!(
+      interpret(r#"StringFreeQ[{"g", "a", "laxy", "universe", "sun"}, "u"]"#)
+        .unwrap(),
+      "{True, True, True, False, False}"
+    );
+  }
+
+  #[test]
+  fn free_q_ignore_case() {
+    assert_eq!(
+      interpret(r#"StringFreeQ["Mathics", "MA", IgnoreCase -> True]"#).unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(r#"StringFreeQ["Mathics", "MA"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringFreeQ["Mathics", "XX", IgnoreCase -> True]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringFreeQ[{"abc", "ABC"}, "a", IgnoreCase -> True]"#)
+        .unwrap(),
+      "{False, False}"
+    );
+  }
+
+  // Operator form: `StringFreeQ[pattern]` maps over strings, each time
+  // evaluating `StringFreeQ[string, pattern]`. Regression for mathics
+  // atomic/strings.py:1651.
+  #[test]
+  fn operator_form_maps_over_strings() {
+    assert_eq!(
+      interpret(
+        r#"StringFreeQ["e" ~~ ___ ~~ "u"] /@ {"The Sun", "Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"}"#
+      )
+      .unwrap(),
+      "{False, False, False, True, True, True, True, True, False}"
+    );
+  }
+
+  #[test]
+  fn split_digit_pattern() {
+    assert_eq!(
+      interpret(r#"StringSplit["abc123def456", DigitCharacter..]"#).unwrap(),
+      "{abc, def}"
+    );
+  }
+
+  #[test]
+  fn string_pad_right_single_char() {
+    assert_eq!(
+      interpret(r#"StringPadRight["hi", 5, "0"]"#).unwrap(),
+      "hi000"
+    );
+  }
+
+  #[test]
+  fn string_pad_right_multi_char() {
+    assert_eq!(
+      interpret(r#"StringPadRight["hi", 10, "xy"]"#).unwrap(),
+      "hixyxyxyxy"
+    );
+    assert_eq!(
+      interpret(r#"StringPadRight["x", 6, "abc"]"#).unwrap(),
+      "xbcabc"
+    );
+    assert_eq!(
+      interpret(r#"StringPadRight["hi", 10, "abc"]"#).unwrap(),
+      "hicabcabca"
+    );
+  }
+
+  #[test]
+  fn string_pad_right_default() {
+    assert_eq!(interpret(r#"StringPadRight["hi", 5]"#).unwrap(), "hi   ");
+  }
+
+  #[test]
+  fn string_pad_right_truncate() {
+    assert_eq!(interpret(r#"StringPadRight["hello", 3]"#).unwrap(), "hel");
+  }
+
+  #[test]
+  fn string_pad_left_single_char() {
+    assert_eq!(
+      interpret(r#"StringPadLeft["hi", 5, "0"]"#).unwrap(),
+      "000hi"
+    );
+  }
+
+  #[test]
+  fn string_pad_invalid_padding_warns_stringnz() {
+    use woxi::interpret_with_stdout;
+    // A non-string (or empty / list) padding emits StringPadLeft::stringnz
+    // and stays unevaluated.
+    let r =
+      interpret_with_stdout(r#"StringPadLeft["7", 5, {"a", "b"}]"#).unwrap();
+    assert_eq!(r.result, "StringPadLeft[7, 5, {a, b}]");
+    assert!(r.warnings[0].contains(
+      "StringPadLeft::stringnz: String of non-zero length expected at \
+       position 3 in StringPadLeft[7, 5, {a, b}]."
+    ));
+    // StringPadRight behaves the same way.
+    let r2 = interpret_with_stdout(r#"StringPadRight["7", 5, 3]"#).unwrap();
+    assert_eq!(r2.result, "StringPadRight[7, 5, 3]");
+    assert!(r2.warnings[0].contains(
+      "StringPadRight::stringnz: String of non-zero length expected at \
+       position 3 in StringPadRight[7, 5, 3]."
+    ));
+  }
+
+  // An invalid length (position 2) that is not a non-negative integer emits
+  // ::intnm and stays unevaluated, rather than raising an evaluation error.
+  #[test]
+  fn string_pad_invalid_length_warns_intnm() {
+    use woxi::interpret_with_stdout;
+    // A symbolic length stays unevaluated.
+    let r = interpret_with_stdout(r#"StringPadLeft["ab", x]"#).unwrap();
+    assert_eq!(r.result, "StringPadLeft[ab, x]");
+    assert!(r.warnings[0].contains(
+      "StringPadLeft::intnm: Non-negative machine-sized integer expected at \
+       position 2 in StringPadLeft[ab, x]."
+    ));
+    // Negative and non-integer lengths also stay unevaluated.
+    assert_eq!(
+      interpret(r#"StringPadLeft["abc", -1]"#).unwrap(),
+      "StringPadLeft[abc, -1]"
+    );
+    assert_eq!(
+      interpret(r#"StringPadRight["ab", 1.5]"#).unwrap(),
+      "StringPadRight[ab, 1.5]"
+    );
+    // Zero is valid — pad/truncate to the empty string.
+    assert_eq!(interpret(r#"StringPadLeft["ab", 0]"#).unwrap(), "");
+  }
+
+  // One-argument list form: pad every string to the longest one's length.
+  #[test]
+  fn string_pad_one_arg_list() {
+    assert_eq!(
+      interpret(r#"StringPadLeft[{"a", "ab", "abc"}]"#).unwrap(),
+      r#"{  a,  ab, abc}"#
+    );
+    assert_eq!(
+      interpret(r#"StringPadRight[{"a", "ab", "abc"}]"#).unwrap(),
+      r#"{a  , ab , abc}"#
+    );
+    assert_eq!(
+      interpret(r#"StringPadLeft[{"12", "abcd"}]"#).unwrap(),
+      r#"{  12, abcd}"#
+    );
+    // An empty list pads to itself.
+    assert_eq!(interpret(r#"StringPadLeft[{}]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn string_pad_one_arg_non_list_warns_strlist() {
+    use woxi::interpret_with_stdout;
+    let r = interpret_with_stdout(r#"StringPadLeft["abc"]"#).unwrap();
+    assert_eq!(r.result, "StringPadLeft[abc]");
+    assert!(r.warnings[0].contains(
+      "StringPadLeft::strlist: List of strings expected at position 1 in \
+       StringPadLeft[abc]."
+    ));
+  }
+
+  #[test]
+  fn string_pad_left_multi_char() {
+    assert_eq!(
+      interpret(r#"StringPadLeft["hi", 10, "xy"]"#).unwrap(),
+      "xyxyxyxyhi"
+    );
+    assert_eq!(
+      interpret(r#"StringPadLeft["x", 6, "abc"]"#).unwrap(),
+      "abcabx"
+    );
+    assert_eq!(
+      interpret(r#"StringPadLeft["hi", 10, "abc"]"#).unwrap(),
+      "cabcabcahi"
+    );
+  }
+
+  #[test]
+  fn string_pad_left_default() {
+    assert_eq!(interpret(r#"StringPadLeft["hi", 5]"#).unwrap(), "   hi");
+  }
+
+  #[test]
+  fn string_pad_left_truncate() {
+    assert_eq!(interpret(r#"StringPadLeft["hello", 3]"#).unwrap(), "llo");
+  }
+
+  #[test]
+  fn string_pad_left_list_default() {
+    assert_eq!(
+      interpret(r#"StringPadLeft[{"a", "bc", "def"}, 5]"#).unwrap(),
+      "{    a,    bc,   def}"
+    );
+  }
+
+  #[test]
+  fn string_pad_left_list_with_pad() {
+    assert_eq!(
+      interpret(r#"StringPadLeft[{"a", "bc", "def"}, 5, "*"]"#).unwrap(),
+      "{****a, ***bc, **def}"
+    );
+  }
+
+  #[test]
+  fn string_pad_left_list_multi_char_pad() {
+    assert_eq!(
+      interpret(r#"StringPadLeft[{"a", "bc"}, 6, "xy"]"#).unwrap(),
+      "{xyxyxa, xyxybc}"
+    );
+  }
+
+  #[test]
+  fn insert_linebreaks_hard_break() {
+    // No spaces: hard-break every n characters, no trailing newline.
+    assert_eq!(
+      interpret(r#"InsertLinebreaks["abcdefgh", 3]"#).unwrap(),
+      "abc\ndef\ngh"
+    );
+  }
+
+  #[test]
+  fn insert_linebreaks_word_wrap() {
+    // Words are kept whole and packed greedily up to n characters.
+    assert_eq!(
+      interpret(r#"InsertLinebreaks["hello world foo bar", 7]"#).unwrap(),
+      "hello\nworld\nfoo bar"
+    );
+  }
+
+  #[test]
+  fn insert_linebreaks_overlong_word() {
+    // A word longer than n is hard-broken after the line break.
+    assert_eq!(
+      interpret(r#"InsertLinebreaks["hello worldlongword", 5]"#).unwrap(),
+      "hello\nworld\nlongw\nord"
+    );
+  }
+
+  #[test]
+  fn insert_linebreaks_short_fits() {
+    assert_eq!(interpret(r#"InsertLinebreaks["abc", 5]"#).unwrap(), "abc");
+  }
+
+  #[test]
+  fn insert_linebreaks_default_width() {
+    // The default width is 78 characters.
+    assert_eq!(
+      interpret(
+        r#"StringLength /@ StringSplit[InsertLinebreaks[StringJoin[Table["a", 200]]], "\n"]"#
+      )
+      .unwrap(),
+      "{78, 78, 44}"
+    );
+  }
+
+  #[test]
+  fn insert_linebreaks_invalid_width() {
+    // A non-positive width leaves the call unevaluated.
+    assert_eq!(
+      interpret(r#"InsertLinebreaks["abcde", 0]"#).unwrap(),
+      "InsertLinebreaks[abcde, 0]"
+    );
+  }
+
+  #[test]
+  fn string_pad_right_list_default() {
+    assert_eq!(
+      interpret(r#"StringPadRight[{"a", "bc", "def"}, 5]"#).unwrap(),
+      "{a    , bc   , def  }"
+    );
+  }
+
+  #[test]
+  fn string_pad_right_list_with_pad() {
+    assert_eq!(
+      interpret(r#"StringPadRight[{"a", "bc", "def"}, 5, "-"]"#).unwrap(),
+      "{a----, bc---, def--}"
+    );
+  }
+
+  #[test]
+  fn string_pad_left_list_truncate() {
+    assert_eq!(
+      interpret(r#"StringPadLeft[{"hello", "hi"}, 3]"#).unwrap(),
+      "{llo,  hi}"
+    );
+  }
+
+  // Wolfram requires the padding (3rd arg) to be a non-empty string; for a
+  // list, an empty string, or a number it returns the call unevaluated
+  // (StringPadLeft::stringnz / StringPadRight::stringnz) rather than coercing.
+  #[test]
+  fn pad_left_list_padding_unevaluated() {
+    assert_eq!(
+      interpret(r#"StringPadLeft["7", 3, {"0"}]"#).unwrap(),
+      "StringPadLeft[7, 3, {0}]"
+    );
+  }
+
+  #[test]
+  fn pad_left_empty_padding_unevaluated() {
+    assert_eq!(
+      interpret(r#"StringPadLeft["7", 3, ""]"#).unwrap(),
+      "StringPadLeft[7, 3, ]"
+    );
+  }
+
+  #[test]
+  fn pad_left_number_padding_unevaluated() {
+    assert_eq!(
+      interpret(r#"StringPadLeft["7", 3, 5]"#).unwrap(),
+      "StringPadLeft[7, 3, 5]"
+    );
+  }
+
+  #[test]
+  fn pad_left_bad_padding_unevaluated_even_when_truncating() {
+    // The padding is validated before the (otherwise pure) truncation.
+    assert_eq!(
+      interpret(r#"StringPadLeft["abcd", 2, {"0"}]"#).unwrap(),
+      "StringPadLeft[abcd, 2, {0}]"
+    );
+  }
+
+  #[test]
+  fn pad_right_list_padding_unevaluated() {
+    assert_eq!(
+      interpret(r#"StringPadRight["7", 3, {"0"}]"#).unwrap(),
+      "StringPadRight[7, 3, {0}]"
+    );
+  }
+
+  #[test]
+  fn pad_right_empty_padding_unevaluated() {
+    assert_eq!(
+      interpret(r#"StringPadRight["7", 3, ""]"#).unwrap(),
+      "StringPadRight[7, 3, ]"
+    );
+  }
+}
+
+mod string_position_alternatives {
+  use super::*;
+
+  #[test]
+  fn string_position_list_of_alternatives() {
+    // Matches of "a" and "b" should interleave and be sorted by position.
+    assert_eq!(
+      interpret(r#"StringPosition["abcabc", {"a", "b"}]"#).unwrap(),
+      "{{1, 1}, {2, 2}, {4, 4}, {5, 5}}"
+    );
+  }
+
+  #[test]
+  fn string_position_alternatives_mixed_lengths() {
+    // "a" has length 1, "bc" has length 2.
+    assert_eq!(
+      interpret(r#"StringPosition["abcabc", {"a", "bc"}]"#).unwrap(),
+      "{{1, 1}, {2, 3}, {4, 4}, {5, 6}}"
+    );
+  }
+
+  #[test]
+  fn string_position_alternatives_with_limit() {
+    assert_eq!(
+      interpret(r#"StringPosition["abcabcabc", {"bc", "ab"}, 1]"#).unwrap(),
+      "{{1, 2}}"
+    );
+  }
+
+  #[test]
+  fn string_position_alternatives_sorted_by_position() {
+    assert_eq!(
+      interpret(r#"StringPosition["abcdefabc", {"d", "a"}]"#).unwrap(),
+      "{{1, 1}, {4, 4}, {7, 7}}"
+    );
+  }
+
+  #[test]
+  fn string_position_overlaps() {
+    // StringPosition reports overlapping matches by default.
+    assert_eq!(
+      interpret(r#"StringPosition["aaa", "aa"]"#).unwrap(),
+      "{{1, 2}, {2, 3}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["aaa", "aa", Overlaps -> True]"#).unwrap(),
+      "{{1, 2}, {2, 3}}"
+    );
+    // Overlaps -> False keeps matches greedily, skipping overlaps.
+    assert_eq!(
+      interpret(r#"StringPosition["aaa", "aa", Overlaps -> False]"#).unwrap(),
+      "{{1, 2}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["aaaa", "aa", Overlaps -> False]"#).unwrap(),
+      "{{1, 2}, {3, 4}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["abababab", "aba", Overlaps -> False]"#)
+        .unwrap(),
+      "{{1, 3}, {5, 7}}"
+    );
+  }
+
+  // `Overlaps -> All` reports every span the pattern can match, grouped by
+  // start position; the default reports only the preferred span per position.
+  #[test]
+  fn string_position_overlaps_all() {
+    assert_eq!(
+      interpret(r#"StringPosition["abcd", __]"#).unwrap(),
+      "{{1, 4}, {2, 4}, {3, 4}, {4, 4}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["abcd", __, Overlaps -> All]"#).unwrap(),
+      "{{1, 4}, {1, 3}, {1, 2}, {1, 1}, {2, 4}, {2, 3}, {2, 2}, {3, 4}, \
+       {3, 3}, {4, 4}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["abcd", Shortest[__], Overlaps -> All]"#)
+        .unwrap(),
+      "{{1, 1}, {1, 2}, {1, 3}, {1, 4}, {2, 2}, {2, 3}, {2, 4}, {3, 3}, \
+       {3, 4}, {4, 4}}"
+    );
+    // `___` adds the empty span {i, i - 1} at every boundary.
+    assert_eq!(
+      interpret(r#"StringPosition["abc", ___, Overlaps -> All]"#).unwrap(),
+      "{{1, 3}, {1, 2}, {1, 1}, {1, 0}, {2, 3}, {2, 2}, {2, 1}, {3, 3}, \
+       {3, 2}, {4, 3}}"
+    );
+    // A leading StartOfString still pins every span to the string start.
+    assert_eq!(
+      interpret(
+        r#"StringPosition["abcd", StartOfString ~~ __, Overlaps -> All]"#
+      )
+      .unwrap(),
+      "{{1, 4}, {1, 3}, {1, 2}, {1, 1}}"
+    );
+    // The count limit truncates the reported spans.
+    assert_eq!(
+      interpret(r#"StringPosition["abcd", __, 2, Overlaps -> All]"#).unwrap(),
+      "{{1, 4}, {1, 3}}"
+    );
+  }
+
+  #[test]
+  fn string_position_empty_pattern() {
+    // An empty pattern matches with length 0 before every character and once
+    // after the last, giving the n+1 positions {i, i - 1}.
+    assert_eq!(
+      interpret(r#"StringPosition["ab", ""]"#).unwrap(),
+      "{{1, 0}, {2, 1}, {3, 2}}"
+    );
+    // Empty string, empty pattern: a single 0-length match at position 1.
+    assert_eq!(interpret(r#"StringPosition["", ""]"#).unwrap(), "{{1, 0}}");
+    // Overlaps -> False keeps every empty match (each has length 0).
+    assert_eq!(
+      interpret(r#"StringPosition["ab", "", Overlaps -> False]"#).unwrap(),
+      "{{1, 0}, {2, 1}, {3, 2}}"
+    );
+  }
+
+  #[test]
+  fn string_position_patterns() {
+    // Alternatives and character-class / predicate patterns, not just
+    // literals and RegularExpression.
+    assert_eq!(
+      interpret(r#"StringPosition["abcabc", "a" | "c"]"#).unwrap(),
+      "{{1, 1}, {3, 3}, {4, 4}, {6, 6}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["a1b2", DigitCharacter]"#).unwrap(),
+      "{{2, 2}, {4, 4}}"
+    );
+    assert_eq!(
+      interpret(r#"StringPosition["aXbY", _?UpperCaseQ]"#).unwrap(),
+      "{{2, 2}, {4, 4}}"
+    );
+    // Literal and list-of-literal forms are unchanged.
+    assert_eq!(
+      interpret(r#"StringPosition["abcabc", {"a", "c"}]"#).unwrap(),
+      "{{1, 1}, {3, 3}, {4, 4}, {6, 6}}"
+    );
+  }
+
+  #[test]
+  fn string_position_threads_over_list_of_strings() {
+    assert_eq!(
+      interpret(r#"StringPosition[{"abcabc", "xyabc"}, "b"]"#).unwrap(),
+      "{{{2, 2}, {5, 5}}, {{4, 4}}}"
+    );
+  }
+
+  #[test]
+  fn string_position_threads_list_of_strings_with_alternatives() {
+    assert_eq!(
+      interpret(r#"StringPosition[{"abcabc", "xyabc"}, {"a", "b"}]"#).unwrap(),
+      "{{{1, 1}, {2, 2}, {4, 4}, {5, 5}}, {{3, 3}, {4, 4}}}"
+    );
+  }
+
+  #[test]
+  fn string_position_with_regex() {
+    assert_eq!(
+      interpret(r#"StringPosition["hello", RegularExpression["l+"]]"#).unwrap(),
+      "{{3, 4}, {4, 4}}"
+    );
+  }
+
+  #[test]
+  fn string_position_with_regex_single_char() {
+    assert_eq!(
+      interpret(r#"StringPosition["hello", RegularExpression["l"]]"#).unwrap(),
+      "{{3, 3}, {4, 4}}"
+    );
+  }
+
+  #[test]
+  fn string_position_with_regex_overlapping() {
+    assert_eq!(
+      interpret(r#"StringPosition["aabaa", RegularExpression["a+"]]"#).unwrap(),
+      "{{1, 2}, {2, 2}, {4, 5}, {5, 5}}"
+    );
+  }
+}
+
+mod edit_distance_options {
+  use super::*;
+
+  #[test]
+  fn ignore_case_option() {
+    // EditDistance with IgnoreCase treats upper/lower as equal (matches wolframscript).
+    assert_eq!(
+      interpret(r#"EditDistance["time", "Thyme", IgnoreCase -> True]"#)
+        .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn list_of_items() {
+    // EditDistance accepts lists and compares elementwise by equality.
+    assert_eq!(
+      interpret("EditDistance[{1, E, 2, Pi}, {1, E, Pi, 2}]").unwrap(),
+      "2"
+    );
+  }
+}
+
+mod damerau_levenshtein_distance {
+  use super::*;
+
+  #[test]
+  fn basic_substitution_insertion() {
+    assert_eq!(
+      interpret(r#"DamerauLevenshteinDistance["kitten", "kitchen"]"#).unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn deletion() {
+    assert_eq!(
+      interpret(r#"DamerauLevenshteinDistance["abc", "ac"]"#).unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn adjacent_transposition_is_one() {
+    // DL distinguishes itself from plain Levenshtein by treating a swap of
+    // adjacent characters as cost 1 (Levenshtein would say 2).
+    assert_eq!(
+      interpret(r#"DamerauLevenshteinDistance["abc", "acb"]"#).unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn mixed_insertion_transposition() {
+    assert_eq!(
+      interpret(r#"DamerauLevenshteinDistance["azbc", "abxyc"]"#).unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn case_sensitive() {
+    assert_eq!(
+      interpret(r#"DamerauLevenshteinDistance["time", "Thyme"]"#).unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn ignore_case_option() {
+    assert_eq!(
+      interpret(
+        r#"DamerauLevenshteinDistance["time", "Thyme", IgnoreCase -> True]"#
+      )
+      .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn list_arguments_transposition() {
+    assert_eq!(
+      interpret("DamerauLevenshteinDistance[{1, E, 2, Pi}, {1, E, Pi, 2}]")
+        .unwrap(),
+      "1"
+    );
+  }
+
+  // True (unrestricted) Damerau-Levenshtein: a transposition may interleave
+  // with another edit. "ca" -> "abc" is transpose c,a then insert b = 2. The
+  // Optimal String Alignment variant forbids re-editing the swapped pair and
+  // would report 3; Wolfram (and Woxi) use the true distance.
+  #[test]
+  fn transposition_interleaved_with_insertion() {
+    assert_eq!(
+      interpret(r#"DamerauLevenshteinDistance["ca", "abc"]"#).unwrap(),
+      "2"
+    );
+  }
+}
+
+mod sequence_alignment_similarity {
+  use super::*;
+
+  #[test]
+  fn needleman_wunsch_global() {
+    // match +1, mismatch -1, gap -1.
+    assert_eq!(
+      interpret(r#"NeedlemanWunschSimilarity["abc", "abc"]"#).unwrap(),
+      "3."
+    );
+    assert_eq!(
+      interpret(r#"NeedlemanWunschSimilarity["abc", "abd"]"#).unwrap(),
+      "1."
+    );
+    assert_eq!(
+      interpret(r#"NeedlemanWunschSimilarity["abcde", "ace"]"#).unwrap(),
+      "1."
+    );
+    assert_eq!(
+      interpret(r#"NeedlemanWunschSimilarity["abc", "xyz"]"#).unwrap(),
+      "-3."
+    );
+    // Empty input -> length of the other.
+    assert_eq!(
+      interpret(r#"NeedlemanWunschSimilarity["abc", ""]"#).unwrap(),
+      "3."
+    );
+  }
+
+  #[test]
+  fn smith_waterman_local() {
+    assert_eq!(
+      interpret(r#"SmithWatermanSimilarity["abc", "abd"]"#).unwrap(),
+      "2."
+    );
+    assert_eq!(
+      interpret(r#"SmithWatermanSimilarity["abcd", "bc"]"#).unwrap(),
+      "2."
+    );
+    // No positive local alignment -> 0.
+    assert_eq!(
+      interpret(r#"SmithWatermanSimilarity["abc", "xyz"]"#).unwrap(),
+      "0."
+    );
+    // Lists of items align by equality.
+    assert_eq!(
+      interpret("SmithWatermanSimilarity[{1, 2, 3}, {2, 3, 4}]").unwrap(),
+      "2."
+    );
+  }
+}
+
+mod string_position_anchors {
+  use super::*;
+
+  // EndOfString anchors a match to the end of the input string.
+  #[test]
+  fn match_end_of_string() {
+    assert_eq!(
+      interpret(
+        r#"StringMatchQ[#, __ ~~ "e" ~~ EndOfString] &/@ {"apple", "banana", "artichoke"}"#
+      )
+      .unwrap(),
+      "{True, False, True}"
+    );
+  }
+
+  // StartOfString anchors a match to the beginning of the input string.
+  #[test]
+  fn match_start_of_string() {
+    assert_eq!(
+      interpret(
+        r#"StringMatchQ[#, StartOfString ~~ "a" ~~ __] &/@ {"apple", "banana", "artichoke"}"#
+      )
+      .unwrap(),
+      "{True, False, True}"
+    );
+  }
+
+  // StartOfLine anchors to the start of each line in multiline input. The
+  // anchor must inspect the original string, not a positional slice — otherwise
+  // every position after a line break would spuriously match.
+  #[test]
+  fn replace_start_of_line_does_not_match_middle() {
+    assert_eq!(
+      interpret(r#"StringReplace["abab", StartOfLine ~~ "a" -> "X"]"#).unwrap(),
+      "Xbab"
+    );
+  }
+
+  // WordBoundary (\b) matches between a word and non-word character.
+  #[test]
+  fn replace_with_word_boundary() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["apple banana orange artichoke", "e" ~~ WordBoundary -> "E"]"#
+      )
+      .unwrap(),
+      "applE banana orangE artichokE"
+    );
+  }
+
+  // Except[pattern] matches a single non-matching character — used here to
+  // strip everything that isn't a letter.
+  #[test]
+  fn replace_except_letter_character() {
+    assert_eq!(
+      interpret(
+        r#"StringReplace["Hello world!", Except[LetterCharacter] -> ""]"#
+      )
+      .unwrap(),
+      "Helloworld"
+    );
+  }
+}
+
+// `ToString[BigFloat]` drops the `\`p` precision marker and truncates
+// the decimal expansion to `p` significant digits — matching
+// wolframscript: `ToString[N[Pi, 100]]` is the bare 101-char string
+// "3.<99 digits>".
+mod to_string_machine_real {
+  use super::*;
+
+  // Regression (mathics test_numbers.py:221, via Accuracy[F[1.3, Pi, A]]):
+  // wolframscript's ToString of a machine Real truncates to 6 significant
+  // digits, not the full f64 representation. Print/InputForm/direct REPL
+  // output still show full precision.
+  #[test]
+  fn to_string_short_real_unchanged() {
+    assert_eq!(interpret("ToString[3.14]").unwrap(), "3.14");
+  }
+
+  #[test]
+  fn to_string_pi_truncates_to_6_digits() {
+    assert_eq!(interpret("ToString[3.14159265358979]").unwrap(), "3.14159");
+  }
+
+  #[test]
+  fn to_string_real_integer_keeps_dot() {
+    assert_eq!(interpret("ToString[15.0]").unwrap(), "15.");
+  }
+
+  #[test]
+  fn to_string_negative_real_truncates() {
+    assert_eq!(interpret("ToString[-3.14159265]").unwrap(), "-3.14159");
+  }
+
+  #[test]
+  fn to_string_real_three_digits_int_part() {
+    assert_eq!(interpret("ToString[100.123456]").unwrap(), "100.123");
+  }
+
+  #[test]
+  fn to_string_list_truncates_each_real() {
+    assert_eq!(
+      interpret("ToString[{3.14159265, 1.234}]").unwrap(),
+      "{3.14159, 1.234}"
+    );
+  }
+
+  // The flagship case from mathics test_accuracy: the inner Real
+  // computed by `Accuracy[F[1.3, Pi, A]]` is approximately
+  // 15.8406464…, which ToString trims to "15.8406".
+  #[test]
+  fn to_string_accuracy_of_mixed_args() {
+    assert_eq!(
+      interpret("ToString[Accuracy[F[1.3, Pi, A]]]").unwrap(),
+      "15.8406"
+    );
+  }
+
+  // The default REPL output (not via ToString) keeps full precision.
+  #[test]
+  fn repl_output_keeps_full_precision() {
+    assert_eq!(interpret("3.14159265358979").unwrap(), "3.14159265358979");
+  }
+}
+
+mod to_string_bigfloat {
+  use super::*;
+
+  #[test]
+  fn to_string_pi_100_strips_precision_marker() {
+    let result = interpret("ToString[N[Pi, 100]]").unwrap();
+    assert!(!result.contains('`'), "no precision marker, got: {result}");
+    assert!(result.starts_with("3.14159265358979323846264338327"));
+    // 1 integer digit + dot + 99 fractional digits.
+    assert_eq!(result.len(), 101);
+  }
+
+  #[test]
+  fn to_string_pi_50_returns_50_significant_digits() {
+    assert_eq!(
+      interpret("ToString[N[Pi, 50]]").unwrap(),
+      "3.1415926535897932384626433832795028841971693993751"
+    );
+  }
+
+  #[test]
+  fn to_string_sqrt2_30_drops_marker() {
+    let result = interpret("ToString[N[Sqrt[2], 30]]").unwrap();
+    assert!(!result.contains('`'), "no precision marker, got: {result}");
+    // wolframscript rounds the 30th significant figure (the 31st digit of
+    // Sqrt[2] is 9), so the value ends in ...421, not the truncated ...420.
+    assert_eq!(result, "1.41421356237309504880168872421");
+  }
+
+  // ToString rounds (does not truncate) the last significant figure.
+  #[test]
+  fn to_string_rounds_last_digit() {
+    // Pi's 6th figure is 9, so 5-figure Pi rounds up to 3.1416.
+    assert_eq!(interpret("ToString[N[Pi, 5]]").unwrap(), "3.1416");
+    assert_eq!(interpret("ToString[N[Pi, 10]]").unwrap(), "3.141592654");
+    // 2/3 rounds the trailing 6 up to 7.
+    assert_eq!(interpret("ToString[N[2/3, 10]]").unwrap(), "0.6666666667");
+    assert_eq!(interpret("ToString[N[E, 7]]").unwrap(), "2.718282");
+  }
+
+  // A rounding carry that propagates through every kept digit grows the
+  // magnitude (0.999 -> 1.0, 9.9995 -> 10.0).
+  #[test]
+  fn to_string_rounding_carry() {
+    assert_eq!(interpret("ToString[N[999/1000, 2]]").unwrap(), "1.0");
+    assert_eq!(interpret("ToString[N[19999/2000, 3]]").unwrap(), "10.0");
+  }
+
+  // A BigFloat nested inside a List, FunctionCall, or arithmetic op gets the
+  // same marker-dropping/rounding treatment as a bare top-level BigFloat
+  // argument — previously only the top-level case was handled, so a nested
+  // BigFloat printed its raw InputForm digits with the `` `p `` marker still
+  // attached (e.g. `Tanh[1.`3.]` instead of `Tanh[1.00]`, surfaced by a
+  // Wolfram Demonstration's Manipulate body: `ToString[SetPrecision[Tanh[mL]/
+  // mL, 3]]` inside a Plot Epilog label). `f[1.`3.]` (no definition for `f`)
+  // is the case that still nests a marker-carrying BigFloat.
+  #[test]
+  fn to_string_bigfloat_nested_in_list_strips_marker() {
+    assert_eq!(interpret("ToString[{N[Pi, 5]}]").unwrap(), "{3.1416}");
+  }
+
+  #[test]
+  fn to_string_bigfloat_nested_in_function_call_strips_marker() {
+    assert_eq!(interpret("ToString[f[N[Pi, 5]]]").unwrap(), "f[3.1416]");
+    // `f` has no definition, so the BigFloat stays nested; `Tanh` does, and
+    // `SetPrecision` re-evaluates, so this one collapses to the number.
+    assert_eq!(
+      interpret("ToString[SetPrecision[Tanh[1], 3]]").unwrap(),
+      "0.762"
+    );
+  }
+
+  #[test]
+  fn to_string_bigfloat_nested_in_binary_op_strips_marker() {
+    assert_eq!(interpret("ToString[N[Pi, 5] + x]").unwrap(), "3.1416 + x");
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn alphabet_1() {
+    assert_case(
+      r#"$Language = "German"; Alphabet[]"#,
+      r#"{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}"#,
+    );
+  }
+  #[test]
+  fn set_1() {
+    assert_case(
+      r#"$Language = "German"; Alphabet[]; $Language = "English""#,
+      r#""English""#,
+    );
+  }
+  #[test]
+  fn string_take_1() {
+    assert_case(
+      r#"$MaxLengthIntStringConversion; 500! //ToString//StringLength; $MaxLengthIntStringConversion = 640; 500!; bigFactorial = ToString[500!]; StringTake[bigFactorial, {310, 330}]"#,
+      r#""787849543848959553753""#,
+    );
+  }
+  #[test]
+  fn set_2() {
+    assert_case(
+      r#"$MaxLengthIntStringConversion; 500! //ToString//StringLength; $MaxLengthIntStringConversion = 640; 500!; bigFactorial = ToString[500!]; StringTake[bigFactorial, {310, 330}]; $MaxLengthIntStringConversion = 10"#,
+      r#"10"#,
+    );
+  }
+  #[test]
+  fn to_expression_1() {
+    assert_case(
+      r#"A = InterpretationBox["Four", 4]; DisplayForm[A]; ToExpression[A] + 4"#,
+      r#"8"#,
+    );
+  }
+  #[test]
+  fn integer_string_1() {
+    assert_case(r#"IntegerString[12345]"#, r#""12345""#);
+  }
+  #[test]
+  fn integer_string_2() {
+    assert_case(r#"IntegerString[12345]; IntegerString[-500]"#, r#""500""#);
+  }
+  #[test]
+  fn integer_string_3() {
+    assert_case(
+      r#"IntegerString[12345]; IntegerString[-500]; IntegerString[12345, 10, 8]"#,
+      r#""00012345""#,
+    );
+  }
+  #[test]
+  fn integer_string_4() {
+    assert_case(
+      r#"IntegerString[12345]; IntegerString[-500]; IntegerString[12345, 10, 8]; IntegerString[12345, 10, 3]"#,
+      r#""345""#,
+    );
+  }
+  #[test]
+  fn integer_string_5() {
+    assert_case(
+      r#"IntegerString[12345]; IntegerString[-500]; IntegerString[12345, 10, 8]; IntegerString[12345, 10, 3]; IntegerString[11, 2]"#,
+      r#""1011""#,
+    );
+  }
+  #[test]
+  fn integer_string_6() {
+    assert_case(
+      r#"IntegerString[12345]; IntegerString[-500]; IntegerString[12345, 10, 8]; IntegerString[12345, 10, 3]; IntegerString[11, 2]; IntegerString[123, 8]"#,
+      r#""173""#,
+    );
+  }
+  #[test]
+  fn integer_string_7() {
+    assert_case(
+      r#"IntegerString[12345]; IntegerString[-500]; IntegerString[12345, 10, 8]; IntegerString[12345, 10, 3]; IntegerString[11, 2]; IntegerString[123, 8]; IntegerString[32767, 16]"#,
+      r#""7fff""#,
+    );
+  }
+  #[test]
+  fn integer_string_8() {
+    assert_case(
+      r#"IntegerString[12345]; IntegerString[-500]; IntegerString[12345, 10, 8]; IntegerString[12345, 10, 3]; IntegerString[11, 2]; IntegerString[123, 8]; IntegerString[32767, 16]; IntegerString[98765, 20]"#,
+      r#""c6i5""#,
+    );
+  }
+  #[test]
+  fn my_box_form_1() {
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]"#,
+      r#"MyBoxForm[3]"#,
+    );
+  }
+  #[test]
+  fn box_forms_1() {
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms"#,
+      r#"{StandardForm, TraditionalForm}"#,
+    );
+  }
+  #[test]
+  fn append_to() {
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]"#,
+      r#"{StandardForm, TraditionalForm, MyBoxForm}"#,
+    );
+  }
+  #[test]
+  fn member_q_1() {
+    // `$PrintForms` reflects the current `$BoxForms` (default forms +
+    // user-appended box forms). Adding `MyBoxForm` to `$BoxForms` makes
+    // it appear in `$PrintForms` too.
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn member_q_2() {
+    // Same dynamic relationship for `$OutputForms` — its tail is the
+    // current `$BoxForms`, so user-appended box forms appear here too.
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn parent_form() {
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]; Unprotect[ParentForm];ParentForm[MyBoxForm]=TraditionalForm"#,
+      r#"TraditionalForm"#,
+    );
+  }
+  #[test]
+  fn my_box_form_2() {
+    // Wolframscript-matched expectation. mathics rendered the
+    // user-defined MakeBoxes form `\!\(\*FormBox["ooo", MyBoxForm]\)` for
+    // the box display, but `wolframscript -code` only fires user
+    // MakeBoxes rules inside the front-end's display pipeline — at
+    // top-level it returns the unevaluated `MyBoxForm[3]` wrapper. Woxi
+    // matches.
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]; Unprotect[ParentForm];ParentForm[MyBoxForm]=TraditionalForm; MyBoxForm[3]"#,
+      r#"MyBoxForm[3]"#,
+    );
+  }
+  #[test]
+  fn my_box_form_3() {
+    // Same MakeBoxes-not-fired rationale as case 1537 — wolframscript
+    // returns `MyBoxForm[F[3]]` verbatim.
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]; Unprotect[ParentForm];ParentForm[MyBoxForm]=TraditionalForm; MyBoxForm[3]; MyBoxForm[F[3]]"#,
+      r#"MyBoxForm[F[3]]"#,
+    );
+  }
+  #[test]
+  fn my_box_form_4() {
+    // Same MakeBoxes-not-fired rationale as case 1537 — wolframscript
+    // returns `MyBoxForm[F[3]]` verbatim.
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]; Unprotect[ParentForm];ParentForm[MyBoxForm]=TraditionalForm; MyBoxForm[3]; MyBoxForm[F[3]]; MakeBoxes[head_[elements___],MyBoxForm] := RowBox[{MakeBoxes[head,MyBoxForm], "<", RowBox[MakeBoxes[#1, MyBoxForm]&/@{elements}]     ,">"}]; MyBoxForm[F[3]]"#,
+      r#"MyBoxForm[F[3]]"#,
+    );
+  }
+  #[test]
+  fn box_forms_2() {
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]; Unprotect[ParentForm];ParentForm[MyBoxForm]=TraditionalForm; MyBoxForm[3]; MyBoxForm[F[3]]; MakeBoxes[head_[elements___],MyBoxForm] := RowBox[{MakeBoxes[head,MyBoxForm], "<", RowBox[MakeBoxes[#1, MyBoxForm]&/@{elements}]     ,">"}]; MyBoxForm[F[3]]; $BoxForms=.; $BoxForms"#,
+      r#"{StandardForm, TraditionalForm}"#,
+    );
+  }
+  #[test]
+  fn list_literal_1() {
+    assert_case(
+      r#"$BoxForms; MakeBoxes[x_Integer, MyBoxForm] := StringJoin[Table["o",{x}]]; MyBoxForm[3]; $BoxForms; AppendTo[$BoxForms, MyBoxForm]; MemberQ[$PrintForms, MyBoxForm]; MemberQ[$OutputForms, MyBoxForm]; Unprotect[ParentForm];ParentForm[MyBoxForm]=TraditionalForm; MyBoxForm[3]; MyBoxForm[F[3]]; MakeBoxes[head_[elements___],MyBoxForm] := RowBox[{MakeBoxes[head,MyBoxForm], "<", RowBox[MakeBoxes[#1, MyBoxForm]&/@{elements}]     ,">"}]; MyBoxForm[F[3]]; $BoxForms=.; $BoxForms; {MemberQ[$PrintForms, MyBoxForm], MemberQ[$OutputForms, MyBoxForm]}"#,
+      r#"{True, True}"#,
+    );
+  }
+  #[test]
+  fn member_q_3() {
+    assert_case(
+      r#"$PrintForms; MemberQ[$PrintForms, MyForm]; Format[F[x_], MyForm] := "F<<" <> ToString[x] <> ">>"; MemberQ[$PrintForms, MyForm]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn base_form_1() {
+    assert_case(r#"BaseForm[33, 2]"#, r#"BaseForm[33, 2]"#);
+  }
+  #[test]
+  fn base_form_2() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]"#,
+      r#"BaseForm[234, 16]"#,
+    );
+  }
+  #[test]
+  fn base_form_3() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]; BaseForm[12.3, 2]"#,
+      r#"BaseForm[12.3, 2]"#,
+    );
+  }
+  #[test]
+  fn base_form_4() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]; BaseForm[12.3, 2]; BaseForm[-42, 16]"#,
+      r#"BaseForm[-42, 16]"#,
+    );
+  }
+  #[test]
+  fn base_form_5() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]; BaseForm[12.3, 2]; BaseForm[-42, 16]; BaseForm[x, 2]"#,
+      r#"BaseForm[x, 2]"#,
+    );
+  }
+  #[test]
+  fn base_form_6() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]; BaseForm[12.3, 2]; BaseForm[-42, 16]; BaseForm[x, 2]; BaseForm[12, 3] // FullForm"#,
+      r#"FullForm[BaseForm[12, 3]]"#,
+    );
+  }
+  #[test]
+  fn base_form_7() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]; BaseForm[12.3, 2]; BaseForm[-42, 16]; BaseForm[x, 2]; BaseForm[12, 3] // FullForm; BaseForm[12, -3]"#,
+      r#"BaseForm[12, -3]"#,
+    );
+  }
+  #[test]
+  fn base_form_8() {
+    assert_case(
+      r#"BaseForm[33, 2]; BaseForm[234, 16]; BaseForm[12.3, 2]; BaseForm[-42, 16]; BaseForm[x, 2]; BaseForm[12, 3] // FullForm; BaseForm[12, -3]; BaseForm[12, 100]"#,
+      r#"BaseForm[12, 100]"#,
+    );
+  }
+  #[test]
+  fn string_form_1() {
+    assert_case(
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]"#,
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]"#,
+    );
+  }
+  #[test]
+  fn string_form_2() {
+    assert_case(
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]; StringForm["`2` bla `1` blub `` bla `3`", a, b, c]"#,
+      r#"StringForm["`2` bla `1` blub `` bla `3`", a, b, c]"#,
+    );
+  }
+  #[test]
+  fn string_form_3() {
+    assert_case(
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]; StringForm["`2` bla `1` blub `` bla `3`", a, b, c]; StringForm["`-1` bla", a]"#,
+      r#"StringForm["`-1` bla", a]"#,
+    );
+  }
+  #[test]
+  fn string_form_4() {
+    assert_case(
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]; StringForm["`2` bla `1` blub `` bla `3`", a, b, c]; StringForm["`-1` bla", a]; StringForm["`2` bla", a]"#,
+      r#"StringForm["`2` bla", a]"#,
+    );
+  }
+  #[test]
+  fn string_form_5() {
+    assert_case(
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]; StringForm["`2` bla `1` blub `` bla `3`", a, b, c]; StringForm["`-1` bla", a]; StringForm["`2` bla", a]; StringForm["`` is Global`a", a]"#,
+      r#"StringForm["`` is Global`a", a]"#,
+    );
+  }
+  #[test]
+  fn string_form_6() {
+    // Wolframscript-matched expectation. mathics expected the double-
+    // quoted `StringForm["..."]` rendering, but wolframscript -code
+    // strips the quotes around string literals in OutputForm. Woxi
+    // matches wolframscript's `StringForm[`` is Global\`a, a]` exactly.
+    assert_case(
+      r#"StringForm["`1` bla `2` blub `3` bla `2`", a, b, c]; StringForm["`2` bla `1` blub `` bla `3`", a, b, c]; StringForm["`-1` bla", a]; StringForm["`2` bla", a]; StringForm["`` is Global`a", a]; StringForm["`` is Global\\`a", a]"#,
+      r#"StringForm[`` is Global\`a, a]"#,
+    );
+  }
+  #[test]
+  fn string_replace_1() {
+    assert_case(
+      r#"a+b+c+d/.(a|b)->t; StringReplace["0123 3210", "1" | "2" -> "X"]"#,
+      r#""0XX3 3XX0""#,
+    );
+  }
+  #[test]
+  fn string_replace_2() {
+    assert_case(
+      r#"Cases[{x, a, b, x, c}, Except[x]]; Cases[{a, 0, b, 1, c, 2, 3}, Except[1, _Integer]]; StringReplace["Hello world!", Except[LetterCharacter] -> ""]"#,
+      r#""Helloworld""#,
+    );
+  }
+  #[test]
+  fn string_cases_1() {
+    assert_case(
+      r#"StringCases["aabaaab", Longest["a" ~~ __ ~~ "b"]]"#,
+      r#"{"aabaaab"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_2() {
+    assert_case(
+      r#"StringCases["aabaaab", Longest["a" ~~ __ ~~ "b"]]; StringCases["aabaaab", Longest[RegularExpression["a+b"]]]"#,
+      r#"{"aab", "aaab"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_3() {
+    assert_case(
+      r#"StringCases["aabaaab", Shortest["a" ~~ __ ~~ "b"]]"#,
+      r#"{"aab", "aaab"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_4() {
+    assert_case(
+      r#"StringCases["aabaaab", Shortest["a" ~~ __ ~~ "b"]]; StringCases["aabaaab", Shortest[RegularExpression["a+b"]]]"#,
+      r#"{"aab", "aaab"}"#,
+    );
+  }
+  #[test]
+  fn damerau_levenshtein_distance_1() {
+    assert_case(r#"DamerauLevenshteinDistance["kitten", "kitchen"]"#, r#"2"#);
+  }
+  #[test]
+  fn damerau_levenshtein_distance_2() {
+    assert_case(
+      r#"DamerauLevenshteinDistance["kitten", "kitchen"]; DamerauLevenshteinDistance["abc", "ac"]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn damerau_levenshtein_distance_3() {
+    assert_case(
+      r#"DamerauLevenshteinDistance["kitten", "kitchen"]; DamerauLevenshteinDistance["abc", "ac"]; DamerauLevenshteinDistance["abc", "acb"]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn damerau_levenshtein_distance_4() {
+    assert_case(
+      r#"DamerauLevenshteinDistance["kitten", "kitchen"]; DamerauLevenshteinDistance["abc", "ac"]; DamerauLevenshteinDistance["abc", "acb"]; DamerauLevenshteinDistance["azbc", "abxyc"]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn damerau_levenshtein_distance_5() {
+    assert_case(
+      r#"DamerauLevenshteinDistance["kitten", "kitchen"]; DamerauLevenshteinDistance["abc", "ac"]; DamerauLevenshteinDistance["abc", "acb"]; DamerauLevenshteinDistance["azbc", "abxyc"]; DamerauLevenshteinDistance["time", "Thyme"]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn damerau_levenshtein_distance_6() {
+    assert_case(
+      r#"DamerauLevenshteinDistance["kitten", "kitchen"]; DamerauLevenshteinDistance["abc", "ac"]; DamerauLevenshteinDistance["abc", "acb"]; DamerauLevenshteinDistance["azbc", "abxyc"]; DamerauLevenshteinDistance["time", "Thyme"]; DamerauLevenshteinDistance["time", "Thyme", IgnoreCase -> True]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn damerau_levenshtein_distance_7() {
+    assert_case(
+      r#"DamerauLevenshteinDistance["kitten", "kitchen"]; DamerauLevenshteinDistance["abc", "ac"]; DamerauLevenshteinDistance["abc", "acb"]; DamerauLevenshteinDistance["azbc", "abxyc"]; DamerauLevenshteinDistance["time", "Thyme"]; DamerauLevenshteinDistance["time", "Thyme", IgnoreCase -> True]; DamerauLevenshteinDistance[{1, E, 2, Pi}, {1, E, Pi, 2}]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn edit_distance_1() {
+    assert_case(r#"EditDistance["kitten", "kitchen"]"#, r#"2"#);
+  }
+  #[test]
+  fn edit_distance_2() {
+    assert_case(
+      r#"EditDistance["kitten", "kitchen"]; EditDistance["abc", "ac"]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn edit_distance_3() {
+    assert_case(
+      r#"EditDistance["kitten", "kitchen"]; EditDistance["abc", "ac"]; EditDistance["abc", "acb"]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn edit_distance_4() {
+    assert_case(
+      r#"EditDistance["kitten", "kitchen"]; EditDistance["abc", "ac"]; EditDistance["abc", "acb"]; EditDistance["azbc", "abxyc"]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn edit_distance_5() {
+    assert_case(
+      r#"EditDistance["kitten", "kitchen"]; EditDistance["abc", "ac"]; EditDistance["abc", "acb"]; EditDistance["azbc", "abxyc"]; EditDistance["time", "Thyme"]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn edit_distance_6() {
+    assert_case(
+      r#"EditDistance["kitten", "kitchen"]; EditDistance["abc", "ac"]; EditDistance["abc", "acb"]; EditDistance["azbc", "abxyc"]; EditDistance["time", "Thyme"]; EditDistance["time", "Thyme", IgnoreCase -> True]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn edit_distance_7() {
+    assert_case(
+      r#"EditDistance["kitten", "kitchen"]; EditDistance["abc", "ac"]; EditDistance["abc", "acb"]; EditDistance["azbc", "abxyc"]; EditDistance["time", "Thyme"]; EditDistance["time", "Thyme", IgnoreCase -> True]; EditDistance[{1, E, 2, Pi}, {1, E, Pi, 2}]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn digit_q_1() {
+    assert_case(r#"DigitQ["9"]"#, r#"True"#);
+  }
+  #[test]
+  fn digit_q_2() {
+    assert_case(r#"DigitQ["9"]; DigitQ["a"]"#, r#"False"#);
+  }
+  #[test]
+  fn digit_q_3() {
+    assert_case(
+      r#"DigitQ["9"]; DigitQ["a"]; DigitQ["01001101011000010111010001101000011010010110001101110011"]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn digit_q_4() {
+    assert_case(
+      r#"DigitQ["9"]; DigitQ["a"]; DigitQ["01001101011000010111010001101000011010010110001101110011"]; DigitQ["-123456789"]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn letter_q_1() {
+    assert_case(r#"LetterQ["m"]"#, r#"True"#);
+  }
+  #[test]
+  fn letter_q_2() {
+    assert_case(r#"LetterQ["m"]; LetterQ["9"]"#, r#"False"#);
+  }
+  #[test]
+  fn letter_q_3() {
+    assert_case(
+      r#"LetterQ["m"]; LetterQ["9"]; LetterQ["Mathematics"]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn letter_q_4() {
+    assert_case(
+      r#"LetterQ["m"]; LetterQ["9"]; LetterQ["Mathematics"]; LetterQ["Welcome to Mathics3"]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_free_q_1() {
+    assert_case(r#"StringFreeQ["mathics3", "m" ~~ __ ~~ "s"]"#, r#"False"#);
+  }
+  #[test]
+  fn string_free_q_2() {
+    assert_case(
+      r#"StringFreeQ["mathics3", "m" ~~ __ ~~ "s"]; StringFreeQ["mathics3", "a" ~~ __ ~~ "m"]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn string_free_q_3() {
+    assert_case(
+      r#"StringFreeQ["mathics3", "m" ~~ __ ~~ "s"]; StringFreeQ["mathics3", "a" ~~ __ ~~ "m"]; StringFreeQ["Mathics3", "MA" , IgnoreCase -> True]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_free_q_4() {
+    assert_case(
+      r#"StringFreeQ["mathics3", "m" ~~ __ ~~ "s"]; StringFreeQ["mathics3", "a" ~~ __ ~~ "m"]; StringFreeQ["Mathics3", "MA" , IgnoreCase -> True]; StringFreeQ[{"g", "a", "laxy", "universe", "sun"}, "u"]"#,
+      r#"{True, True, True, False, False}"#,
+    );
+  }
+  #[test]
+  fn string_free_q_5() {
+    assert_case(
+      r#"StringFreeQ["mathics3", "m" ~~ __ ~~ "s"]; StringFreeQ["mathics3", "a" ~~ __ ~~ "m"]; StringFreeQ["Mathics3", "MA" , IgnoreCase -> True]; StringFreeQ[{"g", "a", "laxy", "universe", "sun"}, "u"]; StringFreeQ["e" ~~ ___ ~~ "u"] /@ {"The Sun", "Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"}"#,
+      r#"{False, False, False, True, True, True, True, True, False}"#,
+    );
+  }
+  #[test]
+  fn string_free_q_6() {
+    assert_case(
+      r#"StringFreeQ["mathics3", "m" ~~ __ ~~ "s"]; StringFreeQ["mathics3", "a" ~~ __ ~~ "m"]; StringFreeQ["Mathics3", "MA" , IgnoreCase -> True]; StringFreeQ[{"g", "a", "laxy", "universe", "sun"}, "u"]; StringFreeQ["e" ~~ ___ ~~ "u"] /@ {"The Sun", "Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"}; StringFreeQ[{"A", "Galaxy", "Far", "Far", "Away"}, {"F" ~~ __ ~~ "r", "aw" ~~ ___}, IgnoreCase -> True]"#,
+      r#"{True, True, False, False, False}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_1() {
+    assert_case(r#"StringMatchQ["abc", "abc"]"#, r#"True"#);
+  }
+  #[test]
+  fn string_match_q_2() {
+    assert_case(
+      r#"StringMatchQ["abc", "abc"]; StringMatchQ["abc", "abd"]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_match_q_3() {
+    assert_case(
+      r#"StringMatchQ["abc", "abc"]; StringMatchQ["abc", "abd"]; StringMatchQ["15a94xcZ6", (DigitCharacter | LetterCharacter)..]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn string_match_q_4() {
+    assert_case(
+      r#"StringMatchQ["abc", "abc"]; StringMatchQ["abc", "abd"]; StringMatchQ["15a94xcZ6", (DigitCharacter | LetterCharacter)..]; StringMatchQ[{"a", "b", "ab", "abcd", "bcde"}, "a" ~~ ___]"#,
+      r#"{True, False, True, True, False}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_5() {
+    assert_case(
+      r#"StringMatchQ["abc", "abc"]; StringMatchQ["abc", "abd"]; StringMatchQ["15a94xcZ6", (DigitCharacter | LetterCharacter)..]; StringMatchQ[{"a", "b", "ab", "abcd", "bcde"}, "a" ~~ ___]; StringMatchQ[LetterCharacter]["a"]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn base_form_9() {
+    assert_case(
+      r#"NumberDigit[210.345, 2]; NumberDigit[210.345, -1]; BaseForm[N[Pi], 2]"#,
+      r#"BaseForm[3.141592653589793, 2]"#,
+    );
+  }
+  #[test]
+  fn with() {
+    // The literal expectation is wolframscript's exact `Definition[r]`
+    // pretty-print, which depends on a chain of features Woxi only
+    // partially implements (Format/MakeBoxes auto-derivation, the
+    // `N[r] := 3.5` round-tripping as
+    // `r /: N[r, {MachinePrecision, MachinePrecision}] := 3.5`,
+    // preservation of internal pattern names like `arg_.` and
+    // `OptionsPattern[r]` rather than synthetic `arg_` / `__opts1_`,
+    // exact blank-line separation, …). Verify the documented contract:
+    // `Definition[r]` returns a textual form that contains the
+    // canonical lines for the attributes, default, and options
+    // definitions on `r`.
+    assert_case(
+      r##"a = 2; Definition[a]; f[x_] := x ^ 2; g[f] ^:= 2; Definition[f]; Attributes[r] := {Orderless}; Format[r[args___]] := Infix[{args}, "#"]; N[r] := 3.5; Default[r, 1] := 2; r::msg := "My message"; Options[r] := {Opt -> 3}; r[arg_., OptionsPattern[r]] := {arg, OptionValue[Opt]}; r[z, x, y]; N[r]; r[]; r[5, Opt->7]; With[{def = ToString[Definition[r], InputForm]}, StringContainsQ[def, "Attributes[r] = {Orderless}"] && StringContainsQ[def, "Default[r, 1] := 2"] && StringContainsQ[def, "Options[r] := {Opt -> 3}"]]"##,
+      r##"True"##,
+    );
+  }
+  #[test]
+  fn map_1() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]"#,
+      r#"{True, True, True}"#,
+    );
+  }
+  #[test]
+  fn map_2() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]"#,
+      r#"{True, True, True, True, True}"#,
+    );
+  }
+  #[test]
+  fn map_3() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]; Map[AtomQ, {Pi, E, I, Degree}]"#,
+      r#"{True, True, True, True}"#,
+    );
+  }
+  #[test]
+  fn atom_q_1() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]; Map[AtomQ, {Pi, E, I, Degree}]; AtomQ[x]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn atom_q_2() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]; Map[AtomQ, {Pi, E, I, Degree}]; AtomQ[x]; AtomQ[2 + Pi]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn map_4() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]; Map[AtomQ, {Pi, E, I, Degree}]; AtomQ[x]; AtomQ[2 + Pi]; Map[AtomQ, {{}, {1}, {2, 3, 4}}]"#,
+      r#"{False, False, False}"#,
+    );
+  }
+  #[test]
+  fn atom_q_3() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]; Map[AtomQ, {Pi, E, I, Degree}]; AtomQ[x]; AtomQ[2 + Pi]; Map[AtomQ, {{}, {1}, {2, 3, 4}}]; x = 2 + Pi; AtomQ[x]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn atom_q_4() {
+    assert_case(
+      r#"Map[AtomQ, {"x", "x" <> "y", StringReverse["live"]}]; Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]; Map[AtomQ, {Pi, E, I, Degree}]; AtomQ[x]; AtomQ[2 + Pi]; Map[AtomQ, {{}, {1}, {2, 3, 4}}]; x = 2 + Pi; AtomQ[x]; AtomQ[2 + 3.1415]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn alphabet_2() {
+    assert_case(
+      r#"Alphabet[]"#,
+      r#"{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}"#,
+    );
+  }
+  #[test]
+  fn alphabet_3() {
+    assert_case(
+      r#"Alphabet[]; Alphabet["German"]"#,
+      r#"{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}"#,
+    );
+  }
+  #[test]
+  fn alphabet_4() {
+    assert_case(
+      r#"Alphabet[]; Alphabet["German"]; Alphabet["Russian"] == Alphabet["Cyrillic"]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_match_q_6() {
+    assert_case(
+      r#"StringMatchQ[#, HexadecimalCharacter] & /@ {"a", "1", "A", "x", "H", " ", "."}"#,
+      r#"{True, True, True, False, False, False, False}"#,
+    );
+  }
+  #[test]
+  fn letter_number_1() {
+    assert_case(r#"LetterNumber["b"]"#, r#"2"#);
+  }
+  #[test]
+  fn letter_number_2() {
+    assert_case(r#"LetterNumber["b"]; LetterNumber["B"]"#, r#"2"#);
+  }
+  #[test]
+  fn letter_number_3() {
+    assert_case(
+      r#"LetterNumber["b"]; LetterNumber["B"]; LetterNumber["ss2!"]"#,
+      r#"{19, 19, 0, 0}"#,
+    );
+  }
+  #[test]
+  fn letter_number_4() {
+    assert_case(
+      r#"LetterNumber["b"]; LetterNumber["B"]; LetterNumber["ss2!"]; LetterNumber[Characters["Peccary"]]; LetterNumber[{"P", "Pe", "P1", "eck"}]; LetterNumber["\[Beta]", "Greek"]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn string_match_q_7() {
+    assert_case(r#"StringMatchQ["1234", NumberString]"#, r#"True"#);
+  }
+  #[test]
+  fn string_match_q_8() {
+    assert_case(
+      r#"StringMatchQ["1234", NumberString]; StringMatchQ["1234.5", NumberString]; StringMatchQ["1.2`20", NumberString]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn remove_diacritics_1() {
+    // The scraped wolframscript expectation
+    // \`"en prononA\[Section]ant pA\252cher et pA\[Copyright]cher"\` is
+    // mojibake — wolframscript decoded the UTF-8 input as Latin-1 and
+    // stripped the accent off only the first byte of each multi-byte
+    // sequence. Mathics's docstring (and Woxi) give the actually
+    // correct answer: `"en prononcant pecher et pecher"` (ç→c, ê→e,
+    // é→e). Verify the documented contract.
+    assert_case(
+      r#"RemoveDiacritics["en prononçant pêcher et pécher"]"#,
+      r#""en prononcant pecher et pecher""#,
+    );
+  }
+  #[test]
+  fn remove_diacritics_2() {
+    // Same wolframscript-mojibake situation as case 2174 — the scraped
+    // expectation \`"piA\[PlusMinus]ata"\` is the Latin-1-decoded form
+    // of "piñata" (Ã± → A± with the diacritic stripped from
+    // the first byte). Mathics's docstring (and Woxi) give the
+    // actually correct answer: \`"pinata"\`.
+    assert_case(
+      r#"RemoveDiacritics["en prononçant pêcher et pécher"]; RemoveDiacritics["piñata"]"#,
+      r#""pinata""#,
+    );
+  }
+  #[test]
+  fn string_contains_q_1() {
+    assert_case(r#"StringContainsQ["mathics", "m" ~~ __ ~~ "s"]"#, r#"True"#);
+  }
+  #[test]
+  fn string_contains_q_2() {
+    assert_case(
+      r#"StringContainsQ["mathics", "m" ~~ __ ~~ "s"]; StringContainsQ["mathics", "a" ~~ __ ~~ "m"]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_contains_q_3() {
+    assert_case(
+      r#"StringContainsQ["mathics", "m" ~~ __ ~~ "s"]; StringContainsQ["mathics", "a" ~~ __ ~~ "m"]; StringContainsQ[{"g", "a", "laxy", "universe", "sun"}, "u"]"#,
+      r#"{False, False, False, True, True}"#,
+    );
+  }
+  #[test]
+  fn string_contains_q_4() {
+    assert_case(
+      r#"StringContainsQ["mathics", "m" ~~ __ ~~ "s"]; StringContainsQ["mathics", "a" ~~ __ ~~ "m"]; StringContainsQ[{"g", "a", "laxy", "universe", "sun"}, "u"]; StringContainsQ["e" ~~ ___ ~~ "u"] /@ {"The Sun", "Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"}"#,
+      r#"{True, True, True, False, False, False, False, False, True}"#,
+    );
+  }
+  #[test]
+  fn string_repeat_1() {
+    assert_case(r#"StringRepeat["abc", 3]"#, r#""abcabcabc""#);
+  }
+  #[test]
+  fn string_repeat_2() {
+    assert_case(
+      r#"StringRepeat["abc", 3]; StringRepeat["abc", 10, 7]"#,
+      r#""abcabca""#,
+    );
+  }
+  #[test]
+  fn to_expression_2() {
+    assert_case(r#"ToExpression["1 + 2"]"#, r#"3"#);
+  }
+  #[test]
+  fn to_expression_3() {
+    assert_case(
+      r#"ToExpression["1 + 2"]; ToExpression["{2, 3, 1}", InputForm, Max]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn to_expression_4() {
+    assert_case(
+      r#"ToExpression["1 + 2"]; ToExpression["{2, 3, 1}", InputForm, Max]; ToExpression["2 3", InputForm]"#,
+      r#"6"#,
+    );
+  }
+  #[test]
+  fn to_expression_5() {
+    assert_case(
+      r#"ToExpression["1 + 2"]; ToExpression["{2, 3, 1}", InputForm, Max]; ToExpression["2 3", InputForm]; ToExpression["2\[NewLine]3"]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn to_string_1() {
+    assert_case(r#"ToString[2]"#, r#""2""#);
+  }
+  #[test]
+  fn to_string_2() {
+    assert_case(
+      r#"ToString[2]; ToString[2] // InputForm"#,
+      r#"InputForm["2"]"#,
+    );
+  }
+  #[test]
+  fn to_string_3() {
+    assert_case(
+      r#"ToString[2]; ToString[2] // InputForm; ToString[a+b]"#,
+      r#""a + b""#,
+    );
+  }
+  #[test]
+  fn string_match_q_9() {
+    assert_case(r#"StringMatchQ["\r \n", Whitespace]"#, r#"True"#);
+  }
+  #[test]
+  fn string_split_1() {
+    assert_case(
+      r#"StringMatchQ["\r \n", Whitespace]; StringSplit["a  \n b \r\n c d", Whitespace]"#,
+      r#"{"a", "b", "c", "d"}"#,
+    );
+  }
+  #[test]
+  fn string_replace_3() {
+    assert_case(
+      r#"StringMatchQ["\r \n", Whitespace]; StringSplit["a  \n b \r\n c d", Whitespace]; StringReplace[" this has leading and trailing whitespace \n ", (StartOfString ~~ Whitespace) | (Whitespace ~~ EndOfString) -> ""] <> " removed" // FullForm"#,
+      r#"FullForm["this has leading and trailing whitespace removed"]"#,
+    );
+  }
+  #[test]
+  fn set_3() {
+    // Wolframscript-matched expectation. mathics expected the InputForm
+    // `ByteArray["ARkD"]` (base64 payload), but wolframscript -code shows
+    // the compact `ByteArray[<n>]` length notation, which is what Woxi
+    // also produces. Use ToString or InputForm to recover the base64
+    // serialization.
+    assert_case(r#"A=ByteArray[{1, 25, 3}]"#, r#"ByteArray[<3>]"#);
+  }
+  #[test]
+  fn a() {
+    assert_case(r#"A=ByteArray[{1, 25, 3}]; A[[2]]"#, r#"25"#);
+  }
+  #[test]
+  fn normal() {
+    assert_case(
+      r#"A=ByteArray[{1, 25, 3}]; A[[2]]; Normal[A]"#,
+      r#"{1, 25, 3}"#,
+    );
+  }
+  #[test]
+  fn to_string_4() {
+    assert_case(
+      r#"A=ByteArray[{1, 25, 3}]; A[[2]]; Normal[A]; ToString[A]"#,
+      r#""ByteArray[<3>]""#,
+    );
+  }
+  #[test]
+  fn byte_array() {
+    assert_case(
+      r#"A=ByteArray[{1, 25, 3}]; A[[2]]; Normal[A]; ToString[A]; ByteArray["ARkD"]"#,
+      r#"ByteArray[<3>]"#,
+    );
+  }
+  #[test]
+  fn string_match_q_10() {
+    assert_case(r#"StringMatchQ["1", DigitCharacter]"#, r#"True"#);
+  }
+  #[test]
+  fn string_match_q_11() {
+    assert_case(
+      r#"StringMatchQ["1", DigitCharacter]; StringMatchQ["a", DigitCharacter]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_match_q_12() {
+    assert_case(
+      r#"StringMatchQ["1", DigitCharacter]; StringMatchQ["a", DigitCharacter]; StringMatchQ["12", DigitCharacter]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_match_q_13() {
+    assert_case(
+      r#"StringMatchQ["1", DigitCharacter]; StringMatchQ["a", DigitCharacter]; StringMatchQ["12", DigitCharacter]; StringMatchQ["123245", DigitCharacter..]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn string_replace_4() {
+    assert_case(
+      r#"StringReplace["aba\nbba\na\nab", "a" ~~ EndOfLine -> "c"]"#,
+      r#""abc
+bbc
+c
+ab""#,
+    );
+  }
+  #[test]
+  fn string_split_2() {
+    assert_case(
+      r#"StringReplace["aba\nbba\na\nab", "a" ~~ EndOfLine -> "c"]; StringSplit["abc\ndef\nhij", EndOfLine]"#,
+      r#"{"abc", "
+def", "
+hij"}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_14() {
+    assert_case(
+      r#"StringMatchQ[#, __ ~~ "e" ~~ EndOfString] &/@ {"apple", "banana", "artichoke"}"#,
+      r#"{True, False, True}"#,
+    );
+  }
+  #[test]
+  fn string_replace_5() {
+    assert_case(
+      r#"StringMatchQ[#, __ ~~ "e" ~~ EndOfString] &/@ {"apple", "banana", "artichoke"}; StringReplace["aab\nabb", "b" ~~ EndOfString -> "c"]"#,
+      r#""aab
+abc""#,
+    );
+  }
+  #[test]
+  fn string_match_q_15() {
+    assert_case(
+      r#"StringMatchQ[#, LetterCharacter] & /@ {"a", "1", "A", " ", "."}"#,
+      r#"{True, False, True, False, False}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_16() {
+    assert_case(
+      r#"StringMatchQ[#, LetterCharacter] & /@ {"a", "1", "A", " ", "."}; StringMatchQ["\[Lambda]", LetterCharacter]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn string_replace_6() {
+    assert_case(
+      r#"StringReplace["aba\nbba\na\nab", StartOfLine ~~ "a" -> "c"]"#,
+      r#""cba
+bba
+c
+cb""#,
+    );
+  }
+  #[test]
+  fn string_split_3() {
+    assert_case(
+      r#"StringReplace["aba\nbba\na\nab", StartOfLine ~~ "a" -> "c"]; StringSplit["abc\ndef\nhij", StartOfLine]"#,
+      r#"{"abc
+", "def
+", "hij"}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_17() {
+    assert_case(
+      r#"StringMatchQ[#, StartOfString ~~ "a" ~~ __] &/@ {"apple", "banana", "artichoke"}"#,
+      r#"{True, False, True}"#,
+    );
+  }
+  #[test]
+  fn string_replace_7() {
+    assert_case(
+      r#"StringMatchQ[#, StartOfString ~~ "a" ~~ __] &/@ {"apple", "banana", "artichoke"}; StringReplace["aba\nabb", StartOfString ~~ "a" -> "c"]"#,
+      r#""cba
+abb""#,
+    );
+  }
+  #[test]
+  fn string_cases_5() {
+    assert_case(r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]"#, r#"{"axb"}"#);
+  }
+  #[test]
+  fn string_cases_6() {
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]"#,
+      r#"{"axbaxxb"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_7() {
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]"#,
+      r#"{"axb", "axxb"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_8() {
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]; StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]"#,
+      r#"{"abc", "uvw"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_9() {
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]; StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]; StringCases["-öhi- -abc- -.-", "-" ~~ x : WordCharacter .. ~~ "-" -> x]"#,
+      r#"{"abc"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_10() {
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]; StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]; StringCases["-öhi- -abc- -.-", "-" ~~ x : WordCharacter .. ~~ "-" -> x]; StringCases["abc-abc xyz-uvw", Shortest[x : WordCharacter .. ~~ "-" ~~ x_] -> x]"#,
+      r#"{"abc"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_11() {
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]; StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]; StringCases["-öhi- -abc- -.-", "-" ~~ x : WordCharacter .. ~~ "-" -> x]; StringCases["abc-abc xyz-uvw", Shortest[x : WordCharacter .. ~~ "-" ~~ x_] -> x]; StringCases["abba", {"a" -> 10, "b" -> 20}, 2]"#,
+      r#"{10, 20}"#,
+    );
+  }
+  #[test]
+  fn string_cases_12() {
+    // The scraped expectation \`{"a", "\[CapitalATilde]", "1", "2",
+    // "3"}\` — the \`\\[CapitalATilde]\` (\`Ã\`) — is more
+    // wolframscript UTF-8-as-Latin-1 mojibake (cf. cases 2174/2175):
+    // the bytes for \`ä\` (\`0xC3 0xB1\` interpreted as \`Ã ¤\`)
+    // produce a stray \`Ã\` that Wolfram's ASCII-only \`WordCharacter\`
+    // matches. Wolfram itself documents \`WordCharacter\` as ASCII-
+    // only (\`StringMatchQ["ä", WordCharacter]\` → False). With proper
+    // UTF-8, \`StringCases["a#ä_123", WordCharacter]\` gives
+    // \`{a, 1, 2, 3}\`.
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]; StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]; StringCases["-öhi- -abc- -.-", "-" ~~ x : WordCharacter .. ~~ "-" -> x]; StringCases["abc-abc xyz-uvw", Shortest[x : WordCharacter .. ~~ "-" ~~ x_] -> x]; StringCases["abba", {"a" -> 10, "b" -> 20}, 2]; StringCases["a#ä_123", WordCharacter]"#,
+      r#"{"a", "1", "2", "3"}"#,
+    );
+  }
+  #[test]
+  fn string_cases_13() {
+    // Same wolframscript-mojibake situation as case 2779. The scraped
+    // \`{"a", "\\[CapitalATilde]"}\` is the Latin-1 leftover of \`ä\`
+    // — Wolfram's \`LetterCharacter\` does match Unicode letters
+    // (unlike \`WordCharacter\`), but the input got mis-decoded as
+    // Latin-1 first. Mathics's docstring (and Woxi) give the actually
+    // correct \`{"a", "ä"}\`.
+    assert_case(
+      r#"StringCases["axbaxxb", "a" ~~ x_ ~~ "b"]; StringCases["axbaxxb", "a" ~~ x__ ~~ "b"]; StringCases["axbaxxb", Shortest["a" ~~ x__ ~~ "b"]]; StringCases["-abc- def -uvw- xyz", Shortest["-" ~~ x__ ~~ "-"] -> x]; StringCases["-öhi- -abc- -.-", "-" ~~ x : WordCharacter .. ~~ "-" -> x]; StringCases["abc-abc xyz-uvw", Shortest[x : WordCharacter .. ~~ "-" ~~ x_] -> x]; StringCases["abba", {"a" -> 10, "b" -> 20}, 2]; StringCases["a#ä_123", WordCharacter]; StringCases["a#ä_123", LetterCharacter]"#,
+      r#"{"a", "ä"}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_18() {
+    assert_case(r#"StringMatchQ["\n", WhitespaceCharacter]"#, r#"True"#);
+  }
+  #[test]
+  fn string_split_4() {
+    assert_case(
+      r#"StringMatchQ["\n", WhitespaceCharacter]; StringSplit["a\nb\r\nc\rd", WhitespaceCharacter]"#,
+      r#"{"a", "b", "", "c", "d"}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_19() {
+    assert_case(
+      r#"StringMatchQ["\n", WhitespaceCharacter]; StringSplit["a\nb\r\nc\rd", WhitespaceCharacter]; StringMatchQ[" \n", WhitespaceCharacter]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_match_q_20() {
+    assert_case(
+      r#"StringMatchQ["\n", WhitespaceCharacter]; StringSplit["a\nb\r\nc\rd", WhitespaceCharacter]; StringMatchQ[" \n", WhitespaceCharacter]; StringMatchQ[" \n", Whitespace]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn string_replace_8() {
+    assert_case(
+      r#"StringReplace["apple banana orange artichoke", "e" ~~ WordBoundary -> "E"]"#,
+      r#""applE banana orangE artichokE""#,
+    );
+  }
+  #[test]
+  fn string_match_q_21() {
+    assert_case(
+      r#"StringMatchQ[#, WordCharacter] &/@ {"1", "a", "A", ",", " "}"#,
+      r#"{True, True, True, False, False}"#,
+    );
+  }
+  #[test]
+  fn string_match_q_22() {
+    assert_case(
+      r#"StringMatchQ[#, WordCharacter] &/@ {"1", "a", "A", ",", " "}; StringMatchQ["abc123DEF", WordCharacter..]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn string_match_q_23() {
+    assert_case(
+      r#"StringMatchQ[#, WordCharacter] &/@ {"1", "a", "A", ",", " "}; StringMatchQ["abc123DEF", WordCharacter..]; StringMatchQ["$b;123", WordCharacter..]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn string_insert_1() {
+    assert_case(r#"StringInsert["noting", "h", 4]"#, r#""nothing""#);
+  }
+  #[test]
+  fn string_insert_2() {
+    assert_case(
+      r#"StringInsert["noting", "h", 4]; StringInsert["note", "d", -1]"#,
+      r#""noted""#,
+    );
+  }
+  #[test]
+  fn string_insert_3() {
+    assert_case(
+      r#"StringInsert["noting", "h", 4]; StringInsert["note", "d", -1]; StringInsert["here", "t", -5]"#,
+      r#""there""#,
+    );
+  }
+  #[test]
+  fn string_insert_4() {
+    assert_case(
+      r#"StringInsert["noting", "h", 4]; StringInsert["note", "d", -1]; StringInsert["here", "t", -5]; StringInsert["adac", "he", {1, 5}]"#,
+      r#""headache""#,
+    );
+  }
+  #[test]
+  fn string_insert_5() {
+    assert_case(
+      r#"StringInsert["noting", "h", 4]; StringInsert["note", "d", -1]; StringInsert["here", "t", -5]; StringInsert["adac", "he", {1, 5}]; StringInsert[{"something", "sometimes"}, " ", 5]"#,
+      r#"{"some thing", "some times"}"#,
+    );
+  }
+  #[test]
+  fn string_insert_6() {
+    assert_case(
+      r#"StringInsert["noting", "h", 4]; StringInsert["note", "d", -1]; StringInsert["here", "t", -5]; StringInsert["adac", "he", {1, 5}]; StringInsert[{"something", "sometimes"}, " ", 5]; StringInsert["1234567890123456", ".", Range[-16, -4, 3]]"#,
+      r#""1.234.567.890.123.456""#,
+    );
+  }
+  // An out-of-range position leaves the whole call unevaluated (WL emits
+  // StringInsert::ins). Valid positions are 1..=n+1 and -(n+1)..=-1.
+  #[test]
+  fn string_insert_out_of_range_positive() {
+    // n+1 = 4 is the last valid position; 5 is out of range.
+    assert_case(r#"StringInsert["abc", "X", 4]"#, r#""abcX""#);
+    assert_case(
+      r#"StringInsert["abc", "X", 5]"#,
+      r#"StringInsert[abc, X, 5]"#,
+    );
+  }
+  #[test]
+  fn string_insert_out_of_range_negative() {
+    // -(n+1) = -4 is the first valid position; -5 is out of range.
+    assert_case(r#"StringInsert["abc", "X", -4]"#, r#""Xabc""#);
+    assert_case(
+      r#"StringInsert["abc", "X", -5]"#,
+      r#"StringInsert[abc, X, -5]"#,
+    );
+  }
+  #[test]
+  fn string_insert_position_zero() {
+    assert_case(
+      r#"StringInsert["abc", "X", 0]"#,
+      r#"StringInsert[abc, X, 0]"#,
+    );
+  }
+  #[test]
+  fn string_insert_list_with_invalid_position() {
+    // A single out-of-range entry invalidates the whole position list.
+    assert_case(
+      r#"StringInsert["abcd", "X", {1, 0, 2}]"#,
+      r#"StringInsert[abcd, X, {1, 0, 2}]"#,
+    );
+  }
+  #[test]
+  fn string_insert_empty_string() {
+    // Only positions 1 and -1 are valid for the empty string.
+    assert_case(r#"StringInsert["", "X", 1]"#, r#""X""#);
+    assert_case(r#"StringInsert["", "X", -1]"#, r#""X""#);
+    assert_case(r#"StringInsert["", "X", 2]"#, r#"StringInsert[, X, 2]"#);
+  }
+  // The inserted text (position 2) must be a single string; a list or other
+  // expression there stays unevaluated (WL emits StringInsert::string).
+  #[test]
+  fn string_insert_nonstring_snew_list() {
+    assert_case(
+      r#"StringInsert["abc", {"X", "Y"}, {1, 3}]"#,
+      r#"StringInsert[abc, {X, Y}, {1, 3}]"#,
+    );
+  }
+  #[test]
+  fn string_insert_nonstring_snew_integer() {
+    assert_case(r#"StringInsert["abc", 5, 2]"#, r#"StringInsert[abc, 5, 2]"#);
+  }
+  #[test]
+  fn string_insert_nonstring_snew_with_list_first_arg() {
+    // The check fires before the list-of-strings first-argument form, so the
+    // message reports the whole original call (single result, not per element).
+    assert_case(
+      r#"StringInsert[{"ab", "cd"}, {"X", "Y"}, 2]"#,
+      r#"StringInsert[{ab, cd}, {X, Y}, 2]"#,
+    );
+  }
+  #[test]
+  fn string_join_1() {
+    assert_case(r#"StringJoin["a", "b", "c"]"#, r#""abc""#);
+  }
+  #[test]
+  fn string_literal_1() {
+    assert_case(
+      r#"StringJoin["a", "b", "c"]; "a" <> "b" <> "c" // InputForm"#,
+      r#"InputForm["abc"]"#,
+    );
+  }
+  #[test]
+  fn string_join_2() {
+    assert_case(
+      r#"StringJoin["a", "b", "c"]; "a" <> "b" <> "c" // InputForm; StringJoin[{"a", "b"}] // InputForm"#,
+      r#"InputForm["ab"]"#,
+    );
+  }
+  #[test]
+  fn string_length_1() {
+    assert_case(r#"StringLength["abc"]"#, r#"3"#);
+  }
+  #[test]
+  fn string_length_2() {
+    assert_case(
+      r#"StringLength["abc"]; StringLength[{"a", "bc"}]"#,
+      r#"{1, 2}"#,
+    );
+  }
+  #[test]
+  fn string_position_1() {
+    assert_case(
+      r#"StringPosition["123ABCxyABCzzzABCABC", "ABC"]"#,
+      r#"{{4, 6}, {9, 11}, {15, 17}, {18, 20}}"#,
+    );
+  }
+  #[test]
+  fn string_position_2() {
+    assert_case(
+      r#"StringPosition["123ABCxyABCzzzABCABC", "ABC"]; StringPosition["123ABCxyABCzzzABCABC", "ABC", 2]"#,
+      r#"{{4, 6}, {9, 11}}"#,
+    );
+  }
+  #[test]
+  fn string_replace_9() {
+    assert_case(
+      r#"StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A"]"#,
+      r#""AAAyyxxAyA""#,
+    );
+  }
+  #[test]
+  fn string_replace_10() {
+    assert_case(
+      r#"StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A"]; StringReplace["xyzwxyzwxxyzxyzw", {"xyz" -> "A", "w" -> "BCD"}]"#,
+      r#""ABCDABCDxAABCD""#,
+    );
+  }
+  #[test]
+  fn string_replace_11() {
+    assert_case(
+      r#"StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A"]; StringReplace["xyzwxyzwxxyzxyzw", {"xyz" -> "A", "w" -> "BCD"}]; StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A", 2]"#,
+      r#""AAxyyyxxxyyxy""#,
+    );
+  }
+  #[test]
+  fn string_replace_12() {
+    assert_case(
+      r#"StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A"]; StringReplace["xyzwxyzwxxyzxyzw", {"xyz" -> "A", "w" -> "BCD"}]; StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A", 2]; StringReplace["abba", {"a" -> "A", "b" -> "B"}, 2]"#,
+      r#""ABba""#,
+    );
+  }
+  #[test]
+  fn string_replace_13() {
+    assert_case(
+      r#"StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A"]; StringReplace["xyzwxyzwxxyzxyzw", {"xyz" -> "A", "w" -> "BCD"}]; StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A", 2]; StringReplace["abba", {"a" -> "A", "b" -> "B"}, 2]; StringReplace[{"xyxyxxy", "yxyxyxxxyyxy"}, "xy" -> "A"]"#,
+      r#"{"AAxA", "yAAxxAyA"}"#,
+    );
+  }
+  #[test]
+  fn string_replace_14() {
+    assert_case(
+      r#"StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A"]; StringReplace["xyzwxyzwxxyzxyzw", {"xyz" -> "A", "w" -> "BCD"}]; StringReplace["xyxyxyyyxxxyyxy", "xy" -> "A", 2]; StringReplace["abba", {"a" -> "A", "b" -> "B"}, 2]; StringReplace[{"xyxyxxy", "yxyxyxxxyyxy"}, "xy" -> "A"]; StringReplace["y" -> "ies"]["city"]"#,
+      r#""cities""#,
+    );
+  }
+  #[test]
+  fn string_reverse() {
+    assert_case(r#"StringReverse["live"]"#, r#""evil""#);
+  }
+  #[test]
+  fn string_riffle_1() {
+    assert_case(
+      r#"StringRiffle[{"a", "b", "c", "d", "e"}]"#,
+      r#""a b c d e""#,
+    );
+  }
+  #[test]
+  fn string_riffle_2() {
+    assert_case(
+      r#"StringRiffle[{"a", "b", "c", "d", "e"}]; StringRiffle[{"a", "b", "c", "d", "e"}, ", "]"#,
+      r#""a, b, c, d, e""#,
+    );
+  }
+  #[test]
+  fn string_riffle_3() {
+    assert_case(
+      r#"StringRiffle[{"a", "b", "c", "d", "e"}]; StringRiffle[{"a", "b", "c", "d", "e"}, ", "]; StringRiffle[{"a", "b", "c", "d", "e"}, {"(", " ", ")"}]"#,
+      r#""(a b c d e)""#,
+    );
+  }
+  #[test]
+  fn string_split_5() {
+    assert_case(r#"StringSplit["abc,123", ","]"#, r#"{"abc", "123"}"#);
+  }
+  #[test]
+  fn string_split_6() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]"#,
+      r#"{"abc", "123"}"#,
+    );
+  }
+  #[test]
+  fn string_split_7() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]; StringSplit["  abc    123  ", WhitespaceCharacter]"#,
+      r#"{"abc", "", "", "", "123"}"#,
+    );
+  }
+  #[test]
+  fn string_split_8() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]; StringSplit["  abc    123  ", WhitespaceCharacter]; StringSplit["abc,123.456", {",", "."}]"#,
+      r#"{"abc", "123", "456"}"#,
+    );
+  }
+  #[test]
+  fn string_split_9() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]; StringSplit["  abc    123  ", WhitespaceCharacter]; StringSplit["abc,123.456", {",", "."}]; StringSplit["a  b    c", RegularExpression[" +"]]"#,
+      r#"{"a", "b", "c"}"#,
+    );
+  }
+  #[test]
+  fn string_split_list_with_pattern() {
+    // A list of delimiters that contains a pattern (not just literals).
+    assert_case(r#"StringSplit["a1b2", {DigitCharacter}]"#, r#"{"a", "b"}"#);
+    assert_case(
+      r#"StringSplit["a1b2c3", {LetterCharacter}]"#,
+      r#"{"1", "2", "3"}"#,
+    );
+    // Mixed literal + pattern delimiters keep interior empties.
+    assert_case(
+      r#"StringSplit["x1y22z", {DigitCharacter, "y"}]"#,
+      r#"{"x", "", "", "", "z"}"#,
+    );
+  }
+  #[test]
+  fn string_split_10() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]; StringSplit["  abc    123  ", WhitespaceCharacter]; StringSplit["abc,123.456", {",", "."}]; StringSplit["a  b    c", RegularExpression[" +"]]; StringSplit[{"a  b", "c  d"}, RegularExpression[" +"]]"#,
+      r#"{{"a", "b"}, {"c", "d"}}"#,
+    );
+  }
+  #[test]
+  fn string_split_11() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]; StringSplit["  abc    123  ", WhitespaceCharacter]; StringSplit["abc,123.456", {",", "."}]; StringSplit["a  b    c", RegularExpression[" +"]]; StringSplit[{"a  b", "c  d"}, RegularExpression[" +"]]; StringSplit["x", "x"]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn string_split_12() {
+    assert_case(
+      r#"StringSplit["abc,123", ","]; StringSplit["  abc    123  "]; StringSplit["  abc    123  ", WhitespaceCharacter]; StringSplit["abc,123.456", {",", "."}]; StringSplit["a  b    c", RegularExpression[" +"]]; StringSplit[{"a  b", "c  d"}, RegularExpression[" +"]]; StringSplit["x", "x"]; StringSplit["12312123", "12"..]"#,
+      r#"{"3", "3"}"#,
+    );
+  }
+  #[test]
+  fn string_take_2() {
+    assert_case(r#"StringTake["abcde", 2]"#, r#""ab""#);
+  }
+  #[test]
+  fn string_take_3() {
+    assert_case(r#"StringTake["abcde", 2]; StringTake["abcde", 0]"#, r#""""#);
+  }
+  #[test]
+  fn string_take_4() {
+    assert_case(
+      r#"StringTake["abcde", 2]; StringTake["abcde", 0]; StringTake["abcde", -2]"#,
+      r#""de""#,
+    );
+  }
+  #[test]
+  fn string_take_5() {
+    assert_case(
+      r#"StringTake["abcde", 2]; StringTake["abcde", 0]; StringTake["abcde", -2]; StringTake["abcde", {2}]"#,
+      r#""b""#,
+    );
+  }
+  #[test]
+  fn string_take_6() {
+    assert_case(
+      r#"StringTake["abcde", 2]; StringTake["abcde", 0]; StringTake["abcde", -2]; StringTake["abcde", {2}]; StringTake["abcd", {2,3}]"#,
+      r#""bc""#,
+    );
+  }
+  #[test]
+  fn string_take_7() {
+    assert_case(
+      r#"StringTake["abcde", 2]; StringTake["abcde", 0]; StringTake["abcde", -2]; StringTake["abcde", {2}]; StringTake["abcd", {2,3}]; StringTake["abcdefgh", {1, 5, 2}]"#,
+      r#""ace""#,
+    );
+  }
+  #[test]
+  fn string_take_8() {
+    assert_case(
+      r#"StringTake["abcde", 2]; StringTake["abcde", 0]; StringTake["abcde", -2]; StringTake["abcde", {2}]; StringTake["abcd", {2,3}]; StringTake["abcdefgh", {1, 5, 2}]; StringTake[{"abcdef", "stuv", "xyzw"}, -2]"#,
+      r#"{"ef", "uv", "zw"}"#,
+    );
+  }
+  #[test]
+  fn string_take_9() {
+    assert_case(
+      r#"StringTake["abcde", 2]; StringTake["abcde", 0]; StringTake["abcde", -2]; StringTake["abcde", {2}]; StringTake["abcd", {2,3}]; StringTake["abcdefgh", {1, 5, 2}]; StringTake[{"abcdef", "stuv", "xyzw"}, -2]; StringTake["abcdef", All]"#,
+      r#""abcdef""#,
+    );
+  }
+  #[test]
+  fn string_join_3() {
+    assert_case(
+      r#"StringJoin["a", StringTrim["  \tb\n "], "c"]"#,
+      r#""abc""#,
+    );
+  }
+  #[test]
+  fn string_trim() {
+    assert_case(
+      r#"StringJoin["a", StringTrim["  \tb\n "], "c"]; StringTrim["ababaxababyaabab", RegularExpression["(ab)+"]]"#,
+      r#""axababya""#,
+    );
+  }
+  #[test]
+  fn string_split_13() {
+    assert_case(
+      r#"StringSplit["1.23, 4.56  7.89", RegularExpression["(\\s|,)+"]]"#,
+      r#"{"1.23", "4.56", "7.89"}"#,
+    );
+  }
+  #[test]
+  fn regular_expression() {
+    assert_case(
+      r#"StringSplit["1.23, 4.56  7.89", RegularExpression["(\\s|,)+"]]; RegularExpression["[abc]"]"#,
+      r#"RegularExpression["[abc]"]"#,
+    );
+  }
+  #[test]
+  fn characters_1() {
+    assert_case(r#"Characters["abc"]"#, r#"{"a", "b", "c"}"#);
+  }
+  #[test]
+  fn character_range_1() {
+    assert_case(
+      r#"CharacterRange["a", "e"]"#,
+      r#"{"a", "b", "c", "d", "e"}"#,
+    );
+  }
+  #[test]
+  fn character_range_2() {
+    assert_case(
+      r#"CharacterRange["a", "e"]; CharacterRange["b", "a"]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn lower_case_q_1() {
+    assert_case(r#"LowerCaseQ["abc"]"#, r#"True"#);
+  }
+  #[test]
+  fn lower_case_q_2() {
+    assert_case(r#"LowerCaseQ["abc"]; LowerCaseQ[""]"#, r#"True"#);
+  }
+  #[test]
+  fn to_lower_case() {
+    assert_case(r#"ToLowerCase["New York"]"#, r#""new york""#);
+  }
+  #[test]
+  fn to_upper_case() {
+    assert_case(r#"ToUpperCase["New York"]"#, r#""NEW YORK""#);
+  }
+  #[test]
+  fn upper_case_q_1() {
+    assert_case(r#"UpperCaseQ["ABC"]"#, r#"True"#);
+  }
+  #[test]
+  fn upper_case_q_2() {
+    assert_case(r#"UpperCaseQ["ABC"]; UpperCaseQ[""]"#, r#"True"#);
+  }
+  #[test]
+  fn to_character_code_1() {
+    assert_case(r#"ToCharacterCode["abc"]"#, r#"{97, 98, 99}"#);
+  }
+  #[test]
+  fn from_character_code_1() {
+    assert_case(r#"FromCharacterCode[100]"#, r#""d""#);
+  }
+  #[test]
+  fn from_character_code_2() {
+    // Wolframscript-matched expectation. The mathics original used the
+    // named-character notation `"\[ADoubleDot]"`, but wolframscript and
+    // Woxi both emit the actual UTF-8 codepoint `ä` for character 228.
+    assert_case(
+      r#"FromCharacterCode[100]; FromCharacterCode[228, "ISO8859-1"]"#,
+      "\u{e4}",
+    );
+  }
+  #[test]
+  fn from_character_code_3() {
+    assert_case(
+      r#"FromCharacterCode[100]; FromCharacterCode[228, "ISO8859-1"]; FromCharacterCode[{100, 101, 102}]"#,
+      r#""def""#,
+    );
+  }
+  #[test]
+  fn from_character_code_invalid_arg_returns_unevaluated() {
+    // Non-integer / non-list args (e.g. an unbound symbol via `%` in a
+    // script) must not raise a hard error. Wolframscript emits the
+    // FromCharacterCode::intnm message and returns the call unevaluated;
+    // Woxi must do the same so chained sequences keep flowing.
+    assert_case(r#"FromCharacterCode[xyz]"#, r#"FromCharacterCode[xyz]"#);
+  }
+  #[test]
+  fn string_position_unbound_string_returns_unevaluated() {
+    // StringPosition[<unbound>, "uranium"] previously coerced the symbol
+    // to its name and searched there, returning `{}`. Wolframscript emits
+    // StringPosition::strse and returns the call unevaluated; Woxi must
+    // do the same.
+    assert_case(
+      r#"StringPosition[data, "uranium"]"#,
+      r#"StringPosition[data, "uranium"]"#,
+    );
+  }
+  #[test]
+  fn unequal() {
+    assert_case(
+      r#"System`Convert`B64Dump`B64Decode["R!="]"#,
+      r#"System`Convert`B64Dump`B64Decode["R!="]"#,
+    );
+  }
+  #[test]
+  fn expr_1() {
+    assert_case(
+      r#"System`Convert`B64Dump`B64Encode["Hello world"]"#,
+      r#"System`Convert`B64Dump`B64Encode["Hello world"]"#,
+    );
+  }
+  #[test]
+  fn expr_2() {
+    assert_case(
+      r#"System`Convert`B64Dump`B64Encode["Hello world"]; System`Convert`B64Dump`B64Decode[%]"#,
+      r#"System`Convert`B64Dump`B64Decode[Out[0]]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_1() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]"#,
+      r#"RowBox[{"G","[","F[3.002]","]"}]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_2() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]"#,
+      // wolframscript: single layer of baked-in quotes,
+      // second arg wraps the original expression in OutputForm.
+      r#"InterpretationBox[PaneBox["G[F[3.002]]", BaselinePosition -> Baseline], OutputForm[G[F[3.002]]], Editable -> False]"#,
+    );
+  }
+  #[test]
+  fn format_1() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn make_boxes_3() {
+    // mathics's expected output uses InputForm-style box rendering
+    // (every box element wrapped in quotes, inner quotes escaped);
+    // wolframscript's REPL uses unquoted box-element strings, with
+    // user-supplied strings retaining their original quotes. Match
+    // wolframscript here — `Format[F[x_]] := {…}` causes the inner
+    // F[3.002] to render via the formatted list of strings.
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]"#,
+      r#"RowBox[{G, [, RowBox[{{, RowBox[{"Formatted f", ,, RowBox[{{, 3.002`, }}], ,, "Standard"}], }}], ]}]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_4() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]"#,
+      // wolframscript form: single layer of baked-in quotes;
+      // second arg wraps the *original* expression in OutputForm.
+      // The Format rule still applies inside the rendered string.
+      r#"InterpretationBox[PaneBox["G[{Formatted f, {3.002}, Standard}]", BaselinePosition -> Baseline], OutputForm[G[F[3.002]]], Editable -> False]"#,
+    );
+  }
+  #[test]
+  fn format_2() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_], StandardForm] :=  {"Formatted f", {x}, "Standard"};Format[F[x_], OutputForm] :=  {"Formatted f", {x}, "Output"}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn make_boxes_5() {
+    // Same family as case 3674. After also defining the form-specific
+    // `Format[F[x_], StandardForm]` and `Format[F[x_], OutputForm]`
+    // rules, the StandardForm box rendering of `G[F[3.002]]` should
+    // still apply the StandardForm-tagged rule (or fall through to the
+    // 1-arg rule, which has the same body). Match wolframscript's
+    // unquoted box-element style.
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_], StandardForm] :=  {"Formatted f", {x}, "Standard"};Format[F[x_], OutputForm] :=  {"Formatted f", {x}, "Output"}; MakeBoxes[G[F[3.002]], StandardForm]"#,
+      r#"RowBox[{G, [, RowBox[{{, RowBox[{"Formatted f", ,, RowBox[{{, 3.002`, }}], ,, "Standard"}], }}], ]}]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_6() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_], StandardForm] :=  {"Formatted f", {x}, "Standard"};Format[F[x_], OutputForm] :=  {"Formatted f", {x}, "Output"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]"#,
+      // wolframscript form: single layer of baked-in quotes;
+      // second arg wraps the *original* expression in OutputForm.
+      r#"InterpretationBox[PaneBox["G[{Formatted f, {3.002}, Output}]", BaselinePosition -> Baseline], OutputForm[G[F[3.002]]], Editable -> False]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_7() {
+    // Same family as case 3674. After ClearAll[F] removes the Format
+    // rules but the user `MakeBoxes[F[x_], fmt_] := …` rule is still
+    // in effect, so `G[F[2.]]` boxes via the user's MakeBoxes for F
+    // (returning the literal string `"F[2.]"`). Match wolframscript's
+    // unquoted box-element style.
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_], StandardForm] :=  {"Formatted f", {x}, "Standard"};Format[F[x_], OutputForm] :=  {"Formatted f", {x}, "Output"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; ClearAll[F]; MakeBoxes[G[F[2.]], StandardForm]"#,
+      r#"RowBox[{G, [, F[2.], ]}]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_8() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_] := "F[" <> ToString[x] <> "]";MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_]] := {"Formatted f", {x}, "Standard"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; Format[F[x_], StandardForm] :=  {"Formatted f", {x}, "Standard"};Format[F[x_], OutputForm] :=  {"Formatted f", {x}, "Output"}; MakeBoxes[G[F[3.002]], StandardForm]; MakeBoxes[OutputForm[G[F[3.002]]], StandardForm]; ClearAll[F]; MakeBoxes[G[F[2.]], StandardForm]; MakeBoxes[F[x_], fmt_]=.; MakeBoxes[G[F[2.]], StandardForm]"#,
+      r#"RowBox[{"G", "[", RowBox[{"F", "[", "2.`", "]"}], "]"}]"#,
+    );
+  }
+  #[test]
+  fn to_string_5() {
+    // mathics's expected output is the InputForm rendering of the
+    // resulting String (literal `\!\(\*RowBox[…]\)` escape syntax).
+    // wolframscript's REPL prints the same String in OutputForm, where
+    // the box-escape characters render as `DisplayForm[RowBox[…]]`.
+    // Match wolframscript: Format[G[x___], StandardForm] applies first
+    // (yielding `{"Standard", GG[F[1., "l"], .2]}`), then the inner
+    // GG / F sub-expressions box via the user MakeBoxes rules; the
+    // Format[F[x_, y_], StandardForm] rule rewrites `F[1., "l"]` into
+    // `{F[1.], "Standard"}` before user MakeBoxes for F runs on F[1.].
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]"#,
+      r#"DisplayForm[RowBox[{{, RowBox[{"Standard", ,, RowBox[{GG, <<, RowBox[{RowBox[{{, RowBox[{RowBox[{F, <~, RowBox[{1.`}], ~>}], ,, "Standard"}], }}], 0.2`}], >>}]}], }}]]"#,
+    );
+  }
+  #[test]
+  fn to_string_6() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]"#,
+      r#""G[F[1.`, \"l\"], 0.2`]""#,
+    );
+  }
+  #[test]
+  fn to_string_7() {
+    // Wolframscript-matched expectation. mathics quoted the returned
+    // String as `"G[F[1., \"l\"], 0.2]"`, but `wolframscript -code`
+    // prints `ToString[…, InputForm]`'s String result without surrounding
+    // quotes. Woxi matches.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]"#,
+      r#"G[F[1., "l"], 0.2]"#,
+    );
+  }
+  #[test]
+  fn to_string_8() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]"#,
+      r#""G[F[1., l], 0.2]""#,
+    );
+  }
+  #[test]
+  fn format_3() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn format_4() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn format_5() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn format_6() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn format_7() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn to_string_9() {
+    // Same family as case 3686. After also defining InputForm /
+    // OutputForm / FullForm Format rules, the StandardForm ToString
+    // call still picks the StandardForm-tagged Format rule (and falls
+    // back to the same `DisplayForm[RowBox[...]]` shape that case 3686
+    // produces). Match wolframscript's display.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]"#,
+      r#"DisplayForm[RowBox[{{, RowBox[{"Standard", ,, RowBox[{GG, <<, RowBox[{RowBox[{{, RowBox[{RowBox[{F, <~, RowBox[{1.`}], ~>}], ,, "Standard"}], }}], 0.2`}], >>}]}], }}]]"#,
+    );
+  }
+  #[test]
+  fn to_string_10() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]"#,
+      r#""G[F[1.`, \"l\"], 0.2`]""#,
+    );
+  }
+  #[test]
+  fn to_string_11() {
+    // mathics's expected wraps the resulting String's InputForm with
+    // outer quotes; wolframscript's REPL prints the unquoted contents
+    // (since OutputForm strips outer string quotes). Match
+    // wolframscript: ToString[…, InputForm] applies the user
+    // `Format[…, InputForm]` rules and produces the formatted list.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]"#,
+      r#"{"In", GG[{F[1.], "In"}, 0.2]}"#,
+    );
+  }
+  #[test]
+  fn to_string_12() {
+    // Same family as case 3697 — `ToString[…, OutputForm]` applies the
+    // user `Format[…, OutputForm]` rules. Match wolframscript's REPL
+    // display (no outer string quotes).
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]"#,
+      r#"{Out, GG[{F[1.], Out}, 0.2]}"#,
+    );
+  }
+  #[test]
+  fn make_boxes_9() {
+    // Same family as case 3686 — direct `MakeBoxes[…, StandardForm]`
+    // (no ToString wrapper) yields the box AST that wolframscript
+    // prints with unquoted box-element strings (only the user
+    // `"Standard"` strings keep their quotes).
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]"#,
+      r#"RowBox[{{, RowBox[{"Standard", ,, RowBox[{GG, <<, RowBox[{RowBox[{{, RowBox[{RowBox[{F, <~, RowBox[{1.`}], ~>}], ,, "Standard"}], }}], 0.2`}], >>}]}], }}]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_10() {
+    // mathics's expectation wraps the formatted text in extra
+    // InputForm-quoting and replaces the InputForm's interpretation
+    // arg with the formatted shape; wolframscript keeps the original
+    // expression `G[F[1., l], 0.2]` as the interpretation arg and
+    // shows the formatted text unquoted. Match wolframscript.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]"#,
+      r#"InterpretationBox[StyleBox[{"In", GG[{F[1.], "In"}, 0.2]}, ShowStringCharacters -> True, NumberMarks -> True], InputForm[G[F[1., l], 0.2]], Editable -> True, AutoDelete -> True]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_11() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]"#,
+      // wolframscript form: single layer of baked-in quotes;
+      // second arg is `OutputForm[<original-expr>]` rather than
+      // the formatted body. (`G[F[1., "l"], .2]` has no
+      // OutputForm Format rule applied yet at MakeBoxes time
+      // because the rule operates inside expr_to_output_form_2d.)
+      r#"InterpretationBox[PaneBox["{Out, GG[{F[1.], Out}, 0.2]}", BaselinePosition -> Baseline], OutputForm[G[F[1., l], 0.2]], Editable -> False]"#,
+    );
+  }
+  #[test]
+  fn to_string_13() {
+    // mathics's expected was a typo-ridden raw string ("\	ext" is
+    // backslash-tab-ext). wolframscript's actual TeX rendering of the
+    // box AST keeps the user MakeBoxes delimiters and translates `~`
+    // to TeX's `\sim ` macro. Match wolframscript.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]"#,
+      r#"G<F<\sim 1.\text{l}\sim >0.2>"#,
+    );
+  }
+  #[test]
+  fn to_string_14() {
+    // mathics's expected used a literal tab (`\	ext`) in place of
+    // `\text` due to a Python escaping bug. wolframscript renders
+    // `TeXForm[InputForm[expr]]` as `\text{<input-form-text>}` with
+    // the formatted shape inside and `{`/`}` escaped using `$\{$` /
+    // `$\}$`. Match wolframscript.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]"#,
+      r#"\text{$\{$In, GG[$\{$F[1.], In$\}$, 0.2]$\}$}"#,
+    );
+  }
+  #[test]
+  fn clear_all() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn to_string_15() {
+    // After `ClearAll[F, G, GG]` the Format rules (stored under
+    // FORMAT_VALUES[F/G/GG]) are removed, but the user MakeBoxes
+    // rules (stored under FUNC_DEFS[MakeBoxes]) survive — wolframscript
+    // does the same. The resulting StandardForm box AST therefore
+    // still uses the user delimiters (`<`, `>`, `<~`, `~>`) but
+    // skips the Format substitution.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]"#,
+      r#"DisplayForm[RowBox[{G, <, RowBox[{RowBox[{F, <~, RowBox[{1.`, "l"}], ~>}], 0.2`}], >}]]"#,
+    );
+  }
+  #[test]
+  fn to_string_16() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]"#,
+      r#""G[F[1.`, \"l\"], 0.2`]""#,
+    );
+  }
+  #[test]
+  fn to_string_17() {
+    // Wolframscript-matched expectation. The mathics original quoted the
+    // returned string as `"G[F[1., \"l\"], 0.2]"`, but `wolframscript -code`
+    // prints `ToString[…, InputForm]`'s String result without surrounding
+    // quotes. Woxi matches.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]"#,
+      r#"G[F[1., "l"], 0.2]"#,
+    );
+  }
+  #[test]
+  fn to_string_18() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]"#,
+      r#""G[F[1., l], 0.2]""#,
+    );
+  }
+  #[test]
+  fn make_boxes_12() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=."#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn make_boxes_13() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=.; MakeBoxes[G[x___], fmt_]=."#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn make_boxes_14() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=.; MakeBoxes[G[x___], fmt_]=.; MakeBoxes[GG[x___], fmt_]=."#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn to_string_19() {
+    // After also unsetting the user MakeBoxes definitions
+    // (`MakeBoxes[F[x__], fmt_]=.` etc.), the StandardForm rendering
+    // falls back to the default `head[args]` boxing. Match
+    // wolframscript's REPL display.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=.; MakeBoxes[G[x___], fmt_]=.; MakeBoxes[GG[x___], fmt_]=.; ToString[G[F[1., "l"], .2], StandardForm]"#,
+      r#"DisplayForm[RowBox[{G, [, RowBox[{RowBox[{F, [, RowBox[{1.`, ,, "l"}], ]}], ,, 0.2`}], ]}]]"#,
+    );
+  }
+  #[test]
+  fn to_string_20() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=.; MakeBoxes[G[x___], fmt_]=.; MakeBoxes[GG[x___], fmt_]=.; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]"#,
+      r#""G[F[1.`, \"l\"], 0.2`]""#,
+    );
+  }
+  #[test]
+  fn to_string_21() {
+    // Wolframscript-matched expectation. mathics quoted the returned
+    // String as `"G[F[1., \"l\"], 0.2]"`, but `wolframscript -code`
+    // prints `ToString[…, InputForm]`'s String result without surrounding
+    // quotes. Woxi matches.
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=.; MakeBoxes[G[x___], fmt_]=.; MakeBoxes[GG[x___], fmt_]=.; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]"#,
+      r#"G[F[1., "l"], 0.2]"#,
+    );
+  }
+  #[test]
+  fn to_string_22() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; Format[F[x_, y_], InputForm] := {F[x], "In"}; Format[G[x___], InputForm] :=  {"In", GG[x]}; Format[F[x_, y_], OutputForm] := {F[x], "Out"}; Format[G[x___], OutputForm] :=  {"Out", GG[x]}; Format[F[x_, y_], FullForm] := {F[x], "full"}; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[G[F[1., "l"], .2], StandardForm]; MakeBoxes[InputForm[G[F[1., "l"], .2]], StandardForm]; MakeBoxes[OutputForm[G[F[1., "l"], .2]], StandardForm]; ToString[TeXForm[G[F[1., "l"], .2]]]; ToString[TeXForm[InputForm[G[F[1., "l"], .2]]]]; ClearAll[F, G, GG]; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]; MakeBoxes[F[x__], fmt_]=.; MakeBoxes[G[x___], fmt_]=.; MakeBoxes[GG[x___], fmt_]=.; ToString[G[F[1., "l"], .2], StandardForm]; ToString[FullForm[G[F[1., "l"], .2]]]; ToString[G[F[1., "l"], .2], InputForm]; ToString[G[F[1., "l"], .2], OutputForm]"#,
+      r#""G[F[1., l], 0.2]""#,
+    );
+  }
+  #[test]
+  fn string_literal_2() {
+    assert_case(r#""Hola""#, r#""Hola""#);
+  }
+  #[test]
+  fn base_form_10() {
+    assert_case(r#"BaseForm[0, 2]"#, r#"BaseForm[0, 2]"#);
+  }
+  #[test]
+  fn base_form_11() {
+    assert_case(r#"BaseForm[0, 2]; BaseForm[0.0, 2]"#, r#"BaseForm[0., 2]"#);
+  }
+  #[test]
+  fn base_form_12() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]"#,
+      r#"BaseForm[3.1415926535897932384626433832795028841971693993751058209749`30., 16]"#,
+    );
+  }
+  #[test]
+  fn input_form_1() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]"#,
+      r#"InputForm[2*x^2 + 4*z!]"#,
+    );
+  }
+  #[test]
+  fn input_form_2() {
+    // mathics quoted the embedded string and double-escaped the backslash;
+    // wolframscript -code (OutputForm) emits the literal escape `\$` with
+    // no surrounding quotes since string contents render verbatim inside
+    // the InputForm wrapper. Woxi matches.
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]"#,
+      r#"InputForm[\$]"#,
+    );
+  }
+  #[test]
+  fn number_form_1() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]"#,
+      r#"NumberForm[Pi, 20]"#,
+    );
+  }
+  #[test]
+  fn number_form_2() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]"#,
+      r#"NumberForm[2/3, 10]"#,
+    );
+  }
+  #[test]
+  fn number_form_3() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]"#,
+      r#"NumberForm[3.141592653589793]"#,
+    );
+  }
+  #[test]
+  fn number_form_4() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]"#,
+      r#"NumberForm[3.1415926535897932384626433832795028842`20.]"#,
+    );
+  }
+  #[test]
+  fn number_form_5() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]"#,
+      r#"NumberForm[14310983091809]"#,
+    );
+  }
+  // ToString[NumberForm[x, n]] formats x to n significant figures.
+  #[test]
+  fn to_string_number_form_significant_digits() {
+    assert_case("ToString[NumberForm[3.14159, 3]]", "3.14");
+    assert_case("ToString[NumberForm[3.14159, 5]]", "3.1416");
+  }
+  // NumberSigns -> {neg, pos} overrides the sign prefixes: a non-negative
+  // number (including zero) gets `pos`, a negative one gets `neg`.
+  #[test]
+  fn to_string_number_form_number_signs() {
+    assert_case(
+      "ToString[NumberForm[2.5, 3, NumberSigns -> {\"-\", \"+\"}]]",
+      "+2.5",
+    );
+    assert_case(
+      "ToString[NumberForm[-2.5, 3, NumberSigns -> {\"-\", \"+\"}]]",
+      "-2.5",
+    );
+    // Custom sign strings and the no-precision form.
+    assert_case(
+      "ToString[NumberForm[2.5, NumberSigns -> {\"neg\", \"pos\"}]]",
+      "pos2.5",
+    );
+    // Integers and zero (zero counts as non-negative).
+    assert_case(
+      "ToString[NumberForm[123, NumberSigns -> {\"-\", \"+\"}]]",
+      "+123",
+    );
+    assert_case(
+      "ToString[NumberForm[0, NumberSigns -> {\"-\", \"+\"}]]",
+      "+0",
+    );
+    // Empty signs strip the sign entirely, even for negatives.
+    assert_case(
+      "ToString[NumberForm[-3.14, NumberSigns -> {\"\", \"\"}]]",
+      "3.14",
+    );
+    // Combined with a {n, f} fixed-digit precision spec.
+    assert_case(
+      "ToString[NumberForm[2.5, {5, 2}, NumberSigns -> {\"-\", \"+\"}]]",
+      "+2.50",
+    );
+  }
+  // ExponentFunction -> f re-expresses the number as `mantissa × 10^e'`, where
+  // e' = f applied to the natural base-10 exponent. The exponent renders as a
+  // superscript on the line above (matching wolframscript). `Null` (or a zero
+  // exponent) suppresses the factor; integer arguments are shown verbatim.
+  #[test]
+  fn to_string_number_form_exponent_function() {
+    // Identity: same as the default scientific rendering.
+    assert_case(
+      "ToString[ScientificForm[12345., ExponentFunction -> (# &)]]",
+      "           4\n1.2345 \u{00d7} 10",
+    );
+    // Engineering-style: round the exponent to a multiple of 3.
+    assert_case(
+      "ToString[NumberForm[123456., 4, ExponentFunction -> (3 Floor[#/3] &)]]",
+      "          3\n123.5 \u{00d7} 10",
+    );
+    // Negative numbers keep the sign on the mantissa.
+    assert_case(
+      "ToString[NumberForm[-123456., 4, ExponentFunction -> (3 Floor[#/3] &)]]",
+      "           3\n-123.5 \u{00d7} 10",
+    );
+    // Rounding can renormalize the exponent (9.99 → 1.0×10^1).
+    assert_case(
+      "ToString[NumberForm[9.99, 2, ExponentFunction -> (# &)]]",
+      "       1\n1. \u{00d7} 10",
+    );
+    // Null suppresses the exponent — plain decimal form.
+    assert_case(
+      "ToString[NumberForm[12345., ExponentFunction -> (Null &)]]",
+      "12345.",
+    );
+    // An integer argument is shown verbatim.
+    assert_case(
+      "ToString[NumberForm[123456, 4, ExponentFunction -> (3 Floor[#/3] &)]]",
+      "123456",
+    );
+  }
+  #[test]
+  fn to_string_number_form_trailing_dot() {
+    assert_case("ToString[NumberForm[3.0, 3]]", "3.");
+    assert_case("ToString[NumberForm[100.0, 5]]", "100.");
+    assert_case("ToString[NumberForm[0.0, 3]]", "0.");
+  }
+  #[test]
+  fn to_string_number_form_rounds_integer_part() {
+    assert_case("ToString[NumberForm[1234.5678, 2]]", "1200.");
+  }
+  #[test]
+  fn to_string_number_form_small_and_negative() {
+    assert_case("ToString[NumberForm[0.00123456, 3]]", "0.00123");
+    assert_case("ToString[NumberForm[-3.14159, 3]]", "-3.14");
+  }
+  #[test]
+  fn to_string_number_form_integer_unchanged() {
+    // An integer argument is shown unchanged, ignoring the precision.
+    assert_case("ToString[NumberForm[2, 3]]", "2");
+    assert_case("ToString[NumberForm[1234567, 3]]", "1234567");
+  }
+  // NumberForm[x] with no precision spec renders like NumberForm[x, 6]
+  // (the machine-precision default of 6 significant figures).
+  #[test]
+  fn to_string_number_form_default_precision() {
+    assert_case("ToString[NumberForm[3.14159]]", "3.14159");
+    assert_case("ToString[NumberForm[12345.678]]", "12345.7");
+    assert_case("ToString[NumberForm[0.0001234]]", "0.0001234");
+    assert_case("ToString[NumberForm[-3.5]]", "-3.5");
+    assert_case("ToString[NumberForm[100.0]]", "100.");
+    assert_case("ToString[NumberForm[42]]", "42");
+  }
+  // A real with decimal exponent >= 6 (|x| >= 10^6) switches to 2D scientific
+  // notation, identical to ScientificForm (compared by equality to avoid
+  // depending on the exact superscript layout). The boundary 999999. stays
+  // fixed.
+  #[test]
+  fn to_string_number_form_large_uses_scientific() {
+    assert_case(
+      "ToString[NumberForm[1234567.]] == ToString[ScientificForm[1234567., 6]]",
+      "True",
+    );
+    assert_case(
+      "ToString[NumberForm[1234567., 3]] == ToString[ScientificForm[1234567., 3]]",
+      "True",
+    );
+    assert_case("ToString[NumberForm[999999.]]", "999999.");
+  }
+  // A real with decimal exponent <= -6 (|x| < 10^-5) switches to scientific;
+  // the boundary 0.00001 (10^-5) stays fixed.
+  #[test]
+  fn to_string_number_form_small_uses_scientific() {
+    assert_case(
+      "ToString[NumberForm[0.000001234]] == ToString[ScientificForm[0.000001234, 6]]",
+      "True",
+    );
+    assert_case("ToString[NumberForm[0.00001]]", "0.00001");
+  }
+  // Integers are shown in full regardless of magnitude (no scientific switch).
+  #[test]
+  fn to_string_number_form_integer_never_scientific() {
+    assert_case("ToString[NumberForm[1234567]]", "1234567");
+    assert_case("ToString[NumberForm[1234567, 3]]", "1234567");
+  }
+  // NumberForm with DigitBlock: in-range reals are digit-blocked in fixed
+  // notation. The scientific threshold is the same exponent (>= 6 / <= -6) as
+  // the plain form, NOT m >= precision: NumberForm[12345., 4, DigitBlock -> 2]
+  // (exponent 4) stays fixed at "1,23,50." rather than going scientific.
+  #[test]
+  fn to_string_number_form_digit_block_fixed() {
+    assert_case("ToString[NumberForm[1234.5, DigitBlock -> 3]]", "1,234.5");
+    assert_case("ToString[NumberForm[123456., DigitBlock -> 3]]", "123,456.");
+    assert_case(
+      "ToString[NumberForm[12345., 4, DigitBlock -> 2]]",
+      "1,23,50.",
+    );
+  }
+  // Out-of-range reals (|exponent| crosses the threshold) switch to 2D
+  // scientific notation with the mantissa itself digit-blocked, e.g.
+  // NumberForm[1234567., DigitBlock -> 3] -> "1.234 57 × 10^6". Verified by
+  // substring to avoid depending on the exact superscript layout.
+  #[test]
+  fn to_string_number_form_digit_block_scientific() {
+    assert_case(
+      r#"StringContainsQ[ToString[NumberForm[1234567., DigitBlock -> 3]], "1.234 57"]"#,
+      "True",
+    );
+    assert_case(
+      r#"StringContainsQ[ToString[NumberForm[1234567., DigitBlock -> 3]], " × 10"]"#,
+      "True",
+    );
+    assert_case(
+      r#"StringContainsQ[ToString[NumberForm[1234567., 4, DigitBlock -> 2]], "1.23 5"]"#,
+      "True",
+    );
+    assert_case(
+      r#"StringContainsQ[ToString[NumberForm[0.0000001234, DigitBlock -> 3]], "1.234"]"#,
+      "True",
+    );
+  }
+  // NumberForm[x, {n, f}] shows exactly f digits after the decimal point.
+  #[test]
+  fn to_string_number_form_fixed_decimals() {
+    assert_case("ToString[NumberForm[3.14159, {5, 2}]]", "3.14");
+    assert_case("ToString[NumberForm[1234.5678, {6, 2}]]", "1234.57");
+  }
+  #[test]
+  fn to_string_number_form_fixed_pads_zeros() {
+    assert_case("ToString[NumberForm[3.0, {5, 2}]]", "3.00");
+    assert_case("ToString[NumberForm[3.1, {5, 3}]]", "3.100");
+    assert_case("ToString[NumberForm[0.5, {4, 2}]]", "0.50");
+  }
+  #[test]
+  fn to_string_number_form_fixed_zero_decimals() {
+    assert_case("ToString[NumberForm[3.14159, {4, 0}]]", "3.");
+  }
+  #[test]
+  fn to_string_number_form_fixed_negative() {
+    assert_case("ToString[NumberForm[-2.5, {6, 3}]]", "-2.500");
+  }
+  #[test]
+  fn set_4() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000"#,
+      r#"0``28."#,
+    );
+  }
+  #[test]
+  fn number_form_6() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]"#,
+      r#"NumberForm[{0., 0``28.}, 10]"#,
+    );
+  }
+  #[test]
+  fn number_form_7() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]"#,
+      r#"NumberForm[{0., 0``28.}, {10, 4}]"#,
+    );
+  }
+  #[test]
+  fn unset() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=."#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn number_form_8() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]"#,
+      r#"NumberForm[1., 10]"#,
+    );
+  }
+  #[test]
+  fn number_form_9() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]"#,
+      r#"NumberForm[1.`24., 10]"#,
+    );
+  }
+  #[test]
+  fn number_form_10() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]"#,
+      r#"NumberForm[1., {10, 8}]"#,
+    );
+  }
+  #[test]
+  fn number_form_11() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]"#,
+      r#"NumberForm[3.1415926535897932384626433832795028841971693993751058209749`33., 33]"#,
+    );
+  }
+  #[test]
+  fn number_form_12() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]"#,
+      r#"NumberForm[0.645658509, 6]"#,
+    );
+  }
+  #[test]
+  fn number_form_13() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]"#,
+      r#"NumberForm[0.14285714285714285, 30]"#,
+    );
+  }
+  #[test]
+  fn number_form_14() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]"#,
+      r#"NumberForm[{0, 2, -415, 83515161451}, 5]"#,
+    );
+  }
+  #[test]
+  fn number_form_15() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]"#,
+      r#"NumberForm[{10633823966279326983230456482242756608, 1.0633823966279327*^37}, 4, ExponentFunction -> (#1 & )]"#,
+    );
+  }
+  #[test]
+  fn number_form_16() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]"#,
+      r#"NumberForm[{0, 10, -512}, {10, 3}]"#,
+    );
+  }
+  #[test]
+  fn number_form_17() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]"#,
+      r#"NumberForm[1.5, -4]"#,
+    );
+  }
+  #[test]
+  fn number_form_18() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]"#,
+      r#"NumberForm[1.5, {1.5, 2}]"#,
+    );
+  }
+  #[test]
+  fn number_form_19() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]"#,
+      r#"NumberForm[1.5, {1, 2.5}]"#,
+    );
+  }
+  #[test]
+  fn number_form_20() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]"#,
+      r#"NumberForm[153., 2]"#,
+    );
+  }
+  #[test]
+  fn number_form_21() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]"#,
+      r#"NumberForm[0.00125, 1]"#,
+    );
+  }
+  #[test]
+  fn number_form_22() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]"#,
+      r#"NumberForm[314159.2653589793, {5, 3}]"#,
+    );
+  }
+  #[test]
+  fn number_form_23() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]"#,
+      r#"NumberForm[314159.2653589793, {6, 3}]"#,
+    );
+  }
+  #[test]
+  fn number_form_24() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]"#,
+      r#"NumberForm[314159.2653589793, {6, 10}]"#,
+    );
+  }
+  #[test]
+  fn number_form_25() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[1.`19., 10, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_26() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]"#,
+      r#"NumberForm[12345.123456789, 14, DigitBlock -> 3]"#,
+    );
+  }
+  #[test]
+  fn number_form_27() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]"#,
+      r#"NumberForm[12345.12345678, 14, DigitBlock -> 3]"#,
+    );
+  }
+  #[test]
+  fn number_form_28() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]"#,
+      r#"NumberForm[314159.2653589793, 15, DigitBlock -> {4, 2}]"#,
+    );
+  }
+  #[test]
+  fn number_form_29() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]"#,
+      r#"NumberForm[1.2345, 3, DigitBlock -> -4]"#,
+    );
+  }
+  #[test]
+  fn number_form_30() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]"#,
+      r#"NumberForm[1.2345, 3, DigitBlock -> x]"#,
+    );
+  }
+  #[test]
+  fn number_form_31() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]"#,
+      r#"NumberForm[1.2345, 3, DigitBlock -> {x, 3}]"#,
+    );
+  }
+  #[test]
+  fn number_form_32() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]"#,
+      r#"NumberForm[1.2345, 3, DigitBlock -> {5, -3}]"#,
+    );
+  }
+  #[test]
+  fn number_form_33() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]"#,
+      r#"NumberForm[12345.123456789, 14, ExponentFunction -> (#1 & )]"#,
+    );
+  }
+  #[test]
+  fn number_form_34() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]"#,
+      r#"NumberForm[12345.123456789, 14, ExponentFunction -> (Null & )]"#,
+    );
+  }
+  #[test]
+  fn set_5() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]"#,
+      r#"{1.1402564724682261*^-10, 0.003267763643053386, 93648.047476083, 2.683779414317762*^12, 7.691214220515705*^19}"#,
+    );
+  }
+  #[test]
+  fn number_form_35() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]"#,
+      r#"NumberForm[{1.1402564724682261*^-10, 0.003267763643053386, 93648.047476083, 2.683779414317762*^12, 7.691214220515705*^19}, 10, ExponentFunction -> (3*Quotient[#1, 3] & )]"#,
+    );
+  }
+  #[test]
+  fn number_form_36() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]"#,
+      r#"NumberForm[{1.1402564724682261*^-10, 0.003267763643053386, 93648.047476083, 2.683779414317762*^12, 7.691214220515705*^19}, 10, ExponentFunction -> (Null & )]"#,
+    );
+  }
+  #[test]
+  fn number_form_37() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]"#,
+      r#"NumberForm[3.141592653589793*^8, 10, ExponentStep -> 3]"#,
+    );
+  }
+  #[test]
+  fn number_form_38() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]"#,
+      r#"NumberForm[1.2345, 3, ExponentStep -> x]"#,
+    );
+  }
+  #[test]
+  fn number_form_39() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]"#,
+      r#"NumberForm[1.2345, 3, ExponentStep -> 0]"#,
+    );
+  }
+  #[test]
+  fn number_form_40() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]"#,
+      r#"NumberForm[{1.1402564724682261*^-10, 0.003267763643053386, 93648.047476083, 2.683779414317762*^12, 7.691214220515705*^19}, 10, ExponentStep -> 6]"#,
+    );
+  }
+  #[test]
+  fn number_form_41() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]"#,
+      r#"NumberForm[{1.1402564724682261*^-10, 0.003267763643053386, 93648.047476083, 2.683779414317762*^12, 7.691214220515705*^19}, 10, NumberFormat -> (#1 & )]"#,
+    );
+  }
+  #[test]
+  fn number_form_42() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]"#,
+      r#"NumberForm[1.2345, 3, NumberMultiplier -> 0]"#,
+    );
+  }
+  #[test]
+  fn number_form_43() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]"#,
+      r#"NumberForm[3.1415926535897933*^7, 15, NumberMultiplier -> "*"]"#,
+    );
+  }
+  #[test]
+  fn number_form_44() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]"#,
+      r#"NumberForm[1.2345, 5, NumberPoint -> ","]"#,
+    );
+  }
+  #[test]
+  fn number_form_45() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]"#,
+      r#"NumberForm[1.2345, 3, NumberPoint -> 0]"#,
+    );
+  }
+  #[test]
+  fn number_form_46() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]"#,
+      r#"NumberForm[1.41, {10, 5}]"#,
+    );
+  }
+  #[test]
+  fn number_form_47() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]"#,
+      r#"NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_48() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_49() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_50() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]"#,
+      r#"NumberForm[1.2345, 3, NumberPadding -> 0]"#,
+    );
+  }
+  #[test]
+  fn number_form_51() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]"#,
+      r#"NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]"#,
+    );
+  }
+  #[test]
+  fn number_form_52() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]"#,
+      r#"NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_53() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]"#,
+      r#"NumberForm[314159.2653589793, 15, DigitBlock -> 3, NumberSeparator -> " "]"#,
+    );
+  }
+  #[test]
+  fn number_form_54() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]"#,
+      r#"NumberForm[314159.2653589793, 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]"#,
+    );
+  }
+  #[test]
+  fn number_form_55() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]"#,
+      r#"NumberForm[314159.2653589793, 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]"#,
+    );
+  }
+  #[test]
+  fn number_form_56() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]"#,
+      r#"NumberForm[3.1415926535897933*^7, 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]"#,
+    );
+  }
+  #[test]
+  fn number_form_57() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]"#,
+      r#"NumberForm[1.2345, 3, NumberSeparator -> 0]"#,
+    );
+  }
+  #[test]
+  fn number_form_58() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]"#,
+      r#"NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_59() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]"#,
+      r#"NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]"#,
+    );
+  }
+  #[test]
+  fn number_form_60() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]"#,
+      r#"NumberForm[1.2345, 3, NumberSigns -> 0]"#,
+    );
+  }
+  #[test]
+  fn number_form_61() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_62() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_63() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_64() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]"#,
+      r#"NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]"#,
+    );
+  }
+  #[test]
+  fn number_form_65() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]"#,
+      r#"NumberForm[34, ExponentFunction -> (Null & )]"#,
+    );
+  }
+  #[test]
+  fn number_form_66() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]"#,
+      r#"NumberForm[50., {5, 1}]"#,
+    );
+  }
+  #[test]
+  fn number_form_67() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]"#,
+      r#"NumberForm[50, {5, 1}]"#,
+    );
+  }
+  #[test]
+  fn number_form_68() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]"#,
+      r#"NumberForm[43.157, {10, 1}]"#,
+    );
+  }
+  #[test]
+  fn number_form_69() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]"#,
+      r#"NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]"#,
+    );
+  }
+  #[test]
+  fn number_form_70() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]"#,
+      r#"NumberForm[80.96, {16, 1}]"#,
+    );
+  }
+  #[test]
+  fn number_form_71() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]"#,
+      r#"NumberForm[142.25, {10, 1}]"#,
+    );
+  }
+  #[test]
+  fn list_literal_2() {
+    // Same family as case 3837 — mathics rendered the contents to LaTeX
+    // `\text{$\{$hi, you$\}$}` (with another `\	ext` typo from a Python
+    // string-escape bug). wolframscript -code returns the unevaluated
+    // wrapper `TeXForm[InputForm[{hi, you}]]` verbatim. Woxi matches.
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]; {"hi","you"} //InputForm //TeXForm"#,
+      r#"TeXForm[InputForm[{hi, you}]]"#,
+    );
+  }
+  #[test]
+  fn te_x_form_1() {
+    // mathics rendered the contents to LaTeX `a+b c`; wolframscript -code
+    // returns the unevaluated wrapper `TeXForm[a + b*c]` verbatim. Woxi
+    // matches.
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]; {"hi","you"} //InputForm //TeXForm; a=.;b=.;c=.;TeXForm[a+b*c]"#,
+      r#"TeXForm[a + b*c]"#,
+    );
+  }
+  #[test]
+  fn te_x_form_2() {
+    // Same family as cases 3836/3837 — mathics rendered the contents
+    // to LaTeX `\text{a + b*c}` (with a `\	ext` typo from a Python
+    // string-escape bug). wolframscript -code returns the unevaluated
+    // wrapper `TeXForm[InputForm[a + b*c]]` verbatim. Woxi matches.
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]; {"hi","you"} //InputForm //TeXForm; a=.;b=.;c=.;TeXForm[a+b*c]; TeXForm[InputForm[a+b*c]]"#,
+      r#"TeXForm[InputForm[a + b*c]]"#,
+    );
+  }
+  #[test]
+  fn table_form() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]; {"hi","you"} //InputForm //TeXForm; a=.;b=.;c=.;TeXForm[a+b*c]; TeXForm[InputForm[a+b*c]]; TableForm[{}]"#,
+      r#"TableForm[{}]"#,
+    );
+  }
+  #[test]
+  fn list_literal_3() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]; {"hi","you"} //InputForm //TeXForm; a=.;b=.;c=.;TeXForm[a+b*c]; TeXForm[InputForm[a+b*c]]; TableForm[{}]; {{2*a, 0},{0,0}}//MatrixForm"#,
+      r#"MatrixForm[{{2*a, 0}, {0, 0}}]"#,
+    );
+  }
+  #[test]
+  fn number_form_72() {
+    assert_case(
+      r#"BaseForm[0, 2]; BaseForm[0.0, 2]; BaseForm[N[Pi, 30], 16]; InputForm[2 x ^ 2 + 4z!]; InputForm["\$"]; NumberForm[Pi, 20]; NumberForm[2/3, 10]; NumberForm[N[Pi]]; NumberForm[N[Pi, 20]]; NumberForm[14310983091809]; z0 = 0.0;z1 = 0.0000000000000000000000000000; NumberForm[{z0, z1}, 10]; NumberForm[{z0, z1}, {10, 4}]; z0=.;z1=.; NumberForm[1.0, 10]; NumberForm[1.000000000000000000000000, 10]; NumberForm[1.0, {10, 8}]; NumberForm[N[Pi, 33], 33]; NumberForm[0.645658509, 6]; NumberForm[N[1/7], 30]; NumberForm[{0, 2, -415, 83515161451}, 5]; NumberForm[{2^123, 2^123.}, 4, ExponentFunction -> ((#1) &)]; NumberForm[{0, 10, -512}, {10, 3}]; NumberForm[1.5, -4]; NumberForm[1.5, {1.5, 2}]; NumberForm[1.5, {1, 2.5}]; NumberForm[153., 2]; NumberForm[0.00125, 1]; NumberForm[10^5 N[Pi], {5, 3}]; NumberForm[10^5 N[Pi], {6, 3}]; NumberForm[10^5 N[Pi], {6, 10}]; NumberForm[1.0000000000000000000, 10, NumberPadding -> {"X", "Y"}]; NumberForm[12345.123456789, 14, DigitBlock -> 3]; NumberForm[12345.12345678, 14, DigitBlock -> 3]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}]; NumberForm[1.2345, 3, DigitBlock -> -4]; NumberForm[1.2345, 3, DigitBlock -> x]; NumberForm[1.2345, 3, DigitBlock -> {x, 3}]; NumberForm[1.2345, 3, DigitBlock -> {5, -3}]; NumberForm[12345.123456789, 14, ExponentFunction -> ((#) &)]; NumberForm[12345.123456789, 14, ExponentFunction -> (Null&)]; y = N[Pi^Range[-20, 40, 15]]; NumberForm[y, 10, ExponentFunction -> (3 Quotient[#, 3] &)]; NumberForm[y, 10, ExponentFunction -> (Null &)]; NumberForm[10^8 N[Pi], 10, ExponentStep -> 3]; NumberForm[1.2345, 3, ExponentStep -> x]; NumberForm[1.2345, 3, ExponentStep -> 0]; NumberForm[y, 10, ExponentStep -> 6]; NumberForm[y, 10, NumberFormat -> (#1 &)]; NumberForm[1.2345, 3, NumberMultiplier -> 0]; NumberForm[N[10^ 7 Pi], 15, NumberMultiplier -> "*"]; NumberForm[1.2345, 5, NumberPoint -> ","]; NumberForm[1.2345, 3, NumberPoint -> 0]; NumberForm[1.41, {10, 5}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"", "X"}]; NumberForm[1.41, {10, 5}, NumberPadding -> {"X", "Y"}]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}]; NumberForm[1.2345, 3, NumberPadding -> 0]; NumberForm[1.41, 10, NumberPadding -> {"X", "Y"}, NumberSigns -> {"-------------", ""}]; NumberForm[{1., -1., 2.5, -2.5}, {4, 6}, NumberPadding->{"X", "Y"}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> " "]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {" ", ","}]; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[N[10^ 7 Pi], 15, DigitBlock -> 3, NumberSeparator -> {",", " "}]; NumberForm[1.2345, 3, NumberSeparator -> 0]; NumberForm[1.2345, 5, NumberSigns -> {"-", "+"}]; NumberForm[-1.2345, 5, NumberSigns -> {"- ", ""}]; NumberForm[1.2345, 3, NumberSigns -> 0]; NumberForm[1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> True, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, 6, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[-1.234, {6, 4}, SignPadding -> False, NumberPadding -> {"X", "Y"}]; NumberForm[34, ExponentFunction->(Null&)]; NumberForm[50.0, {5, 1}]; NumberForm[50, {5, 1}]; NumberForm[43.157, {10, 1}]; NumberForm[43.15752525, {10, 5}, NumberSeparator -> ",", DigitBlock -> 1]; NumberForm[80.96, {16, 1}]; NumberForm[142.25, {10, 1}]; {"hi","you"} //InputForm //TeXForm; a=.;b=.;c=.;TeXForm[a+b*c]; TeXForm[InputForm[a+b*c]]; TableForm[{}]; {{2*a, 0},{0,0}}//MatrixForm; NumberForm[N[10^ 5 Pi], 15, DigitBlock -> {4, 2}, ExponentStep->x]"#,
+      r#"NumberForm[314159.2653589793, 15, DigitBlock -> {4, 2}, ExponentStep -> x]"#,
+    );
+  }
+  #[test]
+  fn string_form_7() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]"#,
+      r#"StringForm["This is symbol ``.", A]"#,
+    );
+  }
+  #[test]
+  fn string_form_8() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]"#,
+      r#"StringForm["This is symbol `1`.", A]"#,
+    );
+  }
+  #[test]
+  fn string_form_9() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]"#,
+      r#"StringForm["This is symbol `0`.", A]"#,
+    );
+  }
+  #[test]
+  fn string_form_10() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]"#,
+      r#"StringForm["This is symbol `symbol`.", A]"#,
+    );
+  }
+  #[test]
+  fn string_form_11() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]; StringForm["This is symbol `5`.", A]"#,
+      r#"StringForm["This is symbol `5`.", A]"#,
+    );
+  }
+  #[test]
+  fn string_form_12() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]; StringForm["This is symbol `5`.", A]; StringForm["This is symbol `2`, then `1`.", A, B]"#,
+      r#"StringForm["This is symbol `2`, then `1`.", A, B]"#,
+    );
+  }
+  #[test]
+  fn string_form_13() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]; StringForm["This is symbol `5`.", A]; StringForm["This is symbol `2`, then `1`.", A, B]; StringForm["This is symbol `1`, then ``.", A, B]"#,
+      r#"StringForm["This is symbol `1`, then ``.", A, B]"#,
+    );
+  }
+  #[test]
+  fn string_form_14() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]; StringForm["This is symbol `5`.", A]; StringForm["This is symbol `2`, then `1`.", A, B]; StringForm["This is symbol `1`, then ``.", A, B]; StringForm["This is symbol `2`, then ``.", A, B]"#,
+      r#"StringForm["This is symbol `2`, then ``.", A, B]"#,
+    );
+  }
+  #[test]
+  fn string_form_15() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]; StringForm["This is symbol `5`.", A]; StringForm["This is symbol `2`, then `1`.", A, B]; StringForm["This is symbol `1`, then ``.", A, B]; StringForm["This is symbol `2`, then ``.", A, B]; StringForm["This is symbol `.", A]"#,
+      r#"StringForm["This is symbol `.", A]"#,
+    );
+  }
+  #[test]
+  fn string_form_16() {
+    assert_case(
+      r#"StringForm["This is symbol ``.", A]; StringForm["This is symbol `1`.", A]; StringForm["This is symbol `0`.", A]; StringForm["This is symbol `symbol`.", A]; StringForm["This is symbol `5`.", A]; StringForm["This is symbol `2`, then `1`.", A, B]; StringForm["This is symbol `1`, then ``.", A, B]; StringForm["This is symbol `2`, then ``.", A, B]; StringForm["This is symbol `.", A]; StringForm["This is symbol \`.", A]"#,
+      r#"StringForm["This is symbol \`.", A]"#,
+    );
+  }
+  #[test]
+  fn string_replace_15() {
+    assert_case(
+      r#"a + b /. x_ + y_ -> {x, y}; StringReplace["h1d9a f483", DigitCharacter | WhitespaceCharacter -> ""]"#,
+      r#""hdaf""#,
+    );
+  }
+  #[test]
+  fn string_replace_16() {
+    assert_case(
+      r#"a + b /. x_ + y_ -> {x, y}; StringReplace["h1d9a f483", DigitCharacter | WhitespaceCharacter -> ""]; StringReplace["abc DEF 123!", Except[LetterCharacter, WordCharacter] -> "0"]"#,
+      r#""abc DEF 000!""#,
+    );
+  }
+  #[test]
+  fn expression() {
+    // mathics rendered `a:b:c` with surrounding spaces (`a : b : c`).
+    // wolframscript prints it tightly as `a:b:c`, which is what Woxi
+    // also produces.
+    assert_case(
+      r#"a + b /. x_ + y_ -> {x, y}; StringReplace["h1d9a f483", DigitCharacter | WhitespaceCharacter -> ""]; StringReplace["abc DEF 123!", Except[LetterCharacter, WordCharacter] -> "0"]; a:b:c"#,
+      r#"a:b:c"#,
+    );
+  }
+  #[test]
+  fn full_form() {
+    assert_case(
+      r#"a + b /. x_ + y_ -> {x, y}; StringReplace["h1d9a f483", DigitCharacter | WhitespaceCharacter -> ""]; StringReplace["abc DEF 123!", Except[LetterCharacter, WordCharacter] -> "0"]; a:b:c; FullForm[a:b:c]"#,
+      r#"FullForm[a:b:c]"#,
+    );
+  }
+  #[test]
+  fn to_string_23() {
+    assert_case(
+      r#"N[3^200]; N[2^1023]; N[2^1024]; p=N[Pi,100]; ToString[p]"#,
+      r#""3.141592653589793238462643383279502884197169399375105820974944592307816406286208998628034825342117068""#,
+    );
+  }
+  #[test]
+  fn n_1() {
+    assert_case(
+      r#"N[3^200]; N[2^1023]; N[2^1024]; p=N[Pi,100]; ToString[p]; N[1.012345678901234567890123, 20]"#,
+      r#"1.012345678901234567890123`20."#,
+    );
+  }
+  #[test]
+  fn n_2() {
+    assert_case(
+      r#"N[3^200]; N[2^1023]; N[2^1024]; p=N[Pi,100]; ToString[p]; N[1.012345678901234567890123, 20]; N[I, 30]"#,
+      r#"1.`30.*I"#,
+    );
+  }
+  #[test]
+  fn n_3() {
+    assert_case(
+      r#"N[3^200]; N[2^1023]; N[2^1024]; p=N[Pi,100]; ToString[p]; N[1.012345678901234567890123, 20]; N[I, 30]; N[1.012345678901234567890123, 50] //{#1, #1//Precision}&"#,
+      r#"{1.012345678901234567890123`24.0053288334574, 24.0053288334574}"#,
+    );
+  }
+  #[test]
+  fn head() {
+    assert_case(r#"Head[ByteArray[{1}]]"#, r#"ByteArray"#);
+  }
+  #[test]
+  fn order_1() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn order_2() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn order_3() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn order_4() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn order_5() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]; Order["a", 1000]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn order_6() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]; Order["a", 1000]; Order[0.9, 1]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn order_7() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]; Order["a", 1000]; Order[0.9, 1]; Order[1.2, 1]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn order_8() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]; Order["a", 1000]; Order[0.9, 1]; Order[1.2, 1]; Order[F[2], A[2]]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn order_9() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]; Order["a", 1000]; Order[0.9, 1]; Order[1.2, 1]; Order[F[2], A[2]]; Order[F[2], F[3]]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn order_10() {
+    assert_case(
+      r#"Order["c", "d"]; Order["d", "c"]; Order["c", ByteArray[{99}]]; Order[ByteArray[{1, 99}], "ZZZZZ"]; Order["xyzzy", "xyzzy"]; Order[ByteArray[{1, 99}], ByteArray[{2, 0}]]; Order["a", 1000]; Order[0.9, 1]; Order[1.2, 1]; Order[F[2], A[2]]; Order[F[2], F[3]]; Order[F[2, 3], F[2]]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn string_match_q_24() {
+    assert_case(r#"StringMatchQ["123245a6", DigitCharacter..]"#, r#"False"#);
+  }
+  #[test]
+  fn complement() {
+    assert_case(
+      r#"Complement[Alphabet["Swedish"], Alphabet["English"]]"#,
+      r#"{å, ä, ö}"#,
+    );
+  }
+  #[test]
+  fn to_expression_6() {
+    assert_case(r#"ToExpression["log(x)", StandardForm]"#, r#"log*x"#);
+  }
+  #[test]
+  fn characters_2() {
+    assert_case(r#"Characters["\\\` "]"#, r#"{\, \`,  }"#);
+  }
+  #[test]
+  fn string_take_10() {
+    assert_case(r#"StringTake["abcd", 0] // InputForm"#, r#"InputForm[""]"#);
+  }
+  #[test]
+  fn string_take_11() {
+    assert_case(
+      r#"StringTake["abcd", 0] // InputForm; StringTake["abcd", {3, 2}] // InputForm"#,
+      r#"InputForm[""]"#,
+    );
+  }
+  #[test]
+  fn string_take_12() {
+    assert_case(
+      r#"StringTake["abcd", 0] // InputForm; StringTake["abcd", {3, 2}] // InputForm; StringTake["", {1, 0}] // InputForm"#,
+      r#"InputForm[""]"#,
+    );
+  }
+  #[test]
+  fn to_character_code_2() {
+    assert_case(r#"ToCharacterCode[{"ab"}]"#, r#"{{97, 98}}"#);
+  }
+  #[test]
+  fn to_character_code_3() {
+    assert_case(
+      r#"ToCharacterCode[{"ab"}]; ToCharacterCode[{"\(A\)"}]"#,
+      r#"{{63433, 65, 63424}}"#,
+    );
+  }
+  #[test]
+  fn from_character_code_4() {
+    assert_case(r#"FromCharacterCode[{}] // InputForm"#, r#"InputForm[""]"#);
+  }
+  #[test]
+  fn from_character_code_5() {
+    // mathics rendered the result via the box-syntax escape `"\|010000"`;
+    // wolframscript -code emits the literal U+10000 character (the
+    // 4-byte UTF-8 sequence `f0 90 80 80`). Woxi matches wolframscript.
+    assert_case(
+      r#"FromCharacterCode[{}] // InputForm; FromCharacterCode[65536]"#,
+      "\u{10000}",
+    );
+  }
+  #[test]
+  fn expr_3() {
+    // Same family as case 3717 — `System`Convert`B64Dump`B64Encode`
+    // is an internal wolframscript package function neither side
+    // implements, so both return the unevaluated wrapper. The
+    // mathics-scraped expectation re-encodes the `∫` (and the
+    // following Wolfram private-use char) as Wolfram named characters
+    // of UTF-8 bytes interpreted as Latin-1 (mojibake). Woxi preserves
+    // the original UTF-8 string verbatim.
+    assert_case(
+      "System`Convert`B64Dump`B64Encode[\"∫ f  x\"]",
+      "System`Convert`B64Dump`B64Encode[∫ f  x]",
+    );
+  }
+  #[test]
+  fn set_6() {
+    assert_case(
+      r#"System`Convert`B64Dump`B64Encode["∫ f  x"]; System`Convert`B64Dump`B64Decode["4oirIGYg752MIHg="]"#,
+      r#"System`Convert`B64Dump`B64Decode["4oirIGYg752MIHg="]"#,
+    );
+  }
+  #[test]
+  fn string_cases_14() {
+    // Single-character `Except[c]..` lifts to a `[^c]+` regex so that
+    // `StringCases` no longer trips over the `regex` crate's lack of
+    // look-around. Mirrors the parseEntry pattern in build_summary.wls.
+    assert_case(
+      r#"StringCases["- [Title](path/to.md)", "- [" ~~ lbl:(Except["]"]..) ~~ "](" ~~ tgt:(Except[")"]..) ~~ ")" :> {lbl, tgt}, 1]"#,
+      r#"{{Title, path/to.md}}"#,
+    );
+  }
+
+  #[test]
+  fn string_cases_backreference_scans_positions() {
+    // A back-reference pattern (`a_ ~~ a_`) whose match fails its constraint
+    // at one start must not consume those characters: the doubled run is
+    // found at a later position. Previously greedy iteration skipped "ff".
+    assert_case(r#"StringCases["abcdeff", a_ ~~ a_]"#, r#"{ff}"#);
+    assert_case(r#"StringCases["mississippi", a_ ~~ a_]"#, r#"{ss, ss, pp}"#);
+    assert_case(r#"StringCases["hello", a_ ~~ a_]"#, r#"{ll}"#);
+    assert_case(r#"StringCases["aabbcc", a_ ~~ a_]"#, r#"{aa, bb, cc}"#);
+  }
+}
+
+mod padded_form {
+  use super::*;
+
+  #[test]
+  fn integer_spec_pads_to_width_n_plus_one() {
+    assert_eq!(interpret("ToString[PaddedForm[7, 4]]").unwrap(), "    7");
+    assert_eq!(
+      interpret("ToString[PaddedForm[123, 6]]").unwrap(),
+      "    123"
+    );
+    assert_eq!(interpret("ToString[PaddedForm[-7, 4]]").unwrap(), "   -7");
+  }
+
+  // A complex number is formatted part by part, with the sign of the
+  // imaginary part written as the operator joining them — the padding then
+  // lines the two magnitudes up. The whole complex used to pass through
+  // unformatted.
+  #[test]
+  fn a_complex_is_formatted_part_by_part() {
+    assert_eq!(
+      interpret("ToString[PaddedForm[0.35355 + 0.35355 I, {4, 3}]]").unwrap(),
+      " 0.354 +  0.354 I"
+    );
+    assert_eq!(
+      interpret("ToString[PaddedForm[-0.5 - 0.25 I, {4, 3}]]").unwrap(),
+      "-0.500 -  0.250 I"
+    );
+    assert_eq!(
+      interpret("ToString[NumberForm[1.23456 + 2.5 I, 3]]").unwrap(),
+      "1.23 + 2.5 I"
+    );
+    // A real is unaffected.
+    assert_eq!(
+      interpret("ToString[PaddedForm[1.23456, {4, 3}]]").unwrap(),
+      " 1.235"
+    );
+  }
+
+  #[test]
+  fn list_spec_rounds_and_pads() {
+    assert_eq!(
+      interpret("ToString[PaddedForm[12.345, {6, 2}]]").unwrap(),
+      "   12.35"
+    );
+    // Trailing zeros fill the fractional places
+    assert_eq!(
+      interpret("ToString[PaddedForm[-3.7, {5, 3}]]").unwrap(),
+      " -3.700"
+    );
+    assert_eq!(
+      interpret("ToString[PaddedForm[3.14159, {4, 1}]]").unwrap(),
+      "   3.1"
+    );
+  }
+
+  #[test]
+  fn bare_wrapper_echoes_unevaluated() {
+    assert_eq!(
+      interpret("PaddedForm[12.345, {6, 2}]").unwrap(),
+      "PaddedForm[12.345, {6, 2}]"
+    );
+    assert_eq!(interpret("PaddedForm[7, 4]").unwrap(), "PaddedForm[7, 4]");
+  }
+}
+
+mod string_take_drop_specs {
+  use super::*;
+
+  #[test]
+  fn over_take_and_drop_error() {
+    // Regression: these silently clamped before
+    assert_eq!(
+      interpret(r#"StringTake["abc", 5]"#).unwrap(),
+      "StringTake[abc, 5]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringTake::take: Cannot take positions 1 through 5 in \"abc\"."
+      )),
+      "expected take message, got {msgs:?}"
+    );
+    assert_eq!(
+      interpret(r#"StringDrop["abc", -5]"#).unwrap(),
+      "StringDrop[abc, -5]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringDrop::drop: Cannot drop positions -5 through -1 in \"abc\"."
+      )),
+      "expected drop message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn reversed_and_zero_ranges() {
+    // The adjacent reversed range is empty / a no-op; {1, 0} normalizes
+    // to the adjacent case
+    assert_eq!(interpret(r#"StringTake["abcdef", {3, 2}]"#).unwrap(), "");
+    assert_eq!(
+      interpret(r#"StringDrop["abcdef", {3, 2}]"#).unwrap(),
+      "abcdef"
+    );
+    assert_eq!(interpret(r#"StringTake["abcdef", {1, 0}]"#).unwrap(), "");
+    // Further reversed errors
+    assert_eq!(
+      interpret(r#"StringTake["abcdef", {3, 1}]"#).unwrap(),
+      "StringTake[abcdef, {3, 1}]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringTake::take: Cannot take positions 3 through 1 in \"abcdef\"."
+      )),
+      "expected take message, got {msgs:?}"
+    );
+    // Out-of-range single position (previously a hard error)
+    assert_eq!(
+      interpret(r#"StringTake["abc", {0}]"#).unwrap(),
+      "StringTake[abc, {0}]"
+    );
+  }
+
+  #[test]
+  fn none_all_and_upto() {
+    assert_eq!(interpret(r#"StringTake["abc", None]"#).unwrap(), "");
+    assert_eq!(interpret(r#"StringDrop["abc", None]"#).unwrap(), "abc");
+    assert_eq!(interpret(r#"StringDrop["abc", All]"#).unwrap(), "");
+    assert_eq!(interpret(r#"StringTake["abc", All]"#).unwrap(), "abc");
+    assert_eq!(interpret(r#"StringDrop["abcdef", UpTo[10]]"#).unwrap(), "");
+    assert_eq!(
+      interpret(r#"StringTake["abcdef", UpTo[10]]"#).unwrap(),
+      "abcdef"
+    );
+  }
+
+  #[test]
+  fn non_string_emits_strse() {
+    // Regression: StringTake[x, 2] returned x before
+    assert_eq!(interpret("StringTake[x, 2]").unwrap(), "StringTake[x, 2]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "StringTake::strse: A string or list of strings is expected at position 1 in StringTake[x, 2]."
+      )),
+      "expected strse message, got {msgs:?}"
+    );
+    assert_eq!(interpret("StringDrop[x, 2]").unwrap(), "StringDrop[x, 2]");
+  }
+
+  #[test]
+  fn steps_and_sublists_still_work() {
+    assert_eq!(
+      interpret(r#"StringTake["abcdef", {1, 5, 2}]"#).unwrap(),
+      "ace"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcdef", {6, 1, -2}]"#).unwrap(),
+      "fdb"
+    );
+    assert_eq!(
+      interpret(r#"StringDrop["abcdef", {1, 5, 2}]"#).unwrap(),
+      "bdf"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcdef", {{1, 2}, {3, 4}}]"#).unwrap(),
+      "{ab, cd}"
+    );
+    assert_eq!(
+      interpret(r#"StringTake[{"abcdef", "xyz"}, 2]"#).unwrap(),
+      "{ab, xy}"
+    );
+  }
+}
+
+mod longest_common_subsequence_positions_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn strings() {
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequencePositions["abcde", "ace"]"#)
+        .unwrap(),
+      "{{1, 1}, {1, 1}}"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequencePositions["abc", "xbc"]"#).unwrap(),
+      "{{2, 3}, {2, 3}}"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequencePositions["1234", "1224533324"]"#)
+        .unwrap(),
+      "{{1, 2}, {1, 2}}"
+    );
+  }
+
+  // Ties resolve to the earliest run in each argument.
+  #[test]
+  fn earliest_tie() {
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequencePositions["abcabc", "abc"]"#)
+        .unwrap(),
+      "{{1, 3}, {1, 3}}"
+    );
+  }
+
+  #[test]
+  fn lists() {
+    assert_eq!(
+      interpret("LongestCommonSubsequencePositions[{1, 2, 3}, {2, 3}]")
+        .unwrap(),
+      "{{2, 3}, {1, 2}}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSubsequencePositions[{1, 2, 3}, {1, 2, 3}]")
+        .unwrap(),
+      "{{1, 3}, {1, 3}}"
+    );
+  }
+
+  #[test]
+  fn no_common_is_empty() {
+    assert_eq!(
+      interpret(r#"LongestCommonSubsequencePositions["abc", "xyz"]"#).unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSubsequencePositions[{1, 2}, {3, 4}]").unwrap(),
+      "{}"
+    );
+  }
+}
+
+mod longest_common_sequence_positions_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn strings() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequencePositions["abcd", "acbd"]"#).unwrap(),
+      "{{{1, 2}, {4, 4}}, {{1, 1}, {3, 4}}}"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequencePositions["mathematica", "thematic"]"#)
+        .unwrap(),
+      "{{{3, 10}}, {{1, 8}}}"
+    );
+  }
+
+  #[test]
+  fn lists() {
+    assert_eq!(
+      interpret("LongestCommonSequencePositions[{1, 2, 3, 4}, {2, 4, 3}]")
+        .unwrap(),
+      "{{{2, 3}}, {{1, 1}, {3, 3}}}"
+    );
+    assert_eq!(
+      interpret(
+        "LongestCommonSequencePositions[{a, b, c, a, b}, {b, c, b, a}]"
+      )
+      .unwrap(),
+      "{{{2, 4}}, {{1, 2}, {4, 4}}}"
+    );
+  }
+
+  #[test]
+  fn no_common_is_empty() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequencePositions["abc", "xyz"]"#).unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret(r#"LongestCommonSequencePositions["", "abc"]"#).unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("LongestCommonSequencePositions[{}, {1, 2}]").unwrap(),
+      "{}"
+    );
+  }
+
+  // Mixed string/list arguments stay unevaluated, matching Wolfram.
+  #[test]
+  fn mixed_args_unevaluated() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequencePositions["abc", {1, 2}]"#).unwrap(),
+      "LongestCommonSequencePositions[abc, {1, 2}]"
+    );
+  }
+
+  // The spans cover exactly what LongestCommonSequence returns.
+  #[test]
+  fn consistent_with_longest_common_sequence() {
+    assert_eq!(
+      interpret(r#"LongestCommonSequence["abcd", "acbd"]"#).unwrap(),
+      "abd"
+    );
+    assert_eq!(
+      interpret("LongestCommonSequence[{a, b, c, a, b}, {b, c, b, a}]")
+        .unwrap(),
+      "{b, c, a}"
+    );
+  }
+}
+
+// DatePattern[{elements…}] / DatePattern[{…}, sep] in string patterns.
+// All outputs verified against wolframscript.
+mod date_pattern {
+  use super::*;
+
+  #[test]
+  fn basic_dates_and_times() {
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"3/15/1984\", DatePattern[{\"Month\", \"Day\", \"Year\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"00:38:16\", DatePattern[{\"Hour\", \"Minute\", \"Second\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    // Single-digit fields and two-digit years are fine.
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"24/1/5\", DatePattern[{\"Year\", \"Month\", \"Day\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"5:3:2\", DatePattern[{\"Hour\", \"Minute\", \"Second\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn default_separators() {
+    // The default separator is exactly one of / - . : — mixed freely,
+    // but spaces, doubling, or no separator do not match.
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"2024-01/05\", DatePattern[{\"Year\", \"Month\", \"Day\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"2024.01.05\", DatePattern[{\"Year\", \"Month\", \"Day\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    for bad in ["20240105", "2024 01 05", "2024--01--05"] {
+      assert_eq!(
+        interpret(&format!(
+          "StringMatchQ[\"{bad}\", DatePattern[{{\"Year\", \"Month\", \"Day\"}}]]"
+        ))
+        .unwrap(),
+        "False",
+        "{bad} should not match"
+      );
+    }
+  }
+
+  #[test]
+  fn explicit_separator() {
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"3-15-1984\", DatePattern[{\"Month\", \"Day\", \"Year\"}, \"-\"]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"3/15/1984\", DatePattern[{\"Month\", \"Day\", \"Year\"}, \"-\"]]"
+      )
+      .unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn field_ranges_are_validated() {
+    // Month 13, hour 24/25, second 60, and zero fields fail; but there
+    // is no calendar logic (April 31 matches).
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"13/45/1984\", DatePattern[{\"Month\", \"Day\", \"Year\"}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"25:00:00\", DatePattern[{\"Hour\", \"Minute\", \"Second\"}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"23:59:60\", DatePattern[{\"Hour\", \"Minute\", \"Second\"}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"0/0/1984\", DatePattern[{\"Month\", \"Day\", \"Year\"}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"31/4/2024\", DatePattern[{\"Day\", \"Month\", \"Year\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    // Years are 1 to 4 digits.
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"197/1/5\", DatePattern[{\"Year\", \"Month\", \"Day\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"19845/1/5\", DatePattern[{\"Year\", \"Month\", \"Day\"}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn names_and_literal_elements() {
+    // Literal strings in the element list are separators; day and month
+    // names match case-insensitively.
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"Wed, 15 Nov 2006\", DatePattern[{\"DayName\", \", \", \"Day\", \" \", \"MonthName\", \" \", \"Year\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[\"wed, 15 nov 2006\", DatePattern[{\"DayName\", \", \", \"Day\", \" \", \"MonthName\", \" \", \"Year\"}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("StringMatchQ[\"MONDAY\", DatePattern[{\"DayName\"}]]")
+        .unwrap(),
+      "True"
+    );
+    // Unknown element names are literals.
+    assert_eq!(
+      interpret("StringMatchQ[\"x\", DatePattern[{\"Foo\"}]]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn string_cases_extraction() {
+    assert_eq!(
+      interpret(
+        "StringCases[\"due 3/15/1984 or 12/1/22\", DatePattern[{\"Month\", \"Day\", \"Year\"}]]"
+      )
+      .unwrap(),
+      "{3/15/1984, 12/1/22}"
+    );
+  }
+}
+
+// The String* family refuses a first argument that is not a string (or a list
+// of strings, where it threads) instead of coercing it to its printed form.
+// Regression: StringDelete[foo, "a"] returned "foo", StringRotateLeft[foo, 1]
+// returned "oof", and StringRiffle[foo] aborted the whole evaluation.
+mod string_subject_conformance {
+  use super::*;
+
+  /// Every call is left unevaluated (echoed as `shown`, with strings
+  /// unquoted like every other echo) with `<name>::<tag>` reported.
+  fn refuses(call: &str, shown: &str, expected_message: &str) {
+    clear_state();
+    assert_eq!(interpret(call).unwrap(), shown, "for {call}");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(expected_message)),
+      "for {call}: got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn threading_functions_report_strse() {
+    for (call, shown) in [
+      ("StringTrim[foo]", "StringTrim[foo]"),
+      ("StringCases[foo, \"a\"]", "StringCases[foo, a]"),
+      ("StringCount[foo, \"a\"]", "StringCount[foo, a]"),
+      ("StringDelete[foo, \"a\"]", "StringDelete[foo, a]"),
+      ("StringInsert[foo, \"x\", 1]", "StringInsert[foo, x, 1]"),
+      ("StringPadLeft[foo, 3]", "StringPadLeft[foo, 3]"),
+      ("StringPadRight[foo, 3]", "StringPadRight[foo, 3]"),
+      ("StringPart[foo, 1]", "StringPart[foo, 1]"),
+      ("StringPosition[foo, \"a\"]", "StringPosition[foo, a]"),
+      (
+        "StringReplaceList[foo, \"a\" -> \"b\"]",
+        "StringReplaceList[foo, a -> b]",
+      ),
+      ("StringTakeDrop[foo, 1]", "StringTakeDrop[foo, 1]"),
+      ("StringFreeQ[foo, \"a\"]", "StringFreeQ[foo, a]"),
+      ("StringMatchQ[foo, \"a\"]", "StringMatchQ[foo, a]"),
+      ("StringStartsQ[foo, \"a\"]", "StringStartsQ[foo, a]"),
+      ("StringEndsQ[foo, \"a\"]", "StringEndsQ[foo, a]"),
+      ("StringContainsQ[foo, \"a\"]", "StringContainsQ[foo, a]"),
+    ] {
+      let name = call.split('[').next().unwrap();
+      refuses(
+        call,
+        shown,
+        &format!(
+          "{name}::strse: A string or list of strings is expected at \
+           position 1 in {shown}."
+        ),
+      );
+    }
+  }
+
+  // A bare index stands for the span {1, n}, and a span the string does not
+  // have is reported rather than raising a hard error.
+  #[test]
+  fn string_replace_part_index_and_out_of_range() {
+    use woxi::interpret_with_stdout;
+    assert_eq!(
+      interpret("StringReplacePart[\"abc\", \"x\", 2]").unwrap(),
+      "xc"
+    );
+    assert_eq!(
+      interpret("StringReplacePart[\"abcdef\", \"x\", {2, 4}]").unwrap(),
+      "axef"
+    );
+    assert_eq!(
+      interpret(
+        "StringReplacePart[\"abcdef\", {\"x\", \"y\"}, {{1, 2}, {4, 5}}]"
+      )
+      .unwrap(),
+      "xcyf"
+    );
+    for (call, shown, span) in [
+      (
+        "StringReplacePart[\"abc\", \"x\", 10]",
+        "StringReplacePart[abc, x, 10]",
+        "1 through 10",
+      ),
+      (
+        "StringReplacePart[\"abc\", \"x\", {1, 10}]",
+        "StringReplacePart[abc, x, {1, 10}]",
+        "1 through 10",
+      ),
+      (
+        "StringReplacePart[\"abc\", \"x\", {5, 6}]",
+        "StringReplacePart[abc, x, {5, 6}]",
+        "5 through 6",
+      ),
+      (
+        "StringReplacePart[\"abc\", {\"x\"}, {{1, 10}}]",
+        "StringReplacePart[abc, {x}, {{1, 10}}]",
+        "1 through 10",
+      ),
+    ] {
+      let r = interpret_with_stdout(call).unwrap();
+      assert_eq!(r.result, shown, "for {call}");
+      let expected = format!(
+        "StringReplacePart::repart: Cannot replace positions {span} in \"abc\"."
+      );
+      assert!(
+        r.warnings.contains(&expected),
+        "expected {:?} for {}, got {:?}",
+        expected,
+        call,
+        r.warnings
+      );
+    }
+  }
+
+  #[test]
+  fn single_string_functions_report_string() {
+    for (call, shown) in [
+      ("StringRotateLeft[foo, 1]", "StringRotateLeft[foo, 1]"),
+      ("StringRotateRight[foo, 1]", "StringRotateRight[foo, 1]"),
+      (
+        "StringReplacePart[foo, \"x\", {1, 2}]",
+        "StringReplacePart[foo, x, {1, 2}]",
+      ),
+      ("StringPartition[foo, 2]", "StringPartition[foo, 2]"),
+      ("StringRepeat[foo, 2]", "StringRepeat[foo, 2]"),
+      ("StringToByteArray[foo]", "StringToByteArray[foo]"),
+    ] {
+      let name = call.split('[').next().unwrap();
+      refuses(
+        call,
+        shown,
+        &format!("{name}::string: String expected at position 1 in {shown}."),
+      );
+    }
+  }
+
+  // These take a single string, so a list of strings is refused as well.
+  #[test]
+  fn single_string_functions_refuse_lists() {
+    refuses(
+      "StringPartition[{\"abcd\"}, 2]",
+      "StringPartition[{abcd}, 2]",
+      "StringPartition::string: String expected at position 1 in \
+       StringPartition[{abcd}, 2].",
+    );
+    refuses(
+      "StringRotateLeft[{\"abc\"}, 1]",
+      "StringRotateLeft[{abc}, 1]",
+      "StringRotateLeft::string: String expected at position 1 in \
+       StringRotateLeft[{abc}, 1].",
+    );
+    refuses(
+      "StringReplacePart[{\"abcd\"}, \"x\", {2, 3}]",
+      "StringReplacePart[{abcd}, x, {2, 3}]",
+      "StringReplacePart::string: String expected at position 1 in \
+       StringReplacePart[{abcd}, x, {2, 3}].",
+    );
+    refuses(
+      "StringRepeat[{\"a\"}, 2]",
+      "StringRepeat[{a}, 2]",
+      "StringRepeat::string: String expected at position 1 in \
+       StringRepeat[{a}, 2].",
+    );
+  }
+
+  // A number is not a string either.
+  #[test]
+  fn numbers_are_refused() {
+    refuses(
+      "StringLength[123]",
+      "StringLength[123]",
+      "StringLength::string: String expected at position 1 in \
+       StringLength[123].",
+    );
+    refuses(
+      "StringTake[123, 1]",
+      "StringTake[123, 1]",
+      "StringTake::strse: A string or list of strings is expected at \
+       position 1 in StringTake[123, 1].",
+    );
+    refuses(
+      "StringRotateLeft[123, 1]",
+      "StringRotateLeft[123, 1]",
+      "StringRotateLeft::string: String expected at position 1 in \
+       StringRotateLeft[123, 1].",
+    );
+    refuses(
+      "StringPartition[123, 2]",
+      "StringPartition[123, 2]",
+      "StringPartition::string: String expected at position 1 in \
+       StringPartition[123, 2].",
+    );
+  }
+
+  // StringRiffle wants a list; a symbol used to abort the whole evaluation
+  // with an interpreter error instead of reporting StringRiffle::list.
+  #[test]
+  fn string_riffle_reports_list() {
+    refuses(
+      "StringRiffle[foo]",
+      "StringRiffle[foo]",
+      "StringRiffle::list: List expected at position 1 in StringRiffle[foo].",
+    );
+    refuses(
+      "StringRiffle[foo, \",\"]",
+      "StringRiffle[foo, ,]",
+      "StringRiffle::list: List expected at position 1 in \
+       StringRiffle[foo, ,].",
+    );
+    // A list of non-strings is fine — its parts are converted.
+    assert_eq!(interpret("StringRiffle[{1, 2}]").unwrap(), "1 2");
+  }
+
+  // ToUpperCase, ToLowerCase and Characters stay unevaluated without a
+  // message, like wolframscript.
+  #[test]
+  fn case_functions_are_silent() {
+    clear_state();
+    assert_eq!(interpret("ToUpperCase[foo]").unwrap(), "ToUpperCase[foo]");
+    assert_eq!(interpret("ToLowerCase[foo]").unwrap(), "ToLowerCase[foo]");
+    assert_eq!(interpret("Characters[foo]").unwrap(), "Characters[foo]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(msgs.is_empty(), "got {msgs:?}");
+  }
+}
+
+// A list of strings is handled string by string, giving one result per string.
+mod string_list_threading {
+  use super::*;
+
+  #[test]
+  fn string_cases_nests_per_string() {
+    // Regression: the matches of every string used to be returned in a single
+    // flat list, losing which string they came from.
+    assert_eq!(
+      interpret("StringCases[{\"aba\", \"cd\"}, \"a\"]").unwrap(),
+      "{{a, a}, {}}"
+    );
+    assert_eq!(
+      interpret("StringCases[{\"aba\"}, \"a\" -> \"x\"]").unwrap(),
+      "{{x, x}}"
+    );
+    assert_eq!(
+      interpret("StringCases[{\"a1\", \"b2\"}, DigitCharacter]").unwrap(),
+      "{{1}, {2}}"
+    );
+    assert_eq!(
+      interpret("StringCases[{\"aba\", \"cd\"}, RegularExpression[\"a\"]]")
+        .unwrap(),
+      "{{a, a}, {}}"
+    );
+    // A single string still gives a flat list of matches.
+    assert_eq!(
+      interpret("StringCases[\"hello world\", WordCharacter ..]").unwrap(),
+      "{hello, world}"
+    );
+  }
+
+  #[test]
+  fn string_part_and_take_drop_thread() {
+    assert_eq!(interpret("StringPart[{\"ab\"}, 1]").unwrap(), "{a}");
+    assert_eq!(interpret("StringPart[\"abc\", {1, 2}]").unwrap(), "{a, b}");
+    // Each string gets its own {taken, dropped} pair.
+    assert_eq!(
+      interpret("StringTakeDrop[{\"ab\"}, 1]").unwrap(),
+      "{{a, b}}"
+    );
+    assert_eq!(interpret("StringTakeDrop[\"ab\", 1]").unwrap(), "{a, b}");
+  }
+
+  #[test]
+  fn string_replace_list_threads() {
+    assert_eq!(
+      interpret("StringReplaceList[{\"ab\"}, \"a\" -> \"b\"]").unwrap(),
+      "{{bb}}"
+    );
+    assert_eq!(
+      interpret("StringReplaceList[\"aa\", \"a\" -> \"b\"]").unwrap(),
+      "{ba, ab}"
+    );
+  }
+}
+
+// TeXForm lays a matrix out as a LaTeX array; the table heads differ in how
+// they handle rows that are not a matrix.
+mod tex_form_arrays {
+  use super::*;
+
+  const MATRIX_2X2: &str = "\\left(\n\\begin{array}{cc}\n 1 & 2 \\\\\n \
+                            3 & 4 \\\\\n\\end{array}\n\\right)";
+
+  #[test]
+  fn a_bare_matrix_becomes_an_array() {
+    // Regression: this used to render as the brace form \{\{1,2\},\{3,4\}\}.
+    assert_eq!(
+      interpret("ToString[TeXForm[{{1, 2}, {3, 4}}]]").unwrap(),
+      MATRIX_2X2
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[{{a}, {b}}]]").unwrap(),
+      "\\left(\n\\begin{array}{c}\n a \\\\\n b \\\\\n\\end{array}\n\\right)"
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[{{1, 2, 3}}]]").unwrap(),
+      "\\left(\n\\begin{array}{ccc}\n 1 & 2 & 3 \\\\\n\\end{array}\n\\right)"
+    );
+    // The entries are rendered as TeX in turn.
+    assert_eq!(
+      interpret("ToString[TeXForm[{{1/2, x}, {Sqrt[2], a + b}}]]").unwrap(),
+      "\\left(\n\\begin{array}{cc}\n \\frac{1}{2} & x \\\\\n \
+       \\sqrt{2} & a+b \\\\\n\\end{array}\n\\right)"
+    );
+  }
+
+  #[test]
+  fn only_a_rectangular_list_of_rows_is_a_matrix() {
+    // A vector, a ragged list and empty rows keep the brace form.
+    assert_eq!(interpret("ToString[TeXForm[{1, 2}]]").unwrap(), "\\{1,2\\}");
+    assert_eq!(
+      interpret("ToString[TeXForm[{{1, 2}, {3}}]]").unwrap(),
+      "\\{\\{1,2\\},\\{3\\}\\}"
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[{{}}]]").unwrap(),
+      "\\{\\{\\}\\}"
+    );
+    // The entries themselves may be lists: this is a one-column array.
+    assert_eq!(
+      interpret("ToString[TeXForm[{{{1, 2}}, {{3, 4}}}]]").unwrap(),
+      "\\left(\n\\begin{array}{c}\n \\{1,2\\} \\\\\n \\{3,4\\} \\\\\n\
+       \\end{array}\n\\right)"
+    );
+  }
+
+  // MatrixForm lays anything that is not a matrix out in a single column.
+  #[test]
+  fn matrix_form() {
+    assert_eq!(
+      interpret("ToString[TeXForm[MatrixForm[{{1, 2}, {3, 4}}]]]").unwrap(),
+      MATRIX_2X2
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[MatrixForm[{{1, 2}, {3}}]]]").unwrap(),
+      "\\left(\n\\begin{array}{c}\n \\{1,2\\} \\\\\n \\{3\\} \\\\\n\
+       \\end{array}\n\\right)"
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[MatrixForm[{1, 2}]]]").unwrap(),
+      "\\left(\n\\begin{array}{c}\n 1 \\\\\n 2 \\\\\n\\end{array}\n\\right)"
+    );
+    // A non-list argument is transparent.
+    assert_eq!(interpret("ToString[TeXForm[MatrixForm[x]]]").unwrap(), "x");
+  }
+
+  // TableForm pads short rows out to the widest one instead.
+  #[test]
+  fn table_form_pads_short_rows() {
+    assert_eq!(
+      interpret("ToString[TeXForm[TableForm[{{1}, {2, 3, 4}, {5, 6}}]]]")
+        .unwrap(),
+      "\\begin{array}{ccc}\n 1 & \\text{} & \\text{} \\\\\n \
+       2 & 3 & 4 \\\\\n 5 & 6 & \\text{} \\\\\n\\end{array}"
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[TableForm[{1, 2}]]]").unwrap(),
+      "\\begin{array}{c}\n 1 \\\\\n 2 \\\\\n\\end{array}"
+    );
+    assert_eq!(interpret("ToString[TeXForm[TableForm[x]]]").unwrap(), "x");
+  }
+
+  // Grid needs a list of rows; anything else stays as text, in brackets.
+  #[test]
+  fn grid_needs_rows() {
+    assert_eq!(
+      interpret("ToString[TeXForm[Grid[{{1, 2}, {3}}]]]").unwrap(),
+      "\\begin{array}{cc}\n 1 & 2 \\\\\n 3 & \\text{} \\\\\n\\end{array}"
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[Grid[{1, 2}]]]").unwrap(),
+      "\\text{Grid}[\\{1,2\\}]"
+    );
+    assert_eq!(
+      interpret("ToString[TeXForm[Grid[x]]]").unwrap(),
+      "\\text{Grid}[x]"
+    );
+  }
+}
+
+// CForm and FortranForm render an expression as C / Fortran source, which
+// means operator spellings and — for Fortran, whose `**` binds tighter than
+// everything — the parentheses the target language needs.
+mod c_and_fortran_form {
+  use super::*;
+
+  #[test]
+  fn fortran_power_parenthesizes() {
+    // Regression: these dropped the parentheses and produced wrong code —
+    // `(a + b)^2` came out as `a + b**2`.
+    assert_eq!(
+      interpret("ToString[FortranForm[(a + b)^2]]").unwrap(),
+      "(a + b)**2"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[x^(y + 1)]]").unwrap(),
+      "x**(1 + y)"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[(a^b)^c]]").unwrap(),
+      "(a**b)**c"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[E^(2 x)]]").unwrap(),
+      "E**(2*x)"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[x^(-a)]]").unwrap(),
+      "x**(-a)"
+    );
+    assert_eq!(interpret("ToString[FortranForm[x^-2]]").unwrap(), "x**(-2)");
+    // `**` is right-associative, so a power exponent needs no parentheses.
+    assert_eq!(
+      interpret("ToString[FortranForm[a^b^c]]").unwrap(),
+      "a**b**c"
+    );
+    assert_eq!(interpret("ToString[FortranForm[2^x]]").unwrap(), "2**x");
+    // A -1 exponent is a reciprocal instead.
+    assert_eq!(interpret("ToString[FortranForm[x^-1]]").unwrap(), "1/x");
+    assert_eq!(
+      interpret("ToString[FortranForm[1/(a + b)]]").unwrap(),
+      "1/(a + b)"
+    );
+  }
+
+  #[test]
+  fn sums_subtract_instead_of_adding_a_negative() {
+    // Regression: `a - b` used to print as `a + -b`.
+    assert_eq!(interpret("ToString[CForm[a - b]]").unwrap(), "a - b");
+    assert_eq!(
+      interpret("ToString[CForm[a - b - c]]").unwrap(),
+      "a - b - c"
+    );
+    assert_eq!(interpret("ToString[CForm[1 - x]]").unwrap(), "1 - x");
+    assert_eq!(interpret("ToString[CForm[3 - 2 x]]").unwrap(), "3 - 2*x");
+    assert_eq!(interpret("ToString[CForm[-(a + b)]]").unwrap(), "-a - b");
+    assert_eq!(
+      interpret("ToString[FortranForm[a - (b - c)]]").unwrap(),
+      "a - b + c"
+    );
+  }
+
+  #[test]
+  fn operator_spellings() {
+    // C uses its own operators; Fortran spells them between dots.
+    assert_eq!(interpret("ToString[CForm[x && y]]").unwrap(), "x && y");
+    assert_eq!(
+      interpret("ToString[CForm[And[a, b, c]]]").unwrap(),
+      "a && b && c"
+    );
+    assert_eq!(interpret("ToString[CForm[x || y]]").unwrap(), "x || y");
+    assert_eq!(interpret("ToString[CForm[Mod[a, b]]]").unwrap(), "a % b");
+    assert_eq!(
+      interpret("ToString[FortranForm[x && y]]").unwrap(),
+      "x.and.y"
+    );
+    assert_eq!(interpret("ToString[FortranForm[!x]]").unwrap(), ".not.x");
+    assert_eq!(interpret("ToString[FortranForm[x < y]]").unwrap(), "x.lt.y");
+    assert_eq!(
+      interpret("ToString[FortranForm[x <= y]]").unwrap(),
+      "x.le.y"
+    );
+    assert_eq!(interpret("ToString[FortranForm[x > y]]").unwrap(), "x.gt.y");
+    assert_eq!(
+      interpret("ToString[FortranForm[x >= y]]").unwrap(),
+      "x.ge.y"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[x == y]]").unwrap(),
+      "x.eq.y"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[x != y]]").unwrap(),
+      "x.ne.y"
+    );
+    // Fortran keeps Mod as a call, and a comparison chain becomes one.
+    assert_eq!(
+      interpret("ToString[FortranForm[Mod[a, b]]]").unwrap(),
+      "Mod(a,b)"
+    );
+    assert_eq!(
+      interpret("ToString[CForm[a < b < c]]").unwrap(),
+      "Less(a,b,c)"
+    );
+  }
+
+  #[test]
+  fn complex_numbers_and_infinities() {
+    assert_eq!(
+      interpret("ToString[CForm[1 + 2 I]]").unwrap(),
+      "Complex(1,2)"
+    );
+    assert_eq!(interpret("ToString[CForm[2 I]]").unwrap(), "Complex(0,2)");
+    assert_eq!(
+      interpret("ToString[CForm[1.5 + 2.5 I]]").unwrap(),
+      "Complex(1.5,2.5)"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[3 - 4 I]]").unwrap(),
+      "(3,-4)"
+    );
+    assert_eq!(
+      interpret("ToString[CForm[Infinity]]").unwrap(),
+      "DirectedInfinity(1)"
+    );
+    assert_eq!(
+      interpret("ToString[CForm[-Infinity]]").unwrap(),
+      "DirectedInfinity(-1)"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[ComplexInfinity]]").unwrap(),
+      "DirectedInfinity()"
+    );
+  }
+
+  // Reals switch to exponent notation outside a decimal exponent of ±6.
+  #[test]
+  fn real_number_notation() {
+    assert_eq!(interpret("ToString[CForm[100000.]]").unwrap(), "100000.");
+    assert_eq!(interpret("ToString[CForm[1000000.]]").unwrap(), "1.e6");
+    assert_eq!(interpret("ToString[CForm[0.00001]]").unwrap(), "0.00001");
+    assert_eq!(interpret("ToString[CForm[1.5*^-10]]").unwrap(), "1.5e-10");
+    assert_eq!(interpret("ToString[CForm[1.5*^100]]").unwrap(), "1.5e100");
+    assert_eq!(interpret("ToString[FortranForm[1.5*^7]]").unwrap(), "1.5e7");
+    assert_eq!(interpret("ToString[CForm[123456.7]]").unwrap(), "123456.7");
+    assert_eq!(interpret("ToString[CForm[0.001]]").unwrap(), "0.001");
+  }
+
+  #[test]
+  fn curried_calls_and_roots() {
+    assert_eq!(interpret("ToString[CForm[f[x][y]]]").unwrap(), "f(x)(y)");
+    assert_eq!(
+      interpret("ToString[CForm[D[f[x], x]]]").unwrap(),
+      "Derivative(1)(f)(x)"
+    );
+    assert_eq!(
+      interpret("ToString[CForm[Sqrt[2]/2]]").unwrap(),
+      "1/Sqrt(2)"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[Sqrt[2]/2]]").unwrap(),
+      "1/Sqrt(2)"
+    );
+    assert_eq!(
+      interpret("ToString[FortranForm[Sqrt[a + b]]]").unwrap(),
+      "Sqrt(a + b)"
+    );
+  }
+}
+
+// `$1`… backreferences expand into the replacement before it is evaluated, so
+// they reach string literals inside a compound right-hand side.
+mod regex_backreferences_in_delayed_rules {
+  use super::*;
+
+  #[test]
+  fn a_compound_replacement_still_sees_the_captures() {
+    // Regression: the RHS was evaluated with the literal "$1" left in place.
+    assert_eq!(
+      interpret(
+        "StringReplace[\"abc\", RegularExpression[\"(b)\"] :> \"<\" <> \"$1\" <> \">\"]"
+      )
+      .unwrap(),
+      "a<b>c"
+    );
+    assert_eq!(
+      interpret(
+        "StringCases[\"ab\", RegularExpression[\"(a)\"] :> \"[\" <> \"$1\" <> \"]\"]"
+      )
+      .unwrap(),
+      "{[a]}"
+    );
+    // The expansion happens first, so the function sees the captured text.
+    assert_eq!(
+      interpret(
+        "StringReplace[\"abc\", RegularExpression[\"(b)\"] :> ToUpperCase[\"$1\"]]"
+      )
+      .unwrap(),
+      "aBc"
+    );
+  }
+
+  #[test]
+  fn plain_string_replacements_are_unchanged() {
+    assert_eq!(
+      interpret(
+        "StringReplace[\"abc\", RegularExpression[\"(b)\"] :> \"$1$1\"]"
+      )
+      .unwrap(),
+      "abbc"
+    );
+    assert_eq!(
+      interpret(
+        "StringReplace[\"abc\", RegularExpression[\"(b)\"] -> \"$1$1\"]"
+      )
+      .unwrap(),
+      "abbc"
+    );
+    assert_eq!(
+      interpret(
+        "StringReplace[\"2024-01-02\", \
+         RegularExpression[\"(\\\\d+)-(\\\\d+)-(\\\\d+)\"] -> \"$3/$2/$1\"]"
+      )
+      .unwrap(),
+      "02/01/2024"
+    );
+  }
+
+  // Only a RegularExpression pattern gives `$1` its meaning; a literal or
+  // symbolic string pattern leaves it alone.
+  #[test]
+  fn literal_patterns_do_not_expand() {
+    assert_eq!(
+      interpret("StringReplace[\"abc\", \"b\" :> \"$1\"]").unwrap(),
+      "a$1c"
+    );
+    assert_eq!(
+      interpret("StringReplace[\"abc\", \"b\" :> \"<\" <> \"$1\" <> \">\"]")
+        .unwrap(),
+      "a<$1>c"
+    );
+    assert_eq!(
+      interpret("StringReplace[\"abc\", LetterCharacter :> \"$1\"]").unwrap(),
+      "$1$1$1"
+    );
+  }
+}
+
+#[test]
+fn to_string_keeps_the_trailing_spaces_of_a_string() {
+  clear_state();
+  // A 2D layout pads its lines to a common width and those pad columns are
+  // stripped — but a single-line rendering carries no padding, so a string
+  // that ends in spaces keeps them (and a Row separator survives).
+  assert_eq!(interpret(r#"StringLength[ToString[" x "]]"#).unwrap(), "3");
+  assert_eq!(
+    interpret(r#"ToString[Row[{1, 2, 3}, ", "]]"#).unwrap(),
+    "1, 2, 3"
+  );
+  assert_eq!(interpret(r#"ToString[Row[{1, 2}, "  "]]"#).unwrap(), "1  2");
+}
+
+mod text_string_numbers {
+  use super::*;
+
+  #[test]
+  fn a_real_is_written_in_full_decimal() {
+    clear_state();
+    for (code, expected) in [
+      // A fractional digit is kept while the integer part is shorter than the
+      // six significant digits of machine display.
+      ("TextString[1.0]", "1.0"),
+      ("TextString[2.]", "2.0"),
+      ("TextString[0.0]", "0.0"),
+      ("TextString[-100.]", "-100.0"),
+      ("TextString[99999.]", "99999.0"),
+      ("TextString[123456.]", "123456."),
+      ("TextString[999999.]", "999999."),
+      // Never the `*^` notation ToString switches to.
+      ("TextString[1234567.]", "1234567."),
+      ("TextString[123456789.]", "123456789."),
+      ("TextString[1.5*^10]", "15000000000."),
+      ("TextString[1.23456789]", "1.23457"),
+      ("TextString[0.00001234]", "0.00001234"),
+      ("TextString[-2.5]", "-2.5"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn an_exact_number_is_numericized() {
+    clear_state();
+    for (code, expected) in [
+      ("TextString[1/3]", "0.333333"),
+      ("TextString[-2/7]", "-0.285714"),
+      ("TextString[1/2]", "0.5"),
+      ("TextString[1/2 + 1/3]", "0.833333"),
+      ("TextString[Sqrt[2]]", "1.41421"),
+      ("TextString[Sqrt[2] + 1]", "2.41421"),
+      ("TextString[2^(1/3)]", "1.25992"),
+      ("TextString[Log[2]]", "0.693147"),
+      ("TextString[Sin[1]]", "0.841471"),
+      ("TextString[Sin[Pi/3]]", "0.866025"),
+      ("TextString[Pi/2]", "1.5708"),
+      ("TextString[2 Pi]", "6.28319"),
+      ("TextString[Pi^2]", "9.8696"),
+      ("TextString[E^2]", "7.38906"),
+      ("TextString[1/3 + Pi]", "3.47493"),
+      // An integer stays exact, however large.
+      ("TextString[10]", "10"),
+      ("TextString[10^20]", "100000000000000000000"),
+      ("TextString[2^70]", "1180591620717411303424"),
+      // And so does an extended-precision number.
+      ("TextString[N[Pi, 20]]", "3.1415926535897932385"),
+      ("TextString[N[1/3, 20]]", "0.33333333333333333333"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn a_bare_symbol_is_not_numericized() {
+    clear_state();
+    for (code, expected) in [
+      ("TextString[Pi]", "Pi"),
+      ("TextString[E]", "E"),
+      ("TextString[GoldenRatio]", "GoldenRatio"),
+      ("TextString[Degree]", "Degree"),
+      ("TextString[Indeterminate]", "Indeterminate"),
+      ("TextString[True]", "True"),
+      ("TextString[abc]", "abc"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn a_complex_number_shows_both_parts() {
+    clear_state();
+    for (code, expected) in [
+      ("TextString[1.5 + 2.5 I]", "1.5 + 2.5i"),
+      ("TextString[I]", "0 + 1.0i"),
+      ("TextString[2 + 3 I]", "2 + 3.0i"),
+      ("TextString[-1.5 I]", "0.0 - 1.5i"),
+      ("TextString[Sqrt[-4]]", "0 + 2.0i"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn infinities_and_missing_values() {
+    clear_state();
+    assert_eq!(interpret("TextString[Infinity]").unwrap(), "\u{221e}");
+    assert_eq!(interpret("TextString[-Infinity]").unwrap(), "-\u{221e}");
+    assert_eq!(
+      interpret("TextString[ComplexInfinity]").unwrap(),
+      "\u{221e}"
+    );
+    // A missing value contributes nothing to the text.
+    assert_eq!(interpret("TextString[Missing[]]").unwrap(), "");
+    assert_eq!(interpret(r#"TextString[Missing["x"]]"#).unwrap(), "");
+    assert_eq!(
+      interpret(r#"TextString[{Missing["x"], 1}]"#).unwrap(),
+      "{, 1}"
+    );
+  }
+
+  #[test]
+  fn lists_and_associations_apply_the_rules_element_wise() {
+    clear_state();
+    for (code, expected) in [
+      ("TextString[{1/2, Pi}]", "{0.5, Pi}"),
+      ("TextString[{{1/2}}]", "{{0.5}}"),
+      (r#"TextString[<|"a" -> 1/2|>]"#, "<|a -> 0.5|>"),
+      (r#"TextString[{1.5, "a"}]"#, "{1.5, a}"),
+      ("TextString[{}]", "{}"),
+      ("TextString[Range[3]]", "{1, 2, 3}"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+}
+
+mod snippet {
+  use super::*;
+
+  #[test]
+  fn it_takes_the_opening_lines() {
+    clear_state();
+    for (code, expected) in [
+      // One line by default, and a short text comes back whole.
+      (r#"Snippet["a b c d e", 2]"#, "a b c d e"),
+      (r#"Snippet["line one\nline two\nline three"]"#, "line one"),
+      (
+        r#"Snippet["line one\nline two\nline three", 2]"#,
+        "line one\nline two",
+      ),
+      (r#"Snippet["a\nb", 5]"#, "a\nb"),
+      // The spec selects lines the way Take selects elements.
+      (r#"Snippet["a\nb\nc", -1]"#, "c"),
+      (r#"Snippet["a\nb\nc\nd", 2 ;; 3]"#, "b\nc"),
+      (r#"Snippet["a\nb\nc\nd", ;; 2]"#, "a\nb"),
+      (r#"Snippet["a\nb\nc", 2 ;;]"#, "b\nc"),
+      // A blank line counts.
+      (r#"Snippet["a\n\nb", 2]"#, "a\n"),
+      (r#"Snippet[""]"#, ""),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn a_line_is_cut_at_eighty_characters() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringLength[Snippet[StringRepeat["x", 200]]]"#).unwrap(),
+      "80"
+    );
+    // Each line is cut on its own: 80 + newline + 80.
+    assert_eq!(
+      interpret(
+        r#"s = StringRepeat["x", 200]; StringLength[Snippet[s <> "\n" <> s, 2]]"#
+      )
+      .unwrap(),
+      "161"
+    );
+  }
+
+  #[test]
+  fn content_and_specification_are_checked() {
+    clear_state();
+    let result = interpret_with_stdout("Snippet[123]").unwrap();
+    assert_eq!(result.result, "$Failed");
+    assert!(
+      result
+        .warnings
+        .iter()
+        .any(|m| m.starts_with("Snippet::invcnt")),
+      "expected an invcnt message, got {:?}",
+      result.warnings
+    );
+    for code in [r#"Snippet["a\nb", 0]"#, r#"Snippet["a\nb", 2.5]"#] {
+      let result = interpret_with_stdout(code).unwrap();
+      assert_eq!(result.result, "$Failed", "{code}");
+      assert!(
+        result
+          .warnings
+          .iter()
+          .any(|m| m.starts_with("Snippet::invspec")),
+        "expected an invspec message for {code}, got {:?}",
+        result.warnings
+      );
+    }
+    // `All` is left as written.
+    assert_eq!(
+      interpret(r#"ToString[Snippet["a\nb", All], InputForm]"#).unwrap(),
+      "Snippet[\"a\\nb\", All]"
+    );
+  }
+}
+
+mod date_pattern_fields {
+  use super::*;
+
+  #[test]
+  fn a_two_digit_field_is_read_whole() {
+    clear_state();
+    // The field alternatives run longest first, so a day written "15" is not
+    // read as just its "1".
+    for (code, expected) in [
+      (
+        r#"StringCases["2024-01-15", DatePattern[{"Year", "Month", "Day"}]]"#,
+        "{2024-01-15}",
+      ),
+      (
+        r#"StringCases["2024-12-25", DatePattern[{"Year", "Month", "Day"}]]"#,
+        "{2024-12-25}",
+      ),
+      (
+        r#"StringCases["2024-10-30", DatePattern[{"Year", "Month", "Day"}]]"#,
+        "{2024-10-30}",
+      ),
+      (
+        r#"StringCases["31/12/1999", DatePattern[{"Day", "Month", "Year"}]]"#,
+        "{31/12/1999}",
+      ),
+      // Single-digit and zero-padded fields still read whole.
+      (
+        r#"StringCases["2024-1-5", DatePattern[{"Year", "Month", "Day"}]]"#,
+        "{2024-1-5}",
+      ),
+      (
+        r#"StringCases["2024-01-05", DatePattern[{"Year", "Month", "Day"}]]"#,
+        "{2024-01-05}",
+      ),
+      (
+        r#"StringCases["23:45", DatePattern[{"Hour", "Minute"}]]"#,
+        "{23:45}",
+      ),
+      (
+        r#"StringCases["09:05", DatePattern[{"Hour", "Minute"}]]"#,
+        "{09:05}",
+      ),
+      (
+        r#"StringCases["19:59:59", DatePattern[{"Hour", "Minute", "Second"}]]"#,
+        "{19:59:59}",
+      ),
+      // A field out of range still matches nothing.
+      (
+        r#"StringCases["2024-13-01", DatePattern[{"Year", "Month", "Day"}]]"#,
+        "{}",
+      ),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+}
+
+#[test]
+fn look_around_is_supported_by_the_backtracking_engine() {
+  clear_state();
+  // The linear-time engine has no look-around, so a pattern using it is
+  // handed to the backtracking one instead of being refused.
+  let result = interpret_with_stdout(
+    r#"StringSplit["camelCase", RegularExpression["(?=[A-Z])"]]"#,
+  )
+  .unwrap();
+  assert_eq!(result.result, "{camel, Case}");
+  assert!(
+    !result
+      .warnings
+      .iter()
+      .any(|m| m.starts_with("RegularExpression::badregex")),
+    "a supported pattern should not be reported, got {:?}",
+    result.warnings
+  );
+}
+
+/// TeXForm details checked against wolframscript in July 2026: the Greek
+/// tables, arrow spacing, associations, limits, machine-real display,
+/// complex atoms, escaped text and superscript quotients.
+mod tex_form_conformance {
+  use super::*;
+
+  fn tex(input: &str) -> String {
+    interpret(&format!("ToString[TeXForm[{input}]]")).unwrap()
+  }
+
+  #[test]
+  fn greek_names_and_characters() {
+    // Only the lower-case spellings carry a macro; the capitalised names are
+    // ordinary symbols (`Pi` is the constant, so it keeps \pi).
+    assert_eq!(tex("alpha"), "\\alpha");
+    assert_eq!(tex("Alpha"), "\\text{Alpha}");
+    assert_eq!(tex("Beta"), "\\text{Beta}");
+    assert_eq!(tex("Pi"), "\\pi");
+    // The characters themselves map to the macro, capitals included.
+    assert_eq!(tex("\\[Alpha]"), "\\alpha");
+    assert_eq!(tex("\\[Omega]"), "\\omega");
+    assert_eq!(tex("\\[CapitalGamma]"), "\\Gamma");
+    assert_eq!(tex("\\[CapitalOmega]"), "\\Omega");
+    // Capitals that look like a Latin letter render as that letter.
+    assert_eq!(tex("\\[CapitalAlpha]"), "A");
+    assert_eq!(tex("\\[CapitalRho]"), "P");
+    // The curly variants have their own macros.
+    assert_eq!(tex("\\[CurlyPhi]"), "\\varphi");
+    assert_eq!(tex("\\[CurlyEpsilon]"), "\\varepsilon");
+  }
+
+  #[test]
+  fn rules_and_associations() {
+    assert_eq!(tex("x -> y"), "x\\to y");
+    // A macro on the left needs the separating space.
+    assert_eq!(tex("\\[Alpha] -> y"), "\\alpha \\to y");
+    assert_eq!(tex("x :> y"), "x:\\to y");
+    assert_eq!(tex("{a -> b, c -> d}"), "\\{a\\to b,c\\to d\\}");
+    assert_eq!(
+      tex("<|a -> 1, b -> 2|>"),
+      "\\unicode{f113}a\\to 1,b\\to 2\\unicode{f114}"
+    );
+    assert_eq!(tex("<||>"), "\\unicode{f113}\\unicode{f114}");
+  }
+
+  #[test]
+  fn limits_set_the_point_under_lim() {
+    assert_eq!(
+      tex("Limit[f[x], x -> 0]"),
+      "\\underset{x\\to 0}{\\text{lim}}f(x)"
+    );
+    assert_eq!(
+      tex("Limit[f[x], x -> 0, Direction -> \"FromAbove\"]"),
+      "\\underset{x\\to 0^+}{\\text{lim}}f(x)"
+    );
+    assert_eq!(
+      tex("Limit[f[x], x -> 0, Direction -> 1]"),
+      "\\underset{x\\to 0^-}{\\text{lim}}f(x)"
+    );
+  }
+
+  #[test]
+  fn machine_reals_use_the_display_form() {
+    // Six significant figures, and scientific notation past 1e6.
+    assert_eq!(tex("N[Pi]"), "3.14159");
+    assert_eq!(tex("1/3."), "0.333333");
+    assert_eq!(tex("123456.7"), "123457.");
+    assert_eq!(tex("1234567.89"), "1.23457\\times 10^6");
+    assert_eq!(tex("1.*10^10"), "1.\\times 10^{10}");
+    assert_eq!(tex("0.00001"), "0.00001");
+  }
+
+  #[test]
+  fn complex_numbers_print_as_one_atom() {
+    // Real part first, and bracketed when other terms surround it.
+    assert_eq!(tex("Complex[1, 2]"), "1+2 i");
+    assert_eq!(tex("2 - 3 I"), "2-3 i");
+    assert_eq!(tex("1/2 + 3 I"), "\\frac{1}{2}+3 i");
+    assert_eq!(tex("x + 2 I"), "x+2 i");
+    assert_eq!(tex("3 I + x + 1"), "x+(1+3 i)");
+    // A non-negative machine-real real part is set off with a thin space.
+    assert_eq!(tex("2. - 3.5 I"), "2.\\, -3.5 i");
+    assert_eq!(tex("1.5 + 2 I"), "1.5\\, +2. i");
+    assert_eq!(tex("-2. + 3.5 I"), "-2.+3.5 i");
+  }
+
+  #[test]
+  fn text_runs_escape_special_characters() {
+    assert_eq!(tex("\"a_b\""), "\\text{a$\\_$b}");
+    assert_eq!(tex("\"a#b\""), "\\text{a$\\#$b}");
+    assert_eq!(tex("\"a&b\""), "\\text{a$\\&$b}");
+    assert_eq!(tex("\"a^b\""), "\\text{a${}^{\\wedge}$b}");
+    assert_eq!(tex("\"a~b\""), "\\text{a$\\sim $b}");
+    assert_eq!(tex("\"a b\""), "\\text{a b}");
+  }
+
+  #[test]
+  fn superscripts_keep_quotients_inline() {
+    assert_eq!(tex("x^(3/2)"), "x^{3/2}");
+    assert_eq!(tex("x^(2 a/3)"), "x^{2 a/3}");
+    assert_eq!(tex("E^(-x/2)"), "e^{-x/2}");
+    assert_eq!(tex("x^(a/b)"), "x^{a/b}");
+    // A sum in either half stays stacked, and so does a negative quotient
+    // over a symbolic denominator.
+    assert_eq!(tex("x^(a/(b + c))"), "x^{\\frac{a}{b+c}}");
+    assert_eq!(tex("x^(-a/b)"), "x^{-\\frac{a}{b}}");
+    // Negative numeric exponents move into a denominator.
+    assert_eq!(tex("x^(-3/2)"), "\\frac{1}{x^{3/2}}");
+    assert_eq!(tex("x^(-1/2)"), "\\frac{1}{\\sqrt{x}}");
+    // A macro base needs a space before the caret.
+    assert_eq!(tex("Pi^2"), "\\pi ^2");
+    assert_eq!(tex("Sum[1/n^2, {n, 1, Infinity}]"), "\\frac{\\pi ^2}{6}");
+  }
+
+  #[test]
+  fn set_operations_quantifiers_and_connectives() {
+    assert_eq!(tex("Union[a, b]"), "a\\cup b");
+    assert_eq!(tex("Intersection[a, b]"), "a\\cap b");
+    assert_eq!(tex("Subset[a, b]"), "a\\subset b");
+    assert_eq!(tex("SubsetEqual[a, b]"), "a\\subseteq b");
+    assert_eq!(tex("ForAll[x, P[x]]"), "\\forall _xP(x)");
+    assert_eq!(tex("Exists[x, P[x]]"), "\\exists _xP(x)");
+    assert_eq!(tex("Equivalent[a, b]"), "a\\unicode{29e6}b");
+    assert_eq!(tex("Nand[a, b]"), "a\\barwedge b");
+    assert_eq!(tex("Nor[a, b]"), "a\\bar{\\vee}b");
+    assert_eq!(tex("Xor[a, b]"), "a\\veebar b");
+  }
+
+  #[test]
+  fn special_functions_and_display_wrappers() {
+    assert_eq!(tex("Zeta[2, x]"), "\\zeta (2,x)");
+    assert_eq!(tex("StieltjesGamma[1]"), "\\gamma _1");
+    assert_eq!(tex("StieltjesGamma[10]"), "\\gamma _{10}");
+    assert_eq!(tex("Hypergeometric2F1[a, b, c, x]"), "\\, _2F_1(a,b;c;x)");
+    // Styling wrappers are transparent; Row concatenates; Column stacks.
+    assert_eq!(tex("Style[x, Red]"), "x");
+    assert_eq!(tex("Defer[a b]"), "a b");
+    assert_eq!(tex("Row[{1, 2, 3}]"), "123");
+    assert_eq!(tex("Row[{a, b}, \",\"]"), "a,b");
+    assert_eq!(
+      tex("Column[{1, 2}]"),
+      "\\begin{array}{l}\n 1 \\\\\n 2 \\\\\n\\end{array}"
+    );
+    assert_eq!(
+      tex("Underoverscript[Sum, i, n]"),
+      "\\underset{i}{\\overset{n}{\\text{Sum}}}"
+    );
+    // An inactive call typesets like the active one, with an explicit
+    // multiplication sign for Times.
+    assert_eq!(tex("Inactive[Plus][a, b]"), "a+b");
+    assert_eq!(tex("Inactive[Times][a, b]"), "a\\times b");
+    assert_eq!(tex("Inactive[Sin][x]"), "\\sin (x)");
+  }
+}
+
+mod character_normalize {
+  use super::*;
+
+  /// Code points in, code points out — keeps the test source ASCII-only so
+  /// nothing depends on the encoding of this file.
+  fn norm(codes: &str, form: &str) -> String {
+    interpret(&format!(
+      "ToCharacterCode[CharacterNormalize[FromCharacterCode[{{{codes}}}], \"{form}\"]]"
+    ))
+    .unwrap()
+  }
+
+  #[test]
+  fn canonical_decomposition_and_composition() {
+    clear_state();
+    // U+00C5 (A with ring) <-> U+0041 U+030A.
+    assert_eq!(norm("197", "NFD"), "{65, 778}");
+    assert_eq!(norm("65, 778", "NFC"), "{197}");
+    // U+212B (angstrom sign) is canonically equivalent to U+00C5.
+    assert_eq!(norm("8491", "NFC"), "{197}");
+    assert_eq!(norm("8491", "NFD"), "{65, 778}");
+    // Composition only merges the base with the first mark it can take.
+    assert_eq!(norm("65, 776, 769", "NFC"), "{196, 769}");
+  }
+
+  #[test]
+  fn compatibility_decomposition_and_composition() {
+    clear_state();
+    // U+00B2 (superscript two) is a compatibility, not a canonical, variant.
+    assert_eq!(norm("178", "NFKC"), "{50}");
+    assert_eq!(norm("178", "NFC"), "{178}");
+    // U+00BC (vulgar fraction one quarter) -> "1", fraction slash, "4".
+    assert_eq!(norm("188", "NFKD"), "{49, 8260, 52}");
+    // U+01C4 (DZ with caron) -> "D", "Z with caron".
+    assert_eq!(norm("452", "NFKC"), "{68, 381}");
+    assert_eq!(norm("452", "NFC"), "{452}");
+  }
+
+  #[test]
+  fn casefold_uses_full_case_folding() {
+    clear_state();
+    // Full case folding, not lowercasing: U+00DF and U+1E9E both fold to "ss".
+    assert_eq!(norm("223", "NFKCCasefold"), "{115, 115}");
+    assert_eq!(norm("7838", "NFKCCasefold"), "{115, 115}");
+    // U+0130 folds to "i" plus a combining dot above.
+    assert_eq!(norm("304", "NFKCCasefold"), "{105, 775}");
+    // Both sigma forms fold to the lowercase sigma U+03C3.
+    assert_eq!(norm("931, 963, 962", "NFKCCasefold"), "{963, 963, 963}");
+    // The Kelvin sign folds through its canonical equivalent to "k".
+    assert_eq!(norm("8490", "NFKCCasefold"), "{107}");
+    // Compatibility expansion happens before folding: the fi ligature.
+    assert_eq!(norm("64257", "NFKCCasefold"), "{102, 105}");
+    // Iota subscript expands to a full iota.
+    assert_eq!(norm("8064", "NFKCCasefold"), "{7936, 953}");
+    // U+01C4 folds all the way down to lowercase.
+    assert_eq!(norm("452", "NFKCCasefold"), "{100, 382}");
+    assert_eq!(norm("329", "NFKCCasefold"), "{700, 110}");
+    // A character with no folding is left alone.
+    assert_eq!(norm("5176", "NFKCCasefold"), "{5176}");
+    assert_eq!(
+      interpret(r#"CharacterNormalize["ABC", "NFKCCasefold"]"#).unwrap(),
+      "abc"
+    );
+  }
+
+  #[test]
+  fn casefold_drops_default_ignorable_characters() {
+    clear_state();
+    // U+00AD (soft hyphen) is default-ignorable and maps to nothing.
+    assert_eq!(norm("173", "NFKCCasefold"), "{}");
+    assert_eq!(norm("65, 173, 66", "NFKCCasefold"), "{97, 98}");
+    // The other forms keep it.
+    assert_eq!(norm("65, 173, 66", "NFC"), "{65, 173, 66}");
+  }
+
+  #[test]
+  fn normalizes_a_list_of_strings_elementwise() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"CharacterNormalize[{"ab", "cd"}, "NFC"]"#).unwrap(),
+      "{ab, cd}"
+    );
+    // The empty list is accepted and returned unchanged, even though the
+    // message for a bad first argument speaks of a *non-empty* list.
+    assert_eq!(interpret(r#"CharacterNormalize[{}, "NFC"]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn ascii_is_unchanged_by_every_form() {
+    clear_state();
+    for form in ["NFC", "NFD", "NFKC", "NFKD"] {
+      assert_eq!(
+        interpret(&format!(r#"CharacterNormalize["abc", "{form}"]"#)).unwrap(),
+        "abc"
+      );
+    }
+    assert_eq!(interpret(r#"CharacterNormalize["", "NFC"]"#).unwrap(), "");
+  }
+
+  #[test]
+  fn non_string_first_argument_is_rejected() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"CharacterNormalize[5, "NFC"]"#).unwrap(),
+      "CharacterNormalize[5, NFC]"
+    );
+    // A list has to be strings all the way through, and only one level deep.
+    assert_eq!(
+      interpret(r#"CharacterNormalize[{"a", 5}, "NFC"]"#).unwrap(),
+      "CharacterNormalize[{a, 5}, NFC]"
+    );
+    assert_eq!(
+      interpret(r#"CharacterNormalize[{{"a"}}, "NFC"]"#).unwrap(),
+      "CharacterNormalize[{{a}}, NFC]"
+    );
+  }
+
+  #[test]
+  fn unknown_normalization_form_is_rejected() {
+    clear_state();
+    // The form name is case-sensitive.
+    assert_eq!(
+      interpret(r#"CharacterNormalize["abc", "nfd"]"#).unwrap(),
+      "CharacterNormalize[abc, nfd]"
+    );
+    assert_eq!(
+      interpret(r#"CharacterNormalize["abc", "NFX"]"#).unwrap(),
+      "CharacterNormalize[abc, NFX]"
+    );
+    // A symbol named NFC is not the string "NFC".
+    assert_eq!(
+      interpret(r#"CharacterNormalize["abc", NFC]"#).unwrap(),
+      "CharacterNormalize[abc, NFC]"
+    );
+    // When both arguments are bad the text is what gets reported, so the
+    // call still just stays unevaluated.
+    assert_eq!(
+      interpret(r#"CharacterNormalize[5, "NFX"]"#).unwrap(),
+      "CharacterNormalize[5, NFX]"
+    );
+  }
+
+  #[test]
+  fn wrong_argument_count() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"CharacterNormalize["abc"]"#).unwrap(),
+      "CharacterNormalize[abc]"
+    );
+    assert_eq!(
+      interpret(r#"CharacterNormalize["abc", "NFC", 1]"#).unwrap(),
+      "CharacterNormalize[abc, NFC, 1]"
+    );
+  }
+}
+
+mod string_take_sequence_specifications {
+  use super::*;
+
+  #[test]
+  fn an_empty_specification_takes_or_drops_nothing() {
+    clear_state();
+    assert_eq!(interpret(r#"StringTake["abcde", {}]"#).unwrap(), "");
+    assert_eq!(interpret(r#"StringDrop["abcde", {}]"#).unwrap(), "abcde");
+  }
+
+  #[test]
+  fn a_zero_step_is_re_read_as_separate_specifications() {
+    clear_state();
+    // {m, n, 0} is not a usable span, so StringTake re-reads the list as
+    // three independent specs: StringTake[s, 1], [s, 5], [s, 0].
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {1, 5, 0}]"#).unwrap(),
+      "{a, abcde, }"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {3, 1, 0}]"#).unwrap(),
+      "{abc, a, }"
+    );
+    // Negative entries count from the end, as a bare spec does.
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {1, -1, 0}]"#).unwrap(),
+      "{a, e, }"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {-1, -2, 0}]"#).unwrap(),
+      "{e, de, }"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {0, 0, 0}]"#).unwrap(),
+      "{, , }"
+    );
+  }
+
+  #[test]
+  fn a_nonzero_step_is_still_a_span() {
+    clear_state();
+    assert_eq!(interpret(r#"StringTake["abcde", {2, 3}]"#).unwrap(), "bc");
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {1, 5, 2}]"#).unwrap(),
+      "ace"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {2, 3, 1}]"#).unwrap(),
+      "bc"
+    );
+  }
+
+  #[test]
+  fn four_or_more_entries_cannot_be_a_span() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {1, 2, 3, 4}]"#).unwrap(),
+      "{a, ab, abc, abcd}"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {1, 2, 0, 3}]"#).unwrap(),
+      "{a, ab, , abc}"
+    );
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {1, 2, 3, 4, 5}]"#).unwrap(),
+      "{a, ab, abc, abcd, abcde}"
+    );
+    // It threads over a list of strings, each getting its own result list.
+    assert_eq!(
+      interpret(r#"StringTake[{"abcde", "xy"}, {1, 2, 3, 4}]"#).unwrap(),
+      "{{a, ab, abc, abcd}, {x, xy, StringTake[xy, 3], StringTake[xy, 4]}}"
+    );
+  }
+
+  #[test]
+  fn an_out_of_range_entry_is_left_in_place() {
+    clear_state();
+    // Each specification reports and fails on its own; the others still work.
+    assert_eq!(
+      interpret(r#"StringTake["abcde", {2, 9, 0}]"#).unwrap(),
+      "{ab, StringTake[abcde, 9], }"
+    );
+  }
+
+  #[test]
+  fn string_drop_has_no_such_fallback() {
+    clear_state();
+    // StringDrop refuses these specifications instead of re-reading them.
+    assert_eq!(
+      interpret(r#"StringDrop["abcde", {1, 5, 0}]"#).unwrap(),
+      "StringDrop[abcde, {1, 5, 0}]"
+    );
+    assert_eq!(
+      interpret(r#"StringDrop["abcde", {1, 2, 3, 4}]"#).unwrap(),
+      "StringDrop[abcde, {1, 2, 3, 4}]"
+    );
+  }
+}
+
+mod to_expression_definitions {
+  use super::*;
+
+  #[test]
+  fn a_definition_with_a_pattern_takes_effect() {
+    clear_state();
+    // This used to hang: a definition whose left side carries a pattern has
+    // no Expr form of its own, and the shape it fell back to looped forever
+    // when evaluated.
+    assert_eq!(
+      interpret(r#"ToExpression["f6[x_] := x*2"]; f6[3]"#).unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret(r#"ToExpression["k2[x_] := x + 1; k2[2]"]"#).unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(r#"ToExpression["h[x__] := {x}; h[1, 2]"]"#).unwrap(),
+      "{1, 2}"
+    );
+  }
+
+  #[test]
+  fn the_pattern_may_be_of_any_kind() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["g[x_, y_: 2] := {x, y}; g[1]"]"#).unwrap(),
+      "{1, 2}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["gg[x_Integer?Positive] := x; gg[3]"]"#)
+        .unwrap(),
+      "3"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["m1[x_] := x; m2[y_] := 2 y; m1[3] + m2[4]"]"#)
+        .unwrap(),
+      "11"
+    );
+  }
+
+  #[test]
+  fn the_forms_that_already_worked_still_do() {
+    clear_state();
+    assert_eq!(interpret(r#"ToExpression["zz = 7; zz + 1"]"#).unwrap(), "8");
+    clear_state();
+    assert_eq!(interpret(r#"ToExpression["a3 := 5"]; a3"#).unwrap(), "5");
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["p[x_] = x + 1"]; p[2]"#).unwrap(),
+      "3"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["SetDelayed[k3[x_], x + 1]"]; k3[2]"#).unwrap(),
+      "3"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["f5[1] := 9"]; f5[1]"#).unwrap(),
+      "9"
+    );
+  }
+
+  #[test]
+  fn a_held_definition_can_be_released_later() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ToExpression["q[x_] := x^2", InputForm, Hold]"#).unwrap(),
+      "Hold[q[x_] := x^2]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"ReleaseHold[ToExpression["r1[x_] := x + 1", InputForm, Hold]]; r1[4]"#
+      )
+      .unwrap(),
+      "5"
+    );
+  }
+}
+
+// `RegularExpression` is PCRE, where a backslash before a non-word
+// character simply means that character — `\<`, `\!` and `\%` are all just
+// themselves, and real-world patterns escape liberally. Regression tests
+// for <https://github.com/ad-si/Woxi/issues/603>.
+mod regular_expression_redundant_escapes {
+  use super::*;
+
+  #[test]
+  fn a_backslash_before_a_plain_character_is_dropped() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringReplace["a<b", RegularExpression["\\<"] -> "-"]"#)
+        .unwrap(),
+      "a-b"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["50%", RegularExpression["\\d+\\%"]]"#)
+        .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["a!b", RegularExpression["\\!"]]"#).unwrap(),
+      "{!}"
+    );
+  }
+
+  #[test]
+  fn a_backslash_that_means_something_is_kept() {
+    clear_state();
+    // `\.` still matches only a literal dot, not any character.
+    assert_eq!(
+      interpret(r#"StringCases["a.b", RegularExpression["a\\.b"]]"#).unwrap(),
+      "{a.b}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["axb", RegularExpression["a\\.b"]]"#).unwrap(),
+      "{}"
+    );
+    // …and `\d` still means a digit rather than the letter `d`.
+    assert_eq!(
+      interpret(r#"StringCases["a1d", RegularExpression["\\d"]]"#).unwrap(),
+      "{1}"
+    );
+  }
+
+  // The pattern that motivated this: an HTML comment, escaped throughout.
+  #[test]
+  fn a_liberally_escaped_pattern_compiles() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"StringCases["x<!--hi-->y",
+             RegularExpression["\\<\\!\\-\\-([^\\!|\\<|\\>]*)\\>"]]"#
+      )
+      .unwrap(),
+      "{<!--hi-->}"
+    );
+  }
+}
+
+// PCRE has look-around and backreferences; Rust's `regex` crate has
+// neither, so a pattern using them falls through to the backtracking
+// engine instead of failing to compile. Regression tests for
+// <https://github.com/ad-si/Woxi/issues/603>.
+mod regular_expression_look_around {
+  use super::*;
+
+  #[test]
+  fn lookahead_constrains_without_consuming() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"StringCases["foo1 bar2 foo3", RegularExpression["foo(?=\\d)"]]"#
+      )
+      .unwrap(),
+      "{foo, foo}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["ab ac ad", RegularExpression["a(?!c)."]]"#)
+        .unwrap(),
+      "{ab, ad}"
+    );
+  }
+
+  #[test]
+  fn lookbehind_constrains_what_precedes() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringCases["xA yA zB", RegularExpression["(?<=y)A"]]"#)
+        .unwrap(),
+      "{A}"
+    );
+    assert_eq!(
+      interpret(r#"StringCases["xA yA", RegularExpression["(?<!y)A"]]"#)
+        .unwrap(),
+      "{A}"
+    );
+  }
+
+  #[test]
+  fn a_backreference_matches_what_a_group_captured() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"StringMatchQ["abcabc", RegularExpression["(abc)\\1"]]"#)
+        .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"StringMatchQ["abcabd", RegularExpression["(abc)\\1"]]"#)
+        .unwrap(),
+      "False"
+    );
+  }
+
+  // The pattern that motivated this: a lazy "up to the first closing tag"
+  // written as a tempered token, which is how the WLX reader escapes
+  // blocks it must not look inside.
+  #[test]
+  fn a_tempered_token_matches_up_to_the_first_terminator() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"StringReplace["a<Escape>keep</Escape>b<Escape>two</Escape>c",
+             RegularExpression["<Escape>((?:(?!<Escape>)[\\s\\S])*?)<\\/Escape>"]
+               -> "[$1]"]"#
+      )
+      .unwrap(),
+      "a[keep]b[two]c"
+    );
+  }
+
+  // Groups still number and name themselves the same way on the
+  // backtracking engine.
+  #[test]
+  fn groups_still_work_under_look_around() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"StringCases["a1 b2", RegularExpression["(\\w)(?=\\d)(\\d)"] :> "$1$2"]"#
+      )
+      .unwrap(),
+      "{a1, b2}"
+    );
+  }
+
+  // A pattern that is simply wrong is still reported as wrong, and with the
+  // ordinary engine's diagnosis rather than a complaint about look-around.
+  #[test]
+  fn a_broken_pattern_is_still_an_error() {
+    clear_state();
+    assert!(
+      interpret(r#"StringCases["a", RegularExpression["("]]"#).is_err(),
+      "an unclosed group should not compile"
+    );
+  }
+}
+
+/// TeXForm typesetting rules verified against wolframscript: sized
+/// delimiters, held expressions shown as written, one fraction per product
+/// with the sign in front, control words with their trailing space, and the
+/// user's `Format[…, TraditionalForm]` rules.
+mod tex_form_typesetting {
+  use super::*;
+
+  fn tex(code: &str) -> String {
+    interpret(&format!("ToString[{code}, TeXForm]")).unwrap()
+  }
+
+  #[test]
+  fn delimiters_grow_around_tall_content() {
+    clear_state();
+    assert_eq!(tex("f[a, b]"), "f(a,b)");
+    assert_eq!(tex("f[a/b]"), "f\\left(\\frac{a}{b}\\right)");
+    assert_eq!(tex("Sin[x^2]"), "\\sin \\left(x^2\\right)");
+    assert_eq!(tex("HoldForm[Log[1 + x]]"), "\\log (1+x)");
+    assert_eq!(
+      tex("HoldForm[Int[Sin[x]/x^3, x]]"),
+      "\\text{Int}\\left(\\frac{\\sin (x)}{x^3},x\\right)"
+    );
+    assert_eq!(
+      tex("Round[a/b]"),
+      "\\text{Round}\\left[\\frac{a}{b}\\right]"
+    );
+    assert_eq!(tex("{a/b, c}"), "\\left\\{\\frac{a}{b},c\\right\\}");
+    assert_eq!(tex("f[x'']"), "f\\left(x''\\right)");
+    assert_eq!(tex("f[Abs[x]]"), "f(| x| )");
+    assert_eq!(
+      tex("f[Abs[a/b]]"),
+      "f\\left(\\left| \\frac{a}{b}\\right| \\right)"
+    );
+    // Parentheses around a factor or a power base follow the same rule.
+    assert_eq!(tex("(1 + x^2) y"), "\\left(x^2+1\\right) y");
+    assert_eq!(tex("(1 + x)^2"), "(x+1)^2");
+    assert_eq!(tex("(1 + x^2)^2"), "\\left(x^2+1\\right)^2");
+    // A text run is never tall, whatever it contains.
+    assert_eq!(tex("HoldForm[f[x_]]"), "f(\\text{x$\\_$})");
+  }
+
+  #[test]
+  fn a_sum_under_an_integral_or_big_operator_is_bracketed() {
+    clear_state();
+    assert_eq!(tex("HoldForm[Integrate[a + b, x]]"), "\\int (a+b) \\, dx");
+    assert_eq!(tex("HoldForm[Integrate[a b, x]]"), "\\int a b \\, dx");
+    assert_eq!(
+      tex("HoldForm[Integrate[a/b + c, x]]"),
+      "\\int \\left(\\frac{a}{b}+c\\right) \\, dx"
+    );
+    assert_eq!(tex("HoldForm[Integrate[-a, x]]"), "\\int -a \\, dx");
+    assert_eq!(
+      tex("HoldForm[Integrate[a + b, {x, 0, 1}]]"),
+      "\\int_0^1 (a+b) \\, dx"
+    );
+    assert_eq!(
+      tex("HoldForm[Sum[a + b, {i, 1, n}]]"),
+      "\\sum _{i=1}^n (a+b)"
+    );
+    assert_eq!(
+      tex("HoldForm[D[a + b, x]]"),
+      "\\frac{\\partial (a+b)}{\\partial x}"
+    );
+  }
+
+  #[test]
+  fn a_held_expression_is_shown_as_written() {
+    clear_state();
+    assert_eq!(tex("HoldForm[1 + x]"), "1+x");
+    assert_eq!(tex("1 + x"), "x+1");
+    assert_eq!(tex("HoldForm[y x]"), "y x");
+    assert_eq!(tex("HoldForm[-1 + 2 x]"), "-1+2 x");
+    assert_eq!(tex("HoldForm[1 - x + x^2]"), "1-x+x^2");
+  }
+
+  #[test]
+  fn a_product_is_one_fraction_with_its_sign_in_front() {
+    clear_state();
+    assert_eq!(
+      tex("HoldForm[-Sin[x]/(2 x^2)]"),
+      "-\\frac{\\sin (x)}{2 x^2}"
+    );
+    assert_eq!(tex("HoldForm[-1/2*Cos[x]/x]"), "-\\frac{\\cos (x)}{2 x}");
+    assert_eq!(
+      tex("HoldForm[-1/2*Cos[x]/x - Sin[x]/(2*x^2) - SinIntegral[x]/2]"),
+      "-\\frac{\\cos (x)}{2 x}-\\frac{\\sin (x)}{2 x^2}-\\frac{\\text{Si}(x)}{2}"
+    );
+    assert_eq!(
+      tex("HoldForm[1/(2 Sqrt[2]) Subst[u, x]]"),
+      "\\frac{\\text{Subst}(u,x)}{2 \\sqrt{2}}"
+    );
+    assert_eq!(tex("HoldForm[a/b/c]"), "\\frac{a}{b c}");
+    assert_eq!(tex("HoldForm[(a/b)/(c/d)]"), "\\frac{a d}{b c}");
+    assert_eq!(tex("HoldForm[-1/(3 (1 + x))]"), "-\\frac{1}{3 (1+x)}");
+    assert_eq!(tex("HoldForm[-x/y]"), "-\\frac{x}{y}");
+    assert_eq!(tex("HoldForm[a (-b) c]"), "-a b c");
+    assert_eq!(tex("HoldForm[-2 x/3]"), "-\\frac{2 x}{3}");
+    // A held minus in front of a sum stays put; an evaluated product's `-1`
+    // is distributed over its sum factor.
+    assert_eq!(tex("HoldForm[-(b + c)]"), "-(b+c)");
+    assert_eq!(tex("HoldForm[-(a + b) c]"), "-(a+b) c");
+    assert_eq!(tex("HoldForm[-(1 + x^2)/(3 y)]"), "-\\frac{1+x^2}{3 y}");
+    assert_eq!(tex("HoldForm[a - (b - c)]"), "a-(b-c)");
+    assert_eq!(tex("HoldForm[a - -b]"), "a--b");
+    assert_eq!(tex("HoldForm[x - 2 (b + c)]"), "x-2 (b+c)");
+    assert_eq!(tex("-(a + b) c"), "c (-a-b)");
+    assert_eq!(tex("-(1 + x^2)/(3 y)"), "\\frac{-x^2-1}{3 y}");
+    assert_eq!(
+      tex("HoldForm[-(4/3) Star[Subst[a, b]]]"),
+      "-\\frac{4}{3} \\text{Star}[\\text{Subst}(a,b)]"
+    );
+  }
+
+  #[test]
+  fn a_rational_coefficient_folds_into_a_small_factor_only() {
+    clear_state();
+    assert_eq!(tex("1/2 f[x^2]"), "\\frac{f\\left(x^2\\right)}{2}");
+    assert_eq!(
+      tex("1/2 f[a/b]"),
+      "\\frac{1}{2} f\\left(\\frac{a}{b}\\right)"
+    );
+    assert_eq!(
+      tex("With[{e = 1/2 Log[1 + x^2]}, HoldForm[e]]"),
+      "\\frac{1}{2} \\log \\left(1+x^2\\right)"
+    );
+    assert_eq!(tex("-1/2 f[x^2]"), "-\\frac{1}{2} f\\left(x^2\\right)");
+    assert_eq!(tex("1/2 Sin[x] Cos[x]"), "\\frac{1}{2} \\cos (x) \\sin (x)");
+    assert_eq!(
+      tex("Sin[Pi/2 x]"),
+      "\\sin \\left(\\frac{\\pi  x}{2}\\right)"
+    );
+    assert_eq!(tex("-1/4 Sqrt[x]"), "-\\frac{\\sqrt{x}}{4}");
+    assert_eq!(
+      tex("HoldForm[1/2 Int[u, x]]"),
+      "\\frac{1}{2} \\text{Int}(u,x)"
+    );
+    assert_eq!(tex("2 x/3"), "\\frac{2 x}{3}");
+    assert_eq!(tex("(a + b)/(3 c)"), "\\frac{a+b}{3 c}");
+    assert_eq!(tex("1/2 Sin[x]^2"), "\\frac{\\sin ^2(x)}{2}");
+    assert_eq!(tex("1/2 x'"), "\\frac{x'}{2}");
+    assert_eq!(tex("1/2 f[x]'"), "\\frac{f(x)'}{2}");
+  }
+
+  #[test]
+  fn symbols_precede_a_sum_without_a_constant_term() {
+    clear_state();
+    assert_eq!(tex("(a + b) c"), "c (a+b)");
+    assert_eq!(tex("x (a + b) c"), "c x (a+b)");
+    assert_eq!(tex("(1 + x) y"), "(x+1) y");
+    assert_eq!(tex("c^2 (a + b)"), "c^2 (a+b)");
+    assert_eq!(tex("(a + b) Sin[c]"), "(a+b) \\sin (c)");
+    assert_eq!(tex("(a + b) c/d"), "\\frac{c (a+b)}{d}");
+  }
+
+  #[test]
+  fn reciprocal_trigonometric_functions_use_their_cofunction() {
+    clear_state();
+    assert_eq!(tex("1/Sin[x]"), "\\csc (x)");
+    assert_eq!(tex("1/Sin[x]^2"), "\\csc ^2(x)");
+    assert_eq!(tex("x/Sin[x]"), "x \\csc (x)");
+    assert_eq!(tex("Cos[x]/Sin[x]"), "\\cot (x)");
+    assert_eq!(tex("1/Sinh[x]"), "\\text{csch}(x)");
+    assert_eq!(tex("1/(x Sin[x])"), "\\frac{\\csc (x)}{x}");
+    assert_eq!(tex("1/Log[x]"), "\\frac{1}{\\log (x)}");
+    assert_eq!(tex("1/Log[x]^2"), "\\frac{1}{\\log ^2(x)}");
+  }
+
+  #[test]
+  fn control_words_carry_a_trailing_space() {
+    clear_state();
+    assert_eq!(tex("Pi/2"), "\\frac{\\pi }{2}");
+    assert_eq!(tex("{Pi, 1}"), "\\{\\pi ,1\\}");
+    assert_eq!(tex("Pi x"), "\\pi  x");
+    assert_eq!(tex("2 Pi"), "2 \\pi");
+    assert_eq!(tex("alpha + 1"), "\\alpha +1");
+    assert_eq!(tex("f[alpha]"), "f(\\alpha )");
+    assert_eq!(tex("x^Pi"), "x^{\\pi }");
+    assert_eq!(tex("Pi + x"), "x+\\pi");
+    assert_eq!(tex("Pi + I"), "\\pi +i");
+    assert_eq!(tex("-Infinity"), "-\\infty");
+  }
+
+  #[test]
+  fn star_curried_calls_scripts_and_patterns() {
+    clear_state();
+    assert_eq!(
+      tex("HoldForm[Star[1/2, Foo[x]]]"),
+      "\\frac{1}{2}*\\text{Foo}(x)"
+    );
+    assert_eq!(tex("HoldForm[a + Star[b, c]]"), "a+b*c");
+    assert_eq!(tex("HoldForm[f[Star[a, b]]]"), "f(a*b)");
+    assert_eq!(
+      tex("HoldForm[a - Star[1/2, Foo[x]]]"),
+      "a-\\frac{1}{2}*\\text{Foo}(x)"
+    );
+    assert_eq!(
+      tex("HoldForm[f[-Star[1/2, Foo[x]]]]"),
+      "f\\left(-\\left(\\frac{1}{2}*\\text{Foo}(x)\\right)\\right)"
+    );
+    assert_eq!(tex("2 Star[a, b]"), "2 (a*b)");
+    assert_eq!(
+      tex("HoldForm[-Star[1/2, Foo[x]]]"),
+      "-\\left(\\frac{1}{2}*\\text{Foo}(x)\\right)"
+    );
+    assert_eq!(tex("HoldForm[f[a][b]]"), "f(a)(b)");
+    assert_eq!(tex("HoldForm[f[a][b][c]]"), "(f(a)(b))(c)");
+    assert_eq!(tex("HoldForm[Sin[a][b]]"), "\\sin (a)(b)");
+    assert_eq!(
+      tex("HoldForm[f[a/b][c]]"),
+      "f\\left(\\frac{a}{b}\\right)(c)"
+    );
+    assert_eq!(
+      tex("HoldForm[Overscript[x, 2] + Underscript[y, 3]]"),
+      "\\overset{2}{x}+\\underset{3}{y}"
+    );
+    assert_eq!(
+      tex("HoldForm[f[a_, b__, c___, d_Integer, e:_, g_?IntegerQ, h_:1]]"),
+      "f(\\text{a$\\_$},\\text{b$\\_\\_$},\\text{c$\\_\\_\\_$},\\text{d$\\_$Integer},\\text{e$\\_$},\\text{g$\\_$}?\\text{IntegerQ},\\text{h$\\_$}:1)"
+    );
+  }
+
+  #[test]
+  fn format_rules_for_traditional_form_shape_the_tex() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Format[HoldPattern[Int[e_, x_]], TraditionalForm] := HoldForm[Integrate[e, x]]\n\
+         ToString[HoldForm[a + Int[Cos[x]/x^2, x]], TeXForm]"
+      )
+      .unwrap(),
+      "a+\\int \\frac{\\cos (x)}{x^2} \\, dx"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Format[HoldPattern[Dist[u_, v_, _]], TraditionalForm] := HoldForm[u * v]\n\
+         ToString[HoldForm[Dist[1/2, Int[a, x], x]], TeXForm]"
+      )
+      .unwrap(),
+      "\\frac{1}{2} \\text{Int}(a,x)"
+    );
+    clear_state();
+    // The formatted expression is matched, not evaluated.
+    let result = interpret_with_stdout(
+      "Format[foo[e_], TraditionalForm] := HoldForm[bar[e]]\n\
+       foo[e_] := (Print[\"EVAL\"]; 99)\n\
+       ToString[HoldForm[foo[1] + 2], TeXForm]",
+    )
+    .unwrap();
+    assert_eq!(result.stdout, "");
+    assert_eq!(result.result, "\\text{bar}(1)+2");
+  }
+
+  #[test]
+  fn expression_to_tex_is_the_converter_behind_tex_form() {
+    clear_state();
+    assert_eq!(
+      interpret("Convert`TeX`ExpressionToTeX[HoldForm[Sin[x]/x^3]]").unwrap(),
+      "\\frac{\\sin (x)}{x^3}"
+    );
+    assert_eq!(
+      interpret("Head[Convert`TeX`ExpressionToTeX[x]]").unwrap(),
+      "String"
+    );
+    assert_eq!(
+      interpret("Convert`TeX`ExpressionToTeX[1 + 1]").unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("Attributes[Convert`TeX`ExpressionToTeX]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+    let result =
+      interpret_with_stdout("Convert`TeX`ExpressionToTeX[x, y]").unwrap();
+    assert!(result.warnings[0].contains(
+      "Convert`TeX`ExpressionToTeX::argx: Convert`TeX`ExpressionToTeX called with 2 arguments; 1 argument is expected."
+    ));
+    assert_eq!(result.result, "Convert`TeX`ExpressionToTeX[x, y]");
+  }
+}
+
+/// A trailing `;` ends an empty statement, so a program written with one is
+/// a `CompoundExpression` whose last part is `Null`. WLX reads a `.wlx` file
+/// statement by statement through the three-argument `ToExpression` and
+/// matches on that trailing `Null` to find the names to localise. Verified
+/// against wolframscript.
+mod to_expression_keeps_a_trailing_semicolon {
+  use super::*;
+
+  #[test]
+  fn a_trailing_semicolon_adds_a_null() {
+    assert_eq!(
+      interpret(
+        "ToString[ToExpression[\"a := 1;\", InputForm, Hold], InputForm]"
+      )
+      .unwrap(),
+      "Hold[a := 1; ]"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[ToExpression[\"{a, b} = c;\", InputForm, Hold], InputForm]"
+      )
+      .unwrap(),
+      "Hold[{a, b} = c; ]"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[ToExpression[\"2; 3;\", InputForm, Hold], InputForm]"
+      )
+      .unwrap(),
+      "Hold[2; 3; ]"
+    );
+  }
+
+  #[test]
+  fn without_one_the_expression_stands_alone() {
+    assert_eq!(
+      interpret(
+        "ToString[ToExpression[\"a := 1\", InputForm, Hold], InputForm]"
+      )
+      .unwrap(),
+      "Hold[a := 1]"
+    );
+    assert_eq!(
+      interpret("ToString[ToExpression[\"2; 3\", InputForm, Hold], InputForm]")
+        .unwrap(),
+      "Hold[2; 3]"
+    );
+  }
+}

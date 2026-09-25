@@ -1,0 +1,141 @@
+use crate::InterpreterError;
+use crate::helpers::{
+  binop, bool_expr, call, call0, call1, const_expr, div2, fail_expr, id_expr,
+  minus2, neg1, null_expr, plus2, pow, pow2, times2, unevaluated,
+};
+use crate::syntax::{
+  BinaryOperator, ComparisonOp, Expr, UnaryOperator, expr_to_output,
+  expr_to_string,
+};
+use num_bigint::BigInt;
+
+// Functions are organized by categories
+pub mod assessment_ast;
+pub mod assessment_render;
+pub mod association_ast;
+pub mod astronomy_ast;
+pub mod audio_ast;
+pub mod boolean_ast;
+pub mod calculus_ast;
+pub mod caputo_d;
+pub mod cellular_automaton_ast;
+pub mod chart;
+pub mod code_parser;
+pub mod confirm_ast;
+pub mod control_flow_ast;
+pub mod convex_hull;
+pub mod convolve_ast;
+pub mod count_roots_ast;
+pub mod country_data;
+pub mod csv_ast;
+pub mod dataset_ast;
+pub mod datetime_ast;
+pub mod delaunay;
+pub mod dendrogram;
+pub mod dirichlet_ast;
+pub mod element_data;
+pub mod entity_ast;
+pub mod example_data;
+pub mod expr_form;
+pub mod field_plot;
+pub mod function_range_ast;
+pub mod geo_math;
+pub mod geographics;
+pub mod geometric_test_ast;
+pub mod graph;
+pub mod graph_data;
+pub mod graphics;
+pub mod graphicsbox;
+pub mod groebner_ast;
+pub mod http_ast;
+pub mod image_ast;
+pub mod information_render;
+pub mod interval_ast;
+pub mod isotope_data;
+pub mod knot_data;
+pub mod linear_algebra_ast;
+pub mod list_helpers_ast;
+pub mod list_plot;
+pub mod math_ast;
+pub mod memory;
+pub mod mesh_region;
+pub mod molecule_ast;
+pub mod molecule_render;
+pub mod music_ast;
+pub mod music_font;
+pub mod music_midi;
+pub mod music_render;
+pub mod number_line_plot;
+pub mod ode_ast;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod paclet;
+pub mod parametric_plot;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pdf_import;
+pub mod periodic_table_plot;
+pub mod plot;
+pub mod plot3d;
+pub mod plot_epilog;
+pub mod polygon_holes;
+pub mod polyhedron_data;
+pub mod polyhedron_operations;
+pub mod polynomial_ast;
+pub mod predicate_ast;
+pub mod quantity_ast;
+pub mod query_ast;
+pub mod regex_engine;
+pub mod region;
+pub mod resolve_ast;
+pub mod resource_function_ast;
+pub mod root_ast;
+pub mod rsolve_ast;
+pub mod scoping;
+pub mod socket_ast;
+pub mod sound;
+pub mod string_ast;
+pub mod sum_convergence_ast;
+pub mod tabular_ast;
+pub mod ternary_list_plot;
+pub mod timeline_plot;
+pub mod timeseries_ast;
+pub mod transliterate_ast;
+pub mod tree_form;
+pub mod trig_factor_ast;
+pub mod turing_machine_ast;
+pub mod txt_ast;
+pub mod unicode_casefold_data;
+pub mod voronoi;
+pub mod wavelet_ast;
+pub mod wikidata_ast;
+#[cfg(target_os = "windows")]
+pub mod windows;
+pub mod wl_serialize;
+pub mod wxf_ast;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod xlsx_ast;
+pub mod xml_ast;
+pub mod ztransform_ast;
+
+// Re-export all function implementations
+pub use association_ast::*;
+pub use boolean_ast::*;
+pub use calculus_ast::*;
+pub use cellular_automaton_ast::*;
+pub use control_flow_ast::*;
+pub use dataset_ast::*;
+pub use datetime_ast::*;
+pub use graphics::*;
+pub use image_ast::*;
+pub use interval_ast::*;
+pub use linear_algebra_ast::*;
+pub use list_helpers_ast::*;
+pub use math_ast::*;
+pub use plot::*;
+pub use polynomial_ast::*;
+pub use predicate_ast::*;
+pub use quantity_ast::*;
+pub use scoping::*;
+pub use string_ast::*;
+pub use turing_machine_ast::*;
+#[cfg(target_os = "windows")]
+pub use windows::*;

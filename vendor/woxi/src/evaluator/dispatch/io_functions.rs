@@ -1,0 +1,6627 @@
+#[allow(unused_imports)]
+use super::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+// Stream registry for open streams (InputStream/OutputStream)
+#[derive(Clone, Debug)]
+enum StreamKind {
+  Text(String), // content of the string
+  // Only the native build opens files: `OpenRead`/`OpenWrite`/`OpenAppend`
+  // are compiled out on wasm, where there is no local filesystem.
+  #[cfg(not(target_arch = "wasm32"))]
+  File(String), // file path
+  // A file specification starting with `!` names an external command
+  // instead of a file; the command runs through the shell and its
+  // standard output is what the stream reads.
+  #[cfg(not(target_arch = "wasm32"))]
+  Command(std::rc::Rc<RefCell<CommandStreamState>>),
+  // The write end of the same convention: `OpenWrite["!command"]` feeds
+  // what is written to it into the command's standard input.
+  #[cfg(not(target_arch = "wasm32"))]
+  CommandSink(std::rc::Rc<RefCell<CommandSinkState>>),
+}
+
+/// State of a `"!command"` stream: the running child process plus the part
+/// of its standard output consumed so far. Output already handed out has to
+/// stay addressable because streams are position-indexed, so it is kept in
+/// `buffer` rather than discarded.
+///
+/// The buffer holds raw bytes so `BinaryRead` sees the command's output
+/// unaltered; text reads decode it lossily, which leaves byte offsets and
+/// string offsets in step for the valid UTF-8 that text reads assume.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct CommandStreamState {
+  child: Option<std::process::Child>,
+  reader: Option<std::io::BufReader<std::process::ChildStdout>>,
+  buffer: Vec<u8>,
+  eof: bool,
+}
+
+/// State of a `"!command"` output stream: the running child process and the
+/// handle on its standard input. Closing the stream drops the handle, which
+/// is the command's end-of-input, and then waits for it to finish.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct CommandSinkState {
+  child: Option<std::process::Child>,
+  stdin: Option<std::process::ChildStdin>,
+}
+
+/// Build the shell invocation that runs `command`.
+#[cfg(not(target_arch = "wasm32"))]
+fn shell_command(command: &str) -> std::process::Command {
+  let mut cmd = if cfg!(target_os = "windows") {
+    std::process::Command::new("cmd")
+  } else {
+    std::process::Command::new("sh")
+  };
+  cmd.arg(if cfg!(target_os = "windows") {
+    "/C"
+  } else {
+    "-c"
+  });
+  cmd.arg(command);
+  cmd
+}
+
+/// Start `command` through the shell, with its standard output piped back
+/// to us. Standard input and standard error are inherited so that filters
+/// like `"!cat"` or `"!grep foo"` read the script's own input and report
+/// their errors on the terminal, as they do in wolframscript.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_command_stream(command: &str) -> std::io::Result<CommandStreamState> {
+  use std::process::Stdio;
+  let mut child = shell_command(command)
+    .stdin(Stdio::inherit())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit())
+    .spawn()?;
+  let reader = child.stdout.take().map(std::io::BufReader::new);
+  Ok(CommandStreamState {
+    child: Some(child),
+    reader,
+    buffer: Vec::new(),
+    eof: false,
+  })
+}
+
+/// Start `command` through the shell with its standard input piped from us.
+/// Its output streams straight to the terminal, as it does in wolframscript.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_command_sink(command: &str) -> std::io::Result<CommandSinkState> {
+  use std::process::Stdio;
+  let mut child = shell_command(command)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit())
+    .spawn()?;
+  let stdin = child.stdin.take();
+  Ok(CommandSinkState {
+    child: Some(child),
+    stdin,
+  })
+}
+
+/// Feed `bytes` to an open command sink. `false` if the command is gone —
+/// it exited early, or the stream has already been closed.
+#[cfg(not(target_arch = "wasm32"))]
+fn command_sink_write(state: &RefCell<CommandSinkState>, bytes: &[u8]) -> bool {
+  use std::io::Write;
+  let mut state = state.borrow_mut();
+  let Some(stdin) = state.stdin.as_mut() else {
+    return false;
+  };
+  stdin.write_all(bytes).is_ok() && stdin.flush().is_ok()
+}
+
+/// Close a command sink: drop the pipe so the command sees end-of-input,
+/// then wait for it to finish so its output lands before evaluation goes on.
+#[cfg(not(target_arch = "wasm32"))]
+fn command_sink_close(state: &RefCell<CommandSinkState>) {
+  let mut state = state.borrow_mut();
+  drop(state.stdin.take());
+  if let Some(mut child) = state.child.take() {
+    let _ = child.wait();
+  }
+}
+
+/// Run `command` through the shell, feed it `input`, and wait for it.
+/// `false` if the shell could not be started at all.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_command_with_input(command: &str, input: &[u8]) -> bool {
+  let Ok(state) = spawn_command_sink(command) else {
+    return false;
+  };
+  let state = RefCell::new(state);
+  command_sink_write(&state, input);
+  command_sink_close(&state);
+  true
+}
+
+/// Release the pipe and reap the child once its output is exhausted.
+#[cfg(not(target_arch = "wasm32"))]
+fn command_stream_finish(state: &mut CommandStreamState) {
+  state.eof = true;
+  state.reader = None;
+  if let Some(mut child) = state.child.take() {
+    let _ = child.wait();
+  }
+}
+
+/// Pull one more line of the child's output into the buffer.
+/// Returns `false` once the command's output is exhausted.
+#[cfg(not(target_arch = "wasm32"))]
+fn command_stream_read_line(state: &mut CommandStreamState) -> bool {
+  use std::io::BufRead;
+  if state.eof {
+    return false;
+  }
+  let Some(reader) = state.reader.as_mut() else {
+    command_stream_finish(state);
+    return false;
+  };
+  let mut chunk: Vec<u8> = Vec::new();
+  match reader.read_until(b'\n', &mut chunk) {
+    Ok(0) | Err(_) => {
+      command_stream_finish(state);
+      false
+    }
+    Ok(_) => {
+      state.buffer.extend_from_slice(&chunk);
+      true
+    }
+  }
+}
+
+/// Pull the rest of the child's output into the buffer.
+#[cfg(not(target_arch = "wasm32"))]
+fn command_stream_read_all(state: &mut CommandStreamState) {
+  while command_stream_read_line(state) {}
+}
+
+/// Stop a command stream that is closed before its output ran out, so a
+/// still-running command (`"!yes"`, an interactive filter) does not keep
+/// the interpreter waiting.
+#[cfg(not(target_arch = "wasm32"))]
+fn command_stream_close(state: &RefCell<CommandStreamState>) {
+  let mut state = state.borrow_mut();
+  state.reader = None;
+  if let Some(mut child) = state.child.take() {
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+  state.eof = true;
+}
+
+/// Run `command` through the shell and return the bytes it writes to
+/// standard output. `None` if the shell could not be started at all.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_command_capture_bytes(command: &str) -> Option<Vec<u8>> {
+  let mut state = spawn_command_stream(command).ok()?;
+  command_stream_read_all(&mut state);
+  Some(state.buffer)
+}
+
+/// Run `command` through the shell and return everything it writes to
+/// standard output as text. `None` if the shell could not be started at all.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_command_capture(command: &str) -> Option<String> {
+  run_command_capture_bytes(command)
+    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `RunProcess[cmd, (prop, (input,)) opts…]` — see the dispatch arm.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_process_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  use std::io::{Read, Write};
+  use std::process::{Command, Stdio};
+
+  let is_option =
+    |e: &Expr| matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. });
+  let positional: Vec<&Expr> =
+    args.iter().take_while(|a| !is_option(a)).collect();
+  let options: Vec<&Expr> = args.iter().skip(positional.len()).collect();
+  if positional.is_empty()
+    || positional.len() > 3
+    || !options.iter().all(|o| is_option(o))
+  {
+    return Ok(unevaluated("RunProcess", args));
+  }
+
+  // The program and its arguments: a string is a program name, a list is
+  // the program followed by its arguments. Neither goes through a shell.
+  let words: Vec<String> = match positional[0] {
+    Expr::String(s) => vec![s.clone()],
+    Expr::List(items) => {
+      let mut words = Vec::with_capacity(items.len());
+      for item in items {
+        match item {
+          Expr::String(s) => words.push(s.clone()),
+          other => words.push(crate::syntax::expr_to_string(other)),
+        }
+      }
+      words
+    }
+    _ => return Ok(unevaluated("RunProcess", args)),
+  };
+  let Some((program, program_args)) = words.split_first() else {
+    return Ok(unevaluated("RunProcess", args));
+  };
+
+  // Which of the results to return.
+  let property = match positional.get(1) {
+    None => None,
+    Some(Expr::Identifier(a)) if a == "All" => None,
+    Some(Expr::String(p))
+      if matches!(
+        p.as_str(),
+        "ExitCode" | "StandardOutput" | "StandardError"
+      ) =>
+    {
+      Some(p.clone())
+    }
+    Some(other) => {
+      crate::emit_message(&format!(
+        "RunProcess::pbad: {} is not a valid RunProcess property.",
+        crate::syntax::expr_to_string(other)
+      ));
+      return Ok(fail_expr());
+    }
+  };
+  let input: Option<String> = match positional.get(2) {
+    None => None,
+    Some(Expr::String(s)) => Some(s.clone()),
+    Some(other) => Some(crate::syntax::expr_to_string(other)),
+  };
+
+  let mut directory: Option<std::path::PathBuf> = None;
+  // `Inherited` (the default) keeps the interpreter's environment; anything
+  // else replaces it outright.
+  let mut environment: Option<Vec<(String, String)>> = None;
+  for option in options {
+    let (Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    }) = option
+    else {
+      continue;
+    };
+    let Expr::Identifier(name) = pattern.as_ref() else {
+      continue;
+    };
+    let value = crate::evaluator::evaluate_expr_to_expr(replacement)?;
+    match name.as_str() {
+      "ProcessDirectory" => {
+        if let Expr::String(dir) = &value {
+          directory = Some(crate::vfs::resolve(dir));
+        }
+      }
+      "ProcessEnvironment" => {
+        let pairs: Vec<(Expr, Expr)> = match &value {
+          Expr::Association(pairs) => pairs.clone(),
+          Expr::List(rules) => rules
+            .iter()
+            .filter_map(|r| match r {
+              Expr::Rule {
+                pattern,
+                replacement,
+              }
+              | Expr::RuleDelayed {
+                pattern,
+                replacement,
+              } => Some(((**pattern).clone(), (**replacement).clone())),
+              _ => None,
+            })
+            .collect(),
+          _ => continue,
+        };
+        let text = |e: &Expr| match e {
+          Expr::String(s) => s.clone(),
+          other => crate::syntax::expr_to_string(other),
+        };
+        environment = Some(
+          pairs
+            .iter()
+            .map(|(key, val)| (text(key), text(val)))
+            .collect(),
+        );
+      }
+      _ => {}
+    }
+  }
+
+  let not_found = || {
+    crate::emit_message(&format!(
+      "RunProcess::pnfd: Program {program} not found. Check Environment[\"PATH\"]."
+    ));
+    Ok(fail_expr())
+  };
+  // A replaced environment also replaces the search path: the program name
+  // is looked up in *its* `PATH`, not the interpreter's, which is the only
+  // one `Command` would consult. So an environment that carries no `PATH`
+  // finds nothing but an absolute or explicitly relative name. Windows reads
+  // either slash, so a name carrying either one is already a path there.
+  let names_a_path =
+    program.contains(path_separators(std::path::MAIN_SEPARATOR));
+  let resolved: std::path::PathBuf = match &environment {
+    Some(env) if !names_a_path => {
+      let path = env
+        .iter()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.as_str())
+        .unwrap_or_default();
+      let Some(found) = std::env::split_paths(path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+      else {
+        return not_found();
+      };
+      found
+    }
+    _ => program.into(),
+  };
+
+  let mut command = Command::new(resolved);
+  command.args(program_args);
+  if let Some(directory) = directory {
+    command.current_dir(directory);
+  }
+  if let Some(environment) = environment {
+    command.env_clear();
+    for (key, value) in environment {
+      command.env(key, value);
+    }
+  }
+  command
+    .stdin(if input.is_some() {
+      Stdio::piped()
+    } else {
+      Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+  let Ok(mut child) = command.spawn() else {
+    return not_found();
+  };
+  // Feed the input on its own thread: a program that writes a lot before
+  // reading would otherwise deadlock against our reads below.
+  let feeder = input.and_then(|text| {
+    child.stdin.take().map(|mut stdin| {
+      std::thread::spawn(move || {
+        let _ = stdin.write_all(text.as_bytes());
+      })
+    })
+  });
+  let stderr_reader = child.stderr.take().map(|mut stderr| {
+    std::thread::spawn(move || {
+      let mut buf = Vec::new();
+      let _ = stderr.read_to_end(&mut buf);
+      buf
+    })
+  });
+  let mut stdout_bytes = Vec::new();
+  if let Some(mut stdout) = child.stdout.take() {
+    let _ = stdout.read_to_end(&mut stdout_bytes);
+  }
+  let stderr_bytes = stderr_reader
+    .and_then(|t| t.join().ok())
+    .unwrap_or_default();
+  if let Some(t) = feeder {
+    let _ = t.join();
+  }
+  let status = child.wait();
+
+  // A process that was killed by a signal has no exit code.
+  let exit_code = match status {
+    Ok(s) => s
+      .code()
+      .map_or_else(|| id_expr("None"), |c| Expr::Integer(i128::from(c))),
+    Err(_) => id_expr("None"),
+  };
+  let stdout =
+    Expr::String(String::from_utf8_lossy(&stdout_bytes).into_owned());
+  let stderr =
+    Expr::String(String::from_utf8_lossy(&stderr_bytes).into_owned());
+
+  Ok(match property.as_deref() {
+    Some("ExitCode") => exit_code,
+    Some("StandardOutput") => stdout,
+    Some("StandardError") => stderr,
+    _ => Expr::Association(vec![
+      (Expr::String("ExitCode".to_string()), exit_code),
+      (Expr::String("StandardOutput".to_string()), stdout),
+      (Expr::String("StandardError".to_string()), stderr),
+    ]),
+  })
+}
+
+/// Split a Wolfram file specification into the external command it names.
+/// `"!sort -u"` runs `sort -u`; anything without the leading `!` is a
+/// plain file path.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn command_file_spec(spec: &str) -> Option<&str> {
+  spec.strip_prefix('!')
+}
+
+/// The two standard output streams, as `(name, id)`. Both are open for the
+/// whole session and keep these fixed ids, which is why `register_stream`
+/// hands out ids starting after them.
+pub(crate) const STANDARD_STREAMS: [(&str, i128); 2] =
+  [("stdout", 1), ("stderr", 2)];
+
+/// The `OutputStream[name, id]` expression for a standard stream:
+/// `OutputStream["stdout", 1]` for stdout, `OutputStream["stderr", 2]` for
+/// stderr. This is what `$StandardOutputStream`, `$StandardErrorStream` and
+/// `Streams[]` all hand out.
+pub(crate) fn standard_stream_expr(is_stdout: bool) -> Expr {
+  let (name, id) = STANDARD_STREAMS[usize::from(!is_stdout)];
+  call(
+    "OutputStream",
+    vec![Expr::String(name.to_string()), Expr::Integer(id)],
+  )
+}
+
+/// Recognize a channel that names one of the process's standard streams:
+/// `Some(true)` for stdout, `Some(false)` for stderr. Covers the stream
+/// names, the `$Output`/`$Messages` symbols and the `OutputStream[…]`
+/// expressions `$StandardOutputStream` / `Streams[]` return.
+///
+/// Only the write functions ask, and those are native-only — the browser
+/// has no process streams to write to.
+#[cfg(not(target_arch = "wasm32"))]
+fn standard_stream_channel(expr: &Expr) -> Option<bool> {
+  let is_stdout = |name: &str| match name {
+    "stdout" | "$Output" => Some(true),
+    "stderr" | "$Messages" => Some(false),
+    _ => None,
+  };
+  match expr {
+    Expr::String(name) => is_stdout(name),
+    Expr::Identifier(name) => is_stdout(name),
+    // Only the standard streams' own ids count: a file stream that
+    // happens to be named "stdout" is still a file.
+    Expr::FunctionCall { name, args }
+      if name == "OutputStream" && args.len() == 2 =>
+    {
+      let (Expr::String(stream_name), Expr::Integer(id)) = (&args[0], &args[1])
+      else {
+        return None;
+      };
+      STANDARD_STREAMS
+        .iter()
+        .any(|(n, i)| n == stream_name && i == id)
+        .then(|| is_stdout(stream_name))
+        .flatten()
+    }
+    _ => None,
+  }
+}
+
+/// The registry id of an `InputStream[name, id]` / `OutputStream[name, id]`.
+fn io_stream_id(expr: &Expr) -> Option<usize> {
+  let Expr::FunctionCall { name, args } = expr else {
+    return None;
+  };
+  if (name != "InputStream" && name != "OutputStream") || args.len() != 2 {
+    return None;
+  }
+  match &args[1] {
+    Expr::Integer(id) => Some(*id as usize),
+    _ => None,
+  }
+}
+
+/// The path an open file stream keeps: the name resolved against the
+/// working directory in force when the stream was opened, so reads and
+/// writes stay pointed at the same file no matter where `SetDirectory`
+/// moves afterwards. The stream's *name* keeps the spelling the caller
+/// used.
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_file_path(filename: &str) -> String {
+  crate::vfs::resolve(filename).to_string_lossy().into_owned()
+}
+
+/// The components of a path, the way `FileNameSplit` reports them: split on
+/// the separator, then drop *exactly one* trailing empty piece. `"/a/b/"` is
+/// `{"", "a", "b"}` — the leading empty piece is what marks the path absolute
+/// — while `"/a/b//"` keeps one empty piece at the end, just as an interior
+/// `"a//b"` keeps its own. `FileNameDepth` is the length of this list, and
+/// `FileNameTake`/`FileNameDrop` take and drop from it.
+pub(crate) fn file_name_pieces(path: &str, sep: char) -> Vec<&str> {
+  if path.is_empty() {
+    return Vec::new();
+  }
+  let mut pieces: Vec<&str> = path.split(path_separators(sep)).collect();
+  if pieces.last().is_some_and(|piece| piece.is_empty()) {
+    pieces.pop();
+  }
+  pieces
+}
+
+/// The separators a path written for `sep`'s operating system may use.
+/// Windows reads either slash, so both split a path there; on Unix a
+/// backslash is an ordinary character in a file name and only `/` divides.
+pub(crate) fn path_separators(sep: char) -> &'static [char] {
+  if sep == '\\' { &['\\', '/'] } else { &['/'] }
+}
+
+/// The separator the `FileName*` functions work in: the one named by an
+/// `OperatingSystem -> "Windows" | "Unix" | "MacOSX"` option among `args`,
+/// or the host's own when none is given.
+pub(crate) fn file_name_separator(args: &[Expr]) -> char {
+  for arg in args {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = arg
+      && matches!(pattern.as_ref(),
+        Expr::Identifier(n) | Expr::Constant(n) if n == "OperatingSystem")
+      && let Expr::String(os) = replacement.as_ref()
+    {
+      return if os == "Windows" { '\\' } else { '/' };
+    }
+  }
+  std::path::MAIN_SEPARATOR
+}
+
+/// The positional arguments of a call — everything that is not an option
+/// rule. Used by the `FileName*` family and by `ReadString`.
+pub(crate) fn positional_args(args: &[Expr]) -> Vec<&Expr> {
+  args
+    .iter()
+    .filter(|arg| !matches!(arg, Expr::Rule { .. }))
+    .collect()
+}
+
+/// Join path components the way `FileNameJoin` does: empty components are
+/// dropped, except that a leading empty one marks the result absolute. So
+/// `{"a", "", "b"}` is `"a/b"`, `{"", "a"}` is `"/a"` and `{""}` is `"/"`.
+pub(crate) fn file_name_join<'a>(
+  pieces: impl IntoIterator<Item = &'a str>,
+  sep: char,
+) -> String {
+  let pieces: Vec<&str> = pieces.into_iter().collect();
+  let absolute = pieces.first().is_some_and(|piece| piece.is_empty());
+  let body = pieces
+    .iter()
+    .filter(|piece| !piece.is_empty())
+    .copied()
+    .collect::<Vec<_>>()
+    .join(&sep.to_string());
+  if absolute {
+    format!("{sep}{body}")
+  } else {
+    body
+  }
+}
+
+/// Bytes for a binary read. An open stream is served from the registry, so
+/// a `"!command"` pipe reads the command's output; `path` (the stream's
+/// name) is the fallback for a stream that is no longer open.
+#[cfg(not(target_arch = "wasm32"))]
+fn io_binary_bytes(expr: &Expr, path: &str) -> std::io::Result<Vec<u8>> {
+  if let Some(id) = io_stream_id(expr)
+    && let Some(bytes) = get_stream_bytes(id)
+  {
+    return Ok(bytes);
+  }
+  match command_file_spec(path) {
+    Some(command) => run_command_capture_bytes(command)
+      .ok_or_else(|| std::io::Error::other("cannot start the shell")),
+    None => std::fs::read(crate::vfs::resolve(path)),
+  }
+}
+
+/// Where a write function sends its bytes.
+#[cfg(not(target_arch = "wasm32"))]
+enum WriteTarget {
+  /// One of the process's standard streams: `true` for stdout, `false`
+  /// for stderr.
+  Standard(bool),
+  /// Append to a file.
+  File(String),
+  /// The standard input of an open `OpenWrite["!command"]` stream.
+  Sink(std::rc::Rc<RefCell<CommandSinkState>>),
+  /// A `"!command"` named directly instead of through an open stream: the
+  /// command runs for this one write and is fed exactly its bytes.
+  Command(String),
+  /// An open `SocketObject`, named by its UUID.
+  Socket(String),
+}
+
+/// Resolve the first argument of `Write`/`WriteString`/`BinaryWrite` to the
+/// thing that receives the bytes. `None` for anything unwritable, which
+/// leaves the call unevaluated.
+#[cfg(not(target_arch = "wasm32"))]
+fn io_write_target(expr: &Expr) -> Option<WriteTarget> {
+  // `"stdout"`, `$Output`, `OutputStream["stdout", 1]` and their stderr
+  // counterparts name the process's own streams, never a file of that name.
+  if let Some(is_stdout) = standard_stream_channel(expr) {
+    return Some(WriteTarget::Standard(is_stdout));
+  }
+  // A socket is written to as directly as a stream is, and is the one
+  // write target that is neither a name nor a stream object.
+  if let Some(uuid) = crate::functions::socket_ast::socket_object_uuid(expr) {
+    return Some(WriteTarget::Socket(uuid));
+  }
+  match expr {
+    Expr::String(spec) => Some(match command_file_spec(spec) {
+      Some(command) => WriteTarget::Command(command.to_string()),
+      None => WriteTarget::File(spec.clone()),
+    }),
+    Expr::FunctionCall { name, args }
+      if (name == "OutputStream" || name == "InputStream")
+        && args.len() == 2 =>
+    {
+      let Expr::Integer(id) = &args[1] else {
+        return None;
+      };
+      match get_stream_kind(*id as usize)?.0 {
+        StreamKind::File(path) => Some(WriteTarget::File(path)),
+        StreamKind::CommandSink(state) => Some(WriteTarget::Sink(state)),
+        // Neither a string stream nor the read end of a pipe is writable.
+        StreamKind::Text(_) | StreamKind::Command(_) => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// The targets a channel argument names. A list of channels — what
+/// `Streams["stderr"]` and `$Output` style variables hand over — writes to
+/// every one of them, as in wolframscript. `None` if any element is not
+/// writable, which leaves the whole call unevaluated.
+#[cfg(not(target_arch = "wasm32"))]
+fn io_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
+  match expr {
+    Expr::List(items) => items.iter().map(io_write_target).collect(),
+    _ => io_write_target(expr).map(|target| vec![target]),
+  }
+}
+
+/// Send `bytes` to every target of a channel, in order.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_targets_bytes(
+  targets: &[WriteTarget],
+  bytes: &[u8],
+  caller: &str,
+) -> Result<(), InterpreterError> {
+  for target in targets {
+    write_target_bytes(target, bytes, caller)?;
+  }
+  Ok(())
+}
+
+/// Shared body of `WriteString` and `WriteLine`. `args[0]` is the channel and
+/// `args[1..]` the things to write; they are concatenated, `terminator` is
+/// appended, and the result goes out in a single write. `WriteLine` is just
+/// `WriteString` with a newline terminator, so both come through here.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_string_to_channel(
+  args: &[Expr],
+  terminator: &str,
+  caller: &str,
+) -> Result<Expr, InterpreterError> {
+  // A `"!command"` named directly runs once per call, so the whole
+  // argument list has to reach it in a single write.
+  let mut text = String::new();
+  for arg in &args[1..] {
+    match arg {
+      Expr::String(s) => text.push_str(s),
+      other => text.push_str(&expr_to_string(other)),
+    }
+  }
+  text.push_str(terminator);
+
+  let Some(targets) = io_write_targets(&args[0]) else {
+    return Ok(unevaluated(caller, args));
+  };
+  write_targets_bytes(&targets, text.as_bytes(), caller)?;
+  Ok(null_expr())
+}
+
+/// Send `bytes` to a write target, appending for files. `caller` only names
+/// the function in the error message.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_target_bytes(
+  target: &WriteTarget,
+  bytes: &[u8],
+  caller: &str,
+) -> Result<(), InterpreterError> {
+  match target {
+    // Stdout writes also go through the captured buffer (like Print) so
+    // they appear in `interpret_with_stdout`.
+    WriteTarget::Standard(is_stdout) => {
+      use std::io::Write;
+      // The bytes go out unaltered — `BinaryWrite` may hand over data that
+      // is not valid UTF-8 — while the capture buffer, being text, gets a
+      // lossy decoding of the same bytes.
+      if *is_stdout {
+        if !crate::is_quiet_print() {
+          let mut stdout = std::io::stdout();
+          let _ = stdout.write_all(bytes);
+          let _ = stdout.flush();
+        }
+        crate::capture_stdout_raw(&String::from_utf8_lossy(bytes));
+      } else {
+        let mut stderr = std::io::stderr();
+        let _ = stderr.write_all(bytes);
+        let _ = stderr.flush();
+      }
+      Ok(())
+    }
+    WriteTarget::File(path) => {
+      use std::io::Write;
+      let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::vfs::resolve(path))
+        .map_err(|e| {
+          InterpreterError::EvaluationError(format!(
+            "{caller}: cannot open {path}: {e}"
+          ))
+        })?;
+      file.write_all(bytes).map_err(|e| {
+        InterpreterError::EvaluationError(format!("{caller}: write error: {e}"))
+      })
+    }
+    WriteTarget::Sink(state) => {
+      command_sink_write(state, bytes);
+      Ok(())
+    }
+    // A socket that is gone has already said so in wolframscript's words,
+    // so the write is simply dropped rather than raised as an error.
+    WriteTarget::Socket(uuid) => {
+      crate::functions::socket_ast::socket_write_bytes(uuid, bytes);
+      Ok(())
+    }
+    WriteTarget::Command(command) => {
+      if run_command_with_input(command, bytes) {
+        Ok(())
+      } else {
+        Err(InterpreterError::EvaluationError(format!(
+          "{caller}: cannot open !{command}."
+        )))
+      }
+    }
+  }
+}
+
+#[derive(Clone, Debug)]
+#[allow(unused)] // id is unused
+struct OpenStream {
+  pub name: String,
+  pub kind: StreamKind,
+  pub id: usize,
+  pub position: usize,
+}
+
+thread_local! {
+    static STREAM_REGISTRY: RefCell<HashMap<usize, OpenStream>> = RefCell::new(HashMap::new());
+    // The standard streams already occupy ids 1 and 2, so — as in
+    // wolframscript — the first stream a script opens gets id 3.
+    static STREAM_COUNTER: RefCell<usize> =
+      const { RefCell::new(STANDARD_STREAMS.len() + 1) };
+}
+
+/// Register a new open stream and return its ID
+fn register_stream(name: String, kind: StreamKind) -> usize {
+  let id = STREAM_COUNTER.with(|c| {
+    let mut counter = c.borrow_mut();
+    let id = *counter;
+    *counter += 1;
+    id
+  });
+  let stream = OpenStream {
+    name,
+    kind,
+    id,
+    position: 0,
+  };
+  STREAM_REGISTRY.with(|reg| {
+    reg.borrow_mut().insert(id, stream);
+  });
+  id
+}
+
+/// Close a stream by ID, returning the stream name and kind if it was open
+fn close_stream(id: usize) -> Option<(String, StreamKind)> {
+  STREAM_REGISTRY
+    .with(|reg| reg.borrow_mut().remove(&id).map(|s| (s.name, s.kind)))
+}
+
+/// Check if a stream is open
+fn is_stream_open(id: usize) -> bool {
+  STREAM_REGISTRY.with(|reg| reg.borrow().contains_key(&id))
+}
+
+/// Look up a stream's kind and current read position.
+/// The kind is cloned so the registry is not kept borrowed across a read,
+/// which for a command stream can block on the child process.
+fn get_stream_kind(id: usize) -> Option<(StreamKind, usize)> {
+  STREAM_REGISTRY
+    .with(|reg| reg.borrow().get(&id).map(|s| (s.kind.clone(), s.position)))
+}
+
+/// Get the remaining content of a stream (for reading)
+fn get_stream_content(id: usize) -> Option<(String, usize)> {
+  let (kind, position) = get_stream_kind(id)?;
+  let content = match &kind {
+    StreamKind::Text(text) => text.clone(),
+    #[cfg(not(target_arch = "wasm32"))]
+    StreamKind::File(path) => {
+      std::fs::read_to_string(crate::vfs::resolve(path)).unwrap_or_default()
+    }
+    // Whole-stream reads have to wait for the command to finish.
+    #[cfg(not(target_arch = "wasm32"))]
+    StreamKind::Command(state) => {
+      let mut state = state.borrow_mut();
+      command_stream_read_all(&mut state);
+      String::from_utf8_lossy(&state.buffer).into_owned()
+    }
+    // Nothing was ever read into a command sink.
+    #[cfg(not(target_arch = "wasm32"))]
+    StreamKind::CommandSink(_) => String::new(),
+  };
+  Some((content, position))
+}
+
+/// The raw bytes behind a stream, for `BinaryRead`. Command streams are
+/// drained to the end, like any other whole-stream read.
+#[cfg(not(target_arch = "wasm32"))]
+fn get_stream_bytes(id: usize) -> Option<Vec<u8>> {
+  match get_stream_kind(id)?.0 {
+    StreamKind::Text(text) => Some(text.into_bytes()),
+    StreamKind::File(path) => std::fs::read(crate::vfs::resolve(path)).ok(),
+    StreamKind::Command(state) => {
+      let mut state = state.borrow_mut();
+      command_stream_read_all(&mut state);
+      Some(state.buffer.clone())
+    }
+    StreamKind::CommandSink(_) => Some(Vec::new()),
+  }
+}
+
+/// Content for a line-oriented read. A command stream only pulls as much of
+/// its child's output as the next line needs, so `ReadLine` keeps working
+/// line by line on a live pipe instead of blocking until the command exits.
+#[cfg(not(target_arch = "wasm32"))]
+fn get_stream_line_content(id: usize) -> Option<(String, usize)> {
+  if let Some((StreamKind::Command(state), position)) = get_stream_kind(id) {
+    let mut state = state.borrow_mut();
+    while !state.eof
+      && !state.buffer[position.min(state.buffer.len())..].contains(&b'\n')
+    {
+      command_stream_read_line(&mut state);
+    }
+    return Some((
+      String::from_utf8_lossy(&state.buffer).into_owned(),
+      position,
+    ));
+  }
+  get_stream_content(id)
+}
+
+/// Get the current read position of a stream
+fn get_stream_position(id: usize) -> Option<usize> {
+  STREAM_REGISTRY.with(|reg| reg.borrow().get(&id).map(|s| s.position))
+}
+
+/// Set the read position of a stream to an absolute position
+fn set_stream_position(id: usize, new_position: usize) {
+  STREAM_REGISTRY.with(|reg| {
+    let mut registry = reg.borrow_mut();
+    if let Some(stream) = registry.get_mut(&id) {
+      stream.position = new_position;
+    }
+  });
+}
+
+/// Advance the read position of a stream
+fn advance_stream_position(id: usize, new_position: usize) {
+  STREAM_REGISTRY.with(|reg| {
+    let mut registry = reg.borrow_mut();
+    if let Some(stream) = registry.get_mut(&id) {
+      stream.position = new_position;
+    }
+  });
+}
+
+/// The file a `Get` / `Needs` argument names.
+///
+/// A context name — `"MyPaclet`"` — is looked up in the loaded paclet
+/// directories and then along `$Path`; anything else is a file name, resolved
+/// against the virtual working directory so a preceding `SetDirectory` is
+/// honoured the way it is in wolframscript. `None` when no such file exists.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn resolve_get_target(name: &str) -> Option<std::path::PathBuf> {
+  resolve_get_target_in(name, &[])
+}
+
+/// The file `Get[name]` reads, searching `extra_path` — the directories a
+/// `Path -> {…}` option names — and then `$Path` when the name does not
+/// resolve against the working directory on its own. That is how a package
+/// laid out in one of several module directories is found by its relative
+/// name alone.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn resolve_get_target_in(
+  name: &str,
+  extra_path: &[String],
+) -> Option<std::path::PathBuf> {
+  if name.ends_with('`') {
+    return crate::functions::paclet::resolve_context(name);
+  }
+  let resolved = crate::vfs::resolve(name);
+  if resolved.is_file() {
+    return Some(resolved);
+  }
+  if std::path::Path::new(name).is_absolute() {
+    return None;
+  }
+  extra_path
+    .iter()
+    .cloned()
+    .chain(crate::utils::search_path())
+    .map(|dir| crate::vfs::resolve(std::path::Path::new(&dir).join(name)))
+    .find(|candidate| candidate.is_file())
+}
+
+/// The directories a `Path -> "dir"` / `Path -> {"dir", …}` option names.
+/// Any other option is accepted and ignored, as one Woxi does not act on.
+#[cfg(not(target_arch = "wasm32"))]
+fn get_path_option(opts: &[Expr]) -> Vec<String> {
+  let mut dirs = Vec::new();
+  for opt in opts {
+    let (Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    }) = opt
+    else {
+      continue;
+    };
+    if !matches!(&**pattern, Expr::Identifier(name) if name == "Path") {
+      continue;
+    }
+    match &**replacement {
+      Expr::String(dir) => dirs.push(dir.clone()),
+      Expr::List(items) => {
+        dirs.extend(items.iter().filter_map(|item| match item {
+          Expr::String(dir) => Some(dir.clone()),
+          _ => None,
+        }));
+      }
+      _ => {}
+    }
+  }
+  dirs
+}
+
+/// Read and evaluate the file at `path`, returning its last result.
+/// `None` when the file cannot be read.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn evaluate_file(
+  path: &std::path::Path,
+) -> Option<Result<Expr, InterpreterError>> {
+  let content = std::fs::read_to_string(path).ok()?;
+  // The read file is the input file for the duration of the read, so
+  // `$InputFileName` must point at it and not at the enclosing script.
+  let _input_file_name = InputFileNameGuard::install(path);
+  Some(match evaluate_source(&content) {
+    // A file that cannot be read through is reported and gives `$Failed`;
+    // it does not take the program that read it down with it. That is what
+    // wolframscript does — a `Get` that hits bad syntax or an error deep in
+    // a package leaves the rest of the script running — and it matters most
+    // for a large project, where one unreadable file would otherwise hide
+    // everything after it.
+    Err(
+      error @ (InterpreterError::ParseError(_)
+      | InterpreterError::EvaluationError(_)),
+    ) => {
+      crate::emit_message(&format!(
+        "Get: {} while reading {}.",
+        error,
+        path.display()
+      ));
+      Ok(fail_expr())
+    }
+    other => other,
+  })
+}
+
+/// Evaluate Wolfram source, returning its last result — what `Get` yields
+/// for whatever it read, be that a file or a command's output.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn evaluate_source(content: &str) -> Result<Expr, InterpreterError> {
+  // Use interpret to evaluate the content (handles all node types
+  // including FunctionDefinition, Expression, etc.)
+  let result_str = crate::interpret(content)?;
+  // `interpret` reports a `Null` result as the "\0" display-suppression
+  // sentinel; as the value of `Get` it is the symbol `Null` again.
+  if result_str == "\0" {
+    return Ok(null_expr());
+  }
+  // Take the value itself where the evaluation recorded one: reading its
+  // display text back both loses whatever `OutputForm` does not spell out
+  // exactly — `{"a b"}` reads back as the product `{a b}`, `"4.17.3.0"` as
+  // the real `0.` — and, for a large table, costs more than the whole read.
+  if let Some(expr) = crate::take_value_expr() {
+    return Ok(expr);
+  }
+  Ok(
+    crate::syntax::string_to_expr(&result_str)
+      .unwrap_or(Expr::Identifier(result_str)),
+  )
+}
+
+/// Scopes `$InputFileName` to the file a `Get` is currently reading.
+///
+/// While a file is being read it *is* the input file, so `$InputFileName`
+/// has to name it rather than the enclosing script. Restoring on drop (rather
+/// than after the evaluation) keeps nested and sequential `Get`s correct even
+/// when the read file raises an error.
+#[cfg(not(target_arch = "wasm32"))]
+struct InputFileNameGuard {
+  prev: Option<crate::StoredValue>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InputFileNameGuard {
+  fn install(path: &std::path::Path) -> Self {
+    let value = crate::StoredValue::ExprVal(Expr::String(
+      path.to_string_lossy().into_owned(),
+    ));
+    let prev = crate::ENV
+      .with(|e| e.borrow_mut().insert("$InputFileName".to_string(), value));
+    Self { prev }
+  }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for InputFileNameGuard {
+  fn drop(&mut self) {
+    crate::ENV.with(|e| {
+      let mut env = e.borrow_mut();
+      match self.prev.take() {
+        Some(v) => {
+          env.insert("$InputFileName".to_string(), v);
+        }
+        None => {
+          env.remove("$InputFileName");
+        }
+      }
+    });
+  }
+}
+
+pub fn dispatch_io_functions(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  match name {
+    // Message[sym::tag, args...] — emit a message and return Null. Only matches
+    // when the first argument is a MessageName; other shapes fall through to
+    // stay unevaluated.
+    "Message" if !args.is_empty() => {
+      if let Expr::FunctionCall {
+        name: mn_name,
+        args: mn_args,
+      } = &args[0]
+        && mn_name == "MessageName"
+        && mn_args.len() == 2
+      {
+        // The tag names the symbol the way it is written where the
+        // message appears: `Int::wrngUsage`, not `Rubi`Int::wrngUsage`,
+        // while the package's context is on `$ContextPath`.
+        let sym_name = match &mn_args[0] {
+          Expr::Identifier(s) => crate::evaluator::contexts::display_name(s),
+          other => expr_to_string(other),
+        };
+        let tag = match &mn_args[1] {
+          Expr::String(s) => s.clone(),
+          Expr::Identifier(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        // Evaluate MessageName[sym, tag]. If it resolves to a String, use it
+        // as the text; otherwise treat the text as unset.
+        let resolved = crate::evaluator::evaluate_expr_to_expr(&args[0]);
+        let text = match &resolved {
+          Ok(Expr::String(s)) => s.clone(),
+          _ => "-- Message text not found --".to_string(),
+        };
+        // Fill the template slots with the extra arguments the way
+        // `StringForm` does — `` `` `` takes them in turn and `` `n` `` picks
+        // the nth — rendered in output form so strings appear unquoted:
+        // `Message[f::mymsg, 42]` shows "Custom 42 here.". A message whose
+        // slots outnumber its arguments keeps them literal, and unlike
+        // `StringForm` says nothing about it: the message being reported is
+        // the news, not the shape of its template.
+        let filled = crate::functions::string_ast::format_message_template(
+          &text,
+          &args[1..],
+        );
+        // Route through emit_message so the message is captured (Check
+        // reacts to user messages), respects Quiet/Off, participates in
+        // General::stop suppression, and reaches the same stream as
+        // built-in messages.
+        crate::emit_message(&format!("{sym_name}::{tag}: {filled}"));
+        return Some(Ok(null_expr()));
+      }
+    }
+    // HTTPRequest[url] / HTTPRequest[url, assoc] / HTTPRequest[assoc] —
+    // symbolic HTTP request object; no network access is performed.
+    // The one-argument URL form canonicalizes to HTTPRequest[url, <||>],
+    // matching wolframscript; other shapes stay as given.
+    "HTTPRequest" if !args.is_empty() => {
+      return Some(crate::functions::http_ast::http_request_ast(args));
+    }
+    // URLRead[req] / URLRead[url] — send the HTTP request through curl and
+    // return the HTTPResponse object (or Failure["ConnectionFailure", …]).
+    #[cfg(not(target_arch = "wasm32"))]
+    "URLRead" if args.len() == 1 => {
+      return Some(crate::functions::http_ast::url_read_ast(&args[0]));
+    }
+    // URLFetch[url] / URLFetch[url, params] — minimal stub.
+    // Returns $Failed for URLs that lack a host (e.g. "https://"), matching
+    // wolframscript's behavior. Network fetches are out of scope for the
+    // CLI/snapshot test loop, so any other URL also returns $Failed.
+    "URLFetch" if args.len() == 1 || args.len() == 2 => {
+      if let Expr::String(_) = &args[0] {
+        return Some(Ok(fail_expr()));
+      }
+    }
+    // Environment["name"] — return the named environment variable value
+    "Environment" if args.len() == 1 => {
+      if let Expr::String(var_name) = &args[0] {
+        return Some(Ok(match std::env::var(var_name) {
+          Ok(val) => Expr::String(val),
+          Err(_) => fail_expr(),
+        }));
+      }
+      return Some(Ok(unevaluated("Environment", args)));
+    }
+    // Internal`DynamicLibraryExtension[] — the file extension shared
+    // libraries carry on this platform, without the dot ("so", "dylib",
+    // "dll"). Packages that ship LibraryLink binaries build their path with
+    // it (`"libuv." <> Internal`DynamicLibraryExtension[]`).
+    "Internal`DynamicLibraryExtension" if args.is_empty() => {
+      let extension = if cfg!(target_os = "macos") {
+        "dylib"
+      } else if cfg!(target_os = "windows") {
+        "dll"
+      } else {
+        "so"
+      };
+      return Some(Ok(Expr::String(extension.to_string())));
+    }
+    // RunProcess[prog], RunProcess[{prog, arg, …}] — run a program to
+    // completion and report its exit code and output streams.
+    // RunProcess[cmd, "StandardOutput" | "StandardError" | "ExitCode" | All]
+    // picks one of them; a third argument is fed to its standard input.
+    // ProcessDirectory -> dir runs it there, ProcessEnvironment -> env
+    // (an association or list of rules, or Inherited) sets its variables.
+    #[cfg(not(target_arch = "wasm32"))]
+    "RunProcess" if !args.is_empty() => {
+      return Some(run_process_ast(args));
+    }
+    // GetEnvironment[] — all environment variables as a List of rules.
+    "GetEnvironment" if args.is_empty() => {
+      let rules: Vec<Expr> = std::env::vars()
+        .map(|(k, v)| Expr::Rule {
+          pattern: Box::new(Expr::String(k)),
+          replacement: Box::new(Expr::String(v)),
+        })
+        .collect();
+      return Some(Ok(Expr::List(rules.into())));
+    }
+    // GetEnvironment["name"] — return "name" -> "value" rule
+    // GetEnvironment[{"n1","n2"}] — list of rules
+    "GetEnvironment" if args.len() == 1 => {
+      let make_rule = |var: &str| -> Expr {
+        Expr::Rule {
+          pattern: Box::new(Expr::String(var.to_string())),
+          replacement: Box::new(match std::env::var(var) {
+            Ok(val) => Expr::String(val),
+            Err(_) => id_expr("None"),
+          }),
+        }
+      };
+      match &args[0] {
+        Expr::String(var) => return Some(Ok(make_rule(var))),
+        Expr::List(items) => {
+          let rules: Vec<Expr> = items
+            .iter()
+            .map(|item| match item {
+              Expr::String(v) => make_rule(v),
+              _ => item.clone(),
+            })
+            .collect();
+          return Some(Ok(Expr::List(rules.into())));
+        }
+        _ => {}
+      }
+      return Some(Ok(unevaluated("GetEnvironment", args)));
+    }
+    // SetEnvironment["name" -> "value"]   — set an environment variable
+    // SetEnvironment["name" -> None]      — unset an environment variable
+    // SetEnvironment[{rule1, rule2, ...}] — apply multiple rules
+    // Returns Null on success, $Failed if any value is not a string or None.
+    "SetEnvironment" if args.len() == 1 => {
+      fn apply_rule(rule: &Expr) -> Option<bool> {
+        let (pat, val) = match rule {
+          Expr::Rule {
+            pattern,
+            replacement,
+          }
+          | Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } => (pattern.as_ref(), replacement.as_ref()),
+          _ => return None,
+        };
+        let var = match pat {
+          Expr::String(s) => s.clone(),
+          _ => return Some(false),
+        };
+        match val {
+          Expr::String(v) => {
+            // SAFETY: Woxi is single-threaded in the REPL / CLI path.
+            unsafe { std::env::set_var(&var, v) };
+            Some(true)
+          }
+          Expr::Identifier(name) if name == "None" => {
+            unsafe { std::env::remove_var(&var) };
+            Some(true)
+          }
+          _ => {
+            eprintln!(
+              "SetEnvironment::setraw: {} must be a string or None.",
+              expr_to_string(val)
+            );
+            Some(false)
+          }
+        }
+      }
+      let ok = match &args[0] {
+        Expr::List(rules) => {
+          let mut all_ok = true;
+          for r in rules {
+            match apply_rule(r) {
+              Some(true) => {}
+              _ => all_ok = false,
+            }
+          }
+          all_ok
+        }
+        other => matches!(apply_rule(other), Some(true)),
+      };
+      return Some(Ok(if ok { null_expr() } else { fail_expr() }));
+    }
+    // Streams[] — return list of open streams (stdout and stderr)
+    "Streams" if args.is_empty() => {
+      return Some(Ok(Expr::List(
+        vec![standard_stream_expr(true), standard_stream_expr(false)].into(),
+      )));
+    }
+    // Streams["name"] — filter streams by name
+    "Streams" if args.len() == 1 => {
+      if let Expr::String(name_filter) = &args[0] {
+        let matching: Vec<Expr> = STANDARD_STREAMS
+          .iter()
+          .filter(|(n, _)| *n == name_filter.as_str())
+          .map(|(n, _)| standard_stream_expr(*n == "stdout"))
+          .collect();
+        return Some(Ok(Expr::List(matching.into())));
+      }
+      return Some(Ok(Expr::List(vec![].into())));
+    }
+    // ReadList[source] or ReadList[source, type] or ReadList[source, type, n]
+    "ReadList" if !args.is_empty() && args.len() <= 3 => {
+      return Some(crate::functions::string_ast::read_list_ast(args));
+    }
+    // ReadString["file"] — read a host-registered virtual file (WASM).
+    // The browser has no local filesystem, so the virtual store registered
+    // via `set_virtual_file` is the only file source.
+    #[cfg(target_arch = "wasm32")]
+    "ReadString" if args.len() == 1 => {
+      let filename = match &args[0] {
+        Expr::String(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("ReadString", args)));
+        }
+      };
+      let Some(bytes) = crate::wasm::virtual_file(&filename) else {
+        crate::emit_message(&format!(
+          "ReadString::noopen: Cannot open {}.",
+          filename
+        ));
+        return Some(Ok(fail_expr()));
+      };
+      return Some(match String::from_utf8(bytes) {
+        Ok(content) => Ok(Expr::String(content)),
+        Err(_) => Err(InterpreterError::EvaluationError(format!(
+          "ReadString: \"{}\" is not valid UTF-8 text",
+          filename
+        ))),
+      });
+    }
+    // ReadString[src] — everything left in `src`;
+    // ReadString[src, term] — up to the next terminator, which is a literal
+    // string or a string pattern; option rules may follow either form.
+    // `src` is a file path or an InputStream, which the read consumes.
+    #[cfg(not(target_arch = "wasm32"))]
+    "ReadString" if !args.is_empty() => {
+      let positional = positional_args(args);
+      if positional.len() > 2 {
+        crate::emit_message(&format!(
+          "ReadString::argt: ReadString called with {} arguments; \
+           1 or 2 arguments are expected.",
+          args.len()
+        ));
+        return Some(Ok(unevaluated("ReadString", args)));
+      }
+      // A terminator is either a literal string — the fast path, which stops
+      // at the first occurrence — or a string pattern such as
+      // `StartOfLine ~~ "%" ~~ ___ ~~ "%"`, which stops at the first match.
+      let mut terminator: Option<String> = None;
+      let mut terminator_pattern: Option<&Expr> = None;
+      match positional.get(1) {
+        None => {}
+        Some(Expr::String(t)) if !t.is_empty() => terminator = Some(t.clone()),
+        Some(other)
+          if crate::functions::string_ast::is_read_terminator(other) =>
+        {
+          terminator_pattern = Some(other);
+        }
+        Some(other) => {
+          crate::emit_message(&format!(
+            "ReadString::iterm: Invalid terminator value {}.",
+            expr_to_string(other)
+          ));
+          return Some(Ok(unevaluated("ReadString", args)));
+        }
+      }
+
+      let (content, position, stream_id) = match positional[0] {
+        Expr::String(path) => {
+          let content = match command_file_spec(path) {
+            Some(command) => run_command_capture(command),
+            None => std::fs::read_to_string(crate::vfs::resolve(path)).ok(),
+          };
+          if let Some(c) = content {
+            (c, 0usize, None)
+          } else {
+            crate::emit_message(&format!(
+              "ReadString::noopen: Cannot open {path}."
+            ));
+            return Some(Ok(fail_expr()));
+          }
+        }
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if stream_head == "InputStream" && stream_args.len() == 2 => {
+          let Some(Expr::Integer(id)) = stream_args.get(1) else {
+            return Some(Ok(unevaluated("ReadString", args)));
+          };
+          match get_stream_content(*id as usize) {
+            Some((c, pos)) => (c, pos, Some(*id as usize)),
+            None => {
+              return Some(Ok(id_expr("EndOfFile")));
+            }
+          }
+        }
+        _ => return Some(Ok(unevaluated("ReadString", args))),
+      };
+
+      let position = position.min(content.len());
+      if let Some(pattern) = terminator_pattern {
+        if position == content.len() {
+          return Some(Ok(id_expr("EndOfFile")));
+        }
+        // The text before the match; the match itself is consumed. With no
+        // match wolframscript reports it and hands back all that is left.
+        let (text, end) = if let Some(m) =
+          crate::functions::string_ast::first_string_pattern_match(
+            &content, position, pattern,
+          ) {
+          (content[position..m.start].to_string(), m.end)
+        } else {
+          crate::emit_message(
+            "ReadString::notfound: Specified terminator not found.",
+          );
+          (content[position..].to_string(), content.len())
+        };
+        if let Some(id) = stream_id {
+          set_stream_position(id, end);
+        }
+        return Some(Ok(Expr::String(text)));
+      }
+      let rest = &content[position..];
+      let Some((text, consumed)) =
+        read_string_chunk(rest, terminator.as_deref())
+      else {
+        return Some(Ok(id_expr("EndOfFile")));
+      };
+      if let Some(id) = stream_id {
+        set_stream_position(id, position + consumed);
+      }
+      return Some(Ok(Expr::String(text)));
+    }
+    // FileTemplate[src] / FileTemplate[src, args] — read a template file from
+    // disk and produce a TemplateObject (the same object StringTemplate would
+    // build from the file's contents). `src` may be a path string or a
+    // File["path"] wrapper.
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileTemplate" if args.len() == 1 || args.len() == 2 => {
+      let filename = match &args[0] {
+        Expr::String(s) => s.clone(),
+        Expr::FunctionCall { name, args: inner }
+          if name == "File"
+            && inner.len() == 1
+            && matches!(&inner[0], Expr::String(_)) =>
+        {
+          match &inner[0] {
+            Expr::String(s) => s.clone(),
+            _ => unreachable!(),
+          }
+        }
+        // URL[…] / CloudObject[…] and other specifications are left
+        // unevaluated (network access is out of scope).
+        _ => {
+          return Some(Ok(unevaluated("FileTemplate", args)));
+        }
+      };
+      // Resolve relative paths against the virtual working directory.
+      let resolved = crate::vfs::resolve(&filename);
+      let Ok(content) = std::fs::read_to_string(&resolved) else {
+        crate::emit_message_to_stdout(&format!(
+          "StringTemplate::fnfnd: File \"{filename}\" not found."
+        ));
+        return Some(Ok(fail_expr()));
+      };
+      let bound_args = if args.len() == 2 {
+        Some(args[1].clone())
+      } else {
+        None
+      };
+      return Some(Ok(crate::functions::string_ast::build_template_object(
+        &content,
+        bound_args,
+        "TextString",
+      )));
+    }
+    // XMLTemplate[src] / XMLTemplate[src, args] — like StringTemplate but with
+    // InsertionFunction -> HTMLFragment. `src` may be a literal template string
+    // or a File["path"] wrapper that is read from disk. The template string may
+    // embed `<* expr *>` sections in addition to `` `slot` `` markers.
+    "XMLTemplate" if args.len() == 1 || args.len() == 2 => {
+      let content = match &args[0] {
+        Expr::String(s) => s.clone(),
+        #[cfg(not(target_arch = "wasm32"))]
+        Expr::FunctionCall { name, args: inner }
+          if name == "File"
+            && inner.len() == 1
+            && matches!(&inner[0], Expr::String(_)) =>
+        {
+          let filename = match &inner[0] {
+            Expr::String(s) => s.clone(),
+            _ => unreachable!(),
+          };
+          let resolved = crate::vfs::resolve(&filename);
+          if let Ok(c) = std::fs::read_to_string(&resolved) {
+            c
+          } else {
+            crate::emit_message_to_stdout(&format!(
+              "XMLTemplate::fnfnd: File \"{filename}\" not found."
+            ));
+            return Some(Ok(fail_expr()));
+          }
+        }
+        // URL[…] / CloudObject[…] and other specifications are left
+        // unevaluated (network access is out of scope).
+        _ => {
+          return Some(Ok(unevaluated("XMLTemplate", args)));
+        }
+      };
+      let bound_args = if args.len() == 2 {
+        Some(args[1].clone())
+      } else {
+        None
+      };
+      return Some(Ok(crate::functions::string_ast::build_template_object(
+        &content,
+        bound_args,
+        "HTMLFragment",
+      )));
+    }
+    // `PacletManager`Package`loadWolframLanguageCode[paclet, context, root,
+    // file, opts…]` is the loader a paclet's `Kernel` file calls to bring in
+    // the code that provides `context`. wolframscript sets up autoloading
+    // for the declared symbols; Woxi has no lazy-loading machinery, so it
+    // reads `root/file` right away — the point either way is that the
+    // context exists afterwards.
+    #[cfg(not(target_arch = "wasm32"))]
+    "PacletManager`Package`loadWolframLanguageCode" if args.len() >= 4 => {
+      let [
+        Expr::String(_paclet),
+        Expr::String(_context),
+        Expr::String(root),
+        Expr::String(file),
+        ..,
+      ] = args
+      else {
+        return Some(Ok(unevaluated(name, args)));
+      };
+      let path = std::path::Path::new(root).join(file);
+      let Some(result) = evaluate_file(&crate::vfs::resolve(&path)) else {
+        crate::emit_message_to_stdout(&format!(
+          "Get::noopen: Cannot open {}.",
+          path.display()
+        ));
+        return Some(Ok(fail_expr()));
+      };
+      return Some(result);
+    }
+    // Get[file] — read and evaluate a file, returning the last result.
+    // `Get[file, Path -> {dir, …}]` searches the named directories for a
+    // relative file name, as wolframscript does.
+    #[cfg(not(target_arch = "wasm32"))]
+    "Get"
+      if !args.is_empty()
+        && args[1..].iter().all(|a| {
+          matches!(a, Expr::Rule { .. } | Expr::RuleDelayed { .. })
+        }) =>
+    {
+      let extra_path = get_path_option(&args[1..]);
+      let filename = match &args[0] {
+        Expr::String(s) => s.clone(),
+        Expr::Identifier(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("Get", args)));
+        }
+      };
+      // A package that ships with the Wolfram Language loads as a no-op:
+      // Woxi keeps every built-in in one namespace, so there is nothing to
+      // read. There may be something to put on `$ContextPath` though (see
+      // `register_standard_context_symbols`), which is what lets a package
+      // like Combinatorica shadow bare names once `Get` has loaded it, the
+      // same as `Needs` already does.
+      if crate::utils::is_standard_distribution_context(&filename) {
+        crate::evaluator::dispatch::evaluate_functions::register_standard_context_symbols(
+          &filename,
+        );
+        return Some(Ok(null_expr()));
+      }
+      // `"!command"` evaluates the code the command writes to its standard
+      // output, the read counterpart of `Put["!command"]`.
+      if let Some(command) = command_file_spec(&filename) {
+        let Some(content) = run_command_capture(command) else {
+          crate::emit_message_to_stdout(&format!(
+            "Get::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        };
+        return Some(evaluate_source(&content));
+      }
+      let resolved = resolve_get_target_in(&filename, &extra_path);
+      let loaded = resolved.as_deref().and_then(evaluate_file);
+      let Some(result) = loaded else {
+        // wolframscript prints this message to stdout (verified with
+        // `wolframscript -file`), so mirror it into the captured buffer to
+        // keep snapshot/playground/Jupyter output byte-for-byte consistent.
+        crate::emit_message_to_stdout(&format!(
+          "Get::noopen: Cannot open {filename}."
+        ));
+        return Some(Ok(fail_expr()));
+      };
+      return Some(result);
+    }
+    // PacletDirectoryLoad[] / PacletDirectoryLoad[dir1, dir2, …] /
+    // PacletDirectoryLoad[{dir1, dir2, …}] — register directories the
+    // paclet manager searches, and return every directory now loaded.
+    // `PacletDirectoryUnload` takes the same arguments and unregisters them.
+    // Directory names have to be given either all as separate arguments or
+    // all in one list; a mixture stays unevaluated, as in wolframscript.
+    #[cfg(not(target_arch = "wasm32"))]
+    "PacletDirectoryLoad" | "PacletDirectoryUnload" => {
+      let string_dir = |e: &Expr| match e {
+        Expr::String(dir) => Some(dir.clone()),
+        _ => None,
+      };
+      let requested: Vec<String> = if let [Expr::List(dirs)] = args {
+        let Some(dirs) =
+          dirs.iter().map(string_dir).collect::<Option<Vec<_>>>()
+        else {
+          return Some(Ok(unevaluated(name, args)));
+        };
+        // Unloading a *list* of directories unregisters only its last
+        // entry in wolframscript — verified against 14.1; Woxi mirrors
+        // that so scripts see identical `PacletDirectoryLoad[]` output.
+        if name == "PacletDirectoryUnload" {
+          dirs.last().into_iter().cloned().collect()
+        } else {
+          dirs
+        }
+      } else {
+        let Some(dirs) =
+          args.iter().map(string_dir).collect::<Option<Vec<_>>>()
+        else {
+          return Some(Ok(unevaluated(name, args)));
+        };
+        dirs
+      };
+      let loaded = if name == "PacletDirectoryLoad" {
+        crate::functions::paclet::load_directories(&requested)
+      } else {
+        crate::functions::paclet::unload_directories(&requested)
+      };
+      return Some(Ok(Expr::List(
+        loaded.into_iter().map(Expr::String).collect(),
+      )));
+    }
+    // Put[expr1, expr2, ..., "file"] — write expressions to a file
+    #[cfg(not(target_arch = "wasm32"))]
+    "Put" if !args.is_empty() => {
+      let filename = match args.last().unwrap() {
+        Expr::String(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("Put", args)));
+        }
+      };
+      let exprs = &args[..args.len() - 1];
+      let content = exprs
+        .iter()
+        .map(expr_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+      let to_write = if exprs.is_empty() {
+        String::new()
+      } else {
+        format!("{content}\n")
+      };
+      // `"!command"` feeds the expressions to a command instead of a file.
+      if let Some(command) = command_file_spec(&filename) {
+        if run_command_with_input(command, to_write.as_bytes()) {
+          return Some(Ok(null_expr()));
+        }
+        crate::emit_message(&format!("Put::noopen: Cannot open {filename}."));
+        return Some(Ok(fail_expr()));
+      }
+      match std::fs::write(crate::vfs::resolve(&filename), to_write) {
+        Ok(()) => return Some(Ok(null_expr())),
+        Err(_e) => {
+          crate::emit_message(&format!("Put::noopen: Cannot open {filename}."));
+          return Some(Ok(fail_expr()));
+        }
+      }
+    }
+    // PutAppend[expr1, expr2, ..., "file"] — append expressions to a file
+    #[cfg(not(target_arch = "wasm32"))]
+    "PutAppend" if !args.is_empty() => {
+      let filename = match args.last().unwrap() {
+        Expr::String(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("PutAppend", args)));
+        }
+      };
+      let exprs = &args[..args.len() - 1];
+      let content = exprs
+        .iter()
+        .map(expr_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+      if !exprs.is_empty() {
+        use std::io::Write;
+        let to_write = format!("{content}\n");
+        // A pipe has nothing to append to, so `"!command"` just runs.
+        if let Some(command) = command_file_spec(&filename) {
+          if run_command_with_input(command, to_write.as_bytes()) {
+            return Some(Ok(null_expr()));
+          }
+          crate::emit_message(&format!(
+            "PutAppend::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+          .create(true)
+          .append(true)
+          .open(crate::vfs::resolve(&filename))
+        {
+          if file.write_all(to_write.as_bytes()).is_err() {
+            crate::emit_message(&format!(
+              "PutAppend::noopen: Cannot open {filename}."
+            ));
+            return Some(Ok(fail_expr()));
+          }
+        } else {
+          crate::emit_message(&format!(
+            "PutAppend::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        }
+      }
+      return Some(Ok(null_expr()));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "Export" if args.len() >= 2 => {
+      let filename = match &args[0] {
+        Expr::String(s) => s.clone(),
+        other => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "Export: first argument must be a filename string, got {}",
+            expr_to_string(other)
+          ))));
+        }
+      };
+      // Determine the export format from the explicit third argument or,
+      // failing that, from the filename extension.
+      let explicit_fmt = args.get(2).and_then(|a| {
+        if let Expr::String(s) = a {
+          Some(s.to_ascii_uppercase())
+        } else {
+          None
+        }
+      });
+      let ext_fmt = std::path::Path::new(&filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_uppercase);
+      let fmt = explicit_fmt.or(ext_fmt).unwrap_or_default();
+
+      // Exporting a graphic writes it to the file; it must not also appear as
+      // inline output in visual frontends (playground, woxi-studio). Evaluating
+      // `args[1]` (e.g. `BarChart[...]`) already pushed its SVG into the capture
+      // buffer, so drop that entry. The `-Graphics-` placeholder case is handled
+      // in the generic branch below, after its SVG is read from the buffer.
+      if let Expr::Graphics { svg, .. } = &args[1] {
+        crate::remove_captured_graphics(svg);
+      }
+
+      // Handle Image export.  Vector formats (SVG) wrap the raster in a
+      // base64-encoded PNG <image> element so the file is a valid SVG;
+      // every other format is written as a raster file by the image crate.
+      if let Expr::Image {
+        width,
+        height,
+        channels,
+        data,
+        ..
+      } = &args[1]
+      {
+        if fmt == "SVG" {
+          let svg = crate::functions::image_ast::image_to_svg_document(
+            *width, *height, *channels, data,
+          );
+          if let Err(e) = std::fs::write(crate::vfs::resolve(&filename), &svg)
+            .map_err(|e| {
+              InterpreterError::EvaluationError(format!("Export: {e}"))
+            })
+          {
+            return Some(Err(e));
+          }
+          return Some(Ok(Expr::String(filename)));
+        }
+        if let Err(e) = crate::functions::image_ast::export_image(
+          &filename, *width, *height, *channels, data,
+        ) {
+          return Some(Err(e));
+        }
+        return Some(Ok(Expr::String(filename)));
+      }
+
+      if fmt == "XLSX" {
+        if let Err(e) =
+          crate::functions::xlsx_ast::xlsx_export_file(&filename, &args[1])
+        {
+          return Some(Err(e));
+        }
+        return Some(Ok(Expr::String(filename)));
+      }
+
+      if fmt == "PDF" {
+        let svg = expr_to_svg(&args[1]);
+        match svg_to_pdf_bytes(&svg) {
+          Ok(pdf_bytes) => {
+            if let Err(e) =
+              std::fs::write(crate::vfs::resolve(&filename), &pdf_bytes)
+                .map_err(|e| {
+                  InterpreterError::EvaluationError(format!("Export: {e}"))
+                })
+            {
+              return Some(Err(e));
+            }
+            return Some(Ok(Expr::String(filename)));
+          }
+          Err(e) => return Some(Err(e)),
+        }
+      }
+
+      if fmt == "SVG" {
+        let svg = expr_to_svg(&args[1]);
+        // expr_to_svg returns an empty string when a graphics head fails to
+        // render; fall back to the text rendering so the file stays valid SVG.
+        let svg = if svg.is_empty() {
+          expr_text_svg(&args[1])
+        } else {
+          svg
+        };
+        let svg = embed_used_fonts(&svg);
+        if let Err(e) = std::fs::write(crate::vfs::resolve(&filename), &svg)
+          .map_err(|e| {
+            InterpreterError::EvaluationError(format!("Export: {e}"))
+          })
+        {
+          return Some(Err(e));
+        }
+        return Some(Ok(Expr::String(filename)));
+      }
+
+      // Raster image formats: rasterize the SVG and write via the image crate.
+      if matches!(
+        fmt.as_str(),
+        "PNG" | "JPG" | "JPEG" | "GIF" | "BMP" | "TIF" | "TIFF"
+      ) {
+        // Parse ImageResolution option (default 96 DPI to match
+        // usvg's default output resolution).
+        let mut dpi: f64 = 96.0;
+        // Frame delay in hundredths of a second (GIF's native unit).
+        // Default 1/8 s = 12 (matches Mathematica's 8 fps default for
+        // animated GIF export).
+        let mut frame_delay_hundredths: u16 = 12;
+        for opt in &args[2..] {
+          if let Expr::Rule {
+            pattern,
+            replacement,
+          } = opt
+            && let Expr::Identifier(k) = pattern.as_ref()
+          {
+            match k.as_str() {
+              "ImageResolution" => match replacement.as_ref() {
+                Expr::Integer(n) => dpi = *n as f64,
+                Expr::Real(f) => dpi = *f,
+                _ => {
+                  return Some(Err(InterpreterError::EvaluationError(
+                    "Export: ImageResolution must be a numeric value".into(),
+                  )));
+                }
+              },
+              "AnimationRate" | "FrameRate" => {
+                // Frames per second → hundredths-of-a-second per frame.
+                let fps = match replacement.as_ref() {
+                  Expr::Integer(n) => *n as f64,
+                  Expr::Real(f) => *f,
+                  _ => 30.0,
+                };
+                if fps > 0.0 {
+                  frame_delay_hundredths =
+                    (100.0 / fps).round().clamp(1.0, 65535.0) as u16;
+                }
+              }
+              _ => {}
+            }
+          }
+        }
+
+        // Animated GIF path: when exporting a list of graphics to GIF,
+        // rasterize each element as a frame.
+        if fmt == "GIF"
+          && let Expr::List(items) = &args[1]
+          && items.len() >= 2
+          && items.iter().all(is_rasterizable_frame)
+        {
+          let mut frames =
+            Vec::<crate::functions::image_ast::GifFrame>::with_capacity(
+              items.len(),
+            );
+          for item in items {
+            let svg = expr_to_svg(item);
+            match crate::functions::image_ast::rasterize_svg(&svg, dpi) {
+              Ok(Expr::Image {
+                width,
+                height,
+                channels,
+                ref data,
+                ..
+              }) => {
+                let dyn_img =
+                  crate::functions::image_ast::expr_to_dynamic_image(
+                    width, height, channels, data,
+                  );
+                frames.push(crate::functions::image_ast::GifFrame {
+                  image: dyn_img.to_rgba8(),
+                  delay_hundredths: frame_delay_hundredths,
+                });
+              }
+              Ok(_) => unreachable!("rasterize_svg returns Expr::Image"),
+              Err(e) => return Some(Err(e)),
+            }
+          }
+          if let Err(e) =
+            crate::functions::image_ast::export_animated_gif(&filename, frames)
+          {
+            return Some(Err(e));
+          }
+          return Some(Ok(Expr::String(filename)));
+        }
+
+        let svg = expr_to_svg(&args[1]);
+        match crate::functions::image_ast::rasterize_svg(&svg, dpi) {
+          Ok(Expr::Image {
+            width,
+            height,
+            channels,
+            ref data,
+            ..
+          }) => {
+            if let Err(e) = crate::functions::image_ast::export_image(
+              &filename, width, height, channels, data,
+            ) {
+              return Some(Err(e));
+            }
+            return Some(Ok(Expr::String(filename)));
+          }
+          Ok(_) => unreachable!("rasterize_svg returns Expr::Image"),
+          Err(e) => return Some(Err(e)),
+        }
+      }
+      // WAV export of a playable sound (Play[…] / Sound[…] / Audio[…]).
+      if matches!(fmt.as_str(), "WAV" | "WAVE")
+        && let Some(bytes) =
+          crate::functions::sound::expr_to_wav_bytes(&args[1])
+      {
+        if let Err(e) = std::fs::write(crate::vfs::resolve(&filename), &bytes)
+          .map_err(|e| {
+            InterpreterError::EvaluationError(format!("Export: {e}"))
+          })
+        {
+          return Some(Err(e));
+        }
+        return Some(Ok(Expr::String(filename)));
+      }
+
+      // MIDI export of a computational-music object (MusicScore / MusicVoice / …).
+      if (fmt == "MID" || fmt == "MIDI")
+        && let Some(bytes) =
+          crate::functions::music_midi::music_to_midi(&args[1])
+      {
+        if let Err(e) = std::fs::write(crate::vfs::resolve(&filename), &bytes)
+          .map_err(|e| {
+            InterpreterError::EvaluationError(format!("Export: {e}"))
+          })
+        {
+          return Some(Err(e));
+        }
+        return Some(Ok(Expr::String(filename)));
+      }
+
+      // The second argument has already been evaluated, which triggers
+      // capture_graphics() for Plot expressions.  Grab the SVG.
+      let content = match &args[1] {
+        Expr::Graphics { svg: svg_data, .. } => svg_data.clone(),
+        Expr::Identifier(s) if s == "-Graphics-" || s == "-Graphics3D-" => {
+          match crate::get_captured_graphics().ok_or_else(|| {
+            InterpreterError::EvaluationError(
+              "Export: no graphics to export".into(),
+            )
+          }) {
+            Ok(v) => {
+              // Written to the file, so don't also render it inline.
+              crate::remove_captured_graphics(&v);
+              v
+            }
+            Err(e) => return Some(Err(e)),
+          }
+        }
+        Expr::String(s) => s.clone(),
+        other => expr_to_string(other),
+      };
+      if let Err(e) = std::fs::write(crate::vfs::resolve(&filename), &content)
+        .map_err(|e| InterpreterError::EvaluationError(format!("Export: {e}")))
+      {
+        return Some(Err(e));
+      }
+      return Some(Ok(Expr::String(filename)));
+    }
+    // Browser (WASM) `Export`: there is no filesystem, so instead of writing to
+    // disk we serialize the value and hand the bytes to the host via
+    // `record_exported_file`, which surfaces them as downloads. Only the
+    // formats whose encoders compile to `wasm32` are supported; native-only
+    // formats (raster images, PDF, XLSX) return a clear error.
+    #[cfg(target_arch = "wasm32")]
+    "Export" if args.len() >= 2 => {
+      let filename = match &args[0] {
+        Expr::String(s) => s.clone(),
+        other => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "Export: first argument must be a filename string, got {}",
+            expr_to_string(other)
+          ))));
+        }
+      };
+      // Format from an explicit third-argument string, else the file extension.
+      let explicit_fmt = args.get(2).and_then(|a| {
+        if let Expr::String(s) = a {
+          Some(s.to_ascii_uppercase())
+        } else {
+          None
+        }
+      });
+      let ext_fmt = std::path::Path::new(&filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase());
+      let fmt = explicit_fmt.or(ext_fmt).unwrap_or_default();
+      let data = &args[1];
+
+      // Exporting a graphic writes it to the file; it must not also appear as
+      // inline output in the playground. Evaluating `args[1]` already pushed its
+      // SVG into the capture buffer, so drop that entry. The `-Graphics-`
+      // placeholder case is handled in the generic branch below, after its SVG
+      // is read from the buffer.
+      if let Expr::Graphics { svg, .. } = data {
+        crate::remove_captured_graphics(svg);
+      }
+
+      // Set to Some(format) when `bytes` is SVG the host must rasterize in the
+      // browser (graphics → PNG/JPEG), rather than ready-to-save file bytes.
+      let mut rasterize: Option<String> = None;
+
+      let bytes: Vec<u8> = match fmt.as_str() {
+        "CSV" => export_string_csv(data, ',', true, true).into_bytes(),
+        // Symbolic XML (an XMLElement or a whole XMLObject document) is
+        // written back out as markup.
+        "XML" => match crate::functions::xml_ast::xml_to_string(data) {
+          Some(text) => text.into_bytes(),
+          None => {
+            return Some(Err(InterpreterError::EvaluationError(
+              "Export: value is not symbolic XML".into(),
+            )));
+          }
+        },
+        "TSV" => export_string_csv(data, '\t', true, true).into_bytes(),
+        "JSON" | "RAWJSON" => match export_string_json(data, 0, false) {
+          Some(mut json) => {
+            json.push('\n');
+            json.into_bytes()
+          }
+          None => {
+            return Some(Err(InterpreterError::EvaluationError(
+              "Export: value cannot be serialized to JSON".into(),
+            )));
+          }
+        },
+        "SVG" => {
+          let svg = expr_to_svg(data);
+          // expr_to_svg is empty when a graphics head fails to render; fall
+          // back to the text rendering so the file stays valid SVG.
+          let svg = if svg.is_empty() {
+            expr_text_svg(data)
+          } else {
+            svg
+          };
+          embed_used_fonts(&svg).into_bytes()
+        }
+        "WAV" | "WAVE" => {
+          match crate::functions::sound::expr_to_wav_bytes(data) {
+            Some(b) => b,
+            None => {
+              return Some(Err(InterpreterError::EvaluationError(
+                "Export: value is not a playable sound".into(),
+              )));
+            }
+          }
+        }
+        "MID" | "MIDI" => {
+          match crate::functions::music_midi::music_to_midi(data) {
+            Some(b) => b,
+            None => {
+              return Some(Err(InterpreterError::EvaluationError(
+                "Export: value is not a music object".into(),
+              )));
+            }
+          }
+        }
+        // Raster image formats. An existing Image is encoded here directly
+        // (the `image` crate compiles to wasm). Graphics/plots can't be
+        // rasterized in wasm (the SVG rasterizer, resvg, is native-only), so
+        // their SVG is handed to the host to rasterize via a browser canvas —
+        // which supports PNG and JPEG only. GIF/BMP/TIFF of a plot is rejected.
+        "PNG" | "JPG" | "JPEG" | "GIF" | "BMP" | "TIF" | "TIFF" => match data {
+          Expr::Image {
+            width,
+            height,
+            channels,
+            data: pixels,
+            ..
+          } => match crate::functions::image_ast::export_image_bytes(
+            &fmt, *width, *height, *channels, pixels,
+          ) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+          },
+          _ if matches!(fmt.as_str(), "PNG" | "JPG" | "JPEG") => {
+            let svg = expr_to_svg(data);
+            let svg = if svg.is_empty() {
+              expr_text_svg(data)
+            } else {
+              svg
+            };
+            rasterize = Some(if fmt == "PNG" { "png" } else { "jpg" }.into());
+            svg.into_bytes()
+          }
+          _ => {
+            return Some(Err(InterpreterError::EvaluationError(format!(
+              "Export: {} export of a non-image expression (e.g. a plot) is \
+               not supported in the browser; export as PNG or SVG instead",
+              fmt
+            ))));
+          }
+        },
+        // Formats whose encoders are native-only in the WASM build.
+        "PDF" | "XLSX" => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "Export: \"{}\" export is not supported in the browser",
+            fmt
+          ))));
+        }
+        // Text and unrecognized formats: strings verbatim, a list one element
+        // per line, graphics as their SVG, other expressions rendered directly.
+        _ => {
+          let elem = |e: &Expr| match e {
+            Expr::String(s) => s.clone(),
+            _ => crate::syntax::format_expr(e, crate::syntax::ExprForm::Output),
+          };
+          let content = match data {
+            Expr::Graphics { svg, .. } => svg.clone(),
+            Expr::Identifier(s) if s == "-Graphics-" || s == "-Graphics3D-" => {
+              let svg = crate::get_captured_graphics().unwrap_or_default();
+              // Written to the file, so don't also render it inline.
+              crate::remove_captured_graphics(&svg);
+              svg
+            }
+            Expr::String(s) => s.clone(),
+            Expr::List(items) => {
+              items.iter().map(elem).collect::<Vec<_>>().join("\n")
+            }
+            other => elem(other),
+          };
+          content.into_bytes()
+        }
+      };
+
+      crate::wasm::record_exported_file(
+        &filename,
+        &bytes,
+        rasterize.as_deref(),
+      );
+      return Some(Ok(Expr::String(filename)));
+    }
+    "ExportString" if args.len() == 2 || args.len() == 3 => {
+      // ExportString[expr, "format"] - return string representation.
+      // An optional third argument carries format options; for JSON the
+      // "Compact" -> True option emits the value with no extra whitespace.
+      let compact = matches!(args.get(2), Some(Expr::Rule { pattern, replacement })
+        if matches!(pattern.as_ref(), Expr::String(s) if s == "Compact")
+          && matches!(replacement.as_ref(), Expr::Identifier(v) if v == "True"));
+      let format_str = match &args[1] {
+        Expr::String(s) => s.clone(),
+        _ => {
+          // Return unevaluated for non-string format
+          return Some(Ok(unevaluated("ExportString", args)));
+        }
+      };
+      if format_str == "SVG" || format_str == "PDF" {
+        let svg = expr_to_svg(&args[0]);
+        if format_str == "PDF" {
+          #[cfg(not(target_arch = "wasm32"))]
+          {
+            match svg_to_pdf_bytes(&svg) {
+              Ok(pdf_bytes) => {
+                // Return raw PDF bytes as a String (binary content)
+                let pdf_str =
+                  pdf_bytes.into_iter().map(|b| b as char).collect::<String>();
+                return Some(Ok(Expr::String(pdf_str)));
+              }
+              Err(e) => return Some(Err(e)),
+            }
+          }
+          #[cfg(target_arch = "wasm32")]
+          {
+            return Some(Ok(unevaluated("ExportString", args)));
+          }
+        }
+        return Some(Ok(Expr::String(embed_used_fonts(&svg))));
+      }
+      if format_str == "CSV" || format_str == "TSV" {
+        let sep = if format_str == "CSV" { ',' } else { '\t' };
+        return Some(Ok(Expr::String(export_string_csv(
+          &args[0], sep, true, true,
+        ))));
+      }
+      // Symbolic XML is written back out as markup.
+      if format_str == "XML" {
+        return Some(Ok(
+          match crate::functions::xml_ast::xml_to_string(&args[0]) {
+            Some(text) => Expr::String(text),
+            None => fail_expr(),
+          },
+        ));
+      }
+      // "Table" is tab-separated like TSV but leaves strings unquoted and
+      // emits no trailing newline.
+      if format_str == "Table" {
+        return Some(Ok(Expr::String(export_string_csv(
+          &args[0], '\t', false, false,
+        ))));
+      }
+      if format_str == "JSON" || format_str == "RawJSON" {
+        // A value JSON cannot represent fails the export outright (the
+        // offending part has already been reported); the call does not come
+        // back unevaluated.
+        return Some(Ok(match export_string_json(&args[0], 0, compact) {
+          Some(json) => Expr::String(json),
+          None => fail_expr(),
+        }));
+      }
+      // "String" is the expression's own text: ExportString[{{1, 2}}, "String"]
+      // is "{{1, 2}}", not the row-per-line layout of "Text".
+      if format_str == "String" {
+        let text = match &args[0] {
+          Expr::String(s) => s.clone(),
+          other => {
+            crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+          }
+        };
+        return Some(Ok(Expr::String(text)));
+      }
+      // "Text"/"Lines"/"List": a string is emitted verbatim; a list has each
+      // element rendered (OutputForm, strings unquoted) on its own line; an
+      // atom is rendered directly.
+      if format_str == "Text" || format_str == "Lines" || format_str == "List" {
+        let elem = |e: &Expr| match e {
+          Expr::String(s) => s.clone(),
+          _ => crate::syntax::format_expr(e, crate::syntax::ExprForm::Output),
+        };
+        let s = match &args[0] {
+          Expr::String(s) => s.clone(),
+          Expr::List(items) => {
+            items.iter().map(elem).collect::<Vec<_>>().join("\n")
+          }
+          other => elem(other),
+        };
+        return Some(Ok(Expr::String(s)));
+      }
+      // Return unevaluated for unsupported formats
+      return Some(Ok(unevaluated("ExportString", args)));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "Find" if args.len() == 2 => {
+      // Find[stream_or_file, "text" | {"a", "b", …}] - find first line
+      // that contains any of the search strings. Accepts file paths,
+      // InputStream[…] / OutputStream[…] backed by either a file or a
+      // string buffer. Advances the stream's position past the matched
+      // line so consecutive Find calls walk forward.
+      let search_terms: Vec<String> = match &args[1] {
+        Expr::String(s) => vec![s.clone()],
+        Expr::List(items) => {
+          let mut terms = Vec::with_capacity(items.len());
+          for item in items {
+            match item {
+              Expr::String(s) => terms.push(s.clone()),
+              _ => {
+                return Some(Err(InterpreterError::EvaluationError(
+                  "Find: second argument must be a string or a list of strings"
+                    .into(),
+                )));
+              }
+            }
+          }
+          terms
+        }
+        _ => {
+          return Some(Err(InterpreterError::EvaluationError(
+            "Find: second argument must be a string or a list of strings"
+              .into(),
+          )));
+        }
+      };
+
+      // (content, start_pos, optional stream id for position advance)
+      let (content, start_pos, stream_id) = match &args[0] {
+        // A `"!command"` name searches the command's output.
+        Expr::String(path) => {
+          let body = match command_file_spec(path) {
+            Some(command) => run_command_capture(command).ok_or_else(|| {
+              InterpreterError::EvaluationError(format!(
+                "Find: cannot run {command}"
+              ))
+            }),
+            None => {
+              std::fs::read_to_string(crate::vfs::resolve(path)).map_err(|e| {
+                InterpreterError::EvaluationError(format!("Find: {e}"))
+              })
+            }
+          };
+          match body {
+            Ok(c) => (c, 0usize, None),
+            Err(e) => return Some(Err(e)),
+          }
+        }
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if (stream_head == "InputStream"
+          || stream_head == "OutputStream")
+          && stream_args.len() == 2 =>
+        {
+          if let Expr::Integer(id) = &stream_args[1] {
+            let id_usize = *id as usize;
+            match get_stream_content(id_usize) {
+              Some((c, p)) => (c, p, Some(id_usize)),
+              None => return Some(Ok(fail_expr())),
+            }
+          } else {
+            return Some(Ok(fail_expr()));
+          }
+        }
+        _ => {
+          let arg_str = expr_to_string(&args[0]);
+          crate::emit_message(&format!(
+            "Find::stream: {arg_str} is not a string, SocketObject, InputStream[ ] or OutputStream[ ]."
+          ));
+          return Some(Ok(fail_expr()));
+        }
+      };
+
+      let remaining = &content[start_pos.min(content.len())..];
+      let mut consumed = 0usize;
+      for line in remaining.split_inclusive('\n') {
+        let stripped = line
+          .strip_suffix('\n')
+          .unwrap_or(line)
+          .trim_end_matches('\r');
+        consumed += line.len();
+        if search_terms.iter().any(|t| stripped.contains(t)) {
+          if let Some(id) = stream_id {
+            set_stream_position(id, start_pos + consumed);
+          }
+          return Some(Ok(Expr::String(stripped.to_string())));
+        }
+      }
+      if let Some(id) = stream_id {
+        set_stream_position(id, content.len());
+      }
+      return Some(Ok(id_expr("EndOfFile")));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "FindList" => {
+      // FindList[file(s), text(s)[, n]] — all lines containing any of the
+      // search strings (literal, case-sensitive substrings). Errors return
+      // $Failed with the matching wolframscript message; a failed file in
+      // a file LIST contributes a $Failed element instead.
+      let failed = || Some(Ok(fail_expr()));
+      let call_display = || expr_to_output(&unevaluated("FindList", args));
+      if args.len() < 2 {
+        let (tag, noun) = if args.len() == 1 {
+          ("argtu", "1 argument")
+        } else {
+          ("argt", "0 arguments")
+        };
+        crate::emit_message(&format!(
+          "FindList::{tag}: FindList called with {noun}; 2 or 3 arguments are expected."
+        ));
+        return failed();
+      }
+      if args.len() > 3 {
+        for extra in &args[3..] {
+          let is_opt = matches!(
+            extra,
+            Expr::Rule { .. } | Expr::RuleDelayed { .. } | Expr::List(_)
+          );
+          if !is_opt {
+            crate::emit_message(&format!(
+              "FindList::nonopt: Options expected (instead of {}) beyond position 3 in {}. An option must be a rule or a list of rules.",
+              expr_to_string(extra),
+              call_display()
+            ));
+            return failed();
+          }
+        }
+      }
+      let terms: Vec<String> = match &args[1] {
+        Expr::String(s) => vec![s.clone()],
+        Expr::List(items)
+          if !items.is_empty()
+            && items.iter().all(|it| matches!(it, Expr::String(_))) =>
+        {
+          items
+            .iter()
+            .map(|it| {
+              let Expr::String(s) = it else { unreachable!() };
+              s.clone()
+            })
+            .collect()
+        }
+        _ => {
+          crate::emit_message(&format!(
+            "FindList::strs: A string or nonempty list of strings is expected at position 2 in {}.",
+            call_display()
+          ));
+          return failed();
+        }
+      };
+      let limit: usize = match args.get(2) {
+        None => usize::MAX,
+        Some(Expr::Integer(n)) if *n >= 0 => *n as usize,
+        Some(_) => {
+          crate::emit_message(&format!(
+            "FindList::intnm: Non-negative machine-sized integer expected at position 3 in {}.",
+            call_display()
+          ));
+          return failed();
+        }
+      };
+      let (files, is_list): (Vec<Expr>, bool) = match &args[0] {
+        Expr::String(_) => (vec![args[0].clone()], false),
+        Expr::List(items) => (items.iter().cloned().collect(), true),
+        other => {
+          crate::emit_message(&format!(
+            "FindList::stream: {} is not a string, SocketObject, InputStream[ ] or OutputStream[ ].",
+            expr_to_string(other)
+          ));
+          return failed();
+        }
+      };
+      let mut out: Vec<Expr> = Vec::new();
+      let mut found = 0usize;
+      for f in &files {
+        if found >= limit {
+          break;
+        }
+        let Expr::String(path) = f else {
+          crate::emit_message(&format!(
+            "FindList::stream: {} is not a string, SocketObject, InputStream[ ] or OutputStream[ ].",
+            expr_to_string(f)
+          ));
+          if !is_list {
+            return failed();
+          }
+          out.push(fail_expr());
+          continue;
+        };
+        // A `"!command"` entry searches that command's output.
+        let read = match command_file_spec(path) {
+          Some(command) => run_command_capture(command).ok_or(()),
+          None => {
+            std::fs::read_to_string(crate::vfs::resolve(path)).map_err(|_| ())
+          }
+        };
+        match read {
+          Err(()) => {
+            crate::emit_message(&format!(
+              "FindList::noopen: Cannot open {path}."
+            ));
+            if !is_list {
+              return failed();
+            }
+            out.push(fail_expr());
+          }
+          Ok(content) => {
+            for line in content.lines() {
+              if found >= limit {
+                break;
+              }
+              let stripped = line.trim_end_matches('\r');
+              if terms.iter().any(|t| stripped.contains(t.as_str())) {
+                out.push(Expr::String(stripped.to_string()));
+                found += 1;
+              }
+            }
+          }
+        }
+      }
+      return Some(Ok(Expr::List(out.into())));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "CreateFile" => {
+      let filename_opt = if args.is_empty() {
+        None
+      } else if let Expr::String(s) = &args[0] {
+        Some(s.clone())
+      } else {
+        let s = expr_to_raw_string(&args[0]);
+        Some(s)
+      };
+      return Some(match crate::utils::create_file(filename_opt) {
+        Ok(path) => Ok(Expr::String(path.to_string_lossy().into_owned())),
+        Err(err) => Err(InterpreterError::EvaluationError(err.to_string())),
+      });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "Directory" if args.is_empty() => {
+      return Some(Ok(Expr::String(crate::vfs::current_dir())));
+    }
+    "NotebookDirectory" if args.is_empty() => {
+      return Some(if let Some(dir) = crate::get_notebook_directory() {
+        Ok(Expr::String(dir))
+      } else {
+        crate::emit_message(
+          "NotebookDirectory::nosv: The notebook directory is not available outside a notebook front-end.",
+        );
+        Ok(unevaluated("NotebookDirectory", args))
+      });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "ParentDirectory" if args.is_empty() || args.len() == 1 => {
+      let base = if args.is_empty() {
+        crate::vfs::current_dir()
+      } else if let Expr::String(s) = &args[0] {
+        s.clone()
+      } else {
+        return Some(Ok(unevaluated("ParentDirectory", args)));
+      };
+      let parent = std::path::Path::new(&base)
+        .parent()
+        .map_or_else(|| base.clone(), |p| p.to_string_lossy().into_owned());
+      return Some(Ok(Expr::String(parent)));
+    }
+    // DirectoryName["path"] or DirectoryName["path", n]
+    "DirectoryName" if args.len() == 1 || args.len() == 2 => {
+      let path_str = match &args[0] {
+        Expr::String(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("DirectoryName", args)));
+        }
+      };
+      let n = if args.len() == 2 {
+        match &args[1] {
+          Expr::Integer(i) if *i >= 1 => *i as usize,
+          Expr::Integer(_) => {
+            crate::emit_message(
+              "DirectoryName::intpm: Positive machine-sized integer expected at position 2 in DirectoryName.",
+            );
+            return Some(Ok(unevaluated("DirectoryName", args)));
+          }
+          _ => {
+            return Some(Ok(unevaluated("DirectoryName", args)));
+          }
+        }
+      } else {
+        1
+      };
+
+      let mut result = path_str;
+      for _ in 0..n {
+        if result.is_empty() {
+          break;
+        }
+        // "/" has no parent
+        let trimmed = result.trim_end_matches('/');
+        if trimmed.is_empty() {
+          // input was "/" or "///" etc.
+          result = String::new();
+          break;
+        }
+        // Find the last separator
+        if let Some(pos) = trimmed.rfind('/') {
+          result = trimmed[..=pos].to_string();
+        } else {
+          result = String::new();
+          break;
+        }
+      }
+      return Some(Ok(Expr::String(result)));
+    }
+    "ToFileName" if args.len() == 1 || args.len() == 2 => {
+      let sep = std::path::MAIN_SEPARATOR.to_string();
+      let collect_dirs = |expr: &Expr| -> Option<Vec<String>> {
+        match expr {
+          Expr::String(s) => Some(vec![s.clone()]),
+          Expr::List(parts) => {
+            let mut segments = Vec::with_capacity(parts.len());
+            for p in parts {
+              if let Expr::String(s) = p {
+                segments.push(s.clone());
+              } else {
+                return None;
+              }
+            }
+            Some(segments)
+          }
+          _ => None,
+        }
+      };
+      if args.len() == 1 {
+        if let Some(dirs) = collect_dirs(&args[0]) {
+          let joined = dirs.join(&sep);
+          return Some(Ok(Expr::String(format!("{joined}{sep}"))));
+        }
+      } else if let (Some(dirs), Expr::String(file)) =
+        (collect_dirs(&args[0]), &args[1])
+      {
+        let mut all = dirs;
+        all.push(file.clone());
+        return Some(Ok(Expr::String(all.join(&sep))));
+      }
+      return Some(Ok(unevaluated("ToFileName", args)));
+    }
+    "FileNameJoin" if args.len() == 1 || args.len() == 2 => {
+      // Detect OperatingSystem option from second argument (a Rule).
+      let sep: char = if args.len() == 2 {
+        let mut s = std::path::MAIN_SEPARATOR;
+        if let Expr::Rule {
+          pattern,
+          replacement,
+        } = &args[1]
+          && matches!(pattern.as_ref(),
+            Expr::Identifier(n) if n == "OperatingSystem")
+          && let Expr::String(os) = replacement.as_ref()
+        {
+          s = if os == "Windows" { '\\' } else { '/' };
+        }
+        s
+      } else {
+        std::path::MAIN_SEPARATOR
+      };
+      if let Expr::List(parts) = &args[0] {
+        let segments: Vec<&str> = parts
+          .iter()
+          .filter_map(|e| {
+            if let Expr::String(s) = e {
+              Some(s.as_str())
+            } else {
+              None
+            }
+          })
+          .collect();
+        if segments.len() == parts.len() {
+          // A component may itself carry separators. Splitting them out
+          // collapses the runs the join would otherwise leave behind, so
+          // `{"/a", "b/", "c.wlx"}` is `"/a/b/c.wlx"`, not `"/a/b//c.wlx"`.
+          let pieces: Vec<&str> = segments
+            .iter()
+            .flat_map(|segment| segment.split(path_separators(sep)))
+            .collect();
+          return Some(Ok(Expr::String(file_name_join(pieces, sep))));
+        }
+      }
+      // A single string is a path already; joining it normalises it —
+      // `FileNameJoin["a//b/"]` is `"a/b"` — which is how WLX's importer
+      // canonicalises the path it stores in a component. Windows reads
+      // either separator, so both split a path there; on Unix a backslash
+      // is an ordinary character in a file name.
+      if let Expr::String(path) = &args[0] {
+        let pieces: Vec<&str> = path.split(path_separators(sep)).collect();
+        return Some(Ok(Expr::String(file_name_join(pieces, sep))));
+      }
+      return Some(Ok(unevaluated("FileNameJoin", args)));
+    }
+    "FileNameSplit" if !args.is_empty() && args.len() <= 2 => {
+      let sep = file_name_separator(args);
+      if let [Expr::String(s)] = positional_args(args).as_slice() {
+        let parts: Vec<Expr> = file_name_pieces(s, sep)
+          .into_iter()
+          .map(|part| Expr::String(part.to_string()))
+          .collect();
+        return Some(Ok(Expr::List(parts.into())));
+      }
+      return Some(Ok(unevaluated("FileNameSplit", args)));
+    }
+    "FileNameDepth" if !args.is_empty() && args.len() <= 2 => {
+      // The depth is just how many components `FileNameSplit` reports.
+      let sep = file_name_separator(args);
+      if let [Expr::String(s)] = positional_args(args).as_slice() {
+        return Some(Ok(Expr::Integer(file_name_pieces(s, sep).len() as i128)));
+      }
+      return Some(Ok(unevaluated("FileNameDepth", args)));
+    }
+    "ExpandFileName" if args.len() == 1 => {
+      if let Expr::String(s) = &args[0] {
+        // Windows has no HOME; fall back to USERPROFILE the way the rest
+        // of the home-directory handling does (SetDirectory[],
+        // $HomeDirectory, …).
+        let expanded = if let Some(rest) = s.strip_prefix('~') {
+          match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+          {
+            Ok(home) => format!("{home}{rest}"),
+            Err(_) => s.clone(),
+          }
+        } else {
+          s.clone()
+        };
+        let path = std::path::PathBuf::from(&expanded);
+        let abs = if path.is_relative() {
+          if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(&path)
+          } else {
+            path
+          }
+        } else {
+          path
+        };
+        // Normalize path components (resolve . and ..)
+        let mut components = Vec::new();
+        for component in abs.components() {
+          match component {
+            std::path::Component::ParentDir => {
+              components.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => components.push(component),
+          }
+        }
+        let normalized: std::path::PathBuf = components.iter().collect();
+        return Some(Ok(Expr::String(
+          normalized.to_string_lossy().into_owned(),
+        )));
+      }
+      return Some(Ok(unevaluated("ExpandFileName", args)));
+    }
+    "URLParse" if args.len() == 1 || args.len() == 2 => {
+      return Some(crate::functions::http_ast::url_parse_ast(args));
+    }
+    // URLBuild[<|"Scheme" -> …, "Domain" -> …, "Path" -> …, …|>] assembles the
+    // parts of a URL back into one.
+    "URLBuild"
+      if args.len() == 1 && matches!(&args[0], Expr::Association(_)) =>
+    {
+      let Expr::Association(entries) = &args[0] else {
+        unreachable!();
+      };
+      return Some(Ok(Expr::String(url_build_from_parts(entries))));
+    }
+    "URLBuild" if args.len() == 1 || args.len() == 2 => {
+      // URLBuild["url"] => "url"
+      // URLBuild[{"base", "path1", ...}] => "base/path1/..."
+      // URLBuild[{"base", ...}, {"key" -> "val", ...}] => "base/...?key=val&..."
+      let parts = match &args[0] {
+        Expr::String(s) => vec![s.clone()],
+        Expr::List(items) => {
+          let mut strs = Vec::new();
+          for item in items {
+            match item {
+              Expr::String(s) => strs.push(s.clone()),
+              other => strs.push(expr_to_string(other)),
+            }
+          }
+          strs
+        }
+        _ => {
+          return Some(Ok(unevaluated("URLBuild", args)));
+        }
+      };
+
+      // Build base URL from parts
+      let mut url = if parts.is_empty() {
+        String::new()
+      } else {
+        let base = parts[0].trim_end_matches('/').to_string();
+        let mut result = base;
+        for part in &parts[1..] {
+          let segment = part.trim_matches('/');
+          if !segment.is_empty() {
+            result.push('/');
+            result.push_str(segment);
+          }
+        }
+        result
+      };
+
+      // Add query parameters
+      if args.len() == 2 {
+        let query_pairs: Vec<(String, String)> = match &args[1] {
+          Expr::List(items) => {
+            let mut pairs = Vec::new();
+            for item in items {
+              match item {
+                Expr::Rule {
+                  pattern,
+                  replacement,
+                }
+                | Expr::RuleDelayed {
+                  pattern,
+                  replacement,
+                } => {
+                  let key = match pattern.as_ref() {
+                    Expr::String(s) => s.clone(),
+                    other => expr_to_string(other),
+                  };
+                  let val = match replacement.as_ref() {
+                    Expr::String(s) => s.clone(),
+                    other => expr_to_string(other),
+                  };
+                  pairs.push((key, val));
+                }
+                _ => {}
+              }
+            }
+            pairs
+          }
+          _ => vec![],
+        };
+        if !query_pairs.is_empty() {
+          url.push('?');
+          for (i, (key, val)) in query_pairs.iter().enumerate() {
+            if i > 0 {
+              url.push('&');
+            }
+            url.push_str(key);
+            url.push('=');
+            url.push_str(val);
+          }
+        }
+      }
+
+      return Some(Ok(Expr::String(url)));
+    }
+    // OpenRead[file] — open a file for reading, return InputStream[name, id]
+    // OpenRead[file, BinaryFormat -> True] — same; binary mode is handled
+    // by BinaryRead at read time, so the option is accepted as a pass-through.
+    #[cfg(not(target_arch = "wasm32"))]
+    "OpenRead" if (1..=2).contains(&args.len()) => {
+      let (filename_arg, _opts) = io_split_filename_and_options(args);
+      let filename = match filename_arg {
+        Some(Expr::String(s)) => s.clone(),
+        Some(other) => {
+          return Some(Ok(call1("OpenRead", other.clone())));
+        }
+        None => {
+          return Some(Ok(unevaluated("OpenRead", args)));
+        }
+      };
+      // `"!command"` opens a pipe from an external command instead of a
+      // file: the command runs through the shell and the stream reads its
+      // standard output.
+      let kind = if let Some(command) = command_file_spec(&filename) {
+        let Ok(state) = spawn_command_stream(command) else {
+          crate::emit_message_to_stdout(&format!(
+            "OpenRead::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        };
+        StreamKind::Command(std::rc::Rc::new(RefCell::new(state)))
+      } else {
+        if !crate::vfs::exists(&filename) {
+          crate::emit_message_to_stdout(&format!(
+            "OpenRead::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        }
+        // The stream is bound to the file the name resolves to now, so a
+        // later `SetDirectory` cannot redirect reads from it.
+        StreamKind::File(stream_file_path(&filename))
+      };
+      let id = register_stream(filename.clone(), kind);
+      return Some(Ok(call(
+        "InputStream",
+        vec![Expr::String(filename), Expr::Integer(id as i128)],
+      )));
+    }
+    // OpenWrite[file] — open a file for writing, return OutputStream[name, id]
+    // OpenWrite[BinaryFormat -> True] — same, options pass-through.
+    #[cfg(not(target_arch = "wasm32"))]
+    "OpenWrite" if args.len() <= 2 => {
+      let (filename_arg, _opts) = io_split_filename_and_options(args);
+      let filename = match filename_arg {
+        Some(Expr::String(s)) => s.clone(),
+        Some(other) => {
+          return Some(Ok(call1("OpenWrite", other.clone())));
+        }
+        None => {
+          let path = match crate::utils::create_file(None)
+            .map_err(|e| InterpreterError::EvaluationError(e.to_string()))
+          {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+          };
+          path.to_string_lossy().into_owned()
+        }
+      };
+      // `"!command"` opens a pipe *into* an external command: whatever is
+      // written to the stream becomes the command's standard input.
+      let kind = if let Some(command) = command_file_spec(&filename) {
+        let Ok(state) = spawn_command_sink(command) else {
+          crate::emit_message_to_stdout(&format!(
+            "OpenWrite::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        };
+        StreamKind::CommandSink(std::rc::Rc::new(RefCell::new(state)))
+      } else {
+        // Create or truncate the file
+        if let Err(e) = std::fs::File::create(crate::vfs::resolve(&filename))
+          .map_err(|e| {
+            InterpreterError::EvaluationError(format!(
+              "OpenWrite: cannot open {filename}: {e}"
+            ))
+          })
+        {
+          return Some(Err(e));
+        }
+        StreamKind::File(stream_file_path(&filename))
+      };
+      let id = register_stream(filename.clone(), kind);
+      return Some(Ok(call(
+        "OutputStream",
+        vec![Expr::String(filename), Expr::Integer(id as i128)],
+      )));
+    }
+    // BinaryWrite[stream, bytes]              — write bytes (Integers in 0..255)
+    // BinaryWrite[stream, bytes, type]        — write with explicit type spec
+    // BinaryWrite[stream, bytes, {types…}]    — per-element types
+    //
+    // Returns the same `stream`. Supported types: "Byte" (Integer → 1 byte),
+    // "Character8" (Integer or 1-char String → 1 byte). The 2-arg form
+    // infers the type from the value (Integer → Byte, String → Character8).
+    #[cfg(not(target_arch = "wasm32"))]
+    "BinaryWrite" if (2..=3).contains(&args.len()) => {
+      let Some(targets) = io_write_targets(&args[0]) else {
+        return Some(Ok(unevaluated("BinaryWrite", args)));
+      };
+      // Render a single value at the given type into the byte buffer.
+      // Returns false on an unsupported pairing so the caller can fall
+      // back to the unevaluated form.
+      fn write_value(out: &mut Vec<u8>, value: &Expr, ty: &str) -> bool {
+        match (value, ty) {
+          (Expr::Integer(n), "Byte" | "Character8") => {
+            out.push((*n & 0xff) as u8);
+            true
+          }
+          (Expr::String(s), "Byte" | "Character8") => {
+            out.extend_from_slice(s.as_bytes());
+            true
+          }
+          _ => false,
+        }
+      }
+      let unevaluated = || unevaluated("BinaryWrite", args);
+      let bytes: Vec<u8> = if args.len() == 3 {
+        // Explicit type spec — either a single type string applied to
+        // every value or a list of per-element types.
+        let mut out: Vec<u8> = Vec::new();
+        let values: Vec<&Expr> = match &args[1] {
+          Expr::List(items) => items.iter().collect(),
+          v => vec![v],
+        };
+        match &args[2] {
+          Expr::String(ty) => {
+            for v in &values {
+              if !write_value(&mut out, v, ty) {
+                return Some(Ok(unevaluated()));
+              }
+            }
+          }
+          Expr::List(types) => {
+            if types.len() != values.len() {
+              return Some(Ok(unevaluated()));
+            }
+            for (v, t) in values.iter().zip(types.iter()) {
+              let Expr::String(ty) = t else {
+                return Some(Ok(unevaluated()));
+              };
+              if !write_value(&mut out, v, ty) {
+                return Some(Ok(unevaluated()));
+              }
+            }
+          }
+          _ => return Some(Ok(unevaluated())),
+        }
+        out
+      } else {
+        // 2-arg form: infer type from the value(s).
+        match &args[1] {
+          Expr::Integer(n) => vec![(*n & 0xff) as u8],
+          Expr::String(s) => s.as_bytes().to_vec(),
+          // A ByteArray writes its bytes as they stand — the only way to
+          // put binary data on a socket without one Integer per byte.
+          Expr::FunctionCall {
+            name,
+            args: ba_args,
+          } if name == "ByteArray" && ba_args.len() == 1 => {
+            let Expr::String(b64) = &ba_args[0] else {
+              return Some(Ok(unevaluated()));
+            };
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(b64) {
+              Ok(bytes) => bytes,
+              Err(_) => return Some(Ok(unevaluated())),
+            }
+          }
+          Expr::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+              match it {
+                Expr::Integer(n) => out.push((*n & 0xff) as u8),
+                Expr::String(s) => out.extend_from_slice(s.as_bytes()),
+                _ => return Some(Ok(unevaluated())),
+              }
+            }
+            out
+          }
+          _ => return Some(Ok(unevaluated())),
+        }
+      };
+      if let Err(e) = write_targets_bytes(&targets, &bytes, "BinaryWrite") {
+        return Some(Err(e));
+      }
+      return Some(Ok(args[0].clone()));
+    }
+    // BinaryRead[stream]                — read 1 Byte (Integer 0..255)
+    // BinaryRead[stream, "Byte"]        — read 1 Byte
+    // BinaryRead[stream, "Character8"]  — read 1 Char (String of length 1)
+    // BinaryRead[stream, {forms…}]      — read N items, returning a List
+    //
+    // Sequential calls advance the stream's read position so a chain like
+    //   BinaryRead[s]; BinaryRead[s, {"Character8","Character8"}]
+    // returns the next bytes after the first call rather than starting
+    // from offset 0 every time.
+    #[cfg(not(target_arch = "wasm32"))]
+    "BinaryRead" if (1..=2).contains(&args.len()) => {
+      let Some(path) = io_stream_path(&args[0]) else {
+        return Some(Ok(unevaluated("BinaryRead", args)));
+      };
+      // The stream id lets consecutive reads advance the position; an
+      // id-less stream always reads from offset 0.
+      let stream_id = io_stream_id(&args[0]);
+      let bytes = match io_binary_bytes(&args[0], &path) {
+        Ok(b) => b,
+        Err(e) => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "BinaryRead: cannot read {path}: {e}"
+          ))));
+        }
+      };
+      let start_pos = stream_id.and_then(get_stream_position).unwrap_or(0);
+      let form = if args.len() == 2 {
+        args[1].clone()
+      } else {
+        Expr::String("Byte".to_string())
+      };
+      // Render a single-byte form (Byte/Character8) at the given offset,
+      // returning EndOfFile when out of range.
+      let read_one = |form: &Expr, offset: usize| -> Option<Expr> {
+        match form {
+          Expr::String(s) if s == "Byte" => {
+            if offset < bytes.len() {
+              Some(Expr::Integer(bytes[offset] as i128))
+            } else {
+              Some(id_expr("EndOfFile"))
+            }
+          }
+          Expr::String(s) if s == "Character8" => {
+            if offset < bytes.len() {
+              // Character8 is a raw byte rendered as a 1-char string;
+              // values >127 use the Latin-1 mapping.
+              let c = bytes[offset] as char;
+              Some(Expr::String(c.to_string()))
+            } else {
+              Some(id_expr("EndOfFile"))
+            }
+          }
+          _ => None,
+        }
+      };
+      match &form {
+        Expr::String(_) => {
+          let Some(result) = read_one(&form, start_pos) else {
+            return Some(Ok(unevaluated("BinaryRead", args)));
+          };
+          if let Some(id) = stream_id {
+            let advance = usize::from(
+              !matches!(&result, Expr::Identifier(s) if s == "EndOfFile"),
+            );
+            set_stream_position(id, start_pos + advance);
+          }
+          return Some(Ok(result));
+        }
+        Expr::List(items) => {
+          let mut out = Vec::with_capacity(items.len());
+          let mut offset = start_pos;
+          for it in items {
+            let Some(value) = read_one(it, offset) else {
+              return Some(Ok(unevaluated("BinaryRead", args)));
+            };
+            if !matches!(&value, Expr::Identifier(s) if s == "EndOfFile") {
+              offset += 1;
+            }
+            out.push(value);
+          }
+          if let Some(id) = stream_id {
+            set_stream_position(id, offset);
+          }
+          return Some(Ok(Expr::List(out.into())));
+        }
+        _ => {
+          return Some(Ok(unevaluated("BinaryRead", args)));
+        }
+      }
+    }
+    // BinaryReadList[file]            — read all bytes from `file`
+    // BinaryReadList[file, "Byte"]    — same
+    // BinaryReadList[stream]          — read remaining bytes from stream
+    // BinaryReadList[stream, "Byte"]  — same
+    //
+    // Returns a List of Integers in 0..255. Returns {} on EOF.
+    #[cfg(not(target_arch = "wasm32"))]
+    "BinaryReadList" if (1..=2).contains(&args.len()) => {
+      let path = match &args[0] {
+        Expr::String(s) => s.clone(),
+        _ => match io_stream_path(&args[0]) {
+          Some(p) => p,
+          None => {
+            return Some(Ok(unevaluated("BinaryReadList", args)));
+          }
+        },
+      };
+      let form = if args.len() == 2 {
+        args[1].clone()
+      } else {
+        Expr::String("Byte".to_string())
+      };
+      // Only "Byte" is supported; other forms fall through unevaluated so
+      // callers see the same behaviour as for BinaryRead.
+      match &form {
+        Expr::String(s) if s == "Byte" => {}
+        _ => {
+          return Some(Ok(unevaluated("BinaryReadList", args)));
+        }
+      }
+      let bytes = match io_binary_bytes(&args[0], &path) {
+        Ok(b) => b,
+        Err(e) => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "BinaryReadList: cannot read {path}: {e}"
+          ))));
+        }
+      };
+      let out: Vec<Expr> = bytes
+        .into_iter()
+        .map(|b| Expr::Integer(b as i128))
+        .collect();
+      return Some(Ok(Expr::List(out.into())));
+    }
+    // OpenAppend[file] — open a file for appending, return OutputStream[name, id]
+    #[cfg(not(target_arch = "wasm32"))]
+    "OpenAppend" if args.len() <= 1 => {
+      let filename = if args.is_empty() {
+        let path = match crate::utils::create_file(None)
+          .map_err(|e| InterpreterError::EvaluationError(e.to_string()))
+        {
+          Ok(v) => v,
+          Err(e) => return Some(Err(e)),
+        };
+        path.to_string_lossy().into_owned()
+      } else {
+        match &args[0] {
+          Expr::String(s) => s.clone(),
+          other => {
+            return Some(Ok(call1("OpenAppend", other.clone())));
+          }
+        }
+      };
+      // A pipe has no contents to append to, so `"!command"` opens the same
+      // stream `OpenWrite` would.
+      let kind = if let Some(command) = command_file_spec(&filename) {
+        let Ok(state) = spawn_command_sink(command) else {
+          crate::emit_message_to_stdout(&format!(
+            "OpenAppend::noopen: Cannot open {filename}."
+          ));
+          return Some(Ok(fail_expr()));
+        };
+        StreamKind::CommandSink(std::rc::Rc::new(RefCell::new(state)))
+      } else {
+        // Open for appending (create if not exists)
+        if let Err(e) = std::fs::OpenOptions::new()
+          .create(true)
+          .append(true)
+          .open(crate::vfs::resolve(&filename))
+          .map_err(|e| {
+            InterpreterError::EvaluationError(format!(
+              "OpenAppend: cannot open {filename}: {e}"
+            ))
+          })
+        {
+          return Some(Err(e));
+        }
+        StreamKind::File(stream_file_path(&filename))
+      };
+      let id = register_stream(filename.clone(), kind);
+      return Some(Ok(call(
+        "OutputStream",
+        vec![Expr::String(filename), Expr::Integer(id as i128)],
+      )));
+    }
+    // StringToStream["text"] — create an input stream from a string
+    "StringToStream" if args.len() == 1 => {
+      let text = match &args[0] {
+        Expr::String(s) => s.clone(),
+        other => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "StringToStream: argument must be a string, got {}",
+            expr_to_string(other)
+          ))));
+        }
+      };
+      let id = register_stream("String".to_string(), StreamKind::Text(text));
+      // Use Symbol `String` (not the string literal "String") so the
+      // formatted form matches wolframscript: `InputStream[String, id]`.
+      return Some(Ok(call(
+        "InputStream",
+        vec![id_expr("String"), Expr::Integer(id as i128)],
+      )));
+    }
+    // Close[stream] — close an open stream
+    "Close" if args.len() == 1 => {
+      // Extract stream ID from InputStream[name, id] or OutputStream[name, id]
+      match &args[0] {
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if (stream_head == "InputStream"
+          || stream_head == "OutputStream")
+          && stream_args.len() == 2 =>
+        {
+          let id = match &stream_args[1] {
+            Expr::Integer(n) => *n as usize,
+            _ => {
+              return Some(Ok(unevaluated("Close", args)));
+            }
+          };
+          match close_stream(id) {
+            // Close[FileStream] returns the file path as a String;
+            // Close[StringToStream[…]] returns the symbol `String`.
+            Some((_, StreamKind::Text(_))) => {
+              return Some(Ok(id_expr("String")));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Some((name, StreamKind::File(_))) => {
+              return Some(Ok(Expr::String(name)));
+            }
+            // Close[OpenRead["!cmd"]] returns the `"!cmd"` spec, and stops
+            // the command if it is still producing output.
+            #[cfg(not(target_arch = "wasm32"))]
+            Some((name, StreamKind::Command(state))) => {
+              command_stream_close(&state);
+              return Some(Ok(Expr::String(name)));
+            }
+            // Closing the write end is what tells the command its input has
+            // ended, so it runs to completion here.
+            #[cfg(not(target_arch = "wasm32"))]
+            Some((name, StreamKind::CommandSink(state))) => {
+              command_sink_close(&state);
+              return Some(Ok(Expr::String(name)));
+            }
+            None => {
+              let stream_str = expr_to_string(&args[0]);
+              crate::emit_message(&format!("{stream_str} is not open."));
+              return Some(Ok(unevaluated("Close", args)));
+            }
+          }
+        }
+        Expr::String(s) => {
+          crate::emit_message(&format!("{s} is not open."));
+          return Some(Ok(unevaluated("Close", args)));
+        }
+        _ => {
+          // Anything else is a type error — match wolframscript's message.
+          let arg_str = expr_to_string(&args[0]);
+          crate::emit_message_to_stdout(&format!(
+            "Close::stream: {arg_str} is not a string, SocketObject, InputStream[ ] or OutputStream[ ]."
+          ));
+          return Some(Ok(unevaluated("Close", args)));
+        }
+      }
+    }
+    // StreamPosition[stream] — get the current position of a stream
+    "StreamPosition" if args.len() == 1 => {
+      let stream = &args[0];
+      match stream {
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if (stream_head == "InputStream"
+          || stream_head == "OutputStream")
+          && stream_args.len() == 2 =>
+        {
+          if let Expr::Integer(id) = &stream_args[1] {
+            if let Some(pos) = get_stream_position(*id as usize) {
+              return Some(Ok(Expr::Integer(pos as i128)));
+            }
+            let stream_str = expr_to_string(stream);
+            crate::emit_message(&format!(
+              "StreamPosition::openx: {stream_str} is not open."
+            ));
+            return Some(Ok(unevaluated("StreamPosition", args)));
+          }
+          return Some(Ok(unevaluated("StreamPosition", args)));
+        }
+        Expr::String(s) => {
+          crate::emit_message(&format!(
+            "StreamPosition::openx: {s} is not open."
+          ));
+          return Some(Ok(unevaluated("StreamPosition", args)));
+        }
+        _ => {
+          return Some(Ok(unevaluated("StreamPosition", args)));
+        }
+      }
+    }
+    // SetStreamPosition[stream, pos] — set the current position of a stream.
+    // `pos` is either a non-negative integer (absolute byte offset) or
+    // `Infinity` (seek to end of stream). Returns the new position.
+    "SetStreamPosition" if args.len() == 2 => {
+      let stream = &args[0];
+      let is_infinity =
+        matches!(&args[1], Expr::Identifier(s) if s == "Infinity");
+      let pos_explicit = match &args[1] {
+        Expr::Integer(n) => Some(*n as usize),
+        _ if is_infinity => None,
+        _ => {
+          return Some(Ok(unevaluated("SetStreamPosition", args)));
+        }
+      };
+      match stream {
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if (stream_head == "InputStream"
+          || stream_head == "OutputStream")
+          && stream_args.len() == 2 =>
+        {
+          if let Expr::Integer(id) = &stream_args[1] {
+            let id_usize = *id as usize;
+            if is_stream_open(id_usize) {
+              let stream_len = get_stream_content(id_usize)
+                .map_or(0, |(content, _)| content.len());
+              let pos = match pos_explicit {
+                Some(p) => {
+                  if p > stream_len {
+                    // wolframscript emits SetStreamPosition::stmrng
+                    // and clamps the position to the end of stream.
+                    let stream_str = expr_to_string(stream);
+                    crate::emit_message(&format!(
+                      "SetStreamPosition::stmrng: Cannot set the current point in {stream_str} to position {p}; the requested position exceeds the length of the stream."
+                    ));
+                    stream_len
+                  } else {
+                    p
+                  }
+                }
+                None => stream_len, // Infinity → end of stream
+              };
+              set_stream_position(id_usize, pos);
+              return Some(Ok(Expr::Integer(pos as i128)));
+            }
+            let stream_str = expr_to_string(stream);
+            crate::emit_message(&format!(
+              "SetStreamPosition::openx: {stream_str} is not open."
+            ));
+            return Some(Ok(unevaluated("SetStreamPosition", args)));
+          }
+          return Some(Ok(unevaluated("SetStreamPosition", args)));
+        }
+        _ => {
+          return Some(Ok(unevaluated("SetStreamPosition", args)));
+        }
+      }
+    }
+    // ReadLine[stream] — read one line from a stream
+    // ReadLine["file"] — read first line from a file
+    #[cfg(not(target_arch = "wasm32"))]
+    "ReadLine" if args.len() == 1 => {
+      let (content, position, stream_id) = match &args[0] {
+        // ReadLine["file"] — read the first line from a file directly;
+        // ReadLine["!cmd"] — the first line of the command's output.
+        Expr::String(path) => {
+          let content = match command_file_spec(path) {
+            Some(command) => run_command_capture(command),
+            None => std::fs::read_to_string(crate::vfs::resolve(path)).ok(),
+          };
+          if let Some(content) = content {
+            (content, 0usize, None)
+          } else {
+            crate::emit_message(&format!(
+              "OpenRead::noopen: Cannot open {path}."
+            ));
+            return Some(Ok(fail_expr()));
+          }
+        }
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if stream_head == "InputStream" && stream_args.len() == 2 => {
+          if let Expr::Integer(id) = &stream_args[1] {
+            let id = *id as usize;
+            match get_stream_line_content(id) {
+              Some((content, pos)) => (content, pos, Some(id)),
+              None => {
+                return Some(Ok(id_expr("EndOfFile")));
+              }
+            }
+          } else {
+            return Some(Ok(unevaluated("ReadLine", args)));
+          }
+        }
+        _ => {
+          return Some(Ok(unevaluated("ReadLine", args)));
+        }
+      };
+
+      let remaining = &content[position.min(content.len())..];
+      if remaining.is_empty() {
+        return Some(Ok(id_expr("EndOfFile")));
+      }
+
+      // Find end of line
+      let (line, advance) = if let Some(idx) = remaining.find('\n') {
+        (&remaining[..idx], idx + 1)
+      } else {
+        (remaining, remaining.len())
+      };
+
+      let result = Expr::String(line.to_string());
+
+      // Advance position if it's a stream
+      if let Some(id) = stream_id {
+        advance_stream_position(id, position + advance);
+      }
+
+      return Some(Ok(result));
+    }
+    // Skip[stream, type] / Skip[stream, type, n] — read and discard `n`
+    // (default 1) values of the given type, advancing the stream position.
+    "Skip" if args.len() == 2 || args.len() == 3 => {
+      let stream = &args[0];
+      let stream_id = match stream {
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if (stream_head == "InputStream"
+          || stream_head == "OutputStream")
+          && stream_args.len() == 2 =>
+        {
+          if let Expr::Integer(id) = &stream_args[1] {
+            Some(*id as usize)
+          } else {
+            None
+          }
+        }
+        _ => None,
+      };
+
+      let count = if args.len() == 3 {
+        match &args[2] {
+          Expr::Integer(n) if *n >= 0 => *n as usize,
+          _ => {
+            return Some(Ok(unevaluated("Skip", args)));
+          }
+        }
+      } else {
+        1
+      };
+
+      if let Some(id) = stream_id
+        && let Some((content, mut position)) = get_stream_content(id)
+      {
+        let mut hit_eof = false;
+        for _ in 0..count {
+          let remaining = &content[position.min(content.len())..];
+          let (val, advance) = read_single_type(remaining, &args[1]);
+          if matches!(&val, Expr::Identifier(s) if s == "EndOfFile") {
+            hit_eof = true;
+            position = content.len();
+            break;
+          }
+          if advance == 0 {
+            hit_eof = true;
+            break;
+          }
+          position += advance;
+        }
+        advance_stream_position(id, position);
+        return Some(Ok(Expr::Identifier(
+          if hit_eof { "EndOfFile" } else { "Null" }.to_string(),
+        )));
+      }
+
+      return Some(Ok(unevaluated("Skip", args)));
+    }
+    // Read[stream] or Read[stream, type] — read from a stream
+    "Read" if !args.is_empty() && args.len() <= 2 => {
+      let stream = &args[0];
+      let stream_id = match stream {
+        Expr::FunctionCall {
+          name: stream_head,
+          args: stream_args,
+        } if (stream_head == "InputStream"
+          || stream_head == "OutputStream")
+          && stream_args.len() == 2 =>
+        {
+          if let Expr::Integer(id) = &stream_args[1] {
+            Some(*id as usize)
+          } else {
+            None
+          }
+        }
+        _ => None,
+      };
+
+      if let Some(id) = stream_id
+        && let Some((content, position)) = get_stream_content(id)
+      {
+        let remaining = &content[position.min(content.len())..];
+
+        // Determine the read type
+        let read_type = if args.len() == 2 {
+          &args[1]
+        } else {
+          &id_expr("Expression")
+        };
+
+        // Handle list of types: Read[stream, {type1, type2, ...}]
+        if let Expr::List(types) = read_type {
+          let mut results = Vec::new();
+          let mut current_pos = position;
+          for t in types {
+            let rem = &content[current_pos.min(content.len())..];
+            let (val, advance) = read_single_type(rem, t);
+            current_pos += advance;
+            results.push(val);
+          }
+          advance_stream_position(id, current_pos);
+          return Some(Ok(Expr::List(results.into())));
+        }
+
+        let (result, advance) = read_single_type(remaining, read_type);
+        advance_stream_position(id, position + advance);
+        return Some(Ok(result));
+      }
+
+      return Some(Ok(unevaluated("Read", args)));
+    }
+    // Write[stream, expr1, expr2, ...] — write expressions to a stream in OutputForm
+    #[cfg(not(target_arch = "wasm32"))]
+    "Write" if args.len() >= 2 => {
+      let Some(targets) = io_write_targets(&args[0]) else {
+        return Some(Ok(unevaluated("Write", args)));
+      };
+      let mut content = String::new();
+      for arg in &args[1..] {
+        content.push_str(&expr_to_string(arg));
+      }
+      content.push('\n');
+      if let Err(e) = write_targets_bytes(&targets, content.as_bytes(), "Write")
+      {
+        return Some(Err(e));
+      }
+      return Some(Ok(null_expr()));
+    }
+    // WriteString[stream, "text1", "text2", ...] — write strings to a stream
+    #[cfg(not(target_arch = "wasm32"))]
+    "WriteString" if args.len() >= 2 => {
+      return Some(write_string_to_channel(args, "", "WriteString"));
+    }
+    // WriteLine[stream, "text"] — write a string plus a newline to a stream
+    #[cfg(not(target_arch = "wasm32"))]
+    "WriteLine" if args.len() == 2 => {
+      return Some(write_string_to_channel(args, "\n", "WriteLine"));
+    }
+    // Save["filename", symbol] or Save["filename", {sym1, sym2, ...}]
+    // Saves symbol definitions (OwnValues, DownValues, Attributes, Options) to a file
+    #[cfg(not(target_arch = "wasm32"))]
+    "Save" if args.len() == 2 => {
+      let filename = match &args[0] {
+        Expr::String(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("Save", args)));
+        }
+      };
+
+      // Collect symbol names from the second argument (held)
+      let symbols: Vec<String> = match &args[1] {
+        Expr::Identifier(s) => vec![s.clone()],
+        Expr::String(s) => vec![s.clone()],
+        Expr::List(items) => items
+          .iter()
+          .filter_map(|item| match item {
+            Expr::Identifier(s) => Some(s.clone()),
+            Expr::String(s) => Some(s.clone()),
+            _ => None,
+          })
+          .collect(),
+        _ => {
+          return Some(Ok(unevaluated("Save", args)));
+        }
+      };
+
+      // Collect all definition lines for all symbols
+      let mut all_lines: Vec<String> = Vec::new();
+
+      for sym in &symbols {
+        let mut sym_lines: Vec<String> = Vec::new();
+
+        // 1. Attributes (user-set only)
+        let user_attrs =
+          crate::FUNC_ATTRS.with(|m| m.borrow().get(sym).cloned());
+        if let Some(attrs) = user_attrs
+          && !attrs.is_empty()
+        {
+          let vals = attrs.to_vec().join(", ");
+          sym_lines.push(format!("Attributes[{sym}] = {{{vals}}}"));
+        }
+
+        // 2. DownValues (function definitions). Includes literal-argument
+        // memoizations (e.g. `f[1] = 42`), which live in MEMO_VALUES.
+        let down_values = crate::down_values_with_memo(sym);
+        if let Some(overloads) = down_values {
+          for (params, conditions, defaults, heads, blank_types, body) in
+            &overloads
+          {
+            // List-pattern params (`_lp{i}`) reconstruct to a surface `{…}`
+            // pattern with the original element names, body, and `/;` guard.
+            if let Some((pattern_args, display_body)) =
+              crate::evaluator::assignment::reconstruct_list_downvalue(
+                params,
+                conditions,
+                heads,
+                blank_types,
+                body,
+              )
+            {
+              let params_str = pattern_args
+                .iter()
+                .map(expr_to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+              sym_lines.push(format!(
+                "{}[{}] := {}",
+                sym,
+                params_str,
+                expr_to_string(&display_body)
+              ));
+              continue;
+            }
+            let params_str = params
+              .iter()
+              .enumerate()
+              .map(|(i, p)| {
+                // Check if this is a literal-dispatch parameter (_dvN with SameQ condition)
+                if (p.starts_with("_dv") || p.starts_with("_lp"))
+                  && let Some(Some(cond)) = conditions.get(i)
+                  && let Expr::Comparison {
+                    operands,
+                    operators,
+                  } = cond
+                  && operators
+                    .iter()
+                    .any(|op| matches!(op, ComparisonOp::SameQ))
+                  && operands.len() == 2
+                {
+                  // Literal value dispatch: use the value directly
+                  return expr_to_string(&operands[1]);
+                }
+
+                let head = heads.get(i).and_then(|h| h.as_ref());
+                let default = defaults.get(i).and_then(|d| d.as_ref());
+                let condition = conditions.get(i).and_then(|c| c.as_ref());
+
+                let mut param_str = if let Some(h) = head {
+                  format!("{p}_{h}")
+                } else {
+                  format!("{p}_")
+                };
+
+                if let Some(def) = default {
+                  param_str = format!("{}:{}", param_str, expr_to_string(def));
+                }
+
+                if let Some(cond) = condition {
+                  param_str =
+                    format!("{} /; {}", param_str, expr_to_string(cond));
+                }
+
+                param_str
+              })
+              .collect::<Vec<_>>()
+              .join(", ");
+
+            let body_str = expr_to_string(body);
+
+            // Use = for literal-dispatch (all params are _dvN), := otherwise
+            let is_literal_dispatch = params
+              .iter()
+              .all(|p| p.starts_with("_dv") || p.starts_with("_lp"));
+            let assign_op = if is_literal_dispatch { "=" } else { ":=" };
+
+            sym_lines
+              .push(format!("{sym}[{params_str}] {assign_op} {body_str}"));
+          }
+        }
+
+        // 3. OwnValues (variable assignments)
+        let own_value = crate::ENV.with(|e| {
+          let env = e.borrow();
+          env.get(sym).cloned()
+        });
+        if let Some(stored) = own_value {
+          let val_str = match stored {
+            crate::StoredValue::ExprVal(e) => expr_to_string(&e),
+            crate::StoredValue::Raw(val) => val,
+            crate::StoredValue::Association(items) => {
+              let parts: Vec<String> = items
+                .iter()
+                .map(|(k, v)| format!("{} -> {}", k, expr_to_string(v)))
+                .collect();
+              format!("<|{}|>", parts.join(", "))
+            }
+          };
+          sym_lines.push(format!("{sym} = {val_str}"));
+        }
+
+        // 4. Options
+        let options =
+          crate::FUNC_OPTIONS.with(|m| m.borrow().get(sym).cloned());
+        if let Some(opts) = options
+          && !opts.is_empty()
+        {
+          let opts_str = opts
+            .iter()
+            .map(expr_to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+          sym_lines.push(format!("Options[{sym}] = {{{opts_str}}}"));
+        }
+
+        all_lines.extend(sym_lines);
+      }
+
+      // Join definitions with "\n \n" separator and add trailing newline
+      let content = if all_lines.is_empty() {
+        "\n".to_string()
+      } else {
+        format!("{}\n", all_lines.join("\n \n"))
+      };
+
+      if filename == "stdout" {
+        print!("{content}");
+        crate::capture_stdout(content.trim_end());
+      } else {
+        match std::fs::write(crate::vfs::resolve(&filename), &content) {
+          Ok(()) => {}
+          Err(_e) => {
+            crate::emit_message(&format!(
+              "Save::noopen: Cannot open {filename}."
+            ));
+            return Some(Ok(fail_expr()));
+          }
+        }
+      }
+
+      return Some(Ok(null_expr()));
+    }
+    // FileNames[] — list all files in current directory
+    // FileNames["pattern"] — list files matching pattern
+    // FileNames[{p1, p2}] / FileNames[p1 | p2] — any of several patterns
+    // FileNames["pattern", "dir"] — list files in dir matching pattern
+    // FileNames["pattern", "dir", n] — descend n directory levels
+    // FileNames["pattern", "dir", {n}] — only the n-th level
+    // FileNames["pattern", "dir", Infinity] — recursive search
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileNames" if args.len() <= 3 => {
+      let patterns = if args.is_empty() {
+        vec![Expr::String("*".to_string())]
+      } else {
+        let mut collected = Vec::new();
+        flatten_file_patterns(&args[0], &mut collected);
+        collected
+      };
+
+      // Third argument: which directory levels to include. `1` (the
+      // default) searches only the given directories, `2` also their
+      // immediate subdirectories, and `Infinity` descends without limit.
+      // A list restricts the search to a range of levels instead.
+      let levels = if args.len() >= 3 {
+        match file_names_levels(&args[2]) {
+          Some(range) => range,
+          None => return Some(Ok(unevaluated("FileNames", args))),
+        }
+      } else {
+        FileNameLevels { min: 1, max: 1 }
+      };
+
+      // With no directory named at all the matches are reported by their
+      // bare relative names; a directory spelled out — even `"."` — prefixes
+      // every match, so `FileNames["*.toml", "."]` is `{"./Cargo.toml"}`
+      // where `FileNames["*.toml"]` is `{"Cargo.toml"}`.
+      let dir = if args.len() >= 2 {
+        match &args[1] {
+          Expr::String(s) => s.clone(),
+          Expr::List(dirs) => {
+            // FileNames["pat", {"dir1", "dir2"}] — search multiple dirs
+            let mut all_files = Vec::new();
+            for d in dirs {
+              if let Expr::String(dir_str) = d {
+                let mut files = collect_file_names(&patterns, dir_str, levels);
+                all_files.append(&mut files);
+              }
+            }
+            all_files.sort();
+            return Some(Ok(Expr::List(
+              all_files.into_iter().map(Expr::String).collect(),
+            )));
+          }
+          _ => String::new(),
+        }
+      } else {
+        String::new()
+      };
+
+      let mut files = collect_file_names(&patterns, &dir, levels);
+      files.sort();
+      return Some(Ok(Expr::List(
+        files.into_iter().map(Expr::String).collect(),
+      )));
+    }
+    // SetDirectory[] — with no arguments, set to $HomeDirectory.
+    #[cfg(not(target_arch = "wasm32"))]
+    "SetDirectory" if args.is_empty() => {
+      let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+      if home.is_empty() {
+        return Some(Err(InterpreterError::EvaluationError(
+          "SetDirectory: cannot determine home directory.".into(),
+        )));
+      }
+      match crate::utils::canonicalize(&home) {
+        Ok(canonical) if canonical.is_dir() => {
+          let new_dir = canonical.to_string_lossy().into_owned();
+          crate::vfs::push_dir(new_dir.clone());
+          return Some(Ok(Expr::String(new_dir)));
+        }
+        _ => {
+          return Some(Err(InterpreterError::EvaluationError(
+            "SetDirectory: home directory does not exist.".into(),
+          )));
+        }
+      }
+    }
+    // SetDirectory["dir"] — push "dir" onto the virtual directory stack.
+    // Does not mutate the process CWD; see the note in `crate::vfs`.
+    #[cfg(not(target_arch = "wasm32"))]
+    "SetDirectory" if args.len() == 1 => {
+      let dir = match &args[0] {
+        Expr::String(s) => s.clone(),
+        _ => {
+          return Some(Ok(unevaluated("SetDirectory", args)));
+        }
+      };
+      // Resolve the requested path against the current virtual directory so
+      // that relative paths behave like the real Wolfram SetDirectory.
+      let resolved = crate::vfs::resolve(&dir);
+      // Canonicalize both to validate existence and normalize the result.
+      match crate::utils::canonicalize(&resolved) {
+        Ok(canonical) if canonical.is_dir() => {
+          let new_dir = canonical.to_string_lossy().into_owned();
+          crate::vfs::push_dir(new_dir.clone());
+          return Some(Ok(Expr::String(new_dir)));
+        }
+        Ok(_) => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "SetDirectory: {dir} is not a directory."
+          ))));
+        }
+        Err(e) => {
+          return Some(Err(InterpreterError::EvaluationError(format!(
+            "SetDirectory: {e}"
+          ))));
+        }
+      }
+    }
+    // ResetDirectory[] — pop the virtual directory stack and return the
+    // restored directory (or the process CWD if the stack becomes empty).
+    #[cfg(not(target_arch = "wasm32"))]
+    "ResetDirectory" if args.is_empty() => match crate::vfs::pop_dir() {
+      Some(_) => {
+        return Some(Ok(Expr::String(crate::vfs::current_dir())));
+      }
+      None => {
+        return Some(Err(InterpreterError::EvaluationError(
+          "ResetDirectory: directory stack is empty.".into(),
+        )));
+      }
+    },
+    // DirectoryStack[] — return the directory stack maintained by
+    // SetDirectory/ResetDirectory. Fresh sessions report `{}`.
+    #[cfg(not(target_arch = "wasm32"))]
+    "DirectoryStack" if args.is_empty() => {
+      return Some(Ok(Expr::List(
+        crate::vfs::directory_stack()
+          .into_iter()
+          .map(Expr::String)
+          .collect(),
+      )));
+    }
+    // FileFormat["name"] — return the format string for a file, or
+    // emit `FileFormat::nffil` and `$Failed` when missing. Actual
+    // format detection isn't implemented yet.
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileFormat" if args.len() == 1 => {
+      let Expr::String(name) = &args[0] else {
+        return Some(Ok(unevaluated("FileFormat", args)));
+      };
+      if !crate::vfs::exists(name) {
+        crate::emit_message(&format!(
+          "FileFormat::nffil: File not found during FileFormat[{name}]."
+        ));
+        return Some(Ok(fail_expr()));
+      }
+      return Some(Ok(unevaluated("FileFormat", args)));
+    }
+    // FileDate["name"] / FileDate["name", "type"] — file timestamps.
+    // Woxi doesn't implement the date lookup yet; for missing files it
+    // still reproduces wolframscript's error path (`fdnfnd` message
+    // and an unevaluated FileDate[…] result).
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileDate" if args.len() == 1 || args.len() == 2 => {
+      let Expr::String(name) = &args[0] else {
+        return Some(Ok(unevaluated("FileDate", args)));
+      };
+      if !crate::vfs::exists(name) {
+        crate::emit_message(&format!(
+          "FileDate::fdnfnd: Directory or file \"{name}\" not found."
+        ));
+      }
+      return Some(Ok(unevaluated("FileDate", args)));
+    }
+    // FileHash[file] / FileHash[file, type] / FileHash[file, type, format] —
+    // the hash of the file's bytes, `MD5` as an Integer by default. Anything
+    // that cannot be read emits `FileHash::noopen` and returns `$Failed`; a
+    // type or format Hash does not know reports it the same way Hash does.
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileHash" if (1..=3).contains(&args.len()) => {
+      let name = match &args[0] {
+        Expr::String(s) => s.clone(),
+        // `File["…"]` names a file just as its path does.
+        Expr::FunctionCall { name, args: inner }
+          if name == "File"
+            && inner.len() == 1
+            && matches!(&inner[0], Expr::String(_)) =>
+        {
+          match &inner[0] {
+            Expr::String(s) => s.clone(),
+            _ => unreachable!(),
+          }
+        }
+        _ => return Some(Ok(unevaluated("FileHash", args))),
+      };
+      let as_string = |i: usize, default: &str| match args.get(i) {
+        None => Some(default.to_string()),
+        Some(Expr::String(s)) => Some(s.clone()),
+        Some(_) => None,
+      };
+      let (Some(hash_type), Some(format)) =
+        (as_string(1, "MD5"), as_string(2, "Integer"))
+      else {
+        return Some(Ok(unevaluated("FileHash", args)));
+      };
+      // wolframscript reports the absolute path, so resolve relative paths
+      // against the current working directory.
+      let path = crate::vfs::resolve(&name);
+      let Ok(data) = std::fs::read(&path) else {
+        let abs = path.to_string_lossy();
+        crate::emit_message(&format!("FileHash::noopen: Cannot open {abs}."));
+        return Some(Ok(fail_expr()));
+      };
+      let Some(hex) =
+        crate::functions::string_ast::hash_bytes(&data, &hash_type)
+      else {
+        crate::emit_message(&format!(
+          "Hash::invhash: {hash_type} is not a valid Hash specification."
+        ));
+        return Some(Ok(fail_expr()));
+      };
+      return Some(Ok(
+        if let Some(result) =
+          crate::functions::string_ast::format_digest(&hex, &format)
+        {
+          result
+        } else {
+          crate::emit_message(&format!(
+            "FileHash::uform: Invalid hash format {format}."
+          ));
+          unevaluated("FileHash", args)
+        },
+      ));
+    }
+    // FileSize["name"] — the size as Quantity[bytes, "Bytes"] with a Real
+    // magnitude. Unlike FileByteCount, errors echo the call unevaluated:
+    // ::fdnfnd for a missing path, ::fdir for a directory, ::badfile for a
+    // non-string argument. A File["…"] wrapper is accepted.
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileSize" if args.len() == 1 => {
+      let unevaluated = || Some(Ok(unevaluated("FileSize", args)));
+      let name = match &args[0] {
+        Expr::String(s) => s.clone(),
+        Expr::FunctionCall { name, args: fargs }
+          if name == "File"
+            && fargs.len() == 1
+            && matches!(&fargs[0], Expr::String(_)) =>
+        {
+          match &fargs[0] {
+            Expr::String(s) => s.clone(),
+            _ => unreachable!(),
+          }
+        }
+        other => {
+          crate::emit_message(&format!(
+            "FileSize::badfile: The specified argument, {}, should be a valid string or File object.",
+            expr_to_output(other)
+          ));
+          return unevaluated();
+        }
+      };
+      match std::fs::metadata(crate::vfs::resolve(&name)) {
+        Ok(meta) if meta.is_file() => {
+          return Some(Ok(call(
+            "Quantity",
+            vec![
+              Expr::Real(meta.len() as f64),
+              Expr::String("Bytes".to_string()),
+            ],
+          )));
+        }
+        Ok(meta) if meta.is_dir() => {
+          crate::emit_message(&format!(
+            "FileSize::fdir: The specified path {name} refers to a directory; a file path was expected."
+          ));
+          return unevaluated();
+        }
+        _ => {
+          crate::emit_message(&format!(
+            "FileSize::fdnfnd: Directory or file \"{name}\" not found."
+          ));
+          return unevaluated();
+        }
+      }
+    }
+    // FileByteCount["name"] — size in bytes, or emit `fdnfnd` and
+    // return `$Failed` when the file is missing.
+    #[cfg(not(target_arch = "wasm32"))]
+    "FileByteCount" if args.len() == 1 => {
+      let Expr::String(name) = &args[0] else {
+        return Some(Ok(unevaluated("FileByteCount", args)));
+      };
+      match std::fs::metadata(crate::vfs::resolve(name)) {
+        Ok(meta) if meta.is_file() => {
+          return Some(Ok(Expr::Integer(meta.len() as i128)));
+        }
+        _ => {
+          crate::emit_message(&format!(
+            "FileByteCount::fdnfnd: Directory or file \"{name}\" not found."
+          ));
+          return Some(Ok(fail_expr()));
+        }
+      }
+    }
+    // AbsoluteFileName["name"] — return the absolute path if the file
+    // exists, otherwise emit `AbsoluteFileName::fdnfnd` and return
+    // `$Failed` (matching wolframscript).
+    #[cfg(not(target_arch = "wasm32"))]
+    "AbsoluteFileName" if args.len() == 1 => {
+      let Expr::String(name) = &args[0] else {
+        return Some(Ok(unevaluated("AbsoluteFileName", args)));
+      };
+      if let Ok(p) = crate::utils::canonicalize(name) {
+        return Some(Ok(Expr::String(p.to_string_lossy().into_owned())));
+      }
+      crate::emit_message(&format!(
+        "AbsoluteFileName::fdnfnd: Directory or file \"{name}\" not found."
+      ));
+      return Some(Ok(fail_expr()));
+    }
+    // FindFile["name"] — return the absolute path if the file exists,
+    // else `$Failed`. A context string like "MyPaclet`" resolves through
+    // the loaded paclet directories and `$Path`, just as `Get` does.
+    #[cfg(not(target_arch = "wasm32"))]
+    "FindFile" if args.len() == 1 => {
+      let Expr::String(name) = &args[0] else {
+        return Some(Ok(unevaluated("FindFile", args)));
+      };
+      if name.ends_with('`') {
+        return Some(Ok(
+          match crate::functions::paclet::resolve_context(name) {
+            Some(path) => {
+              Expr::String(crate::utils::wolfram_path_string(&path))
+            }
+            None => fail_expr(),
+          },
+        ));
+      }
+      // Any other context-ish name can't be resolved to a file on disk.
+      // Match wolframscript's `$Failed` return.
+      if name.contains('`') {
+        return Some(Ok(fail_expr()));
+      }
+      return Some(Ok(match crate::utils::canonicalize(name) {
+        Ok(p) => Expr::String(crate::utils::wolfram_path_string(&p)),
+        Err(_) => fail_expr(),
+      }));
+    }
+    // FileNameDrop["path", n] — drop n path components
+    "FileNameDrop" if !args.is_empty() && args.len() <= 3 => {
+      // The whole family splits and rejoins on the operating system's
+      // separator, the one `FileNameSplit` and `FileNameTake` use.
+      let sep = file_name_separator(args);
+      let positional = positional_args(args);
+      if let Some(Expr::String(path)) = positional.first() {
+        let n = match positional.get(1) {
+          Some(spec) => expr_to_i128(spec)?,
+          // Default: drop the last component.
+          None => -1,
+        };
+        let parts = file_name_pieces(path, sep);
+        let total = parts.len() as i128;
+        let kept: &[&str] = if n >= 0 {
+          // Drop first n components
+          let skip = (n as usize).min(parts.len());
+          &parts[skip..]
+        } else {
+          // Drop last |n| components
+          let keep = (total + n).max(0) as usize;
+          &parts[..keep]
+        };
+        return Some(Ok(Expr::String(file_name_join(
+          kept.iter().copied(),
+          sep,
+        ))));
+      }
+    }
+    "FileNameTake" if !args.is_empty() && args.len() <= 3 => {
+      let sep = file_name_separator(args);
+      let positional = positional_args(args);
+      if let Some(Expr::String(path)) = positional.first() {
+        let components = file_name_pieces(path, sep);
+        let total = components.len() as i128;
+        // Resolve the take specification into a 0-indexed `[start, end)` range.
+        let slice: Option<(usize, usize)> = match positional.get(1).copied() {
+          // Default: just the last component.
+          None => {
+            if total == 0 {
+              Some((0, 0))
+            } else {
+              Some(((total - 1) as usize, total as usize))
+            }
+          }
+          Some(Expr::Integer(n)) => {
+            if *n >= 0 {
+              Some((0, (*n).clamp(0, total) as usize))
+            } else {
+              Some(((total + *n).max(0) as usize, total as usize))
+            }
+          }
+          Some(Expr::List(range)) if range.len() == 2 => {
+            if let (Expr::Integer(m), Expr::Integer(nn)) =
+              (&range[0], &range[1])
+            {
+              let resolve =
+                |idx: i128| if idx < 0 { total + idx } else { idx - 1 };
+              let s = resolve(*m);
+              let e = resolve(*nn);
+              if s < 0 || e >= total || s > e {
+                None
+              } else {
+                Some((s as usize, (e + 1) as usize))
+              }
+            } else {
+              None
+            }
+          }
+          _ => None,
+        };
+        if let Some((s, e)) = slice
+          && s <= e
+          && e <= components.len()
+        {
+          return Some(Ok(Expr::String(file_name_join(
+            components[s..e].iter().copied(),
+            sep,
+          ))));
+        }
+      }
+      return Some(Ok(unevaluated("FileNameTake", args)));
+    }
+    // Input[] / Input[prompt] / InputString[] / InputString[prompt] —
+    // wolframscript prints the prompt to stdout (no trailing newline) and
+    // then reads one line from stdin, returning `EndOfFile` once stdin is
+    // exhausted. `InputString` yields the raw line; `Input` parses and
+    // evaluates it as a Wolfram expression (blank line → Null, syntax error
+    // → $Failed with the usual message), exactly like ToExpression.
+    // Embedders that don't own stdin never get a line, so they keep the
+    // non-interactive `EndOfFile` result.
+    "Input" | "InputString" if args.len() <= 1 => {
+      if let Some(arg) = args.first() {
+        let prompt = match arg {
+          Expr::String(p) => p.clone(),
+          _ => expr_to_string(arg),
+        };
+        if !crate::is_quiet_print() {
+          use std::io::Write as _;
+          print!("{prompt}");
+          let _ = std::io::stdout().flush();
+        }
+        crate::capture_stdout_raw(&prompt);
+      }
+      let Some(line) = crate::read_stdin_line() else {
+        return Some(Ok(id_expr("EndOfFile")));
+      };
+      if name == "InputString" {
+        return Some(Ok(Expr::String(line)));
+      }
+      return Some(crate::functions::string_ast::to_expression_ast_as(
+        &[Expr::String(line)],
+        "Syntax",
+      ));
+    }
+    _ => {}
+  }
+  None
+}
+
+/// Helper for Read: read a single value of a given type from remaining stream content.
+/// Returns (result_expr, bytes_consumed).
+fn read_single_type(remaining: &str, read_type: &Expr) -> (Expr, usize) {
+  let type_name = match read_type {
+    Expr::Identifier(s) => s.as_str(),
+    _ => "Expression",
+  };
+
+  if remaining.is_empty() {
+    return (id_expr("EndOfFile"), 0);
+  }
+
+  match type_name {
+    "Word" => {
+      // Skip leading whitespace
+      let trimmed = remaining.trim_start();
+      let skipped = remaining.len() - trimmed.len();
+      if trimmed.is_empty() {
+        return (id_expr("EndOfFile"), remaining.len());
+      }
+      // Read until whitespace
+      let end = trimmed
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(trimmed.len());
+      let word = &trimmed[..end];
+      (Expr::String(word.to_string()), skipped + end)
+    }
+    "Number" => {
+      // Skip leading whitespace
+      let trimmed = remaining.trim_start();
+      let skipped = remaining.len() - trimmed.len();
+      if trimmed.is_empty() {
+        return (id_expr("EndOfFile"), remaining.len());
+      }
+      // Try to parse a number
+      let mut end = 0;
+      let chars: Vec<char> = trimmed.chars().collect();
+      // Optional sign
+      if end < chars.len() && (chars[end] == '+' || chars[end] == '-') {
+        end += 1;
+      }
+      // Digits before decimal
+      let start_digits = end;
+      while end < chars.len() && chars[end].is_ascii_digit() {
+        end += 1;
+      }
+      let has_int_part = end > start_digits;
+      // Decimal point and more digits
+      let mut is_real = false;
+      if end < chars.len() && chars[end] == '.' {
+        is_real = true;
+        end += 1;
+        while end < chars.len() && chars[end].is_ascii_digit() {
+          end += 1;
+        }
+      }
+      if end == 0 || (!has_int_part && !is_real) {
+        return (fail_expr(), skipped);
+      }
+      let num_str = &trimmed[..end];
+      if is_real {
+        if let Ok(f) = num_str.parse::<f64>() {
+          return (Expr::Real(f), skipped + end);
+        }
+      } else if let Ok(n) = num_str.parse::<i128>() {
+        return (Expr::Integer(n), skipped + end);
+      }
+      (fail_expr(), skipped)
+    }
+    "String" => {
+      // Read until newline
+      let end = remaining.find('\n').unwrap_or(remaining.len());
+      let line = &remaining[..end];
+      let advance = if end < remaining.len() { end + 1 } else { end };
+      (Expr::String(line.to_string()), advance)
+    }
+    "Character" => {
+      let ch = remaining.chars().next().unwrap();
+      (Expr::String(ch.to_string()), ch.len_utf8())
+    }
+    // "Expression", and any unrecognized type, reads a whole expression.
+    _ => {
+      // Read the next top-level Wolfram expression. Strings, comments,
+      // and bracketed groups are allowed to span newlines, so we scan
+      // forward tracking quote/bracket depth instead of cutting at the
+      // first newline — otherwise inputs like `"Tengo una\nvaca."`
+      // would only read the unbalanced opener `"Tengo una`.
+      let trimmed = remaining.trim_start();
+      let skipped = remaining.len() - trimmed.len();
+      if trimmed.is_empty() {
+        return (id_expr("EndOfFile"), remaining.len());
+      }
+      let bytes = trimmed.as_bytes();
+      let mut i = 0;
+      let mut depth: i32 = 0;
+      let mut in_string = false;
+      while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+          if c == b'\\' && i + 1 < bytes.len() {
+            // Escape: skip next byte too.
+            i += 2;
+            continue;
+          }
+          if c == b'"' {
+            in_string = false;
+          }
+          i += 1;
+          continue;
+        }
+        match c {
+          b'"' => in_string = true,
+          b'(' | b'[' | b'{' => depth += 1,
+          b')' | b']' | b'}' => depth -= 1,
+          b'\n' if depth == 0 => break,
+          _ => {}
+        }
+        i += 1;
+      }
+      let end = i;
+      let line = &trimmed[..end];
+      let advance = if skipped + end < remaining.len() {
+        skipped + end + 1
+      } else {
+        remaining.len()
+      };
+      // Parse and evaluate the expression itself. Going through
+      // `interpret`'s *printed* form and re-reading that loses the head of
+      // anything whose output form is not its input form — a quoted
+      // `"x"` came back as the symbol `x`, since a string prints bare.
+      let value = crate::syntax::string_to_expr(line)
+        .and_then(|parsed| crate::evaluator::evaluate_expr_to_expr(&parsed));
+      match value {
+        Ok(expr) => (expr, advance),
+        Err(_) => (fail_expr(), advance),
+      }
+    }
+  }
+}
+
+/// Split an `OpenWrite[…]` / `OpenRead[…]` arg list into the optional
+/// filename argument and the remaining option-Rule arguments. Used so the
+/// `BinaryFormat -> True` option can be passed through alongside (or
+/// instead of) a filename.
+#[cfg(not(target_arch = "wasm32"))]
+fn io_split_filename_and_options(args: &[Expr]) -> (Option<&Expr>, Vec<&Expr>) {
+  let mut filename = None;
+  let mut opts = Vec::new();
+  for a in args {
+    if matches!(a, Expr::Rule { .. } | Expr::RuleDelayed { .. }) {
+      opts.push(a);
+    } else if filename.is_none() {
+      filename = Some(a);
+    } else {
+      opts.push(a);
+    }
+  }
+  (filename, opts)
+}
+
+/// Extract the file path backing an `InputStream[name, id]` /
+/// `OutputStream[name, id]` expression. Used by `BinaryWrite` /
+/// `BinaryRead` to find the underlying file.
+#[cfg(not(target_arch = "wasm32"))]
+fn io_stream_path(expr: &Expr) -> Option<String> {
+  let Expr::FunctionCall { name, args } = expr else {
+    return None;
+  };
+  if name != "InputStream" && name != "OutputStream" {
+    return None;
+  }
+  if args.is_empty() {
+    return None;
+  }
+  match &args[0] {
+    Expr::String(s) => Some(s.clone()),
+    _ => None,
+  }
+}
+
+/// Render a single delimited-table cell. Numeric/symbolic atoms are emitted
+/// bare. When `quote_strings` is set (CSV/TSV) strings are wrapped in `"…"`
+/// with embedded `"` doubled, matching wolframscript; the `"Table"` format
+/// passes `false`, emitting strings verbatim.
+fn csv_cell(expr: &Expr, quote_strings: bool) -> String {
+  let quoted = |text: String| -> String {
+    if quote_strings {
+      format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+      text
+    }
+  };
+  match expr {
+    Expr::String(s) => quoted(s.clone()),
+    // Machine numbers are written bare; a bigger integer is quoted, like
+    // every other non-machine value.
+    Expr::Integer(n) if i64::try_from(*n).is_ok() => n.to_string(),
+    Expr::Real(_) => expr_to_string(expr),
+    // The booleans are lower-cased and left unquoted.
+    Expr::Identifier(name) if name == "True" || name == "False" => {
+      name.to_lowercase()
+    }
+    // A list is written out; any other compound expression has no CSV
+    // representation and becomes the placeholder `-Head-`.
+    Expr::List(_) => quoted(expr_to_string(expr)),
+    Expr::FunctionCall { .. }
+    | Expr::BinaryOp { .. }
+    | Expr::UnaryOp { .. }
+    | Expr::Association(_)
+    | Expr::Comparison { .. }
+      if !matches!(expr, Expr::FunctionCall { name, .. } if name == "Rational") =>
+    {
+      let head =
+        crate::functions::predicate_ast::head_ast(std::slice::from_ref(expr))
+          .map_or_else(|_| "Expression".to_string(), |h| expr_to_string(&h));
+      quoted(format!("-{head}-"))
+    }
+    // Symbols, rationals and the other atoms keep their text, quoted.
+    _ => quoted(expr_to_string(expr)),
+  }
+}
+
+/// Serialize an expression to Wolfram's pretty-printed JSON (tab-indented,
+/// `"key":value` with no space after the colon, `true`/`false`/`null`, empty
+/// containers inline as `[]` / `{}`). `indent` is the tab depth of the value's
+/// opening bracket. Returns `None` for any value JSON cannot represent, so the
+/// caller leaves `ExportString` unevaluated.
+fn export_string_json(
+  expr: &Expr,
+  indent: usize,
+  compact: bool,
+) -> Option<String> {
+  // Format a Real as JSON: a finite decimal with at least one fractional
+  // digit (3.0 -> "3.0", not Wolfram's bare "3.").
+  fn real_json(f: f64) -> Option<String> {
+    if !f.is_finite() {
+      return None;
+    }
+    let s = format!("{f}");
+    Some(if s.contains('.') || s.contains('e') || s.contains('E') {
+      s
+    } else {
+      format!("{s}.0")
+    })
+  }
+  fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+      match c {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\t' => out.push_str("\\t"),
+        '\r' => out.push_str("\\r"),
+        _ => out.push(c),
+      }
+    }
+    out
+  }
+  match expr {
+    Expr::Integer(n) => Some(n.to_string()),
+    Expr::BigInteger(n) => Some(n.to_string()),
+    Expr::Real(f) => real_json(*f),
+    // JSON has no rationals, so they go out as their machine value.
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(n), Expr::Integer(d)) if *d != 0 => {
+          real_json(*n as f64 / *d as f64)
+        }
+        _ => None,
+      }
+    }
+    Expr::String(s) => Some(format!("\"{}\"", escape(s))),
+    Expr::Identifier(s) if s == "True" => Some("true".to_string()),
+    Expr::Identifier(s) if s == "False" => Some("false".to_string()),
+    Expr::Identifier(s) if s == "Null" || s == "None" => {
+      Some("null".to_string())
+    }
+    Expr::List(items) => {
+      if items.is_empty() {
+        return Some("[]".to_string());
+      }
+      let mut parts = Vec::with_capacity(items.len());
+      for it in items {
+        parts.push(export_string_json(it, indent + 1, compact)?);
+      }
+      if compact {
+        return Some(format!("[{}]", parts.join(",")));
+      }
+      let inner = "\t".repeat(indent + 1);
+      let body: Vec<String> =
+        parts.iter().map(|p| format!("{inner}{p}")).collect();
+      Some(format!("[\n{}\n{}]", body.join(",\n"), "\t".repeat(indent)))
+    }
+    Expr::Association(pairs) => {
+      if pairs.is_empty() {
+        return Some("{}".to_string());
+      }
+      let mut parts = Vec::with_capacity(pairs.len());
+      for (k, v) in pairs {
+        // Only string keys exist in JSON; anything else fails the export
+        // rather than being stringified into a key that was never there.
+        let Expr::String(key) = k else {
+          crate::emit_message(
+            "Export::jsonassockeynstr: Association contains a non-string key.",
+          );
+          return None;
+        };
+        let key = key.clone();
+        parts.push(format!(
+          "\"{}\":{}",
+          escape(&key),
+          export_string_json(v, indent + 1, compact)?
+        ));
+      }
+      if compact {
+        return Some(format!("{{{}}}", parts.join(",")));
+      }
+      let inner = "\t".repeat(indent + 1);
+      let body: Vec<String> =
+        parts.iter().map(|p| format!("{inner}{p}")).collect();
+      Some(format!(
+        "{{\n{}\n{}}}",
+        body.join(",\n"),
+        "\t".repeat(indent)
+      ))
+    }
+    other => {
+      crate::emit_message(&format!(
+        "Export::jsonstrictencoding: Expression {} cannot be exported as JSON.",
+        crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+      ));
+      None
+    }
+  }
+}
+
+/// Serialize an expression to CSV (or TSV when `sep` is `\t`).
+/// A list-of-lists is rendered one row per inner list; a flat list is
+/// rendered one element per row. Other expressions become a single row.
+/// Each row is terminated with a newline (Wolfram's `ExportString` always
+/// emits a trailing newline after the last record).
+/// Assemble the `URLParse` parts of an association back into a URL.
+///
+/// A `Domain` (or an absolute `Path` under a scheme, as in `file:///tmp/f`)
+/// introduces the `//` authority marker; without one the scheme is followed
+/// directly by the path, as in `mailto:a@b.c`. A `Path` given as a list is
+/// joined with `/`, so a leading `""` is what makes it absolute.
+fn url_build_from_parts(entries: &[(Expr, Expr)]) -> String {
+  let lookup = |key: &str| -> Option<&Expr> {
+    entries
+      .iter()
+      .find(|(k, _)| matches!(k, Expr::String(s) if s == key))
+      .map(|(_, v)| v)
+      .filter(|v| !matches!(v, Expr::Identifier(s) if s == "None"))
+  };
+  let text = |e: &Expr| match e {
+    Expr::String(s) => s.clone(),
+    other => expr_to_string(other),
+  };
+
+  let scheme = lookup("Scheme").map(&text);
+  let user = lookup("User").map(&text);
+  let domain = lookup("Domain").map(&text);
+  let port = lookup("Port").map(&text);
+  let path = lookup("Path").map(|p| match p {
+    Expr::List(segments) => {
+      segments.iter().map(&text).collect::<Vec<_>>().join("/")
+    }
+    other => text(other),
+  });
+  let fragment = lookup("Fragment").map(&text);
+  let query: Vec<(String, String)> = match lookup("Query") {
+    Some(Expr::List(items)) => items
+      .iter()
+      .filter_map(|item| match item {
+        Expr::Rule {
+          pattern,
+          replacement,
+        }
+        | Expr::RuleDelayed {
+          pattern,
+          replacement,
+        } => Some((text(pattern), text(replacement))),
+        _ => None,
+      })
+      .collect(),
+    Some(Expr::Association(pairs)) => {
+      pairs.iter().map(|(k, v)| (text(k), text(v))).collect()
+    }
+    _ => Vec::new(),
+  };
+
+  let mut url = String::new();
+  if let Some(scheme) = &scheme {
+    url.push_str(scheme);
+    url.push(':');
+  }
+  let absolute_path = path.as_deref().is_some_and(|p| p.starts_with('/'));
+  if domain.is_some() || (scheme.is_some() && absolute_path) {
+    url.push_str("//");
+    if let Some(user) = &user {
+      url.push_str(user);
+      url.push('@');
+    }
+    if let Some(domain) = &domain {
+      url.push_str(domain);
+    }
+    if let Some(port) = &port {
+      url.push(':');
+      url.push_str(port);
+    }
+  }
+  if let Some(path) = &path {
+    url.push_str(path);
+  }
+  if !query.is_empty() {
+    url.push('?');
+    let encoded: Vec<String> = query
+      .iter()
+      .map(|(k, v)| {
+        format!(
+          "{}={}",
+          crate::functions::string_ast::url_query_component(k),
+          crate::functions::string_ast::url_query_component(v)
+        )
+      })
+      .collect();
+    url.push_str(&encoded.join("&"));
+  }
+  if let Some(fragment) = &fragment {
+    url.push('#');
+    url.push_str(fragment);
+  }
+  url
+}
+
+fn export_string_csv(
+  expr: &Expr,
+  sep: char,
+  quote_strings: bool,
+  trailing_newline: bool,
+) -> String {
+  let cell = |e: &Expr| csv_cell(e, quote_strings);
+  let row_strs = |row: &Expr| -> String {
+    if let Expr::List(items) = row {
+      items
+        .iter()
+        .map(&cell)
+        .collect::<Vec<_>>()
+        .join(&sep.to_string())
+    } else {
+      cell(row)
+    }
+  };
+  let rows: Vec<String> = match expr {
+    Expr::List(items) => {
+      let any_nested = items.iter().any(|e| matches!(e, Expr::List(_)));
+      if any_nested {
+        items.iter().map(row_strs).collect()
+      } else {
+        items.iter().map(&cell).collect()
+      }
+    }
+    _ => vec![cell(expr)],
+  };
+  let mut out = rows.join("\n");
+  if trailing_newline {
+    out.push('\n');
+  }
+  out
+}
+
+/// Flatten a `FileNames` pattern argument into the individual patterns it
+/// stands for. Both `{p1, p2}` and `p1 | p2` mean "any of these" and may be
+/// nested arbitrarily; every other expression is a pattern in its own right
+/// (a literal string, `RegularExpression[…]`, `__ ~~ ".txt"`, …).
+#[cfg(not(target_arch = "wasm32"))]
+fn flatten_file_patterns(pattern: &Expr, out: &mut Vec<Expr>) {
+  match pattern {
+    Expr::List(items) => {
+      for item in items {
+        flatten_file_patterns(item, out);
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Alternatives" => {
+      for arg in args {
+        flatten_file_patterns(arg, out);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Alternatives,
+      left,
+      right,
+    } => {
+      flatten_file_patterns(left, out);
+      flatten_file_patterns(right, out);
+    }
+    other => out.push(other.clone()),
+  }
+}
+
+/// Whether a file name matches any of the given `FileNames` patterns.
+/// Matching is delegated to `StringMatchQ`, so file name patterns support
+/// the same string patterns everywhere else in Woxi does — including the
+/// `*` and `@` metacharacters of a bare string pattern.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_name_matches(patterns: &[Expr], file_name: &str) -> bool {
+  patterns.iter().any(|pattern| {
+    let args = [Expr::String(file_name.to_string()), pattern.clone()];
+    matches!(
+      crate::functions::string_ast::string_match_q_ast(&args),
+      Ok(Expr::Identifier(ref s)) if s == "True"
+    )
+  })
+}
+
+/// The names `FileNames` reports for `patterns` under `dir`, searching
+/// `levels` directory levels.
+///
+/// `dir` is resolved against the working directory that `Directory[]`
+/// reports, so a preceding `SetDirectory` is honoured, but it keeps its
+/// spelling in the result: `FileNames["*", "sub"]` reports `sub/a.txt`,
+/// while the current directory reports the bare name.
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_file_names(
+  patterns: &[Expr],
+  dir: &str,
+  levels: FileNameLevels,
+) -> Vec<String> {
+  let root = crate::vfs::resolve(if dir.is_empty() { "." } else { dir });
+  if levels.is_empty() || !root.is_dir() {
+    return Vec::new();
+  }
+
+  let mut results = Vec::new();
+  collect_files_recursive(&root, &root, dir, patterns, levels, 1, &mut results);
+  results
+}
+
+/// The range of directory levels a `FileNames` search reports, with level
+/// `1` standing for the searched directories themselves. An empty range —
+/// one whose `min` exceeds its `max` — matches nothing.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct FileNameLevels {
+  min: usize,
+  max: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FileNameLevels {
+  /// Whether the range cannot contain any level at all.
+  fn is_empty(self) -> bool {
+    self.min > self.max || self.max == 0
+  }
+}
+
+/// A single level number in a `FileNames` level specification.
+/// `Infinity` stands for "no limit"; a non-positive count is clamped to
+/// zero, which is a level no file ever sits on.
+/// Returns `None` for expressions that aren't a level number.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_names_level_number(spec: &Expr) -> Option<usize> {
+  match spec {
+    Expr::Identifier(s) if s == "Infinity" => Some(usize::MAX),
+    Expr::Integer(n) => Some(usize::try_from(*n).unwrap_or(0)),
+    Expr::Real(r) if r.fract() == 0.0 => {
+      Some(if *r <= 0.0 { 0 } else { *r as usize })
+    }
+    _ => None,
+  }
+}
+
+/// The directory levels the third `FileNames` argument asks for, following
+/// the usual level specifications: `n` searches levels `1` through `n`,
+/// `{n}` only level `n`, and `{n1, n2}` the levels from `n1` to `n2`.
+/// `Infinity` stands for "no limit" wherever a level number is allowed.
+/// Returns `None` for arguments that aren't a level specification.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_names_levels(spec: &Expr) -> Option<FileNameLevels> {
+  match spec {
+    Expr::List(items) => match items.as_slice() {
+      // `{}` asks for no particular level, which is the default: the
+      // searched directories themselves (wolframscript-verified,
+      // `FileNames[p, d, {}] === FileNames[p, d, {1}]`).
+      [] => Some(FileNameLevels { min: 1, max: 1 }),
+      [only] => {
+        let n = file_names_level_number(only)?;
+        Some(FileNameLevels { min: n, max: n })
+      }
+      // A level *range* is not part of the specification: wolframscript
+      // leaves `FileNames[p, d, {n1, n2}]` unevaluated, so only `{n}` and
+      // `{}` are accepted here.
+      _ => None,
+    },
+    other => Some(FileNameLevels {
+      min: 1,
+      max: file_names_level_number(other)?,
+    }),
+  }
+}
+
+/// Walk `path`, collecting entries whose name matches any of `patterns`.
+/// `depth` is the level the entries of `path` sit on, counting the searched
+/// directory itself as level `1`; only entries within `levels` are reported
+/// and the walk stops once `levels.max` is reached.
+///
+/// Every match is reported as `base_dir` spells it: entries are named
+/// relative to `root` (the resolved `base_dir`) and prefixed with
+/// `base_dir` again, so the reported names stay relative wherever the
+/// working directory happens to be. An empty `base_dir` — how
+/// `FileNames["pat"]`, which names no directory, arrives here — reports the
+/// bare relative name; a directory spelled out as `"."` prefixes `./`.
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_files_recursive(
+  path: &std::path::Path,
+  root: &std::path::Path,
+  base_dir: &str,
+  patterns: &[Expr],
+  levels: FileNameLevels,
+  depth: usize,
+  results: &mut Vec<String>,
+) {
+  let Ok(entries) = std::fs::read_dir(path) else {
+    return;
+  };
+
+  for entry in entries.flatten() {
+    let entry_path = entry.path();
+    let file_name = entry.file_name().to_string_lossy().to_string();
+    let file_type = entry.file_type();
+
+    if let Ok(ft) = file_type {
+      if depth >= levels.min && file_name_matches(patterns, &file_name) {
+        let relative = entry_path.strip_prefix(root).unwrap_or(&entry_path);
+        let named = if base_dir.is_empty() {
+          relative.to_path_buf()
+        } else {
+          std::path::Path::new(base_dir).join(relative)
+        };
+        let named = named.to_string_lossy().into_owned();
+        // Windows reads either separator but spells a path with only one,
+        // and `base_dir` is echoed back as the caller wrote it — so a
+        // directory given as `"C:/dir"` would otherwise come back as
+        // `"C:/dir\file.txt"`, a spelling no other `FileName*` function
+        // produces. On Unix a backslash is an ordinary character in a file
+        // name and must survive untouched.
+        let named = if std::path::MAIN_SEPARATOR == '\\' {
+          named.replace('/', "\\")
+        } else {
+          named
+        };
+        results.push(named);
+      }
+      if ft.is_dir() && depth < levels.max {
+        collect_files_recursive(
+          &entry_path,
+          root,
+          base_dir,
+          patterns,
+          levels,
+          depth + 1,
+          results,
+        );
+      }
+    }
+  }
+}
+
+/// Render a text-mode SVG fallback for non-graphics expressions.
+fn expr_text_svg(expr: &Expr) -> String {
+  let boxes = super::complex_and_special::expr_to_box_form(expr);
+  // The box form of a machine/arbitrary-precision Real carries a trailing
+  // backtick precision marker (`2.``), matching wolframscript's `MakeBoxes`.
+  // A typeset SVG display (which `Export[…, "SVG"]` emulates) suppresses the
+  // marker and shows the notebook OutputForm — machine reals at 6 significant
+  // figures — so strip it before layout, exactly as `generate_output_svg` does
+  // for the Playground/Studio result SVG.
+  let boxes = crate::strip_number_precision_markers(&boxes);
+  boxes_to_text_svg(&boxes)
+}
+
+/// Render box-form expressions to a text SVG.
+fn boxes_to_text_svg(boxes: &Expr) -> String {
+  let layout = crate::functions::graphics::layout_box(boxes, 14.0);
+  crate::functions::graphics::layout_to_svg(&layout, "currentColor")
+}
+
+/// Convert an expression to its SVG string representation.
+/// True if `expr` is a graphics-like value that `expr_to_svg` will render
+/// to a non-trivial SVG. Used to decide whether a `List` passed to
+/// `Export[..., "gif"]` should be treated as an animated frame sequence.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_rasterizable_frame(expr: &Expr) -> bool {
+  matches!(expr, Expr::Graphics { .. } | Expr::Image { .. })
+    || matches!(
+      expr,
+      Expr::FunctionCall { name, args }
+        if (name == "Graphics" || name == "Graphics3D") && !args.is_empty()
+    )
+}
+
+/// True if `expr` is an already-rendered graphic that can be drawn as a
+/// cell inside a list/grid combination (see the `Expr::List` arms of
+/// `expr_to_svg`).
+fn is_inline_graphic(expr: &Expr) -> bool {
+  match expr {
+    Expr::Graphics { .. } | Expr::Image { .. } => true,
+    Expr::FunctionCall { name, args }
+      if (name == "Legended" || name == "Pane" || name == "Mouseover")
+        && !args.is_empty() =>
+    {
+      is_inline_graphic(&args[0])
+    }
+    _ => false,
+  }
+}
+
+/// The layout wrappers whose *cells* `expr_to_svg` composes: each one
+/// arranges its parts in a grid, so a picture anywhere inside has to be
+/// drawn rather than written out as source.
+const LAYOUT_HEADS: &[&str] = &["Grid", "Column", "Row", "Labeled"];
+
+/// True if `expr` is a picture, or a layout or display wrapper — `Grid`,
+/// `Column`, `Row`, `Labeled`, `Pane`, `LocatorPane`, `Dynamic` — that has
+/// one somewhere inside. Only then does composing it through
+/// [`expr_to_svg`] beat the typeset-text fallback: a `Grid` of plain
+/// strings already lays out correctly as text. Kept apart from the
+/// "produces a graphic" head test so nothing tries to give a wrapper an
+/// `ImageSize` of its own.
+pub(crate) fn lays_out_a_graphic(expr: &Expr) -> bool {
+  if is_inline_graphic(expr) {
+    return true;
+  }
+  // A held `Graphics[…]` / `Graphics3D[…]` call is a picture too —
+  // `expr_to_svg` renders one — and that is the form the args of a
+  // display wrapper like `Labeled` arrive in.
+  if matches!(expr, Expr::FunctionCall { name, args }
+    if (name == "Graphics" || name == "Graphics3D") && !args.is_empty())
+  {
+    return true;
+  }
+  // A bare `LineLegend[…]` is a picture too — a Demonstration placing a
+  // legend beside its plot rather than attached via `Legended`.
+  if matches!(expr, Expr::FunctionCall { name, .. } if name == "LineLegend") {
+    return true;
+  }
+  // Likewise a bare `SwatchLegend[…]` — a color-swatch legend rather than
+  // a line-style one.
+  if matches!(expr, Expr::FunctionCall { name, .. } if name == "SwatchLegend") {
+    return true;
+  }
+  // `Animate[expr, spec, …]` nested in a display draws its first frame
+  // (see `animate_snapshot_svg`), so it counts as a picture too.
+  if matches!(expr, Expr::FunctionCall { name, args } if name == "Animate" && args.len() >= 2)
+  {
+    return true;
+  }
+  // `TableForm[data, …]` / `MatrixForm[data, …]`, and either wrapped in a
+  // `Style[…]` that sets its font, are drawn as an aligned grid picture by
+  // `expr_to_svg` — a Demonstration's Manipulate body composing one into a
+  // `Column`/`Item` layout must be drawn there too, not printed as the
+  // literal `TableForm[…]` source.
+  if matches!(expr, Expr::FunctionCall { name, args }
+    if (name == "TableForm" || name == "MatrixForm") && !args.is_empty())
+  {
+    return true;
+  }
+  if matches!(expr, Expr::FunctionCall { name, args }
+    if name == "Style"
+      && args.len() >= 2
+      && matches!(&args[0], Expr::FunctionCall { name: inner, args: inner_args }
+        if (inner == "TableForm" || inner == "MatrixForm") && !inner_args.is_empty()))
+  {
+    return true;
+  }
+  match expr {
+    Expr::List(items) => items.iter().any(lays_out_a_graphic),
+    // `Pane` and `Deploy` are transparent here: their own arms export what
+    // they wrap. A `Framed` picture is drawn and framed by its own
+    // renderer, so it counts as a picture too.
+    Expr::FunctionCall { name, args }
+      if LAYOUT_HEADS.contains(&name.as_str())
+        || name == "Overlay"
+        || name == "Pane"
+        || name == "Deploy"
+        || name == "Framed" =>
+    {
+      args.iter().any(lays_out_a_graphic)
+    }
+    // `LocatorPane[locators, body, …]` shows `body`; its own arm draws the
+    // locators onto it.
+    Expr::FunctionCall { name, args }
+      if name == "LocatorPane" && args.len() >= 2 =>
+    {
+      lays_out_a_graphic(&args[1])
+    }
+    // `Item[expr, opts…]` is a layout cell: what it displays is `expr`.
+    Expr::FunctionCall { name, args } if name == "Item" && !args.is_empty() => {
+      lays_out_a_graphic(&args[0])
+    }
+    // `ClickPane[expr, …]` shows `expr`; clicking it is the affordance the
+    // handler is for, and contributes nothing to the picture.
+    Expr::FunctionCall { name, args }
+      if name == "ClickPane" && args.len() >= 2 =>
+    {
+      lays_out_a_graphic(&args[0])
+    }
+    // `Mouseover[expr, appearance]` shows `expr`; `appearance` only replaces
+    // it while the mouse hovers, which a static export can't represent, so
+    // the picture is `expr` — the same as `Tooltip` would be if it wrapped
+    // a whole cell instead of a primitive inside a `Graphics`.
+    Expr::FunctionCall { name, args }
+      if name == "Mouseover" && !args.is_empty() =>
+    {
+      lays_out_a_graphic(&args[0])
+    }
+    // `Dynamic[graphic]` is a picture too — its arm shows what it holds.
+    Expr::FunctionCall { name, args }
+      if name == "Dynamic" && args.len() == 1 =>
+    {
+      lays_out_a_graphic(&args[0])
+    }
+    _ => false,
+  }
+}
+
+/// The primitives a locator pane draws at one locator position.
+///
+/// `Appearance -> {g1, g2, …}` gives one picture per locator, each drawn
+/// about the origin, so the marker is that picture translated onto the
+/// point — this is how a Demonstration labels the vertices of a shape it
+/// lets you drag. A single picture is used for every locator, `None` draws
+/// nothing, and with no `Appearance` at all the Wolfram default is a small
+/// circle with a crosshair through it, sized here as a fraction of the plot
+/// range so it keeps its proportions whatever the scale.
+fn locator_marker(
+  appearance: Option<&Expr>,
+  index: usize,
+  point: &Expr,
+  span: f64,
+) -> Option<Expr> {
+  let translate =
+    |prims: &Expr| call("Translate", vec![prims.clone(), point.clone()]);
+  // The primitives of an `Appearance` picture: `Graphics[prims, opts…]`
+  // contributes `prims`; anything else is drawn as given.
+  let primitives = |g: &Expr| match g {
+    Expr::FunctionCall { name, args }
+      if name == "Graphics" && !args.is_empty() =>
+    {
+      args[0].clone()
+    }
+    other => other.clone(),
+  };
+  match appearance {
+    Some(Expr::Identifier(n)) if n == "None" => None,
+    Some(Expr::List(items)) if !items.is_empty() => {
+      Some(translate(&primitives(&items[index % items.len()])))
+    }
+    Some(single) => Some(translate(&primitives(single))),
+    None => {
+      let r = span * 0.015;
+      let arm = span * 0.03;
+      let offset = |dx: f64, dy: f64| Expr::List(vec![num(dx), num(dy)].into());
+      let line =
+        |a: Expr, b: Expr| call("Line", vec![Expr::List(vec![a, b].into())]);
+      Some(translate(&Expr::List(
+        vec![
+          call("Circle", vec![offset(0.0, 0.0), num(r)]),
+          line(offset(-arm, 0.0), offset(arm, 0.0)),
+          line(offset(0.0, -arm), offset(0.0, arm)),
+        ]
+        .into(),
+      )))
+    }
+  }
+}
+
+/// A machine real as an expression, for the synthesized marker geometry.
+fn num(v: f64) -> Expr {
+  Expr::Real(v)
+}
+
+/// Where a locator pane's locators currently are. `Dynamic[sym]` reads
+/// `sym`, and so does the two-argument `Dynamic[sym, setter]` — the setter
+/// is what runs when a locator is dragged and says nothing about where it
+/// is now. A Demonstration often writes the whole thing as
+/// `pt = …; Dynamic[pt, setter]`, computing the position from its sliders
+/// first, so a leading statement is evaluated for that effect before the
+/// last one is read.
+fn locator_positions(arg: &Expr) -> Option<Expr> {
+  match arg {
+    Expr::CompoundExpr(items) => {
+      let (last, leading) = items.split_last()?;
+      for item in leading {
+        let _ = crate::evaluator::evaluate_expr_to_expr(item);
+      }
+      locator_positions(last)
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Dynamic" && !args.is_empty() =>
+    {
+      crate::evaluator::evaluate_expr_to_expr(&args[0]).ok()
+    }
+    other => crate::evaluator::evaluate_expr_to_expr(other).ok(),
+  }
+}
+
+/// `LocatorPane[locators, body, …]` as the picture it displays: the body
+/// graphic with a marker drawn at every locator. Dragging a locator is a
+/// front-end affordance; what the picture itself carries is the markers, so
+/// this is what exporting or laying one out has to produce instead of the
+/// call written out as source. `None` when the arguments don't fit.
+fn locator_pane_graphic(args: &[Expr]) -> Option<Expr> {
+  if args.len() < 2 {
+    return None;
+  }
+  let positions = locator_positions(&args[0])?;
+  let is_point = |e: &Expr| {
+    matches!(e, Expr::List(c) if c.len() == 2
+      && c.iter().all(|v| crate::functions::math_ast::try_eval_to_f64(v).is_some()))
+  };
+  let points: Vec<Expr> = match &positions {
+    p if is_point(p) => vec![p.clone()],
+    Expr::List(items) if items.iter().all(is_point) => items.to_vec(),
+    _ => return None,
+  };
+
+  // The body must be a graphic; its options are kept so the pane inherits
+  // the plot range, axes and grid lines the body asked for. A pane whose
+  // picture depends on the locators is written `Dynamic@Graphics[…]`, and
+  // `Dynamic` is HoldFirst, so what it holds is released here.
+  let held = match &args[1] {
+    Expr::FunctionCall { name, args: inner }
+      if name == "Dynamic" && !inner.is_empty() =>
+    {
+      &inner[0]
+    }
+    other => other,
+  };
+  let body = crate::evaluator::evaluate_expr_to_expr(held).ok()?;
+  let appearance = args[2..].iter().find_map(|o| match o {
+    Expr::Rule { pattern, replacement }
+      if matches!(pattern.as_ref(), Expr::Identifier(p) if p == "Appearance") =>
+    {
+      crate::evaluator::evaluate_expr_to_expr(replacement).ok()
+    }
+    _ => None,
+  });
+  let (body_prims, body_opts) = match &body {
+    Expr::FunctionCall { name, args }
+      if name == "Graphics" && !args.is_empty() =>
+    {
+      (args[0].clone(), args[1..].to_vec())
+    }
+    // A body that evaluates straight to a rendered picture instead of
+    // staying the symbolic `Graphics[prims, opts]` above — `Show[…]`,
+    // `ContourPlot[…]`, or a `Which`/`If` switching between such plots
+    // (a Demonstration toggling between several plotted methods over
+    // the same locator) — can't have its marker spliced into a
+    // primitive list that doesn't exist here. Draw it via `Epilog`
+    // instead.
+    _ => {
+      return locator_pane_graphic_via_epilog(
+        held,
+        &body,
+        &points,
+        appearance.as_ref(),
+      );
+    }
+  };
+
+  // The default marker is sized against the plot range, so it stays a small
+  // fraction of the picture whatever the coordinates are.
+  let span = body_opts
+    .iter()
+    .find_map(|o| match o {
+      Expr::Rule { pattern, replacement }
+        if matches!(pattern.as_ref(), Expr::Identifier(p) if p == "PlotRange") =>
+      {
+        match replacement.as_ref() {
+          Expr::List(axes) if axes.len() == 2 => {
+            let extent = |e: &Expr| match e {
+              Expr::List(b) if b.len() == 2 => {
+                let f = crate::functions::math_ast::try_eval_to_f64;
+                Some((f(&b[1])? - f(&b[0])?).abs())
+              }
+              _ => None,
+            };
+            Some(extent(&axes[0])?.max(extent(&axes[1])?))
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    })
+    .unwrap_or(1.0);
+
+  let mut prims = vec![body_prims];
+  for (i, point) in points.iter().enumerate() {
+    if let Some(marker) = locator_marker(appearance.as_ref(), i, point, span) {
+      prims.push(marker);
+    }
+  }
+  let mut graphics_args = vec![Expr::List(prims.into())];
+  graphics_args.extend(body_opts);
+  Some(call("Graphics", graphics_args))
+}
+
+/// The data-space extent a `LocatorPane` marker's default size is scaled
+/// against, for a body that only exists as a rendered picture (so there is
+/// no `PlotRange` option lying around in a primitive list to read, as
+/// `locator_pane_graphic` reads for the symbolic-`Graphics` case). Falls
+/// back to `1.0` — matching that case's own fallback — when the picture
+/// carries no source range (a plain `Graphics[…]` with no plot data, or a
+/// picture kind that keeps none).
+fn rendered_graphic_span(body: &Expr) -> f64 {
+  if let Expr::Graphics {
+    source: Some(src), ..
+  } = body
+  {
+    let x_extent = (src.x_range.1 - src.x_range.0).abs();
+    let y_extent = (src.y_range.1 - src.y_range.0).abs();
+    let span = x_extent.max(y_extent);
+    if span > 0.0 {
+      return span;
+    }
+  }
+  1.0
+}
+
+/// Whether `name` is a graphics-producing head known to accept an
+/// `Epilog -> {…}` option — extra primitives drawn on top of the picture,
+/// in the same data coordinates, without changing the call's arity the
+/// way appending a plain positional argument would.
+fn accepts_epilog_option(name: &str) -> bool {
+  name == "Show" || crate::functions::graphics::is_graphics_producing_head(name)
+}
+
+/// Add `Epilog -> markers` (merging with any `Epilog` already there) to a
+/// `FunctionCall` with a head [`accepts_epilog_option`] recognizes.
+fn with_epilog(name: &str, args: &[Expr], markers: &Expr) -> Expr {
+  let mut new_args: crate::ExprList = args.to_vec().into();
+  let existing = new_args.iter().position(|a| {
+    matches!(a, Expr::Rule { pattern, .. }
+      if matches!(pattern.as_ref(), Expr::Identifier(n) if n == "Epilog"))
+  });
+  match existing {
+    Some(pos) => {
+      let merged = match &new_args[pos] {
+        Expr::Rule { replacement, .. } => match replacement.as_ref() {
+          Expr::List(items) => {
+            let mut v = items.to_vec();
+            v.push(markers.clone());
+            Expr::List(v.into())
+          }
+          other => Expr::List(vec![other.clone(), markers.clone()].into()),
+        },
+        _ => markers.clone(),
+      };
+      new_args[pos] = Expr::Rule {
+        pattern: Box::new(id_expr("Epilog")),
+        replacement: Box::new(merged),
+      };
+    }
+    None => {
+      new_args.push(Expr::Rule {
+        pattern: Box::new(id_expr("Epilog")),
+        replacement: Box::new(markers.clone()),
+      });
+    }
+  }
+  Expr::FunctionCall {
+    name: name.to_string(),
+    args: new_args,
+  }
+}
+
+/// Recursively add `Epilog -> markers` to every graphics-producing call
+/// reachable through pure control-flow wrappers (`If`, `Which`, `Switch`,
+/// `With`, `Module`, `Block`, the trailing statement of a
+/// `CompoundExpr`) — without evaluating anything, so whichever branch such
+/// a body picks at evaluation time already draws the given markers. A
+/// `LocatorPane` body written `Which[cond1, Show[…], cond2, Show[…], …]`
+/// (a Demonstration switching between plotted methods over the same
+/// locator) is the motivating case: only the branch a `Which`/`If`
+/// actually selects is ever evaluated, so touching the others here is
+/// inert — they are never run at all. Anything else is returned
+/// unchanged, including a call whose head [`accepts_epilog_option`]
+/// does not recognize (appending an option to those could break their
+/// arity).
+fn inject_epilog_through_control_flow(expr: &Expr, markers: &Expr) -> Expr {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "If" && args.len() >= 2 => {
+      let mut new_args = args.clone();
+      for branch in new_args.iter_mut().skip(1) {
+        *branch = inject_epilog_through_control_flow(branch, markers);
+      }
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args,
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Which" && args.len() >= 2 => {
+      let mut new_args = args.clone();
+      let mut i = 1;
+      while i < new_args.len() {
+        new_args[i] = inject_epilog_through_control_flow(&new_args[i], markers);
+        i += 2;
+      }
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args,
+      }
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Switch" && args.len() >= 3 =>
+    {
+      let mut new_args = args.clone();
+      let mut i = 2;
+      while i < new_args.len() {
+        new_args[i] = inject_epilog_through_control_flow(&new_args[i], markers);
+        i += 2;
+      }
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args,
+      }
+    }
+    Expr::FunctionCall { name, args }
+      if matches!(name.as_str(), "With" | "Module" | "Block")
+        && args.len() == 2 =>
+    {
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: vec![
+          args[0].clone(),
+          inject_epilog_through_control_flow(&args[1], markers),
+        ]
+        .into(),
+      }
+    }
+    Expr::CompoundExpr(items) if !items.is_empty() => {
+      let mut new_items = items.clone();
+      let last = new_items.len() - 1;
+      new_items[last] =
+        inject_epilog_through_control_flow(&new_items[last], markers);
+      Expr::CompoundExpr(new_items)
+    }
+    Expr::FunctionCall { name, args } if accepts_epilog_option(name) => {
+      with_epilog(name, args, markers)
+    }
+    other => other.clone(),
+  }
+}
+
+/// [`locator_pane_graphic`]'s fallback for a body that evaluates straight
+/// to a rendered picture — `Show[…]`, `ContourPlot[…]`, or a `Which`/`If`
+/// switching between such plots — rather than staying the symbolic
+/// `Graphics[prims, opts]` the primitive-splicing path needs. Re-runs the
+/// body once more with the locator markers spliced in as an `Epilog` (see
+/// `inject_epilog_through_control_flow`), so they are drawn by the same
+/// renderer that drew the rest of the picture, in the same data
+/// coordinates. Falls back to the unmarked picture — still far better
+/// than the typeset-text fallback `evaluated_wrapper_svg`'s caller uses
+/// otherwise — when `body` is not a picture at all, or no graphics call
+/// is found to draw the markers on.
+fn locator_pane_graphic_via_epilog(
+  held: &Expr,
+  body: &Expr,
+  points: &[Expr],
+  appearance: Option<&Expr>,
+) -> Option<Expr> {
+  if !lays_out_a_graphic(body) {
+    return None;
+  }
+  let span = rendered_graphic_span(body);
+  let markers: Vec<Expr> = points
+    .iter()
+    .enumerate()
+    .filter_map(|(i, p)| locator_marker(appearance, i, p, span))
+    .collect();
+  if markers.is_empty() {
+    return Some(body.clone());
+  }
+  let augmented =
+    inject_epilog_through_control_flow(held, &Expr::List(markers.into()));
+  Some(
+    crate::evaluator::evaluate_expr_to_expr(&augmented)
+      .unwrap_or_else(|_| body.clone()),
+  )
+}
+
+/// A string shown through `Text` loses the quotation marks its own
+/// OutputForm carries — that is what `Text` asks for. Only a string that
+/// would be typeset on its own is affected (directly, or as the content of
+/// a `Style`); the parts of a `Row` already render as text.
+fn unquoted_display_string(expr: &Expr) -> Expr {
+  match expr {
+    Expr::String(s) => Expr::Identifier(s.clone()),
+    Expr::FunctionCall { name, args }
+      if name == "Style" && !args.is_empty() =>
+    {
+      let mut args = args.to_vec();
+      args[0] = unquoted_display_string(&args[0]);
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: args.into(),
+      }
+    }
+    other => other.clone(),
+  }
+}
+
+/// The rows of cells a layout wrapper contributes to a combined grid.
+/// `Grid` keeps its own row structure, `Column` stacks, `Row` spreads;
+/// rows with no cells (a `{}` spacer row in a `Grid`) are dropped, since
+/// the grid engine has nothing to place for them.
+fn layout_rows(name: &str, args: &[Expr]) -> Vec<Vec<Expr>> {
+  let items: &[Expr] = match args.first() {
+    Some(Expr::List(items)) => items,
+    _ => return vec![],
+  };
+  match name {
+    "Grid" => items
+      .iter()
+      .map(|row| match row {
+        Expr::List(cells) => cells.to_vec(),
+        other => vec![other.clone()],
+      })
+      .filter(|cells| !cells.is_empty())
+      .collect(),
+    "Column" => items.iter().map(|c| vec![c.clone()]).collect(),
+    _ => vec![items.to_vec()],
+  }
+}
+
+/// True if the expression is (or, within nested lists, contains) a `Framed`
+/// or `Highlighted` display wrapper.
+fn contains_framed_or_highlighted(expr: &Expr) -> bool {
+  match expr {
+    Expr::FunctionCall { name, .. } => {
+      name == "Framed" || name == "Highlighted"
+    }
+    Expr::List(items) => items.iter().any(contains_framed_or_highlighted),
+    _ => false,
+  }
+}
+
+/// The composed SVG of `Labeled[graphic, label, pos…]` — the label set
+/// beside the picture. `None` when the content is not a picture, so a
+/// label on plain text is left to the text renderer. (`Grid`, `Column`
+/// and `Row` reach the visual pipeline through passes of their own.)
+pub(crate) fn labeled_display_svg(expr: &Expr) -> Option<String> {
+  let is_labeled = matches!(expr, Expr::FunctionCall { name, args }
+    if name == "Labeled" && args.len() >= 2 && lays_out_a_graphic(&args[0]));
+  is_labeled.then(|| expr_to_svg(expr))
+}
+
+/// The picture behind a wrapper that only shows one once its content
+/// evaluates. `None` when it does not, which leaves the call to the arms
+/// below — a `Dynamic` whose body errors still prints as itself.
+fn evaluated_wrapper_svg(expr: &Expr) -> Option<String> {
+  let Expr::FunctionCall { name, args } = expr else {
+    return None;
+  };
+  match name.as_str() {
+    // `Dynamic[expr]` displays the value `expr` has now — a front end
+    // shows the content, never the wrapper. (Script-mode *text* output
+    // keeps the wrapper, matching wolframscript; this is the picture path,
+    // which is what a notebook shows.)
+    "Dynamic" if args.len() == 1 => {
+      let value = crate::evaluator::evaluate_expr_to_expr(&args[0]).ok()?;
+      Some(expr_to_svg(&unquoted_display_string(&value)))
+    }
+    // `LocatorPane[locators, body, …]` displays `body` with a marker on
+    // every locator.
+    "LocatorPane" if args.len() >= 2 => {
+      let drawn = locator_pane_graphic(args)?;
+      Some(expr_to_svg(
+        &crate::evaluator::evaluate_expr_to_expr(&drawn).unwrap_or(drawn),
+      ))
+    }
+    _ => None,
+  }
+}
+
+/// A numeric `Pane` size component (`Expr::Integer`/`Expr::Real`). `None`
+/// for `Automatic`, `Full`, or anything else that leaves that dimension
+/// unconstrained, so a size like `{400, Automatic}` is left for the
+/// unconstrained pass-through rather than clipped against a made-up bound.
+pub(crate) fn pane_size_component(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(r) => Some(*r),
+    _ => None,
+  }
+}
+
+pub(crate) fn expr_to_svg(expr: &Expr) -> String {
+  if let Some(svg) = evaluated_wrapper_svg(expr) {
+    return svg;
+  }
+  match expr {
+    Expr::Graphics { svg: svg_data, .. } => svg_data.clone(),
+    // `Pane[content, opts…]` only constrains its content's size; the
+    // FrontEnd displays the content, so exporting one exports what it
+    // wraps. (The notebook display pipeline already unwraps it — without
+    // this, `Export[…, Pane[graphic]]` wrote the expression as text.)
+    // `Deploy` is the same: it only makes its content non-selectable.
+    //
+    // A `Pane[content, {width, height}]` fixed-size box is the exception:
+    // the FrontEnd reserves exactly that area and clips content that
+    // doesn't fit (there is no scrollbar in a static export), so leaving
+    // the content at its natural size here would draw it past the box the
+    // rest of the layout already sized around — a Demonstration's guess
+    // panel overflowing into a sliver of raw markup below it.
+    Expr::FunctionCall { name, args }
+      if (name == "Pane" || name == "Deploy") && !args.is_empty() =>
+    {
+      let inner_svg = expr_to_svg(&args[0]);
+      match (name.as_str(), args.get(1)) {
+        ("Pane", Some(Expr::List(size))) if size.len() == 2 => {
+          match (pane_size_component(&size[0]), pane_size_component(&size[1])) {
+            (Some(w), Some(h)) => {
+              crate::functions::graphics::clip_svg_to_pane_box(&inner_svg, w, h)
+            }
+            _ => inner_svg,
+          }
+        }
+        _ => inner_svg,
+      }
+    }
+    // `Item[expr, opts…]` is a layout cell; the options place it and what
+    // it displays is `expr`.
+    Expr::FunctionCall { name, args } if name == "Item" && !args.is_empty() => {
+      expr_to_svg(&args[0])
+    }
+    // `ClickPane[expr, …]` displays `expr`. What it adds is a click
+    // handler, which the picture itself does not carry — this is how a
+    // Demonstration lets you draw on a grid.
+    Expr::FunctionCall { name, args }
+      if name == "ClickPane" && args.len() >= 2 =>
+    {
+      expr_to_svg(
+        &crate::evaluator::evaluate_expr_to_expr(&args[0])
+          .unwrap_or_else(|_| args[0].clone()),
+      )
+    }
+    // Outside a `Graphics`, `Text[expr]` only asks for `expr` to be shown
+    // in text rather than mathematical form — it contributes no box of its
+    // own, so export what it holds. (In a `Grid` cell this is the
+    // difference between the typeset row and the string `Text[Row[…]]`.)
+    Expr::FunctionCall { name, args } if name == "Text" && args.len() == 1 => {
+      expr_to_svg(&unquoted_display_string(&args[0]))
+    }
+    // `Style[content, directives…]` shows `content`; the directives only
+    // change how it is set. The picture path has to look through the
+    // wrapper, or a styled layout — `Style[Row[{n, " leaves, ", …}],
+    // FontSize -> 16, Blue]`, how a Demonstration captions its plot —
+    // falls through to the text renderer, which prints the call's own
+    // source instead of the row it wraps. A `Style` is inherited by what
+    // it wraps, so its directives are pushed into the layout's items and
+    // the item renderer applies them there. A styled `Grid`/`TableForm`/
+    // `MatrixForm` is left to the arm below, which hands the directives to
+    // the table renderer whole — they colour its frame and dividers (or set
+    // its cells' font), not only what pushing them cell-by-cell would reach.
+    Expr::FunctionCall { name, args }
+      if name == "Style"
+        && !args.is_empty()
+        && !matches!(&args[0], Expr::FunctionCall { name, args }
+          if matches!(name.as_str(), "Grid" | "TextGrid" | "TableForm" | "MatrixForm")
+            && !args.is_empty()) =>
+    {
+      let inner = crate::functions::graphics::style_pushed_into_layout(
+        &args[0],
+        &args[1..],
+      )
+      .unwrap_or_else(|| args[0].clone());
+      expr_to_svg(&inner)
+    }
+    // `Labeled[content, label]` (and `…, pos]`) puts the label beside the
+    // content — below it by default. With a picture as the content the
+    // FrontEnd stacks the two, so exporting one has to compose them
+    // instead of writing the whole call out as text.
+    Expr::FunctionCall { name, args }
+      if name == "Labeled"
+        && args.len() >= 2
+        && lays_out_a_graphic(&args[0]) =>
+    {
+      let content = expr_to_svg(&args[0]);
+      // A label is shown as text, so a string one loses its quotes.
+      let label = expr_to_svg(&unquoted_display_string(&args[1]));
+      let position = match args.get(2) {
+        Some(Expr::Identifier(p)) => p.as_str(),
+        _ => "Bottom",
+      };
+      let rows = match position {
+        "Top" => vec![vec![label], vec![content]],
+        "Left" => vec![vec![label, content]],
+        "Right" => vec![vec![content, label]],
+        _ => vec![vec![content], vec![label]],
+      };
+      crate::functions::graphics::combine_graphics_svgs(&rows)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    // `Overlay[{item, …}]` stacks its items into one picture instead of
+    // arranging them in a grid, so it gets its own compositor.
+    Expr::FunctionCall { name, args }
+      if name == "Overlay" && !args.is_empty() =>
+    {
+      crate::functions::graphics::overlay_svg(args)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    // `Grid`/`Column`/`Row` holding a picture are composed cell by cell —
+    // pictures drawn, everything else typeset — rather than dumped as
+    // source. Layouts of plain text keep the text renderer, which already
+    // aligns them.
+    Expr::FunctionCall { name, args }
+      if LAYOUT_HEADS.contains(&name.as_str())
+        && !args.is_empty()
+        && lays_out_a_graphic(expr) =>
+    {
+      // `Column` places its own items, so an alignment argument is honoured
+      // — `Column[{picture, legend}, Center]` centres the narrow legend
+      // under the wide picture. The generic composition below packs every
+      // row to the left instead.
+      if name == "Column"
+        && args.len() >= 2
+        && let Some(svg) = crate::functions::graphics::column_to_svg(args)
+      {
+        return svg;
+      }
+      // A plain-string cell is text, not source: a `Row`/`Column`/`Grid`
+      // cell that is just `"label"` prints unquoted, the same as the
+      // `Text[…]` arm above — without this, a Demonstration's labeled row
+      // of pictures (`Grid[{Join[{"encryption"}, pictures]}]`) showed the
+      // label as quoted InputForm text (`"encryption"`) instead of a
+      // caption.
+      let rows: Vec<Vec<String>> = layout_rows(name, args)
+        .iter()
+        .map(|cells| {
+          cells
+            .iter()
+            .map(|c| match crate::syntax::spacer_width_pts(c) {
+              // `Spacer[n]` between pictures is blank space, not a cell to
+              // typeset — without this, a Demonstration's `Row[{plot,
+              // Spacer[20], plot}]` printed the literal source `Spacer[20]`
+              // where the gap belongs.
+              Some(w) => format!(
+                "<svg width=\"{w}\" height=\"1\" viewBox=\"0 0 {w} 1\" xmlns=\"http://www.w3.org/2000/svg\"></svg>"
+              ),
+              None => expr_to_svg(&unquoted_display_string(c)),
+            })
+            .collect()
+        })
+        .collect();
+      if rows.is_empty() {
+        expr_text_svg(expr)
+      } else {
+        // `Grid`'s own option arguments (`Frame`, `Spacings`, `ImageSize`)
+        // are otherwise silently dropped here — a Demonstration's control
+        // panel written `Grid[{…pictures…}, Frame -> All]` lost its
+        // border. `Row`/`Column` (not `GraphicsRow`/`GraphicsColumn`) take
+        // no such options, so they keep the plain default layout.
+        let option_args: &[Expr] = if name == "Grid" || name == "TextGrid" {
+          &args[1..]
+        } else {
+          &[]
+        };
+        crate::functions::graphics::combine_graphics_svgs_with_options(
+          &rows,
+          option_args,
+        )
+        .unwrap_or_else(|| expr_text_svg(expr))
+      }
+    }
+    // A list of graphics renders as `{g1, g2, …}` with the plots drawn
+    // inline (matching how wolframscript displays such a list), instead
+    // of falling through to the text renderer which would dump
+    // `GraphicsBox[]` placeholders.
+    Expr::List(items)
+      if !items.is_empty() && items.iter().all(is_inline_graphic) =>
+    {
+      let svgs: Vec<String> = items.iter().map(expr_to_svg).collect();
+      if svgs.iter().all(|s| !s.is_empty())
+        && let Some(svg) = crate::functions::graphics::graphics_list_svg(&svgs)
+      {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // A 2-D list of graphics renders as a grid of the plots.
+    Expr::List(items)
+      if !items.is_empty()
+        && items.iter().all(|item| {
+          matches!(item, Expr::List(inner)
+            if !inner.is_empty() && inner.iter().all(is_inline_graphic))
+        }) =>
+    {
+      let rows: Vec<Vec<String>> = items
+        .iter()
+        .map(|item| match item {
+          Expr::List(inner) => inner.iter().map(expr_to_svg).collect(),
+          _ => unreachable!(),
+        })
+        .collect();
+      if rows.iter().flatten().all(|s: &String| !s.is_empty())
+        && let Some(svg) =
+          crate::functions::graphics::combine_graphics_svgs(&rows)
+      {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // Legended[graphics, legend]: the wrapped graphics carry the legend
+    // baked into their SVG (e.g. PeriodicTablePlot["Phase"]).
+    Expr::FunctionCall { name, args }
+      if name == "Legended" && !args.is_empty() =>
+    {
+      expr_to_svg(&args[0])
+    }
+    // Mouseover[graphics, appearance]: a static export shows the base
+    // appearance, i.e. the wrapped graphics — `appearance` only replaces it
+    // while the mouse hovers, which does not exist outside a live front end.
+    Expr::FunctionCall { name, args }
+      if name == "Mouseover" && !args.is_empty() =>
+    {
+      expr_to_svg(&args[0])
+    }
+    // A bare `LineLegend[…]` (not wrapped in `Legended`) is how a
+    // Demonstration places a legend beside its plot instead of attached to
+    // it — the front end typesets it as swatches either way.
+    Expr::FunctionCall { name, args } if name == "LineLegend" => {
+      crate::functions::graphics::line_legend_svg(args).unwrap_or_default()
+    }
+    // A bare `SwatchLegend[…]` (not wrapped in `Legended`) is how a
+    // Demonstration places a color-swatch legend beside its plot instead
+    // of attached to it — the front end typesets it as filled squares
+    // either way.
+    Expr::FunctionCall { name, args } if name == "SwatchLegend" => {
+      crate::functions::graphics::swatch_legend_svg(args).unwrap_or_default()
+    }
+    // `Animate[…]` composed into a static display (e.g. `Pane[Animate[…],
+    // …]` sitting in a `Grid` cell) rather than being the whole Manipulate
+    // output — draw its first frame instead of the unevaluated source.
+    Expr::FunctionCall { name, args }
+      if name == "Animate" && args.len() >= 2 =>
+    {
+      crate::functions::graphics::animate_snapshot_svg(args).unwrap_or_default()
+    }
+    // ComputationalMusic objects render as musical-staff notation.
+    Expr::FunctionCall { name, .. }
+      if crate::functions::music_ast::MUSIC_OBJECT_HEADS
+        .contains(&name.as_str())
+        && crate::functions::music_render::music_to_svg(expr).is_some() =>
+    {
+      crate::functions::music_render::music_to_svg(expr).unwrap_or_default()
+    }
+    // A plain list of music events (e.g. {MusicNote[…], MusicNote[…]}) keeps
+    // its list structure: `{ <staff>, <staff>, … }`, each element drawn as its
+    // own staff rather than a bracketed expression dump.
+    _ if crate::functions::music_ast::is_music_object_list(expr) => {
+      if let Some(svg) = crate::functions::music_render::music_list_to_svg(expr)
+      {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    Expr::Identifier(s) if s == "-Graphics-" || s == "-Graphics3D-" => {
+      crate::get_captured_graphics().unwrap_or_default()
+    }
+    Expr::FunctionCall {
+      name: gfx_name,
+      args: gfx_args,
+    } if gfx_name == "Graphics" && !gfx_args.is_empty() => {
+      if let Ok(Expr::Graphics {
+        svg: ref svg_data, ..
+      }) = crate::functions::graphics::graphics_ast(gfx_args)
+      {
+        svg_data.clone()
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: gfx_name,
+      args: gfx_args,
+    } if gfx_name == "Graphics3D" && !gfx_args.is_empty() => {
+      if let Ok(Expr::Graphics {
+        svg: ref svg_data, ..
+      }) = crate::functions::plot3d::graphics3d_ast(gfx_args)
+      {
+        svg_data.clone()
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: grid_name,
+      args: grid_args,
+    } if (grid_name == "Grid" || grid_name == "TextGrid")
+      && !grid_args.is_empty() =>
+    {
+      if crate::functions::graphics::grid_ast(grid_args).is_ok() {
+        crate::get_captured_graphics().unwrap_or_default()
+      } else {
+        String::new()
+      }
+    }
+    // TraditionalForm[Grid[...]] or TraditionalForm[TextGrid[...]]
+    Expr::FunctionCall {
+      name: tf_name,
+      args: tf_args,
+    } if tf_name == "TraditionalForm"
+      && tf_args.len() == 1
+      && matches!(
+        &tf_args[0],
+        Expr::FunctionCall { name, args }
+        if (name == "Grid" || name == "TextGrid") && !args.is_empty()
+      ) =>
+    {
+      if let Expr::FunctionCall {
+        args: grid_args, ..
+      } = &tf_args[0]
+      {
+        if crate::functions::graphics::grid_ast(grid_args).is_ok() {
+          crate::get_captured_graphics().unwrap_or_default()
+        } else {
+          String::new()
+        }
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: style_name,
+      args: style_args,
+    } if style_name == "Style"
+      && style_args.len() >= 2
+      && matches!(
+        &style_args[0],
+        Expr::FunctionCall { name, args }
+        if (name == "Grid" || name == "TextGrid") && !args.is_empty()
+      ) =>
+    {
+      if let Expr::FunctionCall {
+        args: grid_args, ..
+      } = &style_args[0]
+      {
+        let style =
+          crate::functions::graphics::parse_grid_style(&style_args[1..]);
+        if crate::functions::graphics::grid_ast_styled(grid_args, &style)
+          .is_ok()
+        {
+          crate::get_captured_graphics().unwrap_or_default()
+        } else {
+          String::new()
+        }
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: row_name,
+      args: row_args,
+    } if row_name == "Row" && !row_args.is_empty() => {
+      if let Some(svg) = crate::row_svg_with_rendered_items(row_args) {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // `Column[{…}]` holding plain data (not caught by the `LAYOUT_HEADS`
+    // arm above, which only fires when a nested item is itself a picture)
+    // still stacks its items vertically rather than dumping its source —
+    // matching `Row`'s unconditional arm just above. Without this,
+    // `ExportString[Column[{Grid[…], Grid[…]}], "SVG"]` (a stack of data
+    // tables, no plot inside) rendered as literal `Column[{Grid[…]}]` text
+    // instead of the tables themselves.
+    Expr::FunctionCall {
+      name: column_name,
+      args: column_args,
+    } if column_name == "Column" && !column_args.is_empty() => {
+      if let Some(svg) = crate::column_svg_with_rendered_items(column_args) {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    Expr::FunctionCall {
+      name: fr_name,
+      args: fr_args,
+    } if fr_name == "Framed" && !fr_args.is_empty() => {
+      crate::functions::graphics::framed_to_svg(fr_args)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    Expr::FunctionCall {
+      name: hl_name,
+      args: hl_args,
+    } if hl_name == "Highlighted" && !hl_args.is_empty() => {
+      crate::functions::graphics::highlighted_to_svg(hl_args)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    // A list with Framed/Highlighted elements renders as a row `{1, |2|, …}`
+    // with the wrapped items drawn as boxes, matching the inline display path.
+    Expr::List(items) if items.iter().any(contains_framed_or_highlighted) => {
+      crate::functions::graphics::row_with_framed_to_svg(items)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    Expr::FunctionCall {
+      name: ds_name,
+      args: ds_args,
+    } if ds_name == "Dataset" && !ds_args.is_empty() => {
+      if let Some(svg) = crate::functions::graphics::dataset_to_svg(&ds_args[0])
+      {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    Expr::FunctionCall {
+      name: tab_name,
+      args: tab_args,
+    } if tab_name == "Tabular" && tab_args.len() >= 2 => {
+      if let Some(svg) =
+        crate::functions::graphics::tabular_to_svg(&tab_args[0], &tab_args[1])
+      {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    Expr::FunctionCall {
+      name: tf_name,
+      args: tf_args,
+    } if tf_name == "TreeForm" && !tf_args.is_empty() => {
+      if let Ok(Expr::Graphics {
+        svg: ref svg_data, ..
+      }) = crate::functions::tree_form::tree_form_ast(tf_args)
+      {
+        svg_data.clone()
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: tg_name,
+      args: tg_args,
+    } if tg_name == "TreeGraph" && !tg_args.is_empty() => {
+      if let Ok(Expr::Graphics {
+        svg: ref svg_data, ..
+      }) = crate::functions::tree_form::tree_graph_ast(tg_args)
+      {
+        svg_data.clone()
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: g_name,
+      args: g_args,
+    } if g_name == "Graph" && g_args.len() >= 2 => {
+      if let Ok(Expr::Graphics {
+        svg: ref svg_data, ..
+      }) = crate::functions::graph::graph_ast(g_args)
+      {
+        svg_data.clone()
+      } else {
+        String::new()
+      }
+    }
+    Expr::FunctionCall {
+      name: rg_name,
+      args: rg_args,
+    } if rg_name == "Region" && !rg_args.is_empty() => {
+      if let Some(Expr::Graphics { ref svg, .. }) =
+        crate::functions::region::region_to_graphics(rg_args)
+      {
+        svg.clone()
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    Expr::FunctionCall {
+      name: pc_name,
+      args: pc_args,
+    } if (pc_name == "PolarCurve" || pc_name == "FilledPolarCurve")
+      && !pc_args.is_empty() =>
+    {
+      if let Some(Expr::Graphics { ref svg, .. }) =
+        crate::functions::graphics::polar_curve_to_graphics(pc_name, pc_args)
+      {
+        svg.clone()
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    Expr::FunctionCall { name: do_name, .. } if do_name == "DateObject" => {
+      crate::functions::datetime_ast::date_object_panel_svg(expr)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    Expr::FunctionCall {
+      name: mr_name,
+      args: mr_args,
+    } if (mr_name == "MeshRegion" || mr_name == "BoundaryMeshRegion")
+      && mr_args.len() >= 2 =>
+    {
+      // A `BoundaryMeshRegion` (e.g. `ConvexHullMesh`'s result) carries a
+      // `Method` option and possibly `MeshCellStyle`/`WorkingPrecision`
+      // too, so it has more than 2 args; a 3D one renders through the
+      // ordinary Graphics3D pipeline instead of the flat mesh renderer.
+      let is_3d_mesh = matches!(&mr_args[0], Expr::List(items)
+        if items.first().is_some_and(|v| matches!(v, Expr::List(c) if c.len() == 3)));
+      if is_3d_mesh {
+        if let Some(Expr::Graphics { ref svg, .. }) =
+          crate::functions::graphics::mesh_region_to_graphics3d(
+            &mr_args[0],
+            &mr_args[1],
+            &mr_args[2..],
+          )
+        {
+          svg.clone()
+        } else {
+          expr_text_svg(expr)
+        }
+      } else if let Some(svg) =
+        crate::functions::voronoi::mesh_region_to_svg(&mr_args[0], &mr_args[1])
+      {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // DisplayForm[boxes] / RawBoxes[boxes] — render box expressions to SVG
+    Expr::FunctionCall {
+      name: box_name,
+      args: box_args,
+    } if (box_name == "DisplayForm" || box_name == "RawBoxes")
+      && box_args.len() == 1 =>
+    {
+      boxes_to_text_svg(&box_args[0])
+    }
+    // QuestionObject[…] — render as a question panel (prompt, answer
+    // choices / input field, Submit button).
+    Expr::FunctionCall { name: qo_name, .. } if qo_name == "QuestionObject" => {
+      crate::functions::assessment_render::question_object_to_svg(expr)
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    // Molecule[…] — render the 2-D structure diagram, prefixed with an XML
+    // declaration as wolframscript's SVG export is (a standalone document).
+    Expr::FunctionCall { name: mol_name, .. } if mol_name == "Molecule" => {
+      match crate::functions::molecule_render::molecule_to_svg(expr) {
+        Some(svg) => {
+          format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{svg}")
+        }
+        None => expr_text_svg(expr),
+      }
+    }
+    // MoleculePlot[mol] — render the full 2-D skeletal structure diagram.
+    Expr::FunctionCall {
+      name: mp_name,
+      args: mp_args,
+    } if mp_name == "MoleculePlot" && mp_args.len() == 1 => {
+      crate::functions::molecule_render::molecule_to_svg(&mp_args[0])
+        .unwrap_or_else(|| expr_text_svg(expr))
+    }
+    // Image[…] — embed the raster as a base64 PNG inside an <image> element
+    // so the SVG stays a valid vector wrapper around the pixel data.
+    Expr::Image {
+      width,
+      height,
+      channels,
+      data,
+      ..
+    } => crate::functions::image_ast::image_to_svg_document(
+      *width, *height, *channels, data,
+    ),
+    // TableForm[data, opts…] — render the aligned grid (matching how visual
+    // frontends show it), instead of dumping the raw `TableForm[…]` text.
+    Expr::FunctionCall { name, args }
+      if name == "TableForm" && !args.is_empty() =>
+    {
+      // A table of Graphics is combined into a grid of the plots.
+      if let Some(svg) = tableform_graphics_grid_svg(args) {
+        return svg;
+      }
+      let rendered = crate::render_tableform_if_needed(expr.clone());
+      if let Expr::Graphics { svg, .. } = &rendered {
+        svg.clone()
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // MatrixForm[data] — render as a parenthesized matrix.
+    Expr::FunctionCall { name, args }
+      if name == "MatrixForm" && !args.is_empty() =>
+    {
+      let _ = args;
+      let rendered = crate::render_matrixform_if_needed(expr.clone());
+      if let Expr::Graphics { svg, .. } = &rendered {
+        svg.clone()
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // TraditionalForm[list] — render the list as a parenthesized matrix.
+    Expr::FunctionCall { name, args }
+      if name == "TraditionalForm"
+        && args.len() == 1
+        && matches!(&args[0], Expr::List(_)) =>
+    {
+      let _ = args;
+      let rendered = crate::render_traditionalform_list_if_needed(expr.clone());
+      if let Expr::Graphics { svg, .. } = &rendered {
+        svg.clone()
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // Style[TableForm|MatrixForm[data], directives…] — render the styled grid
+    // (font size, weight, color) rather than the raw expression text.
+    Expr::FunctionCall { name, args }
+      if name == "Style"
+        && args.len() >= 2
+        && matches!(
+          &args[0],
+          Expr::FunctionCall { name: inner, args: inner_args }
+          if (inner == "TableForm" || inner == "MatrixForm")
+            && !inner_args.is_empty()
+        ) =>
+    {
+      if let Some(svg) = styled_tableform_svg(&args[0], &args[1..]) {
+        svg
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    // Number-format wrappers around a table — e.g.
+    // `ScientificForm[TableForm[m], 3]` or
+    // `PaddedForm[BaseForm[TableForm[m], 2], 8]` — format each cell and render
+    // the resulting grid.
+    Expr::FunctionCall { name, .. }
+      if is_number_format_head(name)
+        && distribute_format_over_tableform(expr).is_some() =>
+    {
+      let table = distribute_format_over_tableform(expr).unwrap();
+      let rendered = crate::render_tableform_if_needed(table);
+      if let Expr::Graphics { svg, .. } = &rendered {
+        svg.clone()
+      } else {
+        expr_text_svg(expr)
+      }
+    }
+    other => expr_text_svg(other),
+  }
+}
+
+/// Heads of number-display wrappers that format a value without changing it.
+fn is_number_format_head(name: &str) -> bool {
+  matches!(
+    name,
+    "ScientificForm"
+      | "EngineeringForm"
+      | "NumberForm"
+      | "PaddedForm"
+      | "AccountingForm"
+      | "BaseForm"
+  )
+}
+
+/// If `expr` is one or more nested number-format wrappers around a
+/// `TableForm[data, opts…]`, push those wrappers down onto every data cell and
+/// return the rewritten `TableForm`. Returns `None` when no `TableForm` is
+/// found under the wrappers.
+fn distribute_format_over_tableform(expr: &Expr) -> Option<Expr> {
+  // Peel the format wrappers (outermost first), remembering each head and its
+  // trailing arguments, until we reach the TableForm.
+  let mut wrappers: Vec<(String, Vec<Expr>)> = Vec::new();
+  let mut cur = expr;
+  loop {
+    match cur {
+      Expr::FunctionCall { name, args }
+        if is_number_format_head(name) && !args.is_empty() =>
+      {
+        wrappers.push((name.clone(), args[1..].to_vec()));
+        cur = &args[0];
+      }
+      Expr::FunctionCall { name, args }
+        if name == "TableForm" && !args.is_empty() =>
+      {
+        if wrappers.is_empty() {
+          return None;
+        }
+        // Re-wrap each leaf cell, innermost wrapper applied first so nesting
+        // order matches the original (outer wrapper stays outermost).
+        let new_data = map_leaf_cells(&args[0], &|v| {
+          let mut e = v.clone();
+          for (head, targs) in wrappers.iter().rev() {
+            let mut a = vec![e];
+            a.extend(targs.iter().cloned());
+            e = Expr::FunctionCall {
+              name: head.clone(),
+              args: a.into(),
+            };
+          }
+          e
+        });
+        let mut new_args = vec![new_data];
+        new_args.extend(args[1..].iter().cloned());
+        return Some(call("TableForm", new_args));
+      }
+      _ => return None,
+    }
+  }
+}
+
+/// Apply `f` to every non-list leaf of a (possibly nested) list, preserving the
+/// list structure.
+fn map_leaf_cells(expr: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
+  match expr {
+    Expr::List(items) => {
+      Expr::List(items.iter().map(|e| map_leaf_cells(e, f)).collect())
+    }
+    other => f(other),
+  }
+}
+
+/// Render `TableForm[graphics…]` — a table whose cells are `Graphics`
+/// objects — as a combined grid of the plots. Returns `None` when the data
+/// isn't a (ragged) 2-D list of inline graphics.
+fn tableform_graphics_grid_svg(args: &[Expr]) -> Option<String> {
+  let Expr::List(rows) = args.first()? else {
+    return None;
+  };
+  // A cell is a graphic if it is already rendered (`Expr::Graphics`) or is a
+  // `Graphics[…]` / `Graphics3D[…]` call that `expr_to_svg` renders on demand.
+  fn is_graphic_cell(e: &Expr) -> bool {
+    is_inline_graphic(e)
+      || matches!(e, Expr::FunctionCall { name, args }
+        if (name == "Graphics" || name == "Graphics3D") && !args.is_empty())
+  }
+  // Every row must itself be a non-empty list of graphics; a table of plain
+  // values is handled by the ordinary grid path instead. At least one cell
+  // must be a genuinely rendered graphic (not only bare `Graphics[…]` echoes)
+  // so ordinary symbolic tables don't get diverted here.
+  if rows.is_empty()
+    || !rows.iter().all(|r| {
+      matches!(r, Expr::List(cells)
+        if !cells.is_empty() && cells.iter().all(is_graphic_cell))
+    })
+  {
+    return None;
+  }
+  let grid: Vec<Vec<String>> = rows
+    .iter()
+    .map(|r| match r {
+      Expr::List(cells) => cells.iter().map(expr_to_svg).collect(),
+      _ => unreachable!(),
+    })
+    .collect();
+  if grid.iter().flatten().any(std::string::String::is_empty) {
+    return None;
+  }
+  crate::functions::graphics::combine_graphics_svgs(&grid)
+}
+
+/// Render `Style[TableForm|MatrixForm[data], directives…]` to a styled grid
+/// SVG. Falls back to `None` when the data can't be reshaped into a grid.
+fn styled_tableform_svg(inner: &Expr, directives: &[Expr]) -> Option<String> {
+  let Expr::FunctionCall {
+    name: head,
+    args: inner_args,
+  } = inner
+  else {
+    return None;
+  };
+  let style = crate::functions::graphics::parse_grid_style(directives);
+  let rendered = if head == "MatrixForm" {
+    // MatrixForm reshapes the same way as TableForm, but is drawn with
+    // enclosing parentheses.
+    let (grid_args, _gaps) = crate::tableform_grid_args(inner_args)?;
+    crate::functions::graphics::grid_ast_styled_with_parens(&grid_args, &style)
+  } else {
+    let (grid_args, _gaps) = crate::tableform_grid_args(inner_args)?;
+    crate::functions::graphics::grid_ast_styled(&grid_args, &style)
+  }
+  .ok()?;
+  if let Expr::Graphics { svg, .. } = &rendered {
+    Some(svg.clone())
+  } else {
+    None
+  }
+}
+
+/// Fonts bundled for embedding into exported SVGs. These are the same faces the
+/// PDF/PNG rasterizers map the generic CSS families onto (see
+/// `svg_to_pdf_bytes` and `image_ast::load_embedded_fonts`), so vector export
+/// stays visually consistent with raster export and renders identically on
+/// systems where the fonts aren't installed.
+const ATKINSON_MONO_TTF: &[u8] = include_bytes!(
+  "../../../resources/AtkinsonHyperlegibleMono-VariableFont_wght.ttf"
+);
+const ATKINSON_NEXT_TTF: &[u8] = include_bytes!(
+  "../../../resources/AtkinsonHyperlegibleNext-VariableFont_wght.ttf"
+);
+
+/// Base64 `data:` URL for a bundled font, encoded once and cached for reuse
+/// across exports.
+fn font_data_url(
+  cache: &'static std::sync::OnceLock<String>,
+  bytes: &'static [u8],
+) -> &'static str {
+  cache.get_or_init(|| {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:font/ttf;base64,{b64}")
+  })
+}
+
+/// A single `@font-face` CSS rule embedding `family` from `data_url`.
+fn font_face_rule(family: &str, data_url: &str) -> String {
+  format!(
+    "@font-face {{ font-family: \"{family}\"; font-weight: normal; \
+font-style: normal; src: url(\"{data_url}\") format(\"truetype\"); }}\n"
+  )
+}
+
+/// Embed the fonts an exported SVG uses so it renders identically without those
+/// fonts installed on the viewer's system.
+///
+/// Woxi's renderers emit only the generic CSS families `monospace`,
+/// `sans-serif` and `serif` (and bare `<text>` with no family); hosts normally
+/// map these onto the bundled Atkinson faces via their own CSS — see
+/// `tests/playground/style.css`. A standalone exported SVG has no such host, so
+/// we inline that same mapping together with `@font-face` rules carrying the
+/// base64-encoded font data.
+///
+/// We also bake the preferred Atkinson family directly onto each text
+/// element's `font-family` attribute, keeping the generic family as a
+/// fallback (e.g. `"Atkinson Hyperlegible Next, sans-serif"`). CSS-aware
+/// renderers apply the equivalent `svg text {}` rule; renderers that read the
+/// presentation attribute but ignore that type-selector rule still pick up the
+/// embedded face from the attribute. Both paths therefore converge on
+/// Atkinson. The Mono face is embedded only when the document actually uses
+/// monospace text, to avoid bloating graphics that don't.
+fn embed_used_fonts(svg: &str) -> String {
+  // Only SVG documents that actually draw text need embedded fonts.
+  if !svg.contains("<svg") || !svg.contains("<text") {
+    return svg.to_string();
+  }
+
+  // Sans-serif (Atkinson Hyperlegible Next) is the default for every text
+  // element, so it is always embedded once there is any text.
+  static NEXT_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+  let mut style = font_face_rule(
+    "Atkinson Hyperlegible Next",
+    font_data_url(&NEXT_URL, ATKINSON_NEXT_TTF),
+  );
+
+  // Monospace text is tagged with `monospace`, a `Mono` family, or `Courier`
+  // (see the selectors below); embed the Mono face only when a `font-family`
+  // attribute actually requests one. Scanning attribute values rather than the
+  // whole document avoids pulling the face in for a text label that merely
+  // contains one of those words.
+  let needs_mono = svg.match_indices("font-family=\"").any(|(i, m)| {
+    svg[i + m.len()..].split('"').next().is_some_and(|val| {
+      val.contains("monospace")
+        || val.contains("Mono")
+        || val.contains("Courier")
+    })
+  });
+  if needs_mono {
+    static MONO_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    style.push_str(&font_face_rule(
+      "Atkinson Hyperlegible Mono",
+      font_data_url(&MONO_URL, ATKINSON_MONO_TTF),
+    ));
+  }
+
+  style.push_str(
+    "svg text { font-family: \"Atkinson Hyperlegible Next\", sans-serif; }\n",
+  );
+  if needs_mono {
+    style.push_str(
+      "svg text[font-family~=\"monospace\"], \
+svg text[font-family*=\"Mono\"], \
+svg text[font-family*=\"Courier\"] \
+{ font-family: \"Atkinson Hyperlegible Mono\", monospace; }\n",
+    );
+  }
+
+  // Bake the preferred Atkinson family onto each text element's `font-family`
+  // attribute, keeping the generic family as a fallback. The generic token is
+  // retained so the mono `[font-family*="Mono"]` CSS selectors below still
+  // match. Exact-quoted matches make this idempotent (an already-rewritten
+  // value no longer equals the generic form).
+  let body = svg
+    .replace(
+      "font-family=\"sans-serif\"",
+      "font-family=\"Atkinson Hyperlegible Next, sans-serif\"",
+    )
+    .replace(
+      "font-family=\"monospace\"",
+      "font-family=\"Atkinson Hyperlegible Mono, monospace\"",
+    )
+    .replace(
+      "font-family=\"serif\"",
+      "font-family=\"Atkinson Hyperlegible Next, serif\"",
+    );
+
+  // Insert the style block immediately after the opening `<svg …>` tag. The
+  // tag's attribute values never contain `>`, so the first `>` after `<svg`
+  // reliably closes it.
+  let Some(open) = body.find("<svg") else {
+    return body;
+  };
+  let Some(rel) = body[open..].find('>') else {
+    return body;
+  };
+  let insert_at = open + rel + 1;
+  let style_block =
+    format!("\n<defs><style type=\"text/css\">\n{style}</style></defs>");
+
+  let mut out = String::with_capacity(body.len() + style_block.len());
+  out.push_str(&body[..insert_at]);
+  out.push_str(&style_block);
+  out.push_str(&body[insert_at..]);
+  out
+}
+
+/// Convert an SVG string to PDF bytes using svg2pdf.
+#[cfg(not(target_arch = "wasm32"))]
+fn svg_to_pdf_bytes(svg_str: &str) -> Result<Vec<u8>, InterpreterError> {
+  use std::sync::Arc as StdArc;
+
+  let mut fontdb = svg2pdf::usvg::fontdb::Database::new();
+  // Load system fonts first, then embedded fonts + generic-family aliases.
+  // load_system_fonts() resets the generic family mappings, so our
+  // set_sans_serif_family() etc. must come *after* it.
+  fontdb.load_system_fonts();
+  fontdb.load_font_data(
+    include_bytes!(
+      "../../../resources/AtkinsonHyperlegibleMono-VariableFont_wght.ttf"
+    )
+    .to_vec(),
+  );
+  fontdb.load_font_data(
+    include_bytes!(
+      "../../../resources/AtkinsonHyperlegibleNext-VariableFont_wght.ttf"
+    )
+    .to_vec(),
+  );
+  fontdb.set_monospace_family("Atkinson Hyperlegible Mono");
+  fontdb.set_sans_serif_family("Atkinson Hyperlegible Next");
+  fontdb.set_serif_family("Atkinson Hyperlegible Next");
+  fontdb.set_cursive_family("Atkinson Hyperlegible Next");
+  fontdb.set_fantasy_family("Atkinson Hyperlegible Next");
+
+  let opt = svg2pdf::usvg::Options {
+    fontdb: StdArc::new(fontdb),
+    ..Default::default()
+  };
+
+  let tree = svg2pdf::usvg::Tree::from_str(svg_str, &opt).map_err(|e| {
+    InterpreterError::EvaluationError(format!(
+      "Export PDF: SVG parse error: {e}"
+    ))
+  })?;
+
+  let pdf_bytes = svg2pdf::to_pdf(
+    &tree,
+    svg2pdf::ConversionOptions::default(),
+    svg2pdf::PageOptions::default(),
+  )
+  .map_err(|e| {
+    InterpreterError::EvaluationError(format!(
+      "Export PDF: conversion error: {e}"
+    ))
+  })?;
+
+  Ok(pdf_bytes)
+}
+
+/// The text `ReadString` returns from the remaining input, plus how many bytes
+/// it consumes. Without a terminator that is everything; with one, a leading
+/// terminator is skipped first and the read stops *at* the next one, leaving
+/// it in place — so repeated reads yield the separated fields while a
+/// following plain read still sees the separator. Returns `None` at the end of
+/// the input, which `ReadString` reports as `EndOfFile`.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_string_chunk(
+  rest: &str,
+  terminator: Option<&str>,
+) -> Option<(String, usize)> {
+  if rest.is_empty() {
+    return None;
+  }
+  let Some(term) = terminator else {
+    return Some((rest.to_string(), rest.len()));
+  };
+  let (skipped, body) = match rest.strip_prefix(term) {
+    Some(after) => (term.len(), after),
+    None => (0, rest),
+  };
+  if body.is_empty() {
+    return None;
+  }
+  let end = body.find(term).unwrap_or(body.len());
+  Some((body[..end].to_string(), skipped + end))
+}
+
+pub(crate) fn readlist_inputstream(
+  args: &[Expr],
+) -> Result<String, InterpreterError> {
+  let Expr::Integer(id) = &args[1] else {
+    return Err(InterpreterError::EvaluationError(
+      "ReadList: invalid stream object".into(),
+    ));
+  };
+  let stream_id = *id as usize;
+  let Some((kind, _)) = get_stream_kind(stream_id) else {
+    return Err(InterpreterError::EvaluationError(
+      "ReadList: stream is not open".into(),
+    ));
+  };
+  // A file that cannot be read is the one case with its own message; every
+  // other kind (including a command's output) is drained by
+  // `get_stream_content`, which reads it whole.
+  #[cfg(not(target_arch = "wasm32"))]
+  if let StreamKind::File(path) = &kind
+    && !crate::vfs::is_file(path)
+  {
+    return Err(InterpreterError::EvaluationError(format!(
+      "ReadList::noopen: Cannot open {path}."
+    )));
+  }
+  Ok(get_stream_content(stream_id).map_or_else(String::new, |(c, _)| c))
+}

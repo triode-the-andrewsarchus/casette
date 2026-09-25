@@ -5,6 +5,9 @@ members = [
     "crates/casette-kernel",
     "crates/casette-gui",
 ]
+exclude = [
+    "vendor/woxi",
+]
 
 [workspace.package]
 version = "0.1.0"

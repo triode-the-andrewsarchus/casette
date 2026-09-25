@@ -1,0 +1,623 @@
+#[allow(unused_imports)]
+use super::*;
+use crate::functions::math_ast::rat_reduce;
+
+/// Result of decomposing an expression into its canonical form.
+pub enum ExprForm {
+  /// An atomic expression (leaf node in the tree).
+  Atom(String),
+  /// A composite expression with a head and children.
+  Composite { head: String, children: Vec<Expr> },
+}
+
+/// Format a floating-point number for FullForm display.
+fn format_real_helper(f: f64) -> String {
+  if f.fract() == 0.0 && f.abs() < 1e15 {
+    format!("{f:.1}")
+  } else {
+    format!("{f}")
+  }
+}
+
+/// Collect all operands for an associative binary operator (Plus, Times),
+/// flattening nested applications of the same operator.
+fn collect_children(expr: &Expr, target_op: BinaryOperator) -> Vec<Expr> {
+  match expr {
+    Expr::BinaryOp { op, left, right } if *op == target_op => {
+      let mut parts = collect_children(left, target_op);
+      parts.extend(collect_children(right, target_op));
+      parts
+    }
+    _ => vec![expr.clone()],
+  }
+}
+
+/// Flatten nested Part expressions into (base_expr, [index1, index2, ...]).
+fn flatten_part(expr: &Expr) -> (&Expr, Vec<Expr>) {
+  let mut indices = Vec::new();
+  let mut base = expr;
+  while let Expr::Part {
+    expr: inner_expr,
+    index: inner_index,
+  } = base
+  {
+    indices.push(inner_index.as_ref().clone());
+    base = inner_expr.as_ref();
+  }
+  indices.reverse();
+  (base, indices)
+}
+
+/// Decompose an expression into its canonical FullForm representation.
+///
+/// Returns either an `Atom` (leaf label) or a `Composite` (head name + children).
+/// This handles all canonical transformations (Minus→Plus, Divide→Times, etc.)
+/// and associative flattening (Plus, Times).
+pub fn decompose_expr(expr: &Expr) -> ExprForm {
+  match expr {
+    // --- Atoms ---
+    Expr::Integer(n) => ExprForm::Atom(n.to_string()),
+    Expr::BigInteger(n) => ExprForm::Atom(n.to_string()),
+    Expr::Real(f) => ExprForm::Atom(format_real_helper(*f)),
+    Expr::BigFloat(digits, prec) => {
+      ExprForm::Atom(crate::syntax::format_bigfloat(digits, *prec))
+    }
+    Expr::String(s) => ExprForm::Atom(format!("\"{s}\"")),
+    // FullForm shows the internal DirectedInfinity[] representation for
+    // the symbolic infinity constants, matching Wolfram.
+    Expr::Identifier(s) | Expr::Constant(s) if s == "ComplexInfinity" => {
+      ExprForm::Composite {
+        head: "DirectedInfinity".to_string(),
+        children: vec![],
+      }
+    }
+    Expr::Identifier(s) | Expr::Constant(s) if s == "Infinity" => {
+      ExprForm::Composite {
+        head: "DirectedInfinity".to_string(),
+        children: vec![Expr::Integer(1)],
+      }
+    }
+    Expr::Identifier(s) => ExprForm::Atom(s.clone()),
+    Expr::Constant(c) => ExprForm::Atom(c.clone()),
+    Expr::Raw(s) => ExprForm::Atom(s.clone()),
+    Expr::Image { .. } => ExprForm::Atom("-Image-".to_string()),
+    Expr::Graphics { is_3d, .. } => ExprForm::Atom(
+      if *is_3d { "-Graphics3D-" } else { "-Graphics-" }.to_string(),
+    ),
+
+    // --- Slot/SlotSequence ---
+    Expr::Slot(n) => ExprForm::Composite {
+      head: "Slot".to_string(),
+      children: vec![Expr::Integer(*n as i128)],
+    },
+    Expr::SlotSequence(n) => ExprForm::Composite {
+      head: "SlotSequence".to_string(),
+      children: vec![Expr::Integer(*n as i128)],
+    },
+
+    // --- Simple composites ---
+    Expr::List(items) => ExprForm::Composite {
+      head: "List".to_string(),
+      children: items.to_vec(),
+    },
+    Expr::FunctionCall { name, args } => ExprForm::Composite {
+      head: name.clone(),
+      children: args.to_vec(),
+    },
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => ExprForm::Composite {
+      head: "Rule".to_string(),
+      children: vec![pattern.as_ref().clone(), replacement.as_ref().clone()],
+    },
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => ExprForm::Composite {
+      head: "RuleDelayed".to_string(),
+      children: vec![pattern.as_ref().clone(), replacement.as_ref().clone()],
+    },
+    Expr::ReplaceAll { expr, rules } => ExprForm::Composite {
+      head: "ReplaceAll".to_string(),
+      children: vec![expr.as_ref().clone(), rules.as_ref().clone()],
+    },
+    Expr::ReplaceRepeated { expr, rules } => ExprForm::Composite {
+      head: "ReplaceRepeated".to_string(),
+      children: vec![expr.as_ref().clone(), rules.as_ref().clone()],
+    },
+    Expr::Map { func, list } => ExprForm::Composite {
+      head: "Map".to_string(),
+      children: vec![func.as_ref().clone(), list.as_ref().clone()],
+    },
+    Expr::Apply { func, list } => ExprForm::Composite {
+      head: "Apply".to_string(),
+      children: vec![func.as_ref().clone(), list.as_ref().clone()],
+    },
+    Expr::MapApply { func, list } => ExprForm::Composite {
+      head: "MapApply".to_string(),
+      children: vec![func.as_ref().clone(), list.as_ref().clone()],
+    },
+    Expr::CompoundExpr(exprs) => ExprForm::Composite {
+      head: "CompoundExpression".to_string(),
+      children: exprs.clone(),
+    },
+    Expr::Function { body } => ExprForm::Composite {
+      head: "Function".to_string(),
+      children: vec![body.as_ref().clone()],
+    },
+
+    // --- Binary operators ---
+    Expr::BinaryOp { op, left, right } => match op {
+      // Associative: flatten nested Plus/Times
+      BinaryOperator::Plus => ExprForm::Composite {
+        head: "Plus".to_string(),
+        children: collect_children(expr, BinaryOperator::Plus),
+      },
+      BinaryOperator::Times => ExprForm::Composite {
+        head: "Times".to_string(),
+        children: collect_children(expr, BinaryOperator::Times),
+      },
+      // Canonical transformations
+      BinaryOperator::Minus => ExprForm::Composite {
+        head: "Plus".to_string(),
+        children: vec![
+          left.as_ref().clone(),
+          Expr::BinaryOp {
+            op: BinaryOperator::Times,
+            left: Box::new(Expr::Integer(-1)),
+            right: right.clone(),
+          },
+        ],
+      },
+      BinaryOperator::Divide => {
+        // Structural decomposition only: a/b → Times[a, Power[b, -1]]
+        // No evaluation — canonicalization happens during Divide evaluation
+        if matches!(left.as_ref(), Expr::Integer(1)) {
+          // 1/b → Power[b, -1]
+          ExprForm::Composite {
+            head: "Power".to_string(),
+            children: vec![right.as_ref().clone(), Expr::Integer(-1)],
+          }
+        } else {
+          ExprForm::Composite {
+            head: "Times".to_string(),
+            children: vec![
+              left.as_ref().clone(),
+              Expr::BinaryOp {
+                op: BinaryOperator::Power,
+                left: right.clone(),
+                right: Box::new(Expr::Integer(-1)),
+              },
+            ],
+          }
+        }
+      }
+      // Simple binary → named head
+      BinaryOperator::Power => ExprForm::Composite {
+        head: "Power".to_string(),
+        children: vec![left.as_ref().clone(), right.as_ref().clone()],
+      },
+      BinaryOperator::And => ExprForm::Composite {
+        head: "And".to_string(),
+        children: vec![left.as_ref().clone(), right.as_ref().clone()],
+      },
+      BinaryOperator::Or => ExprForm::Composite {
+        head: "Or".to_string(),
+        children: vec![left.as_ref().clone(), right.as_ref().clone()],
+      },
+      BinaryOperator::StringJoin => ExprForm::Composite {
+        head: "StringJoin".to_string(),
+        children: vec![left.as_ref().clone(), right.as_ref().clone()],
+      },
+      BinaryOperator::Alternatives => ExprForm::Composite {
+        head: "Alternatives".to_string(),
+        children: collect_children(expr, BinaryOperator::Alternatives),
+      },
+    },
+
+    // --- Unary operators ---
+    Expr::UnaryOp { op, operand } => match op {
+      UnaryOperator::Minus => ExprForm::Composite {
+        head: "Times".to_string(),
+        children: vec![Expr::Integer(-1), operand.as_ref().clone()],
+      },
+      UnaryOperator::Not => ExprForm::Composite {
+        head: "Not".to_string(),
+        children: vec![operand.as_ref().clone()],
+      },
+    },
+
+    // --- Comparison ---
+    Expr::Comparison {
+      operands,
+      operators,
+    } => {
+      let op_name = |op: &ComparisonOp| match op {
+        ComparisonOp::Equal => "Equal",
+        ComparisonOp::NotEqual => "Unequal",
+        ComparisonOp::Less => "Less",
+        ComparisonOp::LessEqual => "LessEqual",
+        ComparisonOp::Greater => "Greater",
+        ComparisonOp::GreaterEqual => "GreaterEqual",
+        ComparisonOp::SameQ => "SameQ",
+        ComparisonOp::UnsameQ => "UnsameQ",
+      };
+      let all_same =
+        operators.windows(2).all(|w| w[0] == w[1]) && !operators.is_empty();
+      if all_same {
+        ExprForm::Composite {
+          head: op_name(&operators[0]).to_string(),
+          children: operands.clone(),
+        }
+      } else {
+        // Inequality[a, LessEqual, b, Less, c] — interleave operands and operators
+        let mut children = Vec::with_capacity(operands.len() + operators.len());
+        for (i, op) in operands.iter().enumerate() {
+          children.push(op.clone());
+          if i < operators.len() {
+            children.push(Expr::Identifier(op_name(&operators[i]).to_string()));
+          }
+        }
+        ExprForm::Composite {
+          head: "Inequality".to_string(),
+          children,
+        }
+      }
+    }
+
+    // --- Association ---
+    Expr::Association(items) => ExprForm::Composite {
+      head: "Association".to_string(),
+      children: items
+        .iter()
+        .map(|(k, v)| Expr::Rule {
+          pattern: Box::new(k.clone()),
+          replacement: Box::new(v.clone()),
+        })
+        .collect(),
+    },
+
+    // --- Part (flatten nested) ---
+    Expr::Part { .. } => {
+      let (base, indices) = flatten_part(expr);
+      let mut children = vec![base.clone()];
+      children.extend(indices);
+      ExprForm::Composite {
+        head: "Part".to_string(),
+        children,
+      }
+    }
+
+    // --- PrefixApply, Postfix, CurriedCall: head is the rendered function ---
+    Expr::PrefixApply { func, arg } => ExprForm::Composite {
+      head: render_full_form(func),
+      children: vec![arg.as_ref().clone()],
+    },
+    Expr::Postfix { expr, func } => ExprForm::Composite {
+      head: render_full_form(func),
+      children: vec![expr.as_ref().clone()],
+    },
+    Expr::CurriedCall { func, args } => ExprForm::Composite {
+      head: render_full_form(func),
+      children: args.clone(),
+    },
+
+    // --- NamedFunction ---
+    Expr::NamedFunction {
+      params,
+      body,
+      bracketed,
+    } => {
+      let params_expr = if params.len() == 1 && !bracketed {
+        Expr::Identifier(params[0].clone())
+      } else {
+        Expr::List(params.iter().map(|p| Expr::Identifier(p.clone())).collect())
+      };
+      ExprForm::Composite {
+        head: "Function".to_string(),
+        children: vec![params_expr, body.as_ref().clone()],
+      }
+    }
+
+    // --- Pattern matching ---
+    Expr::Pattern {
+      name,
+      head,
+      blank_type,
+    } => {
+      let blank_func_name = match blank_type {
+        2 => "BlankSequence",
+        3 => "BlankNullSequence",
+        _ => "Blank",
+      };
+      let blank_args: Vec<Expr> = head
+        .as_ref()
+        .map(|h| vec![Expr::Identifier(h.clone())])
+        .unwrap_or_default();
+      // An anonymous pattern is the bare blank: `_Integer` is
+      // `Blank[Integer]`, not `Pattern[, Blank[Integer]]`.
+      if name.is_empty() {
+        return ExprForm::Composite {
+          head: blank_func_name.to_string(),
+          children: blank_args,
+        };
+      }
+      ExprForm::Composite {
+        head: "Pattern".to_string(),
+        children: vec![
+          Expr::Identifier(name.clone()),
+          call(blank_func_name, blank_args),
+        ],
+      }
+    }
+    Expr::PatternOptional {
+      name,
+      head,
+      default,
+    } => {
+      let blank = Expr::FunctionCall {
+        name: "Blank".to_string(),
+        args: head
+          .as_ref()
+          .map(|h| vec![Expr::Identifier(h.clone())])
+          .unwrap_or_default()
+          .into(),
+      };
+      // `_.` is `Optional[Blank[]]`; only a named `x_.` wraps in `Pattern`.
+      let pattern = if name.is_empty() {
+        blank
+      } else {
+        call("Pattern", vec![Expr::Identifier(name.clone()), blank])
+      };
+      let mut children = vec![pattern];
+      if let Some(d) = default {
+        children.push(d.as_ref().clone());
+      }
+      ExprForm::Composite {
+        head: "Optional".to_string(),
+        children,
+      }
+    }
+    Expr::PatternTest {
+      name,
+      head,
+      blank_type,
+      test,
+    } => {
+      let blank_name = match blank_type {
+        2 => "BlankSequence",
+        3 => "BlankNullSequence",
+        _ => "Blank",
+      };
+      let blank_args = match head {
+        Some(h) => vec![Expr::Identifier(h.clone())],
+        None => vec![],
+      };
+      let blank_part = if name.is_empty() {
+        call(blank_name, blank_args)
+      } else {
+        call(
+          "Pattern",
+          vec![Expr::Identifier(name.clone()), call(blank_name, blank_args)],
+        )
+      };
+      ExprForm::Composite {
+        head: "PatternTest".to_string(),
+        children: vec![blank_part, test.as_ref().clone()],
+      }
+    }
+  }
+}
+
+/// The two sides of a rule, in whichever spelling it arrives in.
+///
+/// `a -> b` parses to `Expr::Rule`, but a rule assembled head-first —
+/// `Rule @@ {a, b}`, or the `RuleDelayed[lhs, rhs]` a `ReplacePart` on a rule
+/// rebuilds — is a plain call by the same name. Both are the same expression,
+/// so anything that reads rules has to accept either. The flag says whether
+/// the rule is delayed (`:>`).
+pub fn rule_parts(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
+  match expr {
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => Some((pattern, replacement, false)),
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => Some((pattern, replacement, true)),
+    Expr::FunctionCall { name, args }
+      if args.len() == 2 && (name == "Rule" || name == "RuleDelayed") =>
+    {
+      Some((&args[0], &args[1], name == "RuleDelayed"))
+    }
+    _ => None,
+  }
+}
+
+/// Rebuild an expression from the `head` / `children` pair that
+/// `decompose_expr` produces, restoring the dedicated `Expr` variant whenever
+/// one exists.
+///
+/// `Expr::FunctionCall` is the generic fallback, but it is not always
+/// interchangeable with the dedicated variant: `FunctionCall { name: "List" }`
+/// renders as `List[1, 2]` while `Expr::List` renders as `{1, 2}`. Rebuilding
+/// through this function keeps a recomposed expression printing exactly like
+/// the original one.
+///
+/// Associative arithmetic (`Plus`, `Times`, `Power`, …) is deliberately left
+/// as a `FunctionCall`: `decompose_expr` flattens those, so there is no unique
+/// binary tree to restore, and the flat form already renders in operator
+/// notation (`Plus[8, 5]` → `8 + 5`).
+pub fn compose_expr(head: &str, children: &[Expr]) -> Expr {
+  let two = |f: fn(Box<Expr>, Box<Expr>) -> Expr| {
+    f(Box::new(children[0].clone()), Box::new(children[1].clone()))
+  };
+  let comparison = |op: ComparisonOp| Expr::Comparison {
+    operands: children.to_vec(),
+    operators: vec![op; children.len() - 1],
+  };
+
+  match (head, children.len()) {
+    ("List", _) => Expr::List(children.to_vec().into()),
+    ("CompoundExpression", _) => Expr::CompoundExpr(children.to_vec()),
+    ("Rule", 2) => two(|pattern, replacement| Expr::Rule {
+      pattern,
+      replacement,
+    }),
+    ("RuleDelayed", 2) => two(|pattern, replacement| Expr::RuleDelayed {
+      pattern,
+      replacement,
+    }),
+    ("ReplaceAll", 2) => two(|expr, rules| Expr::ReplaceAll { expr, rules }),
+    ("ReplaceRepeated", 2) => {
+      two(|expr, rules| Expr::ReplaceRepeated { expr, rules })
+    }
+    ("Map", 2) => two(|func, list| Expr::Map { func, list }),
+    ("Apply", 2) => two(|func, list| Expr::Apply { func, list }),
+    ("MapApply", 2) => two(|func, list| Expr::MapApply { func, list }),
+    ("Not", 1) => Expr::UnaryOp {
+      op: UnaryOperator::Not,
+      operand: Box::new(children[0].clone()),
+    },
+    // Part[expr, i, j, …] re-nests into expr[[i]][[j]]…, the shape
+    // `flatten_part` collapsed.
+    ("Part", n) if n >= 2 => {
+      children[1..]
+        .iter()
+        .fold(children[0].clone(), |base, index| Expr::Part {
+          expr: Box::new(base),
+          index: Box::new(index.clone()),
+        })
+    }
+    ("Equal", n) if n >= 2 => comparison(ComparisonOp::Equal),
+    ("Unequal", n) if n >= 2 => comparison(ComparisonOp::NotEqual),
+    ("Less", n) if n >= 2 => comparison(ComparisonOp::Less),
+    ("LessEqual", n) if n >= 2 => comparison(ComparisonOp::LessEqual),
+    ("Greater", n) if n >= 2 => comparison(ComparisonOp::Greater),
+    ("GreaterEqual", n) if n >= 2 => comparison(ComparisonOp::GreaterEqual),
+    ("SameQ", n) if n >= 2 => comparison(ComparisonOp::SameQ),
+    ("UnsameQ", n) if n >= 2 => comparison(ComparisonOp::UnsameQ),
+    _ => unevaluated(head, children),
+  }
+}
+
+/// Helper: render a rational (num, denom) pair in FullForm notation.
+fn render_rational_full_form(numer: i128, denom: i128) -> String {
+  // Reduce to lowest terms
+  let (n, d) = rat_reduce(numer, denom);
+  if d == 1 {
+    n.to_string()
+  } else {
+    format!("Rational[{n}, {d}]")
+  }
+}
+
+/// The real and imaginary parts of a complex number, as FullForm sees it.
+///
+/// Woxi stores `2 + 3 I` as a Plus/Times tree, but its head is `Complex`
+/// and its FullForm is `Complex[2, 3]`. Every consumer that reports the
+/// canonical structure — the FullForm renderer below and the structured
+/// (Python) expression tree — recognises one through this function, so the
+/// two cannot disagree about what counts as a complex number.
+///
+/// Returns exact parts as `(numerator, denominator)` pairs, or machine
+/// floats, mirroring the two shapes Woxi stores.
+pub enum ComplexParts {
+  Exact { re: (i128, i128), im: (i128, i128) },
+  Float { re: f64, im: f64 },
+}
+
+pub fn complex_full_form_parts(expr: &Expr) -> Option<ComplexParts> {
+  // Exact: a + b*I with rational a and b.
+  if let Some((re, im)) =
+    crate::functions::math_ast::try_extract_complex_exact(expr)
+    && im.0 != 0
+  {
+    return Some(ComplexParts::Exact { re, im });
+  }
+  // Machine-precision: `Real + Real*I`, including `0. + 0.*I`. Requires a
+  // syntactic `I` and at least one Real component, so pure Reals are not
+  // mistaken for complex numbers.
+  if expr_contains_imag_unit(expr)
+    && expr_contains_real(expr)
+    && let Some((re, im)) =
+      crate::functions::math_ast::try_extract_complex_float(expr)
+  {
+    return Some(ComplexParts::Float { re, im });
+  }
+  None
+}
+
+/// Recursively render an expression in FullForm notation.
+pub fn render_full_form(expr: &Expr) -> String {
+  // Complex numbers are stored as Plus/Times trees internally but display
+  // as Complex[re, im], so this must come before the general decomposition.
+  match complex_full_form_parts(expr) {
+    Some(ComplexParts::Exact { re, im }) => {
+      let re = render_rational_full_form(re.0, re.1);
+      let im = render_rational_full_form(im.0, im.1);
+      return format!("Complex[{re}, {im}]");
+    }
+    Some(ComplexParts::Float { re, im }) => {
+      return format!(
+        "Complex[{}, {}]",
+        format_real_full_form(re),
+        format_real_full_form(im)
+      );
+    }
+    None => {}
+  }
+
+  // Machine-precision Reals get the `1.\`` / `0.2\`` precision-marker
+  // shape in FullForm — Wolfram's `ToString[FullForm[1.0]]` returns
+  // `"1.\`"`, distinct from the bare `1.` it shows in OutputForm.
+  if let Expr::Real(f) = expr {
+    return format_real_full_form(*f);
+  }
+  // String literals embedded in a FullForm result get backslash-escaped
+  // quotes so the surrounding `ToString` produces `"\"l\""`.
+  if let Expr::String(s) = expr {
+    return format!("\\\"{s}\\\"");
+  }
+
+  match decompose_expr(expr) {
+    ExprForm::Atom(label) => label,
+    ExprForm::Composite { head, children } => {
+      let parts: Vec<String> = children.iter().map(render_full_form).collect();
+      format!("{}[{}]", head, parts.join(", "))
+    }
+  }
+}
+
+/// Does `expr` syntactically reference the imaginary-unit symbol `I`?
+fn expr_contains_imag_unit(expr: &Expr) -> bool {
+  match expr {
+    Expr::Identifier(s) => s == "I",
+    Expr::List(items) => items.iter().any(expr_contains_imag_unit),
+    Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_imag_unit),
+    Expr::BinaryOp { left, right, .. } => {
+      expr_contains_imag_unit(left) || expr_contains_imag_unit(right)
+    }
+    Expr::UnaryOp { operand, .. } => expr_contains_imag_unit(operand),
+    _ => false,
+  }
+}
+
+/// Does `expr` contain at least one machine-precision Real? Used
+/// together with `expr_contains_imag_unit` to decide whether a sum
+/// like `Real + Real*I` should collapse to `Complex[re\`, im\`]` in
+/// FullForm.
+use crate::functions::math_ast::expr_contains_real;
+
+/// Render a machine-precision Real for FullForm/InputForm output:
+/// integer values lose their trailing zero (`1.0` → `1.`) and every
+/// machine-precision Real picks up the trailing backtick marker.
+fn format_real_full_form(f: f64) -> String {
+  if f.fract() == 0.0 && f.abs() < 1e15 {
+    format!("{}.`", f as i64)
+  } else {
+    format!("{f}`")
+  }
+}

@@ -1,0 +1,547 @@
+# Prepend local wrappers and cargo-installed binaries to PATH.
+# .bin/ contains wolframscript and wo wrappers for Docker environments.
+export PATH := $(CURDIR)/.bin:$(HOME)/.cargo/bin:$(PATH)
+
+ifeq ($(OS),Windows_NT)
+DEV_NULL = NUL:
+else
+DEV_NULL = /dev/null
+endif
+
+.PHONY: help
+help: makefile
+	@tail -n +4 makefile | grep ".PHONY"
+
+
+.PHONY: test-unit
+test-unit:
+	cargo nextest run \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Self-contained acceptance suite for the exact linear Reduce campaign.
+.PHONY: test-reduce-core
+test-reduce-core:
+	cargo nextest run -p woxi-reduce \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+.PHONY: bench-reduce
+bench-reduce:
+	cargo bench -p woxi-reduce --bench reduce
+
+
+.PHONY: test-reduce
+test-reduce: test-reduce-core
+	cargo nextest run -p woxi \
+		--lib \
+		--test reduce_tests \
+		--test interpreter_tests \
+		-E 'binary(reduce_tests) | test(/functions::polynomial_ast::reduce_backend::/) | test(/interpreter_tests::algebra::(reduce|resolve)::/)' \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Larger deterministic property run. It remains entirely self-contained.
+.PHONY: test-reduce-fuzz
+test-reduce-fuzz:
+	WOXI_REDUCE_PROPTEST_CASES=4096 cargo nextest run --test reduce_tests \
+		-E 'test(/properties::/)' \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+	cargo nextest run --lib --profile slow --run-ignored only \
+		-E 'test(generated_bounded_formulas_agree_with_exhaustive_integer_evaluation)' \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Development-only comparison with Wolfram. This is never part of the runtime
+# implementation or the self-contained test target.
+.PHONY: test-reduce-oracle
+test-reduce-oracle:
+	@command -v wolframscript >/dev/null || \
+		(echo "wolframscript is required for test-reduce-oracle"; exit 1)
+	cargo nextest run --test reduce_tests --run-ignored only \
+		-E 'test(/oracle::/)' \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Independent semantic oracle for generated dense linear formulas. Z3 is a
+# development dependency only; the shipped solver and normal test target do
+# not invoke it.
+.PHONY: test-reduce-smt-oracle
+test-reduce-smt-oracle:
+	@command -v z3 >/dev/null || \
+		(echo "z3 is required for test-reduce-smt-oracle"; exit 1)
+	cargo nextest run --lib --run-ignored only \
+		-E 'test(/generated_closed(_presburger)?_formulas_agree_with_z3/)' \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Run all tests gated behind the `slow-tests` cargo feature: the heavy
+# script snapshot tests (see `slow_script_test!` in
+# tests/script_snapshot_tests.rs) and the wikidata tests that query the
+# live wikidata.org API. These are excluded from `make test` (not compiled
+# at all without the feature) because the scripts take tens of seconds
+# each in debug builds and the wikidata tests need network access. This
+# target runs nightly, so hitting the live endpoint is fine.
+#
+# `--run-ignored only` would otherwise also select the two oracle suites,
+# which need a tool that is a development dependency rather than something
+# this target may assume: wolframscript (`test-reduce-oracle`) and z3
+# (`test-reduce-smt-oracle`). They have their own targets, which check for
+# their tool first; excluding them here keeps this one self-contained.
+.PHONY: test-slow
+test-slow:
+	cargo nextest run \
+		--features slow-tests \
+		--profile slow \
+		--run-ignored only \
+		-E 'not (test(/_agree_with_z3$$/) or test(/oracle::/))' \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Alias the CLI command to test before running the tests.
+# E.g. `wolframscript -c` or `woxi eval`
+#
+# $ cat /bin/wo
+# #! /usr/bin/env bash
+# wolframscript -c "$*"
+.PHONY: test-cli
+test-cli: install-cli
+	@if ! command -v scrut &> /dev/null; \
+		then cargo install scrut; \
+		fi
+	scrut test tests/cli
+
+
+.PHONY: test-cli-wolframscript
+test-cli-wolframscript: install-cli
+	@if ! command -v scrut &> /dev/null; \
+		then cargo install scrut; \
+		fi
+	@# Lazily initialized wolframscript subsystems download their data on
+	@# first use and print a progress bar into the testcase's output, which
+	@# fails whichever document happens to touch them first (tests/cli/
+	@# astronomy.md: "Downloading ephemeris data (1.72 MB of 5.13 MB) …").
+	@# Pay those one-time costs here, outside any compared output.
+	@echo "Warming lazily initialized wolframscript subsystems …"
+	@wolframscript -code 'FullMoon[DateObject[{2024, 1, 1}]];' \
+		> /dev/null 2>&1 || true
+	@wolframscript -code 'DayRange[{2000,1,1},{2000,1,1},Sunday];' \
+		> /dev/null 2>&1 || true
+	WOXI_USE_WOLFRAM=true \
+		scrut test tests/cli
+
+
+.PHONY: test-shebang
+test-shebang: install-cli
+	test "$$(./tests/woxi/hello_world.wls)" = 'Hello World!'
+
+
+# Woxi Studio is not a default workspace member (its iced → wgpu/winit
+# dependency tree is 100+ extra crates), so `make test` never compiles its
+# tests. Run them explicitly here — without this target they silently rot.
+.PHONY: test-studio
+test-studio:
+	cargo nextest run \
+		-p woxi-studio \
+		--show-progress=none \
+		--status-level=fail \
+		--failure-output=final
+
+
+# Build the woxi Python package (woxi-py) into a local virtualenv with
+# maturin and run its pytest suite.
+.PHONY: test-python
+test-python:
+	python3 -m venv woxi-py/.venv
+	woxi-py/.venv/bin/pip install --quiet maturin pytest
+	cd woxi-py && VIRTUAL_ENV=$(CURDIR)/woxi-py/.venv \
+		.venv/bin/maturin develop --quiet
+	woxi-py/.venv/bin/python -m pytest woxi-py/tests --quiet
+
+
+.PHONY: test-scripts-wolframscript
+test-scripts-wolframscript:
+	@echo "Testing scripts with wolframscript against snapshots …"
+	@# The first calendar computation in a fresh wolframscript install lazily
+	@# initializes the CalendarData subsystem (paclet/index fetch), a one-time
+	@# cost that can stall far past nextest's per-test timeout. Several script
+	@# snapshots use DayRange/DatePlus, so whichever runs first would otherwise
+	@# eat that cold start and time out (e.g. find_the_last_sunday_of_each_month
+	@# hit the 900s ceiling here). Pay it once, outside any timed test, so the
+	@# subsequent `wolframscript -file` runs all init from the warm on-disk cache.
+	@echo "Warming wolframscript CalendarData subsystem (one-time lazy init) …"
+	@wolframscript -code 'DayRange[{2000,1,1},{2000,1,1},Sunday];' >/dev/null 2>&1 || true
+	WOXI_USE_WOLFRAM=true cargo nextest run \
+		--features slow-tests \
+		--profile slow --run-ignored all script_ --test-threads=1
+	@echo "All wolframscript script tests passed."
+
+
+.PHONY: test-unit-wolframscript
+test-unit-wolframscript: install-cli
+	@echo "Verifying unit tests against wolframscript …"
+	node tests/wolframscript/verify_unit_tests.ts
+	@echo "All unit test verifications passed."
+
+
+.PHONY: test
+test: test-unit
+
+
+.PHONY: test-all
+test-all: test-unit test-slow test-cli test-shebang test-studio
+
+
+.PHONY: test-conformance
+test-conformance: test-unit-wolframscript test-cli-wolframscript test-scripts-wolframscript
+
+
+# --- Fuzzing (see fuzz/README.md) -----------------------------------------
+
+# Seed the libFuzzer corpora from the existing test scripts (plus generated
+# expressions for the interpret target) so the fuzzer starts from valid
+# Wolfram Language programs instead of random bytes.
+#
+# Parsing any script is fast, so the parse corpus keeps all of them.
+# Evaluating one is not: `tests/scripts/` holds programs that compute for
+# seconds to minutes (and a few that never terminate by design), which the
+# interpret target's libFuzzer -timeout hang detector reports as crashes.
+# Every interpret seed is therefore timed and the slow ones are dropped —
+# measured rather than listed, so a newly added heavy script cannot break
+# the nightly fuzz run. FUZZ_SEED_BUDGET is the wall-clock second(s) a seed
+# may take in a release build; ASan makes that ~27× slower (measured), which
+# has to stay well inside the -timeout below.
+FUZZ_SEED_BUDGET ?= 1
+
+.PHONY: fuzz-corpus
+fuzz-corpus:
+	mkdir -p fuzz/corpus/parse fuzz/corpus/interpret
+	cp tests/scripts/*.wls fuzz/corpus/parse/
+	cp tests/scripts/*.wls fuzz/corpus/interpret/
+	cargo run --features diff-fuzz --bin woxi-diff-fuzz -- --print-cases --cases 200 --seed 0 \
+		| split -l 1 - fuzz/corpus/interpret/gen-
+	cargo build --release --bin woxi
+	scripts/prune_fuzz_corpus.sh fuzz/corpus/interpret $(FUZZ_SEED_BUDGET)
+
+# Coverage-guided crash fuzzing (requires a nightly toolchain and
+# cargo-fuzz). Runs until interrupted; crash inputs land in fuzz/artifacts/.
+.PHONY: fuzz-parse
+fuzz-parse: fuzz-corpus
+	@if ! command -v cargo-fuzz &> /dev/null; \
+		then cargo install cargo-fuzz; \
+		fi
+	cargo +nightly fuzz run parse -- -timeout=10 -max_len=4096
+
+.PHONY: fuzz-interpret
+fuzz-interpret: fuzz-corpus
+	@if ! command -v cargo-fuzz &> /dev/null; \
+		then cargo install cargo-fuzz; \
+		fi
+	cargo +nightly fuzz run interpret -- -timeout=1200 -max_len=2048 -rss_limit_mb=8192
+
+# Differential fuzzing against wolframscript (local binary or the
+# cmd-server.js Docker bridge — auto-detected). Reports and shrinks any
+# output divergence; exits non-zero when one is found.
+.PHONY: fuzz-diff
+fuzz-diff:
+	cargo build --features diff-fuzz --bins
+	cargo run --features diff-fuzz --bin woxi-diff-fuzz -- --cases 200
+
+
+# Build a Docker image with a pinned Rust toolchain and run the
+# machine-specific tests inside a clean Linux environment. The tests
+# themselves derive expected values from the host (env vars,
+# `gethostname`, `current_dir`, …), so this target's purpose is to
+# exercise the Linux branches of the platform-dependent impl
+# (`$OperatingSystem` = "Unix", `$BaseDirectory` = "/usr/share/Wolfram",
+# `$UserBaseDirectory` = "$HOME/.Wolfram") on hosts that aren't Linux.
+.PHONY: test-docker
+test-docker:
+	docker build -t woxi-test -f Dockerfile .
+	docker run --rm --hostname woxi-test woxi-test
+
+
+.PHONY: format
+format:
+	cargo clippy --fix --allow-dirty > $(DEV_NULL) 2>&1
+	cargo fmt
+#	nix fmt
+
+
+# Verify that all workspace crates are formatted without modifying them.
+# Run by CI; fix any failure with `make format`.
+.PHONY: format-check
+format-check:
+	cargo fmt --all --check
+
+
+# Fail on any clippy warning. `clippy::pedantic` is enabled in Cargo.toml's
+# [lints.clippy], together with the lints this codebase deliberately does not
+# follow; everything else must stay clean. Many findings are fixed by
+# `make format`.
+.PHONY: lint
+lint:
+	cargo clippy --all-targets -- -D warnings
+
+
+.PHONY: install-cli
+install-cli:
+	cargo install --path .
+
+
+.PHONY: install
+install: install-cli
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		$(MAKE) install-macos-app; \
+	fi
+
+
+.PHONY: install-debug
+install-debug:
+	cargo install --debug --path .
+
+
+# Build Woxi Studio and assemble it as a macOS .app bundle. The bundle's
+# icon is generated on the fly from images/favicon.png via sips +
+# iconutil (both shipped with macOS).
+#
+# APP_DEST selects where the bundle is written — /Applications for a
+# local install, a staging directory for the release workflow, which
+# zips it up as a release asset. STUDIO_PROFILE selects the cargo
+# profile; the release workflow builds the same one, so a downloaded
+# bundle is what a local install would have produced.
+APP_DEST ?= /Applications
+APP_BUNDLE := $(APP_DEST)/Woxi Studio.app
+STUDIO_PROFILE ?= studio
+
+.PHONY: macos-app
+macos-app:
+	cargo build --profile $(STUDIO_PROFILE) -p woxi-studio
+	rm -rf "$(APP_BUNDLE)"
+	mkdir -p "$(APP_BUNDLE)/Contents/MacOS"
+	mkdir -p "$(APP_BUNDLE)/Contents/Resources"
+	cp target/$(STUDIO_PROFILE)/woxi-studio "$(APP_BUNDLE)/Contents/MacOS/woxi-studio"
+	cp woxi-studio/macos/Info.plist "$(APP_BUNDLE)/Contents/Info.plist"
+	@tmp=$$(mktemp -d) && \
+		iconset="$$tmp/icon.iconset" && \
+		mkdir "$$iconset" && \
+		for s in 16 32 64 128 256 512; do \
+			sips -z $$s $$s images/favicon.png \
+				--out "$$iconset/icon_$${s}x$${s}.png" >/dev/null && \
+			d=$$((s*2)) && \
+			sips -z $$d $$d images/favicon.png \
+				--out "$$iconset/icon_$${s}x$${s}@2x.png" >/dev/null; \
+		done && \
+		iconutil -c icns "$$iconset" \
+			-o "$(APP_BUNDLE)/Contents/Resources/icon.icns" && \
+		rm -rf "$$tmp"
+
+
+# Install the bundle into /Applications and register it with
+# LaunchServices, so Finder picks up the icon and the .nb/.wls file
+# associations. Registering is the only part a staged CI build skips.
+.PHONY: install-macos-app
+install-macos-app: macos-app
+	@/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+		-f "$(APP_BUNDLE)"
+	@echo "Installed $(APP_BUNDLE)"
+
+
+# Inputs that, when changed, require the playground WASM bundle to be rebuilt.
+# Mirrors the CI cache key in publish-book.yml (src/**, Cargo.{toml,lock}) plus
+# build.rs, which also feeds the wasm32 compile.
+WASM_PKG  := tests/playground/pkg/woxi_bg.wasm
+WASM_SRCS := $(shell find src -type f) build.rs Cargo.toml Cargo.lock
+
+# Real file target: only recompiles when a source input is newer than the
+# bundle. wasm-pack regenerates pkg/ on every run, so the output ends up newer
+# than the `touch src/lib.rs` below and the target stays up-to-date afterwards.
+$(WASM_PKG): $(WASM_SRCS)
+	# Invalidate cargo's fingerprint to force recompilation of the woxi crate.
+	# Without this, cargo's wasm32 release cache can go stale and skip rebuilding.
+	touch src/lib.rs
+	wasm-pack build \
+		-d tests/playground/pkg \
+		--target web \
+		--dev \
+		-- \
+		--no-default-features \
+		--features wasm
+
+# Convenience alias: `make wasm-build` (and dependents) delegate to the real
+# file target, so the build is skipped when the bundle is already current.
+.PHONY: wasm-build
+wasm-build: $(WASM_PKG)
+
+
+# Bundle CodeMirror (+ LZString) into tests/playground/vendor/codemirror.js so
+# the playground loads its editor locally instead of from the esm.sh CDN. The
+# committed bundle is what the playground actually serves; run this only to
+# regenerate it after changing versions or the export list in
+# tests/playground-deps/. `npm ci` needs network access to the npm registry.
+CM_BUNDLE := tests/playground/vendor/codemirror.js
+CM_SRCS   := tests/playground-deps/entry.mjs tests/playground-deps/package.json
+
+$(CM_BUNDLE): $(CM_SRCS)
+	cd tests/playground-deps && npm ci && npm run build
+
+.PHONY: playground-codemirror
+playground-codemirror: $(CM_BUNDLE)
+
+
+.PHONY: wasm-build-production
+wasm-build-production:
+	wasm-pack build \
+		-d tests/playground/pkg \
+		--target web \
+		--release \
+		-- \
+		--no-default-features \
+		--features wasm
+
+
+# npm package (npm/): Node.js bindings built with wasm-pack.
+# Real file target like $(WASM_PKG): only recompiles when a source input
+# is newer than the bundle.
+NPM_WASM_PKG := npm/pkg/woxi_bg.wasm
+
+$(NPM_WASM_PKG): $(WASM_SRCS)
+	# Invalidate cargo's fingerprint to force recompilation of the woxi crate.
+	touch src/lib.rs
+	wasm-pack build \
+		-d npm/pkg \
+		--target nodejs \
+		--release \
+		-- \
+		--no-default-features \
+		--features wasm
+	# wasm-pack emits its own package.json/.gitignore/README for pkg/, but the
+	# published package is npm/ itself - drop them to avoid a nested package.
+	rm -f npm/pkg/package.json npm/pkg/.gitignore npm/pkg/README.md
+
+.PHONY: npm-build
+npm-build: $(NPM_WASM_PKG)
+
+.PHONY: npm-test
+npm-test: npm-build
+	cd npm && node --test
+
+# Dry run of the npm publishing step (shows the tarball contents).
+.PHONY: npm-pack
+npm-pack: npm-build
+	cd npm && npm pack --dry-run
+
+.PHONY: npm-publish
+npm-publish: npm-test
+	cd npm && npm publish
+
+
+.PHONY: jupyterlite-kernel-build
+jupyterlite-kernel-build:
+	cd jupyterlite-woxi-kernel && npm install && npx tsc
+	cd jupyterlite-woxi-kernel && \
+		uvx --python 3.12 --from jupyter-builder jupyter-builder build .
+
+
+.PHONY: jupyterlite-build
+jupyterlite-build: wasm-build jupyterlite-kernel-build
+	rm -f .jupyterlite.doit.db
+	uvx \
+		--python 3.12 \
+		--from jupyter-core \
+		--with jupyterlite-core \
+		--with jupyterlab \
+		--with libarchive-c \
+		--with ./jupyterlite-woxi-kernel \
+		jupyter lite build --output-dir tests/jupyterlite
+	cp -r tests/playground/pkg tests/jupyterlite/wasm
+
+
+.PHONY: docs/summary
+docs/summary:
+	@if command -v wolframscript >/dev/null 2>&1; \
+	then wolframscript -file scripts/build_summary.wls; \
+	else woxi run scripts/build_summary.wls; \
+	fi
+
+
+.PHONY: docs/site
+docs/site: wasm-build docs/summary
+	uvx --python 3.12 --from zensical==0.0.40 \
+		zensical build --clean -f tests/zensical.toml
+
+
+# Assemble the deployment tree:
+#   - tests/landing/    → tests/book/             (minimal landing page at /)
+#   - tests/playground/ → tests/book/playground/  (full playground at /playground/)
+#   - zensical output   → tests/book/docs/        (via site_dir in zensical.toml)
+#   - tests/jupyterlite/→ tests/book/jupyterlite/
+# Both the landing page and the /playground/ copy share the same WASM
+# bundle (built once by wasm-build into tests/playground/pkg/), copied
+# into each location so worker.js can find ./pkg/woxi.js.
+.PHONY: docs/build
+docs/build: jupyterlite-build docs/site playground-codemirror
+	cp -R tests/landing/. tests/book/
+	cp -R tests/playground/pkg tests/book/pkg
+	rm -rf tests/book/playground
+	cp -R tests/playground tests/book/playground
+	rm -rf tests/book/jupyterlite
+	cp -R tests/jupyterlite tests/book/jupyterlite
+	cp tests/cli/favicon.png tests/book/favicon.png
+
+
+.PHONY: docs/serve
+docs/serve: docs/build
+	cd tests/book && npx -y http-server -p 5501 -c-1 -s .
+
+
+.PHONY: clean
+clean:
+	cargo clean
+	rm -rf tests/playground/pkg
+	rm -rf tests/jupyterlite
+	rm -rf tests/book
+	rm -f .jupyterlite.doit.db
+
+
+.PHONY: release
+release:
+	@echo '1. `cai changelog <first-commit-hash>`'
+	@echo '2. `git add ./changelog.md && git commit -m "Update changelog"`'
+	@echo '3. `cargo release major / minor / patch`'
+	@echo '4. Create a new GitHub release at https://github.com/ad-si/Woxi/releases/new'
+	@echo '5. Wait for the "Release" workflow to attach the Woxi and' \
+		'Woxi Studio binaries (publishing the release triggers it)'
+	@echo "6. Announce release on \n" \
+		"   - https://x.com \n" \
+		"   - https://bsky.app \n" \
+		"   - https://this-week-in-rust.org \n" \
+		"   - https://news.ycombinator.com \n" \
+		"   - https://lobste.rs \n" \
+		"   - Reddit \n" \
+		"     - https://reddit.com/r/rust \n" \
+		"     - https://reddit.com/r/Mathematica/ \n" \
+		"     - https://reddit.com/r/math \n" \
+		"     - https://reddit.com/r/Physics \n" \
+		"     - https://reddit.com/r/ElectricalEngineering \n" \
+		"     - https://reddit.com/r/matlab \n" \
+		"     - https://reddit.com/r/sympy/ \n" \
+		"     - https://reddit.com/r/Julia/ \n" \
+		"     - https://reddit.com/r/octave/ \n" \
+		"     - https://reddit.com/r/buildinpublic/ \n"

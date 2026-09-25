@@ -1,0 +1,10116 @@
+//! AST-native ODE solving functions (DSolve, NDSolve).
+//!
+//! DSolve solves ordinary differential equations symbolically.
+//! NDSolve solves initial-value problems numerically using RK4.
+
+use super::*;
+use crate::functions::calculus_ast::differentiate_expr;
+use crate::functions::math_ast::{make_sqrt, rat_reduce};
+use crate::syntax::{expr_children, map_children};
+
+// ─── DSolve ────────────────────────────────────────────────────────────
+
+/// DSolve[eqn, y[x], x] or DSolve[{eqn, ic1, ...}, y[x], x]
+/// Also DSolve[eqn, y, x] (returns Function form)
+pub fn dsolve_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  dsolve_ast_with_head(args, "DSolve")
+}
+
+/// Same as [`dsolve_ast`], but an unevaluated result is returned under `head`.
+/// `DSolveValue` delegates here, and an equation neither can solve must come
+/// back as `DSolveValue[…]`, not as the `DSolve[…]` it delegated to.
+pub fn dsolve_ast_with_head(
+  args: &[Expr],
+  head: &str,
+) -> Result<Expr, InterpreterError> {
+  // An ODE Woxi can't classify/solve should stay unevaluated (like
+  // wolframscript for genuinely unsolvable equations) rather than leaking an
+  // internal "DSolve: …" error to the user.
+  let result = match dsolve_ast_inner(args) {
+    Err(InterpreterError::EvaluationError(msg))
+      if msg.starts_with("DSolve:") =>
+    {
+      Ok(unevaluated("DSolve", args))
+    }
+    other => other,
+  };
+  result.map(|expr| retag_unevaluated(expr, "DSolve", head))
+}
+
+/// Rewrite the head of an unevaluated `solver[args…]` result, leaving genuine
+/// solutions untouched.
+fn retag_unevaluated(expr: Expr, from: &str, to: &str) -> Expr {
+  if from != to
+    && let Expr::FunctionCall { name, args } = &expr
+    && name == from
+  {
+    return Expr::FunctionCall {
+      name: to.to_string(),
+      args: args.clone(),
+    };
+  }
+  expr
+}
+
+fn dsolve_ast_inner(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 3 {
+    return Ok(unevaluated("DSolve", args));
+  }
+
+  let eqns_arg = &args[0];
+  let dep_arg = &args[1];
+  let indep_var = &args[2];
+
+  // Purely algebraic case: when the equation(s) contain no derivatives of the
+  // dependent function, DSolve reduces to Solve for the dependent function(s),
+  // e.g. DSolve[y[x] + 2 == 5, y[x], x] -> {{y[x] -> 3}}. Delegate to Solve,
+  // which treats the applications `y[x]` as generalized unknowns.
+  if !contains_derivative(eqns_arg) {
+    let solved =
+      crate::functions::solve_ast(&[eqns_arg.clone(), dep_arg.clone()])?;
+    // Only accept a genuine solution list; otherwise fall through so the ODE
+    // machinery (or the unevaluated fallback) handles it.
+    if matches!(&solved, Expr::List(_)) {
+      return Ok(solved);
+    }
+  }
+
+  // PDE branch: `DSolve[eqn, f, {x, y}]` (or `DSolve[eqn, f[x, y], {x, y}]`)
+  // for a first-order linear PDE in two variables. Three recognised
+  // shapes:
+  //   * Constant coefficients with f-divided derivatives:
+  //       a*D[f,x]/f + b*D[f,y]/f == c
+  //     Solution: f -> Function[{x, y}, E^((c/a)*x) * C[1][y - (b/a)*x]]
+  //   * Constant coefficients on bare derivatives, RHS constant:
+  //       a*D[f,x] + b*D[f,y] == c
+  //     Solution: f[x, y] -> (c/a)*x + C[1][y - (b/a)*x]
+  //   * Euler-type with the variable as coefficient:
+  //       x*D[f,x] + y*D[f,y] == c
+  //     Solution: f[x, y] -> c*Log[x] + C[1][y/x]
+  // The output rule's LHS depends on whether `dep_arg` is `f` (Function
+  // form) or `f[x, y]` (rule on the call form).
+  if let Expr::List(vars) = indep_var
+    && vars.len() == 2
+    && let (Expr::Identifier(xn), Expr::Identifier(yn)) = (&vars[0], &vars[1])
+  {
+    let (fname_opt, return_call_form) = match dep_arg {
+      Expr::Identifier(name) => (Some(name.clone()), false),
+      Expr::FunctionCall { name, args: fargs }
+        if fargs.len() == 2
+          && matches!(&fargs[0], Expr::Identifier(s) if s == xn)
+          && matches!(&fargs[1], Expr::Identifier(s) if s == yn) =>
+      {
+        (Some(name.clone()), true)
+      }
+      _ => (None, false),
+    };
+    if let Some(fname) = fname_opt {
+      if let Some(body) =
+        try_linear_first_order_pde_body(eqns_arg, &fname, xn, yn)
+      {
+        return Ok(wrap_pde_solution(body, &fname, xn, yn, return_call_form));
+      }
+      if let Some(body) = try_direct_linear_pde_body(eqns_arg, &fname, xn, yn) {
+        return Ok(wrap_pde_solution(body, &fname, xn, yn, return_call_form));
+      }
+      if let Some(body) = try_euler_pde_body(eqns_arg, &fname, xn, yn) {
+        return Ok(wrap_pde_solution(body, &fname, xn, yn, return_call_form));
+      }
+      if let Some(body) =
+        try_second_order_constant_pde_body(eqns_arg, &fname, xn, yn)
+      {
+        return Ok(wrap_pde_solution(body, &fname, xn, yn, return_call_form));
+      }
+    }
+  }
+
+  // Extract independent variable name
+  let x_name = match indep_var {
+    Expr::Identifier(name) => name.clone(),
+    _ => {
+      return Ok(unevaluated("DSolve", args));
+    }
+  };
+
+  // `DSolve[{…}, {y1[t], y2[t], …}, t]` — a coupled system of dependent
+  // functions, handled by the operator-elimination solver above instead of
+  // the single-variable machinery below.
+  if let Expr::List(dep_items) = dep_arg {
+    let items: Vec<Expr> = dep_items.iter().cloned().collect();
+    return dsolve_linear_system(eqns_arg, &items, &x_name);
+  }
+
+  // Determine dependent function name and whether Function form is requested
+  let (y_name, function_form) = match dep_arg {
+    // y[x] form → return y[x] -> expr
+    Expr::FunctionCall { name, args: fargs } if fargs.len() == 1 => {
+      if let Expr::Identifier(xn) = &fargs[0] {
+        if xn == &x_name {
+          (name.clone(), false)
+        } else {
+          return Ok(unevaluated("DSolve", args));
+        }
+      } else {
+        return Ok(unevaluated("DSolve", args));
+      }
+    }
+    // y form → return y -> Function[{x}, expr]
+    Expr::Identifier(name) => (name.clone(), true),
+    _ => {
+      return Ok(unevaluated("DSolve", args));
+    }
+  };
+
+  // Separate equations and initial conditions
+  let (ode_expr, initial_conditions) = match eqns_arg {
+    Expr::List(items) => {
+      // First item should be the ODE, rest are initial conditions
+      if items.is_empty() {
+        return Ok(unevaluated("DSolve", args));
+      }
+      let mut ics = Vec::new();
+      let mut ode = None;
+      for item in items {
+        if is_initial_condition(item, &y_name, &x_name) {
+          ics.push(item.clone());
+        } else {
+          if ode.is_some() {
+            // Multiple ODEs not supported
+            return Ok(unevaluated("DSolve", args));
+          }
+          ode = Some(item.clone());
+        }
+      }
+      match ode {
+        Some(o) => (o, ics),
+        None => {
+          return Ok(unevaluated("DSolve", args));
+        }
+      }
+    }
+    // Single equation, no ICs
+    _ => (eqns_arg.clone(), Vec::new()),
+  };
+
+  // Parse the ODE: extract lhs == rhs, move everything to lhs - rhs = 0
+  let ode_normalized = normalize_equation(&ode_expr)?;
+
+  // Collect terms: classify each additive term by derivative order
+  let terms = match collect_ode_terms(&ode_normalized, &y_name, &x_name) {
+    Ok(terms) => terms,
+    // The term classifier only understands equations that are linear in y.
+    // An equation it rejects may still be separable (`y' == g(x) h(y)`), so
+    // try quadrature before giving up.
+    Err(err) => match solve_separable_first_order(
+      &ode_expr,
+      &y_name,
+      &x_name,
+      &initial_conditions,
+    ) {
+      Some(solution) => {
+        return Ok(build_dsolve_result(
+          solution,
+          y_name,
+          x_name,
+          function_form,
+        ));
+      }
+      None => return Err(err),
+    },
+  };
+
+  // Determine max order
+  let max_order = terms.iter().map(|t| t.order).max().unwrap_or(0);
+  if max_order == 0 {
+    // Not actually an ODE
+    return Ok(unevaluated("DSolve", args));
+  }
+
+  // Check if all coefficients are constant w.r.t. x
+  let all_constant_coeffs = terms.iter().filter(|t| t.order >= 0).all(|t| {
+    crate::functions::calculus_ast::is_constant_wrt(&t.coefficient, &x_name)
+  });
+
+  // Check if forcing term is also constant
+  let forcing_is_constant = terms.iter().filter(|t| t.order == -1).all(|t| {
+    crate::functions::calculus_ast::is_constant_wrt(&t.coefficient, &x_name)
+  });
+
+  // Try to solve based on ODE type
+  // For first-order ODEs, always try the first-order solver (handles more cases)
+  let general_solution = if max_order == 1 {
+    solve_first_order_linear(&terms, &x_name)?
+  } else if all_constant_coeffs && forcing_is_constant {
+    solve_constant_coefficient_ode(&terms, max_order as usize, &x_name)?
+  } else if all_constant_coeffs {
+    // Constant-coefficient with non-constant forcing — solve homogeneous part
+    // TODO: add variation of parameters for non-constant forcing
+    solve_constant_coefficient_ode(&terms, max_order as usize, &x_name)?
+  } else {
+    // Unsupported
+    return Ok(unevaluated("DSolve", args));
+  };
+
+  // Apply initial conditions if any
+  let solution = if initial_conditions.is_empty() {
+    general_solution
+  } else {
+    apply_initial_conditions(
+      &general_solution,
+      &initial_conditions,
+      &y_name,
+      &x_name,
+      max_order as usize,
+    )?
+  };
+
+  // Simplify the solution
+  let solution =
+    crate::evaluator::evaluate_expr_to_expr(&solution).unwrap_or(solution);
+
+  Ok(build_dsolve_result(solution, y_name, x_name, function_form))
+}
+
+/// Wrap a solved right-hand side as `{{y[x] -> sol}}`, or
+/// `{{y -> Function[{x}, sol]}}` when the caller asked for `y` rather than
+/// `y[x]`.
+fn build_dsolve_result(
+  solution: Expr,
+  y_name: String,
+  x_name: String,
+  function_form: bool,
+) -> Expr {
+  let rule = if function_form {
+    Expr::Rule {
+      pattern: Box::new(Expr::Identifier(y_name)),
+      replacement: Box::new(Expr::NamedFunction {
+        params: vec![x_name],
+        body: Box::new(solution),
+        bracketed: true,
+      }),
+    }
+  } else {
+    Expr::Rule {
+      pattern: Box::new(Expr::FunctionCall {
+        name: y_name,
+        args: vec![Expr::Identifier(x_name)].into(),
+      }),
+      replacement: Box::new(solution),
+    }
+  };
+
+  Expr::List(vec![Expr::List(vec![rule].into())].into())
+}
+
+// ─── NDSolve ───────────────────────────────────────────────────────────
+
+/// NDSolve[{eqn, ic1, ...}, y[x], {x, xmin, xmax}]
+/// Also NDSolve[{eqn, ic1, ...}, y, {x, xmin, xmax}]
+pub fn ndsolve_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  ndsolve_ast_with_head(args, "NDSolve")
+}
+
+/// Same as [`ndsolve_ast`], but an unevaluated result is returned under
+/// `head`, so `NDSolveValue` keeps its own head instead of the `NDSolve` it
+/// delegates to.
+pub fn ndsolve_ast_with_head(
+  args: &[Expr],
+  head: &str,
+) -> Result<Expr, InterpreterError> {
+  let evaluated = evaluate_ndsolve_args(args)?;
+  ndsolve_ast_inner(&evaluated)
+    .map(|expr| retag_unevaluated(expr, "NDSolve", head))
+}
+
+/// NDSolve holds its arguments (matching Wolfram — see the `NDSolve`/
+/// `NDSolveValue` entry in `core_eval.rs`'s held-function list) so that a
+/// `Block`/Manipulate-bound variable sharing a name with the independent
+/// variable — e.g. a Demonstration's own animation clock, when its ODE
+/// spells the domain as `{t, 0, tMax}` — can't get substituted into the
+/// iterator position before the solve ever sees `t` as symbolic. But
+/// holding everything would just as wrongly leave ordinary named
+/// equations unresolved (`eq1 = y'[t] == 1; NDSolve[{eq1, …}, …]`, a
+/// common idiom, needs `eq1` looked up). So evaluate the whole argument
+/// list normally except the domain spec's own iterator variable name(s)
+/// (one per positional domain argument, for the PDE form's two): the
+/// symbol is temporarily removed from scope — the same
+/// take/restore-symbol-values pair `Block` itself uses, applied directly
+/// rather than through a nested `Block[…]` call (which, evaluated through
+/// the ordinary interpreter, doesn't shadow an *already*-`Block`-bound
+/// outer value of the same name the way re-entering it directly does) —
+/// so it evaluates to itself rather than the caller's current value,
+/// exactly like `Table`/`Do`'s own iterator.
+fn evaluate_ndsolve_args(args: &[Expr]) -> Result<Vec<Expr>, InterpreterError> {
+  let n_pos = args
+    .iter()
+    .take_while(|a| !matches!(a, Expr::Rule { .. } | Expr::RuleDelayed { .. }))
+    .count();
+  let mut iter_names: Vec<String> = Vec::new();
+  for &i in &[2usize, 3usize] {
+    if i < n_pos
+      && let Some(Expr::List(items)) = args.get(i)
+      && let Some(Expr::Identifier(name)) = items.first()
+    {
+      iter_names.push(name.clone());
+    }
+  }
+  if iter_names.is_empty() {
+    // No recognizable `{var, …}` domain spec (malformed call) — evaluate
+    // plainly so it still falls through to the ordinary "not a valid
+    // NDSolve call" outcome below instead of silently skipping evaluation.
+    return args
+      .iter()
+      .map(crate::evaluator::evaluate_expr_to_expr)
+      .collect();
+  }
+  let saved: Vec<_> = iter_names
+    .iter()
+    .map(|n| crate::evaluator::symbol_values::take_symbol_values(n))
+    .collect();
+  let result: Result<Vec<Expr>, InterpreterError> = args
+    .iter()
+    .map(crate::evaluator::evaluate_expr_to_expr)
+    .collect();
+  for s in saved {
+    crate::evaluator::symbol_values::restore_symbol_values(s);
+  }
+  result
+}
+
+fn ndsolve_ast_inner(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // Split trailing option rules (`Method -> …`, `MaxSteps -> …`, …) from
+  // the positional arguments: three for an ODE/DAE system in one
+  // independent variable, four for a scalar PDE
+  // `NDSolve[eqns, u, {t, t0, t1}, {x, x0, x1}]` in two.
+  let n_pos = args
+    .iter()
+    .take_while(|a| !matches!(a, Expr::Rule { .. } | Expr::RuleDelayed { .. }))
+    .count();
+  if n_pos == 4 {
+    // Unknowns written as compound expressions (`Subscript[c, A]`) are keyed
+    // by a fresh symbol while integrating, then restored in the result —
+    // same treatment as the ODE branch below.
+    let renames = compound_head_renamings(&args[1], &args[2]);
+    let positional: Vec<Expr> = if renames.is_empty() {
+      args[..4].to_vec()
+    } else {
+      args[..4]
+        .iter()
+        .map(|a| rename_compound_heads(a, &renames))
+        .collect()
+    };
+    return match ndsolve_pde(&positional) {
+      Ok(Some(result)) => Ok(restore_compound_heads(&result, &renames)),
+      Ok(None) => match ndsolve_pde_hyperbolic(&positional) {
+        Ok(Some(result)) => Ok(restore_compound_heads(&result, &renames)),
+        Ok(None) => Ok(unevaluated("NDSolve", args)),
+        Err(e) => Err(e),
+      },
+      Err(e) => Err(e),
+    };
+  }
+  if n_pos != 3 {
+    return Ok(unevaluated("NDSolve", args));
+  }
+  let opts = &args[n_pos..];
+  let event = parse_event_locator_option(opts);
+
+  // A stage-indexed family (`Table[x[i, t], {i, 1, n}]` as the dependent
+  // variable spec — a discretized PDE or a staged process model) is keyed
+  // by a fresh single-argument symbol per index, the same way a compound
+  // head is below, so the rest of the solver only ever sees ordinary
+  // `f[t]`-shaped unknowns.
+  let idx_renames = indexed_family_renamings(&args[1], &args[2]);
+  let indexed: Vec<Expr> = if idx_renames.is_empty() {
+    args[..3].to_vec()
+  } else {
+    args[..3]
+      .iter()
+      .map(|a| rename_indexed_vars(a, &idx_renames))
+      .collect()
+  };
+
+  // Unknowns written as compound expressions (`Subscript[c, 1]`) are keyed
+  // by a fresh symbol while integrating, then restored in the result.
+  let renames = compound_head_renamings(&indexed[1], &indexed[2]);
+  let positional: Vec<Expr> = if renames.is_empty() {
+    indexed.clone()
+  } else {
+    indexed
+      .iter()
+      .map(|a| rename_compound_heads(a, &renames))
+      .collect()
+  };
+
+  // Every shape — one equation or a coupled system, linear or not — goes
+  // through the same integrator. A single scalar equation used to take a
+  // separate path built on DSolve's *linear* term classifier, which
+  // refused anything nonlinear in the dependent variable (the pendulum's
+  // `Sin[θ[t]]`) even though nothing about integrating it numerically
+  // needs the equation to be linear.
+  match ndsolve_system(&positional, event.as_ref()) {
+    Ok(Some(result)) => {
+      let result = restore_compound_heads(&result, &renames);
+      Ok(restore_indexed_vars(&result, &idx_renames))
+    }
+    Ok(None) => Ok(unevaluated("NDSolve", args)),
+    Err(e) => Err(e),
+  }
+}
+
+// ─── PDE NDSolve (method of lines) ─────────────────────────────────────
+
+/// A domain spec `{name, min, max}` for one PDE independent variable.
+#[derive(Clone)]
+struct PdeDomain {
+  name: String,
+  min: f64,
+  max: f64,
+}
+
+fn parse_pde_domain(expr: &Expr) -> Option<PdeDomain> {
+  let Expr::List(items) = expr else {
+    return None;
+  };
+  if items.len() != 3 {
+    return None;
+  }
+  let Expr::Identifier(name) = &items[0] else {
+    return None;
+  };
+  let min = nval_to_f64(&items[1])?;
+  let max = nval_to_f64(&items[2])?;
+  // NaN bounds must bail out too, so compare via `partial_cmp` rather than
+  // a negated float comparison.
+  if max.partial_cmp(&min) != Some(std::cmp::Ordering::Greater) {
+    return None;
+  }
+  Some(PdeDomain {
+    name: name.clone(),
+    min,
+    max,
+  })
+}
+
+/// Match `Derivative[dt, dx][u_name][t_arg, x_arg]` — the parsed form of a
+/// mixed partial `D[u[t, x], {t, dt}, {x, dx}]` — or the bare
+/// `u_name[t_arg, x_arg]` (order `(0, 0)`). Returns `(dt, dx, t_arg, x_arg)`.
+fn match_pde_term(
+  expr: &Expr,
+  u_name: &str,
+) -> Option<(usize, usize, Expr, Expr)> {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == u_name
+    && args.len() == 2
+  {
+    return Some((0, 0, args[0].clone(), args[1].clone()));
+  }
+  if let Expr::CurriedCall { func, args } = expr
+    && args.len() == 2
+    && let Expr::CurriedCall {
+      func: deriv_head,
+      args: fname_args,
+    } = func.as_ref()
+    && fname_args.len() == 1
+    && matches!(&fname_args[0], Expr::Identifier(n) if n == u_name)
+    && let Expr::FunctionCall {
+      name: deriv_name,
+      args: orders,
+    } = deriv_head.as_ref()
+    && deriv_name == "Derivative"
+    && orders.len() == 2
+    && let (Expr::Integer(dt), Expr::Integer(dx)) = (&orders[0], &orders[1])
+  {
+    return Some((
+      *dt as usize,
+      *dx as usize,
+      args[0].clone(),
+      args[1].clone(),
+    ));
+  }
+  None
+}
+
+/// Like [`match_pde_term`], but normalizes the returned order/arguments so
+/// the first element of each always corresponds to whichever call-argument
+/// position plays the "t" (time-like) role for this match attempt and the
+/// second to the "x" (space-like) role. `swap` is true when the system's
+/// equations call the unknown as `u[x, t]` rather than the conventional
+/// `u[t, x]` — which one it is isn't fixed by the `NDSolve` call's own
+/// domain-argument order, so callers try both.
+fn match_pde_term_roles(
+  expr: &Expr,
+  u_name: &str,
+  swap: bool,
+) -> Option<(usize, usize, Expr, Expr)> {
+  let (dt, dx, arg0, arg1) = match_pde_term(expr, u_name)?;
+  if swap {
+    Some((dx, dt, arg1, arg0))
+  } else {
+    Some((dt, dx, arg0, arg1))
+  }
+}
+
+fn as_equal_pair(eq: &Expr) -> Option<(&Expr, &Expr)> {
+  let Expr::Comparison {
+    operands,
+    operators,
+  } = eq
+  else {
+    return None;
+  };
+  if operands.len() == 2
+    && operators.len() == 1
+    && operators[0] == ComparisonOp::Equal
+  {
+    Some((&operands[0], &operands[1]))
+  } else {
+    None
+  }
+}
+
+/// Flatten a product into its individual factors — a left-associative
+/// chain of `Times` `BinaryOp`s (the parser's shape) or the evaluator's own
+/// canonical n-ary `Times[...]` `FunctionCall` (what a coefficient survives
+/// as once the derivative term next to it has been evaluated). A single
+/// non-product expression is its own one-element flattening.
+fn flatten_times(expr: &Expr) -> Vec<Expr> {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let mut out = flatten_times(left);
+      out.extend(flatten_times(right));
+      out
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      args.iter().flat_map(flatten_times).collect()
+    }
+    other => vec![other.clone()],
+  }
+}
+
+/// Whether `expr` contains a call to any of `names` (as a bare function or
+/// under a `Derivative[…]`) anywhere in its tree — used to reject a
+/// coefficient or boundary value that unexpectedly depends on one of the
+/// system's own unknowns, a shape the method-of-lines solver below doesn't
+/// attempt to handle.
+fn expr_references_any(expr: &Expr, names: &[String]) -> bool {
+  for name in names {
+    if match_pde_term(expr, name).is_some() {
+      return true;
+    }
+  }
+  expr_children(expr)
+    .iter()
+    .any(|c| expr_references_any(c, names))
+}
+
+/// Recognise `[coeff *] Derivative[1, 0][u][t, x] == rhs` (or the reverse,
+/// or the coefficient-scaled term on either side) — the evolution equation
+/// of a parabolic PDE, optionally scaled by a coefficient (which may depend
+/// on `x` or `t`, but not on any unknown) multiplying the time-derivative
+/// term, e.g. the local convection velocity in a falling-film transport
+/// equation. Returns `(coeff, rhs)`; `coeff` is the literal `1` when the
+/// term is bare.
+fn try_pde_evolution_term(
+  eq: &Expr,
+  u_name: &str,
+  t_name: &str,
+  x_name: &str,
+  swap: bool,
+) -> Option<(Expr, Expr)> {
+  let (lhs, rhs) = as_equal_pair(eq)?;
+  let is_dudt = |e: &Expr| {
+    matches!(
+      match_pde_term_roles(e, u_name, swap),
+      Some((1, 0, t_arg, x_arg))
+        if matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+          && matches!(&x_arg, Expr::Identifier(n) if n == x_name)
+    )
+  };
+  // `side` is tried as the (possibly coefficient-scaled) time-derivative
+  // term; `other` becomes the raw RHS once `side`'s coefficient is
+  // factored out.
+  let try_side = |side: &Expr, other: &Expr| -> Option<(Expr, Expr)> {
+    if is_dudt(side) {
+      return Some((Expr::Integer(1), other.clone()));
+    }
+    let factors = flatten_times(side);
+    if factors.len() < 2 {
+      return None;
+    }
+    let deriv_at = factors.iter().position(is_dudt)?;
+    let coeff = factors
+      .into_iter()
+      .enumerate()
+      .filter(|(j, _)| *j != deriv_at)
+      .map(|(_, f)| f)
+      .reduce(times2)
+      .unwrap_or(Expr::Integer(1));
+    Some((coeff, other.clone()))
+  };
+  try_side(lhs, rhs).or_else(|| try_side(rhs, lhs))
+}
+
+/// Recognise `Derivative[2, 0][u][t, x] == rhs` (or the reverse) — the
+/// evolution equation of a hyperbolic (second-order-in-time) PDE. Unlike
+/// [`try_pde_evolution_term`], no coefficient scaling on the
+/// time-derivative term is recognised.
+fn try_pde_evolution_term_order2(
+  eq: &Expr,
+  u_name: &str,
+  t_name: &str,
+  x_name: &str,
+  swap: bool,
+) -> Option<Expr> {
+  let (lhs, rhs) = as_equal_pair(eq)?;
+  let is_d2udt2 = |e: &Expr| {
+    matches!(
+      match_pde_term_roles(e, u_name, swap),
+      Some((2, 0, t_arg, x_arg))
+        if matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+          && matches!(&x_arg, Expr::Identifier(n) if n == x_name)
+    )
+  };
+  if is_d2udt2(lhs) {
+    return Some(rhs.clone());
+  }
+  if is_d2udt2(rhs) {
+    return Some(lhs.clone());
+  }
+  None
+}
+
+/// Recognise `u[t0, x] == rhs(x)` (or `u[x, t0]` when `swap` is set, or
+/// either reversed) — the initial condition at `t == t0`. Returns the RHS.
+fn try_pde_initial_condition(
+  eq: &Expr,
+  u_name: &str,
+  x_name: &str,
+  t0: f64,
+  swap: bool,
+) -> Option<Expr> {
+  try_pde_initial_condition_ord(eq, u_name, x_name, t0, 0, swap)
+}
+
+/// Like [`try_pde_initial_condition`], but for the `time_order`-th time
+/// derivative's initial value: `time_order == 1` recognises
+/// `Derivative[1, 0][u][t0, x] == rhs(x)` — the initial *velocity*
+/// condition a second-order-in-time (hyperbolic) PDE needs in addition to
+/// the ordinary initial value.
+fn try_pde_initial_condition_ord(
+  eq: &Expr,
+  u_name: &str,
+  x_name: &str,
+  t0: f64,
+  time_order: usize,
+  swap: bool,
+) -> Option<Expr> {
+  let (lhs, rhs) = as_equal_pair(eq)?;
+  let is_ic = |e: &Expr| {
+    let Some((dt, dx, t_arg, x_arg)) = match_pde_term_roles(e, u_name, swap)
+    else {
+      return false;
+    };
+    dt == time_order
+      && dx == 0
+      && matches!(&x_arg, Expr::Identifier(n) if n == x_name)
+      && nval_to_f64(&t_arg)
+        .is_some_and(|v| (v - t0).abs() <= 1e-9 * t0.abs().max(1.0))
+  };
+  if is_ic(lhs) {
+    return Some(rhs.clone());
+  }
+  if is_ic(rhs) {
+    return Some(lhs.clone());
+  }
+  None
+}
+
+/// A boundary condition at one end of the space domain: a Dirichlet value
+/// `u(t, x0) = rhs(t)`, or a Neumann flux `∂u/∂x(t, x0) = rhs(t)` — the
+/// parsed form of `D[u[t, x], x] /. x -> x0`.
+enum PdeBc {
+  Dirichlet(Expr),
+  Neumann(Expr),
+  /// Both ends of the space domain tied together (`u[t, xmin] == u[t,
+  /// xmax]`), set at both `bc_lo` and `bc_hi` at once by
+  /// `try_pde_periodic_boundary`. Only the hyperbolic solver
+  /// (`compile_hyperbolic_boundary`) acts on this; the coupled-system
+  /// solver treats it like any other unrecognised shape and bails out.
+  Periodic,
+}
+
+/// Recognise `u[t, x0] == rhs(t)` (Dirichlet) or
+/// `Derivative[0, 1][u][t, x0] == rhs(t)` (Neumann) — or either reversed —
+/// a boundary condition at `x == x0`. Returns the condition kind and RHS.
+fn try_pde_boundary_condition(
+  eq: &Expr,
+  u_name: &str,
+  t_name: &str,
+  x0: f64,
+  swap: bool,
+) -> Option<PdeBc> {
+  let (lhs, rhs) = as_equal_pair(eq)?;
+  let kind = |e: &Expr| -> Option<fn(Expr) -> PdeBc> {
+    let (dt, dx, t_arg, x_arg) = match_pde_term_roles(e, u_name, swap)?;
+    if !matches!(&t_arg, Expr::Identifier(n) if n == t_name) {
+      return None;
+    }
+    if !nval_to_f64(&x_arg)
+      .is_some_and(|v| (v - x0).abs() <= 1e-9 * x0.abs().max(1.0))
+    {
+      return None;
+    }
+    match (dt, dx) {
+      (0, 0) => Some(PdeBc::Dirichlet),
+      (0, 1) => Some(PdeBc::Neumann),
+      _ => None,
+    }
+  };
+  if let Some(ctor) = kind(lhs) {
+    return Some(ctor(rhs.clone()));
+  }
+  if let Some(ctor) = kind(rhs) {
+    return Some(ctor(lhs.clone()));
+  }
+  None
+}
+
+/// Recognise `u[t, x_min] == u[t, x_max]` (or reversed) — a periodic
+/// boundary tying both ends of the space domain together, rather than one
+/// end's value to a function of time. Unlike `try_pde_boundary_condition`,
+/// a single matching equation supplies both `bc_lo` and `bc_hi` at once, so
+/// this must be tried before that function: `u[t, x_max]` also happens to
+/// satisfy `try_pde_boundary_condition`'s shape at `x_min` (matching `u[t,
+/// x_min]`) with the *unevaluated* call `u[t, x_max]` as its "value", which
+/// silently consumes the equation as a bogus Dirichlet condition and leaves
+/// the other end unmatched.
+fn try_pde_periodic_boundary(
+  eq: &Expr,
+  u_name: &str,
+  t_name: &str,
+  x_min: f64,
+  x_max: f64,
+  swap: bool,
+) -> bool {
+  let Some((lhs, rhs)) = as_equal_pair(eq) else {
+    return false;
+  };
+  let at_end = |e: &Expr, x0: f64| -> bool {
+    let Some((dt, dx, t_arg, x_arg)) = match_pde_term_roles(e, u_name, swap)
+    else {
+      return false;
+    };
+    dt == 0
+      && dx == 0
+      && matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+      && nval_to_f64(&x_arg)
+        .is_some_and(|v| (v - x0).abs() <= 1e-9 * x0.abs().max(1.0))
+  };
+  (at_end(lhs, x_min) && at_end(rhs, x_max))
+    || (at_end(lhs, x_max) && at_end(rhs, x_min))
+}
+
+/// Rewrite every unknown's occurrences in a PDE evolution right-hand side
+/// into the placeholder identifiers `NumFn` compiles the finite-difference
+/// stencil's numeric values into (see `ndsolve_pde`): `u_names[i][t, x]`
+/// becomes `NDSolve$U{i}` for every `i` (bare value — how a reaction term
+/// couples to another unknown), while `self_idx`'s own
+/// `Derivative[0, 1][…][t, x]` and `Derivative[0, 2][…][t, x]` become
+/// `NDSolve$UX`/`NDSolve$UXX`. Returns `None` when some other unknown
+/// appears through a derivative (a coupling shape this solver doesn't
+/// support) or any other construct this rewrite can't place.
+fn rewrite_pde_rhs(
+  expr: &Expr,
+  u_names: &[String],
+  self_idx: usize,
+  t_name: &str,
+  x_name: &str,
+  swap: bool,
+) -> Option<Expr> {
+  for (j, name) in u_names.iter().enumerate() {
+    let Some((dt, dx, t_arg, x_arg)) = match_pde_term_roles(expr, name, swap)
+    else {
+      continue;
+    };
+    if !matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+      || !matches!(&x_arg, Expr::Identifier(n) if n == x_name)
+    {
+      return None;
+    }
+    let placeholder = if j == self_idx {
+      match (dt, dx) {
+        (0, 0) => Some(format!("NDSolve$U{j}")),
+        (0, 1) => Some("NDSolve$UX".to_string()),
+        (0, 2) => Some("NDSolve$UXX".to_string()),
+        _ => None,
+      }
+    } else {
+      // Coupling to another unknown is only supported through its plain
+      // value, not its derivatives.
+      match (dt, dx) {
+        (0, 0) => Some(format!("NDSolve$U{j}")),
+        _ => None,
+      }
+    };
+    return placeholder.map(Expr::Identifier);
+  }
+  let failed = std::cell::Cell::new(false);
+  let mapped = map_children(expr, &|c| {
+    if failed.get() {
+      return c.clone();
+    }
+    if let Some(r) = rewrite_pde_rhs(c, u_names, self_idx, t_name, x_name, swap)
+    {
+      r
+    } else {
+      failed.set(true);
+      c.clone()
+    }
+  });
+  if failed.get() { None } else { Some(mapped) }
+}
+
+/// Rewrite every unknown's bare occurrence at the boundary point `x0`
+/// (`u_names[j][t_name, x0]`, in whichever argument order `swap` selects)
+/// into the placeholder identifier `NDSolve$U{j}` — how a Neumann boundary
+/// condition's right-hand side couples to the unknowns' own current
+/// boundary values, e.g. a Robin-type flux condition
+/// `Λ Exp[-α (a[0, t] - b[0, t])]` that depends on both species'
+/// concentrations at the electrode surface. The method-of-lines
+/// integrator (`try_solve_pde_system`'s `derivative` closure) evaluates
+/// the compiled result each step from the already-known grid values at
+/// that boundary. Returns `None` when some unknown appears at a point
+/// other than `x0`, or through a derivative — shapes this boundary solver
+/// doesn't attempt.
+fn rewrite_pde_bc_rhs(
+  expr: &Expr,
+  u_names: &[String],
+  t_name: &str,
+  x0: f64,
+  swap: bool,
+) -> Option<Expr> {
+  for (j, name) in u_names.iter().enumerate() {
+    if let Some((dt, dx, t_arg, x_arg)) = match_pde_term_roles(expr, name, swap)
+    {
+      if dt != 0
+        || dx != 0
+        || !matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+        || !nval_to_f64(&x_arg)
+          .is_some_and(|v| (v - x0).abs() <= 1e-9 * x0.abs().max(1.0))
+      {
+        return None;
+      }
+      return Some(Expr::Identifier(format!("NDSolve$U{j}")));
+    }
+  }
+  let failed = std::cell::Cell::new(false);
+  let mapped = map_children(expr, &|c| {
+    if failed.get() {
+      return c.clone();
+    }
+    if let Some(r) = rewrite_pde_bc_rhs(c, u_names, t_name, x0, swap) {
+      r
+    } else {
+      failed.set(true);
+      c.clone()
+    }
+  });
+  if failed.get() { None } else { Some(mapped) }
+}
+
+/// `NDSolve[eqns, u, {v1, v1min, v1max}, {v2, v2min, v2max}]` — one or
+/// several coupled parabolic PDEs in one space dimension (a
+/// diffusion/reaction/convection shape), solved by the method of lines:
+/// the space-like variable is discretized onto a uniform grid, the spatial
+/// derivatives become central finite-difference stencils, and the
+/// resulting ODE system in the time-like variable is integrated with
+/// classical RK4 subject to a diffusive stability bound on the time step.
+/// Each unknown's evolution equation may carry a coefficient (constant or
+/// depending on the space variable) on its time derivative, and may
+/// reference every other unknown's plain value (not its derivatives) for
+/// reaction coupling; each unknown needs exactly one initial condition and
+/// one boundary condition — Dirichlet or Neumann — at each end of the space
+/// domain. Which of the two declared domains plays the time-like
+/// (integrated) role and which plays the space-like (gridded) role isn't
+/// fixed by argument order, so both assignments are tried.
+///
+/// Returns `Ok(None)` when the equations aren't in that shape, so the
+/// caller falls back to leaving the call unevaluated.
+fn ndsolve_pde(args: &[Expr]) -> Result<Option<Expr>, InterpreterError> {
+  let u_names: Vec<String> = match &args[1] {
+    Expr::Identifier(name) => vec![name.clone()],
+    Expr::List(items) => {
+      let mut names = Vec::with_capacity(items.len());
+      for item in items {
+        match item {
+          Expr::Identifier(name) => names.push(name.clone()),
+          _ => return Ok(None),
+        }
+      }
+      names
+    }
+    _ => return Ok(None),
+  };
+  if u_names.is_empty() {
+    return Ok(None);
+  }
+
+  let Some(dom_a) = parse_pde_domain(&args[2]) else {
+    return Ok(None);
+  };
+  let Some(dom_b) = parse_pde_domain(&args[3]) else {
+    return Ok(None);
+  };
+
+  let eq_items: Vec<Expr> = match &args[0] {
+    Expr::List(items) => items.to_vec(),
+    other => vec![other.clone()],
+  };
+  let eq_items = flatten_chained_equalities(&eq_items);
+  if eq_items.len() != 4 * u_names.len() {
+    return Ok(None);
+  }
+
+  for (t_dom, x_dom) in [(&dom_a, &dom_b), (&dom_b, &dom_a)] {
+    for swap in [false, true] {
+      if let Some(result) =
+        try_solve_pde_system(&eq_items, &u_names, t_dom, x_dom, &dom_a, swap)?
+      {
+        return Ok(Some(result));
+      }
+    }
+  }
+  Ok(None)
+}
+
+/// Expand a chained equality `e0 == e1 == ... == e_{k-1}` (`k > 2`
+/// operands, every operator `==`) into the `k - 1` pairwise equations
+/// `e_i == e_{k-1}` for `i` from `0` to `k - 2`. `NDSolve` demonstrations
+/// commonly use this shorthand — both for a PDE's initial/boundary
+/// conditions (e.g. `u[x, t0] == u[xmax, t] == c`) and for an ODE system's
+/// initial conditions (e.g. `x[0] == y[0] == z[0] == 0`). Transitivity
+/// makes every pairwise equation a valid consequence of the chain, so this
+/// expansion is lossless. Equations that aren't a longer chain pass through
+/// unchanged.
+fn flatten_chained_equalities(items: &[Expr]) -> Vec<Expr> {
+  let mut out = Vec::with_capacity(items.len());
+  for item in items {
+    if let Expr::Comparison {
+      operands,
+      operators,
+    } = item
+      && operands.len() > 2
+      && operators.iter().all(|op| *op == ComparisonOp::Equal)
+    {
+      let last = operands.len() - 1;
+      for operand in &operands[..last] {
+        out.push(Expr::Comparison {
+          operands: vec![operand.clone(), operands[last].clone()],
+          operators: vec![ComparisonOp::Equal],
+        });
+      }
+    } else {
+      out.push(item.clone());
+    }
+  }
+  out
+}
+
+/// One unknown's compiled evolution/initial/boundary functions.
+struct PdeUnknown {
+  /// Coefficient on the evolution equation's time-derivative term,
+  /// compiled over `[t_name, x_name]`.
+  coeff_fn: NumFn,
+  /// The evolution equation's right-hand side (before dividing by
+  /// `coeff_fn`), compiled over `["NDSolve$U0", …, "NDSolve$U{n-1}",
+  /// "NDSolve$UX", "NDSolve$UXX", t_name, x_name]`.
+  rhs_fn: NumFn,
+  /// Initial profile, compiled over `[x_name]`.
+  ic_fn: NumFn,
+  bc_lo: PdeBoundaryFn,
+  bc_hi: PdeBoundaryFn,
+}
+
+enum PdeBoundaryFn {
+  /// The grid point at this boundary is fixed to `NumFn`'s value each step.
+  Dirichlet(NumFn),
+  /// The grid point at this boundary is integrated like an interior point,
+  /// using a ghost point built from `NumFn`'s flux value each step.
+  Neumann(NumFn),
+  /// This end wraps around to the other end of the domain, which carries
+  /// the same value (`u[t, xmin] == u[t, xmax]`); only the hyperbolic
+  /// solver produces this.
+  Periodic,
+}
+
+/// Attempt to match and solve the coupled PDE system with `t_dom` as the
+/// time-like (integrated) domain and `x_dom` as the space-like (gridded)
+/// one. `dim0_dom` is whichever of the two domains was declared first in
+/// the `NDSolve` call (`args[2]`) — the output `InterpolatingFunction`s'
+/// first dimension must match it regardless of which domain plays which
+/// solving role. Returns `Ok(None)` when the equations don't fit this role
+/// assignment.
+fn try_solve_pde_system(
+  eq_items: &[Expr],
+  u_names: &[String],
+  t_dom: &PdeDomain,
+  x_dom: &PdeDomain,
+  dim0_dom: &PdeDomain,
+  swap: bool,
+) -> Result<Option<Expr>, InterpreterError> {
+  let n = u_names.len();
+  let mut claimed = vec![false; eq_items.len()];
+  struct RawSpec {
+    coeff: Expr,
+    rhs: Expr,
+    ic: Expr,
+    bc_lo: PdeBc,
+    bc_hi: PdeBc,
+  }
+
+  /// Try to match `eq` as a linear flux-conservation boundary condition
+  /// shared between several unknowns at the same end of the space domain
+  /// — e.g. `D[a[x, t], x] + dBA D[b[x, t], x] == 0` at `x == 0`, the
+  /// no-accumulation condition tying two coupled species' fluxes at a
+  /// reacting interface — rather than a single unknown's own condition.
+  /// Requires one side of the equation to be identically zero, and every
+  /// unknown referenced besides `target` (at index `target_idx`, not yet
+  /// in `raw_specs`) to already have its own Neumann condition resolved at
+  /// this same end (`raw_specs[j].bc_lo`/`bc_hi`, one entry per unknown
+  /// processed so far). Solving the linear relation for `target`'s flux —
+  /// substituting each other referenced unknown's already-known flux
+  /// expression — yields `target`'s own (derived) Neumann condition.
+  /// Returns `None` when the equation isn't in this shape, or references
+  /// an unknown whose own condition at this end isn't resolved yet.
+  fn try_coupled_flux_bc(
+    eq: &Expr,
+    target_idx: usize,
+    u_names: &[String],
+    raw_specs: &[RawSpec],
+    t_name: &str,
+    x0: f64,
+    at_lo: bool,
+    swap: bool,
+  ) -> Option<PdeBc> {
+    fn is_zero_literal(e: &Expr) -> bool {
+      match e {
+        Expr::Integer(0) => true,
+        Expr::Real(v) => v.abs() < 1e-12,
+        _ => false,
+      }
+    }
+    fn is_one_literal(e: &Expr) -> bool {
+      matches!(e, Expr::Integer(1))
+    }
+    fn neg_expr(e: Expr) -> Expr {
+      if is_zero_literal(&e) {
+        return e;
+      }
+      neg1(e)
+    }
+    fn add_expr(a: Expr, b: Expr) -> Expr {
+      plus2(a, b)
+    }
+    fn mul_expr(coeff: Expr, e: Expr) -> Expr {
+      if is_one_literal(&coeff) {
+        return e;
+      }
+      times2(coeff, e)
+    }
+    fn flatten_additive_signed(
+      expr: &Expr,
+      sign: f64,
+      out: &mut Vec<(f64, Expr)>,
+    ) {
+      match expr {
+        Expr::BinaryOp {
+          op: BinaryOperator::Plus,
+          left,
+          right,
+        } => {
+          flatten_additive_signed(left, sign, out);
+          flatten_additive_signed(right, sign, out);
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Minus,
+          left,
+          right,
+        } => {
+          flatten_additive_signed(left, sign, out);
+          flatten_additive_signed(right, -sign, out);
+        }
+        Expr::UnaryOp {
+          op: UnaryOperator::Minus,
+          operand,
+        } => {
+          flatten_additive_signed(operand, -sign, out);
+        }
+        Expr::FunctionCall { name, args } if name == "Plus" => {
+          for a in args {
+            flatten_additive_signed(a, sign, out);
+          }
+        }
+        other => out.push((sign, other.clone())),
+      }
+    }
+    /// Match a single additive term as `coeff * D[u_name, x]` (any
+    /// factor order, coefficient 1 when the term is a bare derivative),
+    /// returning `(coeff, t_arg, x_arg)`.
+    fn match_flux_term(
+      term: &Expr,
+      u_name: &str,
+      swap: bool,
+    ) -> Option<(Expr, Expr, Expr)> {
+      let factors = flatten_times(term);
+      let mut deriv: Option<(Expr, Expr)> = None;
+      let mut coeff_factors = Vec::new();
+      for f in &factors {
+        if deriv.is_none()
+          && let Some((dt, dx, t_arg, x_arg)) =
+            match_pde_term_roles(f, u_name, swap)
+          && dt == 0
+          && dx == 1
+        {
+          deriv = Some((t_arg, x_arg));
+        } else {
+          coeff_factors.push(f.clone());
+        }
+      }
+      let (t_arg, x_arg) = deriv?;
+      let coeff = match coeff_factors.len() {
+        0 => Expr::Integer(1),
+        1 => coeff_factors.into_iter().next().unwrap(),
+        _ => call("Times", coeff_factors),
+      };
+      Some((coeff, t_arg, x_arg))
+    }
+
+    let (lhs, rhs) = as_equal_pair(eq)?;
+    let sum_side = if is_zero_literal(lhs) {
+      rhs
+    } else if is_zero_literal(rhs) {
+      lhs
+    } else {
+      return None;
+    };
+    let mut terms = Vec::new();
+    flatten_additive_signed(sum_side, 1.0, &mut terms);
+
+    let mut self_coeff: Option<Expr> = None;
+    let mut other_terms: Vec<Expr> = Vec::new();
+    for (sign, term) in &terms {
+      let mut matched = false;
+      for (j, name) in u_names.iter().enumerate() {
+        let Some((coeff, t_arg, x_arg)) = match_flux_term(term, name, swap)
+        else {
+          continue;
+        };
+        if !matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+          || !nval_to_f64(&x_arg)
+            .is_some_and(|v| (v - x0).abs() <= 1e-9 * x0.abs().max(1.0))
+        {
+          return None;
+        }
+        let signed_coeff = if *sign > 0.0 { coeff } else { neg_expr(coeff) };
+        if j == target_idx {
+          if self_coeff.is_some() {
+            return None; // the target's own flux appears more than once.
+          }
+          self_coeff = Some(signed_coeff);
+        } else {
+          if j >= raw_specs.len() {
+            return None; // that unknown's own condition isn't resolved yet.
+          }
+          let other_bc = if at_lo {
+            &raw_specs[j].bc_lo
+          } else {
+            &raw_specs[j].bc_hi
+          };
+          let PdeBc::Neumann(other_flux_expr) = other_bc else {
+            return None; // a Dirichlet boundary has no flux to substitute.
+          };
+          other_terms.push(mul_expr(signed_coeff, other_flux_expr.clone()));
+        }
+        matched = true;
+        break;
+      }
+      if !matched {
+        return None; // an unrecognised remainder term — outside this shape.
+      }
+    }
+    let self_coeff = self_coeff?;
+    let numerator = other_terms
+      .into_iter()
+      .reduce(add_expr)
+      .unwrap_or(Expr::Integer(0));
+    let negated = neg_expr(numerator);
+    let derived = if is_one_literal(&self_coeff) {
+      negated
+    } else {
+      div2(negated, self_coeff)
+    };
+    Some(PdeBc::Neumann(derived))
+  }
+
+  let mut raw_specs: Vec<RawSpec> = Vec::with_capacity(n);
+  for name in u_names {
+    let mut coeff_rhs: Option<(Expr, Expr)> = None;
+    let mut ic: Option<Expr> = None;
+    let mut bc_lo: Option<PdeBc> = None;
+    let mut bc_hi: Option<PdeBc> = None;
+    for (idx, eq) in eq_items.iter().enumerate() {
+      if claimed[idx] {
+        continue;
+      }
+      if coeff_rhs.is_none()
+        && let Some((coeff, rhs)) =
+          try_pde_evolution_term(eq, name, &t_dom.name, &x_dom.name, swap)
+        && !expr_references_any(&coeff, u_names)
+      {
+        coeff_rhs = Some((coeff, rhs));
+        claimed[idx] = true;
+        continue;
+      }
+      if ic.is_none()
+        && let Some(rhs) =
+          try_pde_initial_condition(eq, name, &x_dom.name, t_dom.min, swap)
+      {
+        ic = Some(rhs);
+        claimed[idx] = true;
+        continue;
+      }
+      if bc_lo.is_none()
+        && let Some(bc) =
+          try_pde_boundary_condition(eq, name, &t_dom.name, x_dom.min, swap)
+      {
+        bc_lo = Some(bc);
+        claimed[idx] = true;
+        continue;
+      }
+      if bc_hi.is_none()
+        && let Some(bc) =
+          try_pde_boundary_condition(eq, name, &t_dom.name, x_dom.max, swap)
+      {
+        bc_hi = Some(bc);
+        claimed[idx] = true;
+        continue;
+      }
+      if bc_lo.is_none()
+        && let Some(bc) = try_coupled_flux_bc(
+          eq,
+          raw_specs.len(),
+          u_names,
+          &raw_specs,
+          &t_dom.name,
+          x_dom.min,
+          true,
+          swap,
+        )
+      {
+        bc_lo = Some(bc);
+        claimed[idx] = true;
+        continue;
+      }
+      if bc_hi.is_none()
+        && let Some(bc) = try_coupled_flux_bc(
+          eq,
+          raw_specs.len(),
+          u_names,
+          &raw_specs,
+          &t_dom.name,
+          x_dom.max,
+          false,
+          swap,
+        )
+      {
+        bc_hi = Some(bc);
+        claimed[idx] = true;
+      }
+    }
+    let (Some((coeff, rhs)), Some(ic), Some(bc_lo), Some(bc_hi)) =
+      (coeff_rhs, ic, bc_lo, bc_hi)
+    else {
+      return Ok(None);
+    };
+    raw_specs.push(RawSpec {
+      coeff,
+      rhs,
+      ic,
+      bc_lo,
+      bc_hi,
+    });
+  }
+  if claimed.iter().any(|&c| !c) {
+    return Ok(None);
+  }
+
+  let rhs_vars: Vec<String> = (0..n)
+    .map(|j| format!("NDSolve$U{j}"))
+    .chain(["NDSolve$UX".to_string(), "NDSolve$UXX".to_string()])
+    .chain([t_dom.name.clone(), x_dom.name.clone()])
+    .collect();
+  let bc_rhs_vars: Vec<String> = std::iter::once(t_dom.name.clone())
+    .chain((0..n).map(|j| format!("NDSolve$U{j}")))
+    .collect();
+
+  let mut unknowns: Vec<PdeUnknown> = Vec::with_capacity(n);
+  for (i, spec) in raw_specs.into_iter().enumerate() {
+    let Some(rhs_placeholder) =
+      rewrite_pde_rhs(&spec.rhs, u_names, i, &t_dom.name, &x_dom.name, swap)
+    else {
+      return Ok(None);
+    };
+    let coeff_fn =
+      NumFn::new(spec.coeff, &[t_dom.name.clone(), x_dom.name.clone()]);
+    let rhs_fn = NumFn::new(rhs_placeholder, &rhs_vars);
+    let ic_fn = NumFn::new(spec.ic, std::slice::from_ref(&x_dom.name));
+    let bc_lo = match spec.bc_lo {
+      PdeBc::Dirichlet(rhs) => PdeBoundaryFn::Dirichlet(NumFn::new(
+        rhs,
+        std::slice::from_ref(&t_dom.name),
+      )),
+      PdeBc::Neumann(rhs) => {
+        let Some(rewritten) =
+          rewrite_pde_bc_rhs(&rhs, u_names, &t_dom.name, x_dom.min, swap)
+        else {
+          return Ok(None);
+        };
+        PdeBoundaryFn::Neumann(NumFn::new(rewritten, &bc_rhs_vars))
+      }
+      // The coupled-system solver doesn't attempt a periodic domain; only
+      // the hyperbolic solver (`compile_hyperbolic_boundary`) does.
+      PdeBc::Periodic => return Ok(None),
+    };
+    let bc_hi = match spec.bc_hi {
+      PdeBc::Dirichlet(rhs) => PdeBoundaryFn::Dirichlet(NumFn::new(
+        rhs,
+        std::slice::from_ref(&t_dom.name),
+      )),
+      PdeBc::Neumann(rhs) => {
+        let Some(rewritten) =
+          rewrite_pde_bc_rhs(&rhs, u_names, &t_dom.name, x_dom.max, swap)
+        else {
+          return Ok(None);
+        };
+        PdeBoundaryFn::Neumann(NumFn::new(rewritten, &bc_rhs_vars))
+      }
+      PdeBc::Periodic => return Ok(None),
+    };
+    unknowns.push(PdeUnknown {
+      coeff_fn,
+      rhs_fn,
+      ic_fn,
+      bc_lo,
+      bc_hi,
+    });
+  }
+
+  const N_X: usize = 41;
+  let dx = (x_dom.max - x_dom.min) / (N_X - 1) as f64;
+  let xs: Vec<f64> = (0..N_X).map(|i| x_dom.min + i as f64 * dx).collect();
+
+  // Each unknown's coefficient is floored relative to its own scale over
+  // the domain (rather than to a fixed absolute constant), so a
+  // coefficient that vanishes at a boundary — the no-slip velocity at a
+  // channel wall, say — is regularized to a large but bounded rate there
+  // instead of spiking arbitrarily close to a division by zero.
+  // The coefficient's dominant sign, read off from whichever sampled point
+  // has its largest magnitude — used below instead of a floored-near-zero
+  // sample's own sign, which is floating-point noise (e.g. evaluating to
+  // -1e-15 rather than the mathematically exact 0 at a coefficient's own
+  // zero) and would otherwise flip that grid point's evolution equation
+  // from stable diffusion to unstable anti-diffusion.
+  let (coeff_floors, coeff_signs): (Vec<f64>, Vec<f64>) = unknowns
+    .iter()
+    .map(|u| {
+      let samples: Vec<f64> = xs
+        .iter()
+        .filter_map(|&x| u.coeff_fn.eval(&[t_dom.min, x]).ok())
+        .collect();
+      let peak = samples
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+      let sign = samples
+        .iter()
+        .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+        .map_or(1.0, |v| if *v < 0.0 { -1.0 } else { 1.0 });
+      ((peak * 5e-1).max(1e-9), sign)
+    })
+    .collect();
+
+  // The grid index range each unknown integrates directly: a Dirichlet
+  // boundary is fixed via its `NumFn` each step, so it's excluded; a
+  // Neumann boundary has no such formula and is integrated like an
+  // interior point instead.
+  let free_lo: Vec<usize> = unknowns
+    .iter()
+    .map(|u| usize::from(!matches!(u.bc_lo, PdeBoundaryFn::Neumann(_))))
+    .collect();
+  let free_hi: Vec<usize> = unknowns
+    .iter()
+    .map(|u| {
+      if matches!(u.bc_hi, PdeBoundaryFn::Neumann(_)) {
+        N_X - 1
+      } else {
+        N_X - 2
+      }
+    })
+    .collect();
+  let free_len: Vec<usize> =
+    (0..n).map(|i| free_hi[i] + 1 - free_lo[i]).collect();
+  let offset: Vec<usize> = {
+    let mut acc = 0;
+    (0..n)
+      .map(|i| {
+        let o = acc;
+        acc += free_len[i];
+        o
+      })
+      .collect()
+  };
+  let total_len: usize = free_len.iter().sum();
+
+  // Divide a raw evolution RHS by its (possibly floored, see
+  // `coeff_floors` above) coefficient.
+  let scale = |raw: f64, coeff: f64, floor: f64, sign: f64| -> f64 {
+    let denom = if coeff.abs() < floor {
+      sign * floor
+    } else {
+      coeff
+    };
+    raw / denom
+  };
+
+  // Reconstruct unknown `i`'s full `N_X`-point profile from the combined
+  // integrated state, filling any Dirichlet boundary from its `NumFn`.
+  let full_of =
+    |i: usize, state: &[f64], t: f64| -> Result<Vec<f64>, InterpreterError> {
+      let mut full = vec![0.0; N_X];
+      for (k, gi) in (free_lo[i]..=free_hi[i]).enumerate() {
+        full[gi] = state[offset[i] + k];
+      }
+      if let PdeBoundaryFn::Dirichlet(f) = &unknowns[i].bc_lo {
+        full[0] = f.eval(&[t])?;
+      }
+      if let PdeBoundaryFn::Dirichlet(f) = &unknowns[i].bc_hi {
+        full[N_X - 1] = f.eval(&[t])?;
+      }
+      Ok(full)
+    };
+
+  let derivative =
+    |t: f64, state: &[f64]| -> Result<Vec<f64>, InterpreterError> {
+      let fulls: Vec<Vec<f64>> = (0..n)
+        .map(|i| full_of(i, state, t))
+        .collect::<Result<_, _>>()?;
+      let mut out = vec![0.0; total_len];
+      for i in 0..n {
+        for (k, gi) in (free_lo[i]..=free_hi[i]).enumerate() {
+          let (ux, uxx) = if gi == 0 {
+            let PdeBoundaryFn::Neumann(f) = &unknowns[i].bc_lo else {
+              unreachable!("a Dirichlet lo boundary is never a free index")
+            };
+            let bc_args: Vec<f64> = std::iter::once(t)
+              .chain((0..n).map(|k2| fulls[k2][gi]))
+              .collect();
+            let flux = f.eval(&bc_args)?;
+            let ghost = fulls[i][1] - 2.0 * dx * flux;
+            (
+              (fulls[i][1] - ghost) / (2.0 * dx),
+              (fulls[i][1] - 2.0 * fulls[i][0] + ghost) / (dx * dx),
+            )
+          } else if gi == N_X - 1 {
+            let PdeBoundaryFn::Neumann(f) = &unknowns[i].bc_hi else {
+              unreachable!("a Dirichlet hi boundary is never a free index")
+            };
+            let bc_args: Vec<f64> = std::iter::once(t)
+              .chain((0..n).map(|k2| fulls[k2][gi]))
+              .collect();
+            let flux = f.eval(&bc_args)?;
+            let ghost = fulls[i][N_X - 2] + 2.0 * dx * flux;
+            (
+              (ghost - fulls[i][N_X - 2]) / (2.0 * dx),
+              (ghost - 2.0 * fulls[i][N_X - 1] + fulls[i][N_X - 2]) / (dx * dx),
+            )
+          } else {
+            (
+              (fulls[i][gi + 1] - fulls[i][gi - 1]) / (2.0 * dx),
+              (fulls[i][gi + 1] - 2.0 * fulls[i][gi] + fulls[i][gi - 1])
+                / (dx * dx),
+            )
+          };
+          let mut vars: Vec<f64> = (0..n).map(|k2| fulls[k2][gi]).collect();
+          vars.push(ux);
+          vars.push(uxx);
+          vars.push(t);
+          vars.push(xs[gi]);
+          let raw = unknowns[i].rhs_fn.eval(&vars)?;
+          let coeff = unknowns[i].coeff_fn.eval(&[t, xs[gi]])?;
+          let scaled = scale(raw, coeff, coeff_floors[i], coeff_signs[i]);
+          out[offset[i] + k] = scaled;
+        }
+      }
+      Ok(out)
+    };
+
+  let mut full0: Vec<Vec<f64>> = Vec::with_capacity(n);
+  for u in &unknowns {
+    let mut row = Vec::with_capacity(N_X);
+    for &x in &xs {
+      row.push(u.ic_fn.eval(&[x])?);
+    }
+    if let PdeBoundaryFn::Dirichlet(f) = &u.bc_lo {
+      row[0] = f.eval(&[t_dom.min])?;
+    }
+    if let PdeBoundaryFn::Dirichlet(f) = &u.bc_hi {
+      row[N_X - 1] = f.eval(&[t_dom.min])?;
+    }
+    full0.push(row);
+  }
+
+  // Effective diffusivity per unknown, read off its RHS's dependence on
+  // `NDSolve$UXX` (divided by its coefficient), to size a stable explicit
+  // time step (a von Neumann/CFL-type bound). Sampled at every grid point
+  // rather than just the midpoint: a coefficient that varies over the
+  // domain (and especially one that's floored near a vanishing point, see
+  // `coeff_floors` above) can need a far smaller step there than its
+  // domain-average would suggest. Falls back to a small floor when an
+  // unknown's PDE has (almost) no `NDSolve$UXX` dependence at all.
+  let mut dt_stable = f64::INFINITY;
+  for (i, u) in unknowns.iter().enumerate() {
+    for (j, &x) in xs.iter().enumerate() {
+      let mut probe_lo: Vec<f64> = (0..n).map(|k| full0[k][j]).collect();
+      probe_lo.push(0.0);
+      probe_lo.push(0.0);
+      probe_lo.push(t_dom.min);
+      probe_lo.push(x);
+      let mut probe_hi = probe_lo.clone();
+      probe_hi[n + 1] = 1.0;
+      let raw_c_eff =
+        (u.rhs_fn.eval(&probe_hi)? - u.rhs_fn.eval(&probe_lo)?).max(1e-9);
+      let coeff = u.coeff_fn.eval(&[t_dom.min, x])?.abs().max(coeff_floors[i]);
+      let c_eff = (raw_c_eff / coeff).max(1e-9);
+      dt_stable = dt_stable.min(0.4 * dx * dx / c_eff);
+    }
+  }
+  // The diffusive bound alone can leave the boundary conditions' own time
+  // variation (a seasonal `Sin[2 Pi t/period]` forcing, say) badly
+  // undersampled even though the scheme stays numerically stable, so the
+  // step count is also floored well above what a smooth time-dependent
+  // boundary needs to be resolved.
+  const MIN_STEPS: usize = 200;
+  let n_steps = (((t_dom.max - t_dom.min) / dt_stable).ceil() as usize)
+    .clamp(MIN_STEPS, 200_000);
+  let dt = (t_dom.max - t_dom.min) / n_steps as f64;
+
+  // The fine step count above is sized for integration accuracy and
+  // stability, not for how many rows an `InterpolatingFunction` needs to
+  // represent a smooth solution — and every stored row is a separate
+  // heap-allocated list that later gets cloned whole on every lookup (a
+  // `ContourPlot` alone samples on the order of 10,000 points), so only
+  // every `stride`-th step's row is kept, with the true endpoint always
+  // included.
+  const OUTPUT_ROWS: usize = 60;
+  let stride = (n_steps / OUTPUT_ROWS).max(1);
+  let mut grids: Vec<Vec<Vec<f64>>> =
+    (0..n).map(|i| vec![full0[i].clone()]).collect();
+  let mut ts: Vec<f64> = Vec::with_capacity(n_steps / stride + 2);
+  ts.push(t_dom.min);
+  let mut state: Vec<f64> = Vec::with_capacity(total_len);
+  for (i, row) in full0.iter().enumerate() {
+    state.extend(row[free_lo[i]..=free_hi[i]].iter().copied());
+  }
+  let mut t = t_dom.min;
+  for step in 0..n_steps {
+    let k1 = derivative(t, &state)?;
+    let s2: Vec<f64> = state
+      .iter()
+      .zip(&k1)
+      .map(|(y, k)| y + 0.5 * dt * k)
+      .collect();
+    let k2 = derivative(t + 0.5 * dt, &s2)?;
+    let s3: Vec<f64> = state
+      .iter()
+      .zip(&k2)
+      .map(|(y, k)| y + 0.5 * dt * k)
+      .collect();
+    let k3 = derivative(t + 0.5 * dt, &s3)?;
+    let s4: Vec<f64> = state.iter().zip(&k3).map(|(y, k)| y + dt * k).collect();
+    let k4 = derivative(t + dt, &s4)?;
+    for idx in 0..state.len() {
+      state[idx] +=
+        dt / 6.0 * (k1[idx] + 2.0 * k2[idx] + 2.0 * k3[idx] + k4[idx]);
+    }
+    t += dt;
+    let is_last = step + 1 == n_steps;
+    if (step + 1) % stride == 0 || is_last {
+      for (i, g) in grids.iter_mut().enumerate() {
+        g.push(full_of(i, &state, t)?);
+      }
+      ts.push(t);
+    }
+  }
+
+  // The output `InterpolatingFunction`s' first dimension must match
+  // `dim0_dom` — the domain declared first in the `NDSolve` call —
+  // regardless of which domain played the time-like solving role above.
+  let t_is_dim0 = t_dom.name == dim0_dom.name;
+  let (dim0, dim1) = if t_is_dim0 {
+    (t_dom, x_dom)
+  } else {
+    (x_dom, t_dom)
+  };
+  let (dim0_coords, dim1_coords) =
+    if t_is_dim0 { (&ts, &xs) } else { (&xs, &ts) };
+  let domain = Expr::List(
+    vec![
+      Expr::List(vec![Expr::Real(dim0.min), Expr::Real(dim0.max)].into()),
+      Expr::List(vec![Expr::Real(dim1.min), Expr::Real(dim1.max)].into()),
+    ]
+    .into(),
+  );
+  let orders = Expr::List(vec![Expr::Integer(1), Expr::Integer(1)].into());
+  let coords = Expr::List(
+    vec![
+      Expr::List(dim0_coords.iter().map(|v| Expr::Real(*v)).collect()),
+      Expr::List(dim1_coords.iter().map(|v| Expr::Real(*v)).collect()),
+    ]
+    .into(),
+  );
+
+  let mut rules = Vec::with_capacity(n);
+  for (i, name) in u_names.iter().enumerate() {
+    let grid = if t_is_dim0 {
+      grids[i].clone()
+    } else {
+      transpose_grid(&grids[i])
+    };
+    let grid_expr = Expr::List(
+      grid
+        .iter()
+        .map(|row| Expr::List(row.iter().map(|v| Expr::Real(*v)).collect()))
+        .collect(),
+    );
+    let interp = call(
+      "InterpolatingFunction",
+      vec![domain.clone(), grid_expr, orders.clone(), coords.clone()],
+    );
+    rules.push(Expr::Rule {
+      pattern: Box::new(Expr::Identifier(name.clone())),
+      replacement: Box::new(interp),
+    });
+  }
+  Ok(Some(Expr::List(vec![Expr::List(rules.into())].into())))
+}
+
+/// Transpose a rectangular grid of rows into columns — used to reorient a
+/// `[time-index][space-index]` solve grid into the `[dim0][dim1]` layout an
+/// `InterpolatingFunction` expects when the space-like variable is `dim0`.
+fn transpose_grid(grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
+  if grid.is_empty() {
+    return Vec::new();
+  }
+  let cols = grid[0].len();
+  (0..cols)
+    .map(|c| grid.iter().map(|row| row[c]).collect())
+    .collect()
+}
+
+// ─── Hyperbolic PDE NDSolve (order reduction + implicit method of lines) ──
+
+/// `NDSolve[eqns, u, {t domain}, {x domain}]` for a single hyperbolic
+/// (second-order-in-time) 1-D PDE `Derivative[2, 0][u][t, x] == rhs`,
+/// where `rhs` may reference `u` and its pure space derivatives (up to
+/// second order), the velocity field `Derivative[1, 0][u]` and its own
+/// pure space derivatives, and even the acceleration field itself —
+/// `Derivative[2, 0][u]` — and *its* space derivatives, so long as the
+/// dependence on the acceleration field is linear. That last shape is
+/// what a wave-type equation with mixed space/time derivatives on the
+/// right looks like once it's written out, e.g. the Wolfram Demonstration
+/// "A Passive Cochlear Model"'s
+/// `D[u[t,x],t,t] == a(x) (D[u,x,x]-…) + b(x) (D[u,x,x,t]-…) + c (D[u,x,x,t,t]-…)`.
+///
+/// The equation is reduced to the first-order system `D[u,t] == v`,
+/// `D[v,t] == w`; substituting these into `rhs` turns every mixed
+/// derivative with one time derivative into a pure space derivative of
+/// `v`, and every one with two into a pure space derivative of `w`
+/// itself — the very quantity being solved for. At each method-of-lines
+/// step, `w`'s grid values are eliminated by solving the tridiagonal
+/// linear relation the (linear-in-`w`) equation implies, via
+/// [`solve_tridiagonal`], rather than by evaluating an explicit formula
+/// as the first-order-in-time branch (`try_solve_pde_system`) does.
+///
+/// Needs exactly five equations: the evolution equation, an initial value
+/// `u(t0, x) == f(x)`, an initial velocity `D[u, t](t0, x) == g(x)`, and a
+/// Dirichlet or Neumann boundary condition at each end of the space
+/// domain. Only a single dependent function is supported (no coupled
+/// hyperbolic systems). Returns `Ok(None)` when the equations aren't in
+/// that shape, or the right-hand side isn't linear in the acceleration
+/// field, so the caller leaves the call unevaluated.
+fn ndsolve_pde_hyperbolic(
+  args: &[Expr],
+) -> Result<Option<Expr>, InterpreterError> {
+  let Expr::Identifier(u_name) = &args[1] else {
+    return Ok(None);
+  };
+  let Some(dom_a) = parse_pde_domain(&args[2]) else {
+    return Ok(None);
+  };
+  let Some(dom_b) = parse_pde_domain(&args[3]) else {
+    return Ok(None);
+  };
+
+  let eq_items: Vec<Expr> = match &args[0] {
+    Expr::List(items) => items.to_vec(),
+    other => vec![other.clone()],
+  };
+  let eq_items = flatten_chained_equalities(&eq_items);
+  // Normally 5: the evolution equation, both initial conditions, and one
+  // boundary condition per end. A periodic boundary (`u[t, xmin] == u[t,
+  // xmax]`) ties both ends together in a single equation, so that shape
+  // has only 4.
+  if eq_items.len() != 5 && eq_items.len() != 4 {
+    return Ok(None);
+  }
+
+  for (t_dom, x_dom) in [(&dom_a, &dom_b), (&dom_b, &dom_a)] {
+    for swap in [false, true] {
+      if let Some(result) =
+        try_solve_hyperbolic_pde(&eq_items, u_name, t_dom, x_dom, &dom_a, swap)?
+      {
+        return Ok(Some(result));
+      }
+    }
+  }
+  Ok(None)
+}
+
+/// Rewrite a hyperbolic PDE's right-hand side into the placeholder
+/// identifiers `try_solve_hyperbolic_pde` compiles numeric values into:
+/// `u`'s own value and its first/second space derivative become
+/// `NDSolve$U`/`NDSolve$UX`/`NDSolve$UXX`; the velocity field
+/// `Derivative[1, 0][u]` and its space derivatives become
+/// `NDSolve$V`/`NDSolve$VX`/`NDSolve$VXX`; and the acceleration field
+/// `Derivative[2, 0][u]` and its space derivatives become
+/// `NDSolve$W`/`NDSolve$WX`/`NDSolve$WXX`. Returns `None` for any other
+/// derivative shape (a third time derivative, a derivative at a point
+/// other than `(t, x)`, …) this solver doesn't attempt.
+fn rewrite_pde_rhs_hyperbolic(
+  expr: &Expr,
+  u_name: &str,
+  t_name: &str,
+  x_name: &str,
+  swap: bool,
+) -> Option<Expr> {
+  if let Some((dt, dx, t_arg, x_arg)) = match_pde_term_roles(expr, u_name, swap)
+  {
+    if !matches!(&t_arg, Expr::Identifier(n) if n == t_name)
+      || !matches!(&x_arg, Expr::Identifier(n) if n == x_name)
+    {
+      return None;
+    }
+    let placeholder = match (dt, dx) {
+      (0, 0) => "NDSolve$U",
+      (0, 1) => "NDSolve$UX",
+      (0, 2) => "NDSolve$UXX",
+      (1, 0) => "NDSolve$V",
+      (1, 1) => "NDSolve$VX",
+      (1, 2) => "NDSolve$VXX",
+      (2, 0) => "NDSolve$W",
+      (2, 1) => "NDSolve$WX",
+      (2, 2) => "NDSolve$WXX",
+      _ => return None,
+    };
+    return Some(Expr::Identifier(placeholder.to_string()));
+  }
+  let failed = std::cell::Cell::new(false);
+  let mapped = map_children(expr, &|c| {
+    if failed.get() {
+      return c.clone();
+    }
+    if let Some(r) = rewrite_pde_rhs_hyperbolic(c, u_name, t_name, x_name, swap)
+    {
+      r
+    } else {
+      failed.set(true);
+      c.clone()
+    }
+  });
+  if failed.get() { None } else { Some(mapped) }
+}
+
+/// Whether `expr` contains the bare identifier `name` anywhere in its
+/// tree — used to confirm a coefficient extracted by differentiating a
+/// linear expression really did lose all dependence on the variable
+/// differentiated against (see `try_solve_hyperbolic_pde`'s linearity
+/// check).
+fn expr_contains_ident(expr: &Expr, name: &str) -> bool {
+  if matches!(expr, Expr::Identifier(n) if n == name) {
+    return true;
+  }
+  expr_children(expr)
+    .iter()
+    .any(|c| expr_contains_ident(c, name))
+}
+
+/// Solve the tridiagonal system with sub-diagonal `a` (`a[0]` unused),
+/// diagonal `b`, super-diagonal `c` (`c[last]` unused), and right-hand
+/// side `d` — all the same length — via the Thomas algorithm.
+fn solve_tridiagonal(a: &[f64], b: &[f64], c: &[f64], d: &[f64]) -> Vec<f64> {
+  let n = b.len();
+  if n == 0 {
+    return Vec::new();
+  }
+  let mut cp = vec![0.0; n];
+  let mut dp = vec![0.0; n];
+  cp[0] = c[0] / b[0];
+  dp[0] = d[0] / b[0];
+  for i in 1..n {
+    let m = b[i] - a[i] * cp[i - 1];
+    cp[i] = if i + 1 < n { c[i] / m } else { 0.0 };
+    dp[i] = (d[i] - a[i] * dp[i - 1]) / m;
+  }
+  let mut x = vec![0.0; n];
+  x[n - 1] = dp[n - 1];
+  for i in (0..n - 1).rev() {
+    x[i] = dp[i] - cp[i] * x[i + 1];
+  }
+  x
+}
+
+/// Solve a periodic ("cyclic") tridiagonal system: like `solve_tridiagonal`,
+/// but row `n - 1`'s sub-diagonal wraps around to column `0` with
+/// coefficient `alpha`, and row `0`'s super-diagonal wraps around to
+/// column `n - 1` with coefficient `beta`. Uses the Sherman-Morrison trick
+/// (Numerical Recipes' "cyclic" routine): absorb the two corner entries
+/// into a rank-1 update of an ordinary tridiagonal system, solve that twice
+/// (once for the real right-hand side, once for the update vector), then
+/// combine the two solutions to cancel the update back out.
+fn solve_cyclic_tridiagonal(
+  a: &[f64],
+  b: &[f64],
+  c: &[f64],
+  d: &[f64],
+  alpha: f64,
+  beta: f64,
+) -> Vec<f64> {
+  let n = b.len();
+  if n == 1 {
+    return vec![d[0] / (b[0] + alpha + beta)];
+  }
+  let gamma = -b[0];
+  let mut b2 = b.to_vec();
+  b2[0] -= gamma;
+  b2[n - 1] -= alpha * beta / gamma;
+  let x = solve_tridiagonal(a, &b2, c, d);
+  let mut u = vec![0.0; n];
+  u[0] = gamma;
+  u[n - 1] = alpha;
+  let z = solve_tridiagonal(a, &b2, c, &u);
+  let fact =
+    (x[0] + beta * x[n - 1] / gamma) / (1.0 + z[0] + beta * z[n - 1] / gamma);
+  x.iter().zip(&z).map(|(xi, zi)| xi - fact * zi).collect()
+}
+
+/// One field's (`u`, `v`, or `w`) compiled boundary condition at one end
+/// of the space domain, mirroring `u`'s own condition kind: `v = D[u,t]`'s
+/// right-hand side is `u`'s own boundary value differentiated once with
+/// respect to time, and `w = D[u,t,t]`'s is differentiated twice — a
+/// Dirichlet boundary stays Dirichlet, a Neumann flux stays Neumann.
+struct HyperbolicBoundary {
+  u: PdeBoundaryFn,
+  v: PdeBoundaryFn,
+  w: PdeBoundaryFn,
+}
+
+fn compile_hyperbolic_boundary(
+  bc: PdeBc,
+  u_name: &str,
+  t_name: &str,
+) -> Result<Option<HyperbolicBoundary>, InterpreterError> {
+  let t_vars = vec![t_name.to_string()];
+  match bc {
+    PdeBc::Dirichlet(rhs) => {
+      let d1 = differentiate_expr(&rhs, t_name)?;
+      let d2 = differentiate_expr(&d1, t_name)?;
+      Ok(Some(HyperbolicBoundary {
+        u: PdeBoundaryFn::Dirichlet(NumFn::new(rhs, &t_vars)),
+        v: PdeBoundaryFn::Dirichlet(NumFn::new(d1, &t_vars)),
+        w: PdeBoundaryFn::Dirichlet(NumFn::new(d2, &t_vars)),
+      }))
+    }
+    PdeBc::Neumann(rhs) => {
+      // Single dependent function: a flux depending on the unknown itself
+      // (a Robin-type condition) is outside this solver's scope.
+      let u_names_single = [u_name.to_string()];
+      if expr_references_any(&rhs, &u_names_single) {
+        return Ok(None);
+      }
+      let d1 = differentiate_expr(&rhs, t_name)?;
+      let d2 = differentiate_expr(&d1, t_name)?;
+      Ok(Some(HyperbolicBoundary {
+        u: PdeBoundaryFn::Neumann(NumFn::new(rhs, &t_vars)),
+        v: PdeBoundaryFn::Neumann(NumFn::new(d1, &t_vars)),
+        w: PdeBoundaryFn::Neumann(NumFn::new(d2, &t_vars)),
+      }))
+    }
+    PdeBc::Periodic => Ok(Some(HyperbolicBoundary {
+      u: PdeBoundaryFn::Periodic,
+      v: PdeBoundaryFn::Periodic,
+      w: PdeBoundaryFn::Periodic,
+    })),
+  }
+}
+
+/// Reconstruct a field's full `N_X`-point profile from its combined
+/// integrated free values, filling a Dirichlet boundary from its own
+/// `NumFn`. Mirrors `try_solve_pde_system`'s `full_of` closure, adapted
+/// to a single field/domain pair.
+fn reconstruct_pde_profile(
+  free_vals: &[f64],
+  free_lo: usize,
+  free_hi: usize,
+  n_x: usize,
+  bc_lo: &PdeBoundaryFn,
+  bc_hi: &PdeBoundaryFn,
+  t: f64,
+) -> Result<Vec<f64>, InterpreterError> {
+  let mut full = vec![0.0; n_x];
+  for (k, gi) in (free_lo..=free_hi).enumerate() {
+    full[gi] = free_vals[k];
+  }
+  if let PdeBoundaryFn::Dirichlet(f) = bc_lo {
+    full[0] = f.eval(&[t])?;
+  }
+  if let PdeBoundaryFn::Dirichlet(f) = bc_hi {
+    full[n_x - 1] = f.eval(&[t])?;
+  }
+  // A periodic domain's last grid point is never itself an integrated/free
+  // index (`free_hi` stops one short of it, at `n_x - 2`, to avoid solving
+  // for the same point twice) — it just mirrors the first.
+  if matches!(bc_lo, PdeBoundaryFn::Periodic) {
+    full[n_x - 1] = full[0];
+  }
+  Ok(full)
+}
+
+/// First and second space-derivative of a field at grid index `gi`, via
+/// central differences at an interior point or, at a boundary carrying a
+/// Neumann condition, a ghost point built from the boundary's own flux
+/// value — mirrors `try_solve_pde_system`'s `derivative` closure's own
+/// boundary handling. `bc_lo`/`bc_hi` are never `Dirichlet` when `gi` is
+/// `0`/`n_x - 1` respectively (those indices are excluded from the
+/// free/solved range in that case).
+fn pde_space_derivs(
+  full: &[f64],
+  gi: usize,
+  dx: f64,
+  bc_lo: &PdeBoundaryFn,
+  bc_hi: &PdeBoundaryFn,
+  t: f64,
+) -> Result<(f64, f64), InterpreterError> {
+  let n_x = full.len();
+  if gi == 0 && matches!(bc_lo, PdeBoundaryFn::Periodic) {
+    // The periodic "ghost" below index 0 is the domain's other end, which
+    // `reconstruct_pde_profile` has already mirrored into `full[n_x - 1]`
+    // — but that's the *duplicate* of index 0 itself, so the true wrapped
+    // neighbor is one step further in, at `n_x - 2` (the last genuinely
+    // free/solved index).
+    let lo = full[n_x - 2];
+    Ok((
+      (full[1] - lo) / (2.0 * dx),
+      (full[1] - 2.0 * full[0] + lo) / (dx * dx),
+    ))
+  } else if gi == 0 {
+    let PdeBoundaryFn::Neumann(f) = bc_lo else {
+      unreachable!("a Dirichlet lo boundary is never a free index")
+    };
+    let flux = f.eval(&[t])?;
+    let ghost = full[1] - 2.0 * dx * flux;
+    Ok((flux, (full[1] - 2.0 * full[0] + ghost) / (dx * dx)))
+  } else if gi == n_x - 1 {
+    let PdeBoundaryFn::Neumann(f) = bc_hi else {
+      unreachable!("a Dirichlet hi boundary is never a free index")
+    };
+    let flux = f.eval(&[t])?;
+    let ghost = full[n_x - 2] + 2.0 * dx * flux;
+    Ok((
+      flux,
+      (ghost - 2.0 * full[n_x - 1] + full[n_x - 2]) / (dx * dx),
+    ))
+  } else {
+    Ok((
+      (full[gi + 1] - full[gi - 1]) / (2.0 * dx),
+      (full[gi + 1] - 2.0 * full[gi] + full[gi - 1]) / (dx * dx),
+    ))
+  }
+}
+
+/// Attempt to match and solve the hyperbolic PDE with `t_dom` as the
+/// time-like (integrated) domain and `x_dom` as the space-like (gridded)
+/// one — see [`ndsolve_pde_hyperbolic`]. Returns `Ok(None)` when the
+/// equations don't fit this role assignment.
+fn try_solve_hyperbolic_pde(
+  eq_items: &[Expr],
+  u_name: &str,
+  t_dom: &PdeDomain,
+  x_dom: &PdeDomain,
+  dim0_dom: &PdeDomain,
+  swap: bool,
+) -> Result<Option<Expr>, InterpreterError> {
+  let mut evolution_rhs: Option<Expr> = None;
+  let mut ic_pos: Option<Expr> = None;
+  let mut ic_vel: Option<Expr> = None;
+  let mut bc_lo: Option<PdeBc> = None;
+  let mut bc_hi: Option<PdeBc> = None;
+
+  for eq in eq_items {
+    if evolution_rhs.is_none()
+      && let Some(rhs) = try_pde_evolution_term_order2(
+        eq,
+        u_name,
+        &t_dom.name,
+        &x_dom.name,
+        swap,
+      )
+    {
+      evolution_rhs = Some(rhs);
+      continue;
+    }
+    if ic_pos.is_none()
+      && let Some(rhs) =
+        try_pde_initial_condition(eq, u_name, &x_dom.name, t_dom.min, swap)
+    {
+      ic_pos = Some(rhs);
+      continue;
+    }
+    if ic_vel.is_none()
+      && let Some(rhs) = try_pde_initial_condition_ord(
+        eq,
+        u_name,
+        &x_dom.name,
+        t_dom.min,
+        1,
+        swap,
+      )
+    {
+      ic_vel = Some(rhs);
+      continue;
+    }
+    if bc_lo.is_none()
+      && bc_hi.is_none()
+      && try_pde_periodic_boundary(
+        eq,
+        u_name,
+        &t_dom.name,
+        x_dom.min,
+        x_dom.max,
+        swap,
+      )
+    {
+      bc_lo = Some(PdeBc::Periodic);
+      bc_hi = Some(PdeBc::Periodic);
+      continue;
+    }
+    if bc_lo.is_none()
+      && let Some(bc) =
+        try_pde_boundary_condition(eq, u_name, &t_dom.name, x_dom.min, swap)
+    {
+      bc_lo = Some(bc);
+      continue;
+    }
+    if bc_hi.is_none()
+      && let Some(bc) =
+        try_pde_boundary_condition(eq, u_name, &t_dom.name, x_dom.max, swap)
+    {
+      bc_hi = Some(bc);
+    }
+  }
+  let (Some(rhs), Some(ic_pos), Some(ic_vel), Some(bc_lo), Some(bc_hi)) =
+    (evolution_rhs, ic_pos, ic_vel, bc_lo, bc_hi)
+  else {
+    return Ok(None);
+  };
+
+  let Some(rewritten) =
+    rewrite_pde_rhs_hyperbolic(&rhs, u_name, &t_dom.name, &x_dom.name, swap)
+  else {
+    return Ok(None);
+  };
+
+  // Extract the acceleration field's linear coefficients (`c0` multiplies
+  // `w` itself, `c1` its first space derivative, `c2` its second) via
+  // symbolic differentiation, and verify the right-hand side really is
+  // linear in them: a coefficient that still references one of the three
+  // placeholders after differentiating it away means the dependence
+  // wasn't linear, a shape this solver doesn't attempt.
+  const W_VARS: [&str; 3] = ["NDSolve$W", "NDSolve$WX", "NDSolve$WXX"];
+  let mut coeffs = Vec::with_capacity(3);
+  for wv in W_VARS {
+    let c = differentiate_expr(&rewritten, wv)?;
+    if W_VARS.iter().any(|wv2| expr_contains_ident(&c, wv2)) {
+      return Ok(None);
+    }
+    coeffs.push(c);
+  }
+  let explicit_expr = crate::syntax::substitute_variables(
+    &rewritten,
+    &[
+      ("NDSolve$W", &Expr::Integer(0)),
+      ("NDSolve$WX", &Expr::Integer(0)),
+      ("NDSolve$WXX", &Expr::Integer(0)),
+    ],
+  );
+
+  let full_vars: Vec<String> = [
+    "NDSolve$U",
+    "NDSolve$UX",
+    "NDSolve$UXX",
+    "NDSolve$V",
+    "NDSolve$VX",
+    "NDSolve$VXX",
+  ]
+  .into_iter()
+  .map(String::from)
+  .chain([t_dom.name.clone(), x_dom.name.clone()])
+  .collect();
+
+  let explicit_fn = NumFn::new(explicit_expr, &full_vars);
+  let coeff0_fn = NumFn::new(coeffs[0].clone(), &full_vars);
+  let coeff1_fn = NumFn::new(coeffs[1].clone(), &full_vars);
+  let coeff2_fn = NumFn::new(coeffs[2].clone(), &full_vars);
+
+  let x_vars = vec![x_dom.name.clone()];
+  let ic_pos_fn = NumFn::new(ic_pos, &x_vars);
+  let ic_vel_fn = NumFn::new(ic_vel, &x_vars);
+
+  let Some(bnd_lo) = compile_hyperbolic_boundary(bc_lo, u_name, &t_dom.name)?
+  else {
+    return Ok(None);
+  };
+  let Some(bnd_hi) = compile_hyperbolic_boundary(bc_hi, u_name, &t_dom.name)?
+  else {
+    return Ok(None);
+  };
+
+  const N_X: usize = 41;
+  let dx = (x_dom.max - x_dom.min) / (N_X - 1) as f64;
+  let xs: Vec<f64> = (0..N_X).map(|i| x_dom.min + i as f64 * dx).collect();
+
+  // A periodic domain's last grid point duplicates the first (see
+  // `reconstruct_pde_profile`), so it's excluded from the free/solved
+  // range just like a Dirichlet boundary, even though it isn't fixed from
+  // an external `NumFn` the way a Dirichlet point is.
+  let free_lo = usize::from(matches!(bnd_lo.u, PdeBoundaryFn::Dirichlet(_)));
+  let free_hi = if matches!(bnd_hi.u, PdeBoundaryFn::Neumann(_)) {
+    N_X - 1
+  } else {
+    N_X - 2
+  };
+  let periodic = matches!(bnd_lo.u, PdeBoundaryFn::Periodic);
+  let free_len = free_hi + 1 - free_lo;
+  let total_len = 2 * free_len;
+
+  let derivative = |t: f64,
+                    state: &[f64]|
+   -> Result<Vec<f64>, InterpreterError> {
+    let u_full = reconstruct_pde_profile(
+      &state[..free_len],
+      free_lo,
+      free_hi,
+      N_X,
+      &bnd_lo.u,
+      &bnd_hi.u,
+      t,
+    )?;
+    let v_full = reconstruct_pde_profile(
+      &state[free_len..],
+      free_lo,
+      free_hi,
+      N_X,
+      &bnd_lo.v,
+      &bnd_hi.v,
+      t,
+    )?;
+
+    // Only the free/solved indices ever feed into the tridiagonal system
+    // below — a Dirichlet boundary's own index is fixed directly from its
+    // `NumFn` each step and never appears as a row or a neighbor there —
+    // so `pde_space_derivs` (which assumes index `0`/`N_X - 1` means a
+    // *Neumann* boundary) is never asked to differentiate at one.
+    let mut explicit = vec![0.0; N_X];
+    let mut c0 = vec![0.0; N_X];
+    let mut c1 = vec![0.0; N_X];
+    let mut c2 = vec![0.0; N_X];
+    for gi in free_lo..=free_hi {
+      let (ux, uxx) =
+        pde_space_derivs(&u_full, gi, dx, &bnd_lo.u, &bnd_hi.u, t)?;
+      let (vx, vxx) =
+        pde_space_derivs(&v_full, gi, dx, &bnd_lo.v, &bnd_hi.v, t)?;
+      let vars = [u_full[gi], ux, uxx, v_full[gi], vx, vxx, t, xs[gi]];
+      explicit[gi] = explicit_fn.eval(&vars)?;
+      c0[gi] = coeff0_fn.eval(&vars)?;
+      c1[gi] = coeff1_fn.eval(&vars)?;
+      c2[gi] = coeff2_fn.eval(&vars)?;
+    }
+
+    // Eliminate `w`'s free grid values from the linear relation
+    // `w == c0 w + c1 D[w,x] + c2 D[w,x,x] + explicit`, i.e.
+    // `(1 - c0) w - c1 D[w,x] - c2 D[w,x,x] == explicit`, via a
+    // tridiagonal solve.
+    let mut a = vec![0.0; free_len];
+    let mut b = vec![0.0; free_len];
+    let mut c = vec![0.0; free_len];
+    let mut d = vec![0.0; free_len];
+    // For a periodic domain, row 0's "lower" coupling and the last free
+    // row's "upper" coupling don't land on `a`/`c` at all — they wrap
+    // around to the *other* end of the array, which `solve_cyclic_tridiagonal`
+    // takes as separate corner coefficients instead.
+    let mut corner_lo = 0.0;
+    let mut corner_hi = 0.0;
+    for (k, gi) in (free_lo..=free_hi).enumerate() {
+      if gi == 0 && !periodic {
+        let PdeBoundaryFn::Neumann(f) = &bnd_lo.w else {
+          unreachable!("a Dirichlet lo boundary is never a free index")
+        };
+        let flux = f.eval(&[t])?;
+        b[k] = (1.0 - c0[gi]) + 2.0 * c2[gi] / (dx * dx);
+        c[k] = -2.0 * c2[gi] / (dx * dx);
+        d[k] = explicit[gi] + c1[gi] * flux - 2.0 * c2[gi] * flux / dx;
+      } else if gi == N_X - 1 && !periodic {
+        let PdeBoundaryFn::Neumann(f) = &bnd_hi.w else {
+          unreachable!("a Dirichlet hi boundary is never a free index")
+        };
+        let flux = f.eval(&[t])?;
+        a[k] = -2.0 * c2[gi] / (dx * dx);
+        b[k] = (1.0 - c0[gi]) + 2.0 * c2[gi] / (dx * dx);
+        d[k] = explicit[gi] + c1[gi] * flux + 2.0 * c2[gi] * flux / dx;
+      } else {
+        let ai = c1[gi] / (2.0 * dx) - c2[gi] / (dx * dx);
+        let bi = (1.0 - c0[gi]) + 2.0 * c2[gi] / (dx * dx);
+        let ci = -c1[gi] / (2.0 * dx) - c2[gi] / (dx * dx);
+        let mut di = explicit[gi];
+        if gi == free_lo && free_lo > 0 {
+          let PdeBoundaryFn::Dirichlet(f) = &bnd_lo.w else {
+            unreachable!("gi == free_lo > 0 means the lo boundary is Dirichlet")
+          };
+          di -= ai * f.eval(&[t])?;
+        } else if gi == 0 && periodic {
+          corner_lo = ai;
+        } else {
+          a[k] = ai;
+        }
+        if gi == free_hi && free_hi < N_X - 1 && !periodic {
+          let PdeBoundaryFn::Dirichlet(f) = &bnd_hi.w else {
+            unreachable!(
+              "gi == free_hi < N_X - 1 means the hi boundary is Dirichlet"
+            )
+          };
+          di -= ci * f.eval(&[t])?;
+        } else if gi == free_hi && periodic {
+          corner_hi = ci;
+        } else {
+          c[k] = ci;
+        }
+        b[k] = bi;
+        d[k] = di;
+      }
+    }
+    let w_free = if periodic {
+      solve_cyclic_tridiagonal(&a, &b, &c, &d, corner_hi, corner_lo)
+    } else {
+      solve_tridiagonal(&a, &b, &c, &d)
+    };
+
+    let mut out = vec![0.0; total_len];
+    for (k, gi) in (free_lo..=free_hi).enumerate() {
+      out[k] = v_full[gi];
+      out[free_len + k] = w_free[k];
+    }
+    Ok(out)
+  };
+
+  let mut u0_full = vec![0.0; N_X];
+  let mut v0_full = vec![0.0; N_X];
+  for (gi, &x) in xs.iter().enumerate() {
+    u0_full[gi] = ic_pos_fn.eval(&[x])?;
+    v0_full[gi] = ic_vel_fn.eval(&[x])?;
+  }
+  if let PdeBoundaryFn::Dirichlet(f) = &bnd_lo.u {
+    u0_full[0] = f.eval(&[t_dom.min])?;
+  }
+  if let PdeBoundaryFn::Dirichlet(f) = &bnd_hi.u {
+    u0_full[N_X - 1] = f.eval(&[t_dom.min])?;
+  }
+  if let PdeBoundaryFn::Dirichlet(f) = &bnd_lo.v {
+    v0_full[0] = f.eval(&[t_dom.min])?;
+  }
+  if let PdeBoundaryFn::Dirichlet(f) = &bnd_hi.v {
+    v0_full[N_X - 1] = f.eval(&[t_dom.min])?;
+  }
+
+  let mut state0: Vec<f64> = Vec::with_capacity(total_len);
+  state0.extend(u0_full[free_lo..=free_hi].iter().copied());
+  state0.extend(v0_full[free_lo..=free_hi].iter().copied());
+
+  // Effective diffusivity-like bound, read off the explicit right-hand
+  // side's sensitivity to `u`'s and `v`'s own second space derivative —
+  // mirrors `try_solve_pde_system`'s own CFL-type probe. The acceleration
+  // field's *implicit* dependence (`c0`/`c1`/`c2`) is excluded: an
+  // implicit elliptic solve relaxes the stability bound rather than
+  // tightening it, so the explicit terms' own diffusivity remains the
+  // binding constraint.
+  let mut dt_stable = f64::INFINITY;
+  for &x in &xs {
+    let base =
+      explicit_fn.eval(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, t_dom.min, x])?;
+    let du =
+      (explicit_fn.eval(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, t_dom.min, x])? - base)
+        .abs();
+    let dv =
+      (explicit_fn.eval(&[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, t_dom.min, x])? - base)
+        .abs();
+    let c_eff = du.max(dv).max(1e-9);
+    dt_stable = dt_stable.min(0.4 * dx * dx / c_eff);
+  }
+  const MIN_STEPS: usize = 200;
+  let n_steps = (((t_dom.max - t_dom.min) / dt_stable).ceil() as usize)
+    .clamp(MIN_STEPS, 200_000);
+  let dt = (t_dom.max - t_dom.min) / n_steps as f64;
+
+  const OUTPUT_ROWS: usize = 60;
+  let stride = (n_steps / OUTPUT_ROWS).max(1);
+  let mut ts: Vec<f64> = Vec::with_capacity(n_steps / stride + 2);
+  ts.push(t_dom.min);
+  let mut grid: Vec<Vec<f64>> = vec![reconstruct_pde_profile(
+    &state0[..free_len],
+    free_lo,
+    free_hi,
+    N_X,
+    &bnd_lo.u,
+    &bnd_hi.u,
+    t_dom.min,
+  )?];
+  let mut state = state0;
+  let mut t = t_dom.min;
+  for step in 0..n_steps {
+    let k1 = derivative(t, &state)?;
+    let s2: Vec<f64> = state
+      .iter()
+      .zip(&k1)
+      .map(|(y, k)| y + 0.5 * dt * k)
+      .collect();
+    let k2 = derivative(t + 0.5 * dt, &s2)?;
+    let s3: Vec<f64> = state
+      .iter()
+      .zip(&k2)
+      .map(|(y, k)| y + 0.5 * dt * k)
+      .collect();
+    let k3 = derivative(t + 0.5 * dt, &s3)?;
+    let s4: Vec<f64> = state.iter().zip(&k3).map(|(y, k)| y + dt * k).collect();
+    let k4 = derivative(t + dt, &s4)?;
+    for idx in 0..state.len() {
+      state[idx] +=
+        dt / 6.0 * (k1[idx] + 2.0 * k2[idx] + 2.0 * k3[idx] + k4[idx]);
+    }
+    t += dt;
+    let is_last = step + 1 == n_steps;
+    if (step + 1) % stride == 0 || is_last {
+      grid.push(reconstruct_pde_profile(
+        &state[..free_len],
+        free_lo,
+        free_hi,
+        N_X,
+        &bnd_lo.u,
+        &bnd_hi.u,
+        t,
+      )?);
+      ts.push(t);
+    }
+  }
+
+  let t_is_dim0 = t_dom.name == dim0_dom.name;
+  let (dim0, dim1) = if t_is_dim0 {
+    (t_dom, x_dom)
+  } else {
+    (x_dom, t_dom)
+  };
+  let (dim0_coords, dim1_coords) =
+    if t_is_dim0 { (&ts, &xs) } else { (&xs, &ts) };
+  let domain = Expr::List(
+    vec![
+      Expr::List(vec![Expr::Real(dim0.min), Expr::Real(dim0.max)].into()),
+      Expr::List(vec![Expr::Real(dim1.min), Expr::Real(dim1.max)].into()),
+    ]
+    .into(),
+  );
+  let orders = Expr::List(vec![Expr::Integer(1), Expr::Integer(1)].into());
+  let coords = Expr::List(
+    vec![
+      Expr::List(dim0_coords.iter().map(|v| Expr::Real(*v)).collect()),
+      Expr::List(dim1_coords.iter().map(|v| Expr::Real(*v)).collect()),
+    ]
+    .into(),
+  );
+  let grid = if t_is_dim0 {
+    grid
+  } else {
+    transpose_grid(&grid)
+  };
+  let grid_expr = Expr::List(
+    grid
+      .iter()
+      .map(|row| Expr::List(row.iter().map(|v| Expr::Real(*v)).collect()))
+      .collect(),
+  );
+  let interp = call(
+    "InterpolatingFunction",
+    vec![domain, grid_expr, orders, coords],
+  );
+  let rule = Expr::Rule {
+    pattern: Box::new(Expr::Identifier(u_name.to_string())),
+    replacement: Box::new(interp),
+  };
+  Ok(Some(Expr::List(vec![Expr::List(vec![rule].into())].into())))
+}
+
+/// Dependent functions of an `NDSolve` system need not be bare symbols:
+/// a spatially discretized transport equation is normally written
+/// `NDSolve[…, Table[Subscript[c, i], {i, 1, n}], {t, 0, tmax}]`, where every
+/// unknown is a `Subscript[…]` expression. The integrator keys each unknown
+/// by a symbol name, so every distinct compound head is rewritten to a fresh
+/// symbol before integrating and restored in the solution rules afterwards.
+///
+/// Returns the `(head expression, fresh symbol)` pairs, empty when every
+/// unknown already is a symbol.
+fn compound_head_renamings(vars: &Expr, domain: &Expr) -> Vec<(Expr, String)> {
+  let x_name = match domain {
+    Expr::List(items) => match items.first() {
+      Some(Expr::Identifier(x)) => x.clone(),
+      _ => return Vec::new(),
+    },
+    _ => return Vec::new(),
+  };
+  let entries: Vec<&Expr> = match vars {
+    Expr::List(items) => items.iter().collect(),
+    single => vec![single],
+  };
+  let mut renames: Vec<(Expr, String)> = Vec::new();
+  for entry in entries {
+    let head = match entry {
+      // `Subscript[c, 1][t]` — applied form of a compound head.
+      Expr::CurriedCall { func, args }
+        if args.len() == 1
+          && matches!(&args[0], Expr::Identifier(a) if *a == x_name) =>
+      {
+        func.as_ref().clone()
+      }
+      // `y[t]` — applied form of a plain symbol; nothing to rename.
+      Expr::FunctionCall { args, .. }
+        if args.len() == 1
+          && matches!(&args[0], Expr::Identifier(a) if *a == x_name) =>
+      {
+        continue;
+      }
+      // `Derivative[k][f]` (bare) or `Derivative[k][f][x]` (applied) — a
+      // request for `f`'s derivative, not a compound head itself unless
+      // `f` is one (e.g. `Derivative[1][Subscript[c, 1]]`).
+      Expr::FunctionCall { name, args }
+        if name == "Derivative" && (args.len() == 2 || args.len() == 3) =>
+      {
+        match &args[1] {
+          Expr::Identifier(_) => continue,
+          inner => inner.clone(),
+        }
+      }
+      // `Subscript[c, 1]` — bare compound head.
+      Expr::FunctionCall { .. } => entry.clone(),
+      // `y` — bare symbol.
+      _ => continue,
+    };
+    if matches!(head, Expr::Identifier(_)) {
+      continue;
+    }
+    let key = expr_to_string(&head);
+    if renames.iter().any(|(h, _)| expr_to_string(h) == key) {
+      continue;
+    }
+    let fresh = format!("NDSolve$fn${}", renames.len() + 1);
+    renames.push((head, fresh));
+  }
+  renames
+}
+
+/// Rewrite every occurrence of a compound head to its fresh symbol, turning
+/// `Subscript[c, 1][t]` into `NDSolve$fn$1[t]` and
+/// `Derivative[1][Subscript[c, 1]][t]` into `Derivative[1][NDSolve$fn$1][t]`.
+fn rename_compound_heads(expr: &Expr, renames: &[(Expr, String)]) -> Expr {
+  let key = expr_to_string(expr);
+  for (head, fresh) in renames {
+    if expr_to_string(head) == key {
+      return Expr::Identifier(fresh.clone());
+    }
+  }
+  let mapped = map_children(expr, &|c| rename_compound_heads(c, renames));
+  // `Subscript[c, 1][t]` is a curried call; once its head is a plain symbol
+  // it must print and match as the ordinary call `NDSolve$fn$1[t]`.
+  if let Expr::CurriedCall { func, args } = &mapped
+    && let Expr::Identifier(name) = func.as_ref()
+    && renames.iter().any(|(_, fresh)| fresh == name)
+  {
+    return Expr::FunctionCall {
+      name: name.clone(),
+      args: args.clone().into(),
+    };
+  }
+  mapped
+}
+
+/// The inverse of [`rename_compound_heads`], applied to the solution rules:
+/// `NDSolve$fn$1 -> InterpolatingFunction[…]` becomes
+/// `Subscript[c, 1] -> InterpolatingFunction[…]`.
+fn restore_compound_heads(expr: &Expr, renames: &[(Expr, String)]) -> Expr {
+  if renames.is_empty() {
+    return expr.clone();
+  }
+  if let Expr::Identifier(name) = expr
+    && let Some((head, _)) = renames.iter().find(|(_, fresh)| fresh == name)
+  {
+    return head.clone();
+  }
+  if let Expr::FunctionCall { name, args } = expr
+    && let Some((head, _)) = renames.iter().find(|(_, fresh)| fresh == name)
+  {
+    return Expr::CurriedCall {
+      func: Box::new(head.clone()),
+      args: args
+        .iter()
+        .map(|a| restore_compound_heads(a, renames))
+        .collect(),
+    };
+  }
+  map_children(expr, &|c| restore_compound_heads(c, renames))
+}
+
+/// One member of a stage-indexed dependent-variable family: `head[index,
+/// x_name]` (e.g. `x[3, t]`, the 3rd entry of `Table[x[i, t], {i, 1, n}]`)
+/// is keyed by `fresh`, a synthesized single-argument symbol name.
+struct IndexedRename {
+  head: String,
+  index: Expr,
+  fresh: String,
+}
+
+/// Find every `head[index, x]` entry in the dependent-variable spec — the
+/// idiom a discretized PDE or a staged process model (a distillation
+/// column's per-tray composition, a chain of coupled oscillators, …) uses
+/// to name its unknowns: `Table[x[i, t], {i, 1, n}]` rather than `n`
+/// separately named functions. `ndsolve_system` below only understands
+/// `f[t]`-shaped unknowns, so each concrete `head[index, x]` is assigned a
+/// fresh 1-argument symbol; [`rename_indexed_vars`]/[`restore_indexed_vars`]
+/// translate the system into and back out of that vocabulary.
+fn indexed_family_renamings(vars: &Expr, domain: &Expr) -> Vec<IndexedRename> {
+  let x_name = match domain {
+    Expr::List(items) => match items.first() {
+      Some(Expr::Identifier(x)) => x.clone(),
+      _ => return Vec::new(),
+    },
+    _ => return Vec::new(),
+  };
+  let entries: Vec<&Expr> = match vars {
+    Expr::List(items) => items.iter().collect(),
+    single => vec![single],
+  };
+  let mut renames: Vec<IndexedRename> = Vec::new();
+  for entry in entries {
+    let Expr::FunctionCall { name, args } = entry else {
+      continue;
+    };
+    if args.len() != 2 {
+      continue;
+    }
+    let Some(Expr::Identifier(a)) = args.get(1) else {
+      continue;
+    };
+    if *a != x_name {
+      continue;
+    }
+    let index = args[0].clone();
+    let index_key = expr_to_string(&index);
+    if renames
+      .iter()
+      .any(|r| r.head == *name && expr_to_string(&r.index) == index_key)
+    {
+      continue;
+    }
+    let fresh = format!("NDSolve$idx${name}${}", renames.len() + 1);
+    renames.push(IndexedRename {
+      head: name.clone(),
+      index,
+      fresh,
+    });
+  }
+  renames
+}
+
+/// Rewrite `head[index, other]` — bare, or under `Derivative[0, k][head]`
+/// (the parsed form of `D[head[index, x], {x, k}]`) — to the matching
+/// family member's fresh symbol applied to `other` alone: `fresh[other]`,
+/// respectively `Derivative[k][fresh][other]`.
+fn rename_indexed_vars(expr: &Expr, renames: &[IndexedRename]) -> Expr {
+  if renames.is_empty() {
+    return expr.clone();
+  }
+  // `Derivative[0, k][head][index, other]`, the parsed form of
+  // `D[head[index, x], {x, k}]`: the leading `0` says the derivative isn't
+  // taken with respect to the index slot, so it collapses away with it.
+  if let Expr::CurriedCall { func, args } = expr
+    && args.len() == 2
+    && let Expr::CurriedCall {
+      func: deriv_head,
+      args: fname_args,
+    } = func.as_ref()
+    && fname_args.len() == 1
+    && let Expr::Identifier(fname) = &fname_args[0]
+    && let Expr::FunctionCall {
+      name: deriv_name,
+      args: orders,
+    } = deriv_head.as_ref()
+    && deriv_name == "Derivative"
+    && orders.len() == 2
+    && matches!(orders[0], Expr::Integer(0))
+  {
+    let index_key = expr_to_string(&args[0]);
+    if let Some(r) = renames
+      .iter()
+      .find(|r| r.head == *fname && expr_to_string(&r.index) == index_key)
+    {
+      let other = rename_indexed_vars(&args[1], renames);
+      return Expr::CurriedCall {
+        func: Box::new(Expr::CurriedCall {
+          func: Box::new(call1("Derivative", orders[1].clone())),
+          args: vec![Expr::Identifier(r.fresh.clone())],
+        }),
+        args: vec![other],
+      };
+    }
+  }
+  if let Expr::FunctionCall { name, args } = expr
+    && args.len() == 2
+  {
+    let index_key = expr_to_string(&args[0]);
+    if let Some(r) = renames
+      .iter()
+      .find(|r| r.head == *name && expr_to_string(&r.index) == index_key)
+    {
+      let other = rename_indexed_vars(&args[1], renames);
+      return Expr::FunctionCall {
+        name: r.fresh.clone(),
+        args: vec![other].into(),
+      };
+    }
+  }
+  map_children(expr, &|c| rename_indexed_vars(c, renames))
+}
+
+/// The inverse of [`rename_indexed_vars`], applied to the solution rules:
+/// `NDSolve$idx$x$1 -> InterpolatingFunction[…][t]` becomes
+/// `x[1, t] -> InterpolatingFunction[…][t]`.
+fn restore_indexed_vars(expr: &Expr, renames: &[IndexedRename]) -> Expr {
+  if renames.is_empty() {
+    return expr.clone();
+  }
+  if let Expr::FunctionCall { name, args } = expr
+    && args.len() == 1
+    && let Some(r) = renames.iter().find(|r| r.fresh == *name)
+  {
+    let other = restore_indexed_vars(&args[0], renames);
+    return Expr::FunctionCall {
+      name: r.head.clone(),
+      args: vec![r.index.clone(), other].into(),
+    };
+  }
+  if let Expr::Identifier(name) = expr
+    && let Some(r) = renames.iter().find(|r| r.fresh == *name)
+  {
+    return Expr::FunctionCall {
+      name: r.head.clone(),
+      args: vec![r.index.clone()].into(),
+    };
+  }
+  map_children(expr, &|c| restore_indexed_vars(c, renames))
+}
+
+// ─── The NDSolve integrator ────────────────────────────────────────────
+//
+// Handles every shape NDSolve takes: one equation or several coupled
+// dependent functions (`NDSolve[eqns, {θ, ϕ, ψ}, {t, t0, t1}]`), any
+// order, linear or not, equations that are implicit in the highest
+// derivatives (each equation may mix θ'', ϕ'', ψ''), initial conditions
+// given at an interior point of the domain (integrating both
+// directions), and the `Method -> {"EventLocator", …}` option that stops
+// integration when an event function crosses zero.
+//
+// Each step evaluates the residuals numerically: with the state fixed,
+// every residual is affine in the vector of highest derivatives, so one
+// evaluation at h = 0 and one per unit vector recovers the linear system
+// M·h = -c, which Gaussian elimination solves. Residuals are compiled to
+// a small numeric closure tree (`NExpr`) for speed, with a fall-back to
+// full symbolic evaluation for operations the compiler doesn't know.
+
+/// The event specification of `Method -> {"EventLocator", "Event" -> g,
+/// "EventAction" :> action}`: the (still symbolic) event function and the
+/// held action.
+struct EventSpec {
+  event: Expr,
+  action: Option<Expr>,
+}
+
+/// Extract an `EventLocator` event from NDSolve's option rules. Returns
+/// `None` when no such method is given (any other `Method` is ignored —
+/// the integrator itself stays the same).
+fn parse_event_locator_option(opts: &[Expr]) -> Option<EventSpec> {
+  for opt in opts {
+    let (Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    }) = opt
+    else {
+      continue;
+    };
+    if !matches!(pattern.as_ref(), Expr::Identifier(s) if s == "Method") {
+      continue;
+    }
+    let Expr::List(items) = replacement.as_ref() else {
+      continue;
+    };
+    let is_event_locator = items
+      .first()
+      .is_some_and(|i| matches!(i, Expr::String(s) if s == "EventLocator"));
+    if !is_event_locator {
+      continue;
+    }
+    let mut event = None;
+    let mut action = None;
+    for item in &items[1..] {
+      if let Expr::Rule {
+        pattern,
+        replacement,
+      }
+      | Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } = item
+      {
+        match pattern.as_ref() {
+          Expr::String(s) if s == "Event" => {
+            event = Some(replacement.as_ref().clone());
+          }
+          Expr::String(s) if s == "EventAction" => {
+            action = Some(replacement.as_ref().clone());
+          }
+          _ => {}
+        }
+      }
+    }
+    if let Some(event) = event {
+      return Some(EventSpec { event, action });
+    }
+  }
+  None
+}
+
+/// One dependent function of the system.
+struct SysFunc {
+  name: String,
+  /// Order of its highest derivative in the equations.
+  order: usize,
+  /// Whether the result rule should use the bare-symbol form
+  /// (`θ -> InterpolatingFunction[…]`); `false` means the `θ[t]` form.
+  function_form: bool,
+  /// Initial values `[f(x0), f'(x0), …]`, filled during IC parsing.
+  ics: Vec<Option<f64>>,
+}
+
+/// Solve a (possibly coupled) system. Returns `Ok(None)` when the input
+/// doesn't have a shape this solver understands, so the caller can leave
+/// the expression unevaluated.
+/// The dependent function's name in an `NDSolve` second argument entry:
+/// `f` or `f[x]`.
+fn dep_name(item: &Expr) -> Option<String> {
+  match item {
+    Expr::Identifier(name) => Some(name.clone()),
+    Expr::FunctionCall { name, .. } => Some(name.clone()),
+    _ => None,
+  }
+}
+
+/// Recognize a `Derivative[k][f]` (bare) or `Derivative[k][f][x]` (applied)
+/// second-argument entry as a request for `f`'s `k`-th derivative,
+/// returned alongside `f` itself — e.g.
+/// `NDSolve[eqns, {y, y'}, {t, t0, t1}]` returns both `y ->
+/// InterpolatingFunction[…]` and `Derivative[1][y] ->
+/// InterpolatingFunction[…]`, sparing the caller from differentiating the
+/// interpolant. Returns `(function name, order, function_form)`;
+/// `function_form` is `false` when the entry was applied to `x_name`.
+/// The parser builds `Derivative[k][f]` as nested `CurriedCall`s
+/// (`Derivative[k]` called on `f`), so that raw shape is matched first;
+/// the flattened `FunctionCall("Derivative", [k, f])` form some
+/// normalization passes produce is matched too, defensively.
+fn derivative_dep_item(
+  item: &Expr,
+  x_name: &str,
+) -> Option<(String, usize, bool)> {
+  if let Expr::CurriedCall { func, args } = item
+    && args.len() == 1
+  {
+    if let Expr::Identifier(fname) = &args[0]
+      && let Expr::FunctionCall {
+        name: deriv_name,
+        args: deriv_args,
+      } = func.as_ref()
+      && deriv_name == "Derivative"
+      && deriv_args.len() == 1
+      && let Expr::Integer(k) = &deriv_args[0]
+    {
+      return Some((fname.clone(), *k as usize, true));
+    }
+    if matches!(&args[0], Expr::Identifier(a) if a == x_name)
+      && let Some((fname, k, _)) = derivative_dep_item(func.as_ref(), x_name)
+    {
+      return Some((fname, k, false));
+    }
+  }
+  if let Expr::FunctionCall { name, args } = item
+    && name == "Derivative"
+  {
+    if args.len() == 2
+      && let Expr::Integer(k) = &args[0]
+      && let Expr::Identifier(fname) = &args[1]
+    {
+      return Some((fname.clone(), *k as usize, true));
+    }
+    if args.len() == 3
+      && let Expr::Integer(k) = &args[0]
+      && let Expr::Identifier(fname) = &args[1]
+      && matches!(&args[2], Expr::Identifier(a) if a == x_name)
+    {
+      return Some((fname.clone(), *k as usize, false));
+    }
+  }
+  None
+}
+
+/// Flatten every nesting level of `List` in an `NDSolve`/`DSolve`
+/// equations argument into individual equations. A single function's
+/// initial conditions are often grouped into their own sublist —
+/// `{ode, {ic1, ic2}}` — and that grouping can nest arbitrarily deep, so
+/// each level is flattened, not just the outermost.
+fn flatten_eq_list(expr: &Expr, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::List(items) => {
+      for item in items {
+        flatten_eq_list(item, out);
+      }
+    }
+    other => out.push(other.clone()),
+  }
+}
+
+/// The function a solution rule is for: `f -> …` or `f[x] -> …`.
+fn rule_target_name(rule: &Expr) -> Option<&str> {
+  let Expr::Rule { pattern, .. } = rule else {
+    return None;
+  };
+  match pattern.as_ref() {
+    Expr::Identifier(name) => Some(name.as_str()),
+    Expr::FunctionCall { name, .. } => Some(name.as_str()),
+    _ => None,
+  }
+}
+
+/// Find an algebraic constraint among `odes` that determines one of `funcs`
+/// explicitly: an equation with no derivative of any unknown, in which
+/// exactly one unknown appears and appears nowhere differentiated elsewhere.
+/// Returns its index, that function's index, and the expression it solves to.
+fn find_algebraic_constraint(
+  odes: &[Expr],
+  funcs: &[SysFunc],
+) -> Option<(usize, usize, Expr)> {
+  for (ei, eq) in odes.iter().enumerate() {
+    if funcs.iter().any(|f| max_derivative_order(eq, &f.name) > 0) {
+      continue;
+    }
+    // The unknown this constraint defines is one it mentions that no
+    // equation ever differentiates — the others in it are dynamic
+    // variables the solution is written in terms of.
+    let Some(fi) = funcs.iter().enumerate().position(|(_, f)| {
+      expr_mentions_function(eq, &f.name)
+        && odes.iter().all(|o| max_derivative_order(o, &f.name) == 0)
+    }) else {
+      continue;
+    };
+    let Some(solved) = solve_for_function(eq, &funcs[fi].name) else {
+      continue;
+    };
+    return Some((ei, fi, solved));
+  }
+  None
+}
+
+/// Whether `expr` contains `fname[…]` anywhere.
+fn expr_mentions_function(expr: &Expr, fname: &str) -> bool {
+  if matches!(expr, Expr::FunctionCall { name, .. } if name == fname) {
+    return true;
+  }
+  expr_children(expr)
+    .into_iter()
+    .any(|c| expr_mentions_function(c, fname))
+}
+
+/// Whether `expr` is, at the top level, exactly a call to `fname`
+/// (`fname[…]`) — not merely an expression that mentions one somewhere
+/// inside it.
+fn is_bare_call(expr: &Expr, fname: &str) -> bool {
+  matches!(expr, Expr::FunctionCall { name, .. } if name == fname)
+}
+
+/// Solve an algebraic equation for `fname[x]`, returning the right-hand side
+/// of the single solution. `None` when it does not solve uniquely.
+fn solve_for_function(eq: &Expr, fname: &str) -> Option<Expr> {
+  let unknown = find_function_call(eq, fname)?;
+
+  // Fast path: the equation already reads `fname[x] == rhs` (or the
+  // mirror image) — an explicit definition, not one that needs solving.
+  // Elimination keeps substituting the *other* side of equations like this
+  // as more unknowns fall out of the system, so their `rhs` can grow large
+  // well before this one's own turn comes up; handing that growing
+  // expression to the general `Solve[]` below on every candidate equation,
+  // every elimination round, is what makes a system of this DAE's size
+  // (dozens of unknowns) stop scaling. Recognizing the already-solved
+  // shape directly is exact — not an approximation of what `Solve[]` would
+  // return — since `rhs` not mentioning `fname` means it already is the
+  // unique solution.
+  if let Some((lhs, rhs)) = as_equal_pair(eq) {
+    if is_bare_call(lhs, fname) && !expr_mentions_function(rhs, fname) {
+      return Some(rhs.clone());
+    }
+    if is_bare_call(rhs, fname) && !expr_mentions_function(lhs, fname) {
+      return Some(lhs.clone());
+    }
+  }
+
+  let solved = crate::evaluator::evaluate_expr_to_expr(&call(
+    "Solve",
+    vec![eq.clone(), unknown],
+  ))
+  .ok()?;
+  let Expr::List(ref sols) = solved else {
+    return None;
+  };
+  let [Expr::List(rules)] = &sols[..] else {
+    return None;
+  };
+  let [Expr::Rule { replacement, .. }] = &rules[..] else {
+    return None;
+  };
+  Some(replacement.as_ref().clone())
+}
+
+/// The first `fname[…]` call inside `expr`.
+fn find_function_call(expr: &Expr, fname: &str) -> Option<Expr> {
+  if matches!(expr, Expr::FunctionCall { name, .. } if name == fname) {
+    return Some(expr.clone());
+  }
+  expr_children(expr)
+    .into_iter()
+    .find_map(|c| find_function_call(c, fname))
+}
+
+/// The interpolation order NDSolve's InterpolatingFunctions carry, matching
+/// the Wolfram Language's default. Reading the solution back between grid
+/// points then has the accuracy of the integration itself; a linear
+/// interpolation would throw most of it away — visibly so through `θ'`,
+/// which differentiates the interpolating piece.
+const NDSOLVE_INTERPOLATION_ORDER: i128 = 3;
+
+/// Restrict integrated solution samples (ascending in x) to `[lo, hi]`.
+///
+/// A bound that falls between two grid points becomes a sample of its own,
+/// interpolated from the neighbours at the same order the returned
+/// `InterpolatingFunction` uses, so the reported domain is exactly the
+/// requested range rather than the nearest grid point to it. A bound that
+/// already coincides with a grid point keeps that point untouched.
+fn clip_points_to_range(
+  points: &[(f64, Vec<f64>)],
+  lo: f64,
+  hi: f64,
+) -> Vec<(f64, Vec<f64>)> {
+  let tol = (hi - lo).abs().max(1.0) * 1e-9;
+  let xs: Vec<f64> = points.iter().map(|(x, _)| *x).collect();
+  let bound = |target: f64| -> (f64, Vec<f64>) {
+    if let Some(p) = points.iter().find(|(x, _)| (x - target).abs() <= tol) {
+      return p.clone();
+    }
+    let state = (0..points[0].1.len())
+      .map(|k| {
+        let ys: Vec<f64> = points.iter().map(|(_, s)| s[k]).collect();
+        interp_1d_xy_f64(&xs, &ys, target, NDSOLVE_INTERPOLATION_ORDER as usize)
+      })
+      .collect();
+    (target, state)
+  };
+  let mut clipped = vec![bound(lo)];
+  clipped.extend(
+    points
+      .iter()
+      .filter(|(x, _)| *x > lo + tol && *x < hi - tol)
+      .cloned(),
+  );
+  clipped.push(bound(hi));
+  clipped
+}
+
+fn ndsolve_system(
+  args: &[Expr],
+  event: Option<&EventSpec>,
+) -> Result<Option<Expr>, InterpreterError> {
+  // Domain {x, xmin, xmax}, or the shorthand {x, xmax} that integrates
+  // from the initial conditions' x-value out to xmax — the x_min side is
+  // resolved below, once x0 is known from the equations.
+  let Expr::List(domain_items) = &args[2] else {
+    return Ok(None);
+  };
+  let Expr::Identifier(x_name) = &domain_items[0] else {
+    return Ok(None);
+  };
+  let (x_min_given, x_max): (Option<f64>, f64) = match domain_items.len() {
+    3 => {
+      let Some(min) = nval_to_f64(&domain_items[1]) else {
+        return Ok(None);
+      };
+      // `{t, t0, Infinity}` is only solvable when an event is present to
+      // stop the integration — nothing else would ever tell a fixed-step
+      // method when to quit, so without one it's left unevaluated like
+      // any other pattern this solver doesn't cover.
+      let max = if is_infinity(&domain_items[2]) {
+        if event.is_none() {
+          return Ok(None);
+        }
+        f64::INFINITY
+      } else {
+        let Some(max) = nval_to_f64(&domain_items[2]) else {
+          return Ok(None);
+        };
+        max
+      };
+      // NaN bounds must bail out too, so compare via partial_cmp rather
+      // than a negated float comparison.
+      if max.partial_cmp(&min) != Some(std::cmp::Ordering::Greater) {
+        return Ok(None);
+      }
+      (Some(min), max)
+    }
+    2 => {
+      let Some(target) = nval_to_f64(&domain_items[1]) else {
+        return Ok(None);
+      };
+      (None, target)
+    }
+    _ => return Ok(None),
+  };
+
+  // Dependent functions: `{θ, ϕ, ψ}`, a single symbol, or `f[x]` forms.
+  let dep_items: Vec<&Expr> = match &args[1] {
+    Expr::List(items) => items.iter().collect(),
+    other => vec![other],
+  };
+  let mut funcs: Vec<SysFunc> = Vec::with_capacity(dep_items.len());
+  // A `Derivative[k][f]` entry doesn't introduce a new dependent function;
+  // it asks for `f`'s k-th derivative alongside `f`'s own solution, so
+  // it's collected separately and resolved once `f`'s order is known.
+  let mut deriv_requests: Vec<(String, usize, bool)> = Vec::new();
+  for item in dep_items {
+    if let Some(req) = derivative_dep_item(item, x_name) {
+      deriv_requests.push(req);
+      continue;
+    }
+    match item {
+      Expr::Identifier(name) => funcs.push(SysFunc {
+        name: name.clone(),
+        order: 0,
+        function_form: true,
+        ics: Vec::new(),
+      }),
+      Expr::FunctionCall { name, args: fargs }
+        if fargs.len() == 1
+          && matches!(&fargs[0], Expr::Identifier(a) if a == x_name) =>
+      {
+        funcs.push(SysFunc {
+          name: name.clone(),
+          order: 0,
+          function_form: false,
+          ics: Vec::new(),
+        });
+      }
+      _ => return Ok(None),
+    }
+  }
+  if funcs.is_empty() {
+    return Ok(None);
+  }
+
+  // Split equations into ODEs and initial conditions. The equations
+  // argument nests arbitrarily — a common idiom groups a function's
+  // initial conditions into their own sublist, e.g. `{ode, {ic1, ic2}}` —
+  // so every level of `List` is flattened rather than just the outermost.
+  let mut eq_items: Vec<Expr> = Vec::new();
+  flatten_eq_list(&args[0], &mut eq_items);
+  let eq_items = flatten_chained_equalities(&eq_items);
+  let mut odes: Vec<Expr> = Vec::new();
+  // (function name, derivative order, evaluation point, value) — by name,
+  // not index: an eliminated constraint variable shifts the positions in
+  // `funcs`. Conditions are no longer required to share one point here —
+  // a two-point boundary value problem states one condition at each end
+  // of the domain — so the point travels with each condition and the
+  // shape (one shared point vs. exactly two) is decided once every
+  // condition has been collected, below.
+  let mut raw_ics: Vec<(String, usize, f64, f64)> = Vec::new();
+  for eq in &eq_items {
+    let mut is_ic = false;
+    for f in &funcs {
+      if is_initial_condition(eq, &f.name, x_name) {
+        let Some((order, x_val, y_val)) =
+          parse_numeric_initial_condition(eq, &f.name)
+        else {
+          return Ok(None);
+        };
+        raw_ics.push((f.name.clone(), order, x_val, y_val));
+        is_ic = true;
+        break;
+      }
+    }
+    if !is_ic {
+      odes.push(eq.clone());
+    }
+  }
+  // An algebraic constraint — an equation with no derivative in it — that
+  // determines one unknown explicitly is eliminated: the constraint is
+  // solved for that unknown, the solution substituted into the remaining
+  // equations, and the unknown dropped from the system. This is how a
+  // Lagrangian model states a rigid link (`l[t] + d - y[t] == L`), and it
+  // turns an index-1 DAE the integrator cannot take into the ODE system it
+  // can. The eliminated function is rebuilt from the solution afterwards.
+  let mut eliminated: Vec<(SysFunc, Expr)> = Vec::new();
+  loop {
+    let Some((eq_idx, fi, solved)) = find_algebraic_constraint(&odes, &funcs)
+    else {
+      break;
+    };
+    let f = funcs.remove(fi);
+    odes.remove(eq_idx);
+    let target = Expr::FunctionCall {
+      name: f.name.clone(),
+      args: vec![Expr::Identifier(x_name.clone())].into(),
+    };
+    for ode in &mut odes {
+      *ode = crate::functions::polynomial_ast::solve::substitute_expr(
+        ode, &target, &solved,
+      );
+    }
+    // A later constraint may refer to an already-eliminated function.
+    for (_, prev) in &mut eliminated {
+      *prev = crate::functions::polynomial_ast::solve::substitute_expr(
+        prev, &target, &solved,
+      );
+    }
+    eliminated.push((f, solved));
+  }
+
+  if odes.len() != funcs.len() {
+    return Ok(None);
+  }
+
+  // Determine each function's order from the equations — needed both to
+  // classify the conditions below and to lay out the state vector.
+  for ode in &odes {
+    for f in &mut funcs {
+      let order = max_derivative_order(ode, &f.name);
+      f.order = f.order.max(order);
+    }
+  }
+  if funcs.iter().any(|f| f.order == 0) {
+    return Ok(None);
+  }
+  // Every requested derivative must be of a function actually being
+  // solved for, and of an order already carried in its state vector
+  // (0..order-1); the highest derivative itself isn't stored there.
+  for (name, order, _) in &deriv_requests {
+    let Some(f) = funcs.iter().find(|f| &f.name == name) else {
+      return Ok(None);
+    };
+    if *order >= f.order {
+      return Ok(None);
+    }
+  }
+
+  // Classify the conditions by the distinct points they're given at. One
+  // shared point is an initial value problem (the ordinary case, handled
+  // exactly as before); a single second-order equation with one condition
+  // at each of two distinct points — matching the solved domain's own
+  // endpoints — is a two-point boundary value problem, solved below by
+  // shooting: integrating the very same IVP stepper from a guessed value
+  // at one end and adjusting that guess until the far condition is met.
+  // Anything else (three or more distinct points, a coupled system, …)
+  // isn't a shape this solver understands.
+  let mut distinct_points: Vec<f64> = Vec::new();
+  for (_, _, x_val, _) in &raw_ics {
+    if !distinct_points.iter().any(|p| (p - x_val).abs() <= 1e-9) {
+      distinct_points.push(*x_val);
+    }
+  }
+  #[derive(Clone, Copy)]
+  enum ProblemKind {
+    Initial {
+      x0: f64,
+    },
+    Boundary {
+      x_lo: f64,
+      order_lo: usize,
+      val_lo: f64,
+      x_hi: f64,
+      order_hi: usize,
+      val_hi: f64,
+    },
+  }
+  let kind = match distinct_points.len() {
+    1 => ProblemKind::Initial {
+      x0: distinct_points[0],
+    },
+    2 if funcs.len() == 1
+      && eliminated.is_empty()
+      && raw_ics.len() == 2
+      && raw_ics.iter().all(|(_, order, _, _)| *order <= 1)
+      && funcs[0].order == 2 =>
+    {
+      let (mut p0, mut p1) = (distinct_points[0], distinct_points[1]);
+      if p0 > p1 {
+        std::mem::swap(&mut p0, &mut p1);
+      }
+      let Some(x_min_given) = x_min_given else {
+        return Ok(None);
+      };
+      // A two-point boundary value problem states its conditions at the
+      // domain's own endpoints; anything else isn't a shape this solver
+      // understands.
+      if (p0 - x_min_given).abs() > 1e-9 || (p1 - x_max).abs() > 1e-9 {
+        return Ok(None);
+      }
+      let (_, order_lo, _, val_lo) = *raw_ics
+        .iter()
+        .find(|(_, _, x, _)| (x - p0).abs() <= 1e-9)
+        .unwrap();
+      let (_, order_hi, _, val_hi) = *raw_ics
+        .iter()
+        .find(|(_, _, x, _)| (x - p1).abs() <= 1e-9)
+        .unwrap();
+      ProblemKind::Boundary {
+        x_lo: p0,
+        order_lo,
+        val_lo,
+        x_hi: p1,
+        order_hi,
+        val_hi,
+      }
+    }
+    _ => return Ok(None),
+  };
+
+  // For an initial value problem: the range that was *asked* for, before
+  // the integration range below is widened to reach the initial
+  // condition. The solution is reported over this range (see the
+  // clipping step after the integration/shooting).
+  let mut requested_range: Option<(f64, f64)> = None;
+  let mut x_min = 0.0;
+  let mut x_max_resolved = 0.0;
+  let mut x0 = 0.0;
+  if let ProblemKind::Initial { x0: x0_val } = kind {
+    x0 = x0_val;
+    requested_range = x_min_given.map(|min| (min, x_max));
+    let (lo, hi) = if let Some(min) = x_min_given {
+      // The initial condition may sit just outside the requested output
+      // range — a Demonstration commonly states `y[0] == n0` at the
+      // natural reference point but plots from a tiny epsilon
+      // (`{t, 0.00001, 200}`) to dodge a singularity (a fractional power
+      // of `y`, a `LogPlot`, …) exactly at that point. The integrator
+      // still has to start at the initial condition, so the solved range
+      // extends to include it rather than rejecting the system outright —
+      // matching the `{x, xmax}` shorthand below, which already
+      // integrates from x0 unconditionally.
+      (min.min(x0), x_max.max(x0))
+    } else {
+      // {x, xmax} shorthand: integrate from x0 to xmax, in whichever
+      // direction that is — x0 always lands on one edge of the range. An
+      // absolute epsilon here would wrongly reject ranges that are tiny
+      // by scale (e.g. femtosecond time constants) rather than
+      // degenerate, so only bit-identical endpoints count as degenerate.
+      let target = x_max;
+      if target == x0 {
+        return Ok(None);
+      }
+      (x0.min(target), x0.max(target))
+    };
+    x_min = lo;
+    x_max_resolved = hi;
+  } else if let ProblemKind::Boundary { x_lo, x_hi, .. } = kind {
+    requested_range = Some((x_lo, x_hi));
+  }
+
+  // Validate and store the initial conditions (initial value problems
+  // only — a boundary value problem's two conditions are consumed
+  // directly by the shooting solver below instead of seeding `f.ics`).
+  for f in &mut funcs {
+    f.ics = vec![None; f.order];
+  }
+  if matches!(kind, ProblemKind::Initial { .. }) {
+    for (name, order, _, val) in &raw_ics {
+      // An initial condition for a function the constraint eliminated is
+      // redundant — its value follows from the others — so it is dropped.
+      let Some(f) = funcs.iter_mut().find(|f| &f.name == name) else {
+        continue;
+      };
+      if *order >= f.order || f.ics[*order].is_some() {
+        return Ok(None);
+      }
+      f.ics[*order] = Some(*val);
+    }
+    if funcs
+      .iter()
+      .any(|f| f.ics.iter().any(std::option::Option::is_none))
+    {
+      return Ok(None);
+    }
+  }
+
+  // Variable vector layout: [x, state…, h…] where `state` holds
+  // (f, f', …, f^(order-1)) for each function in turn and `h` holds the
+  // highest derivative of each function.
+  let mut var_names: Vec<String> = vec![x_name.clone()];
+  let mut state_offset: Vec<usize> = Vec::with_capacity(funcs.len());
+  for f in &funcs {
+    state_offset.push(var_names.len() - 1);
+    for k in 0..f.order {
+      var_names.push(placeholder_name(&f.name, k));
+    }
+  }
+  let n_state = var_names.len() - 1;
+  for f in &funcs {
+    var_names.push(placeholder_name(&f.name, f.order));
+  }
+
+  // Rewrite the equations over placeholder variables and wrap them into
+  // numeric residual functions.
+  let mut residuals: Vec<NumFn> = Vec::with_capacity(odes.len());
+  for ode in &odes {
+    let normalized = normalize_equation(ode).ok();
+    let Some(normalized) = normalized else {
+      return Ok(None);
+    };
+    let rewritten = substitute_function_values(&normalized, &funcs, x_name);
+    residuals.push(NumFn::new(rewritten, &var_names));
+  }
+  let event_fn = match event {
+    Some(spec) => {
+      let rewritten = substitute_function_values(&spec.event, &funcs, x_name);
+      Some(NumFn::new(rewritten, &var_names))
+    }
+    None => None,
+  };
+
+  let n_steps = 1000usize;
+  let mut points: Vec<(f64, Vec<f64>)> = match kind {
+    ProblemKind::Initial { .. } => {
+      // Initial state.
+      let mut init_state: Vec<f64> = vec![0.0; n_state];
+      for (fi, f) in funcs.iter().enumerate() {
+        for (k, ic) in f.ics.iter().enumerate() {
+          init_state[state_offset[fi] + k] = ic.unwrap_or(0.0);
+        }
+      }
+
+      // When the mass matrix (the highest-derivative coefficients) turns
+      // out not to depend on `x` or the state — common for a
+      // holdup/mass-balance system, whose coefficients are plain
+      // numerals — building it once here instead of at every one of the
+      // run's stage evaluations is a large constant-factor speedup with
+      // no change to the result: the linear solve at each stage is
+      // unaffected, only where its matrix comes from.
+      let cached_mass_matrix = probe_constant_mass_matrix(
+        &residuals,
+        funcs.len(),
+        x0,
+        &init_state,
+        x_min,
+        x_max_resolved,
+      );
+      // Integrate forward from x0 to x_max, then (if x0 is interior)
+      // backward from x0 to x_min; events are only located on the
+      // forward leg, matching the direction NDSolve integrates first.
+      //
+      // An infinite `x_max_resolved` (`{t, t0, Infinity}`) only reaches
+      // here with an event present (the domain parsing above rejects it
+      // otherwise), so there's always something to stop on; a fixed step
+      // size sized to the whole domain, the way the finite case picks
+      // one, has no domain length to size itself from, so it's searched
+      // for instead.
+      let forward = if x_max_resolved.is_finite() {
+        let h = (x_max_resolved - x_min) / n_steps as f64;
+        integrate_leg(
+          &residuals,
+          &funcs,
+          &state_offset,
+          init_state.clone(),
+          x0,
+          x_max_resolved,
+          h,
+          event_fn.as_ref(),
+          event.and_then(|e| e.action.as_ref()),
+          x_name,
+          cached_mass_matrix.as_deref(),
+        )?
+      } else {
+        integrate_leg_until_event(
+          &residuals,
+          &funcs,
+          &state_offset,
+          &init_state,
+          x0,
+          event_fn.as_ref(),
+          event.and_then(|e| e.action.as_ref()),
+          x_name,
+          cached_mass_matrix.as_deref(),
+        )?
+      };
+      let Some(forward) = forward else {
+        return Ok(None);
+      };
+      let backward = if x0 - x_min > 1e-12 {
+        // An infinite `x_max_resolved` leaves no whole-domain length to
+        // size a step from (unlike the finite case, which reuses the
+        // forward leg's own step); the backward leg's own span, from
+        // `x0` down to `x_min`, is always finite, so it's sized off that
+        // instead.
+        let h_back = if x_max_resolved.is_finite() {
+          (x_max_resolved - x_min) / n_steps as f64
+        } else {
+          (x0 - x_min) / n_steps as f64
+        };
+        let leg = integrate_leg(
+          &residuals,
+          &funcs,
+          &state_offset,
+          init_state,
+          x0,
+          x_min,
+          -h_back,
+          None,
+          None,
+          x_name,
+          cached_mass_matrix.as_deref(),
+        )?;
+        let Some(leg) = leg else {
+          return Ok(None);
+        };
+        leg
+      } else {
+        Vec::new()
+      };
+
+      // Combined, ascending in x. The backward leg is (x0, x0-h, …);
+      // reverse it and drop its first point (x0, present in the forward
+      // leg too).
+      let mut points: Vec<(f64, Vec<f64>)> = backward;
+      points.reverse();
+      points.pop();
+      points.extend(forward);
+      points
+    }
+    ProblemKind::Boundary {
+      x_lo,
+      order_lo,
+      val_lo,
+      x_hi,
+      order_hi,
+      val_hi,
+    } => {
+      let Some(points) = solve_bvp_shooting(
+        &residuals,
+        &funcs,
+        &state_offset,
+        n_state,
+        x_lo,
+        order_lo,
+        val_lo,
+        x_hi,
+        order_hi,
+        val_hi,
+        n_steps,
+        x_name,
+      )?
+      else {
+        return Ok(None);
+      };
+      points
+    }
+  };
+  if points.len() < 2 {
+    return Ok(None);
+  }
+  // Integrating had to start at the initial condition even when that sits
+  // outside the requested range, but the solution NDSolve hands back only
+  // covers the range that was asked for:
+  // `NDSolve[{y'[t] == -y[t], y[0] == 1}, y, {t, 50, 200}]` reports a
+  // domain of `{{50., 200.}}` and warns (`ifun::dmval`) about a query at
+  // t == 0, rather than quietly carrying the run-up along.
+  //
+  // Only ever *narrows*: an integration that stalled before the requested
+  // endpoint (a singularity, a step size driven to zero) covers less than
+  // was asked for, and that truncated domain is the answer.
+  if let Some((req_lo, req_hi)) = requested_range {
+    let lo = req_lo.max(points.first().unwrap().0);
+    let hi = req_hi.min(points.last().unwrap().0);
+    if hi > lo {
+      points = clip_points_to_range(&points, lo, hi);
+    }
+    if points.len() < 2 {
+      return Ok(None);
+    }
+  }
+  let x_lo = points.first().unwrap().0;
+  let x_hi = points.last().unwrap().0;
+
+  // Build one InterpolatingFunction rule per dependent function.
+  let mut rules: Vec<Expr> = Vec::with_capacity(funcs.len() + eliminated.len());
+  for (fi, f) in funcs.iter().enumerate() {
+    let domain = Expr::List(
+      vec![Expr::List(vec![Expr::Real(x_lo), Expr::Real(x_hi)].into())].into(),
+    );
+    let data = Expr::List(
+      points
+        .iter()
+        .map(|(x, s)| {
+          Expr::List(
+            vec![Expr::Real(*x), Expr::Real(s[state_offset[fi]])].into(),
+          )
+        })
+        .collect(),
+    );
+    let interp = call(
+      "InterpolatingFunction",
+      vec![domain, data, Expr::Integer(NDSOLVE_INTERPOLATION_ORDER)],
+    );
+    rules.push(if f.function_form {
+      Expr::Rule {
+        pattern: Box::new(Expr::Identifier(f.name.clone())),
+        replacement: Box::new(interp),
+      }
+    } else {
+      Expr::Rule {
+        pattern: Box::new(Expr::FunctionCall {
+          name: f.name.clone(),
+          args: vec![Expr::Identifier(x_name.clone())].into(),
+        }),
+        replacement: Box::new(Expr::CurriedCall {
+          func: Box::new(interp),
+          args: vec![Expr::Identifier(x_name.clone())],
+        }),
+      }
+    });
+  }
+
+  // Extra rules for `Derivative[k][f]` entries requested alongside `f`:
+  // the same points, just read from the state slot the derivative already
+  // occupies (`f`'s state runs f, f', …, f^(order-1) from `state_offset`).
+  for (name, order, function_form) in &deriv_requests {
+    let fi = funcs.iter().position(|f| &f.name == name).unwrap();
+    let domain = Expr::List(
+      vec![Expr::List(vec![Expr::Real(x_lo), Expr::Real(x_hi)].into())].into(),
+    );
+    let data = Expr::List(
+      points
+        .iter()
+        .map(|(x, s)| {
+          Expr::List(
+            vec![Expr::Real(*x), Expr::Real(s[state_offset[fi] + order])]
+              .into(),
+          )
+        })
+        .collect(),
+    );
+    let interp = call(
+      "InterpolatingFunction",
+      vec![domain, data, Expr::Integer(NDSOLVE_INTERPOLATION_ORDER)],
+    );
+    // Mirrors the parser's own shape for `Derivative[k][f]` (nested
+    // `CurriedCall`s) so `/.` matches the same expression the user wrote.
+    let deriv_pattern = Expr::CurriedCall {
+      func: Box::new(call("Derivative", vec![Expr::Integer(*order as i128)])),
+      args: vec![Expr::Identifier(name.clone())],
+    };
+    rules.push(if *function_form {
+      Expr::Rule {
+        pattern: Box::new(deriv_pattern),
+        replacement: Box::new(interp),
+      }
+    } else {
+      Expr::Rule {
+        pattern: Box::new(Expr::CurriedCall {
+          func: Box::new(deriv_pattern),
+          args: vec![Expr::Identifier(x_name.clone())],
+        }),
+        replacement: Box::new(Expr::CurriedCall {
+          func: Box::new(interp),
+          args: vec![Expr::Identifier(x_name.clone())],
+        }),
+      }
+    });
+  }
+
+  // An eliminated function is sampled from its constraint solution at the
+  // same grid, so it comes back as an InterpolatingFunction like the rest.
+  for (f, solved) in &eliminated {
+    let rewritten = substitute_function_values(solved, &funcs, x_name);
+    let value_fn = NumFn::new(rewritten, &var_names);
+    let mut vars = vec![0.0; var_names.len()];
+    let data = Expr::List(
+      points
+        .iter()
+        .map(|(x, state)| {
+          vars[0] = *x;
+          vars[1..=n_state].copy_from_slice(&state[..n_state]);
+          Expr::List(
+            vec![
+              Expr::Real(*x),
+              Expr::Real(value_fn.eval(&vars).unwrap_or(f64::NAN)),
+            ]
+            .into(),
+          )
+        })
+        .collect(),
+    );
+    let domain = Expr::List(
+      vec![Expr::List(vec![Expr::Real(x_lo), Expr::Real(x_hi)].into())].into(),
+    );
+    let interp = call(
+      "InterpolatingFunction",
+      vec![domain, data, Expr::Integer(NDSOLVE_INTERPOLATION_ORDER)],
+    );
+    rules.push(if f.function_form {
+      Expr::Rule {
+        pattern: Box::new(Expr::Identifier(f.name.clone())),
+        replacement: Box::new(interp),
+      }
+    } else {
+      Expr::Rule {
+        pattern: Box::new(Expr::FunctionCall {
+          name: f.name.clone(),
+          args: vec![Expr::Identifier(x_name.clone())].into(),
+        }),
+        replacement: Box::new(Expr::CurriedCall {
+          func: Box::new(interp),
+          args: vec![Expr::Identifier(x_name.clone())],
+        }),
+      }
+    });
+  }
+  // Return the rules in the order the functions were asked for: an
+  // eliminated one was appended last, but `NDSolveValue` hands back a list
+  // of values positionally.
+  let requested: Vec<String> = match &args[1] {
+    Expr::List(items) => items.iter().filter_map(dep_name).collect(),
+    other => dep_name(other).into_iter().collect(),
+  };
+  let mut ordered: Vec<Expr> = Vec::with_capacity(rules.len());
+  for name in &requested {
+    if let Some(pos) = rules
+      .iter()
+      .position(|r| rule_target_name(r) == Some(name.as_str()))
+    {
+      ordered.push(rules.remove(pos));
+    }
+  }
+  ordered.append(&mut rules);
+  Ok(Some(Expr::List(vec![Expr::List(ordered.into())].into())))
+}
+
+/// How many times [`integrate_leg_until_event`] doubles its search window
+/// before giving up. `2^40` units past `x0` is far past any plausible
+/// event time for a problem whose own scale is of order 1 — the common
+/// case, since a Demonstration's controls are themselves usually of that
+/// order — while still costing only `MAX_UNBOUNDED_DOUBLINGS * 1000` RK4
+/// evaluations in the worst case.
+const MAX_UNBOUNDED_DOUBLINGS: u32 = 40;
+
+/// Forward-integrate from `x0` with no fixed upper bound, for
+/// `NDSolve[…, {t, t0, Infinity}, Method -> {"EventLocator", …}]`. There's
+/// no domain length to size a step from, so the unknown span is searched
+/// geometrically — windows of 1, 2, 4, … units past `x0`, each with its
+/// own 1000-step grid — until `event_fn` fires inside one of them. Gives
+/// up after [`MAX_UNBOUNDED_DOUBLINGS`] windows and reports the last
+/// (event-less) one, the way wolframscript's `NDSolve::mxst` reports a
+/// truncated solution after an ordinary step-count overrun.
+#[allow(clippy::too_many_arguments)]
+fn integrate_leg_until_event(
+  residuals: &[NumFn],
+  funcs: &[SysFunc],
+  state_offset: &[usize],
+  init_state: &[f64],
+  x0: f64,
+  event_fn: Option<&NumFn>,
+  event_action: Option<&Expr>,
+  x_name: &str,
+  cached_m: Option<&[Vec<f64>]>,
+) -> Result<Option<Vec<(f64, Vec<f64>)>>, InterpreterError> {
+  let mut window = 1.0f64;
+  for attempt in 0..MAX_UNBOUNDED_DOUBLINGS {
+    let x_to = x0 + window;
+    let h = window / 1000.0;
+    let Some(leg) = integrate_leg(
+      residuals,
+      funcs,
+      state_offset,
+      init_state.to_vec(),
+      x0,
+      x_to,
+      h,
+      event_fn,
+      event_action,
+      x_name,
+      cached_m,
+    )?
+    else {
+      return Ok(None);
+    };
+    // The leg stops short of `x_to` exactly when the event fired (or a
+    // step failed) before the window's end; a leg that reaches it ran
+    // clean to the requested window with no event, so the search widens.
+    let reached_end =
+      leg.last().is_some_and(|(x, _)| (x_to - x).abs() < h * 0.5);
+    if !reached_end || attempt + 1 == MAX_UNBOUNDED_DOUBLINGS {
+      if reached_end {
+        crate::emit_message(
+          "NDSolve::mxst: Maximum number of 40000 steps reached before the \
+           event was located; returning the solution found so far.",
+        );
+      }
+      return Ok(Some(leg));
+    }
+    window *= 2.0;
+  }
+  Ok(None)
+}
+
+/// Solve a two-point boundary value problem for a single second-order
+/// equation by shooting: at `x_lo`, one state component is fixed at
+/// `val_lo` (`order_lo == 0` fixes the value, `1` fixes the derivative)
+/// while the other is repeatedly guessed and the *same* IVP stepper
+/// (`integrate_leg`) integrates out to `x_hi`; the guess is refined by the
+/// secant method until the far condition (`val_hi`, likewise a value or a
+/// derivative depending on `order_hi`) is met there. This works for any
+/// well-posed equation — linear or not — since it never inspects the
+/// equation's coefficients directly, only the trajectories the existing
+/// integrator already knows how to produce.
+#[allow(clippy::too_many_arguments)]
+fn solve_bvp_shooting(
+  residuals: &[NumFn],
+  funcs: &[SysFunc],
+  state_offset: &[usize],
+  n_state: usize,
+  x_lo: f64,
+  order_lo: usize,
+  val_lo: f64,
+  x_hi: f64,
+  order_hi: usize,
+  val_hi: f64,
+  n_steps: usize,
+  x_name: &str,
+) -> Result<Option<Vec<(f64, Vec<f64>)>>, InterpreterError> {
+  // The other state component at `x_lo` — the one shooting guesses.
+  let unknown_lo = 1 - order_lo;
+  let h = (x_hi - x_lo) / n_steps as f64;
+
+  let mut probe_state = vec![0.0; n_state];
+  probe_state[order_lo] = val_lo;
+  let cached_mass_matrix = probe_constant_mass_matrix(
+    residuals,
+    funcs.len(),
+    x_lo,
+    &probe_state,
+    x_lo,
+    x_hi,
+  );
+
+  let shoot =
+    |guess: f64| -> Result<Option<Vec<(f64, Vec<f64>)>>, InterpreterError> {
+      let mut init_state = vec![0.0; n_state];
+      init_state[order_lo] = val_lo;
+      init_state[unknown_lo] = guess;
+      integrate_leg(
+        residuals,
+        funcs,
+        state_offset,
+        init_state,
+        x_lo,
+        x_hi,
+        h,
+        None,
+        None,
+        x_name,
+        cached_mass_matrix.as_deref(),
+      )
+    };
+  let reached_end = |pts: &[(f64, Vec<f64>)]| {
+    pts
+      .last()
+      .is_some_and(|(x, _)| (x - x_hi).abs() <= 1e-6 * (1.0 + x_hi.abs()))
+  };
+  // The shooting residual: how far the far end misses its target, as a
+  // function of the guessed unknown at `x_lo`.
+  let residual = |guess: f64| -> Result<
+    Option<(f64, Vec<(f64, Vec<f64>)>)>,
+    InterpreterError,
+  > {
+    match shoot(guess)? {
+      Some(pts) if reached_end(&pts) => {
+        let end = pts.last().unwrap().1[order_hi];
+        Ok(Some((end - val_hi, pts)))
+      }
+      _ => Ok(None),
+    }
+  };
+
+  let mut s0 = 0.0;
+  let mut s1 = 1.0;
+  let Some((mut f0, _)) = residual(s0)? else {
+    return Ok(None);
+  };
+  let tol = 1e-7 * (1.0 + val_hi.abs());
+  for _ in 0..60 {
+    let Some((f1, pts1)) = residual(s1)? else {
+      return Ok(None);
+    };
+    if f1.abs() <= tol {
+      return Ok(Some(pts1));
+    }
+    let denom = f1 - f0;
+    if denom.abs() < 1e-300 {
+      return Ok(None);
+    }
+    let s2 = s1 - f1 * (s1 - s0) / denom;
+    s0 = s1;
+    f0 = f1;
+    s1 = s2;
+  }
+  Ok(None)
+}
+
+/// Integrate one leg with RK4. Returns the points in integration order
+/// (starting at `x_from`), or `None` if a derivative evaluation failed.
+/// When an event function is given, integration stops at the located
+/// event point after running the (held) event action; an action that
+/// throws the `"StopIntegration"` tag simply stops the leg.
+#[allow(clippy::too_many_arguments)]
+fn integrate_leg(
+  residuals: &[NumFn],
+  funcs: &[SysFunc],
+  state_offset: &[usize],
+  init_state: Vec<f64>,
+  x_from: f64,
+  x_to: f64,
+  h: f64,
+  event_fn: Option<&NumFn>,
+  event_action: Option<&Expr>,
+  x_name: &str,
+  cached_m: Option<&[Vec<f64>]>,
+) -> Result<Option<Vec<(f64, Vec<f64>)>>, InterpreterError> {
+  let n_steps = ((x_to - x_from) / h).round() as usize;
+  // Each grid point is computed from the leg's ends rather than by adding
+  // `h` to the previous one, and the last one *is* `x_to`: accumulating
+  // the step leaves the domain a few ulps short of where it was asked to
+  // end (`{{0., 4.999999999999916}}` instead of `{{0., 5.}}`).
+  let step = if n_steps > 0 {
+    (x_to - x_from) / n_steps as f64
+  } else {
+    h
+  };
+  let grid = |i: usize| {
+    if i >= n_steps {
+      x_to
+    } else {
+      x_from + i as f64 * step
+    }
+  };
+  let mut points: Vec<(f64, Vec<f64>)> = Vec::with_capacity(n_steps + 1);
+  let mut state = init_state;
+  let mut x = x_from;
+  points.push((x, state.clone()));
+
+  let eval_event = |x: f64, state: &[f64]| -> Option<f64> {
+    event_fn.and_then(|f| f.eval_state(x, state, funcs.len()).ok())
+  };
+  let mut prev_event = eval_event(x, &state);
+
+  for i in 0..n_steps {
+    let new_x = grid(i + 1);
+    let h = new_x - x;
+    let mut refined: Vec<(f64, Vec<f64>)> = Vec::new();
+    let Some(new_state) = rk4_step_refined(
+      residuals,
+      funcs,
+      state_offset,
+      &state,
+      x,
+      h,
+      0,
+      &mut refined,
+      cached_m,
+    )?
+    else {
+      // The step failed even after refinement — typically the trajectory
+      // itself diverges to infinity partway through the domain (a shooting
+      // guess that isn't yet the true boundary-value solution commonly
+      // does this well short of `x_to`). Rather than discarding every
+      // point integrated so far, hand back the leg truncated at the last
+      // point that was actually reached: the caller already builds the
+      // returned `InterpolatingFunction`'s domain from the first/last
+      // collected point rather than assuming it spans the requested
+      // range, so a truncated leg becomes a truncated (rather than a
+      // missing) solution — matching wolframscript, which likewise
+      // returns an `InterpolatingFunction` valid up to where it could
+      // integrate instead of failing the whole call (alongside the
+      // `NDSolve::ndsz` message it prints at the point stepping stalled).
+      if points.len() > 1 {
+        crate::emit_message(&format!(
+          "NDSolve::ndsz: At x == {x}, step size is effectively zero; \
+           singularity or stiff system suspected."
+        ));
+      }
+      return Ok(if points.len() > 1 { Some(points) } else { None });
+    };
+
+    if let Some(prev_g) = prev_event
+      && let Some(new_g) = eval_event(new_x, &new_state)
+    {
+      if prev_g.signum() != new_g.signum() && prev_g.is_finite() {
+        // Event crossing inside this step: locate it by linear
+        // interpolation of the event function, then take a partial RK4
+        // step to land on it.
+        let frac = if (prev_g - new_g).abs() > f64::EPSILON {
+          (prev_g / (prev_g - new_g)).clamp(0.0, 1.0)
+        } else {
+          1.0
+        };
+        let h_star = h * frac;
+        let (x_ev, state_ev) = if h_star.abs() > f64::EPSILON {
+          match rk4_system_step(
+            residuals,
+            funcs,
+            state_offset,
+            &state,
+            x,
+            h_star,
+            cached_m,
+          )? {
+            Some(s) => (x + h_star, s),
+            None => (new_x, new_state.clone()),
+          }
+        } else {
+          (x, state.clone())
+        };
+        points.push((x_ev, state_ev));
+        if let Some(action) = event_action {
+          let action = crate::syntax::substitute_variable(
+            action,
+            x_name,
+            &Expr::Real(x_ev),
+          );
+          match crate::evaluator::evaluate_expr_to_expr(&action) {
+            Ok(_) => {}
+            Err(InterpreterError::ThrowValue(_, tag))
+              if matches!(
+                tag.as_deref(),
+                Some(Expr::String(s)) if s == "StopIntegration"
+              ) => {}
+            Err(e) => return Err(e),
+          }
+        }
+        return Ok(Some(points));
+      }
+      prev_event = Some(new_g);
+    } else {
+      prev_event = eval_event(new_x, &new_state);
+    }
+
+    state = new_state;
+    x = new_x;
+    points.append(&mut refined);
+  }
+  Ok(Some(points))
+}
+
+/// Local-error tolerances for the step-doubling refinement below. They are
+/// deliberately loose: RK4's local error at the nominal step size is orders
+/// of magnitude smaller for any smooth problem, so an ordinary integration
+/// never subdivides and keeps exactly the grid — and the values — the
+/// fixed-step integrator produced.
+const STEP_REFINE_RTOL: f64 = 1e-4;
+const STEP_REFINE_ATOL: f64 = 1e-8;
+
+/// How far one nominal step may be bisected. A tracer pulse 10^-6 wide in a
+/// domain of length 20 needs ~15 bisections of the 1/1000 nominal step to be
+/// seen at all, and another dozen for its edges to stop costing accuracy.
+const MAX_STEP_BISECTIONS: u32 = 32;
+
+/// Upper bound on the points one leg may accumulate, so a pathological
+/// right-hand side cannot make the refinement run away.
+const MAX_REFINED_POINTS: usize = 200_000;
+
+/// Take one nominal step, bisecting it when comparing a whole step against
+/// two half steps says the step is too coarse. A forcing term that is
+/// nonzero only on a very narrow interval — an injected tracer pulse, say —
+/// is otherwise integrated as though it lasted the whole step, which
+/// inflates the solution by the ratio of the two widths.
+///
+/// Every point the refinement visits is appended to `out`, so the
+/// interpolating solution resolves the feature too. Returns the state at
+/// `x + h`.
+#[allow(clippy::too_many_arguments)]
+fn rk4_step_refined(
+  residuals: &[NumFn],
+  funcs: &[SysFunc],
+  state_offset: &[usize],
+  state: &[f64],
+  x: f64,
+  h: f64,
+  depth: u32,
+  out: &mut Vec<(f64, Vec<f64>)>,
+  cached_m: Option<&[Vec<f64>]>,
+) -> Result<Option<Vec<f64>>, InterpreterError> {
+  let Some(full) =
+    rk4_system_step(residuals, funcs, state_offset, state, x, h, cached_m)?
+  else {
+    return Ok(None);
+  };
+  let accept = |s: Vec<f64>, out: &mut Vec<(f64, Vec<f64>)>| {
+    out.push((x + h, s.clone()));
+    Ok(Some(s))
+  };
+  if depth >= MAX_STEP_BISECTIONS || out.len() >= MAX_REFINED_POINTS {
+    return accept(full, out);
+  }
+
+  // Two half steps. If either fails the whole step stands — the coarse
+  // result is still the best available.
+  let half = h / 2.0;
+  // A half step too small to move `x` cannot be refined any further.
+  if x + half == x {
+    return accept(full, out);
+  }
+  let Some(mid) =
+    rk4_system_step(residuals, funcs, state_offset, state, x, half, cached_m)?
+  else {
+    return accept(full, out);
+  };
+  let Some(two) = rk4_system_step(
+    residuals,
+    funcs,
+    state_offset,
+    &mid,
+    x + half,
+    half,
+    cached_m,
+  )?
+  else {
+    return accept(full, out);
+  };
+
+  // A non-finite difference means the problem is singular here, not that a
+  // smaller step would help, so it counts as converged.
+  let converged = full.iter().zip(&two).all(|(a, b)| {
+    let diff = (a - b).abs();
+    let scale = STEP_REFINE_ATOL + STEP_REFINE_RTOL * a.abs().max(b.abs());
+    !diff.is_finite() || diff <= scale
+  });
+  if converged {
+    return accept(full, out);
+  }
+
+  let Some(mid) = rk4_step_refined(
+    residuals,
+    funcs,
+    state_offset,
+    state,
+    x,
+    half,
+    depth + 1,
+    out,
+    cached_m,
+  )?
+  else {
+    return Ok(None);
+  };
+  rk4_step_refined(
+    residuals,
+    funcs,
+    state_offset,
+    &mid,
+    x + half,
+    half,
+    depth + 1,
+    out,
+    cached_m,
+  )
+}
+
+/// One RK4 step of the first-order system equivalent. Returns `None`
+/// when a residual can't be evaluated numerically or the linear system
+/// for the highest derivatives is singular. `cached_m` is the mass matrix
+/// `probe_constant_mass_matrix` proved constant for this system, if any —
+/// passing it in skips the `O(n^2)` rebuild at every stage.
+fn rk4_system_step(
+  residuals: &[NumFn],
+  funcs: &[SysFunc],
+  state_offset: &[usize],
+  state: &[f64],
+  x: f64,
+  h: f64,
+  cached_m: Option<&[Vec<f64>]>,
+) -> Result<Option<Vec<f64>>, InterpreterError> {
+  let deriv = |s: &[f64],
+               xv: f64|
+   -> Result<Option<Vec<f64>>, InterpreterError> {
+    let Some(high) =
+      solve_highest_derivatives_cached(residuals, funcs.len(), xv, s, cached_m)
+    else {
+      return Ok(None);
+    };
+    let mut d = vec![0.0; s.len()];
+    for (fi, f) in funcs.iter().enumerate() {
+      let off = state_offset[fi];
+      for k in 0..f.order - 1 {
+        d[off + k] = s[off + k + 1];
+      }
+      d[off + f.order - 1] = high[fi];
+    }
+    Ok(Some(d))
+  };
+
+  let add_scaled = |s: &[f64], d: &[f64], c: f64| -> Vec<f64> {
+    s.iter().zip(d).map(|(a, b)| a + b * c).collect()
+  };
+
+  let Some(k1) = deriv(state, x)? else {
+    return Ok(None);
+  };
+  let Some(k2) = deriv(&add_scaled(state, &k1, h / 2.0), x + h / 2.0)? else {
+    return Ok(None);
+  };
+  let Some(k3) = deriv(&add_scaled(state, &k2, h / 2.0), x + h / 2.0)? else {
+    return Ok(None);
+  };
+  let Some(k4) = deriv(&add_scaled(state, &k3, h), x + h)? else {
+    return Ok(None);
+  };
+
+  Ok(Some(
+    state
+      .iter()
+      .enumerate()
+      .map(|(i, s)| s + h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]))
+      .collect(),
+  ))
+}
+
+/// Solve for the highest derivatives at one point. The residuals are
+/// affine in the highest-derivative vector `hvec`: `r(hvec) = M·hvec + c`,
+/// so `c = r(0)` and the columns of `M` follow from unit vectors; the
+/// result solves `M·hvec = -c`.
+/// The `c` half of `r(hvec) = M·hvec + c`: `r` evaluated with every
+/// highest-derivative placeholder at zero. Cheap (one pass over the
+/// residuals) — the expensive part is `mass_matrix`, below.
+fn residual_constant_term(
+  residuals: &[NumFn],
+  n: usize,
+  x: f64,
+  state: &[f64],
+) -> Option<Vec<f64>> {
+  let mut vars = Vec::with_capacity(1 + state.len() + n);
+  vars.push(x);
+  vars.extend_from_slice(state);
+  vars.extend(std::iter::repeat_n(0.0, n));
+
+  let mut c = vec![0.0; n];
+  for (i, r) in residuals.iter().enumerate() {
+    let v = r.eval(&vars).ok()?;
+    if !v.is_finite() {
+      return None;
+    }
+    c[i] = v;
+  }
+  Some(c)
+}
+
+/// The `M` half of `r(hvec) = M·hvec + c`, recovered a column at a time via
+/// `r(delta·e_j) − r(0) = M·(delta·e_j)` — exact since the residuals are
+/// affine in the highest-derivative vector `hvec`. This is the expensive
+/// part of solving for the highest derivatives: `n` extra residual
+/// evaluations per column, `n` columns. When `M` is independent of `x` and
+/// `state` (e.g. the highest-derivative coefficients are plain numerals,
+/// as in a constant-holdup mass/energy balance), the caller can compute it
+/// once and reuse it — see `probe_constant_mass_matrix`.
+fn mass_matrix(
+  residuals: &[NumFn],
+  n: usize,
+  x: f64,
+  state: &[f64],
+  c: &[f64],
+) -> Option<Vec<Vec<f64>>> {
+  let mut vars = Vec::with_capacity(1 + state.len() + n);
+  vars.push(x);
+  vars.extend_from_slice(state);
+  vars.extend(std::iter::repeat_n(0.0, n));
+
+  // A unit-sized `delta` is lost entirely to rounding when the other terms
+  // in the residual dwarf it — e.g. a coefficient of 1e16 (from squaring a
+  // large angular frequency) makes `c[i] + 1.0` round straight back down
+  // to `c[i]` in `f64`, which reads as an exactly-zero, falsely singular
+  // column. Scaling `delta` up to the residuals' own magnitude keeps the
+  // perturbation's contribution above the rounding floor at that scale, so
+  // it survives the subtraction.
+  let delta = c.iter().fold(1.0_f64, |acc, v| acc.max(v.abs()));
+  let mut m = vec![vec![0.0; n]; n];
+  for j in 0..n {
+    vars[1 + state.len() + j] = delta;
+    for (i, r) in residuals.iter().enumerate() {
+      let v = r.eval(&vars).ok()?;
+      if !v.is_finite() {
+        return None;
+      }
+      m[i][j] = (v - c[i]) / delta;
+    }
+    vars[1 + state.len() + j] = 0.0;
+  }
+  Some(m)
+}
+
+/// Solve `M·hvec = -c` by Gaussian elimination with partial pivoting.
+/// `m` is consumed (the elimination overwrites it) since every caller
+/// either owns a fresh matrix or is working from a clone of a cached one.
+fn solve_mass_matrix_system(
+  mut m: Vec<Vec<f64>>,
+  c: &[f64],
+) -> Option<Vec<f64>> {
+  let n = c.len();
+  let mut rhs: Vec<f64> = c.iter().map(|v| -v).collect();
+  for col in 0..n {
+    let (pivot_row, pivot_abs) = (col..n)
+      .map(|r| (r, m[r][col].abs()))
+      .max_by(|a, b| a.1.total_cmp(&b.1))
+      .unwrap();
+    if pivot_abs < 1e-14 {
+      return None;
+    }
+    m.swap(col, pivot_row);
+    rhs.swap(col, pivot_row);
+    for row in col + 1..n {
+      let factor = m[row][col] / m[col][col];
+      for k in col..n {
+        m[row][k] -= factor * m[col][k];
+      }
+      rhs[row] -= factor * rhs[col];
+    }
+  }
+  let mut sol = vec![0.0; n];
+  for row in (0..n).rev() {
+    let mut acc = rhs[row];
+    for k in row + 1..n {
+      acc -= m[row][k] * sol[k];
+    }
+    sol[row] = acc / m[row][row];
+  }
+  Some(sol)
+}
+
+/// Solve for the highest derivatives at one point, reusing `cached_m` in
+/// place of rebuilding the mass matrix when the caller has established
+/// (via `probe_constant_mass_matrix`) that it doesn't vary with `x` or
+/// `state`. Recomputing `c` (an `O(n)` pass) still happens every call,
+/// since that half genuinely does depend on the current point.
+fn solve_highest_derivatives_cached(
+  residuals: &[NumFn],
+  n_funcs: usize,
+  x: f64,
+  state: &[f64],
+  cached_m: Option<&[Vec<f64>]>,
+) -> Option<Vec<f64>> {
+  let n = n_funcs;
+  let c = residual_constant_term(residuals, n, x, state)?;
+  if let Some(m) = cached_m {
+    solve_mass_matrix_system(m.to_vec(), &c)
+  } else {
+    let m = mass_matrix(residuals, n, x, state, &c)?;
+    solve_mass_matrix_system(m, &c)
+  }
+}
+
+/// Local-error tolerances for judging two mass-matrix samples "the same
+/// point" — loose enough to absorb the finite-difference rounding a
+/// different `delta` scale (from a different `c` at each probe point)
+/// introduces, tight enough that a genuinely state-dependent mass matrix
+/// still fails the check.
+const MASS_MATRIX_RTOL: f64 = 1e-8;
+const MASS_MATRIX_ATOL: f64 = 1e-10;
+
+fn mass_matrices_close(a: &[Vec<f64>], b: &[Vec<f64>]) -> bool {
+  a.iter().zip(b).all(|(ra, rb)| {
+    ra.iter().zip(rb).all(|(x, y)| {
+      let diff = (x - y).abs();
+      diff.is_finite()
+        && diff <= MASS_MATRIX_ATOL + MASS_MATRIX_RTOL * x.abs().max(y.abs())
+    })
+  })
+}
+
+/// Whether the DAE's mass matrix — the highest-derivative coefficients in
+/// `r(hvec) = M·hvec + c` — is the same everywhere, so integrating can
+/// build it once instead of at every one of the thousands of stage
+/// evaluations a run takes. Many physical models are exactly this way: a
+/// holdup/mass balance's highest-derivative coefficients are plain
+/// numerals (a tank's volume, a stage's molar holdup), not expressions of
+/// the state.
+///
+/// Checked numerically rather than by inspecting the symbolic equations:
+/// `M` is recomputed at two points away from `(x0, state0)` and compared.
+/// Since the finite-difference recovery of `M` is exact for any point at
+/// which the residuals evaluate (affine-in-`hvec` is already required for
+/// this solver to apply at all), a truly constant `M` reproduces to near
+/// machine precision regardless of where it's sampled — so this can't
+/// mistake a slowly-varying `M` for a constant one, only a genuinely
+/// constant one for itself. Any evaluation failure (e.g. a probe point
+/// landing outside a `Log`/`Sqrt` argument's domain) is treated as "not
+/// safely cacheable" and falls back to the exact per-call rebuild.
+fn probe_constant_mass_matrix(
+  residuals: &[NumFn],
+  n: usize,
+  x0: f64,
+  state0: &[f64],
+  x_min: f64,
+  x_max: f64,
+) -> Option<Vec<Vec<f64>>> {
+  let c0 = residual_constant_term(residuals, n, x0, state0)?;
+  let m0 = mass_matrix(residuals, n, x0, state0, &c0)?;
+
+  // Probe 1: a different point in the integration domain.
+  let span = x_max - x_min;
+  let x_probe = if span.is_finite() && span > 0.0 {
+    x_min + span * 0.618
+  } else {
+    x0 + 1.0
+  };
+  if x_probe != x0 {
+    let c1 = residual_constant_term(residuals, n, x_probe, state0)?;
+    let m1 = mass_matrix(residuals, n, x_probe, state0, &c1)?;
+    if !mass_matrices_close(&m0, &m1) {
+      return None;
+    }
+  }
+
+  // Probe 2: a perturbed state vector (relative offset, plus a small
+  // absolute one so an exactly-zero component still moves).
+  let state_probe: Vec<f64> = state0
+    .iter()
+    .map(|v| v * 1.0009 + v.signum() * 1e-6 + 1e-9)
+    .collect();
+  let c2 = residual_constant_term(residuals, n, x0, &state_probe)?;
+  let m2 = mass_matrix(residuals, n, x0, &state_probe, &c2)?;
+  if !mass_matrices_close(&m0, &m2) {
+    return None;
+  }
+
+  Some(m0)
+}
+
+/// The synthesized variable name standing for the k-th derivative of `f`
+/// in a rewritten residual.
+fn placeholder_name(fname: &str, k: usize) -> String {
+  format!("__ndsolve${fname}${k}")
+}
+
+/// Highest derivative order of `fname` appearing anywhere in `expr`
+/// (`fname[x]` counts as order 0 only if a derivative also appears —
+/// order is the max over `Derivative[k][fname][…]` occurrences).
+fn max_derivative_order(expr: &Expr, fname: &str) -> usize {
+  let mut max = 0;
+  if let Some((order, _)) = extract_derivative_order_and_point(expr, fname) {
+    max = max.max(order);
+  }
+  for child in expr_children(expr) {
+    max = max.max(max_derivative_order(child, fname));
+  }
+  max
+}
+
+/// Replace every `f[x]` and `Derivative[k][f][x]` occurrence with its
+/// placeholder identifier, for every function of the system.
+fn substitute_function_values(
+  expr: &Expr,
+  funcs: &[SysFunc],
+  x_name: &str,
+) -> Expr {
+  // Match this node against `f[x]` / `Derivative[k][f][x]`.
+  for f in funcs {
+    if let Expr::FunctionCall { name, args } = expr
+      && name == &f.name
+      && args.len() == 1
+      && matches!(&args[0], Expr::Identifier(a) if a == x_name)
+    {
+      return Expr::Identifier(placeholder_name(&f.name, 0));
+    }
+    if let Some((order, point)) =
+      extract_derivative_order_and_point(expr, &f.name)
+      && matches!(&point, Expr::Identifier(a) if a == x_name)
+    {
+      return Expr::Identifier(placeholder_name(&f.name, order));
+    }
+  }
+  map_children(expr, &|child| {
+    substitute_function_values(child, funcs, x_name)
+  })
+}
+
+// ─── Compiled numeric expressions ─────────────────────────────────────
+
+/// A residual/event function over the numeric variable vector, compiled
+/// to a closure tree when possible and falling back to per-call symbolic
+/// substitution otherwise.
+enum NumFn {
+  Compiled(NExpr),
+  Symbolic { expr: Expr, names: Vec<String> },
+}
+
+impl NumFn {
+  fn new(expr: Expr, var_names: &[String]) -> Self {
+    match compile_numeric(&expr, var_names) {
+      Some(compiled) => Self::Compiled(compiled),
+      None => Self::Symbolic {
+        expr,
+        names: var_names.to_vec(),
+      },
+    }
+  }
+
+  fn eval(&self, vars: &[f64]) -> Result<f64, InterpreterError> {
+    match self {
+      Self::Compiled(nexpr) => Ok(nexpr.eval(vars)),
+      Self::Symbolic { expr, names } => {
+        let mut substituted = expr.clone();
+        for (name, value) in names.iter().zip(vars) {
+          substituted = crate::syntax::substitute_variable(
+            &substituted,
+            name,
+            &Expr::Real(*value),
+          );
+        }
+        let result = crate::evaluator::evaluate_expr_to_expr(&substituted)?;
+        expr_to_f64(&result)
+      }
+    }
+  }
+
+  /// Evaluate with the highest-derivative slots zeroed (they may
+  /// legitimately appear in an event function; zero is the best guess
+  /// short of re-solving, and events rarely reference them).
+  fn eval_state(
+    &self,
+    x: f64,
+    state: &[f64],
+    n_funcs: usize,
+  ) -> Result<f64, InterpreterError> {
+    let mut vars = Vec::with_capacity(1 + state.len() + n_funcs);
+    vars.push(x);
+    vars.extend_from_slice(state);
+    vars.extend(std::iter::repeat_n(0.0, n_funcs));
+    self.eval(&vars)
+  }
+}
+
+/// A numeric expression tree over a variable vector — the compiled form
+/// of a residual, evaluated tens of thousands of times per solve.
+enum NExpr {
+  Const(f64),
+  Var(usize),
+  Add(Vec<Self>),
+  Mul(Vec<Self>),
+  Pow(Box<Self>, Box<Self>),
+  Neg(Box<Self>),
+  Fn1(fn(f64) -> f64, Box<Self>),
+  Fn2(fn(f64, f64) -> f64, Box<Self>, Box<Self>),
+  /// A leaf the compiler can't reduce to closed-form arithmetic — e.g. a
+  /// call to a function defined elsewhere in the session (a boundary value
+  /// pinned via `f[n][t_] := …`, say) rather than one of `compile_numeric`'s
+  /// known operators. Falls back to full symbolic evaluation, but only for
+  /// this leaf: the surrounding arithmetic stays compiled, so one
+  /// unresolved call amid an otherwise-numeric right-hand side doesn't
+  /// force the *entire* residual through the slow path on every step.
+  External {
+    template: Expr,
+    refs: Vec<(String, usize)>,
+  },
+  /// A call `InterpolatingFunction[domain, data, order…][arg]` — e.g. a
+  /// lookup table built with `Interpolation[…]` and referenced from an
+  /// ODE's right-hand side. Goes straight to
+  /// `evaluate_interpolating_function` instead of through `External`'s
+  /// full symbolic round trip (re-resolving the call generically on every
+  /// one of the tens of thousands of RK4 stages a solve takes), while
+  /// still calling that same function so the interpolation math itself is
+  /// not duplicated.
+  Interp1D {
+    func_args: Vec<Expr>,
+    arg: Box<Self>,
+  },
+}
+
+impl NExpr {
+  fn eval(&self, vars: &[f64]) -> f64 {
+    match self {
+      Self::Const(v) => *v,
+      Self::Var(i) => vars[*i],
+      Self::Add(items) => items.iter().map(|e| e.eval(vars)).sum(),
+      Self::Mul(items) => items.iter().map(|e| e.eval(vars)).product(),
+      Self::Pow(base, exp) => {
+        let b = base.eval(vars);
+        let e = exp.eval(vars);
+        // Integer exponents use powi to keep negative bases exact.
+        if e.fract() == 0.0 && e.abs() < i32::MAX as f64 {
+          b.powi(e as i32)
+        } else {
+          b.powf(e)
+        }
+      }
+      Self::Neg(e) => -e.eval(vars),
+      Self::Fn1(f, a) => f(a.eval(vars)),
+      Self::Fn2(f, a, b) => f(a.eval(vars), b.eval(vars)),
+      Self::External { template, refs } => {
+        let mut substituted = template.clone();
+        for (name, idx) in refs {
+          substituted = crate::syntax::substitute_variable(
+            &substituted,
+            name,
+            &Expr::Real(vars[*idx]),
+          );
+        }
+        crate::evaluator::evaluate_expr_to_expr(&substituted)
+          .ok()
+          .and_then(|r| expr_to_f64(&r).ok())
+          .unwrap_or(f64::NAN)
+      }
+      Self::Interp1D { func_args, arg } => {
+        let x = arg.eval(vars);
+        evaluate_interpolating_function(func_args, &[Expr::Real(x)])
+          .ok()
+          .and_then(|r| expr_to_f64(&r).ok())
+          .unwrap_or(f64::NAN)
+      }
+    }
+  }
+}
+
+/// Every `var_names` identifier referenced anywhere inside `expr`, paired
+/// with its index — the substitutions an `NExpr::External` leaf needs to
+/// apply before handing the template to the full evaluator.
+fn collect_var_refs(
+  expr: &Expr,
+  var_names: &[String],
+  out: &mut Vec<(String, usize)>,
+) {
+  if let Expr::Identifier(name) = expr {
+    if let Some(idx) = var_names.iter().position(|n| n == name)
+      && !out.iter().any(|(n, _)| n == name)
+    {
+      out.push((name.clone(), idx));
+    }
+    return;
+  }
+  for child in expr_children(expr) {
+    collect_var_refs(child, var_names, out);
+  }
+}
+
+/// Wrap a construct `compile_numeric` doesn't otherwise reduce to
+/// closed-form arithmetic as an `NExpr::External` leaf.
+fn compile_external_leaf(expr: &Expr, var_names: &[String]) -> NExpr {
+  let mut refs = Vec::new();
+  collect_var_refs(expr, var_names, &mut refs);
+  NExpr::External {
+    template: expr.clone(),
+    refs,
+  }
+}
+
+/// If `expr` is a call `InterpolatingFunction[domain, data, …][arg]` — a
+/// lookup table built by `Interpolation[…]`/`ListInterpolation[…]` or an
+/// NDSolve result, already resolved to its value by the time equations
+/// reach this compiler — compile it as an `NExpr::Interp1D` leaf so a
+/// residual that looks the table up stays out of `External`'s full
+/// symbolic dispatch on every RK4 stage. Returns `None` for anything else:
+/// a 2-D grid interpolation (its call takes a `{x, y}` pair, not this
+/// leaf's single scalar) or a call whose head isn't `InterpolatingFunction`.
+fn compile_interp1d_call(
+  func: &Expr,
+  args: &[Expr],
+  var_names: &[String],
+) -> Option<NExpr> {
+  if args.len() != 1 {
+    return None;
+  }
+  let Expr::FunctionCall {
+    name: interp_name,
+    args: func_args,
+  } = func
+  else {
+    return None;
+  };
+  if interp_name != "InterpolatingFunction"
+    || !(2..=4).contains(&func_args.len())
+  {
+    return None;
+  }
+  // The 2-D grid form carries `{orderRow, orderCol}` as its third
+  // argument; a plain 1-D table has a single integer order (or none).
+  if matches!(func_args.get(2), Some(Expr::List(_))) {
+    return None;
+  }
+  let arg = compile_numeric(&args[0], var_names)?;
+  Some(NExpr::Interp1D {
+    func_args: func_args.to_vec(),
+    arg: Box::new(arg),
+  })
+}
+
+/// Compile an expression over the given variable names to an `NExpr`.
+/// Returns `None` for any construct outside the supported numeric subset
+/// (the caller then falls back to symbolic evaluation).
+fn compile_numeric(expr: &Expr, var_names: &[String]) -> Option<NExpr> {
+  let comp = |e: &Expr| compile_numeric(e, var_names);
+  match expr {
+    Expr::Integer(n) => Some(NExpr::Const(*n as f64)),
+    Expr::Real(v) => Some(NExpr::Const(*v)),
+    Expr::Identifier(name) => {
+      if let Some(idx) = var_names.iter().position(|n| n == name) {
+        return Some(NExpr::Var(idx));
+      }
+      match name.as_str() {
+        "Pi" => Some(NExpr::Const(std::f64::consts::PI)),
+        "E" => Some(NExpr::Const(std::f64::consts::E)),
+        "Degree" => Some(NExpr::Const(std::f64::consts::PI / 180.0)),
+        "GoldenRatio" => Some(NExpr::Const(f64::midpoint(1.0, 5.0_f64.sqrt()))),
+        _ => None,
+      }
+    }
+    Expr::BinaryOp { op, left, right } => {
+      let l = comp(left)?;
+      let r = comp(right)?;
+      Some(match op {
+        BinaryOperator::Plus => NExpr::Add(vec![l, r]),
+        BinaryOperator::Minus => NExpr::Add(vec![l, NExpr::Neg(Box::new(r))]),
+        BinaryOperator::Times => NExpr::Mul(vec![l, r]),
+        BinaryOperator::Divide => NExpr::Mul(vec![
+          l,
+          NExpr::Pow(Box::new(r), Box::new(NExpr::Const(-1.0))),
+        ]),
+        BinaryOperator::Power => NExpr::Pow(Box::new(l), Box::new(r)),
+        _ => return None,
+      })
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => Some(NExpr::Neg(Box::new(comp(operand)?))),
+    Expr::FunctionCall { name, args } => {
+      let unary: Option<fn(f64) -> f64> = match name.as_str() {
+        "Sin" => Some(f64::sin),
+        "Cos" => Some(f64::cos),
+        "Tan" => Some(f64::tan),
+        "Sec" => Some(|v: f64| 1.0 / v.cos()),
+        "Csc" => Some(|v: f64| 1.0 / v.sin()),
+        "Cot" => Some(|v: f64| 1.0 / v.tan()),
+        "Sinh" => Some(f64::sinh),
+        "Cosh" => Some(f64::cosh),
+        "Tanh" => Some(f64::tanh),
+        "ArcSin" => Some(f64::asin),
+        "ArcCos" => Some(f64::acos),
+        "ArcTan" if args.len() == 1 => Some(f64::atan),
+        "Exp" => Some(f64::exp),
+        "Log" if args.len() == 1 => Some(f64::ln),
+        "Sqrt" => Some(f64::sqrt),
+        "Abs" => Some(f64::abs),
+        "Sign" => Some(f64::signum),
+        "Floor" if args.len() == 1 => Some(f64::floor),
+        "Ceiling" if args.len() == 1 => Some(f64::ceil),
+        _ => None,
+      };
+      if let Some(f) = unary
+        && args.len() == 1
+      {
+        return Some(NExpr::Fn1(f, Box::new(comp(&args[0])?)));
+      }
+      match name.as_str() {
+        "Plus" => Some(NExpr::Add(
+          args.iter().map(comp).collect::<Option<Vec<_>>>()?,
+        )),
+        "Times" => Some(NExpr::Mul(
+          args.iter().map(comp).collect::<Option<Vec<_>>>()?,
+        )),
+        "Subtract" if args.len() == 2 => Some(NExpr::Add(vec![
+          comp(&args[0])?,
+          NExpr::Neg(Box::new(comp(&args[1])?)),
+        ])),
+        "Divide" if args.len() == 2 => Some(NExpr::Mul(vec![
+          comp(&args[0])?,
+          NExpr::Pow(Box::new(comp(&args[1])?), Box::new(NExpr::Const(-1.0))),
+        ])),
+        "Power" if args.len() == 2 => Some(NExpr::Pow(
+          Box::new(comp(&args[0])?),
+          Box::new(comp(&args[1])?),
+        )),
+        "Rational" if args.len() == 2 => match (&args[0], &args[1]) {
+          (Expr::Integer(a), Expr::Integer(b)) if *b != 0 => {
+            Some(NExpr::Const(*a as f64 / *b as f64))
+          }
+          _ => None,
+        },
+        // Wolfram's `ArcTan[x, y]` is the angle of the point (x, y).
+        "ArcTan" if args.len() == 2 => Some(NExpr::Fn2(
+          |x, y| y.atan2(x),
+          Box::new(comp(&args[0])?),
+          Box::new(comp(&args[1])?),
+        )),
+        "Log" if args.len() == 2 => Some(NExpr::Fn2(
+          |b, v| v.ln() / b.ln(),
+          Box::new(comp(&args[0])?),
+          Box::new(comp(&args[1])?),
+        )),
+        "Mod" if args.len() == 2 => Some(NExpr::Fn2(
+          f64::rem_euclid,
+          Box::new(comp(&args[0])?),
+          Box::new(comp(&args[1])?),
+        )),
+        "Max" if !args.is_empty() => {
+          let compiled = args.iter().map(comp).collect::<Option<Vec<_>>>()?;
+          compiled
+            .into_iter()
+            .reduce(|acc, e| NExpr::Fn2(f64::max, Box::new(acc), Box::new(e)))
+        }
+        "Min" if !args.is_empty() => {
+          let compiled = args.iter().map(comp).collect::<Option<Vec<_>>>()?;
+          compiled
+            .into_iter()
+            .reduce(|acc, e| NExpr::Fn2(f64::min, Box::new(acc), Box::new(e)))
+        }
+        // Not one of the closed-form operators above — most commonly a
+        // call to a function the session itself defined (a fixed boundary
+        // value, a helper via `f[n_] := …`), which can only be resolved by
+        // the full evaluator. Compiled as an External leaf rather than
+        // bailing the whole residual out to the symbolic path.
+        _ => Some(compile_external_leaf(expr, var_names)),
+      }
+    }
+    // `xy = Interpolation[…]; …xy[y[t]]…` — by the time an ODE's
+    // right-hand side reaches this compiler, the symbol `xy` has already
+    // been resolved to its value, leaving `InterpolatingFunction[…][arg]`
+    // as a `CurriedCall` rather than a plain named call. Recognizing it
+    // here keeps a table lookup out of `External`'s full generic dispatch
+    // on every one of the tens of thousands of RK4 stages a solve takes.
+    Expr::CurriedCall { func, args } => {
+      compile_interp1d_call(func, args, var_names)
+        .or_else(|| Some(compile_external_leaf(expr, var_names)))
+    }
+    other => Some(compile_external_leaf(other, var_names)),
+  }
+}
+
+// ─── ODE Term Structures ───────────────────────────────────────────────
+
+/// Represents a term in the ODE: coefficient * y^(order)[x]
+/// order == -1 means it's a forcing term (no y dependence)
+#[derive(Debug, Clone)]
+struct OdeTerm {
+  /// Derivative order: 0 for y[x], 1 for y'[x], 2 for y''[x], etc.
+  /// -1 for forcing terms (free of y)
+  order: i32,
+  /// The coefficient multiplying this term
+  coefficient: Expr,
+}
+
+// ─── ODE Parsing Helpers ───────────────────────────────────────────────
+
+/// Normalize equation: lhs == rhs → lhs - rhs (everything on left side)
+/// Does `expr` contain any derivative anywhere — a `Derivative[...]` head
+/// (i.e. `y'[x]`, `y''[x]`, … which parse to `Derivative[n][y][x]`) or a `D[…]`
+/// operator? Used to distinguish a genuine ODE/PDE from a purely algebraic
+/// equation in the dependent function.
+fn contains_derivative(expr: &Expr) -> bool {
+  match expr {
+    Expr::FunctionCall { name, args } => {
+      name == "Derivative"
+        || name == "D"
+        || args.iter().any(contains_derivative)
+    }
+    // Derivative[n][y][x] parses to a nested CurriedCall whose innermost head
+    // is FunctionCall("Derivative", …); traverse both func and args.
+    Expr::CurriedCall { func, args } => {
+      contains_derivative(func) || args.iter().any(contains_derivative)
+    }
+    Expr::List(items) => items.iter().any(contains_derivative),
+    Expr::BinaryOp { left, right, .. } => {
+      contains_derivative(left) || contains_derivative(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_derivative(operand),
+    Expr::Comparison { operands, .. } => {
+      operands.iter().any(contains_derivative)
+    }
+    _ => false,
+  }
+}
+
+fn normalize_equation(eq: &Expr) -> Result<Expr, InterpreterError> {
+  match eq {
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      let lhs = &operands[0];
+      let rhs = &operands[1];
+      // lhs - rhs
+      Ok(minus2(lhs.clone(), rhs.clone()))
+    }
+    _ => Err(InterpreterError::EvaluationError(
+      "DSolve expects an equation (lhs == rhs)".into(),
+    )),
+  }
+}
+
+/// Check if an expression is an initial condition like `y[0] == 1` or
+/// `y'[0] == 0`. The condition's point must NOT be the independent variable
+/// `x`; otherwise `y[x] == …` / `y'[x] == …` (i.e. the ODE itself) would be
+/// misclassified as an initial condition.
+fn is_initial_condition(expr: &Expr, y_name: &str, x_name: &str) -> bool {
+  let is_ode_point = |p: &Expr| matches!(p, Expr::Identifier(s) if s == x_name);
+  if let Expr::Comparison {
+    operands,
+    operators,
+  } = expr
+    && operands.len() == 2
+    && operators.len() == 1
+    && operators[0] == ComparisonOp::Equal
+  {
+    let lhs = &operands[0];
+    // y[val]
+    if let Expr::FunctionCall { name, args } = lhs
+      && name == y_name
+      && args.len() == 1
+    {
+      return !is_ode_point(&args[0]);
+    }
+    // Derivative[n][y][val] — curried/flattened form
+    if let Some((_, point)) = extract_derivative_order_and_point(lhs, y_name) {
+      return !is_ode_point(&point);
+    }
+  }
+  false
+}
+
+/// Extract derivative order and evaluation point from y^(n)[val]
+/// Returns (order, val_expr) if matched
+fn extract_derivative_order_and_point(
+  expr: &Expr,
+  y_name: &str,
+) -> Option<(usize, Expr)> {
+  // Flattened form: FunctionCall("Derivative", [n, y, val])
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Derivative"
+    && args.len() == 3
+    && let Expr::Integer(n) = &args[0]
+    && let Expr::Identifier(fname) = &args[1]
+    && fname == y_name
+  {
+    return Some((*n as usize, args[2].clone()));
+  }
+
+  // CurriedCall form: Derivative[n][y][val]
+  if let Expr::CurriedCall { func, args } = expr
+    && args.len() == 1
+  {
+    // CurriedCall { func: FunctionCall("Derivative", [n, y]), args: [val] }
+    if let Expr::FunctionCall {
+      name: deriv_name,
+      args: deriv_args,
+    } = func.as_ref()
+      && deriv_name == "Derivative"
+      && deriv_args.len() == 2
+      && let Expr::Integer(n) = &deriv_args[0]
+      && let Expr::Identifier(fname) = &deriv_args[1]
+      && fname == y_name
+    {
+      return Some((*n as usize, args[0].clone()));
+    }
+
+    // CurriedCall { func: CurriedCall { func: FunctionCall("Derivative", [n]), args: [Id(y)] }, args: [val] }
+    if let Expr::CurriedCall {
+      func: inner_func,
+      args: inner_args,
+    } = func.as_ref()
+      && inner_args.len() == 1
+      && let Expr::Identifier(name) = &inner_args[0]
+      && name == y_name
+      && let Expr::FunctionCall {
+        name: deriv_name,
+        args: deriv_args,
+      } = inner_func.as_ref()
+      && deriv_name == "Derivative"
+      && deriv_args.len() == 1
+      && let Expr::Integer(n) = &deriv_args[0]
+    {
+      return Some((*n as usize, args[0].clone()));
+    }
+  }
+  None
+}
+
+/// Evaluate an initial-condition side (or domain bound) numerically.
+/// Exact symbolic values (`-ArcCos[31/40]`, `Pi/6`, …) numericise via the
+/// `N` fallback of `interp_value_to_f64` — NDSolve is a numeric solver,
+/// so this loses nothing.
+fn nval_to_f64(expr: &Expr) -> Option<f64> {
+  interp_value_to_f64(expr).ok()
+}
+
+/// Is `expr` the `Infinity` symbol (as opposed to a finite numeric bound)?
+fn is_infinity(expr: &Expr) -> bool {
+  matches!(expr, Expr::Identifier(s) | Expr::Constant(s) if s == "Infinity")
+}
+
+/// Parse a numeric initial condition: y[x0] == y0 or y'[x0] == y0
+/// Returns (derivative_order, x_val, y_val)
+fn parse_numeric_initial_condition(
+  expr: &Expr,
+  y_name: &str,
+) -> std::option::Option<(usize, f64, f64)> {
+  if let Expr::Comparison {
+    operands,
+    operators,
+  } = expr
+    && operands.len() == 2
+    && operators.len() == 1
+    && operators[0] == ComparisonOp::Equal
+  {
+    let lhs = &operands[0];
+
+    // y[x0] == val
+    if let Expr::FunctionCall { name, args } = lhs
+      && name == y_name
+      && args.len() == 1
+    {
+      // Try to evaluate both sides numerically
+      if let (Some(x_val), Some(rhs_val)) =
+        (nval_to_f64(&args[0]), nval_to_f64(&operands[1]))
+      {
+        return Some((0, x_val, rhs_val));
+      }
+    }
+
+    // Derivative[n, y, x0] == val or Derivative[n][y][x0] == val
+    if let Some((order, val_expr)) =
+      extract_derivative_order_and_point(lhs, y_name)
+      && let (Some(x_val), Some(rhs_val)) =
+        (nval_to_f64(&val_expr), nval_to_f64(&operands[1]))
+    {
+      return Some((order, x_val, rhs_val));
+    }
+  }
+  None
+}
+
+/// Collect all additive terms from the normalized ODE expression,
+/// classifying each by derivative order of y.
+fn collect_ode_terms(
+  expr: &Expr,
+  y_name: &str,
+  x_name: &str,
+) -> Result<Vec<OdeTerm>, InterpreterError> {
+  let mut terms = Vec::new();
+  collect_additive_terms(expr, y_name, x_name, false, &mut terms)?;
+  Ok(terms)
+}
+
+/// Recursively collect additive terms, handling Plus, Minus, UnaryMinus
+fn collect_additive_terms(
+  expr: &Expr,
+  y_name: &str,
+  x_name: &str,
+  negated: bool,
+  terms: &mut Vec<OdeTerm>,
+) -> Result<(), InterpreterError> {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      collect_additive_terms(left, y_name, x_name, negated, terms)?;
+      collect_additive_terms(right, y_name, x_name, negated, terms)?;
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      collect_additive_terms(left, y_name, x_name, negated, terms)?;
+      collect_additive_terms(right, y_name, x_name, !negated, terms)?;
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      collect_additive_terms(operand, y_name, x_name, !negated, terms)?;
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" && args.len() >= 2 => {
+      for arg in args {
+        collect_additive_terms(arg, y_name, x_name, negated, terms)?;
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      // Times[a, b, ...] — check which factor is y-related
+      classify_product_term(args, y_name, x_name, negated, terms)?;
+    }
+    _ => {
+      // Single term: classify it
+      let term = classify_single_term(expr, y_name, x_name)?;
+      let coeff = if negated {
+        negate_expr(&term.coefficient)
+      } else {
+        term.coefficient
+      };
+      terms.push(OdeTerm {
+        order: term.order,
+        coefficient: coeff,
+      });
+    }
+  }
+  Ok(())
+}
+
+/// Classify a single expression as an ODE term
+fn classify_single_term(
+  expr: &Expr,
+  y_name: &str,
+  _x_name: &str,
+) -> Result<OdeTerm, InterpreterError> {
+  // Check if expr is y[x] — order 0
+  if let Expr::FunctionCall { name, args } = expr
+    && name == y_name
+    && args.len() == 1
+  {
+    return Ok(OdeTerm {
+      order: 0,
+      coefficient: Expr::Integer(1),
+    });
+  }
+
+  // Check if expr is Derivative[n][y][x] — order n
+  if let Some(order) = extract_derivative_order(expr, y_name) {
+    return Ok(OdeTerm {
+      order: order as i32,
+      coefficient: Expr::Integer(1),
+    });
+  }
+
+  // Check if it's a product: coeff * y^(n)[x]
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Times,
+    left,
+    right,
+  } = expr
+  {
+    // Check left * y^(n)[x]
+    if let Some(order) = extract_derivative_order(right, y_name) {
+      return Ok(OdeTerm {
+        order: order as i32,
+        coefficient: *left.clone(),
+      });
+    }
+    if let Expr::FunctionCall { name, args } = right.as_ref()
+      && name == y_name
+      && args.len() == 1
+    {
+      return Ok(OdeTerm {
+        order: 0,
+        coefficient: *left.clone(),
+      });
+    }
+    // Check y^(n)[x] * right
+    if let Some(order) = extract_derivative_order(left, y_name) {
+      return Ok(OdeTerm {
+        order: order as i32,
+        coefficient: *right.clone(),
+      });
+    }
+    if let Expr::FunctionCall { name, args } = left.as_ref()
+      && name == y_name
+      && args.len() == 1
+    {
+      return Ok(OdeTerm {
+        order: 0,
+        coefficient: *right.clone(),
+      });
+    }
+  }
+
+  // Not y-related: it's a forcing term
+  if is_free_of_y(expr, y_name) {
+    return Ok(OdeTerm {
+      order: -1,
+      coefficient: expr.clone(),
+    });
+  }
+
+  // Complex y-dependent term we can't handle
+  Err(InterpreterError::EvaluationError(format!(
+    "DSolve: cannot classify term involving {y_name}"
+  )))
+}
+
+/// Classify a product (Times[...]) as an ODE term
+fn classify_product_term(
+  factors: &[Expr],
+  y_name: &str,
+  _x_name: &str,
+  negated: bool,
+  terms: &mut Vec<OdeTerm>,
+) -> Result<(), InterpreterError> {
+  // Find the y-dependent factor
+  let mut y_factor_idx = None;
+  let mut y_order = -1i32;
+
+  for (i, factor) in factors.iter().enumerate() {
+    if let Some(order) = extract_derivative_order(factor, y_name) {
+      y_factor_idx = Some(i);
+      y_order = order as i32;
+      break;
+    }
+    if let Expr::FunctionCall { name, args } = factor
+      && name == y_name
+      && args.len() == 1
+    {
+      y_factor_idx = Some(i);
+      y_order = 0;
+      break;
+    }
+  }
+
+  let order;
+  let coefficient;
+
+  if let Some(idx) = y_factor_idx {
+    order = y_order;
+    // Coefficient is product of all other factors
+    let other_factors: Vec<&Expr> = factors
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| *i != idx)
+      .map(|(_, f)| f)
+      .collect();
+    coefficient = if other_factors.is_empty() {
+      Expr::Integer(1)
+    } else if other_factors.len() == 1 {
+      other_factors[0].clone()
+    } else {
+      Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: other_factors.into_iter().cloned().collect(),
+      }
+    };
+  } else {
+    // No recognized linear y factor. The product is only a forcing term if it
+    // is genuinely free of y; otherwise it depends on y nonlinearly (e.g.
+    // x*y[x]^2) and the linear solver cannot handle it — bail out so DSolve
+    // returns unevaluated rather than fabricating a circular
+    // `C[1] + Integrate[x*y[x]^2, x]` "solution". Mirrors classify_single_term.
+    let product = if factors.len() == 1 {
+      factors[0].clone()
+    } else {
+      unevaluated("Times", factors)
+    };
+    if !is_free_of_y(&product, y_name) {
+      return Err(InterpreterError::EvaluationError(format!(
+        "DSolve: cannot classify term involving {y_name}"
+      )));
+    }
+    order = -1;
+    coefficient = product;
+  }
+
+  let coeff = if negated {
+    negate_expr(&coefficient)
+  } else {
+    coefficient
+  };
+
+  terms.push(OdeTerm {
+    order,
+    coefficient: coeff,
+  });
+  Ok(())
+}
+
+/// Extract derivative order from Derivative[n][y][x] pattern
+/// After evaluation, this can appear as:
+///   - FunctionCall("Derivative", [n, y, x]) — fully flattened form
+///   - CurriedCall { func: CurriedCall { func: FunctionCall("Derivative", [n]), args: [Id(y)] }, args: [x] }
+fn extract_derivative_order(expr: &Expr, y_name: &str) -> Option<usize> {
+  // Flattened form: FunctionCall("Derivative", [n, y, x])
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Derivative"
+    && args.len() == 3
+    && let Expr::Integer(n) = &args[0]
+    && let Expr::Identifier(fname) = &args[1]
+    && fname == y_name
+  {
+    return Some(*n as usize);
+  }
+
+  // CurriedCall form: Derivative[n][y][x]
+  if let Expr::CurriedCall { func, args: _ } = expr {
+    if let Expr::CurriedCall {
+      func: inner_func,
+      args: inner_args,
+    } = func.as_ref()
+      && inner_args.len() == 1
+      && let Expr::Identifier(name) = &inner_args[0]
+      && name == y_name
+      && let Expr::FunctionCall {
+        name: deriv_name,
+        args: deriv_args,
+      } = inner_func.as_ref()
+      && deriv_name == "Derivative"
+      && deriv_args.len() == 1
+      && let Expr::Integer(n) = &deriv_args[0]
+    {
+      return Some(*n as usize);
+    }
+    // Also handle FunctionCall("Derivative", [n, y])[x]
+    if let Expr::FunctionCall {
+      name: deriv_name,
+      args: deriv_args,
+    } = func.as_ref()
+      && deriv_name == "Derivative"
+      && deriv_args.len() == 2
+      && let Expr::Integer(n) = &deriv_args[0]
+      && let Expr::Identifier(fname) = &deriv_args[1]
+      && fname == y_name
+    {
+      return Some(*n as usize);
+    }
+  }
+  None
+}
+
+/// Check if expression is free of the dependent variable y
+fn is_free_of_y(expr: &Expr, y_name: &str) -> bool {
+  match expr {
+    Expr::Identifier(name) => name != y_name,
+    Expr::Integer(_) | Expr::Real(_) | Expr::Constant(_) | Expr::String(_) => {
+      true
+    }
+    Expr::FunctionCall { name, args } => {
+      if name == y_name {
+        return false;
+      }
+      // Derivative[n, y, x] contains y
+      if name == "Derivative"
+        && args.len() >= 2
+        && matches!(&args[1], Expr::Identifier(n) if n == y_name)
+      {
+        return false;
+      }
+      args.iter().all(|a| is_free_of_y(a, y_name))
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      is_free_of_y(left, y_name) && is_free_of_y(right, y_name)
+    }
+    Expr::UnaryOp { operand, .. } => is_free_of_y(operand, y_name),
+    Expr::List(items) => items.iter().all(|e| is_free_of_y(e, y_name)),
+    Expr::CurriedCall { func, args } => {
+      is_free_of_y(func, y_name) && args.iter().all(|a| is_free_of_y(a, y_name))
+    }
+    _ => false,
+  }
+}
+
+/// Negate an expression
+fn negate_expr(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Integer(n) => Expr::Integer(-n),
+    Expr::Real(f) => Expr::Real(-f),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => *operand.clone(),
+    _ => times2(Expr::Integer(-1), expr.clone()),
+  }
+}
+
+// ─── Constant Coefficient ODE Solver ───────────────────────────────────
+
+/// Solve constant-coefficient linear ODE
+/// a_n * y^(n) + ... + a_1 * y' + a_0 * y = f(x)
+fn solve_constant_coefficient_ode(
+  terms: &[OdeTerm],
+  max_order: usize,
+  x_name: &str,
+) -> Result<Expr, InterpreterError> {
+  // Extract numeric coefficients for the characteristic equation
+  let mut coeffs: Vec<f64> = vec![0.0; max_order + 1];
+  let mut forcing: Option<Expr> = None;
+
+  for term in terms {
+    if term.order >= 0 {
+      let idx = term.order as usize;
+      let val = eval_to_f64(&term.coefficient)?;
+      coeffs[idx] += val;
+    } else {
+      // Forcing term
+      let evaluated =
+        crate::evaluator::evaluate_expr_to_expr(&term.coefficient)
+          .unwrap_or(term.coefficient.clone());
+      match &forcing {
+        None => forcing = Some(evaluated),
+        Some(existing) => {
+          forcing = Some(plus2(existing.clone(), evaluated));
+        }
+      }
+    }
+  }
+
+  // Solve characteristic equation: a_n*r^n + ... + a_1*r + a_0 = 0
+  let roots = find_characteristic_roots(&coeffs, max_order)?;
+
+  // Build the general homogeneous solution
+  let homogeneous = build_homogeneous_solution(&roots, x_name);
+
+  // If there's no forcing term, we're done
+  if forcing.is_none() || matches!(&forcing, Some(Expr::Integer(0))) {
+    return Ok(homogeneous);
+  }
+
+  // For non-homogeneous: return homogeneous part + particular solution
+  // For now, handle simple forcing terms
+  if let Some(forcing_expr) = &forcing {
+    let particular = find_particular_solution(
+      &coeffs,
+      max_order,
+      forcing_expr,
+      &roots,
+      x_name,
+    )
+    .or_else(|| variation_of_parameters(&coeffs, &roots, forcing_expr, x_name));
+    if let Some(part) = particular {
+      return Ok(crate::functions::calculus_ast::simplify(plus2(
+        homogeneous,
+        part,
+      )));
+    }
+  }
+
+  // A non-constant forcing term we cannot integrate: returning just the
+  // homogeneous part would silently drop the forcing and produce a wrong
+  // answer, so leave DSolve unevaluated instead.
+  Err(InterpreterError::EvaluationError(
+    "DSolve: cannot find a particular solution for the forcing term".into(),
+  ))
+}
+
+/// Particular solution of a second-order constant-coefficient ODE
+/// a2 y'' + a1 y' + a0 y = g(x) by variation of parameters:
+///
+///   y_p = -y1 ∫ y2 g / (a2 W) dx + y2 ∫ y1 g / (a2 W) dx
+///
+/// with {y1, y2} the fundamental pair from the characteristic roots and W
+/// their Wronskian (computed in closed form per root configuration). The
+/// `terms` convention is Σ term = 0 with the forcing collected on the left,
+/// so g = -forcing. Returns None when the quadratures don't close.
+fn variation_of_parameters(
+  coeffs: &[f64],
+  roots: &[(f64, f64, usize)],
+  forcing: &Expr,
+  x_name: &str,
+) -> Option<Expr> {
+  if coeffs.len() != 3 {
+    return None;
+  }
+  let x = || Expr::Identifier(x_name.to_string());
+  // E^(r x), reduced to 1 for r == 0.
+  let exp_rx = |r: f64| -> Expr {
+    if r.abs() < 1e-10 {
+      Expr::Integer(1)
+    } else {
+      make_exp_term(r, x_name)
+    }
+  };
+  let mul = |a: Expr, b: Expr| -> Expr {
+    match (&a, &b) {
+      (Expr::Integer(1), _) => b,
+      (_, Expr::Integer(1)) => a,
+      _ => times2(a, b),
+    }
+  };
+
+  // Fundamental pair and Wronskian y1 y2' - y1' y2 per root configuration.
+  let (y1, y2, wronskian) = match roots {
+    [(r, im, 2)] if im.abs() < 1e-10 => {
+      // Double root r: {E^(r x), x E^(r x)}, W = E^(2 r x)
+      (exp_rx(*r), mul(x(), exp_rx(*r)), exp_rx(2.0 * r))
+    }
+    [(r1, im1, 1), (r2, im2, 1)] if im1.abs() < 1e-10 && im2.abs() < 1e-10 => {
+      // Distinct real roots: {E^(r1 x), E^(r2 x)}, W = (r2 - r1) E^((r1+r2) x)
+      (
+        exp_rx(*r1),
+        exp_rx(*r2),
+        mul(f64_to_nice_expr(r2 - r1), exp_rx(r1 + r2)),
+      )
+    }
+    [(alpha, beta, 1)] if *beta > 1e-10 => {
+      // Complex pair α ± iβ: {E^(α x) Cos[β x], E^(α x) Sin[β x]},
+      // W = β E^(2 α x)
+      let cos_t = make_trig_term("Cos", *beta, x_name);
+      let sin_t = make_trig_term("Sin", *beta, x_name);
+      (
+        mul(exp_rx(*alpha), cos_t),
+        mul(exp_rx(*alpha), sin_t),
+        mul(f64_to_nice_expr(*beta), exp_rx(2.0 * alpha)),
+      )
+    }
+    _ => return None,
+  };
+
+  // g = -forcing (terms sum to zero), scaled by the leading coefficient and
+  // the Wronskian: integrands are y_i * g / (a2 W).
+  let g = negate_expr(forcing);
+  let a2 = f64_to_nice_expr(coeffs[2]);
+  let integrate_with = |y: &Expr| -> Option<Expr> {
+    let integrand = div2(
+      times2(y.clone(), g.clone()),
+      mul(a2.clone(), wronskian.clone()),
+    );
+    // Canonicalize first so the integrator sees simplified products
+    // (e.g. Cos[x]*Tan[x] -> Sin[x]).
+    let integrand =
+      crate::evaluator::evaluate_expr_to_expr(&integrand).unwrap_or(integrand);
+    let result = crate::functions::calculus_ast::integrate_ast(&[
+      integrand,
+      Expr::Identifier(x_name.to_string()),
+    ])
+    .ok()?;
+    if contains_function_call(&result, "Integrate") {
+      return None;
+    }
+    Some(result)
+  };
+  let int1 = integrate_with(&y2)?;
+  let int2 = integrate_with(&y1)?;
+
+  // y_p = -y1 ∫ y2 g/(a2 W) + y2 ∫ y1 g/(a2 W); expand so products like
+  // -Cos (ArcTanh[Sin] - Sin) + Sin (-Cos) cancel across the two halves.
+  let y_p = plus2(times2(negate_expr(&y1), int1), times2(y2, int2));
+  let y_p = crate::evaluator::evaluate_function_call_ast(
+    "Expand",
+    std::slice::from_ref(&y_p),
+  )
+  .unwrap_or(y_p);
+  let y_p = crate::evaluator::evaluate_function_call_ast(
+    "Simplify",
+    std::slice::from_ref(&y_p),
+  )
+  .unwrap_or(y_p);
+  Some(y_p)
+}
+
+/// Whether the expression contains a call to the named function anywhere.
+fn contains_function_call(expr: &Expr, fname: &str) -> bool {
+  match expr {
+    Expr::FunctionCall { name, args } => {
+      name == fname || args.iter().any(|a| contains_function_call(a, fname))
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      contains_function_call(left, fname)
+        || contains_function_call(right, fname)
+    }
+    Expr::UnaryOp { operand, .. } => contains_function_call(operand, fname),
+    Expr::List(items) => items.iter().any(|a| contains_function_call(a, fname)),
+    Expr::CurriedCall { func, args } => {
+      contains_function_call(func, fname)
+        || args.iter().any(|a| contains_function_call(a, fname))
+    }
+    _ => false,
+  }
+}
+
+/// Find roots of characteristic polynomial
+fn find_characteristic_roots(
+  coeffs: &[f64],
+  max_order: usize,
+) -> Result<Vec<(f64, f64, usize)>, InterpreterError> {
+  // Returns (real_part, imag_part, multiplicity)
+  let leading = coeffs[max_order];
+  if leading.abs() < 1e-15 {
+    return Err(InterpreterError::EvaluationError(
+      "DSolve: leading coefficient is zero".into(),
+    ));
+  }
+
+  match max_order {
+    1 => {
+      // a_1*r + a_0 = 0 → r = -a_0/a_1
+      let r = -coeffs[0] / coeffs[1];
+      Ok(vec![(r, 0.0, 1)])
+    }
+    2 => {
+      // a_2*r^2 + a_1*r + a_0 = 0
+      let a = coeffs[2];
+      let b = coeffs[1];
+      let c = coeffs[0];
+      let disc = b * b - 4.0 * a * c;
+      if disc > 1e-10 {
+        let ra = (-b + disc.sqrt()) / (2.0 * a);
+        let rb = (-b - disc.sqrt()) / (2.0 * a);
+        // Match wolframscript's constant labeling: the fundamental solutions
+        // (and hence C[1], C[2]) are ordered by ascending root, except for a
+        // pair symmetric about zero (r, -r), where the positive root leads.
+        let (first, second) = if (ra + rb).abs() < 1e-10 {
+          if ra >= rb { (ra, rb) } else { (rb, ra) }
+        } else if ra <= rb {
+          (ra, rb)
+        } else {
+          (rb, ra)
+        };
+        Ok(vec![(first, 0.0, 1), (second, 0.0, 1)])
+      } else if disc.abs() <= 1e-10 {
+        let r = -b / (2.0 * a);
+        Ok(vec![(r, 0.0, 2)])
+      } else {
+        let real = -b / (2.0 * a);
+        let imag = (-disc).sqrt() / (2.0 * a);
+        Ok(vec![(real, imag, 1)])
+      }
+    }
+    3 => Ok(solve_cubic_characteristic(coeffs)),
+    4 => Ok(solve_quartic_characteristic(coeffs)),
+    _ => {
+      // For higher orders, try numerical root finding
+      Err(InterpreterError::EvaluationError(format!(
+        "DSolve: order {max_order} constant-coefficient ODEs not supported"
+      )))
+    }
+  }
+}
+
+/// Solve cubic characteristic polynomial
+fn solve_cubic_characteristic(
+  coeffs: &[f64],
+) -> std::vec::Vec<(f64, f64, usize)> {
+  let a = coeffs[3];
+  let b = coeffs[2];
+  let c = coeffs[1];
+  let d = coeffs[0];
+
+  // Normalize: r^3 + pr^2 + qr + s = 0
+  let p = b / a;
+  let q = c / a;
+  let s = d / a;
+
+  // Depressed cubic: t^3 + pt2 + q2 = 0 where r = t - p/3
+  let p2 = q - p * p / 3.0;
+  let q2 = 2.0 * p * p * p / 27.0 - p * q / 3.0 + s;
+
+  let disc = q2 * q2 / 4.0 + p2 * p2 * p2 / 27.0;
+
+  let mut roots = Vec::new();
+
+  if disc > 1e-10 {
+    // One real root, two complex conjugates
+    let sqrt_disc = disc.sqrt();
+    let u = (-q2 / 2.0 + sqrt_disc).cbrt();
+    let v = (-q2 / 2.0 - sqrt_disc).cbrt();
+    let r1 = u + v - p / 3.0;
+    roots.push((r1, 0.0, 1));
+
+    let real_part = -(u + v) / 2.0 - p / 3.0;
+    let imag_part = (u - v) * 3.0_f64.sqrt() / 2.0;
+    if imag_part.abs() > 1e-10 {
+      roots.push((real_part, imag_part.abs(), 1));
+    } else {
+      roots.push((real_part, 0.0, 1));
+      roots.push((real_part, 0.0, 1));
+    }
+  } else if disc.abs() <= 1e-10 {
+    // All real, at least two equal
+    if p2.abs() < 1e-10 && q2.abs() < 1e-10 {
+      roots.push((-p / 3.0, 0.0, 3));
+    } else {
+      let u = if q2 > 0.0 {
+        -(q2 / 2.0).cbrt()
+      } else {
+        (-q2 / 2.0).cbrt()
+      };
+      roots.push((2.0 * u - p / 3.0, 0.0, 1));
+      roots.push((-u - p / 3.0, 0.0, 2));
+    }
+  } else {
+    // Three distinct real roots (casus irreducibilis)
+    let r = (-p2 * p2 * p2 / 27.0).sqrt();
+    let theta = (-q2 / (2.0 * r)).acos();
+    let m = 2.0 * (r.cbrt());
+    roots.push((m * (theta / 3.0).cos() - p / 3.0, 0.0, 1));
+    roots.push((
+      m * ((theta + 2.0 * std::f64::consts::PI) / 3.0).cos() - p / 3.0,
+      0.0,
+      1,
+    ));
+    roots.push((
+      m * ((theta + 4.0 * std::f64::consts::PI) / 3.0).cos() - p / 3.0,
+      0.0,
+      1,
+    ));
+  }
+
+  roots
+}
+
+/// Solve quartic characteristic polynomial
+/// Roots of the depressed biquadratic `y^4 + p*y^2 + r = 0` (`x = y +
+/// shift`), via the quadratic `u^2 + p*u + r = 0` in `u = y^2` followed by
+/// a complex square root of each `u` root. See the comment at its call
+/// site in [`solve_quartic_characteristic`] for why this is needed instead
+/// of always going through the general resolvent-cubic method.
+fn solve_biquadratic(
+  p: f64,
+  r: f64,
+  shift: f64,
+) -> std::vec::Vec<(f64, f64, usize)> {
+  let disc = p * p - 4.0 * r;
+  let u_roots: [(f64, f64); 2] = if disc >= 0.0 {
+    let s = disc.sqrt();
+    [(f64::midpoint(-p, s), 0.0), ((-p - s) / 2.0, 0.0)]
+  } else {
+    let s = (-disc).sqrt();
+    [(-p / 2.0, s / 2.0), (-p / 2.0, -s / 2.0)]
+  };
+
+  let mut roots = Vec::with_capacity(4);
+  for &(ure, uim) in &u_roots {
+    if uim.abs() < 1e-12 {
+      // Real u: y = ±sqrt(u), real if u >= 0, else a conjugate pair on the
+      // imaginary axis.
+      if ure >= 0.0 {
+        let s = ure.sqrt();
+        roots.push((s + shift, 0.0, 1));
+        roots.push((-s + shift, 0.0, 1));
+      } else {
+        let s = (-ure).sqrt();
+        roots.push((shift, s, 1));
+      }
+    } else if uim > 0.0 {
+      // Complex-conjugate u pair: y = ±sqrt(u) for the positive-imaginary
+      // twin gives the two conjugate-pair representatives directly (see
+      // the call site comment for the derivation).
+      let (sre, sim) = complex_sqrt(ure, uim);
+      roots.push((sre + shift, sim, 1));
+      roots.push((-sre + shift, sim, 1));
+    }
+    // uim < 0 is the conjugate of the pair already handled above; skip.
+  }
+  roots
+}
+
+/// Principal square root of a complex number, matching the sign of `im` in
+/// the result (so `im < 0` gives a result with negative imaginary part).
+fn complex_sqrt(re: f64, im: f64) -> (f64, f64) {
+  let modulus = re.hypot(im);
+  let sre = f64::midpoint(modulus, re).max(0.0).sqrt();
+  let mut sim = ((modulus - re) / 2.0).max(0.0).sqrt();
+  if im < 0.0 {
+    sim = -sim;
+  }
+  (sre, sim)
+}
+
+fn solve_quartic_characteristic(
+  coeffs: &[f64],
+) -> std::vec::Vec<(f64, f64, usize)> {
+  let a = coeffs[4];
+  let b = coeffs[3] / a;
+  let c = coeffs[2] / a;
+  let d = coeffs[1] / a;
+  let e = coeffs[0] / a;
+
+  // Depressed quartic: y^4 + py^2 + qy + r = 0 where x = y - b/4
+  let p = c - 3.0 * b * b / 8.0;
+  let q = b * b * b / 8.0 - b * c / 2.0 + d;
+  let r = -3.0 * b * b * b * b / 256.0 + b * b * c / 16.0 - b * d / 4.0 + e;
+  let quartic_shift = -b / 4.0;
+
+  // Biquadratic special case (q == 0, e.g. any quartic with no odd-power
+  // terms — the common shape a real coupled linear ODE system's
+  // characteristic polynomial takes): the general resolvent-cubic method
+  // below is numerically fragile right where it matters most here, because
+  // a biquadratic's resolvent cubic is itself degenerate (a repeated or
+  // near-repeated root), which the cubic solver's branch selection can
+  // land on the wrong side of by a hair — turning what should be a purely
+  // imaginary conjugate quadruple into a spuriously real one. Solving
+  // y^4 + py^2 + r = 0 directly as a quadratic in u = y^2 sidesteps that
+  // entirely and is exact.
+  if q.abs() < 1e-9 * (p.abs() + r.abs() + 1.0) {
+    return solve_biquadratic(p, r, quartic_shift);
+  }
+
+  // Solve resolvent cubic: m^3 - p/2 * m^2 - r*m + (p*r/2 - q^2/8) = 0
+  let resolvent_coeffs = vec![p * r / 2.0 - q * q / 8.0, -r, -p / 2.0, 1.0];
+
+  let cubic_roots = solve_cubic_characteristic(&resolvent_coeffs);
+  // Pick a real root
+  let m = cubic_roots
+    .iter()
+    .find(|(_, im, _)| im.abs() < 1e-10)
+    .map_or(cubic_roots[0].0, |(re, _, _)| *re);
+
+  let disc1 = 2.0 * m - p;
+  let mut roots = Vec::new();
+  let shift = -b / 4.0;
+
+  if disc1 > 1e-10 {
+    let sqrt_disc1 = disc1.sqrt();
+    // Two quadratics
+    let disc2a = -(2.0 * m + p + q / sqrt_disc1);
+    let disc2b = -(2.0 * m + p - q / sqrt_disc1);
+
+    if disc2a >= -1e-10 {
+      let s = disc2a.max(0.0).sqrt();
+      roots.push((f64::midpoint(sqrt_disc1, s) + shift, 0.0, 1));
+      roots.push(((sqrt_disc1 - s) / 2.0 + shift, 0.0, 1));
+    } else {
+      let s = (-disc2a).sqrt();
+      roots.push((sqrt_disc1 / 2.0 + shift, s / 2.0, 1));
+    }
+
+    if disc2b >= -1e-10 {
+      let s = disc2b.max(0.0).sqrt();
+      roots.push((f64::midpoint(-sqrt_disc1, s) + shift, 0.0, 1));
+      roots.push(((-sqrt_disc1 - s) / 2.0 + shift, 0.0, 1));
+    } else {
+      let s = (-disc2b).sqrt();
+      roots.push((-sqrt_disc1 / 2.0 + shift, s / 2.0, 1));
+    }
+  } else if disc1.abs() <= 1e-10 {
+    // m is a double root of the resolvent
+    let disc2 = m * m - r;
+    if disc2 >= -1e-10 {
+      let s = disc2.max(0.0).sqrt();
+      roots.push(((m + s).sqrt() + shift, 0.0, 1));
+      roots.push((-(m + s).sqrt() + shift, 0.0, 1));
+      roots.push(((m - s).sqrt() + shift, 0.0, 1));
+      roots.push((-(m - s).sqrt() + shift, 0.0, 1));
+    } else {
+      // Complex roots
+      let s = (-disc2).sqrt();
+      let mod_val = (m * m + disc2.abs()).sqrt().sqrt();
+      let angle = s.atan2(m) / 2.0;
+      roots.push((mod_val * angle.cos() + shift, mod_val * angle.sin(), 1));
+      roots.push((-mod_val * angle.cos() + shift, -mod_val * angle.sin(), 1));
+    }
+  } else {
+    // disc1 < 0: complex scenario
+    let sqrt_disc1 = (-disc1).sqrt();
+    roots.push((shift, sqrt_disc1 / 2.0, 1));
+    roots.push((shift, -sqrt_disc1 / 2.0, 1));
+  }
+
+  roots
+}
+
+/// Build homogeneous solution from characteristic roots
+fn build_homogeneous_solution(
+  roots: &[(f64, f64, usize)],
+  x_name: &str,
+) -> Expr {
+  let x = Expr::Identifier(x_name.to_string());
+  let mut terms: Vec<Expr> = Vec::new();
+  let mut c_idx = 1usize;
+
+  for (real, imag, mult) in roots {
+    if imag.abs() < 1e-10 {
+      // Real root with multiplicity
+      for k in 0..*mult {
+        let c_k = make_c(c_idx);
+        c_idx += 1;
+
+        let mut term = c_k;
+
+        // Multiply by x^k for repeated roots
+        if k > 0 {
+          let x_power = if k == 1 {
+            x.clone()
+          } else {
+            pow2(x.clone(), Expr::Integer(k as i128))
+          };
+          term = times2(x_power, term);
+        }
+
+        // Multiply by E^(r*x) if r != 0
+        if real.abs() > 1e-10 {
+          let exp_term = make_exp_term(*real, x_name);
+          term = times2(exp_term, term);
+        }
+
+        terms.push(term);
+      }
+    } else if *imag > 0.0 {
+      // Complex roots α ± iβ
+      // E^(α*x) * (C[n]*Cos[β*x] + C[n+1]*Sin[β*x])
+      let c1 = make_c(c_idx);
+      c_idx += 1;
+      let c2 = make_c(c_idx);
+      c_idx += 1;
+
+      let cos_term = times2(c1, make_trig_term("Cos", *imag, x_name));
+      let sin_term = times2(c2, make_trig_term("Sin", *imag, x_name));
+
+      let trig_sum = plus2(cos_term, sin_term);
+
+      let term = if real.abs() > 1e-10 {
+        let exp_term = make_exp_term(*real, x_name);
+        times2(exp_term, trig_sum)
+      } else {
+        trig_sum
+      };
+
+      terms.push(term);
+    }
+    // Skip negative imaginary parts (conjugate pairs handled together)
+  }
+
+  if terms.is_empty() {
+    return Expr::Integer(0);
+  }
+  if terms.len() == 1 {
+    return terms.into_iter().next().unwrap();
+  }
+
+  // Sum all terms
+  let mut result = terms.remove(0);
+  for term in terms {
+    result = plus2(result, term);
+  }
+  result
+}
+
+/// Create C[n] constant expression
+fn make_c(n: usize) -> Expr {
+  call1("C", Expr::Integer(n as i128))
+}
+
+/// Create E^(r*x) expression, simplifying for special values
+fn make_exp_term(r: f64, x_name: &str) -> Expr {
+  let x = Expr::Identifier(x_name.to_string());
+  let r_expr = f64_to_nice_expr(r);
+  let exponent = if matches!(&r_expr, Expr::Integer(1)) {
+    x
+  } else {
+    times2(r_expr, x)
+  };
+  pow2(const_expr("E"), exponent)
+}
+
+/// Create Cos[β*x] or Sin[β*x] expression
+fn make_trig_term(func: &str, beta: f64, x_name: &str) -> Expr {
+  let x = Expr::Identifier(x_name.to_string());
+  let beta_expr = f64_to_nice_expr(beta);
+  let arg = if matches!(&beta_expr, Expr::Integer(1)) {
+    x
+  } else {
+    times2(beta_expr, x)
+  };
+  call1(func, arg)
+}
+
+/// Convert f64 to a nice Expr: integer if whole, fraction if rational, otherwise Real
+fn f64_to_nice_expr(f: f64) -> Expr {
+  if f == f.round() && f.abs() < 1e15 {
+    return Expr::Integer(f as i128);
+  }
+  // Try simple fractions
+  for denom in 2..=12 {
+    let numer = f * denom as f64;
+    if (numer - numer.round()).abs() < 1e-10 {
+      let (n, d) = (numer.round() as i128, denom as i128);
+      let (nn, dd) = rat_reduce(n, d);
+      if dd == 1 {
+        return Expr::Integer(nn);
+      }
+      return div2(Expr::Integer(nn), Expr::Integer(dd));
+    }
+  }
+  // Try sqrt expressions: check if f^2 is a nice rational. A negative f is
+  // the negated square root of the same rational (-Sqrt[3], not the raw
+  // -1.7320508075688772).
+  let f2 = f * f;
+  for denom in 1..=12 {
+    let numer = f2 * denom as f64;
+    if (numer - numer.round()).abs() < 1e-10 {
+      let n = numer.round() as i128;
+      let d = denom as i128;
+      // |f| = Sqrt[n/d]
+      let magnitude = if d == 1 {
+        make_sqrt(Expr::Integer(n))
+      } else {
+        div2(make_sqrt(Expr::Integer(n)), make_sqrt(Expr::Integer(d)))
+      };
+      return if f < 0.0 {
+        times2(Expr::Integer(-1), magnitude)
+      } else {
+        magnitude
+      };
+    }
+  }
+  Expr::Real(f)
+}
+
+// ─── First-order Linear ODE Solver ─────────────────────────────────────
+
+/// Solve first-order linear ODE: y' + P(x)*y = Q(x)
+fn solve_first_order_linear(
+  terms: &[OdeTerm],
+  x_name: &str,
+) -> Result<Expr, InterpreterError> {
+  // Collect coefficients: a1*y' + a0*y + forcing = 0
+  let mut a1 = Expr::Integer(0);
+  let mut a0 = Expr::Integer(0);
+  let mut forcing = Expr::Integer(0);
+
+  for term in terms {
+    match term.order {
+      1 => {
+        a1 = plus2(a1, term.coefficient.clone());
+      }
+      0 => {
+        a0 = plus2(a0, term.coefficient.clone());
+      }
+      -1 => {
+        forcing = plus2(forcing, term.coefficient.clone());
+      }
+      _ => {
+        return Err(InterpreterError::EvaluationError(
+          "DSolve: unexpected term order in first-order ODE".into(),
+        ));
+      }
+    }
+  }
+
+  let a1 = crate::evaluator::evaluate_expr_to_expr(&a1).unwrap_or(a1);
+  let a0 = crate::evaluator::evaluate_expr_to_expr(&a0).unwrap_or(a0);
+  let forcing =
+    crate::evaluator::evaluate_expr_to_expr(&forcing).unwrap_or(forcing);
+
+  // Normalize: y' + P(x)*y = Q(x)
+  // P(x) = a0/a1, Q(x) = -forcing/a1
+  let p_expr = crate::functions::calculus_ast::simplify(div2(a0, a1.clone()));
+  let q_expr =
+    crate::functions::calculus_ast::simplify(div2(negate_expr(&forcing), a1));
+
+  // Check for special cases
+
+  // Case 1: y' = f(x) (P=0, Q=f(x))
+  let p_is_zero = matches!(&p_expr, Expr::Integer(0))
+    || matches!(&p_expr, Expr::Real(f) if f.abs() < 1e-15);
+  if p_is_zero {
+    // y = ∫Q(x)dx + C[1]
+    let integral = crate::functions::calculus_ast::integrate_ast(&[
+      q_expr,
+      Expr::Identifier(x_name.to_string()),
+    ])?;
+    return Ok(plus2(integral, make_c(1)));
+  }
+
+  // Case 2: y' + a*y = 0 (constant coefficient, homogeneous)
+  let q_is_zero = matches!(&q_expr, Expr::Integer(0))
+    || matches!(&q_expr, Expr::Real(f) if f.abs() < 1e-15);
+  if q_is_zero
+    && crate::functions::calculus_ast::is_constant_wrt(&p_expr, x_name)
+  {
+    // y = E^(-a*x)*C[1]
+    let neg_p = negate_expr(&p_expr);
+    let exp_term = make_exp_term_expr(&neg_p, x_name);
+    return Ok(times2(exp_term, make_c(1)));
+  }
+
+  // Case 3: General integrating factor method
+  // μ(x) = E^(∫P(x)dx)
+  // y = (1/μ) * (∫μ*Q(x)dx + C[1])
+  let p_integral = crate::functions::calculus_ast::integrate_ast(&[
+    p_expr.clone(),
+    Expr::Identifier(x_name.to_string()),
+  ])?;
+
+  let mu = pow2(const_expr("E"), p_integral.clone());
+
+  let mu_q =
+    crate::functions::calculus_ast::simplify(times2(mu.clone(), q_expr));
+
+  let mu_q_integral = crate::functions::calculus_ast::integrate_ast(&[
+    mu_q,
+    Expr::Identifier(x_name.to_string()),
+  ])?;
+
+  // y = E^(-∫P dx) * (∫(μ*Q)dx + C[1])
+  let neg_p_integral = negate_expr(&p_integral);
+  let inv_mu = pow2(const_expr("E"), neg_p_integral);
+
+  // Distribute the integrating factor over the particular part and the
+  // constant separately, matching wolframscript's form, e.g.
+  // (E^(3x)/3 + C[1])/E^(2x) -> E^x/3 + C[1]/E^(2x). Each product is simplified
+  // (not fully expanded), so a grouped particular like (-Cos[x]+3Sin[x])/10
+  // stays grouped rather than splitting into separate terms.
+  let particular = crate::functions::calculus_ast::simplify(times2(
+    inv_mu.clone(),
+    mu_q_integral,
+  ));
+  let homogeneous =
+    crate::functions::calculus_ast::simplify(times2(inv_mu, make_c(1)));
+  Ok(plus2(particular, homogeneous))
+}
+
+// ─── Separable First-Order ODEs ────────────────────────────────────────
+
+/// Solve a separable first-order ODE `y'[x] == g(x) h(y[x])` by quadrature.
+///
+/// Only the initial-value problem is answered: the general solution needs an
+/// arbitrary constant, and where wolframscript places it inside the solved
+/// form is not something Woxi reproduces yet, so `DSolve` keeps returning the
+/// equation unevaluated when no initial condition pins the constant.
+fn solve_separable_first_order(
+  ode: &Expr,
+  y_name: &str,
+  x_name: &str,
+  initial_conditions: &[Expr],
+) -> Option<Expr> {
+  let rhs = separable_derivative_rhs(ode, y_name, x_name)?;
+  let (x0, y0) = separable_initial_value(initial_conditions, y_name)?;
+
+  let u_name = fresh_symbol_name(ode, "u")?;
+  let rhs_u =
+    replace_y_call(&rhs, y_name, x_name, &Expr::Identifier(u_name.clone()));
+  if !is_free_of_y(&rhs_u, y_name) {
+    return None;
+  }
+  let (g, h) = split_separable_factors(&rhs_u, &u_name, x_name)?;
+
+  // Separating gives ∫ du/h(u) == ∫ g(x) dx + C.
+  let y_integral = closed_form_integral(&div2(Expr::Integer(1), h), &u_name)?;
+  let x_integral = closed_form_integral(&g, x_name)?;
+
+  let constant = simplify(minus2(
+    crate::syntax::substitute_variable(&y_integral, &u_name, &y0),
+    crate::syntax::substitute_variable(&x_integral, x_name, &x0),
+  ));
+  let relation = Expr::Comparison {
+    operands: vec![y_integral, plus2(x_integral, constant)],
+    operators: vec![ComparisonOp::Equal],
+  };
+
+  let solved =
+    crate::functions::solve_ast(&[relation, Expr::Identifier(u_name.clone())])
+      .ok()?;
+
+  // Separating loses branch information, so more than one root can come back
+  // (`y^2` on the right gives a ± pair). Keep the one the initial condition
+  // actually selects.
+  let Expr::List(solution_sets) = &solved else {
+    return None;
+  };
+  for set in solution_sets {
+    let Expr::List(rules) = set else { continue };
+    let Some(Expr::Rule {
+      pattern,
+      replacement,
+    }) = rules.get(0)
+    else {
+      continue;
+    };
+    if !matches!(pattern.as_ref(), Expr::Identifier(n) if n == &u_name) {
+      continue;
+    }
+    let candidate = simplify(replacement.as_ref().clone());
+    let at_x0 = crate::evaluator::evaluate_expr_to_expr(
+      &crate::syntax::substitute_variable(&candidate, x_name, &x0),
+    )
+    .ok()?;
+    if values_agree(&at_x0, &y0) {
+      return Some(candidate);
+    }
+  }
+  None
+}
+
+/// Read `y'[x] == rhs` (in either orientation) and return the right-hand side.
+fn separable_derivative_rhs(
+  ode: &Expr,
+  y_name: &str,
+  x_name: &str,
+) -> Option<Expr> {
+  let (lhs, rhs) = as_equal_pair(ode)?;
+  for (derivative, other) in [(lhs, rhs), (rhs, lhs)] {
+    if let Some((1, point)) =
+      extract_derivative_order_and_point(derivative, y_name)
+      && matches!(&point, Expr::Identifier(n) if n == x_name)
+      && !contains_derivative(other)
+    {
+      return Some(other.clone());
+    }
+  }
+  None
+}
+
+/// Find an initial condition `y[x0] == y0`, returning the pair `(x0, y0)`.
+fn separable_initial_value(
+  initial_conditions: &[Expr],
+  y_name: &str,
+) -> Option<(Expr, Expr)> {
+  for condition in initial_conditions {
+    let Some((lhs, rhs)) = as_equal_pair(condition) else {
+      continue;
+    };
+    if let Expr::FunctionCall { name, args } = lhs
+      && name == y_name
+      && args.len() == 1
+    {
+      return Some((args[0].clone(), rhs.clone()));
+    }
+  }
+  None
+}
+
+/// Pick a symbol name that does not occur in `expr`, so the dependent
+/// variable can be stood in for by a plain symbol while integrating.
+fn fresh_symbol_name(expr: &Expr, base: &str) -> Option<String> {
+  (0..64).find_map(|n| {
+    let candidate = if n == 0 {
+      base.to_string()
+    } else {
+      format!("{base}{n}")
+    };
+    crate::functions::calculus_ast::is_constant_wrt(expr, &candidate)
+      .then_some(candidate)
+  })
+}
+
+/// Replace every `y[x]` in `expr` with `value`.
+fn replace_y_call(
+  expr: &Expr,
+  y_name: &str,
+  x_name: &str,
+  value: &Expr,
+) -> Expr {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == y_name
+    && args.len() == 1
+    && matches!(&args[0], Expr::Identifier(n) if n == x_name)
+  {
+    return value.clone();
+  }
+  map_children(expr, &|child| replace_y_call(child, y_name, x_name, value))
+}
+
+/// Split a product into its `x`-only and `u`-only halves. `None` when some
+/// factor mixes the two, which means the equation is not separable this way.
+fn split_separable_factors(
+  rhs: &Expr,
+  u_name: &str,
+  x_name: &str,
+) -> Option<(Expr, Expr)> {
+  let mut factors = Vec::new();
+  collect_multiplicative_factors(rhs, &mut factors);
+
+  let mut x_part = Vec::new();
+  let mut u_part = Vec::new();
+  for factor in factors {
+    if crate::functions::calculus_ast::is_constant_wrt(&factor, u_name) {
+      x_part.push(factor);
+    } else if crate::functions::calculus_ast::is_constant_wrt(&factor, x_name) {
+      u_part.push(factor);
+    } else {
+      return None;
+    }
+  }
+  Some((product_of(x_part), product_of(u_part)))
+}
+
+fn collect_multiplicative_factors(expr: &Expr, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      collect_multiplicative_factors(left, out);
+      collect_multiplicative_factors(right, out);
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      collect_multiplicative_factors(left, out);
+      out.push(pow2(right.as_ref().clone(), Expr::Integer(-1)));
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      out.push(Expr::Integer(-1));
+      collect_multiplicative_factors(operand, out);
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      for arg in args {
+        collect_multiplicative_factors(arg, out);
+      }
+    }
+    _ => out.push(expr.clone()),
+  }
+}
+
+fn product_of(factors: Vec<Expr>) -> Expr {
+  factors
+    .into_iter()
+    .reduce(times2)
+    .unwrap_or(Expr::Integer(1))
+}
+
+/// Integrate, accepting only a result that actually closed — a residual
+/// `Integrate[…]` head means the antiderivative is not available and the
+/// separable route cannot finish.
+fn closed_form_integral(integrand: &Expr, var: &str) -> Option<Expr> {
+  let result = crate::functions::calculus_ast::integrate_ast(&[
+    simplify(integrand.clone()),
+    Expr::Identifier(var.to_string()),
+  ])
+  .ok()?;
+  (!mentions_head(&result, "Integrate")).then_some(result)
+}
+
+fn mentions_head(expr: &Expr, head: &str) -> bool {
+  if matches!(expr, Expr::FunctionCall { name, .. } if name == head) {
+    return true;
+  }
+  expr_children(expr).iter().any(|c| mentions_head(c, head))
+}
+
+/// Compare two solution values, numerically where both sides evaluate to a
+/// number and structurally otherwise.
+fn values_agree(a: &Expr, b: &Expr) -> bool {
+  match (expr_to_f64(a), expr_to_f64(b)) {
+    (Ok(x), Ok(y)) => (x - y).abs() <= 1e-9 * y.abs().max(1.0),
+    _ => exprs_match(a, b),
+  }
+}
+
+/// Create E^(expr*x) for symbolic expressions
+fn make_exp_term_expr(coeff: &Expr, x_name: &str) -> Expr {
+  let x = Expr::Identifier(x_name.to_string());
+  let exponent = match coeff {
+    Expr::Integer(1) => x,
+    Expr::Integer(-1) => neg1(x),
+    _ => times2(coeff.clone(), x),
+  };
+  pow2(const_expr("E"), exponent)
+}
+
+// ─── Particular Solution (Undetermined Coefficients) ───────────────────
+
+/// Find a particular solution for constant-coefficient ODE with forcing term
+fn find_particular_solution(
+  coeffs: &[f64],
+  _max_order: usize,
+  forcing: &Expr,
+  _roots: &[(f64, f64, usize)],
+  x_name: &str,
+) -> Option<Expr> {
+  // Try to evaluate forcing as a constant
+  if let Ok(val) = eval_to_f64(forcing) {
+    if val.abs() < 1e-15 {
+      return Some(Expr::Integer(0));
+    }
+    // Constant forcing: particular solution is constant c where a_0 * c = -val
+    if coeffs[0].abs() > 1e-15 {
+      let c = -val / coeffs[0];
+      return Some(f64_to_nice_expr(c));
+    }
+    // If a_0 = 0 but a_1 != 0, try y_p = c*x
+    if coeffs.len() > 1 && coeffs[1].abs() > 1e-15 {
+      let c = -val / coeffs[1];
+      return Some(times2(
+        f64_to_nice_expr(c),
+        Expr::Identifier(x_name.to_string()),
+      ));
+    }
+  }
+  None
+}
+
+// ─── Initial Condition Application ─────────────────────────────────────
+
+/// Apply initial conditions to determine constants C[1], C[2], ...
+fn apply_initial_conditions(
+  general_solution: &Expr,
+  ics: &[Expr],
+  y_name: &str,
+  x_name: &str,
+  max_order: usize,
+) -> Result<Expr, InterpreterError> {
+  // Replace C[i] with placeholder identifiers for Solve compatibility
+  let placeholders: Vec<String> =
+    (1..=max_order).map(|i| format!("__C{i}")).collect();
+
+  // Substitute C[i] -> __Ci in the general solution
+  let mut sol_with_placeholders = general_solution.clone();
+  for i in 1..=max_order {
+    sol_with_placeholders = substitute_c_constant(
+      &sol_with_placeholders,
+      &make_c(i),
+      &Expr::Identifier(placeholders[i - 1].clone()),
+    );
+  }
+
+  // Build equations from initial conditions
+  let mut equations = Vec::new();
+
+  for ic in ics {
+    if let Expr::Comparison {
+      operands,
+      operators,
+    } = ic
+      && operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal
+    {
+      let lhs = &operands[0];
+      let rhs = &operands[1];
+
+      // Determine order and point
+      let (order, point) = if let Expr::FunctionCall { name, args } = lhs {
+        if name == y_name && args.len() == 1 {
+          (0usize, args[0].clone())
+        } else if name == "Derivative" && args.len() == 3 {
+          if let Expr::Integer(n) = &args[0] {
+            if let Expr::Identifier(fname) = &args[1] {
+              if fname == y_name {
+                (*n as usize, args[2].clone())
+              } else {
+                continue;
+              }
+            } else {
+              continue;
+            }
+          } else {
+            continue;
+          }
+        } else {
+          continue;
+        }
+      } else if let Some((ord, pt)) =
+        extract_derivative_order_and_point(lhs, y_name)
+      {
+        (ord, pt)
+      } else {
+        continue;
+      };
+
+      // Differentiate general solution `order` times
+      let mut deriv_solution = sol_with_placeholders.clone();
+      for _ in 0..order {
+        deriv_solution = crate::functions::calculus_ast::differentiate_expr(
+          &deriv_solution,
+          x_name,
+        )?;
+        deriv_solution =
+          crate::functions::calculus_ast::simplify(deriv_solution);
+        deriv_solution =
+          crate::evaluator::evaluate_expr_to_expr(&deriv_solution)
+            .unwrap_or(deriv_solution);
+      }
+
+      // Substitute x = point
+      let substituted =
+        crate::syntax::substitute_variable(&deriv_solution, x_name, &point);
+      let evaluated = crate::evaluator::evaluate_expr_to_expr(&substituted)
+        .unwrap_or(substituted);
+
+      // Create equation: evaluated == rhs
+      let equation = Expr::Comparison {
+        operands: vec![evaluated, rhs.clone()],
+        operators: vec![ComparisonOp::Equal],
+      };
+      equations.push(equation);
+    }
+  }
+
+  if equations.len() != max_order {
+    // Not enough initial conditions — return general solution
+    return Ok(general_solution.clone());
+  }
+
+  // Solve for __C1, __C2, ...
+  let c_id_exprs: Vec<Expr> = placeholders
+    .iter()
+    .map(|name| Expr::Identifier(name.clone()))
+    .collect();
+
+  let eqs_list = Expr::List(equations.into());
+  let vars_list = Expr::List(c_id_exprs.into());
+
+  let solve_result = crate::functions::solve_ast(&[eqs_list, vars_list])?;
+
+  // Extract solutions: {{__C1 -> val1, __C2 -> val2, ...}}
+  if let Expr::List(outer) = &solve_result
+    && let Some(Expr::List(rules)) = outer.first()
+  {
+    let mut result = sol_with_placeholders.clone();
+    for rule in rules {
+      if let Expr::Rule {
+        pattern,
+        replacement,
+      } = rule
+        && let Expr::Identifier(var_name) = pattern.as_ref()
+      {
+        result =
+          crate::syntax::substitute_variable(&result, var_name, replacement);
+      }
+    }
+    // Simplify the result
+    let result =
+      crate::evaluator::evaluate_expr_to_expr(&result).unwrap_or(result);
+    return Ok(result);
+  }
+
+  // Solve failed — return general solution
+  Ok(general_solution.clone())
+}
+
+/// Substitute a C[n] constant in an expression
+fn substitute_c_constant(
+  expr: &Expr,
+  pattern: &Expr,
+  replacement: &Expr,
+) -> Expr {
+  // Pattern is C[n], need to find and replace matching FunctionCall
+  if exprs_match(expr, pattern) {
+    return replacement.clone();
+  }
+
+  match expr {
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(substitute_c_constant(left, pattern, replacement)),
+      right: Box::new(substitute_c_constant(right, pattern, replacement)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(substitute_c_constant(operand, pattern, replacement)),
+    },
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(|a| substitute_c_constant(a, pattern, replacement))
+        .collect(),
+    },
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(|a| substitute_c_constant(a, pattern, replacement))
+        .collect(),
+    ),
+    _ => expr.clone(),
+  }
+}
+
+/// Check if two expressions are structurally equal
+fn exprs_match(a: &Expr, b: &Expr) -> bool {
+  match (a, b) {
+    (Expr::Integer(x), Expr::Integer(y)) => x == y,
+    (Expr::Real(x), Expr::Real(y)) => (x - y).abs() < 1e-15,
+    (Expr::Identifier(x), Expr::Identifier(y)) => x == y,
+    (Expr::Constant(x), Expr::Constant(y)) => x == y,
+    (
+      Expr::FunctionCall { name: n1, args: a1 },
+      Expr::FunctionCall { name: n2, args: a2 },
+    ) => {
+      n1 == n2
+        && a1.len() == a2.len()
+        && a1.iter().zip(a2.iter()).all(|(x, y)| exprs_match(x, y))
+    }
+    _ => false,
+  }
+}
+
+// ─── NDSolve RK4 Helpers ──────────────────────────────────────────────
+
+/// Convert Expr to f64.
+///
+/// Shared by `NDSolve` and every other caller in this module that needs a
+/// plain numeric value from an expression (`Interpolation`, `DSolve`'s
+/// numeric fallbacks, …) — the error text below must stay caller-agnostic
+/// rather than naming any one of them.
+fn expr_to_f64(expr: &Expr) -> Result<f64, InterpreterError> {
+  match expr {
+    Expr::Integer(n) => Ok(*n as f64),
+    Expr::Real(f) => Ok(*f),
+    Expr::Constant(name) if name == "E" => Ok(std::f64::consts::E),
+    Expr::Constant(name) if name == "Pi" => Ok(std::f64::consts::PI),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => Ok(-expr_to_f64(operand)?),
+    Expr::BinaryOp { op, left, right } => {
+      let l = expr_to_f64(left)?;
+      let r = expr_to_f64(right)?;
+      match op {
+        BinaryOperator::Plus => Ok(l + r),
+        BinaryOperator::Minus => Ok(l - r),
+        BinaryOperator::Times => Ok(l * r),
+        BinaryOperator::Divide => Ok(l / r),
+        BinaryOperator::Power => Ok(l.powf(r)),
+        _ => Err(InterpreterError::EvaluationError(
+          "cannot convert expression to a numeric value".into(),
+        )),
+      }
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      let n = expr_to_f64(&args[0])?;
+      let d = expr_to_f64(&args[1])?;
+      Ok(n / d)
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut result = 1.0;
+      for arg in args {
+        result *= expr_to_f64(arg)?;
+      }
+      Ok(result)
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      let mut result = 0.0;
+      for arg in args {
+        result += expr_to_f64(arg)?;
+      }
+      Ok(result)
+    }
+    _ => Err(InterpreterError::EvaluationError(format!(
+      "cannot convert {} to a numeric value",
+      expr_to_string(expr)
+    ))),
+  }
+}
+
+/// Evaluate an expression to f64, with simplification
+fn eval_to_f64(expr: &Expr) -> Result<f64, InterpreterError> {
+  let evaluated =
+    crate::evaluator::evaluate_expr_to_expr(expr).unwrap_or(expr.clone());
+  expr_to_f64(&evaluated)
+}
+
+/// Convert an interpolation data value to f64, numericising exact symbolic
+/// entries (e.g. `Sin[1]`, `Pi/2`) via `N` when a direct conversion fails.
+/// wolframscript's Interpolation accepts exact symbolic data by numericising
+/// it, so `Interpolation[Table[{x, Sin[x]}, {x, 0, 10}]]` must work.
+fn interp_value_to_f64(expr: &Expr) -> Result<f64, InterpreterError> {
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(expr)
+    .unwrap_or_else(|_| expr.clone());
+  if let Ok(v) = expr_to_f64(&evaluated) {
+    return Ok(v);
+  }
+  // Fall back to N[...] for exact symbolic values that do not reduce to a
+  // number on their own (Sin[1] stays symbolic until numericised).
+  let n_expr = call1("N", evaluated);
+  let numericized = crate::evaluator::evaluate_expr_to_expr(&n_expr)
+    .unwrap_or_else(|_| expr.clone());
+  expr_to_f64(&numericized)
+}
+
+// ─── Interpolation ─────────────────────────────────────────────────────
+
+/// Interpolation[{y1, y2, ...}] or Interpolation[{{x1,y1}, {x2,y2}, ...}]
+/// Returns InterpolatingFunction[domain, data]
+pub fn interpolation_ast(
+  args: &[Expr],
+  head: &str,
+) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Ok(unevaluated(head, args));
+  }
+
+  // Extract InterpolationOrder option (default 3). A 2-D grid may give one
+  // order per axis (`InterpolationOrder -> {orderX, orderY}`); a bare
+  // integer applies to both.
+  let mut interp_order: i128 = 3;
+  let mut interp_order_xy: Option<(i128, i128)> = None;
+  let data_arg = &args[0];
+
+  let mut apply_interpolation_order = |replacement: &Expr| {
+    if let Some(n) = crate::functions::math_ast::expr_to_i128(replacement) {
+      interp_order = n;
+    } else if let Expr::List(items) = replacement
+      && items.len() == 2
+      && let (Some(a), Some(b)) = (
+        crate::functions::math_ast::expr_to_i128(&items[0]),
+        crate::functions::math_ast::expr_to_i128(&items[1]),
+      )
+    {
+      interp_order_xy = Some((a, b));
+    }
+  };
+  for opt in args.iter().skip(1) {
+    match opt {
+      Expr::Rule {
+        pattern,
+        replacement,
+      } => {
+        if let Expr::Identifier(name) = pattern.as_ref()
+          && name == "InterpolationOrder"
+        {
+          apply_interpolation_order(replacement);
+        }
+      }
+      Expr::FunctionCall {
+        name,
+        args: rule_args,
+      } if name == "Rule" && rule_args.len() == 2 => {
+        if let Expr::Identifier(opt_name) = &rule_args[0]
+          && opt_name == "InterpolationOrder"
+        {
+          apply_interpolation_order(&rule_args[1]);
+        }
+      }
+      _ => {}
+    }
+  }
+
+  // A positional `{{xmin, xmax}}` argument gives the coordinate domain for the
+  // (uniformly spaced) 1-D value list, overriding the default 1, 2, 3, … grid.
+  let mut domain_spec: Option<(f64, f64)> = None;
+  for opt in args.iter().skip(1) {
+    if let Expr::List(dims) = opt
+      && dims.len() == 1
+      && let Expr::List(pair) = &dims[0]
+      && pair.len() == 2
+      && let (Ok(a), Ok(b)) =
+        (interp_value_to_f64(&pair[0]), interp_value_to_f64(&pair[1]))
+    {
+      domain_spec = Some((a, b));
+    }
+  }
+
+  // Evaluate the data argument
+  let data_evaluated = crate::evaluator::evaluate_expr_to_expr(data_arg)?;
+
+  let Expr::List(data_list) = &data_evaluated else {
+    // A non-list first argument is not interpolatable. wolframscript emits
+    // this message tagged `Interpolation` (regardless of the actual head)
+    // and keeps the call unevaluated.
+    crate::emit_message(&format!(
+      "Interpolation::innd: First argument in {} does not contain a list of data and coordinates.",
+      crate::syntax::format_expr(
+        &data_evaluated,
+        crate::syntax::ExprForm::Output
+      )
+    ));
+    return Ok(unevaluated(head, args));
+  };
+
+  if data_list.is_empty() {
+    // An empty data list is not interpolatable: emit innd and stay
+    // unevaluated (wolframscript parity) rather than raising a hard error.
+    crate::emit_message(&format!(
+      "Interpolation::innd: First argument in {} does not contain a list of data and coordinates.",
+      crate::syntax::format_expr(
+        &data_evaluated,
+        crate::syntax::ExprForm::Output
+      )
+    ));
+    return Ok(unevaluated(head, args));
+  }
+
+  // ListInterpolation of a rectangular numeric matrix is a 2-D grid (values on
+  // the integer grid 1..rows × 1..cols), not a list of {x, y} points.
+  if head == "ListInterpolation"
+    && let Some(grid) = as_2d_scalar_grid(data_list)
+  {
+    return Ok(build_2d_list_interpolation(&grid, interp_order, head));
+  }
+
+  // `Interpolation` (not `ListInterpolation`, whose triples are raw grid
+  // rows — see above) of a flat `{x, y, z}` list — the shape
+  // `Flatten[Table[Table[{x, y, f[x, y]}, {y, ys}], {x, xs}], 1]` (or the
+  // equivalent built with `Join`) produces — is 2-D scattered data. It
+  // interpolates like `ListInterpolation`'s grid once the distinct x/y
+  // coordinates recover the grid structure; see `try_2d_scattered_interpolation`.
+  //
+  // The documented multidimensional form `{{{x1, y1}, f1}, {{x2, y2}, f2},
+  // ...}` — a list of `{coords, value}` pairs — carries the same grid, just
+  // nested rather than flattened; normalize it to the flat triple shape so
+  // both reach `try_2d_scattered_interpolation`.
+  let flattened_2d_pairs: Option<Vec<Expr>> = if head != "ListInterpolation"
+    && matches!(&data_list[0], Expr::List(items)
+      if items.len() == 2
+        && matches!(&items[0], Expr::List(coords) if coords.len() == 2)
+        && !matches!(&items[1], Expr::List(_)))
+  {
+    data_list
+      .iter()
+      .map(|item| {
+        let Expr::List(parts) = item else {
+          return None;
+        };
+        if parts.len() != 2 {
+          return None;
+        }
+        let Expr::List(coords) = &parts[0] else {
+          return None;
+        };
+        if coords.len() != 2 {
+          return None;
+        }
+        Some(Expr::List(
+          vec![coords[0].clone(), coords[1].clone(), parts[1].clone()].into(),
+        ))
+      })
+      .collect::<Option<Vec<Expr>>>()
+  } else {
+    None
+  };
+  let triples_2d: Option<&[Expr]> =
+    flattened_2d_pairs.as_deref().or_else(|| {
+      (head != "ListInterpolation"
+        && matches!(&data_list[0], Expr::List(items) if items.len() == 3))
+      .then_some(data_list.as_slice())
+    });
+  if let Some(triples) = triples_2d
+    && let Some(result) = try_2d_scattered_interpolation(
+      triples,
+      interp_order_xy.map_or(interp_order, |(a, _)| a),
+      interp_order_xy.map_or(interp_order, |(_, b)| b),
+      head,
+    )
+  {
+    return Ok(result);
+  }
+
+  // Determine format: list of values or list of {x, y} pairs
+  let mut points: Vec<(f64, f64)> = Vec::new();
+  // The exact coordinate expressions alongside their f64 values, so that
+  // interpolating at an exact point can stay exact.
+  let mut exact_coords: Vec<(Expr, Expr)> = Vec::new();
+
+  let first = &data_list[0];
+  let is_pair_format = matches!(first, Expr::List(items) if items.len() == 2);
+
+  if is_pair_format {
+    // {{x1, y1}, {x2, y2}, ...}
+    for item in data_list {
+      let (x, y) = extract_point(item)?;
+      points.push((x, y));
+      let Expr::List(pair) = item else {
+        return Err(InterpreterError::EvaluationError(
+          "InterpolatingFunction: invalid data point format".into(),
+        ));
+      };
+      exact_coords
+        .push((exact_coordinate(&pair[0], x), exact_coordinate(&pair[1], y)));
+    }
+  } else {
+    // {y1, y2, ...} — x values are 1, 2, 3, ... by default, or uniformly
+    // spaced across [xmin, xmax] when a domain was supplied.
+    let count = data_list.len();
+    for (i, item) in data_list.iter().enumerate() {
+      let y = interp_value_to_f64(item)?;
+      let (x, x_expr) = match domain_spec {
+        Some((xmin, xmax)) if count > 1 => {
+          let x = xmin + (i as f64) * (xmax - xmin) / ((count - 1) as f64);
+          (x, Expr::Real(x))
+        }
+        _ => ((i + 1) as f64, Expr::Integer(i as i128 + 1)),
+      };
+      points.push((x, y));
+      exact_coords.push((x_expr, exact_coordinate(item, y)));
+    }
+  }
+
+  // Sort by x value, keeping each exact coordinate pair with its point.
+  let mut order_index: Vec<usize> = (0..points.len()).collect();
+  order_index.sort_by(|a, b| points[*a].0.partial_cmp(&points[*b].0).unwrap());
+  points = order_index.iter().map(|i| points[*i]).collect();
+  exact_coords = order_index
+    .iter()
+    .map(|i| exact_coords[*i].clone())
+    .collect();
+
+  let n = points.len();
+
+  // Clamp order to valid range. A single data point is allowed: the order is
+  // reduced to 0 (with inhr) and the result is a constant interpolation,
+  // matching wolframscript.
+  let mut order = interp_order.clamp(1, 3) as usize;
+  if order >= n {
+    let reduced = n - 1;
+    crate::emit_message(&format!(
+      "{head}::inhr: Requested order is too high; order has been reduced to {{{reduced}}}."
+    ));
+    order = reduced;
+  }
+
+  let x_min = points[0].0;
+  let x_max = points[n - 1].0;
+
+  let domain = Expr::List(
+    vec![Expr::List(
+      vec![Expr::Real(x_min), Expr::Real(x_max)].into(),
+    )]
+    .into(),
+  );
+
+  // Store data as list of {x, y} pairs, keeping exact coordinates exact (an
+  // Integer grid, rational values) so that interpolating at an exact point
+  // gives an exact result, and evaluation at a grid point returns the
+  // original value unchanged.
+  let data_expr = Expr::List(
+    exact_coords
+      .iter()
+      .map(|(x, y)| Expr::List(vec![x.clone(), y.clone()].into()))
+      .collect(),
+  );
+
+  // Store the interpolation order as a third argument
+  let interp_func = call(
+    "InterpolatingFunction",
+    vec![domain, data_expr, Expr::Integer(order as i128)],
+  );
+
+  Ok(interp_func)
+}
+
+/// A rectangular numeric matrix (≥2 rows, ≥2 columns, all rows the same length,
+/// every entry a number). Returns the original entries (preserving Integer /
+/// Real types) alongside their `f64` values. Returns `None` for ragged matrices,
+/// 1-D lists, or any non-numeric entry — so 1-D `ListInterpolation` and
+/// `Interpolation` of `{x, y}` pairs keep the existing path.
+type Grid = (Vec<Vec<Expr>>, Vec<Vec<f64>>);
+fn as_2d_scalar_grid(rows: &[Expr]) -> Option<Grid> {
+  if rows.len() < 2 {
+    return None;
+  }
+  let mut exprs: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
+  let mut vals: Vec<Vec<f64>> = Vec::with_capacity(rows.len());
+  let mut width: Option<usize> = None;
+  for row in rows {
+    let Expr::List(cells) = row else {
+      return None;
+    };
+    if cells.len() < 2 || *width.get_or_insert(cells.len()) != cells.len() {
+      return None;
+    }
+    let mut row_e = Vec::with_capacity(cells.len());
+    let mut row_v = Vec::with_capacity(cells.len());
+    for c in cells {
+      let ce = crate::evaluator::evaluate_expr_to_expr(c).unwrap_or(c.clone());
+      let v = match &ce {
+        Expr::Integer(n) => *n as f64,
+        Expr::Real(f) => *f,
+        _ => return None,
+      };
+      row_e.push(ce);
+      row_v.push(v);
+    }
+    exprs.push(row_e);
+    vals.push(row_v);
+  }
+  Some((exprs, vals))
+}
+
+/// Build the `InterpolatingFunction` for a 2-D grid. Stored form is
+/// `InterpolatingFunction[{{1, nr}, {1, nc}}, gridExprs, {orderR, orderC}]`;
+/// the `{orderR, orderC}` list (rather than an integer) marks it as 2-D for the
+/// evaluator. Orders are clamped per dimension to `min(requested, dim - 1, 3)`.
+fn build_2d_list_interpolation(
+  grid: &Grid,
+  interp_order: i128,
+  head: &str,
+) -> Expr {
+  let (exprs, _vals) = &grid;
+  let nr = exprs.len();
+  let nc = exprs[0].len();
+  let want = interp_order.clamp(1, 3) as usize;
+  let order_r = want.min(nr - 1);
+  let order_c = want.min(nc - 1);
+  if order_r < want || order_c < want {
+    crate::emit_message(&format!(
+      "{head}::inhr: Requested order is too high; order has been reduced to {{{order_r}, {order_c}}}."
+    ));
+  }
+  let domain = Expr::List(
+    vec![
+      Expr::List(vec![Expr::Integer(1), Expr::Integer(nr as i128)].into()),
+      Expr::List(vec![Expr::Integer(1), Expr::Integer(nc as i128)].into()),
+    ]
+    .into(),
+  );
+  let grid_expr = Expr::List(
+    exprs
+      .iter()
+      .map(|row| Expr::List(row.clone().into()))
+      .collect(),
+  );
+  let orders = Expr::List(
+    vec![
+      Expr::Integer(order_r as i128),
+      Expr::Integer(order_c as i128),
+    ]
+    .into(),
+  );
+  call("InterpolatingFunction", vec![domain, grid_expr, orders])
+}
+
+/// The relative tolerance two coordinates must fall within to count as "the
+/// same" grid line — generous enough for the roundoff two different `Table`
+/// passes over the same arithmetic can leave, tight enough not to merge
+/// genuinely distinct samples.
+fn same_coordinate(a: f64, b: f64) -> bool {
+  (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Detect a flat `{x, y, z}` triple list that tiles a complete rectangular
+/// grid over its distinct x and y coordinates — the shape
+/// `Flatten[Table[Table[{x, y, f[x, y]}, {y, ys}], {x, xs}], 1]` (or the
+/// equivalent built with `Join`) produces — and build the 2-D
+/// `InterpolatingFunction` for it: `InterpolatingFunction[{{xmin, xmax},
+/// {ymin, ymax}}, grid, {orderX, orderY}, {xcoords, ycoords}]`, the explicit-
+/// coordinate counterpart of `build_2d_list_interpolation`'s implicit
+/// integer grid.
+///
+/// Returns `Ok(None)` when the data isn't in this shape (a non-triple entry,
+/// a non-numeric coordinate, or coordinates that don't tile a full grid) so
+/// the caller falls back to its other formats. Genuinely scattered, non-grid
+/// 2-D data — which Wolfram interpolates via Delaunay triangulation — is not
+/// supported here.
+fn try_2d_scattered_interpolation(
+  data_list: &[Expr],
+  order_x: i128,
+  order_y: i128,
+  head: &str,
+) -> Option<Expr> {
+  // At least a 2x2 grid is needed for either axis to interpolate at all.
+  if data_list.len() < 4 {
+    return None;
+  }
+  let mut triples: Vec<(Expr, f64, Expr, f64, Expr, f64)> =
+    Vec::with_capacity(data_list.len());
+  for item in data_list {
+    let Expr::List(parts) = item else {
+      return None;
+    };
+    if parts.len() != 3 {
+      return None;
+    }
+    let (Ok(x), Ok(y), Ok(z)) = (
+      interp_value_to_f64(&parts[0]),
+      interp_value_to_f64(&parts[1]),
+      interp_value_to_f64(&parts[2]),
+    ) else {
+      return None;
+    };
+    triples.push((
+      parts[0].clone(),
+      x,
+      parts[1].clone(),
+      y,
+      parts[2].clone(),
+      z,
+    ));
+  }
+
+  // Distinct x/y values, sorted, each keeping the first expression seen for
+  // it (so an exact/integer coordinate stays exact).
+  let mut xs_pairs: Vec<(f64, Expr)> = Vec::new();
+  let mut ys_pairs: Vec<(f64, Expr)> = Vec::new();
+  for (xe, x, ye, y, _ze, _z) in &triples {
+    if !xs_pairs.iter().any(|(xv, _)| same_coordinate(*xv, *x)) {
+      xs_pairs.push((*x, xe.clone()));
+    }
+    if !ys_pairs.iter().any(|(yv, _)| same_coordinate(*yv, *y)) {
+      ys_pairs.push((*y, ye.clone()));
+    }
+  }
+  xs_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+  ys_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+  let nr = xs_pairs.len();
+  let nc = ys_pairs.len();
+  // Fewer than 2 distinct values along an axis, or a point count that isn't
+  // the full nr*nc product, means this isn't a complete rectangular grid.
+  if nr < 2 || nc < 2 || nr * nc != triples.len() {
+    return None;
+  }
+
+  let mut grid: Vec<Vec<Option<Expr>>> = vec![vec![None; nc]; nr];
+  for (_xe, x, _ye, y, ze, z) in &triples {
+    let i = xs_pairs
+      .iter()
+      .position(|(xv, _)| same_coordinate(*xv, *x))?;
+    let j = ys_pairs
+      .iter()
+      .position(|(yv, _)| same_coordinate(*yv, *y))?;
+    if grid[i][j].is_some() {
+      // Duplicate (x, y) — not a well-formed grid.
+      return None;
+    }
+    grid[i][j] = Some(exact_coordinate(ze, *z));
+  }
+  if grid.iter().flatten().any(Option::is_none) {
+    // A combination of some x with some y is missing — a partial grid,
+    // which is genuinely scattered data this path does not support.
+    return None;
+  }
+
+  let x_exprs: Vec<Expr> = xs_pairs
+    .iter()
+    .map(|(v, e)| exact_coordinate(e, *v))
+    .collect();
+  let y_exprs: Vec<Expr> = ys_pairs
+    .iter()
+    .map(|(v, e)| exact_coordinate(e, *v))
+    .collect();
+  let grid_exprs: Vec<Vec<Expr>> = grid
+    .into_iter()
+    .map(|row| row.into_iter().map(Option::unwrap).collect())
+    .collect();
+
+  let want_r = order_x.clamp(1, 3) as usize;
+  let want_c = order_y.clamp(1, 3) as usize;
+  let order_r = want_r.min(nr - 1);
+  let order_c = want_c.min(nc - 1);
+  if order_r < want_r || order_c < want_c {
+    crate::emit_message(&format!(
+      "{head}::inhr: Requested order is too high; order has been reduced to {{{order_r}, {order_c}}}."
+    ));
+  }
+
+  let domain = Expr::List(
+    vec![
+      Expr::List(vec![x_exprs[0].clone(), x_exprs[nr - 1].clone()].into()),
+      Expr::List(vec![y_exprs[0].clone(), y_exprs[nc - 1].clone()].into()),
+    ]
+    .into(),
+  );
+  let grid_expr = Expr::List(
+    grid_exprs
+      .into_iter()
+      .map(|row| Expr::List(row.into()))
+      .collect(),
+  );
+  let orders = Expr::List(
+    vec![
+      Expr::Integer(order_r as i128),
+      Expr::Integer(order_c as i128),
+    ]
+    .into(),
+  );
+  let coords = Expr::List(
+    vec![Expr::List(x_exprs.into()), Expr::List(y_exprs.into())].into(),
+  );
+
+  Some(call(
+    "InterpolatingFunction",
+    vec![domain, grid_expr, orders, coords],
+  ))
+}
+
+/// Evaluate a 2-D grid `InterpolatingFunction` whose coordinates are
+/// explicit (rather than the implicit integer grid
+/// `evaluate_interpolating_function_2d` assumes) — the form
+/// `try_2d_scattered_interpolation` builds from a flat `{x, y, z}` triple
+/// list. Otherwise identical: tensor-product local Lagrange interpolation,
+/// exact at grid points.
+fn evaluate_interpolating_function_2d_explicit(
+  domain: &Expr,
+  grid_rows: &[Expr],
+  orders: &[Expr],
+  coords: &[Expr],
+  call_args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let order_r = match &orders[0] {
+    Expr::Integer(n) => *n as usize,
+    _ => 1,
+  };
+  let order_c = match &orders[1] {
+    Expr::Integer(n) => *n as usize,
+    _ => 1,
+  };
+
+  let (Expr::List(x_coord_exprs), Expr::List(y_coord_exprs)) =
+    (&coords[0], &coords[1])
+  else {
+    return Err(InterpreterError::EvaluationError(
+      "InterpolatingFunction: invalid coordinates".into(),
+    ));
+  };
+  let xs: Vec<f64> = x_coord_exprs
+    .iter()
+    .map(|e| interp_value_to_f64(e).unwrap_or(f64::NAN))
+    .collect();
+  let ys: Vec<f64> = y_coord_exprs
+    .iter()
+    .map(|e| interp_value_to_f64(e).unwrap_or(f64::NAN))
+    .collect();
+  let nr = xs.len();
+  let nc = ys.len();
+
+  // A single grid cell, decoded lazily: a query only ever needs an
+  // `(order + 1) x (order + 1)` window of cells, not the full `nr x nc`
+  // grid — materializing the whole thing up front made every call
+  // `O(nr * nc)` regardless of interpolation order, which is ruinous for
+  // the grids `NDSolve`'s PDE branch produces (hundreds of time steps by
+  // tens of space steps, resampled at every `ContourPlot` point).
+  let cell = |i: usize, j: usize| -> Result<&Expr, InterpreterError> {
+    let Expr::List(cells) = &grid_rows[i] else {
+      return Err(InterpreterError::EvaluationError(
+        "InterpolatingFunction: invalid 2-D grid".into(),
+      ));
+    };
+    cells.get(j).ok_or_else(|| {
+      InterpreterError::EvaluationError(
+        "InterpolatingFunction: invalid 2-D grid".into(),
+      )
+    })
+  };
+  let cell_f64 = |i: usize, j: usize| -> Result<f64, InterpreterError> {
+    Ok(match cell(i, j)? {
+      Expr::Integer(n) => *n as f64,
+      Expr::Real(f) => *f,
+      other => interp_value_to_f64(other).unwrap_or(f64::NAN),
+    })
+  };
+
+  let unevaluated = || Expr::CurriedCall {
+    func: Box::new(call(
+      "InterpolatingFunction",
+      vec![
+        domain.clone(),
+        Expr::List(grid_rows.to_vec().into()),
+        Expr::List(orders.to_vec().into()),
+        Expr::List(coords.to_vec().into()),
+      ],
+    )),
+    args: call_args.to_vec(),
+  };
+
+  if nr == 0 || nc == 0 {
+    return Ok(unevaluated());
+  }
+
+  if call_args.len() == 1
+    && let Expr::String(prop) = &call_args[0]
+  {
+    match prop.as_str() {
+      "Domain" => return Ok(domain.clone()),
+      "Coordinates" => {
+        return Ok(Expr::List(
+          vec![
+            Expr::List(x_coord_exprs.clone()),
+            Expr::List(y_coord_exprs.clone()),
+          ]
+          .into(),
+        ));
+      }
+      "Grid" => {
+        let mut pts = Vec::with_capacity(nr * nc);
+        for xe in x_coord_exprs {
+          for ye in y_coord_exprs {
+            pts.push(Expr::List(vec![xe.clone(), ye.clone()].into()));
+          }
+        }
+        return Ok(Expr::List(pts.into()));
+      }
+      "ValuesOnGrid" => return Ok(Expr::List(grid_rows.to_vec().into())),
+      "InterpolationOrder" => return Ok(Expr::List(orders.to_vec().into())),
+      _ => {}
+    }
+  }
+
+  let coord_args: Vec<Expr> = match call_args {
+    [Expr::List(pair)] if pair.len() == 2 => pair.to_vec(),
+    other => other.to_vec(),
+  };
+  if coord_args.len() != 2 {
+    return Ok(unevaluated());
+  }
+  let coord_exprs: Vec<Expr> = coord_args
+    .iter()
+    .map(|a| {
+      crate::evaluator::evaluate_expr_to_expr(a).unwrap_or_else(|_| a.clone())
+    })
+    .collect();
+  let coord = |e: &Expr| -> Option<f64> {
+    match e {
+      Expr::Integer(n) => Some(*n as f64),
+      Expr::Real(f) => Some(*f),
+      _ if is_exact_number(e) => interp_value_to_f64(e).ok(),
+      _ => None,
+    }
+  };
+  let (Some(x), Some(y)) = (coord(&coord_exprs[0]), coord(&coord_exprs[1]))
+  else {
+    return Ok(unevaluated());
+  };
+
+  // Exact grid point: return the stored entry, preserving its type only
+  // when both query coordinates were given as exact integers (matching
+  // `evaluate_interpolating_function_2d`).
+  let int_coords = coord_exprs.iter().all(|a| matches!(a, Expr::Integer(_)));
+  if let (Some(i), Some(j)) = (
+    xs.iter().position(|&xv| same_coordinate(xv, x)),
+    ys.iter().position(|&yv| same_coordinate(yv, y)),
+  ) {
+    if int_coords {
+      return Ok(cell(i, j)?.clone());
+    }
+    return Ok(Expr::Real(cell_f64(i, j)?));
+  }
+
+  let (x_lo, x_hi) = (xs[0].min(xs[nr - 1]), xs[0].max(xs[nr - 1]));
+  let (y_lo, y_hi) = (ys[0].min(ys[nc - 1]), ys[0].max(ys[nc - 1]));
+  if x < x_lo || x > x_hi || y < y_lo || y > y_hi {
+    crate::emit_message(&format!(
+      "InterpolatingFunction::dmval: Input value {{{}, {}}} lies outside the range of data in the interpolating function. Extrapolation will be used.",
+      crate::syntax::format_expr(
+        &coord_exprs[0],
+        crate::syntax::ExprForm::Output
+      ),
+      crate::syntax::format_expr(
+        &coord_exprs[1],
+        crate::syntax::ExprForm::Output
+      )
+    ));
+  }
+
+  // Only the local `(order + 1)`-point stencil on each axis feeds the
+  // result, so the cells outside that window never need decoding.
+  let eff_order_r = order_r.min(nr - 1).max(1);
+  let eff_order_c = order_c.min(nc - 1).max(1);
+  let (r_start, r_end) =
+    lagrange_window(nr, bracket_index_f64(&xs, x), eff_order_r);
+  let (c_start, c_end) =
+    lagrange_window(nc, bracket_index_f64(&ys, y), eff_order_c);
+  let ys_window = &ys[c_start..c_end];
+  let mut col_interp: Vec<f64> = Vec::with_capacity(r_end - r_start);
+  for i in r_start..r_end {
+    let mut row_vals: Vec<f64> = Vec::with_capacity(c_end - c_start);
+    for j in c_start..c_end {
+      row_vals.push(cell_f64(i, j)?);
+    }
+    col_interp.push(interp_1d_xy_f64(ys_window, &row_vals, y, eff_order_c));
+  }
+  let result =
+    interp_1d_xy_f64(&xs[r_start..r_end], &col_interp, x, eff_order_r);
+  Ok(Expr::Real(result))
+}
+
+/// Binary search for the interval bracketing `x_val` in an ascending or
+/// descending coordinate array: returns `lo` such that `[lo, lo + 1]`
+/// brackets it (clamped to the array's ends for an out-of-range query).
+fn bracket_index_f64(xs: &[f64], x_val: f64) -> usize {
+  let n = xs.len();
+  if n < 2 {
+    return 0;
+  }
+  let ascending = xs[n - 1] >= xs[0];
+  let mut lo = 0usize;
+  let mut hi = n - 1;
+  while lo < hi - 1 {
+    let mid = usize::midpoint(lo, hi);
+    let before = if ascending {
+      x_val < xs[mid]
+    } else {
+      x_val > xs[mid]
+    };
+    if before {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  lo
+}
+
+/// 1-D local Lagrange interpolation of `(xs[i], ys[i])` samples at
+/// arbitrary (not necessarily unit-spaced) coordinates, evaluated at
+/// `x_val`. The explicit-coordinate counterpart of `interp_1d_f64`, which
+/// assumes samples at integer positions `1..=n`; shares its window
+/// selection (`lagrange_window`) so results agree wherever the spacing
+/// happens to be uniform.
+fn interp_1d_xy_f64(xs: &[f64], ys: &[f64], x_val: f64, order: usize) -> f64 {
+  let n = xs.len();
+  if n == 1 {
+    return ys[0];
+  }
+  // Binary search for the interval containing x_val (or nearest, for a
+  // point outside the range, so extrapolation uses the boundary stencil).
+  let mut lo = 0usize;
+  let mut hi = n - 1;
+  while lo < hi - 1 {
+    let mid = usize::midpoint(lo, hi);
+    if x_val < xs[mid] {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  let eff_order = order.min(n - 1).max(1);
+  let (start, end) = lagrange_window(n, lo, eff_order);
+  let m = end - start;
+  let mut result = 0.0;
+  for i in 0..m {
+    let mut basis = 1.0;
+    for j in 0..m {
+      if j != i {
+        basis *= (x_val - xs[start + j]) / (xs[start + i] - xs[start + j]);
+      }
+    }
+    result += ys[start + i] * basis;
+  }
+  result
+}
+
+/// 1-D local Lagrange interpolation of `values` (sampled at positions
+/// `1..=values.len()`) at `coord`, using `order + 1` nearest samples. Mirrors
+/// the point-selection of `lagrange_interpolate` so 2-D results match the 1-D
+/// engine (and wolframscript).
+fn interp_1d_f64(values: &[f64], coord: f64, order: usize) -> f64 {
+  let n = values.len();
+  let coord = coord.max(1.0).min(n as f64);
+  // Interval index: largest i with (i+1) <= coord.
+  let mut idx = (coord.floor() as usize).saturating_sub(1);
+  if idx >= n - 1 {
+    idx = n - 2;
+  }
+  let needed = (order + 1).min(n);
+  // Order 1 uses the bracketing interval [idx, idx+1] (linear interpolation
+  // within the cell), matching the 1-D engine; higher orders center the
+  // (order+1)-point stencil on that interval, always containing both
+  // interval endpoints.
+  let start = if needed <= 2 {
+    idx.min(n - needed)
+  } else {
+    idx.saturating_sub((needed - 2) / 2).min(n - needed)
+  };
+  let mut acc = 0.0;
+  for i in 0..needed {
+    let xi = (start + i + 1) as f64;
+    let yi = values[start + i];
+    let mut term = yi;
+    for j in 0..needed {
+      if j != i {
+        let xj = (start + j + 1) as f64;
+        term *= (coord - xj) / (xi - xj);
+      }
+    }
+    acc += term;
+  }
+  acc
+}
+
+// ─── InterpolatingFunction evaluation ──────────────────────────────────
+
+/// InterpolatingFunction returns machine-precision reals for interpolated values.
+fn real_or_integer(v: f64) -> Expr {
+  Expr::Real(v)
+}
+
+/// The stored form of one interpolation coordinate: the evaluated source
+/// expression when it is an exact number (so `1/2` stays a rational rather
+/// than becoming `0.5`), and the machine value otherwise.
+fn exact_coordinate(source: &Expr, value: f64) -> Expr {
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(source)
+    .unwrap_or_else(|_| source.clone());
+  match &evaluated {
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => evaluated,
+    Expr::FunctionCall { name, args }
+      if name == "Rational"
+        && args.len() == 2
+        && args
+          .iter()
+          .all(|a| matches!(a, Expr::Integer(_) | Expr::BigInteger(_))) =>
+    {
+      evaluated
+    }
+    _ => Expr::Real(value),
+  }
+}
+
+/// Whether an interpolation coordinate is an exact number, so that exact
+/// arithmetic through it is worthwhile.
+fn is_exact_number(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_) | Expr::BigInteger(_) => true,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      args
+        .iter()
+        .all(|a| matches!(a, Expr::Integer(_) | Expr::BigInteger(_)))
+    }
+    _ => false,
+  }
+}
+
+/// Answer an `InterpolatingFunction[…]["property"]` query from the stored
+/// `{x, y}` grid data. Returns `None` for unrecognized properties so the call
+/// stays unevaluated.
+fn interpolating_function_property(
+  data: &Expr,
+  order: usize,
+  derivative_order: usize,
+  prop: &str,
+) -> Option<Expr> {
+  let Expr::List(pairs) = data else {
+    return None;
+  };
+  let mut xs: Vec<Expr> = Vec::with_capacity(pairs.len());
+  let mut ys: Vec<Expr> = Vec::with_capacity(pairs.len());
+  for p in pairs {
+    if let Expr::List(pair) = p
+      && pair.len() == 2
+    {
+      xs.push(pair[0].clone());
+      ys.push(pair[1].clone());
+    } else {
+      return None;
+    }
+  }
+  if xs.is_empty() {
+    return None;
+  }
+  let list1 = |items: Vec<Expr>| Expr::List(items.into());
+  match prop {
+    // The interpolation domain, as a list of {min, max} per dimension.
+    "Domain" => Some(list1(vec![list1(vec![
+      xs.first().unwrap().clone(),
+      xs.last().unwrap().clone(),
+    ])])),
+    // Each grid coordinate wrapped in a one-element list.
+    "Grid" => Some(list1(xs.into_iter().map(|x| list1(vec![x])).collect())),
+    // The grid coordinates of each dimension (here, one dimension).
+    "Coordinates" => Some(list1(vec![list1(xs)])),
+    // The sampled values at the grid points.
+    "ValuesOnGrid" => Some(list1(ys)),
+    "InterpolationOrder" => Some(list1(vec![Expr::Integer(order as i128)])),
+    // wolframscript reports a differentiated interpolating function's order
+    // as the Derivative operator itself, and a plain one's as 0.
+    "DerivativeOrder" => Some(if derivative_order == 0 {
+      Expr::Integer(0)
+    } else {
+      call("Derivative", vec![Expr::Integer(derivative_order as i128)])
+    }),
+    _ => None,
+  }
+}
+
+/// Evaluate InterpolatingFunction[domain, data][x_val]
+/// or InterpolatingFunction[domain, data, order][x_val]
+pub fn evaluate_interpolating_function(
+  func_args: &[Expr],
+  call_args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  // 2-D grid form: InterpolatingFunction[{{1,nr},{1,nc}}, grid, {orderR, orderC}].
+  // The `{orderR, orderC}` list marks it as 2-D.
+  if func_args.len() == 3
+    && let Expr::List(orders) = &func_args[2]
+    && orders.len() == 2
+    && let Expr::List(grid_rows) = &func_args[1]
+  {
+    return evaluate_interpolating_function_2d(grid_rows, orders, call_args);
+  }
+
+  // 2-D grid form with explicit coordinates: InterpolatingFunction[{{xmin,
+  // xmax}, {ymin, ymax}}, grid, {orderX, orderY}, {xcoords, ycoords}] —
+  // `try_2d_scattered_interpolation`'s output.
+  if func_args.len() == 4
+    && let Expr::List(orders) = &func_args[2]
+    && orders.len() == 2
+    && let Expr::List(grid_rows) = &func_args[1]
+    && let Expr::List(coords) = &func_args[3]
+    && coords.len() == 2
+    && matches!(&coords[0], Expr::List(_))
+    && matches!(&coords[1], Expr::List(_))
+  {
+    return evaluate_interpolating_function_2d_explicit(
+      &func_args[0],
+      grid_rows,
+      orders,
+      coords,
+      call_args,
+    );
+  }
+
+  if !(2..=4).contains(&func_args.len()) || call_args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "InterpolatingFunction expects domain and data, called with one argument"
+        .into(),
+    ));
+  }
+
+  let data = &func_args[1];
+  let order = if func_args.len() >= 3 {
+    match &func_args[2] {
+      Expr::Integer(n) => *n as usize,
+      _ => 3,
+    }
+  } else {
+    1 // Default for NDSolve-generated (backwards compat)
+  };
+  // A fourth argument is the derivative order, as left by `f'`.
+  let derivative_order = match func_args.get(3) {
+    Some(Expr::Integer(n)) if *n >= 0 => *n as usize,
+    _ => 0,
+  };
+
+  // Property access: InterpolatingFunction[…]["Domain"], ["Grid"], etc.
+  if let Expr::String(prop) = &call_args[0]
+    && let Some(result) =
+      interpolating_function_property(data, order, derivative_order, prop)
+  {
+    return Ok(result);
+  }
+
+  let x_val_expr = crate::evaluator::evaluate_expr_to_expr(&call_args[0])?;
+  // Rationals and other exact numbers count as arguments too, not just
+  // machine numbers: Interpolation[{1, 4, 9}][5/2] is 25/4.
+  let Ok(x_val) = interp_value_to_f64(&x_val_expr) else {
+    // Can't evaluate symbolically — return unevaluated
+    return Ok(Expr::CurriedCall {
+      func: Box::new(unevaluated("InterpolatingFunction", func_args)),
+      args: call_args.to_vec(),
+    });
+  };
+
+  // Data is a list of {x, y} pairs
+  let Expr::List(data_points) = data else {
+    return Err(InterpreterError::EvaluationError(
+      "InterpolatingFunction: invalid data format".into(),
+    ));
+  };
+
+  let n = data_points.len();
+  if n == 0 {
+    return Err(InterpreterError::EvaluationError(
+      "InterpolatingFunction: not enough data points".into(),
+    ));
+  }
+
+  // Outside the data range the boundary piece is extended rather than the
+  // value clamped, which is what wolframscript does after warning about it.
+  if let (Ok((x_lo, _)), Ok((x_hi, _))) = (
+    extract_point(&data_points[0]),
+    extract_point(&data_points[n - 1]),
+  ) && (x_val < x_lo || x_val > x_hi)
+  {
+    crate::emit_message(&format!(
+      "InterpolatingFunction::dmval: Input value {{{}}} lies outside the range of data in the interpolating function. Extrapolation will be used.",
+      crate::syntax::format_expr(&x_val_expr, crate::syntax::ExprForm::Output)
+    ));
+  }
+
+  if n == 1 {
+    // A single data point is a constant interpolation: return the stored y
+    // (preserving its Integer/Real type) for any input; its derivative is 0.
+    if derivative_order > 0 {
+      return Ok(Expr::Integer(0));
+    }
+    if let Expr::List(pair) = &data_points[0]
+      && pair.len() == 2
+    {
+      return Ok(pair[1].clone());
+    }
+    let (_, y) = extract_point(&data_points[0])?;
+    return Ok(real_or_integer(y));
+  }
+
+  // Extract all points for interpolation
+  let (x_first, _) = extract_point(&data_points[0])?;
+  let (x_last, _) = extract_point(&data_points[n - 1])?;
+
+  // Check for exact grid point match — return the stored y-value directly
+  // to preserve original types (e.g. Integer for ListInterpolation with integer data).
+  if derivative_order == 0 {
+    for pt in data_points {
+      if let Expr::List(pair) = pt
+        && pair.len() == 2
+        && let Ok(xp) = interp_value_to_f64(&pair[0])
+        && (xp - x_val).abs() < 1e-15
+      {
+        return Ok(pair[1].clone());
+      }
+    }
+  }
+
+  // Binary search for the interval containing x; a point outside the data
+  // range picks up the nearest interval and extrapolates along it.
+  let idx = find_interval(data_points, x_val.max(x_first).min(x_last), n)?;
+  let eff_order = if order == 1 || n <= 2 {
+    1
+  } else {
+    order.min(n - 1)
+  };
+  let (start, end) = lagrange_window(n, idx, eff_order);
+
+  // `f'` differentiates the local polynomial piece, so the derivative is
+  // exact wherever the interpolation itself is. Exact data and an exact
+  // query point take the symbolic route to preserve exactness; anything
+  // else (machine-precision NDSolve output, the common case) takes the
+  // fast numeric route so sampling a phase portrait's velocity stays cheap.
+  if derivative_order > 0 {
+    if is_exact_number(&x_val_expr)
+      && let Some(exact) = interpolating_derivative_value_exact(
+        data_points,
+        &x_val_expr,
+        start,
+        end,
+        derivative_order,
+      )?
+    {
+      return Ok(exact);
+    }
+    return interpolating_derivative_value_numeric(
+      data_points,
+      x_val,
+      start,
+      end,
+      derivative_order,
+    );
+  }
+
+  // An exact query point over exact data interpolates exactly, the way
+  // wolframscript reports Interpolation[{1, 4, 9}][5/2] as 25/4.
+  if is_exact_number(&x_val_expr)
+    && let Some(exact) =
+      lagrange_interpolate_exact(data_points, &x_val_expr, start, end)?
+  {
+    return Ok(exact);
+  }
+
+  if eff_order == 1 {
+    // Linear interpolation
+    let (x0, y0) = extract_point(&data_points[idx])?;
+    let (x1, y1) = extract_point(&data_points[idx + 1])?;
+    let t = if (x1 - x0).abs() > 1e-15 {
+      (x_val - x0) / (x1 - x0)
+    } else {
+      0.0
+    };
+    let y_val = y0 + t * (y1 - y0);
+    Ok(real_or_integer(y_val))
+  } else {
+    // Order >= 2: piecewise local polynomial interpolation through the
+    // nearest (order + 1) points. This matches wolframscript's default
+    // `Interpolation`, which reproduces any polynomial of degree <= order
+    // exactly — unlike a natural cubic spline, whose zero-curvature
+    // boundary conditions distort the fit (e.g. x^2 data would not yield
+    // exact values).
+    let y_val = lagrange_interpolate(data_points, x_val, n, idx, eff_order)?;
+    Ok(real_or_integer(y_val))
+  }
+}
+
+/// `InterpolatingFunctionDomain[interp]`, from the
+/// `DifferentialEquations`InterpolatingFunctionAnatomy`` package. Reports the
+/// same domain as `interp["Domain"]` (a list of `{min, max}` pairs, one per
+/// independent variable), so it delegates to `evaluate_interpolating_function`
+/// rather than re-deriving the domain.
+pub fn interpolating_function_domain_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let interp = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  if let Expr::FunctionCall {
+    name,
+    args: func_args,
+  } = &interp
+    && name == "InterpolatingFunction"
+  {
+    return evaluate_interpolating_function(
+      func_args,
+      &[Expr::String("Domain".to_string())],
+    );
+  }
+  Ok(unevaluated("InterpolatingFunctionDomain", &[interp]))
+}
+
+/// Evaluate a 2-D grid InterpolatingFunction at `[x, y]` via tensor-product
+/// local Lagrange interpolation: interpolate each row along the column
+/// direction at `y`, then interpolate those values along the row direction at
+/// `x`. Exact integer grid points return the stored entry (preserving type).
+fn evaluate_interpolating_function_2d(
+  grid_rows: &[Expr],
+  orders: &[Expr],
+  call_args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let nr = grid_rows.len();
+  let order_r = match &orders[0] {
+    Expr::Integer(n) => *n as usize,
+    _ => 1,
+  };
+  let order_c = match &orders[1] {
+    Expr::Integer(n) => *n as usize,
+    _ => 1,
+  };
+
+  // Materialize the grid as f64 values and as original expressions.
+  let mut vals: Vec<Vec<f64>> = Vec::with_capacity(nr);
+  let mut exprs: Vec<Vec<Expr>> = Vec::with_capacity(nr);
+  for row in grid_rows {
+    let Expr::List(cells) = row else {
+      return Err(InterpreterError::EvaluationError(
+        "InterpolatingFunction: invalid 2-D grid".into(),
+      ));
+    };
+    let mut rv = Vec::with_capacity(cells.len());
+    let mut re = Vec::with_capacity(cells.len());
+    for c in cells {
+      rv.push(match c {
+        Expr::Integer(n) => *n as f64,
+        Expr::Real(f) => *f,
+        _ => 0.0,
+      });
+      re.push(c.clone());
+    }
+    vals.push(rv);
+    exprs.push(re);
+  }
+  let nc = vals[0].len();
+
+  let domain2d = || {
+    Expr::List(
+      vec![
+        Expr::List(vec![Expr::Integer(1), Expr::Integer(nr as i128)].into()),
+        Expr::List(vec![Expr::Integer(1), Expr::Integer(nc as i128)].into()),
+      ]
+      .into(),
+    )
+  };
+  let unevaluated = || Expr::CurriedCall {
+    func: Box::new(call(
+      "InterpolatingFunction",
+      vec![
+        domain2d(),
+        Expr::List(grid_rows.to_vec().into()),
+        Expr::List(orders.to_vec().into()),
+      ],
+    )),
+    args: call_args.to_vec(),
+  };
+
+  // Property access (e.g. ["Domain"]) — return the rectangular domain.
+  if call_args.len() == 1
+    && let Expr::String(prop) = &call_args[0]
+    && prop == "Domain"
+  {
+    return Ok(domain2d());
+  }
+  // Other properties: leave unevaluated.
+
+  // The coordinates may come either as two arguments or as one list.
+  let coord_args: Vec<Expr> = match call_args {
+    [Expr::List(pair)] if pair.len() == 2 => pair.to_vec(),
+    other => other.to_vec(),
+  };
+  if coord_args.len() != 2 {
+    return Ok(unevaluated());
+  }
+
+  let coord_exprs: Vec<Expr> = coord_args
+    .iter()
+    .map(|a| {
+      crate::evaluator::evaluate_expr_to_expr(a).unwrap_or_else(|_| a.clone())
+    })
+    .collect();
+  let coord = |e: &Expr| -> Option<f64> {
+    match e {
+      Expr::Integer(n) => Some(*n as f64),
+      Expr::Real(f) => Some(*f),
+      _ if is_exact_number(e) => interp_value_to_f64(e).ok(),
+      _ => None,
+    }
+  };
+  let (Some(x), Some(y)) = (coord(&coord_exprs[0]), coord(&coord_exprs[1]))
+  else {
+    // Non-numeric coordinate: stay symbolic.
+    return Ok(unevaluated());
+  };
+
+  // Exact grid point: return the stored entry, but only keep its (Integer)
+  // type when both coordinates were given as integers — a real coordinate
+  // forces a real result (matching wolframscript: `[1, 3]` → 9, `[1., 3.]` → 9.).
+  let int_coords = coord_exprs.iter().all(|a| matches!(a, Expr::Integer(_)));
+  let xi = x.round();
+  let yi = y.round();
+  if (x - xi).abs() < 1e-12
+    && (y - yi).abs() < 1e-12
+    && xi >= 1.0
+    && xi <= nr as f64
+    && yi >= 1.0
+    && yi <= nc as f64
+  {
+    let entry = &exprs[xi as usize - 1][yi as usize - 1];
+    if int_coords {
+      return Ok(entry.clone());
+    }
+    return Ok(Expr::Real(vals[xi as usize - 1][yi as usize - 1]));
+  }
+
+  // Exact coordinates over an exact grid interpolate exactly, the way
+  // wolframscript reports ListInterpolation[{{1, 2}, {3, 4}}][{3/2, 3/2}]
+  // as 5/2.
+  if coord_exprs.iter().all(is_exact_number)
+    && exprs.iter().flatten().all(is_exact_number)
+    && let Some(rows) = exprs
+      .iter()
+      .map(|row| interp_1d_exact(row, &coord_exprs[1], y, order_c))
+      .collect::<Option<Vec<Expr>>>()
+    && let Some(result) = interp_1d_exact(&rows, &coord_exprs[0], x, order_r)
+  {
+    return Ok(result);
+  }
+
+  // Interpolate each row along columns at y, then along rows at x.
+  let col_interp: Vec<f64> = vals
+    .iter()
+    .map(|row| interp_1d_f64(row, y, order_c))
+    .collect();
+  let result = interp_1d_f64(&col_interp, x, order_r);
+  Ok(Expr::Real(result))
+}
+
+/// Exact counterpart of `interp_1d_f64`: interpolate `values` sitting on the
+/// integer grid 1..n at the exact coordinate `coord`, using the same stencil.
+fn interp_1d_exact(
+  values: &[Expr],
+  coord: &Expr,
+  coord_f64: f64,
+  order: usize,
+) -> Option<Expr> {
+  let n = values.len();
+  if n == 0 {
+    return None;
+  }
+  let clamped = coord_f64.max(1.0).min(n as f64);
+  let mut idx = (clamped.floor() as usize).saturating_sub(1);
+  if idx >= n - 1 {
+    idx = n - 2;
+  }
+  let needed = (order + 1).min(n);
+  let start = if needed <= 2 {
+    idx.min(n - needed)
+  } else {
+    idx.saturating_sub((needed - 2) / 2).min(n - needed)
+  };
+  let points: Vec<Expr> = values
+    .iter()
+    .enumerate()
+    .map(|(i, v)| {
+      Expr::List(vec![Expr::Integer(i as i128 + 1), v.clone()].into())
+    })
+    .collect();
+  let poly = lagrange_polynomial(&points, coord, start, start + needed, true)?;
+  crate::evaluator::evaluate_expr_to_expr(&poly).ok()
+}
+
+/// Find the interval index for x_val using binary search.
+/// Returns idx such that x[idx] <= x_val <= x[idx+1].
+fn find_interval(
+  data_points: &[Expr],
+  x_val: f64,
+  n: usize,
+) -> Result<usize, InterpreterError> {
+  let mut lo = 0usize;
+  let mut hi = n - 1;
+  while lo < hi - 1 {
+    let mid = usize::midpoint(lo, hi);
+    let (x_mid, _) = extract_point(&data_points[mid])?;
+    if x_val < x_mid {
+      hi = mid;
+    } else {
+      lo = mid;
+    }
+  }
+  Ok(lo)
+}
+
+/// The (order+1)-point stencil for the interval starting at `idx`, as centered
+/// as possible on it; it must contain both interval endpoints or the local
+/// polynomial would extrapolate and miss the next grid value.
+fn lagrange_window(n: usize, idx: usize, order: usize) -> (usize, usize) {
+  let needed = order + 1;
+  let start = idx
+    .saturating_sub((order.max(1) - 1) / 2)
+    .min(n.saturating_sub(needed));
+  (start, (start + needed).min(n))
+}
+
+/// The local Lagrange polynomial over the stencil `data_points[start..end]`,
+/// written in `var`. `require_exact` rejects machine numbers, which is what
+/// the exact-value path wants; the derivative path takes them.
+fn lagrange_polynomial(
+  data_points: &[Expr],
+  var: &Expr,
+  start: usize,
+  end: usize,
+  require_exact: bool,
+) -> Option<Expr> {
+  let usable = |e: &Expr| {
+    is_exact_number(e) || (!require_exact && matches!(e, Expr::Real(_)))
+  };
+  let mut xs: Vec<Expr> = Vec::with_capacity(end - start);
+  let mut ys: Vec<Expr> = Vec::with_capacity(end - start);
+  for pt in &data_points[start..end] {
+    let Expr::List(pair) = pt else {
+      return None;
+    };
+    if pair.len() != 2 || !usable(&pair[0]) || !usable(&pair[1]) {
+      return None;
+    }
+    xs.push(pair[0].clone());
+    ys.push(pair[1].clone());
+  }
+
+  let minus = |a: &Expr, b: &Expr| minus2(a.clone(), b.clone());
+  let m = xs.len();
+  let mut terms: Vec<Expr> = Vec::with_capacity(m);
+  for i in 0..m {
+    let mut factors: Vec<Expr> = vec![ys[i].clone()];
+    for j in 0..m {
+      if j != i {
+        factors.push(div2(minus(var, &xs[j]), minus(&xs[i], &xs[j])));
+      }
+    }
+    factors.retain(|f| !matches!(f, Expr::Integer(1)));
+    terms.push(call("Times", factors));
+  }
+  Some(call("Plus", terms))
+}
+
+/// Lagrange interpolation over the stencil carried out in exact arithmetic.
+/// Returns `None` when a coordinate in the stencil is not an exact number,
+/// leaving the machine-precision path to handle it.
+fn lagrange_interpolate_exact(
+  data_points: &[Expr],
+  x: &Expr,
+  start: usize,
+  end: usize,
+) -> Result<Option<Expr>, InterpreterError> {
+  match lagrange_polynomial(data_points, x, start, end, true) {
+    Some(poly) => Ok(Some(crate::evaluator::evaluate_expr_to_expr(&poly)?)),
+    None => Ok(None),
+  }
+}
+
+/// The `derivative_order`-th derivative of the local polynomial piece,
+/// evaluated at `x`, carried out in exact arithmetic. Returns `None` when a
+/// coordinate in the stencil (or `x` itself) is not an exact number, leaving
+/// [`interpolating_derivative_value_numeric`] to handle it.
+fn interpolating_derivative_value_exact(
+  data_points: &[Expr],
+  x: &Expr,
+  start: usize,
+  end: usize,
+  derivative_order: usize,
+) -> Result<Option<Expr>, InterpreterError> {
+  let var = id_expr("\u{2620}ifderiv\u{2620}");
+  let Some(poly) = lagrange_polynomial(data_points, &var, start, end, true)
+  else {
+    return Ok(None);
+  };
+  let mut expr = crate::evaluator::evaluate_expr_to_expr(&poly)?;
+  for _ in 0..derivative_order {
+    expr = crate::evaluator::evaluate_expr_to_expr(&call(
+      "D",
+      vec![expr, var.clone()],
+    ))?;
+  }
+  let substituted =
+    crate::syntax::substitute_variable(&expr, "\u{2620}ifderiv\u{2620}", x);
+  Ok(Some(crate::evaluator::evaluate_expr_to_expr(&substituted)?))
+}
+
+/// The `derivative_order`-th derivative of the local polynomial piece,
+/// evaluated at `x_val`, computed directly in machine arithmetic (Newton
+/// divided differences expanded to monomial coefficients, then
+/// differentiated and evaluated by Horner's method).
+///
+/// This is the hot path for `f'[t]`/`f''[t]` on an `NDSolve`-produced
+/// `InterpolatingFunction` — e.g. sampling a phase portrait's velocity
+/// alongside its position. Building and simplifying a symbolic Lagrange
+/// polynomial through the general evaluator for every sample point (the
+/// exact-arithmetic path above) is thousands of times slower and turns a
+/// `Manipulate` slider drag into a multi-second stall, so machine-precision
+/// data — the overwhelmingly common case — never takes that path.
+fn interpolating_derivative_value_numeric(
+  data_points: &[Expr],
+  x_val: f64,
+  start: usize,
+  end: usize,
+  derivative_order: usize,
+) -> Result<Expr, InterpreterError> {
+  let mut xs = Vec::with_capacity(end - start);
+  let mut coeffs = Vec::with_capacity(end - start);
+  for pt in &data_points[start..end] {
+    let (x, y) = extract_point(pt)?;
+    xs.push(x);
+    coeffs.push(y);
+  }
+  let m = xs.len();
+
+  // Newton divided differences: coeffs[k] becomes f[x_0, ..., x_k].
+  for j in 1..m {
+    for i in (j..m).rev() {
+      coeffs[i] = (coeffs[i] - coeffs[i - 1]) / (xs[i] - xs[i - j]);
+    }
+  }
+
+  // Expand the nested Newton form
+  // c[0] + (x-x0)(c[1] + (x-x1)(c[2] + ...))
+  // into ascending-power monomial coefficients, via repeated polynomial
+  // multiplication by (x - x_k) — cheap since m is a handful of points.
+  let mut monomial = vec![coeffs[m - 1]];
+  for k in (0..m - 1).rev() {
+    // monomial *= (x - xs[k])
+    let mut shifted = vec![0.0; monomial.len() + 1];
+    for (i, c) in monomial.iter().enumerate() {
+      shifted[i + 1] += c;
+      shifted[i] -= c * xs[k];
+    }
+    monomial = shifted;
+    // monomial += coeffs[k] (constant term)
+    monomial[0] += coeffs[k];
+  }
+
+  if derivative_order >= monomial.len() {
+    return Ok(Expr::Real(0.0));
+  }
+  // Differentiate `derivative_order` times: term c*x^p -> c*p*x^(p-1).
+  for _ in 0..derivative_order {
+    monomial = monomial
+      .iter()
+      .enumerate()
+      .skip(1)
+      .map(|(p, c)| c * p as f64)
+      .collect();
+  }
+
+  // Horner evaluation of the (now differentiated) monomial polynomial.
+  let value = monomial.iter().rev().fold(0.0, |acc, c| acc * x_val + c);
+  Ok(Expr::Real(value))
+}
+
+/// Lagrange polynomial interpolation using (order+1) nearest points.
+fn lagrange_interpolate(
+  data_points: &[Expr],
+  x_val: f64,
+  n: usize,
+  idx: usize,
+  order: usize,
+) -> Result<f64, InterpreterError> {
+  let (start, end) = lagrange_window(n, idx, order);
+
+  let mut xs = Vec::with_capacity(end - start);
+  let mut ys = Vec::with_capacity(end - start);
+  for pt in &data_points[start..end] {
+    let (x, y) = extract_point(pt)?;
+    xs.push(x);
+    ys.push(y);
+  }
+
+  // Lagrange basis polynomials
+  let m = xs.len();
+  let mut result = 0.0;
+  for i in 0..m {
+    let mut basis = 1.0;
+    for j in 0..m {
+      if j != i {
+        basis *= (x_val - xs[j]) / (xs[i] - xs[j]);
+      }
+    }
+    result += ys[i] * basis;
+  }
+  Ok(result)
+}
+
+/// Extract (x, y) from a List[x, y] expression
+fn extract_point(expr: &Expr) -> Result<(f64, f64), InterpreterError> {
+  if let Expr::List(items) = expr
+    && items.len() == 2
+  {
+    let x = interp_value_to_f64(&items[0])?;
+    let y = interp_value_to_f64(&items[1])?;
+    return Ok((x, y));
+  }
+  Err(InterpreterError::EvaluationError(
+    "InterpolatingFunction: invalid data point format".into(),
+  ))
+}
+
+// ─── First-order linear PDE in two variables ──────────────────────────
+
+/// Recognise `a*D[f[x,y], x] + b*D[f[x,y], y] == c*f[x,y]` (and its
+/// equivalent forms) and return the closed-form solution
+/// `{{f -> Function[{x, y}, E^((c/a)*x) * C[1][y - (b/a)*x]]}}`.
+///
+/// Accepts the input in the form Wolfram emits after evaluating
+/// `D[f[x,y], x]/f[x,y] + 3 D[f[x,y], y]/f[x,y] == 2` — i.e. each
+/// derivative term divided by `f[x,y]` and the RHS being the constant
+/// `c`. The implementation collects all top-level Plus terms on both
+/// sides of the equation, classifies each as either a constant, a
+/// derivative-over-`f[x,y]` term, or a multiple of `f[x,y]`, and
+/// solves for the (a, b, c) triple.
+fn try_linear_first_order_pde_body(
+  eqn: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<Expr> {
+  let (lhs, rhs) = pde_split_equation(eqn)?;
+  // Move everything to the LHS: lhs - rhs == 0. Each term then
+  // contributes a signed coefficient.
+  let mut a = 0i128; // coefficient of D[f[x,y], x] / f[x,y]
+  let mut b = 0i128; // coefficient of D[f[x,y], y] / f[x,y]
+  let mut c = 0i128; // coefficient of constant (negated; we want a*fx + b*fy = c*f)
+  collect_pde_terms(&lhs, fname, xn, yn, 1, &mut a, &mut b, &mut c)?;
+  collect_pde_terms(&rhs, fname, xn, yn, -1, &mut a, &mut b, &mut c)?;
+  // Equation as gathered: a*fx/f + b*fy/f - c == 0  ⇒  a*fx + b*fy == c*f.
+  let c_eff = -c; // -c was accumulated; flip sign back.
+  if a == 0 || a != 1 {
+    // The closed form below assumes a == 1. Restrict to that shape;
+    // generalised rationals require a Rational arithmetic path.
+    return None;
+  }
+  // Build the body: E^(c*x) * C[1][y - b*x]
+  let n_var = |s: &str| Expr::Identifier(s.to_string());
+  let exp_part = if c_eff == 0 {
+    Expr::Integer(1)
+  } else {
+    let exponent = if c_eff == 1 {
+      n_var(xn)
+    } else {
+      times2(Expr::Integer(c_eff), n_var(xn))
+    };
+    pow2(const_expr("E"), exponent)
+  };
+  // Argument to C[1]: y - b*x  (or just y when b == 0).
+  let c1_arg = if b == 0 {
+    n_var(yn)
+  } else {
+    let bx = if b == 1 {
+      n_var(xn)
+    } else {
+      times2(Expr::Integer(-b), n_var(xn))
+    };
+    plus2(bx, n_var(yn))
+  };
+  let c1_applied = Expr::CurriedCall {
+    func: Box::new(call1("C", Expr::Integer(1))),
+    args: vec![c1_arg],
+  };
+  let body = if matches!(&exp_part, Expr::Integer(1)) {
+    c1_applied
+  } else {
+    times2(exp_part, c1_applied)
+  };
+  Some(body)
+}
+
+/// Recognise the Euler-type PDE `x*D[f[x,y], x] + y*D[f[x,y], y] == c`
+/// (constant c) and return the body
+/// `c*Log[x] + C[1][y/x]` of the closed-form solution.
+/// Recognise `a*D[f[x,y], x] + b*D[f[x,y], y] == c` (constant integer
+/// coefficients on bare derivatives, integer RHS) and return the body
+/// `(c/a)*x + C[1][y - (b/a)*x]`. Inhomogeneous (c ≠ 0) and homogeneous
+/// (c = 0) cases are both handled.
+fn try_direct_linear_pde_body(
+  eqn: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<Expr> {
+  let (lhs, rhs) = pde_split_equation(eqn)?;
+  // LHS: collect coefficients of Fx and Fy via Plus walking. Reject
+  // shapes that don't fit (e.g. divided-by-f, mixed parameters, etc.).
+  let mut a = 0i128;
+  let mut b = 0i128;
+  collect_direct_pde_terms(&lhs, fname, xn, yn, 1, &mut a, &mut b)?;
+  // RHS must be an integer constant for the closed form below.
+  let mut c = match &rhs {
+    Expr::Integer(n) => *n,
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => match operand.as_ref() {
+      Expr::Integer(n) => -*n,
+      _ => return None,
+    },
+    _ => return None,
+  };
+  // If we accumulated any constant terms on the LHS, fold them into
+  // -c on the RHS by negating: a*Fx + b*Fy + k == c  ⇒  a*Fx + b*Fy
+  // == c - k. We don't currently parse a separate `k` slot, so any
+  // non-derivative LHS term aborts the recognition above.
+  let _ = &mut c;
+  if a == 0 {
+    return None; // No Fx term means no characteristic to integrate along.
+  }
+  let n_var = |s: &str| Expr::Identifier(s.to_string());
+  // Argument to C[1]: y - (b/a)*x.
+  let c1_arg = if b == 0 {
+    n_var(yn)
+  } else {
+    let coeff = make_neg_b_over_a(b, a);
+    let bx = match &coeff {
+      Expr::Integer(1) => n_var(xn),
+      Expr::Integer(n) => times2(Expr::Integer(*n), n_var(xn)),
+      other => times2(other.clone(), n_var(xn)),
+    };
+    plus2(n_var(yn), bx)
+  };
+  let c1_applied = Expr::CurriedCall {
+    func: Box::new(call1("C", Expr::Integer(1))),
+    args: vec![c1_arg],
+  };
+  // Inhomogeneous head term: (c/a)*x.
+  if c == 0 {
+    return Some(c1_applied);
+  }
+  let coeff = make_c_over_a(c, a);
+  let head_term = match &coeff {
+    Expr::Integer(1) => n_var(xn),
+    Expr::Integer(n) => times2(Expr::Integer(*n), n_var(xn)),
+    other => times2(other.clone(), n_var(xn)),
+  };
+  Some(plus2(head_term, c1_applied))
+}
+
+/// `-b/a` reduced to either an `Integer` (if `a` divides `b`) or a
+/// `Rational` literal. Sign is folded into the numerator.
+fn make_neg_b_over_a(b: i128, a: i128) -> Expr {
+  use crate::functions::math_ast::make_rational;
+  let (num, den) = rat_reduce(-b, a);
+  if den == 1 {
+    Expr::Integer(num)
+  } else {
+    make_rational(num, den)
+  }
+}
+
+fn make_c_over_a(c: i128, a: i128) -> Expr {
+  use crate::functions::math_ast::make_rational;
+  let (num, den) = rat_reduce(c, a);
+  if den == 1 {
+    Expr::Integer(num)
+  } else {
+    make_rational(num, den)
+  }
+}
+
+/// Walk a Plus chain and accumulate signed integer coefficients of
+/// bare `Derivative[1,0][f][x,y]` and `Derivative[0,1][f][x,y]` terms.
+/// Anything else (constants, divided-by-f terms, mixed factors) bails.
+fn collect_direct_pde_terms(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+  sign: i128,
+  a: &mut i128,
+  b: &mut i128,
+) -> Option<()> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      for arg in args {
+        collect_direct_pde_terms(arg, fname, xn, yn, sign, a, b)?;
+      }
+      Some(())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      collect_direct_pde_terms(left, fname, xn, yn, sign, a, b)?;
+      collect_direct_pde_terms(right, fname, xn, yn, sign, a, b)
+    }
+    _ => {
+      let (coeff, kind) = classify_direct_pde_term(expr, fname, xn, yn)?;
+      let signed = sign * coeff;
+      match kind {
+        PdeTerm::Fx => *a += signed,
+        PdeTerm::Fy => *b += signed,
+        PdeTerm::Const => return None, // not allowed in this branch
+      }
+      Some(())
+    }
+  }
+}
+
+fn classify_direct_pde_term(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<(i128, PdeTerm)> {
+  // Bare derivative call (coefficient 1).
+  if let Some(kind) = classify_derivative_call(expr, fname, xn, yn) {
+    return Some((1, kind));
+  }
+  // Times[coeff, Derivative…] with integer coefficient.
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Times"
+  {
+    let mut coeff = 1i128;
+    let mut deriv_kind: Option<PdeTerm> = None;
+    for factor in args {
+      if let Expr::Integer(n) = factor {
+        coeff *= *n;
+        continue;
+      }
+      if let Some(kind) = classify_derivative_call(factor, fname, xn, yn) {
+        if deriv_kind.is_some() {
+          return None;
+        }
+        deriv_kind = Some(kind);
+        continue;
+      }
+      return None;
+    }
+    if let Some(kind) = deriv_kind {
+      return Some((coeff, kind));
+    }
+  }
+  None
+}
+
+fn try_euler_pde_body(
+  eqn: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<Expr> {
+  let (lhs, rhs) = pde_split_equation(eqn)?;
+  // Walk the LHS Plus chain: expect exactly two terms — `x * Fx` and
+  // `y * Fy`, in either order. RHS must be an integer constant.
+  let mut saw_fx = false;
+  let mut saw_fy = false;
+  walk_euler_terms(&lhs, fname, xn, yn, &mut saw_fx, &mut saw_fy)?;
+  if !(saw_fx && saw_fy) {
+    return None;
+  }
+  let c = match &rhs {
+    Expr::Integer(n) => *n,
+    _ => return None,
+  };
+  let n_var = |s: &str| Expr::Identifier(s.to_string());
+  // Build c*Log[x] + C[1][y/x].
+  let log_x = call1("Log", n_var(xn));
+  let y_over_x = div2(n_var(yn), n_var(xn));
+  let c1_applied = Expr::CurriedCall {
+    func: Box::new(call1("C", Expr::Integer(1))),
+    args: vec![y_over_x],
+  };
+  // `c == 0` drops the logarithm entirely; keeping `0*Log[x]` would leak an
+  // unfolded zero term into the solution.
+  if c == 0 {
+    return Some(c1_applied);
+  }
+  let log_term = if c == 1 {
+    log_x
+  } else {
+    times2(Expr::Integer(c), log_x)
+  };
+  let body = plus2(log_term, c1_applied);
+  Some(body)
+}
+
+fn walk_euler_terms(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+  saw_fx: &mut bool,
+  saw_fy: &mut bool,
+) -> Option<()> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      for arg in args {
+        walk_euler_terms(arg, fname, xn, yn, saw_fx, saw_fy)?;
+      }
+      Some(())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      walk_euler_terms(left, fname, xn, yn, saw_fx, saw_fy)?;
+      walk_euler_terms(right, fname, xn, yn, saw_fx, saw_fy)
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      // Look for exactly one Identifier matching xn or yn and exactly
+      // one Derivative call on f.
+      let mut coord: Option<&str> = None;
+      let mut deriv_kind: Option<PdeTerm> = None;
+      for factor in args {
+        if let Expr::Identifier(s) = factor {
+          if s == xn || s == yn {
+            if coord.is_some() {
+              return None;
+            }
+            coord = Some(if s == xn { xn } else { yn });
+            continue;
+          }
+          return None;
+        }
+        if let Some(kind) = classify_derivative_call(factor, fname, xn, yn) {
+          if deriv_kind.is_some() {
+            return None;
+          }
+          deriv_kind = Some(kind);
+          continue;
+        }
+        return None;
+      }
+      match (coord, deriv_kind) {
+        (Some(c), Some(PdeTerm::Fx)) if c == xn => {
+          if *saw_fx {
+            return None;
+          }
+          *saw_fx = true;
+          Some(())
+        }
+        (Some(c), Some(PdeTerm::Fy)) if c == yn => {
+          if *saw_fy {
+            return None;
+          }
+          *saw_fy = true;
+          Some(())
+        }
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Wrap a PDE body expression as the rule the test expects.
+/// `return_call_form` selects between `f[x, y] -> body` and
+/// `f -> Function[{x, y}, body]`.
+fn wrap_pde_solution(
+  body: Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+  return_call_form: bool,
+) -> Expr {
+  let n_var = |s: &str| Expr::Identifier(s.to_string());
+  let rule = if return_call_form {
+    Expr::Rule {
+      pattern: Box::new(call(fname, vec![n_var(xn), n_var(yn)])),
+      replacement: Box::new(body),
+    }
+  } else {
+    Expr::Rule {
+      pattern: Box::new(Expr::Identifier(fname.to_string())),
+      replacement: Box::new(call(
+        "Function",
+        vec![Expr::List(vec![n_var(xn), n_var(yn)].into()), body],
+      )),
+    }
+  };
+  Expr::List(vec![Expr::List(vec![rule].into())].into())
+}
+
+/// Pull `(lhs, rhs)` out of an `Equal` expression, accepting either the
+/// `Comparison` AST node or a literal `Equal[…]` FunctionCall.
+fn pde_split_equation(eqn: &Expr) -> Option<(Expr, Expr)> {
+  match eqn {
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      Some((operands[0].clone(), operands[1].clone()))
+    }
+    Expr::FunctionCall { name, args } if name == "Equal" && args.len() == 2 => {
+      Some((args[0].clone(), args[1].clone()))
+    }
+    _ => None,
+  }
+}
+
+/// Walk a Plus chain in `expr`, classifying each term by its shape and
+/// adding its (signed) integer coefficient to the appropriate slot.
+/// Returns `None` if any term doesn't fit the recognised PDE shape.
+fn collect_pde_terms(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+  sign: i128,
+  a: &mut i128,
+  b: &mut i128,
+  c: &mut i128,
+) -> Option<()> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      for arg in args {
+        collect_pde_terms(arg, fname, xn, yn, sign, a, b, c)?;
+      }
+      Some(())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      collect_pde_terms(left, fname, xn, yn, sign, a, b, c)?;
+      collect_pde_terms(right, fname, xn, yn, sign, a, b, c)
+    }
+    _ => {
+      let (coeff, kind) = classify_pde_term(expr, fname, xn, yn)?;
+      let signed = sign * coeff;
+      match kind {
+        PdeTerm::Fx => *a += signed,
+        PdeTerm::Fy => *b += signed,
+        PdeTerm::Const => *c += signed,
+      }
+      Some(())
+    }
+  }
+}
+
+#[derive(Clone, Copy)]
+enum PdeTerm {
+  Fx,
+  Fy,
+  Const,
+}
+
+/// Decompose a single Plus term into (integer coefficient, kind). The
+/// recognised shapes are:
+///   * integer constant                        -> Const
+///   * c * f[x,y]                              -> Const (consumes the f)
+///   * c * Derivative[1,0][f][x,y] / f[x,y]    -> Fx
+///   * c * Derivative[0,1][f][x,y] / f[x,y]    -> Fy
+///   * Derivative[…][f][x,y] / f[x,y]          -> Fx/Fy with c = 1
+fn classify_pde_term(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<(i128, PdeTerm)> {
+  // Plain integer constant (RHS of the PDE).
+  if let Expr::Integer(n) = expr {
+    return Some((*n, PdeTerm::Const));
+  }
+  // `c * f[x,y]` (rare on input but possible after rearrangement).
+  if is_f_at_xy(expr, fname, xn, yn) {
+    return Some((1, PdeTerm::Const));
+  }
+  // Single `Derivative[…][f][x,y] / f[x,y]` (coefficient 1).
+  if let Some(kind) = classify_derivative_over_f(expr, fname, xn, yn) {
+    return Some((1, kind));
+  }
+  // `c * Derivative[…][f][x,y] / f[x,y]` represented as
+  // `Times[c, Derivative…, Power[f[x,y], -1]]` (or any factor order).
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Times"
+  {
+    let mut coeff = 1i128;
+    let mut deriv_kind: Option<PdeTerm> = None;
+    let mut saw_inverse_f = false;
+    for factor in args {
+      if let Expr::Integer(n) = factor {
+        coeff *= *n;
+        continue;
+      }
+      if let Some(kind) = classify_derivative_call(factor, fname, xn, yn) {
+        if deriv_kind.is_some() {
+          return None; // Two derivatives in one term — not a linear PDE term.
+        }
+        deriv_kind = Some(kind);
+        continue;
+      }
+      if is_inverse_f(factor, fname, xn, yn) {
+        if saw_inverse_f {
+          return None;
+        }
+        saw_inverse_f = true;
+        continue;
+      }
+      // Unknown factor — give up.
+      return None;
+    }
+    if saw_inverse_f && let Some(kind) = deriv_kind {
+      return Some((coeff, kind));
+    }
+  }
+  None
+}
+
+/// The derivative order `Derivative[i, j][f][x, y]` names, for a call on
+/// exactly `f[x, y]`. `None` for anything else.
+fn derivative_order_of(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<(i128, i128)> {
+  if let Expr::CurriedCall {
+    func,
+    args: call_args,
+  } = expr
+    && call_args.len() == 2
+    && let Expr::Identifier(x_arg) = &call_args[0]
+    && let Expr::Identifier(y_arg) = &call_args[1]
+    && x_arg == xn
+    && y_arg == yn
+    && let Expr::CurriedCall {
+      func: deriv,
+      args: f_args,
+    } = func.as_ref()
+    && f_args.len() == 1
+    && let Expr::Identifier(fa) = &f_args[0]
+    && fa == fname
+    && let Expr::FunctionCall {
+      name: dn,
+      args: dargs,
+    } = deriv.as_ref()
+    && dn == "Derivative"
+    && dargs.len() == 2
+    && let (Expr::Integer(di), Expr::Integer(dj)) = (&dargs[0], &dargs[1])
+  {
+    return Some((*di, *dj));
+  }
+  None
+}
+
+/// Recognise the homogeneous second-order PDE with constant coefficients
+/// `a*D[f, x, x] + b*D[f, x, y] + c*D[f, y, y] == 0` and return the body of
+/// its general solution.
+///
+/// A solution `f = C[λ*x + y]` turns the equation into `a λ² + b λ + c = 0`
+/// for the characteristic slope λ, so the general solution is one arbitrary
+/// function per root. Wolfram reports the two in the order their
+/// *reciprocals* μ = 1/λ take in canonical order — the roots of the
+/// reversed polynomial `c μ² + b μ + a` — which is what decides whether
+/// `C[1]` gets `I*x + y` or `(-I)*x + y`:
+///
+/// ```wolfram
+/// DSolveValue[D[u[x, y], x, x] + D[u[x, y], y, y] == 0, u, {x, y}]
+/// (* Function[{x, y}, C[1][I*x + y] + C[2][(-I)*x + y]] *)
+/// ```
+///
+/// A repeated root gives `C[1][λ*x + y] + x*C[2][λ*x + y]`. Equations with
+/// no `D[f, x, x]` or no `D[f, y, y]` term have a characteristic along an
+/// axis, which Wolfram writes in a different (unnormalised) shape; those are
+/// left to the caller's other recognisers.
+fn try_second_order_constant_pde_body(
+  eqn: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<Expr> {
+  let (lhs, rhs) = pde_split_equation(eqn)?;
+  // Everything moves to the left: each derivative contributes its signed
+  // coefficient, and anything else at all disqualifies the equation.
+  let mut coeffs: [Expr; 3] =
+    [Expr::Integer(0), Expr::Integer(0), Expr::Integer(0)];
+  collect_second_order_pde_terms(&lhs, fname, xn, yn, false, &mut coeffs)?;
+  collect_second_order_pde_terms(&rhs, fname, xn, yn, true, &mut coeffs)?;
+  let [a, b, c] = coeffs;
+  let is_zero = |e: &Expr| matches!(e, Expr::Integer(0));
+  if is_zero(&a) || is_zero(&c) {
+    return None;
+  }
+
+  let eval = |e: Expr| crate::evaluator::evaluate_expr_to_expr(&e).unwrap_or(e);
+  let disc = eval(minus2(
+    pow2(b.clone(), Expr::Integer(2)),
+    times2(Expr::Integer(4), times2(c.clone(), a.clone())),
+  ));
+  let sqrt_disc = eval(call1("Sqrt", disc.clone()));
+  // The quadratic formula, over the leading coefficient of whichever
+  // polynomial is asked for: `a λ² + b λ + c` for the slopes themselves,
+  // `c μ² + b μ + a` for their reciprocals.
+  let root = |lead: &Expr, sign: i128| {
+    eval(div2(
+      plus2(
+        times2(Expr::Integer(-1), b.clone()),
+        times2(Expr::Integer(sign), sqrt_disc.clone()),
+      ),
+      times2(Expr::Integer(2), lead.clone()),
+    ))
+  };
+  // `λ*x + y`, with the coefficient folded in by the evaluator so that
+  // λ = 1 leaves a bare `x`.
+  let arg_of = |lambda: Expr| {
+    eval(plus2(
+      times2(lambda, Expr::Identifier(xn.to_string())),
+      Expr::Identifier(yn.to_string()),
+    ))
+  };
+  let c_of = |k: i128, arg: Expr| Expr::CurriedCall {
+    func: Box::new(call1("C", Expr::Integer(k))),
+    args: vec![arg],
+  };
+
+  if is_zero(&disc) {
+    // A repeated root: the second solution picks up a factor of x.
+    let arg = arg_of(root(&a, 1));
+    return Some(plus2(
+      c_of(1, arg.clone()),
+      times2(Expr::Identifier(xn.to_string()), c_of(2, arg)),
+    ));
+  }
+  // Taking the reciprocal turns the `+` root into the `-` one, so the
+  // canonical order of the reciprocals decides which slope `C[1]` gets.
+  let mu_plus_first = crate::functions::list_helpers_ast::compare_exprs(
+    &root(&c, 1),
+    &root(&c, -1),
+  ) > 0;
+  let (first, second) = if mu_plus_first { (-1, 1) } else { (1, -1) };
+  Some(plus2(
+    c_of(1, arg_of(root(&a, first))),
+    c_of(2, arg_of(root(&a, second))),
+  ))
+}
+
+/// Walk a Plus chain, adding each term's coefficient to the `xx`, `xy` and
+/// `yy` slots of `coeffs`. `negate` flips the sign (for the right-hand side
+/// of the equation). `None` for a term that is not a constant multiple of
+/// one of those three second derivatives.
+fn collect_second_order_pde_terms(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+  negate: bool,
+  coeffs: &mut [Expr; 3],
+) -> Option<()> {
+  match expr {
+    Expr::Integer(0) => Some(()),
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      for arg in args {
+        collect_second_order_pde_terms(arg, fname, xn, yn, negate, coeffs)?;
+      }
+      Some(())
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      collect_second_order_pde_terms(left, fname, xn, yn, negate, coeffs)?;
+      collect_second_order_pde_terms(right, fname, xn, yn, negate, coeffs)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      collect_second_order_pde_terms(left, fname, xn, yn, negate, coeffs)?;
+      collect_second_order_pde_terms(right, fname, xn, yn, !negate, coeffs)
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      collect_second_order_pde_terms(operand, fname, xn, yn, !negate, coeffs)
+    }
+    _ => {
+      // A bare derivative, or a product of one with constant factors.
+      let mut factors: Vec<&Expr> = Vec::new();
+      match expr {
+        Expr::FunctionCall { name, args } if name == "Times" => {
+          factors.extend(args.iter());
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left,
+          right,
+        } => {
+          factors.push(left);
+          factors.push(right);
+        }
+        other => factors.push(other),
+      }
+      let mut order: Option<(i128, i128)> = None;
+      let mut coeff = Expr::Integer(1);
+      for factor in factors {
+        if let Some(o) = derivative_order_of(factor, fname, xn, yn) {
+          if order.is_some() {
+            return None; // Two derivatives multiplied — not linear.
+          }
+          order = Some(o);
+          continue;
+        }
+        // Every other factor has to be free of the unknown function and of
+        // both variables, or the coefficients are not constant.
+        if expr_mentions(factor, fname)
+          || expr_mentions(factor, xn)
+          || expr_mentions(factor, yn)
+        {
+          return None;
+        }
+        coeff = times2(coeff, factor.clone());
+      }
+      let slot = match order? {
+        (2, 0) => 0,
+        (1, 1) => 1,
+        (0, 2) => 2,
+        _ => return None,
+      };
+      if negate {
+        coeff = times2(Expr::Integer(-1), coeff);
+      }
+      let sum = plus2(coeffs[slot].clone(), coeff);
+      coeffs[slot] =
+        crate::evaluator::evaluate_expr_to_expr(&sum).unwrap_or(sum);
+      Some(())
+    }
+  }
+}
+
+/// Whether `name` occurs anywhere in `expr` as a symbol.
+fn expr_mentions(expr: &Expr, name: &str) -> bool {
+  expr_to_string(expr)
+    .split(|c: char| !(c.is_alphanumeric() || c == '$'))
+    .any(|tok| tok == name)
+}
+
+/// Match `Derivative[1,0][f][x, y] / f[x, y]` (and the (0,1) variant)
+/// expressed as a Times of the derivative call and Power[f[x,y], -1].
+fn classify_derivative_over_f(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<PdeTerm> {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Times"
+    && args.len() == 2
+  {
+    for (i, j) in [(0usize, 1usize), (1, 0)] {
+      if let Some(kind) = classify_derivative_call(&args[i], fname, xn, yn)
+        && is_inverse_f(&args[j], fname, xn, yn)
+      {
+        return Some(kind);
+      }
+    }
+  }
+  None
+}
+
+/// Match `Derivative[1,0][f][x, y]` -> Fx, `Derivative[0,1][f][x, y]` -> Fy.
+fn classify_derivative_call(
+  expr: &Expr,
+  fname: &str,
+  xn: &str,
+  yn: &str,
+) -> Option<PdeTerm> {
+  // Shape: CurriedCall { func: FunctionCall { name: "Derivative", args: [i, j] },
+  //                     args: [Identifier f] } applied to [x, y].
+  if let Expr::CurriedCall {
+    func,
+    args: call_args,
+  } = expr
+    && call_args.len() == 2
+    && let Expr::Identifier(x_arg) = &call_args[0]
+    && let Expr::Identifier(y_arg) = &call_args[1]
+    && x_arg == xn
+    && y_arg == yn
+    && let Expr::CurriedCall {
+      func: deriv,
+      args: f_args,
+    } = func.as_ref()
+    && f_args.len() == 1
+    && let Expr::Identifier(fa) = &f_args[0]
+    && fa == fname
+    && let Expr::FunctionCall {
+      name: dn,
+      args: dargs,
+    } = deriv.as_ref()
+    && dn == "Derivative"
+    && dargs.len() == 2
+    && let (Expr::Integer(di), Expr::Integer(dj)) = (&dargs[0], &dargs[1])
+  {
+    return match (*di, *dj) {
+      (1, 0) => Some(PdeTerm::Fx),
+      (0, 1) => Some(PdeTerm::Fy),
+      _ => None,
+    };
+  }
+  None
+}
+
+/// Match `Power[f[x, y], -1]` in either FunctionCall or BinaryOp form.
+fn is_inverse_f(expr: &Expr, fname: &str, xn: &str, yn: &str) -> bool {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Power"
+    && args.len() == 2
+    && is_f_at_xy(&args[0], fname, xn, yn)
+    && matches!(&args[1], Expr::Integer(-1))
+  {
+    return true;
+  }
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Power,
+    left,
+    right,
+  } = expr
+    && is_f_at_xy(left, fname, xn, yn)
+    && matches!(right.as_ref(), Expr::Integer(-1))
+  {
+    return true;
+  }
+  false
+}
+
+/// Match `f[x, y]`.
+fn is_f_at_xy(expr: &Expr, fname: &str, xn: &str, yn: &str) -> bool {
+  matches!(
+    expr,
+    Expr::FunctionCall { name, args }
+      if name == fname
+        && args.len() == 2
+        && matches!(&args[0], Expr::Identifier(s) if s == xn)
+        && matches!(&args[1], Expr::Identifier(s) if s == yn)
+  )
+}
+
+// ─── Coupled Linear Constant-Coefficient ODE Systems ───────────────────
+//
+// `DSolve[{eq1, eq2, …, ic1, ic2, …}, {y1[t], y2[t], …}, t]` for a linear,
+// constant-coefficient system (the classic "two coupled oscillators" shape
+// a Demonstrations-Project notebook tends to use, e.g. a Foucault pendulum
+// or coupled pendulums). The single-variable branch above only recognises
+// one dependent function; this extends the same closed-form machinery to a
+// small system via operator-determinant elimination:
+//
+//   1. Each equation is linear in the y_i and their t-derivatives with
+//      constant coefficients, so it can be written as a row of the
+//      differential-operator matrix M(D), D = d/dt.
+//   2. Every y_i solves the SAME scalar ODE Δ(D) y_i = (cofactor terms),
+//      Δ = det(M(D)) — Cramer's rule for a linear operator system. Only a
+//      constant forcing term is supported (enough for a homogeneous
+//      physical system in equilibrium coordinates); Δ has degree ≤ 4 to
+//      reuse the existing closed-form quadratic/cubic/quartic root finder.
+//   3. For each simple root λ of Δ, the amplitude ratios between the y_i
+//      at that mode are the null vector of M(λ) (found by Gaussian
+//      elimination in complex arithmetic — n is small, typically 2–4).
+//   4. The shared arbitrary constants C[k] are pinned down by evaluating
+//      the symbolic general solution (and its derivatives) at the initial
+//      conditions and calling the existing linear `Solve`.
+//
+// Repeated roots (defective systems needing a `t*E^(λt)` secular term) and
+// non-constant forcing are out of scope and fall back to unevaluated,
+// exactly like the single-variable solver's own unsupported cases.
+
+/// One classified additive term of a coupled system's equation: which
+/// dependent variable (by index into the system's `y_names`) and
+/// derivative order it belongs to, or `None` for a term free of every
+/// dependent variable (the forcing side).
+struct MultiOdeTerm {
+  var_index: Option<usize>,
+  order: i32,
+  coefficient: Expr,
+}
+
+/// Is `expr` free of every name in `y_names` (as `Identifier` uses and as
+/// `Derivative[…, name, …]` heads)? Delegates to the single-variable
+/// [`is_free_of_y`] once per name.
+fn is_free_of_any_y(expr: &Expr, y_names: &[String]) -> bool {
+  y_names.iter().all(|yn| is_free_of_y(expr, yn))
+}
+
+/// Like [`extract_derivative_order`], but against a whole set of dependent
+/// variable names. Returns `(index into y_names, order)`.
+fn extract_multivar_derivative(
+  expr: &Expr,
+  y_names: &[String],
+) -> Option<(usize, usize)> {
+  for (i, yn) in y_names.iter().enumerate() {
+    if let Some(order) = extract_derivative_order(expr, yn) {
+      return Some((i, order));
+    }
+  }
+  None
+}
+
+/// Multi-variable counterpart of [`collect_ode_terms`]: collect the
+/// additive terms of a normalized (lhs − rhs) equation, classifying each
+/// by which dependent variable (if any) it involves.
+fn collect_multivar_terms(
+  expr: &Expr,
+  y_names: &[String],
+) -> Result<Vec<MultiOdeTerm>, InterpreterError> {
+  let mut terms = Vec::new();
+  collect_multivar_additive(expr, y_names, false, &mut terms)?;
+  Ok(terms)
+}
+
+fn collect_multivar_additive(
+  expr: &Expr,
+  y_names: &[String],
+  negated: bool,
+  terms: &mut Vec<MultiOdeTerm>,
+) -> Result<(), InterpreterError> {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      collect_multivar_additive(left, y_names, negated, terms)?;
+      collect_multivar_additive(right, y_names, negated, terms)?;
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      collect_multivar_additive(left, y_names, negated, terms)?;
+      collect_multivar_additive(right, y_names, !negated, terms)?;
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      collect_multivar_additive(operand, y_names, !negated, terms)?;
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" && args.len() >= 2 => {
+      for arg in args {
+        collect_multivar_additive(arg, y_names, negated, terms)?;
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      classify_multivar_product(args, y_names, negated, terms)?;
+    }
+    _ => {
+      let term = classify_multivar_single(expr, y_names)?;
+      let coeff = if negated {
+        negate_expr(&term.coefficient)
+      } else {
+        term.coefficient
+      };
+      terms.push(MultiOdeTerm {
+        var_index: term.var_index,
+        order: term.order,
+        coefficient: coeff,
+      });
+    }
+  }
+  Ok(())
+}
+
+fn classify_multivar_product(
+  factors: &[Expr],
+  y_names: &[String],
+  negated: bool,
+  terms: &mut Vec<MultiOdeTerm>,
+) -> Result<(), InterpreterError> {
+  let mut y_factor_idx = None;
+  let mut y_var = 0usize;
+  let mut y_order = -1i32;
+
+  for (i, factor) in factors.iter().enumerate() {
+    if let Some((vi, order)) = extract_multivar_derivative(factor, y_names) {
+      y_factor_idx = Some(i);
+      y_var = vi;
+      y_order = order as i32;
+      break;
+    }
+    if let Expr::FunctionCall { name, args } = factor
+      && args.len() == 1
+      && let Some(vi) = y_names.iter().position(|n| n == name)
+    {
+      y_factor_idx = Some(i);
+      y_var = vi;
+      y_order = 0;
+      break;
+    }
+  }
+
+  let (order, var_index, coefficient) = if let Some(idx) = y_factor_idx {
+    let other_factors: Vec<&Expr> = factors
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| *i != idx)
+      .map(|(_, f)| f)
+      .collect();
+    let coeff = if other_factors.is_empty() {
+      Expr::Integer(1)
+    } else if other_factors.len() == 1 {
+      other_factors[0].clone()
+    } else {
+      Expr::FunctionCall {
+        name: "Times".to_string(),
+        args: other_factors.into_iter().cloned().collect(),
+      }
+    };
+    (y_order, Some(y_var), coeff)
+  } else {
+    let product = if factors.len() == 1 {
+      factors[0].clone()
+    } else {
+      unevaluated("Times", factors)
+    };
+    if !is_free_of_any_y(&product, y_names) {
+      return Err(InterpreterError::EvaluationError(
+        "DSolve: cannot classify term in coupled system".into(),
+      ));
+    }
+    (-1, None, product)
+  };
+
+  let coeff = if negated {
+    negate_expr(&coefficient)
+  } else {
+    coefficient
+  };
+  terms.push(MultiOdeTerm {
+    var_index,
+    order,
+    coefficient: coeff,
+  });
+  Ok(())
+}
+
+fn classify_multivar_single(
+  expr: &Expr,
+  y_names: &[String],
+) -> Result<MultiOdeTerm, InterpreterError> {
+  if let Expr::FunctionCall { name, args } = expr
+    && args.len() == 1
+    && let Some(i) = y_names.iter().position(|n| n == name)
+  {
+    return Ok(MultiOdeTerm {
+      var_index: Some(i),
+      order: 0,
+      coefficient: Expr::Integer(1),
+    });
+  }
+  if let Some((i, order)) = extract_multivar_derivative(expr, y_names) {
+    return Ok(MultiOdeTerm {
+      var_index: Some(i),
+      order: order as i32,
+      coefficient: Expr::Integer(1),
+    });
+  }
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Times,
+    left,
+    right,
+  } = expr
+  {
+    if let Some((i, order)) = extract_multivar_derivative(right, y_names) {
+      return Ok(MultiOdeTerm {
+        var_index: Some(i),
+        order: order as i32,
+        coefficient: *left.clone(),
+      });
+    }
+    if let Expr::FunctionCall { name, args } = right.as_ref()
+      && args.len() == 1
+      && let Some(i) = y_names.iter().position(|n| n == name)
+    {
+      return Ok(MultiOdeTerm {
+        var_index: Some(i),
+        order: 0,
+        coefficient: *left.clone(),
+      });
+    }
+    if let Some((i, order)) = extract_multivar_derivative(left, y_names) {
+      return Ok(MultiOdeTerm {
+        var_index: Some(i),
+        order: order as i32,
+        coefficient: *right.clone(),
+      });
+    }
+    if let Expr::FunctionCall { name, args } = left.as_ref()
+      && args.len() == 1
+      && let Some(i) = y_names.iter().position(|n| n == name)
+    {
+      return Ok(MultiOdeTerm {
+        var_index: Some(i),
+        order: 0,
+        coefficient: *right.clone(),
+      });
+    }
+  }
+  if is_free_of_any_y(expr, y_names) {
+    return Ok(MultiOdeTerm {
+      var_index: None,
+      order: -1,
+      coefficient: expr.clone(),
+    });
+  }
+  Err(InterpreterError::EvaluationError(
+    "DSolve: cannot classify term in coupled system".into(),
+  ))
+}
+
+// ─── Small numeric linear algebra for the companion system ─────────────
+
+/// A complex number as a plain `(re, im)` pair — the system's dimension is
+/// always tiny (a handful of coupled equations), so a dependency on a
+/// complex-number crate isn't worth it for this one local computation.
+type Cplx = (f64, f64);
+
+fn cadd(a: Cplx, b: Cplx) -> Cplx {
+  (a.0 + b.0, a.1 + b.1)
+}
+fn csub(a: Cplx, b: Cplx) -> Cplx {
+  (a.0 - b.0, a.1 - b.1)
+}
+fn cmul(a: Cplx, b: Cplx) -> Cplx {
+  (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+fn cdiv(a: Cplx, b: Cplx) -> Cplx {
+  let d = b.0 * b.0 + b.1 * b.1;
+  ((a.0 * b.0 + a.1 * b.1) / d, (a.1 * b.0 - a.0 * b.1) / d)
+}
+fn cabs(a: Cplx) -> f64 {
+  a.0.hypot(a.1)
+}
+
+/// A polynomial in the differential operator `D`, `coeffs[k]` is the
+/// coefficient of `D^k` (constant, since the ODE system has constant
+/// coefficients).
+type OpPoly = Vec<f64>;
+
+fn poly_add(a: &[f64], b: &[f64]) -> OpPoly {
+  let n = a.len().max(b.len());
+  let mut out = vec![0.0; n];
+  for (i, v) in a.iter().enumerate() {
+    out[i] += v;
+  }
+  for (i, v) in b.iter().enumerate() {
+    out[i] += v;
+  }
+  out
+}
+
+fn poly_scale(a: &[f64], s: f64) -> OpPoly {
+  a.iter().map(|v| v * s).collect()
+}
+
+fn poly_mul(a: &[f64], b: &[f64]) -> OpPoly {
+  if a.is_empty() || b.is_empty() {
+    return Vec::new();
+  }
+  let mut out = vec![0.0; a.len() + b.len() - 1];
+  for (i, &av) in a.iter().enumerate() {
+    if av == 0.0 {
+      continue;
+    }
+    for (j, &bv) in b.iter().enumerate() {
+      out[i + j] += av * bv;
+    }
+  }
+  out
+}
+
+/// Determinant of an `n×n` matrix of operator polynomials, via cofactor
+/// expansion along the first row. `n` is always small (the number of
+/// coupled dependent variables), so the `O(n!)` recursion is fine.
+fn poly_det(m: &[Vec<OpPoly>]) -> OpPoly {
+  let n = m.len();
+  if n == 1 {
+    return m[0][0].clone();
+  }
+  let mut result: OpPoly = vec![0.0];
+  let mut sign = 1.0;
+  for col in 0..n {
+    let minor: Vec<Vec<OpPoly>> = (1..n)
+      .map(|r| {
+        (0..n)
+          .filter(|&c| c != col)
+          .map(|c| m[r][c].clone())
+          .collect()
+      })
+      .collect();
+    let cofactor = poly_det(&minor);
+    let term = poly_scale(&poly_mul(&m[0][col], &cofactor), sign);
+    result = poly_add(&result, &term);
+    sign = -sign;
+  }
+  result
+}
+
+/// Drop numerically-negligible trailing high-order coefficients so the
+/// polynomial's true degree can be read off from its length.
+fn poly_trim(p: OpPoly) -> OpPoly {
+  let mut p = p;
+  let scale = p.iter().fold(1.0_f64, |acc, v| acc.max(v.abs()));
+  while p.len() > 1 && p.last().is_some_and(|v| v.abs() < scale * 1e-9) {
+    p.pop();
+  }
+  if p.is_empty() {
+    p.push(0.0);
+  }
+  p
+}
+
+fn eval_poly_c(p: &[f64], x: Cplx) -> Cplx {
+  let mut acc: Cplx = (0.0, 0.0);
+  let mut xp: Cplx = (1.0, 0.0);
+  for &c in p {
+    acc = cadd(acc, (c * xp.0, c * xp.1));
+    xp = cmul(xp, x);
+  }
+  acc
+}
+
+fn eval_matrix_at(m: &[Vec<OpPoly>], lambda: Cplx) -> Vec<Vec<Cplx>> {
+  m.iter()
+    .map(|row| row.iter().map(|cell| eval_poly_c(cell, lambda)).collect())
+    .collect()
+}
+
+/// A basis of the null space of a (numerically) rank-deficient complex
+/// matrix with `cols` columns, via Gauss-Jordan elimination with partial
+/// pivoting to reduced row-echelon form. One basis vector per free column,
+/// each setting its own free column to 1 and the other free columns to 0,
+/// so the basis follows the column order of the unknowns.
+fn null_space(mut mat: Vec<Vec<Cplx>>, cols: usize) -> Vec<Vec<Cplx>> {
+  let rows = mat.len();
+  let scale = mat
+    .iter()
+    .flat_map(|r| r.iter())
+    .fold(1.0_f64, |acc, c| acc.max(cabs(*c)));
+  let tol = 1e-7 * scale;
+  let mut pivot_cols: Vec<usize> = Vec::new();
+  let mut row = 0usize;
+
+  for col in 0..cols {
+    if row >= rows {
+      break;
+    }
+    let mut best_row = row;
+    let mut best_val = cabs(mat[row][col]);
+    for r in (row + 1)..rows {
+      let v = cabs(mat[r][col]);
+      if v > best_val {
+        best_val = v;
+        best_row = r;
+      }
+    }
+    if best_val < tol {
+      continue;
+    }
+    mat.swap(row, best_row);
+    let piv = mat[row][col];
+    for cell in mat[row].iter_mut().skip(col) {
+      *cell = cdiv(*cell, piv);
+    }
+    for r in 0..rows {
+      if r == row {
+        continue;
+      }
+      let factor = mat[r][col];
+      if cabs(factor) > 0.0 {
+        for c in col..cols {
+          let sub = cmul(factor, mat[row][c]);
+          mat[r][c] = csub(mat[r][c], sub);
+        }
+      }
+    }
+    pivot_cols.push(col);
+    row += 1;
+  }
+
+  let free_cols: Vec<usize> =
+    (0..cols).filter(|c| !pivot_cols.contains(c)).collect();
+  free_cols
+    .iter()
+    .map(|&free_col| {
+      let mut v = vec![(0.0, 0.0); cols];
+      v[free_col] = (1.0, 0.0);
+      for (i, &pc) in pivot_cols.iter().enumerate() {
+        v[pc] = (-mat[i][free_col].0, -mat[i][free_col].1);
+      }
+      v
+    })
+    .collect()
+}
+
+/// One term of a basis solution of a homogeneous linear system:
+/// `coeff · x^power · E^(rate·x) · Cos[freq·x]`, or the same with `Sin`
+/// when `sine` is set. A zero `freq` always uses the cosine form, whose
+/// trigonometric factor is 1.
+#[derive(Clone, Copy, Debug)]
+struct SolTerm {
+  rate: f64,
+  freq: f64,
+  power: usize,
+  sine: bool,
+  coeff: f64,
+}
+
+/// `P^(order)(λ)` — an operator polynomial's `order`-th derivative
+/// evaluated at a (possibly complex) root.
+fn poly_deriv_at(p: &OpPoly, order: usize, lambda: Cplx) -> Cplx {
+  if order >= p.len() {
+    return (0.0, 0.0);
+  }
+  let derived: OpPoly = p
+    .iter()
+    .enumerate()
+    .skip(order)
+    .map(|(k, c)| c * (0..order).map(|s| (k - s) as f64).product::<f64>())
+    .collect();
+  eval_poly_c(&derived, lambda)
+}
+
+/// Add a term to a solution, merging it into an existing term with the same
+/// shape rather than repeating that shape.
+fn add_sol_term(terms: &mut Vec<SolTerm>, term: SolTerm) {
+  if let Some(existing) = terms.iter_mut().find(|t| {
+    t.power == term.power
+      && t.sine == term.sine
+      && (t.rate - term.rate).abs() < 1e-9
+      && (t.freq - term.freq).abs() < 1e-9
+  }) {
+    existing.coeff += term.coeff;
+  } else {
+    terms.push(term);
+  }
+}
+
+/// The solutions of `M(D)·Y = 0` belonging to one root λ of multiplicity
+/// `m` of `Det M(D)`. They have the form `Y_i = Σ_j a_ij·x^j·E^(λx)` with
+/// `j < m`, and since `P(D)[x^j·E^(λx)] = E^(λx)·P(D+λ)[x^j]`, row `r` of
+/// the system becomes one linear constraint per power of `x`:
+///
+/// `Σ_ij a_ij · P_ri^(j−p)(λ)/(j−p)! · j!/p! = 0` for every `p < m`.
+///
+/// The null space of that `n·m × n·m` matrix is `m`-dimensional — that is
+/// what multiplicity `m` means — and each of its vectors is one solution,
+/// or two real ones (the real and imaginary parts) when λ is complex.
+fn root_solutions(
+  poly_matrix: &[Vec<OpPoly>],
+  lambda: Cplx,
+  m: usize,
+  n: usize,
+) -> Option<Vec<Vec<Vec<SolTerm>>>> {
+  let cols = n * m;
+  let mut rows: Vec<Vec<Cplx>> = Vec::with_capacity(cols);
+  for r in 0..n {
+    for p in 0..m {
+      let mut row = vec![(0.0, 0.0); cols];
+      for i in 0..n {
+        for j in p..m {
+          let s = j - p;
+          // j!/p! / s!, all of them tiny factorials (m ≤ 4).
+          let factor = ((p + 1)..=j).map(|v| v as f64).product::<f64>()
+            / (1..=s).map(|v| v as f64).product::<f64>();
+          let value = poly_deriv_at(&poly_matrix[r][i], s, lambda);
+          row[i * m + j] = (value.0 * factor, value.1 * factor);
+        }
+      }
+      rows.push(row);
+    }
+  }
+
+  let space = null_space(rows, cols);
+  if space.len() != m {
+    return None;
+  }
+
+  let mut solutions: Vec<Vec<Vec<SolTerm>>> = Vec::new();
+  for v in &space {
+    if lambda.1.abs() < 1e-9 {
+      let mut solution: Vec<Vec<SolTerm>> = vec![Vec::new(); n];
+      for (i, terms) in solution.iter_mut().enumerate() {
+        for j in 0..m {
+          let coeff = v[i * m + j].0;
+          if coeff.abs() > 1e-12 {
+            add_sol_term(
+              terms,
+              SolTerm {
+                rate: lambda.0,
+                freq: 0.0,
+                power: j,
+                sine: false,
+                coeff,
+              },
+            );
+          }
+        }
+      }
+      solutions.push(solution);
+    } else {
+      // `a·x^j·E^((α+iβ)x)` contributes the real solution
+      // `x^j·E^(αx)·(Re a·Cos[βx] − Im a·Sin[βx])` and the imaginary one
+      // `x^j·E^(αx)·(Im a·Cos[βx] + Re a·Sin[βx])`.
+      let mut real_part: Vec<Vec<SolTerm>> = vec![Vec::new(); n];
+      let mut imag_part: Vec<Vec<SolTerm>> = vec![Vec::new(); n];
+      for i in 0..n {
+        for j in 0..m {
+          let (p, q) = v[i * m + j];
+          for (terms, cos_coeff, sin_coeff) in
+            [(&mut real_part[i], p, -q), (&mut imag_part[i], q, p)]
+          {
+            for (sine, coeff) in [(false, cos_coeff), (true, sin_coeff)] {
+              if coeff.abs() > 1e-12 {
+                add_sol_term(
+                  terms,
+                  SolTerm {
+                    rate: lambda.0,
+                    freq: lambda.1,
+                    power: j,
+                    sine,
+                    coeff,
+                  },
+                );
+              }
+            }
+          }
+        }
+      }
+      solutions.push(real_part);
+      solutions.push(imag_part);
+    }
+  }
+  Some(solutions)
+}
+
+/// A fundamental basis of the homogeneous system's solution space: the
+/// solutions of every characteristic root, in root order.
+fn solution_basis(
+  poly_matrix: &[Vec<OpPoly>],
+  roots: &[(f64, f64, usize)],
+  n: usize,
+) -> Option<Vec<Vec<Vec<SolTerm>>>> {
+  let mut basis: Vec<Vec<Vec<SolTerm>>> = Vec::new();
+  for (re, im, mult) in roots {
+    basis.extend(root_solutions(poly_matrix, (*re, *im), *mult, n)?);
+  }
+  Some(basis)
+}
+
+/// Re-parametrize a basis of a *first-order* system so that its `k`-th
+/// solution is the one starting at the `k`-th unit vector — i.e. so the
+/// fundamental matrix is the identity at the origin and the arbitrary
+/// constants are the initial values, `Y(x) = MatrixExp[A·x]·Y(0)`. That is
+/// the basis wolframscript reports, and unlike the eigenvector basis it is
+/// unique.
+fn normalize_basis_at_origin(
+  basis: &[Vec<Vec<SolTerm>>],
+  n: usize,
+) -> Option<Vec<Vec<Vec<SolTerm>>>> {
+  // Φ(0): only a constant term (no `x` factor, no sine) survives at x = 0.
+  let phi0: Vec<Vec<f64>> = (0..n)
+    .map(|i| {
+      (0..n)
+        .map(|j| {
+          basis[j][i]
+            .iter()
+            .filter(|t| t.power == 0 && !t.sine)
+            .map(|t| t.coeff)
+            .sum()
+        })
+        .collect()
+    })
+    .collect();
+
+  // Column k of Φ(0)⁻¹ solves Φ(0)·b = e_k.
+  let mut inverse: Vec<Vec<f64>> = Vec::with_capacity(n);
+  for k in 0..n {
+    let mut unit = vec![0.0; n];
+    unit[k] = 1.0;
+    let column = solve_real_linear_system(&phi0, &unit)?;
+    if column.iter().any(|v| !v.is_finite()) {
+      return None;
+    }
+    inverse.push(column);
+  }
+  // Guard against a near-singular Φ(0) that Gaussian elimination solved
+  // with nonsense instead of failing outright.
+  for i in 0..n {
+    for k in 0..n {
+      let entry: f64 = (0..n).map(|j| phi0[i][j] * inverse[k][j]).sum();
+      let expected = if i == k { 1.0 } else { 0.0 };
+      if (entry - expected).abs() > 1e-6 {
+        return None;
+      }
+    }
+  }
+
+  let mut normalized: Vec<Vec<Vec<SolTerm>>> = Vec::with_capacity(n);
+  for k in 0..n {
+    let mut solution: Vec<Vec<SolTerm>> = vec![Vec::new(); n];
+    for j in 0..n {
+      let weight = inverse[k][j];
+      if weight.abs() <= 1e-12 {
+        continue;
+      }
+      for (i, terms) in solution.iter_mut().enumerate() {
+        for term in &basis[j][i] {
+          add_sol_term(
+            terms,
+            SolTerm {
+              coeff: term.coeff * weight,
+              ..*term
+            },
+          );
+        }
+      }
+    }
+    for terms in &mut solution {
+      terms.retain(|t| t.coeff.abs() > 1e-12);
+    }
+    normalized.push(solution);
+  }
+  Some(normalized)
+}
+
+/// One basis solution's terms for a single variable, as an expression.
+fn sol_terms_expr(terms: &[SolTerm], x_name: &str) -> Expr {
+  let mut sum: Option<Expr> = None;
+  for term in terms {
+    let mut factors: Vec<Expr> = Vec::new();
+    let coeff = f64_to_nice_expr(term.coeff);
+    if !matches!(&coeff, Expr::Integer(1)) {
+      factors.push(coeff);
+    }
+    if term.power > 0 {
+      let x = Expr::Identifier(x_name.to_string());
+      factors.push(if term.power == 1 {
+        x
+      } else {
+        pow2(x, Expr::Integer(term.power as i128))
+      });
+    }
+    if term.rate.abs() > 1e-10 {
+      factors.push(make_exp_term(term.rate, x_name));
+    }
+    if term.freq.abs() > 1e-10 {
+      factors.push(make_trig_term(
+        if term.sine { "Sin" } else { "Cos" },
+        term.freq,
+        x_name,
+      ));
+    }
+    let product = factors
+      .into_iter()
+      .reduce(times2)
+      .unwrap_or(Expr::Integer(1));
+    sum = Some(match sum {
+      Some(acc) => plus2(acc, product),
+      None => product,
+    });
+  }
+  sum.unwrap_or(Expr::Integer(0))
+}
+
+/// Solve a real `n×n` linear system by Gaussian elimination with partial
+/// pivoting. Used only for the constant particular solution of a system
+/// with nonzero (constant) forcing.
+fn solve_real_linear_system(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+  let n = a.len();
+  let mut aug: Vec<Vec<f64>> = a
+    .iter()
+    .zip(b)
+    .map(|(row, &bi)| {
+      let mut r = row.clone();
+      r.push(bi);
+      r
+    })
+    .collect();
+
+  for col in 0..n {
+    let mut best_row = col;
+    let mut best_val = aug[col][col].abs();
+    for r in (col + 1)..n {
+      if aug[r][col].abs() > best_val {
+        best_val = aug[r][col].abs();
+        best_row = r;
+      }
+    }
+    if best_val < 1e-12 {
+      return None;
+    }
+    aug.swap(col, best_row);
+    let pivot = aug[col][col];
+    for r in (col + 1)..n {
+      let factor = aug[r][col] / pivot;
+      for c in col..=n {
+        aug[r][c] -= factor * aug[col][c];
+      }
+    }
+  }
+
+  let mut x = vec![0.0; n];
+  for i in (0..n).rev() {
+    let mut s = aug[i][n];
+    for j in (i + 1)..n {
+      s -= aug[i][j] * x[j];
+    }
+    x[i] = s / aug[i][i];
+  }
+  Some(x)
+}
+
+/// Placeholder identifier standing in for the shared arbitrary constant
+/// `C[k]` while the general solution is still being solved against the
+/// initial conditions (mirrors [`apply_initial_conditions`]'s own `__Ci`
+/// placeholders, generalized to the whole system rather than one `y`).
+fn sys_const(k: usize) -> Expr {
+  Expr::Identifier(format!("$DSolveSystemC{k}"))
+}
+
+/// `DSolve[{eq1, …, ic1, …}, {y1[t], y2[t], …}, t]` for a linear,
+/// constant-coefficient system — see the module-level comment above this
+/// section for the method. Returns an `Err` with a `"DSolve:"`-prefixed
+/// message for any shape outside this scope, which
+/// [`dsolve_ast_with_head`] turns into an unevaluated `DSolve[…]` rather
+/// than leaking the internal error.
+fn dsolve_linear_system(
+  eqns_arg: &Expr,
+  dep_items: &[Expr],
+  x_name: &str,
+) -> Result<Expr, InterpreterError> {
+  let bail = || {
+    InterpreterError::EvaluationError(
+      "DSolve: coupled system not supported".to_string(),
+    )
+  };
+
+  let mut y_names: Vec<String> = Vec::with_capacity(dep_items.len());
+  for item in dep_items {
+    match item {
+      Expr::FunctionCall { name, args }
+        if args.len() == 1
+          && matches!(&args[0], Expr::Identifier(s) if s == x_name) =>
+      {
+        y_names.push(name.clone());
+      }
+      _ => return Err(bail()),
+    }
+  }
+  let n = y_names.len();
+  if n < 2 {
+    return Err(bail());
+  }
+
+  let items: Vec<Expr> = match eqns_arg {
+    Expr::List(items) => items.iter().cloned().collect(),
+    other => vec![other.clone()],
+  };
+
+  let mut odes: Vec<Expr> = Vec::new();
+  let mut ics: Vec<(usize, Expr)> = Vec::new();
+  for item in &items {
+    let matched_var = y_names
+      .iter()
+      .position(|yn| is_initial_condition(item, yn, x_name));
+    match matched_var {
+      Some(vi) => ics.push((vi, item.clone())),
+      None => odes.push(item.clone()),
+    }
+  }
+  if odes.len() != n {
+    return Err(bail());
+  }
+
+  // Build the n×n matrix of operator polynomials and the constant forcing
+  // vector from each normalized (lhs − rhs) equation.
+  let mut poly_matrix: Vec<Vec<OpPoly>> = vec![vec![Vec::new(); n]; n];
+  let mut forcing_sum: Vec<f64> = vec![0.0; n];
+
+  for (row, ode) in odes.iter().enumerate() {
+    let normalized = normalize_equation(ode)?;
+    let terms = collect_multivar_terms(&normalized, &y_names)?;
+    for term in terms {
+      match term.var_index {
+        Some(col) => {
+          let coeff = eval_to_f64(&term.coefficient)?;
+          let order = usize::try_from(term.order).map_err(|_| bail())?;
+          let cell = &mut poly_matrix[row][col];
+          if cell.len() <= order {
+            cell.resize(order + 1, 0.0);
+          }
+          cell[order] += coeff;
+        }
+        None => {
+          forcing_sum[row] += eval_to_f64(&term.coefficient)?;
+        }
+      }
+    }
+  }
+  let f_vec: Vec<f64> = forcing_sum.iter().map(|v| -v).collect();
+
+  let delta = poly_trim(poly_det(&poly_matrix));
+  let degree = delta.len() - 1;
+  if degree == 0 || delta.iter().all(|c| c.abs() < 1e-9) || degree > 4 {
+    return Err(bail());
+  }
+
+  let roots = find_characteristic_roots(&delta, degree)?;
+
+  // Constant particular solution for nonzero constant forcing: M(0) Yp = f.
+  let particular: Vec<f64> = if f_vec.iter().any(|v| v.abs() > 1e-12) {
+    let m0 = eval_matrix_at(&poly_matrix, (0.0, 0.0));
+    let m0_real: Vec<Vec<f64>> =
+      m0.iter().map(|r| r.iter().map(|c| c.0).collect()).collect();
+    solve_real_linear_system(&m0_real, &f_vec).ok_or_else(bail)?
+  } else {
+    vec![0.0; n]
+  };
+
+  // A fundamental basis of the homogeneous solution space: one entry per
+  // degree of freedom, each listing every variable's terms.
+  let mut basis = solution_basis(&poly_matrix, &roots, n).ok_or_else(bail)?;
+  if basis.len() != degree {
+    return Err(bail());
+  }
+  let total_dof = basis.len();
+
+  // For a first-order homogeneous system, wolframscript's constants are the
+  // initial values themselves — its solution is `Y(x) = MatrixExp[A·x]·C`,
+  // i.e. the fundamental matrix normalized to the identity at the origin.
+  // Re-parametrize to that basis, which is unique (unlike the eigenvector
+  // basis above, whose scaling and ordering are arbitrary).
+  let is_first_order_homogeneous =
+    total_dof == n && f_vec.iter().all(|v| v.abs() <= 1e-12);
+  if is_first_order_homogeneous {
+    basis = normalize_basis_at_origin(&basis, n).ok_or_else(bail)?;
+  }
+
+  let mut y_exprs: Vec<Expr> = (0..n)
+    .map(|i| {
+      if particular[i].abs() > 1e-12 {
+        f64_to_nice_expr(particular[i])
+      } else {
+        Expr::Integer(0)
+      }
+    })
+    .collect();
+
+  for (j, solution) in basis.iter().enumerate() {
+    let c = sys_const(j + 1);
+    for k in 0..n {
+      let mut coefficient = sol_terms_expr(&solution[k], x_name);
+      if matches!(&coefficient, Expr::Integer(0)) {
+        continue;
+      }
+      coefficient = crate::evaluator::evaluate_expr_to_expr(&coefficient)
+        .unwrap_or(coefficient);
+      if is_first_order_homogeneous {
+        // wolframscript presents each constant's coefficient over a common
+        // denominator: `(1 + E^(2*x))/(2*E^x)`, not `1/(2*E^x) + E^x/2`.
+        coefficient = crate::functions::polynomial_ast::together::together_ast(
+          std::slice::from_ref(&coefficient),
+        )?;
+      }
+      y_exprs[k] = plus2(y_exprs[k].clone(), times2(coefficient, c.clone()));
+    }
+  }
+
+  // Apply initial conditions (if a full set was given) by evaluating each
+  // y_i and its derivatives at the IC point and solving for the shared
+  // constants — the same technique as the single-variable
+  // `apply_initial_conditions`, generalized across variables.
+  let mut equations: Vec<Expr> = Vec::new();
+  for (vi, ic) in &ics {
+    let Expr::Comparison {
+      operands,
+      operators,
+    } = ic
+    else {
+      continue;
+    };
+    if operands.len() != 2
+      || operators.len() != 1
+      || operators[0] != ComparisonOp::Equal
+    {
+      continue;
+    }
+    let lhs = &operands[0];
+    let rhs = &operands[1];
+    let yn = &y_names[*vi];
+    let point_order = if let Expr::FunctionCall { name, args } = lhs
+      && name == yn
+      && args.len() == 1
+    {
+      Some((0usize, args[0].clone()))
+    } else {
+      extract_derivative_order_and_point(lhs, yn)
+    };
+    let Some((order, point)) = point_order else {
+      continue;
+    };
+
+    let mut deriv = y_exprs[*vi].clone();
+    for _ in 0..order {
+      deriv =
+        crate::functions::calculus_ast::differentiate_expr(&deriv, x_name)?;
+      deriv = crate::functions::calculus_ast::simplify(deriv);
+      deriv = crate::evaluator::evaluate_expr_to_expr(&deriv).unwrap_or(deriv);
+    }
+    let substituted =
+      crate::syntax::substitute_variable(&deriv, x_name, &point);
+    let evaluated = crate::evaluator::evaluate_expr_to_expr(&substituted)
+      .unwrap_or(substituted);
+    equations.push(Expr::Comparison {
+      operands: vec![evaluated, rhs.clone()],
+      operators: vec![ComparisonOp::Equal],
+    });
+  }
+
+  if equations.len() == total_dof {
+    let var_exprs: Vec<Expr> = (1..=total_dof).map(sys_const).collect();
+    let solve_result = crate::functions::solve_ast(&[
+      Expr::List(equations.into()),
+      Expr::List(var_exprs.into()),
+    ])?;
+    if let Expr::List(outer) = &solve_result
+      && let Some(Expr::List(rules)) = outer.first()
+    {
+      for y_expr in &mut y_exprs {
+        for rule in rules {
+          if let Expr::Rule {
+            pattern,
+            replacement,
+          } = rule
+            && let Expr::Identifier(var_name) = pattern.as_ref()
+          {
+            *y_expr =
+              crate::syntax::substitute_variable(y_expr, var_name, replacement);
+          }
+        }
+        *y_expr = crate::evaluator::evaluate_expr_to_expr(y_expr)
+          .unwrap_or_else(|_| y_expr.clone());
+      }
+    }
+  } else {
+    // Not enough initial conditions: present the general solution with
+    // Wolfram's `C[k]` constants instead of the internal placeholders.
+    for y_expr in &mut y_exprs {
+      for k in 1..=total_dof {
+        *y_expr = crate::syntax::substitute_variable(
+          y_expr,
+          &format!("$DSolveSystemC{k}"),
+          &make_c(k),
+        );
+      }
+      *y_expr = crate::evaluator::evaluate_expr_to_expr(y_expr)
+        .unwrap_or_else(|_| y_expr.clone());
+    }
+  }
+
+  let rules: Vec<Expr> = y_names
+    .iter()
+    .zip(y_exprs)
+    .map(|(yn, sol)| Expr::Rule {
+      pattern: Box::new(Expr::FunctionCall {
+        name: yn.clone(),
+        args: vec![Expr::Identifier(x_name.to_string())].into(),
+      }),
+      replacement: Box::new(sol),
+    })
+    .collect();
+
+  Ok(Expr::List(vec![Expr::List(rules.into())].into()))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A hand-built 4x4 periodic tridiagonal system whose two corners
+  /// (`alpha` at the bottom-left, `beta` at the top-right — see
+  /// `solve_cyclic_tridiagonal`'s doc comment) are different values,
+  /// instead of the coincidentally-zero, symmetric corners every PDE
+  /// integration test exercises this solver through. A caller that swaps
+  /// `alpha`/`beta` (as `try_solve_hyperbolic_pde`'s call site did — see
+  /// PR #960's review) transposes the solved matrix's two corners; with
+  /// `alpha == beta` that transposition is invisible, so it takes a
+  /// genuinely asymmetric system like this one to catch it. Verified by
+  /// reconstructing the dense matrix and checking `A x == d` directly,
+  /// independent of `solve_cyclic_tridiagonal`'s own algorithm.
+  #[test]
+  fn cyclic_tridiagonal_solves_the_periodic_system_with_asymmetric_corners() {
+    let a = [0.0, 1.0, 1.0, 1.0];
+    let b = [4.0, 4.0, 4.0, 4.0];
+    let c = [1.0, 1.0, 1.0, 0.0];
+    let alpha = 2.0; // bottom-left corner: A[3][0]
+    let beta = 3.0; // top-right corner: A[0][3]
+    let d = [10.0, 11.0, 12.0, 13.0];
+
+    let x = solve_cyclic_tridiagonal(&a, &b, &c, &d, alpha, beta);
+
+    let n = 4;
+    let dense = [
+      [b[0], c[0], 0.0, beta],
+      [a[1], b[1], c[1], 0.0],
+      [0.0, a[2], b[2], c[2]],
+      [alpha, 0.0, a[3], b[3]],
+    ];
+    for i in 0..n {
+      let row_dot: f64 = (0..n).map(|j| dense[i][j] * x[j]).sum();
+      assert!(
+        (row_dot - d[i]).abs() < 1e-9,
+        "row {i}: A x = {row_dot}, expected {}",
+        d[i]
+      );
+    }
+  }
+}

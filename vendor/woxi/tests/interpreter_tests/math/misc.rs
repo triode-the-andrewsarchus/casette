@@ -1,0 +1,2466 @@
+use super::*;
+
+mod minus_wrong_arity {
+  use super::*;
+
+  #[test]
+  fn minus_single_arg_negates() {
+    assert_eq!(interpret("Minus[5]").unwrap(), "-5");
+  }
+
+  #[test]
+  fn minus_two_args_returns_unevaluated() {
+    // Minus[5, 2] should print warning and return 5 − 2 (Unicode minus, matching Wolfram)
+    let result = interpret("Minus[5, 2]").unwrap();
+    assert_eq!(result, "5 \u{2212} 2");
+  }
+}
+
+mod therefore {
+  use super::*;
+
+  #[test]
+  fn two_args() {
+    assert_eq!(interpret("Therefore[a, b]").unwrap(), "a \u{2234} b");
+  }
+
+  #[test]
+  fn three_args() {
+    assert_eq!(
+      interpret("Therefore[a, b, c]").unwrap(),
+      "a \u{2234} b \u{2234} c"
+    );
+  }
+
+  #[test]
+  fn one_arg() {
+    assert_eq!(interpret("Therefore[a]").unwrap(), "Therefore[a]");
+  }
+
+  #[test]
+  fn zero_args() {
+    assert_eq!(interpret("Therefore[]").unwrap(), "Therefore[]");
+  }
+
+  #[test]
+  fn args_evaluated() {
+    assert_eq!(interpret("Therefore[1+2, 3]").unwrap(), "3 \u{2234} 3");
+  }
+}
+
+mod because {
+  use super::*;
+
+  #[test]
+  fn two_args() {
+    assert_eq!(interpret("Because[a, b]").unwrap(), "a \u{2235} b");
+  }
+
+  #[test]
+  fn three_args() {
+    assert_eq!(
+      interpret("Because[a, b, c]").unwrap(),
+      "a \u{2235} b \u{2235} c"
+    );
+  }
+
+  #[test]
+  fn one_arg() {
+    assert_eq!(interpret("Because[a]").unwrap(), "Because[a]");
+  }
+
+  #[test]
+  fn args_evaluated() {
+    assert_eq!(interpret("Because[1+2, 3]").unwrap(), "3 \u{2235} 3");
+  }
+}
+
+mod implicit_multiply_power_precedence {
+  use super::*;
+
+  #[test]
+  fn b_y_cubed() {
+    assert_eq!(interpret("FullForm[b y^3]").unwrap(), "FullForm[b*y^3]");
+    assert_eq!(
+      interpret("ToString[FullForm[b y^3]]").unwrap(),
+      "Times[b, Power[y, 3]]"
+    );
+  }
+
+  #[test]
+  fn two_x_squared_y_cubed() {
+    assert_eq!(
+      interpret("FullForm[2 x^2 y^3]").unwrap(),
+      "FullForm[2*x^2*y^3]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[2 x^2 y^3]]").unwrap(),
+      "Times[2, Power[x, 2], Power[y, 3]]"
+    );
+  }
+
+  #[test]
+  fn coefficient_with_implicit_multiply() {
+    assert_eq!(
+      interpret("Coefficient[a x^2 + b y^3 + c x + d y + 5, y, 3]").unwrap(),
+      "b"
+    );
+  }
+
+  #[test]
+  fn function_call_implicit_times() {
+    // Regression: Sin[x] Sin[y] was not parsed as implicit multiplication
+    assert_eq!(interpret("Sin[x] Cos[y]").unwrap(), "Cos[y]*Sin[x]");
+  }
+
+  #[test]
+  fn function_call_implicit_times_three_factors() {
+    assert_eq!(
+      interpret("Sin[x] Cos[y] Tan[z]").unwrap(),
+      "Cos[y]*Sin[x]*Tan[z]"
+    );
+  }
+
+  #[test]
+  fn function_call_implicit_times_with_number() {
+    assert_eq!(interpret("2 Sin[x]").unwrap(), "2*Sin[x]");
+  }
+
+  #[test]
+  fn function_call_implicit_times_with_implicit_arg() {
+    // Sin[3y] should parse 3y as implicit multiplication inside the argument
+    assert_eq!(interpret("Sin[x] Sin[3y]").unwrap(), "Sin[x]*Sin[3*y]");
+  }
+
+  #[test]
+  fn function_call_implicit_times_evaluates() {
+    assert_eq!(interpret("Sin[0] Sin[Pi/2]").unwrap(), "0");
+  }
+
+  #[test]
+  fn implicit_times_with_part_access() {
+    // Regression: 2 x[[1]] was not parsed as implicit multiplication with Part access
+    assert_eq!(interpret("x = {10, 20, 30}; 2 x[[2]]").unwrap(), "40");
+  }
+
+  #[test]
+  fn implicit_times_real_with_part_access() {
+    // Regression: 100. masses[[i]] failed to parse
+    assert_eq!(
+      interpret("masses = {1, 2, 3}; 100. masses[[2]]").unwrap(),
+      "200."
+    );
+  }
+
+  #[test]
+  fn implicit_times_part_access_multiple_factors() {
+    assert_eq!(interpret("a = {2}; b = {3}; a[[1]] b[[1]]").unwrap(), "6");
+  }
+
+  #[test]
+  fn implicit_times_function_call_with_part_access() {
+    // 2 f[x][[1]] should parse as 2 * Part[f[x], 1]
+    assert_eq!(
+      interpret("FullForm[Hold[2 f[x][[1]]]]").unwrap(),
+      "FullForm[Hold[2*f[x][[1]]]]"
+    );
+  }
+}
+
+mod max_symbolic {
+  use super::*;
+
+  #[test]
+  fn filters_numeric_keeps_symbolic() {
+    assert_eq!(interpret("Max[5, x, -3, y, 40]").unwrap(), "Max[40, x, y]");
+  }
+
+  #[test]
+  fn all_numeric() {
+    assert_eq!(interpret("Max[5, 3, 8, 1]").unwrap(), "8");
+  }
+}
+
+mod min_symbolic {
+  use super::*;
+
+  #[test]
+  fn filters_numeric_keeps_symbolic() {
+    assert_eq!(interpret("Min[5, x, -3, y, 40]").unwrap(), "Min[-3, x, y]");
+  }
+}
+
+mod implicit_times_with_patterns {
+  use super::*;
+
+  #[test]
+  fn pattern_optional_default_implicit_times() {
+    // Regression: c_. x_^2 failed to parse as implicit multiplication
+    assert_eq!(interpret("Hold[c_. x_^2]").unwrap(), "Hold[(c_.)*(x_)^2]");
+  }
+
+  #[test]
+  fn pattern_optional_default_implicit_times_with_power() {
+    // c_. x_^2 should be Times[c_., Power[x_, 2]]
+    assert_eq!(
+      interpret("Hold[c_. x_^2] // FullForm").unwrap(),
+      "FullForm[Hold[(c_.)*(x_)^2]]"
+    );
+  }
+
+  #[test]
+  fn number_times_pattern_implicit() {
+    assert_eq!(interpret("Hold[2 x_]").unwrap(), "Hold[2*(x_)]");
+  }
+
+  #[test]
+  fn complex_pattern_expression_implicit_times() {
+    // The expression from compare_output.sh
+    assert_eq!(
+      interpret("Int[(a_.+b_.*x_+c_. x_^2)^n_,x_Symbol] := Foo[x]").unwrap(),
+      "\0"
+    );
+  }
+}
+
+mod precision_real {
+  use super::*;
+
+  #[test]
+  fn parse_precision_real() {
+    assert_eq!(interpret("0.1`1").unwrap(), "0.1`1.");
+  }
+
+  #[test]
+  fn parse_bare_backtick_machine_precision() {
+    // Bare backtick is machine precision, displayed as normal Real
+    assert_eq!(interpret("0.1`").unwrap(), "0.1");
+  }
+
+  #[test]
+  fn precision_real_addition() {
+    assert_eq!(interpret("0.1`1 + 0.2`1").unwrap(), "0.3`1.");
+  }
+
+  #[test]
+  fn precision_real_plus_integer() {
+    assert_eq!(interpret("0.1`1 + 1").unwrap(), "1.1`2.041392685158225");
+  }
+}
+
+mod max_min_flatten {
+  use super::*;
+
+  #[test]
+  fn max_flattens_nested_lists() {
+    assert_eq!(
+      interpret("Max[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]").unwrap(),
+      "3.5"
+    );
+  }
+
+  #[test]
+  fn min_flattens_nested_lists() {
+    assert_eq!(
+      interpret("Min[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]").unwrap(),
+      "-Infinity"
+    );
+  }
+}
+
+mod diagonal {
+  use super::*;
+
+  #[test]
+  fn main_diagonal() {
+    assert_eq!(
+      interpret("Diagonal[{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}]").unwrap(),
+      "{1, 5, 9}"
+    );
+  }
+
+  #[test]
+  fn superdiagonal() {
+    assert_eq!(
+      interpret("Diagonal[{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}, 1]").unwrap(),
+      "{2, 6}"
+    );
+  }
+
+  #[test]
+  fn subdiagonal() {
+    assert_eq!(
+      interpret("Diagonal[{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}, -1]").unwrap(),
+      "{4, 8}"
+    );
+  }
+
+  #[test]
+  fn rectangular() {
+    assert_eq!(
+      interpret("Diagonal[{{1, 2, 3}, {4, 5, 6}}]").unwrap(),
+      "{1, 5}"
+    );
+  }
+}
+
+mod pauli_matrix {
+  use super::*;
+
+  #[test]
+  fn pauli_1() {
+    assert_eq!(interpret("PauliMatrix[1]").unwrap(), "{{0, 1}, {1, 0}}");
+  }
+
+  #[test]
+  fn pauli_2() {
+    assert_eq!(interpret("PauliMatrix[2]").unwrap(), "{{0, -I}, {I, 0}}");
+  }
+
+  #[test]
+  fn pauli_3() {
+    assert_eq!(interpret("PauliMatrix[3]").unwrap(), "{{1, 0}, {0, -1}}");
+  }
+
+  #[test]
+  fn pauli_table() {
+    assert_eq!(
+      interpret("Table[PauliMatrix[i], {i, 1, 3}]").unwrap(),
+      "{{{0, 1}, {1, 0}}, {{0, -I}, {I, 0}}, {{1, 0}, {0, -1}}}"
+    );
+  }
+}
+
+mod wigner_symbols {
+  use super::*;
+
+  // ThreeJSymbol returns 0 when m1 + m2 + m3 ≠ 0.
+  #[test]
+  fn three_j_nonzero_m_sum() {
+    assert_eq!(
+      interpret("ThreeJSymbol[{2, 0}, {6, 0}, {4, 1}]").unwrap(),
+      "0"
+    );
+  }
+
+  // ThreeJSymbol returns 0 when |m_i| > j_i for any i.
+  #[test]
+  fn three_j_m_exceeds_j() {
+    assert_eq!(
+      interpret("ThreeJSymbol[{1, 2}, {3, 4}, {5, 12}]").unwrap(),
+      "0"
+    );
+  }
+
+  // SixJSymbol returns 0 when any triangle inequality fails.
+  #[test]
+  fn six_j_triangle_fails() {
+    assert_eq!(interpret("SixJSymbol[{1, 2, 3}, {4, 5, 12}]").unwrap(), "0");
+  }
+
+  // ThreeJSymbol now evaluates to its closed form via the Racah formula.
+  #[test]
+  fn three_j_valid_evaluates() {
+    assert_eq!(
+      interpret("ThreeJSymbol[{2, 0}, {6, 0}, {4, 0}]").unwrap(),
+      "Sqrt[5/143]"
+    );
+  }
+
+  // ClebschGordan of the "stretched state" (max |m| aligned with max j)
+  // is exactly 1.
+  #[test]
+  fn clebsch_gordan_stretched_negative() {
+    assert_eq!(
+      interpret("ClebschGordan[{1/2, -1/2}, {1/2, -1/2}, {1, -1}]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn clebsch_gordan_stretched_positive() {
+    assert_eq!(
+      interpret("ClebschGordan[{1/2, 1/2}, {1/2, 1/2}, {1, 1}]").unwrap(),
+      "1"
+    );
+  }
+
+  // ClebschGordan is zero when m1 + m2 ≠ m.
+  #[test]
+  fn clebsch_gordan_m_mismatch() {
+    assert_eq!(
+      interpret("ClebschGordan[{1/2, 1/2}, {1/2, 1/2}, {0, 0}]").unwrap(),
+      "0"
+    );
+  }
+}
+
+mod curl {
+  use super::*;
+
+  #[test]
+  fn curl_2d() {
+    assert_eq!(interpret("Curl[{y, -x}, {x, y}]").unwrap(), "-2");
+  }
+
+  #[test]
+  fn curl_3d() {
+    assert_eq!(
+      interpret("Curl[{y, -x, 2 z}, {x, y, z}]").unwrap(),
+      "{0, 0, -2}"
+    );
+  }
+
+  // Curl[F, vars, "Coordinates"] uses orthogonal-curvilinear scale factors.
+  // 2D gives a scalar; 3D gives a vector.
+  #[test]
+  fn curl_polar_scalar() {
+    assert_eq!(interpret(r#"Curl[{0, r}, {r, t}, "Polar"]"#).unwrap(), "2");
+  }
+
+  #[test]
+  fn curl_cylindrical() {
+    assert_eq!(
+      interpret(r#"Curl[{0, 0, r}, {r, t, z}, "Cylindrical"]"#).unwrap(),
+      "{0, -1, 0}"
+    );
+    assert_eq!(
+      interpret(r#"Curl[{r, 0, 0}, {r, t, z}, "Cylindrical"]"#).unwrap(),
+      "{0, 0, 0}"
+    );
+  }
+
+  #[test]
+  fn curl_spherical() {
+    assert_eq!(
+      interpret(r#"Curl[{0, 0, r Sin[t]}, {r, t, p}, "Spherical"]"#).unwrap(),
+      "{2*Cos[t], -2*Sin[t], 0}"
+    );
+  }
+
+  #[test]
+  fn curl_unknown_coordinates_unevaluated() {
+    assert_eq!(
+      interpret(r#"Curl[{0, r}, {r, t}, "Bogus"]"#).unwrap(),
+      "Curl[{0, r}, {r, t}, Bogus]"
+    );
+  }
+}
+
+mod log {
+  use super::*;
+
+  #[test]
+  fn log_zero() {
+    assert_eq!(interpret("Log[0]").unwrap(), "-Infinity");
+  }
+
+  #[test]
+  fn log_two_arg_exact() {
+    assert_eq!(interpret("Log[2, 8]").unwrap(), "3");
+    assert_eq!(interpret("Log[2, 16]").unwrap(), "4");
+    assert_eq!(interpret("Log[3, 9]").unwrap(), "2");
+  }
+
+  #[test]
+  fn log_two_arg_symbolic() {
+    assert_eq!(interpret("Log[2, 5]").unwrap(), "Log[5]/Log[2]");
+  }
+
+  #[test]
+  fn log_infinity() {
+    assert_eq!(interpret("Log[Infinity]").unwrap(), "Infinity");
+  }
+
+  #[test]
+  fn log_complex_infinity() {
+    assert_eq!(interpret("Log[ComplexInfinity]").unwrap(), "Infinity");
+  }
+
+  #[test]
+  fn log_i() {
+    assert_eq!(interpret("Log[I]").unwrap(), "I/2*Pi");
+  }
+
+  #[test]
+  fn log_neg_i() {
+    assert_eq!(interpret("Log[-I]").unwrap(), "(-1/2*I)*Pi");
+  }
+
+  #[test]
+  fn log_e_to_pi() {
+    assert_eq!(interpret("Log[E^Pi]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn log_e_to_x() {
+    // Log[E^x] stays unevaluated for symbolic x
+    assert_eq!(interpret("Log[E^x]").unwrap(), "Log[E^x]");
+  }
+
+  // Log[E^z] for a numeric complex exponent z reduces to z with its imaginary
+  // part brought into (-Pi, Pi].
+  #[test]
+  fn log_e_to_imaginary() {
+    assert_eq!(interpret("Log[E^(2 I)]").unwrap(), "2*I");
+    assert_eq!(interpret("Log[E^(3 I)]").unwrap(), "3*I");
+    assert_eq!(interpret("Log[E^(I Pi/2)]").unwrap(), "I/2*Pi");
+  }
+
+  #[test]
+  fn log_e_to_imaginary_reduced() {
+    // Im outside (-Pi, Pi] is reduced by a multiple of 2 Pi.
+    assert_eq!(interpret("Log[E^(5 I)]").unwrap(), "5*I - (2*I)*Pi");
+    assert_eq!(interpret("Log[E^(-5 I)]").unwrap(), "-5*I + (2*I)*Pi");
+  }
+
+  #[test]
+  fn log_e_to_complex_in_range() {
+    // Re concrete, Im in range: result is the exponent itself.
+    assert_eq!(interpret("Log[E^(2 + 3 I)]").unwrap(), "2 + 3*I");
+  }
+
+  #[test]
+  fn log_e_to_complex_symbolic_real_part() {
+    // A symbolic real part keeps it unevaluated (E^a need not be positive real).
+    // The pure-imaginary numeric term sorts ahead of the symbol, like
+    // wolframscript's `Log[E^(3*I + a)]`.
+    assert_eq!(interpret("Log[E^(a + 3 I)]").unwrap(), "Log[E^(3*I + a)]");
+  }
+}
+
+mod linear_recurrence {
+  use super::*;
+
+  #[test]
+  fn fibonacci_via_recurrence() {
+    assert_eq!(
+      interpret("LinearRecurrence[{1, 1}, {1, 1}, 10]").unwrap(),
+      "{1, 1, 2, 3, 5, 8, 13, 21, 34, 55}"
+    );
+  }
+}
+
+mod zero_divided_by_symbolic {
+  use super::*;
+
+  #[test]
+  fn zero_over_symbolic() {
+    assert_eq!(interpret("0/x").unwrap(), "0");
+    assert_eq!(interpret("0/(2*Pi)").unwrap(), "0");
+    assert_eq!(interpret("0/Sqrt[2]").unwrap(), "0");
+  }
+
+  #[test]
+  fn zero_real_over_symbolic() {
+    assert_eq!(interpret("0.0/x").unwrap(), "0.");
+    assert_eq!(interpret("0.0/Pi").unwrap(), "0.");
+  }
+
+  #[test]
+  fn zero_over_integer() {
+    assert_eq!(interpret("0/5").unwrap(), "0");
+  }
+}
+
+mod eigensystem {
+  use super::*;
+
+  #[test]
+  fn two_by_two() {
+    assert_eq!(
+      interpret("Eigensystem[{{1, 2}, {3, 4}}]").unwrap(),
+      "{{(5 + Sqrt[33])/2, (5 - Sqrt[33])/2}, {{(-3 + Sqrt[33])/6, 1}, {(-3 - Sqrt[33])/6, 1}}}"
+    );
+  }
+
+  #[test]
+  fn diagonal() {
+    assert_eq!(
+      interpret("Eigensystem[{{2, 0}, {0, 3}}]").unwrap(),
+      "{{3, 2}, {{0, 1}, {1, 0}}}"
+    );
+  }
+
+  #[test]
+  fn three_by_three_diagonal() {
+    assert_eq!(
+      interpret("Eigensystem[{{1, 0, 0}, {0, 2, 0}, {0, 0, 3}}]").unwrap(),
+      "{{3, 2, 1}, {{0, 0, 1}, {0, 1, 0}, {1, 0, 0}}}"
+    );
+  }
+
+  #[test]
+  fn symbolic_unevaluated() {
+    assert_eq!(interpret("Eigensystem[m]").unwrap(), "Eigensystem[m]");
+  }
+}
+
+mod unit_box {
+  use super::*;
+
+  #[test]
+  fn zero() {
+    assert_eq!(interpret("UnitBox[0]").unwrap(), "1");
+  }
+
+  #[test]
+  fn inside() {
+    assert_eq!(interpret("UnitBox[0.3]").unwrap(), "1");
+  }
+
+  #[test]
+  fn boundary() {
+    assert_eq!(interpret("UnitBox[0.5]").unwrap(), "1");
+  }
+
+  #[test]
+  fn outside() {
+    assert_eq!(interpret("UnitBox[1]").unwrap(), "0");
+  }
+
+  #[test]
+  fn negative_inside() {
+    assert_eq!(interpret("UnitBox[-0.3]").unwrap(), "1");
+  }
+
+  #[test]
+  fn symbolic() {
+    assert_eq!(interpret("UnitBox[x]").unwrap(), "UnitBox[x]");
+  }
+}
+
+mod unit_triangle {
+  use super::*;
+
+  #[test]
+  fn zero() {
+    assert_eq!(interpret("UnitTriangle[0]").unwrap(), "1");
+  }
+
+  #[test]
+  fn half() {
+    assert_eq!(interpret("UnitTriangle[0.5]").unwrap(), "0.5");
+  }
+
+  #[test]
+  fn boundary() {
+    assert_eq!(interpret("UnitTriangle[1]").unwrap(), "0");
+  }
+
+  #[test]
+  fn negative() {
+    assert_eq!(interpret("UnitTriangle[-0.5]").unwrap(), "0.5");
+  }
+
+  #[test]
+  fn outside() {
+    assert_eq!(interpret("UnitTriangle[2]").unwrap(), "0");
+  }
+
+  #[test]
+  fn symbolic() {
+    assert_eq!(interpret("UnitTriangle[x]").unwrap(), "UnitTriangle[x]");
+  }
+}
+
+mod angle_vector {
+  use super::*;
+
+  #[test]
+  fn basic_angle() {
+    assert_eq!(
+      interpret("AngleVector[Pi/4]").unwrap(),
+      "{1/Sqrt[2], 1/Sqrt[2]}"
+    );
+  }
+
+  #[test]
+  fn zero_angle() {
+    assert_eq!(interpret("AngleVector[0]").unwrap(), "{1, 0}");
+  }
+
+  #[test]
+  fn pi_half() {
+    assert_eq!(interpret("AngleVector[Pi/2]").unwrap(), "{0, 1}");
+  }
+
+  #[test]
+  fn with_radius() {
+    assert_eq!(interpret("AngleVector[{2, Pi/3}]").unwrap(), "{1, Sqrt[3]}");
+  }
+
+  #[test]
+  fn with_center() {
+    assert_eq!(
+      interpret("AngleVector[{1, 2}, Pi/6]").unwrap(),
+      "{1 + Sqrt[3]/2, 5/2}"
+    );
+  }
+
+  #[test]
+  fn with_center_and_radius() {
+    assert_eq!(
+      interpret("AngleVector[{1, 0}, {2, Pi/2}]").unwrap(),
+      "{1, 2}"
+    );
+  }
+}
+
+mod inverse_trig_identities {
+  use super::*;
+
+  #[test]
+  fn sin_arcsin() {
+    assert_eq!(interpret("Sin[ArcSin[x]]").unwrap(), "x");
+    assert_eq!(interpret("Sin[ArcSin[1/2]]").unwrap(), "1/2");
+  }
+
+  #[test]
+  fn cos_arccos() {
+    assert_eq!(interpret("Cos[ArcCos[x]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn tan_arctan() {
+    assert_eq!(interpret("Tan[ArcTan[x]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn arctan_sqrt3() {
+    assert_eq!(interpret("ArcTan[Sqrt[3]]").unwrap(), "Pi/3");
+  }
+
+  #[test]
+  fn arctan_inv_sqrt3() {
+    assert_eq!(interpret("ArcTan[1/Sqrt[3]]").unwrap(), "Pi/6");
+  }
+
+  #[test]
+  fn arctan_neg_sqrt3() {
+    assert_eq!(interpret("ArcTan[-Sqrt[3]]").unwrap(), "-1/3*Pi");
+  }
+
+  #[test]
+  fn arctan_neg_inv_sqrt3() {
+    assert_eq!(interpret("ArcTan[-1/Sqrt[3]]").unwrap(), "-1/6*Pi");
+  }
+
+  // Twelfth-angle values: inverse of Tan[Pi/12] = 2 - Sqrt[3] and
+  // Tan[5 Pi/12] = 2 + Sqrt[3]. ArcCot picks these up via ArcTan.
+  #[test]
+  fn arctan_twelfth_angle() {
+    assert_eq!(interpret("ArcTan[2 - Sqrt[3]]").unwrap(), "Pi/12");
+    assert_eq!(interpret("ArcTan[2 + Sqrt[3]]").unwrap(), "(5*Pi)/12");
+    assert_eq!(interpret("ArcTan[-(2 - Sqrt[3])]").unwrap(), "-1/12*Pi");
+    assert_eq!(interpret("ArcTan[-(2 + Sqrt[3])]").unwrap(), "(-5*Pi)/12");
+    assert_eq!(interpret("ArcCot[2 - Sqrt[3]]").unwrap(), "(5*Pi)/12");
+    assert_eq!(interpret("ArcCot[2 + Sqrt[3]]").unwrap(), "Pi/12");
+  }
+
+  // The inverse applied to its own forward function is not the identity —
+  // it lands on the one value in the inverse's principal range that shares
+  // the forward value. Wolfram reduces the round trip automatically for
+  // every exact real argument.
+  #[test]
+  fn arcsin_sin_reduces_into_principal_range() {
+    // Inside [-Pi/2, Pi/2] the round trip is the identity.
+    assert_eq!(interpret("ArcSin[Sin[1]]").unwrap(), "1");
+    assert_eq!(interpret("ArcSin[Sin[3/2]]").unwrap(), "3/2");
+    // One half-turn out: the sign flips around Pi.
+    assert_eq!(interpret("ArcSin[Sin[2]]").unwrap(), "-2 + Pi");
+    assert_eq!(interpret("ArcSin[Sin[-2]]").unwrap(), "2 - Pi");
+    // Several turns out, both parities of the reduction.
+    assert_eq!(interpret("ArcSin[Sin[7]]").unwrap(), "7 - 2*Pi");
+    assert_eq!(interpret("ArcSin[Sin[10]]").unwrap(), "-10 + 3*Pi");
+    // The half-turn count is exact, so the reduction holds however many
+    // turns out the argument is — far past what a machine float resolves.
+    assert_eq!(
+      interpret("ArcSin[Sin[10^20]]").unwrap(),
+      "100000000000000000000 - 31830988618379067154*Pi"
+    );
+  }
+
+  #[test]
+  fn arccos_cos_reduces_into_principal_range() {
+    // ArcCos lands in [0, Pi], so a negative argument comes back positive.
+    assert_eq!(interpret("ArcCos[Cos[1]]").unwrap(), "1");
+    assert_eq!(interpret("ArcCos[Cos[-1]]").unwrap(), "1");
+    assert_eq!(interpret("ArcCos[Cos[2]]").unwrap(), "2");
+    assert_eq!(interpret("ArcCos[Cos[7]]").unwrap(), "7 - 2*Pi");
+    assert_eq!(interpret("ArcCos[Cos[Sqrt[2]]]").unwrap(), "Sqrt[2]");
+  }
+
+  // Tan and Cot have period Pi, so the reduction is a plain shift. ArcCot's
+  // range is half-open the other way (`(-Pi/2, Pi/2]`), which is what makes
+  // ArcCot[Cot[Pi/2]] come back as Pi/2 rather than -Pi/2.
+  #[test]
+  fn arctan_tan_and_arccot_cot_shift_by_pi() {
+    assert_eq!(interpret("ArcTan[Tan[1]]").unwrap(), "1");
+    assert_eq!(interpret("ArcTan[Tan[7]]").unwrap(), "7 - 2*Pi");
+    assert_eq!(interpret("ArcTan[Tan[-7]]").unwrap(), "-7 + 2*Pi");
+    assert_eq!(interpret("ArcCot[Cot[3]]").unwrap(), "3 - Pi");
+    assert_eq!(interpret("ArcCot[Cot[Pi/2]]").unwrap(), "Pi/2");
+    assert_eq!(interpret("ArcCot[Cot[3*Pi/2]]").unwrap(), "Pi/2");
+  }
+
+  // Sec and Csc are reciprocals of Cos and Sin and share their ranges.
+  #[test]
+  fn arcsec_sec_and_arccsc_csc_reduce_like_cos_and_sin() {
+    assert_eq!(interpret("ArcSec[Sec[3]]").unwrap(), "3");
+    assert_eq!(interpret("ArcSec[Sec[7]]").unwrap(), "7 - 2*Pi");
+    assert_eq!(interpret("ArcCsc[Csc[3]]").unwrap(), "-3 + Pi");
+    assert_eq!(interpret("ArcCsc[Csc[1]]").unwrap(), "1");
+  }
+
+  // A symbolic argument has no branch to pick, and an inexact one already
+  // collapsed to a machine number in the forward call.
+  #[test]
+  fn inverse_of_forward_keeps_symbolic_and_inexact_arguments() {
+    assert_eq!(interpret("ArcSin[Sin[x]]").unwrap(), "ArcSin[Sin[x]]");
+    assert_eq!(
+      interpret("ArcCos[Cos[y + 1]]").unwrap(),
+      "ArcCos[Cos[1 + y]]"
+    );
+    assert_eq!(interpret("ArcSin[Sin[2.0]]").unwrap(), "1.1415926535897933");
+  }
+
+  #[test]
+  fn sinh_arcsinh() {
+    assert_eq!(interpret("Sinh[ArcSinh[x]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn cosh_arccosh() {
+    assert_eq!(interpret("Cosh[ArcCosh[x]]").unwrap(), "x");
+  }
+
+  #[test]
+  fn tanh_arctanh() {
+    assert_eq!(interpret("Tanh[ArcTanh[x]]").unwrap(), "x");
+  }
+
+  // ArcSinh is odd and unbounded: ArcSinh[±Infinity] = ±Infinity; an
+  // undirected ComplexInfinity maps to ComplexInfinity. Per wolframscript.
+  #[test]
+  fn arcsinh_infinite_limits() {
+    assert_eq!(interpret("ArcSinh[Infinity]").unwrap(), "Infinity");
+    assert_eq!(interpret("ArcSinh[-Infinity]").unwrap(), "-Infinity");
+    assert_eq!(
+      interpret("ArcSinh[ComplexInfinity]").unwrap(),
+      "ComplexInfinity"
+    );
+    // A finite exact argument stays symbolic.
+    assert_eq!(interpret("ArcSinh[2]").unwrap(), "ArcSinh[2]");
+  }
+
+  // ArcCosh grows without bound in magnitude, so every infinite argument
+  // (Infinity, -Infinity, ComplexInfinity) maps to Infinity. Per wolframscript.
+  #[test]
+  fn arccosh_infinite_limits() {
+    assert_eq!(interpret("ArcCosh[Infinity]").unwrap(), "Infinity");
+    assert_eq!(interpret("ArcCosh[-Infinity]").unwrap(), "Infinity");
+    assert_eq!(interpret("ArcCosh[ComplexInfinity]").unwrap(), "Infinity");
+    // A finite exact argument stays symbolic.
+    assert_eq!(interpret("ArcCosh[2]").unwrap(), "ArcCosh[2]");
+  }
+
+  // ArcSin/ArcCos/ArcTanh of an inexact real outside their real domain give a
+  // numeric complex result (an exact integer/rational argument stays
+  // symbolic). All expected values verified against wolframscript.
+  #[test]
+  fn arcsin_out_of_domain_real_is_complex() {
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(
+      interpret("Round[ArcSin[2.0], 0.001]").unwrap(),
+      "1.571 - 1.317*I"
+    );
+    assert_eq!(
+      interpret("Round[ArcSin[-1.5], 0.001]").unwrap(),
+      "-1.571 + 0.962*I"
+    );
+    // Exact integer stays symbolic.
+    assert_eq!(interpret("ArcSin[3]").unwrap(), "ArcSin[3]");
+  }
+
+  #[test]
+  fn arccos_out_of_domain_real_is_complex() {
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(
+      interpret("Round[ArcCos[2.0], 0.001]").unwrap(),
+      "0. + 1.317*I"
+    );
+    assert_eq!(
+      interpret("Round[ArcCos[-1.5], 0.001]").unwrap(),
+      "3.142 - 0.962*I"
+    );
+  }
+
+  #[test]
+  fn arctanh_out_of_domain_real_is_complex() {
+    // Round to avoid a last-ULP libm divergence between platforms in the real
+    // part (macOS ...549 vs Linux ...548).
+    assert_eq!(
+      interpret("Round[ArcTanh[2.0], 0.0001]").unwrap(),
+      "0.5493 - 1.5708*I"
+    );
+    assert_eq!(
+      interpret("Round[ArcTanh[-2.0], 0.0001]").unwrap(),
+      "-0.5493 + 1.5708*I"
+    );
+  }
+
+  // In-domain reals are unchanged (still return a plain real).
+  #[test]
+  fn arc_in_domain_reals_stay_real() {
+    // Round to avoid a last-ULP libm divergence between platforms in the
+    // full-precision output (macOS ...988 vs Linux ...989).
+    assert_eq!(interpret("Round[ArcSin[0.5], 0.001]").unwrap(), "0.524");
+    assert_eq!(interpret("Round[ArcCos[0.5], 0.001]").unwrap(), "1.047");
+    assert_eq!(interpret("Round[ArcTanh[0.5], 0.001]").unwrap(), "0.549");
+  }
+
+  // ArcSec/ArcCsc/ArcSech follow the reciprocal identities (ArcSec[x] =
+  // ArcCos[1/x], ArcCsc[x] = ArcSin[1/x], ArcSech[x] = ArcCosh[1/x]), so an
+  // inexact real outside their real domain gives a complex result. Also
+  // covers the ArcCosh[x < -1] branch. Verified against wolframscript.
+  #[test]
+  fn arcsec_out_of_domain_real_is_complex() {
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(
+      interpret("Round[ArcSec[0.5], 0.001]").unwrap(),
+      "0. + 1.317*I"
+    );
+  }
+
+  #[test]
+  fn arccsc_out_of_domain_real_is_complex() {
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(
+      interpret("Round[ArcCsc[0.5], 0.001]").unwrap(),
+      "1.571 - 1.317*I"
+    );
+  }
+
+  #[test]
+  fn arcsech_out_of_domain_real_is_complex() {
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(
+      interpret("Round[ArcSech[2.0], 0.001]").unwrap(),
+      "0. + 1.047*I"
+    );
+    assert_eq!(
+      interpret("Round[ArcSech[-0.5], 0.001]").unwrap(),
+      "1.317 + 3.142*I"
+    );
+  }
+
+  #[test]
+  fn arccosh_below_negative_one_is_complex() {
+    // Previously returned Indeterminate (x.acos() is NaN for x < -1).
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(
+      interpret("Round[ArcCosh[-2.0], 0.001]").unwrap(),
+      "1.317 + 3.142*I"
+    );
+    assert_eq!(
+      interpret("Round[ArcCosh[-1.0], 0.001]").unwrap(),
+      "0. + 3.142*I"
+    );
+  }
+
+  // In-domain reals still return a plain real, and exact integer arguments
+  // stay symbolic rather than being numericized.
+  #[test]
+  fn arcsec_arccsc_in_domain_and_exact() {
+    // Round to avoid last-ULP libm divergence between platforms.
+    assert_eq!(interpret("Round[ArcSec[2.0], 0.001]").unwrap(), "1.047");
+    assert_eq!(interpret("Round[ArcCsc[2.0], 0.001]").unwrap(), "0.524");
+    assert_eq!(interpret("Round[ArcSech[0.5], 0.001]").unwrap(), "1.317");
+    assert_eq!(interpret("ArcSec[3]").unwrap(), "ArcSec[3]");
+    assert_eq!(interpret("ArcCsc[3]").unwrap(), "ArcCsc[3]");
+    assert_eq!(interpret("ArcSec[2]").unwrap(), "Pi/3");
+  }
+
+  // A zero real argument: ArcSec/ArcCsc diverge to ComplexInfinity, ArcSech
+  // to Indeterminate. Per wolframscript.
+  #[test]
+  fn arcsec_family_zero_real() {
+    assert_eq!(interpret("ArcSec[0.0]").unwrap(), "ComplexInfinity");
+    assert_eq!(interpret("ArcCsc[0.0]").unwrap(), "ComplexInfinity");
+    assert_eq!(interpret("ArcSech[0.0]").unwrap(), "Indeterminate");
+  }
+
+  // ArcCoth[±1.] is a singularity: it returns Indeterminate (the (x+1)/(x-1)
+  // ratio divides by zero). The exact ArcCoth[±1] instead stays ±Infinity,
+  // and ArcCsch[0.] diverges to ComplexInfinity. Per wolframscript.
+  #[test]
+  fn arccoth_singular_real_is_indeterminate() {
+    assert_eq!(interpret("ArcCoth[1.0]").unwrap(), "Indeterminate");
+    assert_eq!(interpret("ArcCoth[-1.0]").unwrap(), "Indeterminate");
+    // Exact ±1 is a different limit and stays ±Infinity.
+    assert_eq!(interpret("ArcCoth[1]").unwrap(), "Infinity");
+    assert_eq!(interpret("ArcCoth[-1]").unwrap(), "-Infinity");
+  }
+
+  #[test]
+  fn arccsch_zero_real_is_complex_infinity() {
+    assert_eq!(interpret("ArcCsch[0.0]").unwrap(), "ComplexInfinity");
+    assert_eq!(interpret("ArcCsch[0]").unwrap(), "ComplexInfinity");
+  }
+
+  // The non-singular real branches are unchanged.
+  #[test]
+  fn arccoth_arccsch_real_branches_unchanged() {
+    // Round to avoid a last-ULP libm divergence between platforms
+    // (macOS ...549 vs Linux ...548).
+    assert_eq!(interpret("Round[ArcCoth[2.0], 0.001]").unwrap(), "0.549");
+    assert_eq!(
+      interpret("Round[ArcCoth[0.5], 0.0001]").unwrap(),
+      "0.5493 - 1.5708*I"
+    );
+    assert_eq!(interpret("Round[ArcCsch[2.0], 0.0001]").unwrap(), "0.4812");
+  }
+}
+
+mod inverse_function {
+  use super::*;
+
+  #[test]
+  fn trig_inverses() {
+    assert_eq!(interpret("InverseFunction[Sin]").unwrap(), "ArcSin");
+    assert_eq!(interpret("InverseFunction[Cos]").unwrap(), "ArcCos");
+    assert_eq!(interpret("InverseFunction[Tan]").unwrap(), "ArcTan");
+    assert_eq!(interpret("InverseFunction[Cot]").unwrap(), "ArcCot");
+    assert_eq!(interpret("InverseFunction[Sec]").unwrap(), "ArcSec");
+    assert_eq!(interpret("InverseFunction[Csc]").unwrap(), "ArcCsc");
+  }
+
+  #[test]
+  fn arc_trig_inverses() {
+    assert_eq!(interpret("InverseFunction[ArcSin]").unwrap(), "Sin");
+    assert_eq!(interpret("InverseFunction[ArcCos]").unwrap(), "Cos");
+    assert_eq!(interpret("InverseFunction[ArcTan]").unwrap(), "Tan");
+  }
+
+  #[test]
+  fn hyperbolic_inverses() {
+    assert_eq!(interpret("InverseFunction[Sinh]").unwrap(), "ArcSinh");
+    assert_eq!(interpret("InverseFunction[Cosh]").unwrap(), "ArcCosh");
+    assert_eq!(interpret("InverseFunction[Tanh]").unwrap(), "ArcTanh");
+    assert_eq!(interpret("InverseFunction[ArcSinh]").unwrap(), "Sinh");
+    assert_eq!(interpret("InverseFunction[ArcCosh]").unwrap(), "Cosh");
+    assert_eq!(interpret("InverseFunction[ArcTanh]").unwrap(), "Tanh");
+  }
+
+  #[test]
+  fn exp_log_inverses() {
+    assert_eq!(interpret("InverseFunction[Exp]").unwrap(), "Log");
+    assert_eq!(interpret("InverseFunction[Log]").unwrap(), "Exp");
+  }
+
+  #[test]
+  fn unknown_stays_unevaluated() {
+    assert_eq!(
+      interpret("InverseFunction[f]").unwrap(),
+      "InverseFunction[f]"
+    );
+  }
+
+  #[test]
+  fn applied_to_argument() {
+    assert_eq!(interpret("InverseFunction[Sin][1/2]").unwrap(), "Pi/6");
+    assert_eq!(interpret("InverseFunction[Exp][5]").unwrap(), "Log[5]");
+  }
+
+  #[test]
+  fn pure_function_linear() {
+    // InverseFunction[2*#1 + 3 &] = (-3 + #1)/2 &.
+    assert_eq!(
+      interpret("InverseFunction[2*#1 + 3 &]").unwrap(),
+      "(-3 + #1)/2 & "
+    );
+  }
+
+  #[test]
+  fn pure_function_mobius() {
+    // wolframscript: (-b + d*#1)/(a - c*#1) &. Woxi's Times ordering puts
+    // the slot first within products: (-b + #1*d)/(a - #1*c) — same value.
+    assert_eq!(
+      interpret("InverseFunction[(a*#1 + b)/(c*#1 + d) &]").unwrap(),
+      "(-b + #1*d)/(a - #1*c) & "
+    );
+  }
+
+  #[test]
+  fn pure_function_applied() {
+    // The returned inverse function should evaluate when applied.
+    assert_eq!(interpret("InverseFunction[2*#1 + 3 &][7]").unwrap(), "2");
+  }
+}
+
+mod cases {
+  use super::super::super::case_helpers::assert_case;
+
+  #[test]
+  fn boole_1() {
+    assert_case(r#"Boole[2 == 2]"#, r#"1"#);
+  }
+  #[test]
+  fn boole_2() {
+    assert_case(r#"Boole[2 == 2]; Boole[7 < 5]"#, r#"0"#);
+  }
+  #[test]
+  fn boole_3() {
+    assert_case(
+      r#"Boole[2 == 2]; Boole[7 < 5]; Boole[a == 7]"#,
+      r#"Boole[a == 7]"#,
+    );
+  }
+  #[test]
+  fn element() {
+    assert_case(r#"Element[3 | a, Integers]"#, r#"Element[a, Integers]"#);
+  }
+  #[test]
+  fn trace_evaluation() {
+    assert_case(
+      r#"TraceEvaluation[(x + x)^2]; TraceEvaluation[(x + x)^2, ShowTimeBySteps->True]"#,
+      r#"TraceEvaluation[4*x^2, ShowTimeBySteps -> True]"#,
+    );
+  }
+  #[test]
+  fn uncompress() {
+    // Same situation as case 534 — `Compress` produces implementation-
+    // specific bytes. Verify the documented contract via round-trip on
+    // a string input.
+    assert_case(
+      r#"Uncompress[Compress["Mathics3 is cool"]] == "Mathics3 is cool""#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn real_abs_1() {
+    assert_case(r#"RealAbs[-3.]"#, r#"3."#);
+  }
+  #[test]
+  fn real_abs_2() {
+    assert_case(
+      r#"RealAbs[-3.]; RealAbs[2. + 3. I]"#,
+      r#"RealAbs[2. + 3.*I]"#,
+    );
+  }
+  #[test]
+  fn angle_path_1() {
+    assert_case(
+      r#"AnglePath[{90 Degree, 90 Degree, 90 Degree, 90 Degree}]"#,
+      r#"{{0, 0}, {0, 1}, {-1, 1}, {-1, 0}, {0, 0}}"#,
+    );
+  }
+  #[test]
+  fn angle_path_2() {
+    assert_case(
+      r#"AnglePath[{90 Degree, 90 Degree, 90 Degree, 90 Degree}]; AnglePath[{{1, 1}, 90 Degree}, {{1, 90 Degree}, {2, 90 Degree}, {1, 90 Degree}, {2, 90 Degree}}]"#,
+      r#"{{1, 1}, {0, 1}, {0, -1}, {1, -1}, {1, 1}}"#,
+    );
+  }
+  #[test]
+  fn angle_path_3() {
+    assert_case(
+      r#"AnglePath[{90 Degree, 90 Degree, 90 Degree, 90 Degree}]; AnglePath[{{1, 1}, 90 Degree}, {{1, 90 Degree}, {2, 90 Degree}, {1, 90 Degree}, {2, 90 Degree}}]; AnglePath[{a, b}]"#,
+      r#"{{0, 0}, {Cos[a], Sin[a]}, {Cos[a] + Cos[a + b], Sin[a] + Sin[a + b]}}"#,
+    );
+  }
+  // Two-argument AnglePath with a flat start point {x0, y0} (facing 0):
+  // the path is the one-argument path translated by the start point.
+  #[test]
+  fn angle_path_flat_start_point() {
+    assert_case(
+      r#"AnglePath[{1, 2}, {Pi/2, Pi/2}]"#,
+      r#"{{1, 2}, {1, 3}, {0, 3}}"#,
+    );
+  }
+  #[test]
+  fn angle_path_flat_start_symbolic() {
+    assert_case(
+      r#"AnglePath[{x0, y0}, {a1, a2}]"#,
+      r#"{{x0, y0}, {x0 + Cos[a1], y0 + Sin[a1]}, {x0 + Cos[a1] + Cos[a1 + a2], y0 + Sin[a1] + Sin[a1 + a2]}}"#,
+    );
+  }
+  #[test]
+  fn divide_1() {
+    assert_case(r#"Catalan // N"#, r#"0.915965594177219"#);
+  }
+  #[test]
+  fn divide_2() {
+    assert_case(r#"EulerGamma // N"#, r#"0.5772156649015329"#);
+  }
+  #[test]
+  fn divide_3() {
+    assert_case(r#"GoldenRatio // N"#, r#"1.618033988749895"#);
+  }
+  #[test]
+  fn anonymous_function_1() {
+    assert_case(r#"True && True && False"#, r#"False"#);
+  }
+  #[test]
+  fn anonymous_function_2() {
+    assert_case(
+      r#"True && True && False; a && b && True && c"#,
+      r#"a && b && c"#,
+    );
+  }
+  #[test]
+  fn implies_1() {
+    assert_case(r#"Implies[False, a]"#, r#"True"#);
+  }
+  #[test]
+  fn implies_2() {
+    assert_case(r#"Implies[False, a]; Implies[True, a]"#, r#"a"#);
+  }
+  #[test]
+  fn implies_3() {
+    assert_case(
+      r#"Implies[False, a]; Implies[True, a]; Implies[a, Implies[b, Implies[True, c]]]"#,
+      r#"Implies[a, Implies[b, c]]"#,
+    );
+  }
+  #[test]
+  fn expression_1() {
+    assert_case(r#"False || True"#, r#"True"#);
+  }
+  #[test]
+  fn expression_2() {
+    assert_case(r#"False || True; a || False || b"#, r#"a || b"#);
+  }
+  #[test]
+  fn nand() {
+    assert_case(r#"Nand[True, False]"#, r#"True"#);
+  }
+  #[test]
+  fn nor() {
+    assert_case(r#"Nor[True, False]"#, r#"False"#);
+  }
+  #[test]
+  fn factorial_1() {
+    assert_case(r#"!True"#, r#"False"#);
+  }
+  #[test]
+  fn factorial_2() {
+    assert_case(r#"!True; !False"#, r#"True"#);
+  }
+  #[test]
+  fn factorial_3() {
+    assert_case(r#"!True; !False; !b"#, r#"!b"#);
+  }
+  #[test]
+  fn xor_1() {
+    assert_case(r#"Xor[False, True]"#, r#"True"#);
+  }
+  #[test]
+  fn xor_2() {
+    assert_case(r#"Xor[False, True]; Xor[True, True]"#, r#"False"#);
+  }
+  #[test]
+  fn xor_3() {
+    assert_case(
+      r#"Xor[False, True]; Xor[True, True]; Xor[a, False, b]"#,
+      r#"Xor[a, b]"#,
+    );
+  }
+  #[test]
+  fn between_1() {
+    assert_case(r#"Between[6, {4, 10}]"#, r#"True"#);
+  }
+  #[test]
+  fn between_2() {
+    assert_case(r#"Between[6, {4, 10}]; Between[{4, 10}][6]"#, r#"True"#);
+  }
+  #[test]
+  fn between_3() {
+    assert_case(
+      r#"Between[6, {4, 10}]; Between[{4, 10}][6]; Between[2, {E, Pi}]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn equal_1() {
+    assert_case(r#"1 == 1."#, r#"True"#);
+  }
+  #[test]
+  fn equal_2() {
+    assert_case(r#"1 == 1.; 5/3 == 3/2"#, r#"False"#);
+  }
+  #[test]
+  fn greater_1() {
+    assert_case(r#"E > 1"#, r#"True"#);
+  }
+  #[test]
+  fn greater_2() {
+    assert_case(r#"E > 1; a > b > c // FullForm"#, r#"FullForm[a > b > c]"#);
+  }
+  #[test]
+  fn greater_3() {
+    assert_case(r#"E > 1; a > b > c // FullForm; 3 > 2 > 1"#, r#"True"#);
+  }
+  #[test]
+  fn less_equal_1() {
+    assert_case(r#"a < b <= c"#, r#"Inequality[a, Less, b, LessEqual, c]"#);
+  }
+  #[test]
+  fn inequality() {
+    assert_case(
+      r#"a < b <= c; Inequality[a, Greater, b, LessEqual, c]"#,
+      r#"a > b && b <= c"#,
+    );
+  }
+  #[test]
+  fn less_equal_2() {
+    assert_case(
+      r#"a < b <= c; Inequality[a, Greater, b, LessEqual, c]; 1 < 2 <= 3"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn less_1() {
+    assert_case(
+      r#"a < b <= c; Inequality[a, Greater, b, LessEqual, c]; 1 < 2 <= 3; 1 < 2 > 0"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn less_2() {
+    assert_case(
+      r#"a < b <= c; Inequality[a, Greater, b, LessEqual, c]; 1 < 2 <= 3; 1 < 2 > 0; 1 < 2 < -1"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn less_3() {
+    assert_case(r#"1 < 0; 2/18 < 1/5 < Pi/10"#, r#"True"#);
+  }
+  #[test]
+  fn less_4() {
+    assert_case(r#"1 < 0; 2/18 < 1/5 < Pi/10; 1 < 3 < x < 2"#, r#"False"#);
+  }
+  #[test]
+  fn less_equal_3() {
+    assert_case(r#"LessEqual[1, 3, 3, 2]"#, r#"False"#);
+  }
+  #[test]
+  fn less_equal_4() {
+    assert_case(r#"LessEqual[1, 3, 3, 2]; 1 <= 3 <= 3"#, r#"True"#);
+  }
+  #[test]
+  fn max_1() {
+    assert_case(r#"Max[4, -8, 1]"#, r#"4"#);
+  }
+  #[test]
+  fn max_2() {
+    assert_case(
+      r#"Max[4, -8, 1]; Max[E - Pi, Pi, E + Pi, 2 E]"#,
+      r#"E + Pi"#,
+    );
+  }
+  #[test]
+  fn max_3() {
+    assert_case(
+      r#"Max[4, -8, 1]; Max[E - Pi, Pi, E + Pi, 2 E]; Max[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]"#,
+      r#"3.5"#,
+    );
+  }
+  #[test]
+  fn max_4() {
+    assert_case(
+      r#"Max[4, -8, 1]; Max[E - Pi, Pi, E + Pi, 2 E]; Max[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Max[x, y]"#,
+      r#"Max[x, y]"#,
+    );
+  }
+  #[test]
+  fn max_5() {
+    assert_case(
+      r#"Max[4, -8, 1]; Max[E - Pi, Pi, E + Pi, 2 E]; Max[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Max[x, y]; Max[5, x, -3, y, 40]"#,
+      r#"Max[40, x, y]"#,
+    );
+  }
+  #[test]
+  fn max_6() {
+    assert_case(
+      r#"Max[4, -8, 1]; Max[E - Pi, Pi, E + Pi, 2 E]; Max[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Max[x, y]; Max[5, x, -3, y, 40]; Max[]"#,
+      r#"-Infinity"#,
+    );
+  }
+  #[test]
+  fn max_7() {
+    assert_case(
+      r#"Max[4, -8, 1]; Max[E - Pi, Pi, E + Pi, 2 E]; Max[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Max[x, y]; Max[5, x, -3, y, 40]; Max[]; Max[-1.37, 2, "a", b]"#,
+      r#"Max[2, "a", b]"#,
+    );
+  }
+  #[test]
+  fn min_1() {
+    assert_case(r#"Min[4, -8, 1]"#, r#"-8"#);
+  }
+  #[test]
+  fn min_2() {
+    assert_case(
+      r#"Min[4, -8, 1]; Min[E - Pi, Pi, E + Pi, 2 E]"#,
+      r#"E - Pi"#,
+    );
+  }
+  #[test]
+  fn min_3() {
+    assert_case(
+      r#"Min[4, -8, 1]; Min[E - Pi, Pi, E + Pi, 2 E]; Min[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]"#,
+      r#"-Infinity"#,
+    );
+  }
+  #[test]
+  fn min_4() {
+    assert_case(
+      r#"Min[4, -8, 1]; Min[E - Pi, Pi, E + Pi, 2 E]; Min[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Min[x, y]"#,
+      r#"Min[x, y]"#,
+    );
+  }
+  #[test]
+  fn min_5() {
+    assert_case(
+      r#"Min[4, -8, 1]; Min[E - Pi, Pi, E + Pi, 2 E]; Min[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Min[x, y]; Min[5, x, -3, y, 40]"#,
+      r#"Min[-3, x, y]"#,
+    );
+  }
+  #[test]
+  fn min_6() {
+    assert_case(
+      r#"Min[4, -8, 1]; Min[E - Pi, Pi, E + Pi, 2 E]; Min[{1,2},3,{-3,3.5,-Infinity},{{1/2}}]; Min[x, y]; Min[5, x, -3, y, 40]; Min[]"#,
+      r#"Infinity"#,
+    );
+  }
+  #[test]
+  fn equal_3() {
+    assert_case(r#"a === a"#, r#"True"#);
+  }
+  #[test]
+  fn unequal_1() {
+    assert_case(r#"1 != 1."#, r#"False"#);
+  }
+  #[test]
+  fn unequal_2() {
+    assert_case(r#"1 != 1.; 1 != 2 != 3"#, r#"True"#);
+  }
+  #[test]
+  fn unequal_3() {
+    assert_case(r#"1 != 1.; 1 != 2 != 3; 1 != 2 != x"#, r#"1 != 2 != x"#);
+  }
+  #[test]
+  fn angle_vector_1() {
+    assert_case(r#"AngleVector[90 Degree]"#, r#"{0, 1}"#);
+  }
+  #[test]
+  fn angle_vector_2() {
+    assert_case(
+      r#"AngleVector[90 Degree]; AngleVector[{1, 10}, a]"#,
+      r#"{1 + Cos[a], 10 + Sin[a]}"#,
+    );
+  }
+  #[test]
+  fn plus_1() {
+    assert_case(r#"\! \(2+2\)"#, r#"4"#);
+  }
+  #[test]
+  fn divide_4() {
+    assert_case(r#"30 / 5; 1 / 8; Pi / 4"#, r#"Pi / 4"#);
+  }
+  #[test]
+  fn divide_5() {
+    assert_case(
+      r#"30 / 5; 1 / 8; Pi / 4; Pi / 4.0"#,
+      r#"0.7853981633974483"#,
+    );
+  }
+  #[test]
+  fn divide_6() {
+    assert_case(r#"30 / 5; 1 / 8; Pi / 4; Pi / 4.0; 1 / 8"#, r#"1 / 8"#);
+  }
+  #[test]
+  fn leaf_count_1() {
+    assert_case(
+      r#"LeafCount[1 + x + y^a]; LeafCount[f[x, y]]; LeafCount[{1 / 3, 1 + I}]; LeafCount[Sqrt[2]]"#,
+      r#"5"#,
+    );
+  }
+  #[test]
+  fn leaf_count_2() {
+    assert_case(
+      r#"LeafCount[1 + x + y^a]; LeafCount[f[x, y]]; LeafCount[{1 / 3, 1 + I}]; LeafCount[Sqrt[2]]; LeafCount[100!]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn level_1() {
+    assert_case(
+      r#"Level[a + b ^ 3 * f[2 x ^ 2], {-1}]; Level[{{{{a}}}}, 3]; Level[{{{{a}}}}, -4]; Level[{{{{a}}}}, -5]; Level[h0[h1[h2[h3[a]]]], {0, -1}]; Level[{{{{a}}}}, 3, Heads -> True]"#,
+      r#"{List, List, List, {a}, {{a}}, {{{a}}}}"#,
+    );
+  }
+  #[test]
+  fn level_2() {
+    assert_case(
+      r#"Level[a + b ^ 3 * f[2 x ^ 2], {-1}]; Level[{{{{a}}}}, 3]; Level[{{{{a}}}}, -4]; Level[{{{{a}}}}, -5]; Level[h0[h1[h2[h3[a]]]], {0, -1}]; Level[{{{{a}}}}, 3, Heads -> True]; Level[x^2 + y^3, 3, Heads -> True]"#,
+      r#"{Plus, Power, x, 2, x ^ 2, Power, y, 3, y ^ 3}"#,
+    );
+  }
+  #[test]
+  fn level_3() {
+    assert_case(
+      r#"Level[a + b ^ 3 * f[2 x ^ 2], {-1}]; Level[{{{{a}}}}, 3]; Level[{{{{a}}}}, -4]; Level[{{{{a}}}}, -5]; Level[h0[h1[h2[h3[a]]]], {0, -1}]; Level[{{{{a}}}}, 3, Heads -> True]; Level[x^2 + y^3, 3, Heads -> True]; Level[a ^ 2 + 2 * b, {-1}, Heads -> True]"#,
+      r#"{Plus, Power, a, 2, Times, 2, b}"#,
+    );
+  }
+  #[test]
+  fn level_4() {
+    assert_case(
+      r#"Level[a + b ^ 3 * f[2 x ^ 2], {-1}]; Level[{{{{a}}}}, 3]; Level[{{{{a}}}}, -4]; Level[{{{{a}}}}, -5]; Level[h0[h1[h2[h3[a]]]], {0, -1}]; Level[{{{{a}}}}, 3, Heads -> True]; Level[x^2 + y^3, 3, Heads -> True]; Level[a ^ 2 + 2 * b, {-1}, Heads -> True]; Level[f[g[h]][x], {-1}, Heads -> True]"#,
+      r#"{f, g, h, x}"#,
+    );
+  }
+  #[test]
+  fn level_5() {
+    assert_case(
+      r#"Level[a + b ^ 3 * f[2 x ^ 2], {-1}]; Level[{{{{a}}}}, 3]; Level[{{{{a}}}}, -4]; Level[{{{{a}}}}, -5]; Level[h0[h1[h2[h3[a]]]], {0, -1}]; Level[{{{{a}}}}, 3, Heads -> True]; Level[x^2 + y^3, 3, Heads -> True]; Level[a ^ 2 + 2 * b, {-1}, Heads -> True]; Level[f[g[h]][x], {-1}, Heads -> True]; Level[f[g[h]][x], {-2, -1}, Heads -> True]"#,
+      r#"{f, g, h, g[h], x, f[g[h]][x]}"#,
+    );
+  }
+  #[test]
+  fn normal() {
+    assert_case(r#"Normal[Pi]"#, r#"Pi"#);
+  }
+  #[test]
+  fn lerch_phi_1() {
+    // wolframscript: `LerchPhi[2, 3, -1.5]` = 51.981… - 2.135…·I, using
+    // its analytic continuation outside the convergence radius
+    // (|z| > 1). The branch matches Wolfram's by combining
+    //   * the PV integral representation for a > 0, plus
+    //     `-iπ·(ln z)^(s−1)·z^(−a) / (s−1)!` from the residue at
+    //     t = ln z,
+    //   * the recurrence `LerchPhi(z, s, a) = |a|^(−s) + z·LerchPhi(z, s, a+1)`
+    //     to walk negative a up to a positive value.
+    // The closed-form identity `LerchPhi[1, 2, 1/4] == 8 Catalan + Pi^2`
+    // is still checked since it exercises a different (z = 1) path.
+    assert_case(r#"LerchPhi[1, 2, 1/4] == 8 Catalan + Pi^2"#, r#"True"#);
+  }
+  #[test]
+  fn lerch_phi_2() {
+    assert_case(
+      r#"LerchPhi[2, 3, -1.5]; LerchPhi[1, 2, 1/4] == 8 Catalan + Pi^2"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn factorial_4() {
+    assert_case(r#"20!"#, r#"2432902008176640000"#);
+  }
+  #[test]
+  fn factorial_5() {
+    assert_case(r#"20!; 10.5!"#, r#"1.1899423083962249*^7"#);
+  }
+  #[test]
+  fn plus_2() {
+    assert_case(
+      r#"20!; 10.5!; (-3.0+1.5*I)!"#,
+      r#"0.04279434371837664 - 0.0046156525286039285*I"#,
+    );
+  }
+  #[test]
+  fn minus_1() {
+    assert_case(r#"20!; 10.5!; (-3.0+1.5*I)!; (-1.)!"#, r#"ComplexInfinity"#);
+  }
+  #[test]
+  fn divide_7() {
+    assert_case(
+      r#"20!; 10.5!; (-3.0+1.5*I)!; (-1.)!; !a! // FullForm"#,
+      r#"FullForm[ !a!]"#,
+    );
+  }
+  #[test]
+  fn factorial2() {
+    assert_case(r#"5!!"#, r#"15"#);
+  }
+  #[test]
+  fn plus_3() {
+    assert_case(r#"Plus[##]& [1, 2, 3]"#, r#"6"#);
+  }
+  #[test]
+  fn plus_4() {
+    assert_case(r#"Plus[##]& [1, 2, 3]; Plus[##2]& [1, 2, 3]"#, r#"5"#);
+  }
+  #[test]
+  fn i() {
+    assert_case(r#"2; 3+2 I; 2/9;  "hi!"; Infinity; Pi; E; I"#, r#"I"#);
+  }
+  #[test]
+  fn symbol_literal_1() {
+    assert_case(r#"2; 3+2 I; 2/9;  "hi!"; Infinity; Pi; E; I; a"#, r#"a"#);
+  }
+  #[test]
+  fn symbol_literal_2() {
+    assert_case(
+      r#"2; 3+2 I; 2/9;  "hi!"; Infinity; Pi; E; I; a; b=2;b"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn equal_4() {
+    assert_case(r#"3.1416==3.14`2"#, r#"True"#);
+  }
+  #[test]
+  fn equal_5() {
+    assert_case(r#"3.1416==3.14`2; 3.14`2==3.1416"#, r#"True"#);
+  }
+  #[test]
+  fn equal_6() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_7() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_8() {
+    // Wolframscript-matched expectation. mathics expected the symbolic
+    // `Pi == 3.14`2.` form, but wolframscript collapses `Pi == 3.14`2`
+    // to True because the BigFloat's 2-digit precision tolerance covers
+    // the gap to Pi. Woxi matches wolframscript here.
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_9() {
+    // Wolframscript-matched expectation. Same rationale as case 3965 — the
+    // 2-digit BigFloat tolerance makes `3.14`2 == Pi` collapse to True.
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_10() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_11() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_12() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0; 0`===0."#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_13() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0; 0`===0.; 0`2===0"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_14() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0; 0`===0.; 0`2===0; 0`2===0."#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn equal_15() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0; 0`===0.; 0`2===0; 0`2===0.; 0.`==0."#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_16() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0; 0`===0.; 0`2===0; 0`2===0.; 0.`==0.; 2^^1.000000000000000000000000000000000000000000000000000000000000 ==  2^^1.000000000000000000000000000000000000000000000000000000000001"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_17() {
+    assert_case(
+      r#"3.1416==3.14`2; 3.14`2==3.1416; 3.1416`4==3.14`2; 3.14`2==3.1416`4; Pi==3.14`2; 3.14`2==Pi; 0`==0; 0`3==0; 0`===0.; 0`2===0; 0`2===0.; 0.`==0.; 2^^1.000000000000000000000000000000000000000000000000000000000000 ==  2^^1.000000000000000000000000000000000000000000000000000000000001; 2^^1.000000000000000000000000000000000000000000000000000000000000 ==  2^^1.000000000000000000000000000000000000000000000000000010000000"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn list_literal() {
+    assert_case(
+      r#"{a, b} = {2^10000, 2^10000 + 1}; {a == b, a < b, a <= b}"#,
+      r#"{False, True, True}"#,
+    );
+  }
+  #[test]
+  fn equal_18() {
+    assert_case(
+      r#"ByteOrdering; ByteOrdering == -1 || ByteOrdering == 1"#,
+      r#"ByteOrdering == -1 || ByteOrdering == 1"#,
+    );
+  }
+  #[test]
+  fn equal_19() {
+    assert_case(r#"x === Global`x"#, r#"True"#);
+  }
+  #[test]
+  fn equal_20() {
+    assert_case(r#"x === Global`x; `x === Global`x"#, r#"True"#);
+  }
+  #[test]
+  fn equal_21() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn equal_22() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_23() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn plus_5() {
+    assert_case(r#"E^(3+I Pi)"#, r#"-E ^ 3"#);
+  }
+  #[test]
+  fn divide_8() {
+    assert_case(r#"E^(3+I Pi); E^(I Pi/2)"#, r#"I"#);
+  }
+  #[test]
+  fn power() {
+    assert_case(r#"E^(3+I Pi); E^(I Pi/2); E^1"#, r#"E"#);
+  }
+  #[test]
+  fn symbol_literal_3() {
+    assert_case(r#"I; 0; 1; Pi; a"#, r#"a"#);
+  }
+  #[test]
+  fn minus_2() {
+    assert_case(r#"I; 0; 1; Pi; a; -Pi"#, r#"-Pi"#);
+  }
+  #[test]
+  fn minus_3() {
+    assert_case(r#"I; 0; 1; Pi; a; -Pi; (-1)^2"#, r#"1"#);
+  }
+  #[test]
+  fn minus_4() {
+    assert_case(r#"I; 0; 1; Pi; a; -Pi; (-1)^2; (-1)^3"#, r#"-1"#);
+  }
+  #[test]
+  fn symbol_literal_4() {
+    assert_case(r#"I; 0; 1; Pi; a"#, r#"a"#);
+  }
+  #[test]
+  fn minus_5() {
+    assert_case(r#"I; 0; 1; Pi; a; a-a"#, r#"0"#);
+  }
+  #[test]
+  fn minus_6() {
+    assert_case(r#"I; 0; 1; Pi; a; a-a; 3-3."#, r#"0."#);
+  }
+  #[test]
+  fn factorial_6() {
+    assert_case(r#"0!"#, r#"1"#);
+  }
+}
+
+mod machine_real_division {
+  use super::*;
+
+  // wolframscript evaluates a/b as Times[a, Power[b, -1]]. When the denominator
+  // is inexact (a machine Real, or an irrational constant whose reciprocal must
+  // be rounded to a machine real), the multiply-by-reciprocal double-rounds and
+  // lands one ULP away from a single IEEE division. Woxi must match byte-for-byte.
+  #[test]
+  fn real_over_real_uses_multiply_by_reciprocal() {
+    // Direct IEEE 13.522987986828882 / 84.75863032002954 == 0.15954703297787043,
+    // but wolframscript reports the reciprocal-multiply value ...046.
+    assert_eq!(
+      interpret("13.522987986828882/84.75863032002954").unwrap(),
+      "0.15954703297787046"
+    );
+    assert_eq!(
+      interpret("65.19413797500401/78.89346277843777").unwrap(),
+      "0.8263566546456889"
+    );
+    assert_eq!(
+      interpret("44.594180686074665/72.18184923084418").unwrap(),
+      "0.6178032450160481"
+    );
+  }
+
+  #[test]
+  fn real_over_symbolic_constant_double_rounds() {
+    // 15.9/Pi: direct IEEE is 5.061127190322272, reciprocal-multiply is ...725.
+    assert_eq!(interpret("15.9/Pi").unwrap(), "5.0611271903222725");
+    assert_eq!(interpret("Divide[15.9, Pi]").unwrap(), "5.0611271903222725");
+  }
+
+  // Dividing by an exact Integer/Rational is Times[a, Rational[..]] — an exact
+  // reciprocal, so the product is single-rounded (identical to direct division).
+  // The reciprocal-multiply rule must NOT touch these (regression: CentralMoment,
+  // Kurtosis, Skewness and AbsoluteCorrelation all divide by an integer count).
+  #[test]
+  fn real_over_exact_denominator_stays_direct() {
+    assert_eq!(interpret("15.9/3").unwrap(), "5.3");
+    assert_eq!(interpret("3/15.9").unwrap(), "0.18867924528301888");
+    assert_eq!(
+      interpret("CentralMoment[{1.1, 1.2, 1.4, 2.1, 2.4}, 4]").unwrap(),
+      "0.10084511999999998"
+    );
+    assert_eq!(
+      interpret("Kurtosis[{1.1, 1.2, 1.4, 2.1, 2.4}]").unwrap(),
+      "1.4209750290831373"
+    );
+    assert_eq!(
+      interpret("Skewness[{1.1, 1.2, 1.4, 2.1, 2.4}]").unwrap(),
+      "0.4070412816074878"
+    );
+  }
+
+  // The explicit `Divide[a, b]` head is different from the `/` operator:
+  // wolframscript compiles it to a single IEEE division when the
+  // denominator is an explicit machine Real and the numerator is a plain
+  // number, so it lands one ULP away from the operator's
+  // multiply-by-reciprocal for roughly half of all operand pairs
+  // (differential-fuzzer regression, seed 1783672988021454491).
+  #[test]
+  fn divide_head_over_real_is_direct_division() {
+    assert_eq!(
+      interpret("Divide[Divide[-37, -1.8], 95]").unwrap(),
+      "0.21637426900584794"
+    );
+    assert_eq!(
+      interpret("Divide[-37, -1.8]").unwrap(),
+      "20.555555555555554"
+    );
+    assert_eq!(interpret("-37/-1.8").unwrap(), "20.555555555555557");
+    assert_eq!(
+      interpret("Divide[52.75492379532281, -48.98619485211566]").unwrap(),
+      "-1.0769345109287334"
+    );
+    assert_eq!(
+      interpret("52.75492379532281/(-48.98619485211566)").unwrap(),
+      "-1.0769345109287332"
+    );
+    // A Rational numerator also divides directly under the Divide head.
+    assert_eq!(
+      interpret("Divide[42/25, 5.7744670227102635]").unwrap(),
+      "0.2909359415150815"
+    );
+    assert_eq!(
+      interpret("(42/25)/5.7744670227102635").unwrap(),
+      "0.29093594151508145"
+    );
+    // Lists thread with the same head semantics.
+    assert_eq!(
+      interpret(
+        "InputForm[Divide[{52.75492379532281, 1.}, -48.98619485211566]]"
+      )
+      .unwrap(),
+      "InputForm[{-1.0769345109287334, -0.0204139146349068}]"
+    );
+    // A symbolic numerator falls back to the reciprocal coefficient.
+    assert_eq!(
+      interpret("InputForm[Divide[x, -48.98619485211566]]").unwrap(),
+      "InputForm[-0.0204139146349068*x]"
+    );
+  }
+}
+
+mod radical_coefficient_merge {
+  use super::*;
+
+  // A rational coefficient times a square root of a positive rational
+  // merges into one canonical radical: square the coefficient into the
+  // radicand, reduce, then pull the largest square factors back out of
+  // numerator and denominator separately (differential-fuzzer regression,
+  // seed 1783672988021454491; all wolframscript-verified).
+  #[test]
+  fn coefficient_merges_into_radical() {
+    assert_eq!(
+      interpret("InputForm[2/Sqrt[30]]").unwrap(),
+      "InputForm[Sqrt[2/15]]"
+    );
+    assert_eq!(
+      interpret("InputForm[6*Sqrt[5/3]]").unwrap(),
+      "InputForm[2*Sqrt[15]]"
+    );
+    assert_eq!(
+      interpret("InputForm[30*Sqrt[23/15]]").unwrap(),
+      "InputForm[2*Sqrt[345]]"
+    );
+    assert_eq!(
+      interpret("InputForm[-2/Sqrt[30]]").unwrap(),
+      "InputForm[-Sqrt[2/15]]"
+    );
+    assert_eq!(
+      interpret("InputForm[(3/2)*Sqrt[2/3]]").unwrap(),
+      "InputForm[Sqrt[3/2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[2*Sqrt[1/2]]").unwrap(),
+      "InputForm[Sqrt[2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[(1/3)*Sqrt[15/11]]").unwrap(),
+      "InputForm[Sqrt[5/33]]"
+    );
+    assert_eq!(
+      interpret("InputForm[(2/5)/Sqrt[14]]").unwrap(),
+      "InputForm[Sqrt[2/7]/5]"
+    );
+    assert_eq!(
+      interpret("InputForm[(4/35)*Sqrt[3/2]]").unwrap(),
+      "InputForm[(2*Sqrt[6])/35]"
+    );
+    assert_eq!(
+      interpret("InputForm[(13/35)*Sqrt[35/6]]").unwrap(),
+      "InputForm[13/Sqrt[210]]"
+    );
+    assert_eq!(
+      interpret("InputForm[3*Sqrt[46]*Sqrt[10/3]]").unwrap(),
+      "InputForm[2*Sqrt[345]]"
+    );
+    assert_eq!(
+      interpret(
+        "InputForm[Times[Times[Times[3, Sqrt[2]], Sqrt[23]], \
+         Divide[Times[2, Sqrt[25]], Sqrt[30]]]]"
+      )
+      .unwrap(),
+      "InputForm[2*Sqrt[345]]"
+    );
+  }
+
+  // The same merge runs when the radicand carries a named positive constant
+  // alongside its rational part: the coefficient folds in, the constant stays
+  // inside. All wolframscript-verified.
+  #[test]
+  fn coefficient_merges_into_radical_with_constants() {
+    assert_eq!(
+      interpret("InputForm[Sqrt[2*Pi]/2]").unwrap(),
+      "InputForm[Sqrt[Pi/2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[2*Pi]/4]").unwrap(),
+      "InputForm[Sqrt[Pi/2]/2]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[2*Pi]/6]").unwrap(),
+      "InputForm[Sqrt[Pi/2]/3]"
+    );
+    assert_eq!(
+      interpret("InputForm[(3/2)*Sqrt[2*Pi]]").unwrap(),
+      "InputForm[3*Sqrt[Pi/2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[3*Pi]/3]").unwrap(),
+      "InputForm[Sqrt[Pi/3]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[2*E]/2]").unwrap(),
+      "InputForm[Sqrt[E/2]]"
+    );
+    // A reciprocal radical flips only once its numerator carries something.
+    assert_eq!(
+      interpret("InputForm[2/Sqrt[2*Pi]]").unwrap(),
+      "InputForm[Sqrt[2/Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[4/Sqrt[2*Pi]]").unwrap(),
+      "InputForm[2*Sqrt[2/Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[6/Sqrt[2*Pi]]").unwrap(),
+      "InputForm[3*Sqrt[2/Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[1/Sqrt[Pi/2]]").unwrap(),
+      "InputForm[Sqrt[2/Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[1/(3*Sqrt[Pi/2])]").unwrap(),
+      "InputForm[Sqrt[2/Pi]/3]"
+    );
+    assert_eq!(
+      interpret("InputForm[(Pi/2)^(-1/3)]").unwrap(),
+      "InputForm[(2/Pi)^(1/3)]"
+    );
+    // Sqrt itself extracts the square part of a rational denominator, not
+    // just of the numerator.
+    assert_eq!(
+      interpret("InputForm[Sqrt[Pi/4]]").unwrap(),
+      "InputForm[Sqrt[Pi]/2]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[Pi/8]]").unwrap(),
+      "InputForm[Sqrt[Pi/2]/2]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[Pi/18]]").unwrap(),
+      "InputForm[Sqrt[Pi/2]/3]"
+    );
+  }
+
+  // Already-canonical shapes are fixed points and must not be rewritten.
+  #[test]
+  fn canonical_shapes_are_fixed_points() {
+    // A radicand whose rational part has no square factor stays put, and a
+    // radicand that would come out a pure reciprocal keeps the reciprocal
+    // spelling — wolframscript writes 3/Sqrt[2 Pi], not 3 Sqrt[1/(2 Pi)].
+    assert_eq!(
+      interpret("InputForm[Sqrt[2*Pi]]").unwrap(),
+      "InputForm[Sqrt[2*Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[2*Sqrt[2*Pi]]").unwrap(),
+      "InputForm[2*Sqrt[2*Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[Pi/2]]").unwrap(),
+      "InputForm[Sqrt[Pi/2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[1/Sqrt[2*Pi]]").unwrap(),
+      "InputForm[1/Sqrt[2*Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[3/Sqrt[2*Pi]]").unwrap(),
+      "InputForm[3/Sqrt[2*Pi]]"
+    );
+    assert_eq!(
+      interpret("InputForm[1/(2*Sqrt[2*Pi])]").unwrap(),
+      "InputForm[1/(2*Sqrt[2*Pi])]"
+    );
+    assert_eq!(
+      interpret("InputForm[(2*Pi)^(-1/3)]").unwrap(),
+      "InputForm[(2*Pi)^(-1/3)]"
+    );
+    // A free symbol is not a constant: wolframscript splits those radicals
+    // instead of merging the coefficient in.
+    assert_eq!(
+      interpret("InputForm[Sqrt[2*x]/2]").unwrap(),
+      "InputForm[Sqrt[x]/Sqrt[2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[2/Sqrt[3]]").unwrap(),
+      "InputForm[2/Sqrt[3]]"
+    );
+    assert_eq!(
+      interpret("InputForm[2*Sqrt[3]]").unwrap(),
+      "InputForm[2*Sqrt[3]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[5/3]/2]").unwrap(),
+      "InputForm[Sqrt[5/3]/2]"
+    );
+    assert_eq!(
+      interpret("InputForm[(1/3)*Sqrt[5/11]]").unwrap(),
+      "InputForm[Sqrt[5/11]/3]"
+    );
+    assert_eq!(
+      interpret("InputForm[1/Sqrt[3]]").unwrap(),
+      "InputForm[1/Sqrt[3]]"
+    );
+  }
+
+  // A square factor too large to reach by trial division still comes out, and
+  // `Sqrt` and the `c * Sqrt[r]` merge agree about it.
+  //
+  // Regression: the merge stopped looking for square factors at 100000 while
+  // `Sqrt` kept going, so `Sqrt[100003^2 * 115]/2` reduced one way, was
+  // rebuilt the other, and the two rewrote each other forever — halving a
+  // coefficient carrying a radical (a `Mean` of two such points) never
+  // returned.
+  #[test]
+  fn large_square_factors_come_out_of_a_radical() {
+    assert_eq!(
+      interpret("InputForm[Sqrt[1150069001035]]").unwrap(),
+      "InputForm[100003*Sqrt[115]]",
+      "1150069001035 == 100003^2 * 115"
+    );
+    // Halving a coefficient that carries the radical: the shape is already
+    // canonical, so only the coefficient changes.
+    assert_eq!(
+      interpret("InputForm[(100003*Sqrt[115])/2]").unwrap(),
+      "InputForm[(100003*Sqrt[115])/2]"
+    );
+    assert_eq!(
+      interpret("InputForm[Mean[{Sqrt[115]/7, Sqrt[115]/11}]]").unwrap(),
+      "InputForm[(9*Sqrt[115])/77]"
+    );
+    assert_eq!(
+      interpret("InputForm[Sqrt[1150069001035]/2]").unwrap(),
+      "InputForm[(100003*Sqrt[115])/2]"
+    );
+    // Two distinct large primes leave nothing square to take out.
+    assert_eq!(
+      interpret("InputForm[Sqrt[15485599740329]]").unwrap(),
+      "InputForm[Sqrt[15485599740329]]",
+      "15485599740329 == 999983 * 15485863, square-free"
+    );
+    // The same factorisation reaches the rational form.
+    assert_eq!(
+      interpret("InputForm[Sqrt[1150069001035/4]]").unwrap(),
+      "InputForm[(100003*Sqrt[115])/2]"
+    );
+  }
+
+  // wolframscript pulls a positive numeric factor out of a product radicand
+  // as its own radical, and only when the rest is NOT numeric.
+  #[test]
+  fn positive_numeric_factor_splits_off_the_radical() {
+    for (input, expected) in [
+      ("Sqrt[2*x]", "Sqrt[2]*Sqrt[x]"),
+      ("Sqrt[8*x]", "2*Sqrt[2]*Sqrt[x]"),
+      ("Sqrt[12*x]", "2*Sqrt[3]*Sqrt[x]"),
+      ("Sqrt[4*x]", "2*Sqrt[x]"),
+      ("Sqrt[2*x*y]", "Sqrt[2]*Sqrt[x*y]"),
+      ("Sqrt[x/2]", "Sqrt[x]/Sqrt[2]"),
+      ("Sqrt[2*x/3]", "Sqrt[2/3]*Sqrt[x]"),
+      // Named constants stay under the numeric radical.
+      ("Sqrt[2*Pi*x]", "Sqrt[2*Pi]*Sqrt[x]"),
+      ("Sqrt[Pi*x]", "Sqrt[Pi]*Sqrt[x]"),
+      ("Sqrt[GoldenRatio*x]", "Sqrt[GoldenRatio]*Sqrt[x]"),
+      // The sign and the imaginary unit stay with the symbolic part.
+      ("Sqrt[-2*x]", "Sqrt[2]*Sqrt[-x]"),
+      ("Sqrt[-x/3]", "Sqrt[-x]/Sqrt[3]"),
+      ("Sqrt[-2*x/3]", "Sqrt[2/3]*Sqrt[-x]"),
+      ("Sqrt[2*I*x]", "Sqrt[2]*Sqrt[I*x]"),
+      // A factor that already carries a fractional exponent collapses on its
+      // own rather than joining the other radical.
+      ("Sqrt[2*Sqrt[3]*x]", "Sqrt[2]*3^(1/4)*Sqrt[x]"),
+      ("Sqrt[2*Sqrt[3]]", "Sqrt[2]*3^(1/4)"),
+      // Machine reals evaluate instead of staying under a radical.
+      ("Sqrt[2.*x]", "1.4142135623730951*Sqrt[x]"),
+      // Nothing to split: the whole radicand is numeric, or none of it is.
+      ("Sqrt[2*Pi]", "Sqrt[2*Pi]"),
+      ("Sqrt[-x]", "Sqrt[-x]"),
+      ("Sqrt[2*(1 + Sqrt[2])]", "Sqrt[2*(1 + Sqrt[2])]"),
+      // A numeric factor only splits off when it is a positive real.
+      ("Sqrt[(1 - Sqrt[2])*x]", "Sqrt[(1 - Sqrt[2])*x]"),
+      ("Sqrt[(2 + I)*x]", "Sqrt[(2 + I)*x]"),
+      ("Sqrt[(1 + Sqrt[2])*x]", "Sqrt[1 + Sqrt[2]]*Sqrt[x]"),
+      ("Sqrt[Log[2]*x]", "Sqrt[x]*Sqrt[Log[2]]"),
+    ] {
+      assert_eq!(
+        interpret(&format!("InputForm[{input}]")).unwrap(),
+        format!("InputForm[{expected}]"),
+        "for {}",
+        input
+      );
+    }
+  }
+
+  // Numerator/Denominator split a fractional power of a rational into its
+  // parts: (2/15)^(1/2) is 2^(1/2) * 15^(-1/2) (fuzzer regression:
+  // Numerator[Divide[Sqrt[2], Divide[Times[-4, Sqrt[3]], Times[-1,
+  // Sqrt[10]]]]] must give Sqrt[5], not Sqrt[5/3]).
+  #[test]
+  fn numerator_denominator_split_rational_radicand() {
+    assert_eq!(
+      interpret("InputForm[Numerator[2/Sqrt[30]]]").unwrap(),
+      "InputForm[Sqrt[2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Denominator[2/Sqrt[30]]]").unwrap(),
+      "InputForm[Sqrt[15]]"
+    );
+    assert_eq!(
+      interpret(
+        "InputForm[Numerator[Divide[Sqrt[2], Divide[Times[-4, Sqrt[3]], \
+         Times[-1, Sqrt[10]]]]]]"
+      )
+      .unwrap(),
+      "InputForm[Sqrt[5]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Denominator[Sqrt[5/3]/2]]").unwrap(),
+      "InputForm[2*Sqrt[3]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Numerator[(2/15)^(3/2)]]").unwrap(),
+      "InputForm[2*Sqrt[2]]"
+    );
+    assert_eq!(
+      interpret("InputForm[Denominator[(2/15)^(3/2)]]").unwrap(),
+      "InputForm[15*Sqrt[15]]"
+    );
+  }
+}
+
+mod canonical_order_radicals {
+  use super::*;
+
+  // Canonical order strips number-literal coefficients before comparing
+  // and only breaks a tie on the symbolic part by coefficient, ascending
+  // (differential-fuzzer regression, seed 8305606480288499401; all
+  // wolframscript-verified).
+  #[test]
+  fn order_strips_numeric_coefficients() {
+    assert_eq!(interpret("Order[2*Sqrt[2], Sqrt[11]]").unwrap(), "1");
+    assert_eq!(interpret("Order[-Sqrt[11], 2*Sqrt[6]]").unwrap(), "-1");
+    assert_eq!(interpret("Order[2*x, y]").unwrap(), "1");
+    assert_eq!(interpret("Order[2*x, x]").unwrap(), "-1");
+    assert_eq!(interpret("Order[-x, x]").unwrap(), "1");
+  }
+
+  // Powers of integer bases order by base ascending, then exponent
+  // ascending (wolframscript-verified).
+  #[test]
+  fn integer_base_powers_order_numerically() {
+    assert_eq!(interpret("Order[Sqrt[2], Sqrt[11]]").unwrap(), "1");
+    assert_eq!(interpret("Order[2^(1/3), Sqrt[2]]").unwrap(), "1");
+    assert_eq!(interpret("Order[Sqrt[2], 2^(2/3)]").unwrap(), "1");
+    assert_eq!(
+      interpret("Sort[{Sqrt[11], 2*Sqrt[2]}]").unwrap(),
+      "{2*Sqrt[2], Sqrt[11]}"
+    );
+    assert_eq!(interpret("Sort[{y, 2*x}]").unwrap(), "{2*x, y}");
+  }
+
+  // Times orders Plus factors by their terms from the last (canonically
+  // greatest) one backward, comparing coefficient-stripped terms first
+  // (differential-fuzzer regression, seed 8305606480288499401; all
+  // wolframscript-verified).
+  #[test]
+  fn radical_sum_factors_order() {
+    assert_eq!(
+      interpret("InputForm[(1 + Sqrt[8]) (Sqrt[11] - Sqrt[5])]").unwrap(),
+      "InputForm[(1 + 2*Sqrt[2])*(-Sqrt[5] + Sqrt[11])]"
+    );
+    assert_eq!(
+      interpret("InputForm[(Sqrt[5] - Sqrt[11]) (2 Sqrt[6] - 2 Sqrt[2])]")
+        .unwrap(),
+      "InputForm[(-2*Sqrt[2] + 2*Sqrt[6])*(Sqrt[5] - Sqrt[11])]"
+    );
+    assert_eq!(
+      interpret(
+        "InputForm[Numerator[Times[Plus[Sqrt[24], Times[-1, Sqrt[8]]], \
+         Subtract[Times[-1, Sqrt[11]], Sqrt[5]]]]]"
+      )
+      .unwrap(),
+      "InputForm[(-2*Sqrt[2] + 2*Sqrt[6])*(-Sqrt[5] - Sqrt[11])]"
+    );
+    // Coefficient tie-breaks and mixed atom/radical sums keep their
+    // established order.
+    assert_eq!(
+      interpret("InputForm[(1 + 2 Sqrt[2]) (2 + Sqrt[2])]").unwrap(),
+      "InputForm[(2 + Sqrt[2])*(1 + 2*Sqrt[2])]"
+    );
+    assert_eq!(
+      interpret("InputForm[(1 + Sqrt[7]) (Sqrt[2] + Sqrt[3])]").unwrap(),
+      "InputForm[(Sqrt[2] + Sqrt[3])*(1 + Sqrt[7])]"
+    );
+  }
+}
+
+mod expand_radical_terms {
+  use super::*;
+
+  // Expand re-runs radical-bearing terms through Times so numeric
+  // radicals merge and take their canonical position (differential
+  // fuzzer, seed 6493139821400918028; all wolframscript-verified).
+  #[test]
+  fn radical_products_merge() {
+    assert_eq!(
+      interpret("Expand[(Sqrt[26] - Sqrt[28]) (Sqrt[21] Sqrt[3])]").unwrap(),
+      "-42 + 3*Sqrt[182]"
+    );
+    assert_eq!(
+      interpret("Expand[(Sqrt[2] + Sqrt[3]) (Sqrt[5] + Sqrt[7])]").unwrap(),
+      "Sqrt[10] + Sqrt[14] + Sqrt[15] + Sqrt[21]"
+    );
+    assert_eq!(
+      interpret("Expand[(x + Sqrt[2]) (x + Sqrt[8])]").unwrap(),
+      "4 + 3*Sqrt[2]*x + x^2"
+    );
+    assert_eq!(
+      interpret("Expand[(1 + Sqrt[2])^2]").unwrap(),
+      "3 + 2*Sqrt[2]"
+    );
+  }
+}
+
+mod simplify_radical_content {
+  use super::*;
+
+  // Simplify follows the exact SimplifyCount for radical sums: a common
+  // radical factor extracts on a strict win, numeric content extracts on
+  // a strict win or a unit-cofactor tie, everything else stays expanded
+  // (differential fuzzer, seeds 14799314084710522344 and
+  // 12449481718952209155; all wolframscript-verified).
+  #[test]
+  fn radical_and_content_extraction() {
+    assert_eq!(
+      interpret("Simplify[-Sqrt[8] - (Sqrt[2] - Sqrt[10])]").unwrap(),
+      "Sqrt[2]*(-3 + Sqrt[5])"
+    );
+    assert_eq!(
+      interpret("Simplify[Sqrt[4]*(-4*Sqrt[30]) - (-2)*Sqrt[8]]").unwrap(),
+      "4*Sqrt[2] - 8*Sqrt[30]"
+    );
+    assert_eq!(
+      interpret("Simplify[Sqrt[2] + Sqrt[10]]").unwrap(),
+      "Sqrt[2] + Sqrt[10]"
+    );
+    assert_eq!(
+      interpret("Simplify[9 + 9*Sqrt[19]]").unwrap(),
+      "9*(1 + Sqrt[19])"
+    );
+  }
+
+  // A sum with a VARIABLE-denominator term never extracts numeric content
+  // (Simplify[-4 - 2/x] keeps the split form, never -2*(2 + x^(-1)));
+  // numeric-radical denominators still participate
+  // (wolframscript-verified).
+  #[test]
+  fn variable_denominator_sums_stay_split() {
+    assert_eq!(interpret("Simplify[-4 - 2/x]").unwrap(), "-4 - 2/x");
+    assert_eq!(interpret("Simplify[(-2 - 4 x)/x]").unwrap(), "-4 - 2/x");
+    assert_eq!(
+      interpret("Simplify[3/2 + (3/2)*Sqrt[2]]").unwrap(),
+      "(3*(1 + Sqrt[2]))/2"
+    );
+  }
+}
+
+mod simplify_sign_pull_ties {
+  use super::*;
+
+  // The sign-only -(…) pull competes for ANY negative numerator content
+  // and wins SimplifyCount ties against the content extraction; a strict
+  // count win keeps the extraction (differential fuzzer, seed
+  // 5520550946540289960; all wolframscript-verified).
+  #[test]
+  fn pull_beats_extraction_on_tie() {
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(1 + 5 x)]").unwrap(),
+      "-((2 + 4*x)/(1 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Simplify[(-3 - 6 x)/(1 + 5 x)]").unwrap(),
+      "-((3 + 6*x)/(1 + 5*x))"
+    );
+    assert_eq!(
+      interpret("Simplify[(-5 - 10 x)/(1 + 7 x)]").unwrap(),
+      "(-5*(1 + 2*x))/(1 + 7*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(-10 - 20 x)/(1 + 5 x)]").unwrap(),
+      "(-10*(1 + 2*x))/(1 + 5*x)"
+    );
+    assert_eq!(
+      interpret("Simplify[(2 + 4 x)/(1 + 5 x)]").unwrap(),
+      "(2 + 4*x)/(1 + 5*x)"
+    );
+  }
+
+  // A monomial denominator's coefficient joins the pulled sign as a
+  // rational prefactor, and that display is final — no candidate may
+  // re-expand or re-combine it (wolframscript-verified).
+  #[test]
+  fn monomial_denominator_pull_display() {
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(5 x)]").unwrap(),
+      "-1/5*(2 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[(-1 - 4 x)/(5 x)]").unwrap(),
+      "-1/5*(1 + 4*x)/x"
+    );
+    assert_eq!(
+      interpret("Simplify[(-2 - 4 x)/(5 x^2)]").unwrap(),
+      "-1/5*(2 + 4*x)/x^2"
+    );
+    assert_eq!(
+      interpret("Simplify[(5 + 3 x)/(5 x)]").unwrap(),
+      "3/5 + x^(-1)"
+    );
+  }
+}
+
+mod quotient_term_plus_order {
+  use super::*;
+
+  // Rational terms over reciprocal-sum denominators order by their
+  // greatest base: the term missing the canonically greatest base comes
+  // first; on a shared leading base the exponents compare ascending
+  // (differential fuzzer, seed 4040222378236757762; all
+  // wolframscript-verified).
+  #[test]
+  fn quotient_rule_shape() {
+    assert_eq!(
+      interpret("D[(5 - 2 x + 4 x^2)/(-5 - 4 x + 4 x^2), x]").unwrap(),
+      "(-2 + 8*x)/(-5 - 4*x + 4*x^2) - \
+       ((-4 + 8*x)*(5 - 2*x + 4*x^2))/(-5 - 4*x + 4*x^2)^2"
+    );
+    assert_eq!(
+      interpret(
+        "(-2 + 8 x)/(-5 - 4 x + 4 x^2) - \
+         (-4 + 8 x)/(-5 - 4 x + 4 x^2)^2"
+      )
+      .unwrap(),
+      "-((-4 + 8*x)/(-5 - 4*x + 4*x^2)^2) + (-2 + 8*x)/(-5 - 4*x + 4*x^2)"
+    );
+    assert_eq!(
+      interpret(
+        "(-2 + 8 x)/(-5 - 4 x + 4 x^2) - \
+         (5 - 2 x + 4 x^2)/(-5 - 4 x + 4 x^2)^2"
+      )
+      .unwrap(),
+      "(-2 + 8*x)/(-5 - 4*x + 4*x^2) - (5 - 2*x + 4*x^2)/(-5 - 4*x + 4*x^2)^2"
+    );
+    // The Apart tail: polynomial terms first, the reciprocal term last.
+    assert_eq!(
+      interpret("Apart[(1 + 5 x - 3 x^2 + 3 x^3)/(1 - 2 x)]").unwrap(),
+      "-17/8 + (3*x)/4 - (3*x^2)/2 - 25/(8*(-1 + 2*x))"
+    );
+  }
+
+  // D keeps a chain-rule reciprocal composed — no integer-content
+  // cancellation through the squared denominator — while still cancelling
+  // shared SYMBOLIC factors (differential fuzzer, seed
+  // 15005068122302321648; all wolframscript-verified).
+  #[test]
+  fn d_reciprocal_keeps_composed_shape() {
+    assert_eq!(
+      interpret("D[3/(2 + 4 x - 4 x^2), x]").unwrap(),
+      "(-3*(4 - 8*x))/(2 + 4*x - 4*x^2)^2"
+    );
+    assert_eq!(interpret("D[4/(2 + 4 x), x]").unwrap(), "-16/(2 + 4*x)^2");
+    assert_eq!(interpret("D[2/(2 + 2 x), x]").unwrap(), "-4/(2 + 2*x)^2");
+    assert_eq!(interpret("D[Log[x^2], x]").unwrap(), "2/x");
+  }
+}

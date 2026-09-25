@@ -1,0 +1,148 @@
+# Fuzzing Woxi
+
+Two complementary fuzzing setups live in this repo:
+
+1. **Crash fuzzing** (this directory) — coverage-guided libFuzzer targets
+   that assert the parser and interpreter never panic, hang, or overflow
+   the stack, whatever the input.
+2. **Differential fuzzing** (`src/bin/diff_fuzz.rs`) — generates random
+   valid programs and checks that `woxi eval` and `wolframscript -code`
+   produce identical output, which is the project's core contract.
+
+
+## Crash fuzzing (`cargo fuzz`)
+
+Requires a nightly toolchain and [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html)
+(`cargo install cargo-fuzz`). The make targets handle corpus seeding and
+the cargo-fuzz install:
+
+```sh
+make fuzz-parse      # fuzz woxi::parse (syntax level)
+make fuzz-interpret  # fuzz woxi::interpret (full pipeline)
+```
+
+Both run until interrupted (Ctrl-C). Findings land in `fuzz/artifacts/`;
+reproduce one with:
+
+```sh
+cargo +nightly fuzz run interpret fuzz/artifacts/interpret/crash-<hash>
+```
+
+Once a crash is fixed, keep the input as a regression test (a unit test in
+`tests/`, per the repo testing rules) — the corpus and artifacts
+directories are gitignored.
+
+Details:
+
+- The corpora are seeded from `tests/scripts/*.wls` plus generated
+  expressions (`make fuzz-corpus`), so the fuzzer starts from valid
+  programs instead of random bytes.
+- The `interpret` corpus is then pruned by `scripts/prune_fuzz_corpus.sh`,
+  which drops the seeds that target would skip anyway (oversized or
+  denylisted) and *times* the rest, dropping any that needs more than
+  `FUZZ_SEED_BUDGET` seconds (default 1) in a release build. Many test
+  scripts legitimately compute for seconds — and a few never terminate by
+  design — which the `-timeout` hang detector would misreport as crashes;
+  ASan multiplies those seconds by roughly 27. Measuring instead of
+  maintaining a list means a newly added heavy script cannot break the
+  nightly fuzz run.
+- The `interpret` target skips inputs containing filesystem/network heads
+  (`Export`, `Import`, `Run`, …) so fuzzing has no side effects; see
+  `SIDE_EFFECT_DENYLIST` in `fuzz_targets/interpret.rs`.
+- It also skips inputs containing a head whose termination the program
+  itself decides (`While`, `For`, `FixedPoint`, …; see
+  `NONTERMINATING_DENYLIST`). Mutating away a loop's `Break[]` or its
+  counter update produces a program that runs forever by definition — in
+  the Wolfram Language just as much as in Woxi — so the hang libFuzzer
+  reports is not a finding.
+- Every `interpret` iteration starts from a cleared session
+  (`woxi::clear_state()`). Definitions and memoized values are
+  thread-local state that outlives a single `interpret` call, and libFuzzer
+  assumes the target is a pure function of its input — without the reset a
+  finding need not reproduce from its artifact.
+- Hangs elsewhere do count as findings: libFuzzer's `-timeout` flag (set
+  in the make targets) turns a rewrite that never reaches a fixed point,
+  or any other runaway evaluation outside an explicit loop, into a
+  reported crash. For `interpret` that flag is 1200 s — four times the
+  campaign's own budget, so an input still running when the campaign ends
+  is allowed to finish rather than reported. Being *slow* is not what this
+  target tests, and a tighter bound only buys false positives: the fuzzer
+  mutates a seed's data as readily as its shape, and raising the `n` in
+  `Permutations[Range[n]]` turns a millisecond program into a minute-long
+  one that terminates perfectly well. Three nightly runs were lost that
+  way, the last to a `Fold` whose accumulator nests the whole previous
+  list each step: 21 s natively and 367 s under ASan — it finishes, but CI
+  killed it at 319 s. Exponential growth outruns any bound, so if this
+  happens again prefer denylisting the head over raising the flag further.
+- The nightly CI workflow (`.github/workflows/nightly.yml`) runs each
+  target for 5 minutes per night and uploads crashing inputs as
+  artifacts.
+
+
+## Differential fuzzing (`woxi-diff-fuzz`)
+
+Generates random, terminating expressions built only from functions that
+`functions.csv` marks implemented (curated argument shapes keep programs
+meaningful — see `FN_SPECS` in `src/bin/diff_fuzz.rs`), then compares
+woxi against a wolframscript oracle and greedily shrinks any divergence
+to a minimal reproducer:
+
+```sh
+make fuzz-diff
+# or directly:
+cargo run --bin woxi-diff-fuzz -- --cases 500 --seed 42
+```
+
+The oracle is auto-detected: a local `wolframscript` binary if one is on
+the `PATH`. Override with `--oracle wolframscript|woxi` or
+`--wolframscript <path>`. `--oracle woxi` is a self-check mode that uses
+woxi as its own oracle — useful for validating the harness itself (it
+must report zero divergences).
+
+Coverage: the table holds ~480 entries over ~410 distinct heads, spanning
+elementary and special functions, number theory, list and string surface,
+associations, linear algebra, polynomial algebra, calculus, the
+simplifiers and descriptive statistics. Adding a head means adding one
+`f("Name", &[shape, …])` line; the shapes are the `Arg` enum, and a new
+one needs a match arm in `gen_arg` plus its generator. Two rules keep the
+table honest:
+
+- Argument shapes are deliberately narrow. `Arg::TrigArg` is weighted
+  towards rational multiples of Pi and `Arg::ExactNum` excludes machine
+  reals, because a float argument collapses every special function to a
+  last-digit comparison instead of a comparison of closed forms. Matrices
+  stay 2×2/3×3 with small integer entries so exact eigenvalues and
+  inverses remain short enough to diff. Bounds like `Arg::Frac(3, 8)`
+  exist because Quantile and TrimmedMean reject anything outside them.
+- `curated_table_matches_functions_csv` fails if a head is not marked
+  implemented in `functions.csv`, and `every_spec_generates_parsable_code`
+  builds every entry 20 times and parses the result — a broken argument
+  shape cannot hide between random samples.
+
+How it works:
+
+- Cases are pre-filtered in batches (`Print[InputForm[…]]` statements
+  separated by marker prints), so one slow wolframscript start-up covers
+  `--batch-size` cases. Any differing case is re-confirmed individually
+  with the bare expression — the exact `woxi eval` vs `wolframscript
+  -code` pairing the CLI doc tests use — so the batch scaffolding can
+  never cause a false positive.
+- Outputs are compared as a sorted line-bag over stdout + stderr by
+  default, because the two tools route messages to different streams
+  (the CLI doc tests need `output_stream: combined` for the same
+  reason). Use `--compare combined|stdout` for stricter modes.
+- Runs are fully deterministic: every finding prints the master seed and
+  its per-case seed, and `--seed <n>` replays a run exactly.
+  `--print-cases` shows the generated programs without evaluating them.
+- A woxi crash, non-zero exit, or hang on generated input is always
+  reported, independent of the oracle's answer.
+- A snippet starting with `-` is parenthesised before it reaches either
+  CLI. `wolframscript -code -2` exits 255 with "-code called with no
+  argument", and the shrinker reaches bare negative literals routinely by
+  hoisting an argument out of its call, so without the guard shrinking
+  walks off towards a "reproducer" that is only a transport failure.
+- Exit code: 0 = no divergences, 1 = divergences found (with shrunk
+  reproducers in the report), 2 = setup error.
+
+When a divergence is found, fix it and add a regression test with the
+shrunk reproducer, following the repo testing rules in `CLAUDE.md`.

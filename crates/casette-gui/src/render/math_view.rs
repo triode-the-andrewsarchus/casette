@@ -144,13 +144,34 @@ fn render_matrix_view(ui: &mut Ui, result: &WorkerResponse) {
         return;
     }
 
-    // Parse matrix lines like "[1  2]\n[3  4]"
+    let trimmed_plain = plain.trim();
     let mut matrix_rows: Vec<Vec<String>> = Vec::new();
-    for line in &lines {
-        let trimmed = line.trim().trim_start_matches('[').trim_end_matches(']');
-        let cells: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
-        if !cells.is_empty() {
-            matrix_rows.push(cells);
+
+    if trimmed_plain.starts_with("{{") && trimmed_plain.ends_with("}}") {
+        // Parse Wolfram matrix syntax like "{{1, 2}, {3, 4}}"
+        let inner = &trimmed_plain[1..trimmed_plain.len() - 1];
+        for row_part in inner.split('}') {
+            let row_clean = row_part.trim().trim_start_matches(',').trim().trim_start_matches('{');
+            if row_clean.is_empty() {
+                continue;
+            }
+            let cells: Vec<String> = row_clean
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if !cells.is_empty() {
+                matrix_rows.push(cells);
+            }
+        }
+    } else {
+        // Parse matrix lines like "[1  2]\n[3  4]"
+        for line in &lines {
+            let trimmed = line.trim().trim_start_matches('[').trim_end_matches(']');
+            let cells: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
+            if !cells.is_empty() {
+                matrix_rows.push(cells);
+            }
         }
     }
 

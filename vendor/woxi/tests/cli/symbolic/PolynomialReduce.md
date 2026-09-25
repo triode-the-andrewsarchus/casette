@@ -1,0 +1,48 @@
+# `PolynomialReduce`
+
+Reduces a polynomial modulo a list of polynomials in a single variable.
+`PolynomialReduce[poly, {p1, p2, ...}, x]` returns `{{a1, a2, ...}, b}` with
+`a1 p1 + a2 p2 + ... + b == poly` and `b` the minimal remainder.
+
+```scrut
+$ wo 'PolynomialReduce[x^2 + 1, {x + 1}, x]'
+{{-1 + x}, 2}
+```
+
+```scrut
+$ wo 'PolynomialReduce[x^3 + 2 x + 1, {x^2 + 1, x + 1}, x]'
+{{x, 1}, 0}
+```
+
+```scrut
+$ wo 'PolynomialReduce[x^3, {x - 1}, x]'
+{{1 + x + x^2}, 1}
+```
+
+```scrut
+$ wo 'PolynomialReduce[x^2, {3 x + 1}, x]'
+{{-1/9 + x/3}, 1/9}
+```
+
+A divisor with rational coefficients divides just as exactly.
+The factor that clears the denominator stays in front of the quotient
+rather than being distributed into it:
+
+```scrut
+$ wo 'PolynomialReduce[1 - 2 x^3 + x^4, {(1 + x + x^2 - x^3)/2}, x]'
+{{2*(1 - x)}, 0}
+```
+
+A single divisor may be given without the surrounding list:
+
+```scrut
+$ wo 'PolynomialReduce[x^2 + 1, x + 1, x]'
+{{-1 + x}, 2}
+```
+
+When no divisor can reduce the polynomial, it is returned as the remainder:
+
+```scrut
+$ wo 'PolynomialReduce[x^2 + 1, {x^3 + 1}, x]'
+{{0}, 1 + x^2}
+```

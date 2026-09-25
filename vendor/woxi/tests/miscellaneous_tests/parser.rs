@@ -1,0 +1,319 @@
+use woxi::parse;
+
+#[cfg(test)]
+mod tests {
+  use woxi::Rule;
+
+  use super::*;
+  #[test]
+  fn test_parse_calculation() {
+    let input = "1 + 2";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_symbolic_calculation() {
+    let input = "x + 2";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_constant() {
+    let input = "Sin[Pi]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_unicode_pi() {
+    let input = "Sin[π]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_function_definition() {
+    let input = "f[x_] := x^2 + 2*x + 1";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_function_call() {
+    let input = "Plot[f[x], {x, -2, 2}]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_complex_expression() {
+    let input = "3*x^2 + 2*x + 1";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_list() {
+    let input = "{1, 2, 3, 4, 5}";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_symbolic_list() {
+    let input = "{a, b, c}";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_boolean_list() {
+    let input = "{True, False, False}";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_nested_function_calls() {
+    let input = "Cos[Sin[x]]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_complex_nested_function_calls() {
+    let input = "Plot[Sin[x], {x, -Pi, Pi}]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_program() {
+    let input = "1 + 2";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_expression() {
+    let input = "1 + 2";
+    let program = parse(input).unwrap().next().unwrap();
+    let expression = program.into_inner().next().unwrap();
+    assert_eq!(expression.as_rule(), Rule::Expression);
+  }
+
+  #[test]
+  fn test_parse_leading_dot_real_literal() {
+    let input = "Hue[.9, .3]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_part_span() {
+    let input = "{a, b, c, d}[[2;;3]]";
+    let pair = parse(input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_deeply_nested_function_calls() {
+    // Regression: deeply nested function calls must parse in linear time, not O(2^d).
+    // At 30 levels, exponential backtracking would take hours; this must finish instantly.
+    let input = "F[".repeat(30) + "x" + &"]".repeat(30);
+    let pair = parse(&input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_deeply_nested_with_implicit_times() {
+    // Ensure implicit multiplication still works correctly with deep nesting
+    let input = "F[".repeat(20) + "x" + &"]".repeat(20) + " y";
+    let pair = parse(&input).unwrap().next().unwrap();
+    assert_eq!(pair.as_rule(), Rule::Program);
+  }
+
+  #[test]
+  fn test_parse_unary_plus() {
+    let inputs = vec!["(+q)", "+x", "+5", "1 + +2", "+x^2"];
+    for input in inputs {
+      let pair = parse(input).unwrap().next().unwrap();
+      assert_eq!(pair.as_rule(), Rule::Program, "Failed to parse: {input}");
+    }
+  }
+
+  #[test]
+  fn test_parse_named_character_function_head() {
+    // Regression: a named-character symbol used as a function head — e.g. the
+    // wavefunction `\[Psi][x, t]` — must parse as a call on the decoded symbol
+    // `ψ`, not fail at the trailing `[`.
+    for input in ["\\[Psi][x, t]", "\\[Phi][r]", "\\[CapitalGamma][z]"] {
+      let pair = parse(input).unwrap().next().unwrap();
+      assert_eq!(pair.as_rule(), Rule::Program, "Failed to parse: {input}");
+    }
+    assert_eq!(
+      woxi::interpret("\\[Psi][x, t]").unwrap(),
+      "\u{03C8}[x, t]",
+      "named-char head resolves to ψ"
+    );
+  }
+
+  #[test]
+  fn test_parse_pathological_nesting_rejected_quickly() {
+    // Regression (fuzz finding): deeply nested invalid input made pest
+    // backtrack exponentially — depth 20 previously took hours to reject.
+    // The call limit in parse_wolfram must turn these into prompt errors.
+    let cases = [
+      // unclosed nested brackets
+      format!("{}x", "f[".repeat(30)),
+      // balanced nesting around a token that is invalid everywhere
+      format!("{}\u{0}{}", "f[".repeat(30), "]".repeat(30)),
+    ];
+    for input in &cases {
+      let start = std::time::Instant::now();
+      assert!(parse(input).is_err(), "should not parse: {input:?}");
+      assert!(
+        start.elapsed() < std::time::Duration::from_mins(1),
+        "rejection took too long for: {input:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_parse_truncated_nested_groups_rejected_quickly() {
+    // Regression (fuzz finding, nightly 2026-09-02): a *truncated* script —
+    // an unclosed group with real code inside it — cost 2-3x more to reject
+    // per nesting level, because every enclosing alternative parsed the same
+    // contents again before failing. Rejecting a 4 KB truncated `Graphics`
+    // script took 0.6 s, which is over the fuzzer's 10 s timeout in a
+    // sanitizer build. The balanced-group guards in the grammar make it a
+    // linear scan instead.
+    let body = "Line[{{1.5, -1.2}, {0.2, -0.8}}],\n".repeat(40);
+    let cases = [
+      format!("{}{body}", "f[\n".repeat(10)),
+      format!("{}{body}", "{\n".repeat(10)),
+      format!("{}{body}", "(\n".repeat(10)),
+      format!("{}{body}", "<|a -> ".repeat(10)),
+      // The head of a truncated call is a string / number / list literal.
+      format!("{}{body}", "\"s\"[\n".repeat(10)),
+      format!("{}{body}", "{1}[\n".repeat(10)),
+    ];
+    for input in &cases {
+      let start = std::time::Instant::now();
+      assert!(parse(input).is_err(), "should not parse: {input:?}");
+      assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "rejection took too long for: {input:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_parse_groups_closed_inside_string_literals() {
+    // The balanced-group guards skip strings and comments, so a bracket that
+    // is only string content neither opens nor closes a group — and `\"` is
+    // an escaped quote, not the end of the literal.
+    for input in [
+      r#"f["\""]"#,
+      r#"f["]"]"#,
+      r#"{"}"}"#,
+      r#"("(")"#,
+      r#"<|"a" -> "|>"|>"#,
+      r#"f["a(*b", "c"]"#,
+      "f[a (* ] *), b]",
+    ] {
+      let pair = parse(input).unwrap().next().unwrap();
+      assert_eq!(pair.as_rule(), Rule::Program, "Failed to parse: {input}");
+    }
+  }
+
+  #[test]
+  fn test_parse_deeply_nested_bracket_groups() {
+    // Regression: a term that is just a bracket group was parsed twice (three
+    // times for parentheses) because `ImplicitTimes`, `ParenExtended` and
+    // `AssociationExtended` all consumed it before failing. The waste doubled
+    // per nesting level, so these legitimate expressions used to exhaust the
+    // parser call limit.
+    for depth in 1..=25 {
+      for (open, close) in [("{", "}"), ("(", ")"), ("<|a -> ", "|>")] {
+        let input = format!("{}1{}", open.repeat(depth), close.repeat(depth));
+        assert!(parse(&input).is_ok(), "should parse: {input:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn test_deeply_nested_lists_evaluate() {
+    assert_eq!(
+      woxi::interpret("{f[{1, {{{{{{1}}}}}}}]}").unwrap(),
+      "{f[{1, {{{{{{1}}}}}}}]}"
+    );
+    assert_eq!(woxi::interpret("((((((((((1))))))))))").unwrap(), "1");
+    assert_eq!(
+      woxi::interpret("ToString[{{{{{{{{1}}}}}}}}, InputForm]").unwrap(),
+      "{{{{{{{{1}}}}}}}}"
+    );
+  }
+
+  #[test]
+  fn test_comment_holding_a_bracket_before_a_semicolon() {
+    // Regression: the zero-width lookaheads that scan ahead for a `;` (and
+    // for `;;` / `->`) walk the source bracket by bracket, and run inside an
+    // atomic rule where pest does not skip comments for them. A comment
+    // holding an unbalanced bracket, quote or semicolon therefore threw the
+    // scan off and made the whole enclosing expression unparseable — as in
+    // `For[…] (* endof For[ ik *);`, which is ordinary Demonstration code.
+    for input in [
+      "r[a (* [ *); b]",
+      "r[a (* ] *); b]",
+      "r[a (* endof For[ ij *);]",
+      "{1 (* ) *); 2}",
+      "f[a (* \" *); b]",
+      "f[a (* ; *), b]",
+      "f[a (* [ *) ;; 2]",
+      "f[a (* -> *) -> b]",
+    ] {
+      assert!(parse(input).is_ok(), "should parse: {input:?}");
+    }
+    // The comment is still only a comment: what it holds never changes the
+    // expression the parser builds.
+    assert_eq!(
+      woxi::interpret("Hold[f[a (* [ *); b]]").unwrap(),
+      "Hold[f[a; b]]"
+    );
+    assert_eq!(woxi::interpret("{1 (* ) *); 2}").unwrap(), "{2}");
+    assert_eq!(
+      woxi::interpret("Range[5][[2 (* [ *);; 3]]").unwrap(),
+      "{2, 3}"
+    );
+    assert_eq!(
+      woxi::interpret("{a, b} /. a (* [ *) -> 1").unwrap(),
+      "{1, b}"
+    );
+  }
+
+  #[test]
+  fn test_comment_inside_a_manipulate_control_block() {
+    // The same scan runs for every function argument, so a commented-out
+    // bracket between a `For` body and the `;` that ends it has to survive
+    // several levels of nesting.
+    let code = "Hold[Module[{a}, \
+       For[i = 1, i < 3, i++, \
+         { For[j = 1, j < 2, j++, {a = i j}] } (* endof For[ j *) \
+       ]; (* endof For[ i *) \
+       a]]";
+    assert!(parse(code).is_ok(), "should parse: {code:?}");
+  }
+
+  #[test]
+  fn test_bracket_group_still_starts_implicit_times() {
+    // The `SoloBracketGroup` guard must not reject a genuine juxtaposition.
+    assert_eq!(woxi::interpret("{1, 2} {3, 4}").unwrap(), "{3, 8}");
+    assert_eq!(woxi::interpret("(1 + 2) (3 + 4)").unwrap(), "21");
+    assert_eq!(woxi::interpret("{1, 2}^2 {3, 4}").unwrap(), "{3, 16}");
+    assert_eq!(woxi::interpret("{1, 2}[[1]] {3, 4}").unwrap(), "{3, 4}");
+    assert_eq!(woxi::interpret("(3)! {1, 2}").unwrap(), "{6, 12}");
+  }
+}

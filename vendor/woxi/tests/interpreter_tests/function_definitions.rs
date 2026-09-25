@@ -1,0 +1,5803 @@
+use super::*;
+
+mod pattern_test_conditions {
+  use super::*;
+
+  // A named pattern with a non-Blank body — x : (_Integer | _Real),
+  // x : Except[...], x : {_, _} — must keep its constraint: previously
+  // the definition stored just x_ and matched anything. All outputs
+  // verified against wolframscript 15.0.
+  #[test]
+  fn named_pattern_keeps_constraint_in_definitions() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"s4[x : (_Integer | _Real)] := "num"; {s4[1.5], s4[7], s4[c]}"#
+      )
+      .unwrap(),
+      "{num, num, s4[c]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("s5[x : (a | b)] := {x}; {s5[a], s5[q]}").unwrap(),
+      "{{a}, s5[q]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("s7[x : Except[_Integer]] := {x}; {s7[w], s7[3]}").unwrap(),
+      "{{w}, s7[3]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("s8[x : {_, _}] := x; {s8[{1, 2}], s8[{1, 2, 3}]}").unwrap(),
+      "{{1, 2}, s8[{1, 2, 3}]}"
+    );
+    // The long colon form of a plain blank still works
+    clear_state();
+    assert_eq!(
+      interpret(r#"s2[x : _Integer] := "int"; {s2[4], s2[c]}"#).unwrap(),
+      "{int, s2[c]}"
+    );
+  }
+
+  // A `?test` on a BlankSequence/BlankNullSequence (`x__?test`,
+  // `x___?test`) checks `test` against each matched argument individually,
+  // vacuously passing when a BlankNullSequence matches zero arguments —
+  // not by handing `test` the whole matched `Sequence[...]` as its
+  // argument, which splices at call time into the wrong argument count
+  // (`test[]` for zero elements, `test[a, b]` for two). Regression test
+  // for a Wolfram Demonstration (`ArrowHead[pt1_, pt2_,
+  // opts___?OptionQ]`) that Woxi Studio failed to render because of this.
+  #[test]
+  fn sequence_pattern_test_checks_each_element() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "sq1[x___?OptionQ] := {matched, x}; \
+         {sq1[], sq1[a -> 1], sq1[a -> 1, b -> 2], sq1[a -> 1, 2]}"
+      )
+      .unwrap(),
+      "{{matched}, {matched, a -> 1}, {matched, a -> 1, b -> 2}, sq1[a -> 1, 2]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        "sq2[x__?OptionQ] := {matched, x}; {sq2[], sq2[a -> 1, b -> 2]}"
+      )
+      .unwrap(),
+      "{sq2[], {matched, a -> 1, b -> 2}}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        "sq3[x___?IntegerQ] := {matched, x}; {sq3[], sq3[1, 2, 3], sq3[1, a]}"
+      )
+      .unwrap(),
+      "{{matched}, {matched, 1, 2, 3}, sq3[1, a]}"
+    );
+  }
+
+  #[test]
+  fn pure_function_test_in_definition_fires() {
+    // A definition pattern `x_?(purefn)` must fire during dispatch (the test
+    // was previously stored as a stringified head that never re-applied).
+    assert_eq!(
+      interpret("g[c_?(# > 0 &)] := \"pos\"; {g[5], g[-1]}").unwrap(),
+      "{pos, g[-1]}"
+    );
+    assert_eq!(
+      interpret(
+        "h[c_?(Function[v, StringFreeQ[v, {\"A\"}]])] := \"ok\"; \
+         {h[\"710889\"], h[\"BAD\"]}"
+      )
+      .unwrap(),
+      "{ok, h[BAD]}"
+    );
+  }
+}
+
+mod user_defined_functions {
+  use super::*;
+
+  #[test]
+  fn function_with_multiple_calls() {
+    // Regression test: ensure function calls with different arguments
+    // return different results (not cached incorrectly)
+    assert_eq!(
+      interpret("f[a_, b_, c_] := {a, b, c}; f[1, 2, 3]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn function_calls_are_not_incorrectly_cached() {
+    // This test ensures that consecutive calls to a user-defined function
+    // with different arguments return correct results
+    assert_eq!(
+      interpret(
+        "g[a_, b_, c_] := a + b + c; x = g[1, 2, 3]; y = g[4, 5, 6]; {x, y}"
+      )
+      .unwrap(),
+      "{6, 15}"
+    );
+  }
+
+  #[test]
+  fn map_apply_with_user_function() {
+    // Test @@@ with user-defined function
+    assert_eq!(
+      interpret("f[a_, b_, c_] := a + b + c; f @@@ {{1, 2, 3}, {4, 5, 6}}")
+        .unwrap(),
+      "{6, 15}"
+    );
+  }
+
+  #[test]
+  fn user_function_with_if_lazy_evaluation() {
+    // Test that If only evaluates the selected branch in user-defined functions
+    // If both branches were evaluated, First[{}] would error
+    assert_eq!(
+      interpret("f[x_] := If[x > 0, 1, First[{}]]; f[5]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("f[x_] := If[x > 0, First[{}], 2]; f[-5]").unwrap(),
+      "2"
+    );
+  }
+
+  // Regression (mathics test_assignment.py:405): when a list is built
+  // from `G[x]` and `x` is later assigned/unassigned between read-backs,
+  // each read re-evaluates G against the current head-constrained
+  // definition. The list elements are not "frozen" at definition time.
+  #[test]
+  fn typed_function_definition_re_evaluates_per_x_binding() {
+    clear_state();
+    assert_eq!(
+      interpret("G[x_Real]=x^2; a={G[x]}; {x=1.; a, x=.; a}").unwrap(),
+      "{{1.}, {G[x]}}"
+    );
+  }
+}
+
+mod conditional_definitions {
+  use super::*;
+
+  #[test]
+  fn single_condition() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "f[n_ /; n > 0] := \"positive\"; f[n_] := \"non-positive\"; f[3]"
+      )
+      .unwrap(),
+      "positive"
+    );
+  }
+
+  #[test]
+  fn single_condition_fallback() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "f[n_ /; n > 0] := \"positive\"; f[n_] := \"non-positive\"; f[-1]"
+      )
+      .unwrap(),
+      "non-positive"
+    );
+  }
+
+  #[test]
+  fn multiple_conditions_fizzbuzz() {
+    // Regression: multiple SetDelayed definitions with conditions overwrote each other
+    clear_state();
+    assert_eq!(
+        interpret(r#"f[n_ /; Mod[n, 15] == 0] := "FizzBuzz"; f[n_ /; Mod[n, 3] == 0] := "Fizz"; f[n_ /; Mod[n, 5] == 0] := "Buzz"; f[n_] := n; f[3]"#).unwrap(),
+        "Fizz"
+      );
+    assert_eq!(interpret("f[5]").unwrap(), "Buzz");
+    assert_eq!(interpret("f[15]").unwrap(), "FizzBuzz");
+    assert_eq!(interpret("f[7]").unwrap(), "7");
+  }
+
+  #[test]
+  fn conditions_tried_in_order() {
+    // Definitions are tried in the order they were defined
+    clear_state();
+    assert_eq!(
+        interpret(r#"g[n_ /; n > 10] := "big"; g[n_ /; n > 0] := "small"; g[n_] := "zero or negative"; g[20]"#).unwrap(),
+        "big"
+      );
+    assert_eq!(interpret("g[5]").unwrap(), "small");
+    assert_eq!(interpret("g[0]").unwrap(), "zero or negative");
+  }
+
+  #[test]
+  fn condition_on_whole_lhs_single_arg() {
+    // f[x_] /; cond := body (condition outside brackets) must work
+    // the same as f[x_ /; cond] := body
+    clear_state();
+    assert_eq!(interpret("f[x_] /; x > 0 := x^2; f[3]").unwrap(), "9");
+  }
+
+  #[test]
+  fn condition_on_whole_lhs_fallback() {
+    clear_state();
+    assert_eq!(interpret("f[x_] /; x > 0 := x^2; f[-3]").unwrap(), "f[-3]");
+  }
+
+  #[test]
+  fn condition_on_whole_lhs_multi_arg() {
+    clear_state();
+    assert_eq!(
+      interpret("f[x_, y_] /; x > y := x - y; f[5, 3]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn condition_on_whole_lhs_multiple_definitions() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "f[x_] /; x >= 0 := x; f[x_] /; x < 0 := -x; {f[3], f[-3], f[0]}"
+      )
+      .unwrap(),
+      "{3, 3, 0}"
+    );
+  }
+
+  #[test]
+  fn condition_on_whole_lhs_with_default_fallback() {
+    // Condition on whole LHS combined with a general fallback
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"f[x_] /; x > 0 := "positive"; f[x_] := "non-positive"; {f[5], f[0], f[-1]}"#
+      )
+      .unwrap(),
+      "{positive, non-positive, non-positive}"
+    );
+  }
+}
+
+mod set_delayed {
+  use super::*;
+
+  #[test]
+  fn list_pattern_destructuring() {
+    clear_state();
+    assert_eq!(
+      interpret("swap[{a_Integer, b_Integer}] := {b, a}; swap[{1, 2}]")
+        .unwrap(),
+      "{2, 1}"
+    );
+  }
+
+  #[test]
+  fn list_pattern_with_computation() {
+    clear_state();
+    assert_eq!(
+      interpret("f[{x_Integer, y_Integer}] := x + y; f[{3, 4}]").unwrap(),
+      "7"
+    );
+  }
+
+  #[test]
+  fn list_pattern_trailing_blank_null_sequence() {
+    clear_state();
+    assert_eq!(interpret("f[{x_, ___}] := x; f[{2, 3, 4}]").unwrap(), "2");
+  }
+
+  #[test]
+  fn list_pattern_trailing_blank_sequence() {
+    clear_state();
+    assert_eq!(interpret("f[{x_, __}] := x; f[{2, 3}]").unwrap(), "2");
+  }
+
+  #[test]
+  fn list_pattern_blank_sequence_requires_at_least_one_extra() {
+    clear_state();
+    // `{x_, __}` requires at least one element after x.
+    assert_eq!(interpret("f[{x_, __}] := x; f[{2}]").unwrap(), "f[{2}]");
+  }
+
+  #[test]
+  fn list_pattern_named_trailing_sequence() {
+    clear_state();
+    assert_eq!(
+      interpret("f[{x_, y___}] := {x, y}; f[{2, 3, 4}]").unwrap(),
+      "{2, 3, 4}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("f[{x_, y___}] := {y, x}; f[{1, 2, 3}]").unwrap(),
+      "{2, 3, 1}"
+    );
+  }
+
+  #[test]
+  fn named_outer_list_pattern() {
+    // `seq:{x_, ___}` binds both `seq` (whole list) and `x` (first element).
+    clear_state();
+    assert_eq!(
+      interpret("f[seq:{x_, ___}] := seq; f[{2, 3, 4}]").unwrap(),
+      "{2, 3, 4}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("f[seq:{x_, ___}] := x; f[{2, 3, 4}]").unwrap(),
+      "2"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("f[seq:{x_, ___}] := {seq, x}; f[{2, 3, 4}]").unwrap(),
+      "{{2, 3, 4}, 2}"
+    );
+  }
+
+  #[test]
+  fn literal_arg_priority_over_blank() {
+    // f[1] := 1 (literal) should take priority over f[x_] := x + 1 (blank)
+    clear_state();
+    assert_eq!(interpret("f[1] := 1; f[x_] := x + 1; f[1]").unwrap(), "1");
+    assert_eq!(interpret("f[5]").unwrap(), "6");
+  }
+
+  #[test]
+  fn literal_arg_priority_over_pattern_test() {
+    // Literal match should take priority even when defined before PatternTest
+    clear_state();
+    assert_eq!(
+      interpret("g[0] := 0; g[x_ ? EvenQ] := x / 2; g[x_] := 3 x + 1; g[0]")
+        .unwrap(),
+      "0"
+    );
+    assert_eq!(interpret("g[4]").unwrap(), "2");
+    assert_eq!(interpret("g[3]").unwrap(), "10");
+  }
+
+  mod structural_patterns {
+    use super::*;
+
+    #[test]
+    fn reciprocal_pattern_does_not_match_plain_variable() {
+      // Regression: 1/x_ should NOT match plain x
+      clear_state();
+      assert_eq!(
+        interpret("Int[1/x_, x_Symbol] := Log[x]; Int[x, x]").unwrap(),
+        "Int[x, x]"
+      );
+    }
+
+    #[test]
+    fn reciprocal_pattern_matches_reciprocal() {
+      clear_state();
+      assert_eq!(
+        interpret("Int[1/x_, x_Symbol] := Log[x]; Int[1/y, y]").unwrap(),
+        "Log[y]"
+      );
+    }
+
+    #[test]
+    fn simple_reciprocal_pattern() {
+      clear_state();
+      assert_eq!(interpret("f[1/x_] := Log[x]; f[1/y]").unwrap(), "Log[y]");
+    }
+
+    #[test]
+    fn sum_pattern() {
+      clear_state();
+      assert_eq!(interpret("f[a_ + b_] := a * b; f[x + y]").unwrap(), "x*y");
+    }
+
+    #[test]
+    fn sum_pattern_does_not_match_non_sum() {
+      clear_state();
+      assert_eq!(interpret("f[a_ + b_] := a * b; f[3]").unwrap(), "f[3]");
+    }
+
+    // Regression: a downvalue pattern that peers into a `Set` inside a
+    // `HoldFirst` argument (`f[a_ = b_] := ...`, the shape a `let`-style
+    // local-binding idiom uses) used to run the held assignment for real
+    // while *canonicalizing* the stored pattern for dispatch — replacing
+    // pattern variables with placeholder symbols and evaluating the result
+    // to look for an arithmetic normal form (as `1/x_` does for `x_^-1`).
+    // Evaluating `Set[placeholder_a, placeholder_b]` actually performs the
+    // assignment and collapses to just its right-hand side, permanently
+    // losing the left variable from the stored pattern. The lost slot then
+    // fell back to matching the *whole* argument, so the real call's raw,
+    // still-unevaluated `Set` ended up spliced into the (unheld) function
+    // body, where it fired for real once the body was evaluated.
+    #[test]
+    fn set_pattern_argument_does_not_run_the_held_assignment() {
+      clear_state();
+      assert_eq!(
+        interpret(
+          "Clear[g, uu]; SetAttributes[g, HoldFirst]; \
+           g[a_ = b_] := {a, b}; g[uu = 42]"
+        )
+        .unwrap(),
+        "{uu, 42}"
+      );
+      assert_eq!(interpret("uu").unwrap(), "uu");
+    }
+
+    // Same regression as above, but for the list-wrapped shape
+    // (`f[{a_ = b_}, ...] := ...`) an actual `let`-style `HoldFirst` binding
+    // uses. This argument goes through a separate list-pattern Part-accessor
+    // path that reconstructs `Part[{x = expr}, 1]` and evaluates it like
+    // ordinary code, running the assignment the same way.
+    #[test]
+    fn list_wrapped_set_pattern_does_not_run_the_held_assignment() {
+      clear_state();
+      assert_eq!(
+        interpret(
+          "Clear[myLet, uu]; Attributes[myLet] = {HoldFirst}; \
+           myLet[{a_ = b_}, a_] := b; myLet[{uu = 42}, uu]"
+        )
+        .unwrap(),
+        "42"
+      );
+      assert_eq!(interpret("uu").unwrap(), "uu");
+    }
+
+    // End-to-end version of the two regressions above: a Church-encoding
+    // style Demonstration builds a `let` binding out of a `HoldFirst`
+    // function and a curried infix combinator (`(lambda[x_] . body_)[arg_]
+    // := let[{x = arg}, body]`). Applying the identity combinator to a value
+    // used to leave the combinator's own bound variable permanently
+    // assigned to that value as a side effect of the two bugs above.
+    #[test]
+    fn curried_let_combinator_does_not_leak_its_bound_variable() {
+      clear_state();
+      assert_eq!(
+        interpret(
+          r#"Clear[myLet, lam, vv]; Attributes[myLet] = {HoldFirst};
+myLet[{a_ = b_}, a_] := b;
+(lam[a_] \[CenterDot] body_)[arg_] := myLet[{a = arg}, body];
+(lam[vv] \[CenterDot] vv)[42]"#
+        )
+        .unwrap(),
+        "42"
+      );
+      assert_eq!(interpret("vv").unwrap(), "vv");
+    }
+  }
+}
+
+mod down_values {
+  use super::*;
+
+  #[test]
+  fn basic_down_value() {
+    clear_state();
+    assert_eq!(interpret("f[0] = 42; f[0]").unwrap(), "42");
+  }
+
+  #[test]
+  fn multiple_down_values() {
+    clear_state();
+    assert_eq!(interpret("f[0] = 0; f[1] = 1; f[0]").unwrap(), "0");
+    assert_eq!(interpret("f[1]").unwrap(), "1");
+  }
+
+  #[test]
+  fn down_value_with_pattern() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "g[0] = 0; g[1] = 1; g[n_Integer] := g[n - 1] + g[n - 2]; g[5]"
+      )
+      .unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn memoized_down_value() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "h[0] = 0; h[1] = 1; h[n_Integer] := h[n] = h[n - 1] + h[n - 2]; h[10]"
+      )
+      .unwrap(),
+      "55"
+    );
+  }
+
+  #[test]
+  fn down_values_introspection() {
+    clear_state();
+    assert_eq!(
+      interpret("F[x_] := x + 2; DownValues[F]").unwrap(),
+      "{HoldPattern[F[x_]] :> x + 2}"
+    );
+  }
+
+  #[test]
+  fn down_values_multiple_definitions() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "g[x_Integer] := x^2; g[x_String] := StringLength[x]; DownValues[g]"
+      )
+      .unwrap(),
+      "{HoldPattern[g[x_Integer]] :> x^2, HoldPattern[g[x_String]] :> StringLength[x]}"
+    );
+  }
+
+  #[test]
+  fn down_values_empty() {
+    clear_state();
+    assert_eq!(interpret("DownValues[undefined]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn down_values_literal_args() {
+    clear_state();
+    assert_eq!(
+      interpret("f[1] := a; f[2] := b; DownValues[f]").unwrap(),
+      "{HoldPattern[f[1]] :> a, HoldPattern[f[2]] :> b}"
+    );
+  }
+
+  #[test]
+  fn down_values_mixed_literal_and_pattern() {
+    clear_state();
+    assert_eq!(
+      interpret("g[x_] := x^2; g[1] := one; DownValues[g]").unwrap(),
+      "{HoldPattern[g[1]] :> one, HoldPattern[g[x_]] :> x^2}"
+    );
+  }
+
+  #[test]
+  fn down_values_partial_literal_args() {
+    clear_state();
+    assert_eq!(
+      interpret("h[x_, 1] := x; h[x_, y_] := x + y; DownValues[h]").unwrap(),
+      "{HoldPattern[h[x_, 1]] :> x, HoldPattern[h[x_, y_]] :> x + y}"
+    );
+  }
+
+  // Regression test for #616: a rule whose argument is itself a compound
+  // pattern used to lose its `/;` guard to a phantom extra parameter, so
+  // `f[g[x_]] := body /; test` stopped matching `f[g[1]]` at all — the whole
+  // shape Rubi's rule base is written in.
+  #[test]
+  fn guarded_rule_with_a_structural_argument_fires() {
+    clear_state();
+    assert_eq!(
+      interpret("q[Sin[x_]] := big[x] /; x > 3; q[Sin[5]]").unwrap(),
+      "big[5]"
+    );
+  }
+
+  #[test]
+  fn guarded_rule_with_a_structural_argument_respects_its_guard() {
+    clear_state();
+    assert_eq!(
+      interpret("q[Sin[x_]] := big[x] /; x > 3; q[Sin[2]]").unwrap(),
+      "q[Sin[2]]"
+    );
+  }
+
+  // The guard belongs to the rule, so it shows up on the rule — not as an
+  // extra argument in the pattern.
+  #[test]
+  fn down_values_show_a_structural_rule_guard() {
+    clear_state();
+    assert_eq!(
+      interpret("q[Sin[x_]] := big[x] /; x > 3; DownValues[q]").unwrap(),
+      "{HoldPattern[q[Sin[x_]]] :> big[x] /; x > 3}"
+    );
+  }
+
+  // A guard on an ordinary parameter list prints on the rule too, rather
+  // than disappearing into a parameter's condition slot.
+  #[test]
+  fn down_values_show_a_rule_guard_over_several_arguments() {
+    clear_state();
+    assert_eq!(
+      interpret("q[a_, b_Symbol] := big[a] /; FreeQ[a, b]; DownValues[q]")
+        .unwrap(),
+      "{HoldPattern[q[a_, b_Symbol]] :> big[a] /; FreeQ[a, b]}"
+    );
+  }
+
+  // Reading DownValues out and putting them back keeps the rules working —
+  // Rubi rewrites its whole rule base that way (`DownValues[Int] =
+  // FixIntRules[DownValues[Int]]`).
+  #[test]
+  fn down_values_round_trip_through_assignment() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "q[Sin[x_]] := big[x] /; x > 3; DownValues[q] = DownValues[q];          {q[Sin[5]], q[Sin[2]]}"
+      )
+      .unwrap(),
+      "{big[5], q[Sin[2]]}"
+    );
+  }
+
+  // A rule assembled head-first is the same rule: `ReplacePart` on a rule
+  // hands back `RuleDelayed[lhs, rhs]`, and assigning a list of those has to
+  // install them. Rubi's `FixIntRule` rebuilds every one of its rules this
+  // way before assigning the list back to `DownValues[Int]`.
+  #[test]
+  fn down_values_accept_rules_rebuilt_by_replace_part() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "q[x_] := x + 1; DownValues[q] = \
+         Map[ReplacePart[#, {2} -> 99] &, DownValues[q]]; {q[1], DownValues[q]}"
+      )
+      .unwrap(),
+      "{99, {HoldPattern[q[x_]] :> 99}}"
+    );
+  }
+
+  // A `/;` guard is not a literal argument. Reading it as one used to hoist
+  // the rule to the front of the DownValues, ahead of rules whose patterns
+  // are strictly more specific — which silently changes which rule fires.
+  #[test]
+  fn a_same_q_guard_does_not_reorder_the_rules() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "q[F_[G_[l_, u_], t_]] := \"deep\" /; F === Condition;\n\
+         q[F_[u_, t_]] := \"shallow\" /; F === Condition;\n\
+         ToString[First /@ DownValues[q], InputForm]"
+      )
+      .unwrap(),
+      "{HoldPattern[q[(F_)[(G_)[l_, u_], t_]]], HoldPattern[q[(F_)[u_, t_]]]}"
+    );
+  }
+
+  // `DownValues[f] = {}` clears f, even though an empty list names no head
+  // of its own. Rubi's `ClearDownValues` is exactly this.
+  #[test]
+  fn assigning_an_empty_list_clears_down_values() {
+    clear_state();
+    assert_eq!(
+      interpret("q[x_] := x + 1; DownValues[q] = {}; {DownValues[q], q[1]}")
+        .unwrap(),
+      "{{}, q[1]}"
+    );
+  }
+}
+
+mod default_values {
+  use super::*;
+
+  // DefaultValues exposes the built-in identity elements that
+  // Optional/OneIdentity patterns fall back to. Only Plus/Times/Power
+  // have them in Wolfram; everything else returns {}.
+
+  #[test]
+  fn plus_default_is_zero() {
+    assert_eq!(
+      interpret("DefaultValues[Plus]").unwrap(),
+      "{HoldPattern[Default[Plus]] :> 0}"
+    );
+  }
+
+  #[test]
+  fn times_default_is_one() {
+    assert_eq!(
+      interpret("DefaultValues[Times]").unwrap(),
+      "{HoldPattern[Default[Times]] :> 1}"
+    );
+  }
+
+  #[test]
+  fn power_second_slot_default_is_one() {
+    // Default[Power, 2] = 1 (only the exponent has a default; the base
+    // does not).
+    assert_eq!(
+      interpret("DefaultValues[Power]").unwrap(),
+      "{HoldPattern[Default[Power, 2]] :> 1}"
+    );
+  }
+
+  #[test]
+  fn other_symbols_have_no_defaults() {
+    assert_eq!(interpret("DefaultValues[Sin]").unwrap(), "{}");
+    assert_eq!(interpret("DefaultValues[myFunc]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn user_set_default_position_appears_in_default_values() {
+    // `Default[f, n] = v` is stored as a DownValue on Default itself;
+    // DefaultValues[f] must surface it as a HoldPattern RuleDelayed list.
+    clear_state();
+    assert_eq!(
+      interpret("Default[f, 1] = 4; DefaultValues[f]").unwrap(),
+      "{HoldPattern[Default[f, 1]] :> 4}"
+    );
+  }
+
+  #[test]
+  fn user_set_position_less_default_appears_in_default_values() {
+    clear_state();
+    assert_eq!(
+      interpret("Default[g] = 3; DefaultValues[g]").unwrap(),
+      "{HoldPattern[Default[g]] :> 3}"
+    );
+  }
+
+  #[test]
+  fn default_values_filters_to_target_symbol() {
+    // Multiple symbols share the Default DownValues table; DefaultValues
+    // must only return entries whose first arg is the requested symbol.
+    clear_state();
+    assert_eq!(
+      interpret("Default[h, 1] = 7; Default[k, 2] = 9; DefaultValues[k]")
+        .unwrap(),
+      "{HoldPattern[Default[k, 2]] :> 9}"
+    );
+  }
+
+  #[test]
+  fn default_values_set_via_assignment_round_trips() {
+    // `DefaultValues[g] = {Default[g] -> 3}` should install the rule
+    // such that `Default[g]` returns 3 *and* `DefaultValues[g]` reports
+    // it back, matching wolframscript's round-trip behavior.
+    clear_state();
+    assert_eq!(
+      interpret("DefaultValues[g] = {Default[g] -> 3}; DefaultValues[g]")
+        .unwrap(),
+      "{HoldPattern[Default[g]] :> 3}"
+    );
+    assert_eq!(interpret("Default[g]").unwrap(), "3");
+  }
+
+  #[test]
+  fn default_values_set_drives_optional_match() {
+    // The whole point of DefaultValues — `g[x_.]` with no argument
+    // should look up `Default[g]` and substitute its value (3).
+    clear_state();
+    assert_eq!(
+      interpret("DefaultValues[g] = {Default[g] -> 3}; g[x_.] := {x}; g[]")
+        .unwrap(),
+      "{3}"
+    );
+  }
+}
+
+mod compile {
+  use super::*;
+
+  #[test]
+  fn compile_basic() {
+    clear_state();
+    assert_eq!(
+      interpret("cf = Compile[{x, y}, x + 2 y]; cf[2.5, 4.3]").unwrap(),
+      "11.1"
+    );
+  }
+
+  #[test]
+  fn compile_with_typed_specs() {
+    clear_state();
+    assert_eq!(
+      interpret("cf = Compile[{{x, _Real}}, Sin[x]]; cf[1.4]").unwrap(),
+      "0.9854497299884601"
+    );
+  }
+
+  #[test]
+  fn compile_complex_body() {
+    clear_state();
+    assert_eq!(
+      interpret("cf = Compile[{{x, _Real}, {y, _Integer}}, If[x == 0.0 && y <= 0, 0.0, Sin[x ^ y] + 1 / Min[x, 0.5]] + 0.5]; cf[3.5, 2]").unwrap(),
+      "2.1888806450188727"
+    );
+  }
+
+  #[test]
+  fn compile_forces_numerical() {
+    clear_state();
+    // Compile forces numerical evaluation even for integer inputs
+    assert_eq!(interpret("sqr = Compile[{x}, x x]; sqr[2]").unwrap(), "4.");
+  }
+
+  // A declared `_Integer` argument binds an integer. Regression: every
+  // argument was coerced to a Real, so a compiled `Nest` count arrived as
+  // `6.` and the iteration failed with `Nest::intnm` — which is how the
+  // "Mandelbrot Set Print" Demonstration's surface came out empty.
+  #[test]
+  fn compile_respects_declared_integer_arguments() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"Compile[{{n, _Integer, 0}}, n + 1][3]"#).unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret(r#"Head[Compile[{{n, _Integer, 0}}, n + 1][3]]"#).unwrap(),
+      "Integer"
+    );
+    assert_eq!(
+      interpret(r#"Compile[{{n, _Integer, 0}}, Nest[# + 1 &, 0, n]][4]"#)
+        .unwrap(),
+      "4"
+    );
+    // An undeclared argument still defaults to `_Real`.
+    assert_eq!(
+      interpret(r#"Compile[{{x, _Real, 0}}, x + 1][3]"#).unwrap(),
+      "4."
+    );
+  }
+
+  // A *bare* (no `{name, type}` spec at all) argument used only as a
+  // repetition count — the last argument of `Nest`/`NestList`, or a bare
+  // `{n}` iterator — is inferred as `_Integer` from usage, the same as an
+  // explicit `{n, _Integer, 0}` spec. Regression: a bare argument always
+  // defaulted to `_Real` regardless of usage, so a Setter control's exact
+  // integer value arrived at a compiled loop count as e.g. `100.` and
+  // `NestList` failed with `NestList::intnm` — how a Wolfram Demonstrations
+  // Project notebook's Manipulate output came out blank in Woxi Studio.
+  #[test]
+  fn compile_infers_integer_for_bare_repetition_count_arguments() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"Compile[{n}, NestList[# + 1 &, 0, n]][3]"#).unwrap(),
+      "{0, 1, 2, 3}"
+    );
+    assert_eq!(
+      interpret(r#"Compile[{n}, Nest[# + 1 &, 0, n]][5]"#).unwrap(),
+      "5"
+    );
+    // A bare `{count}` iterator spec (`Do`, `Table`, …) also infers
+    // `_Integer`.
+    assert_eq!(
+      interpret(
+        r#"cf = Compile[{count}, Module[{v = 0}, Do[v += 1, {count}]; v]]; cf[4]"#
+      )
+      .unwrap(),
+      "4"
+    );
+    // An argument only ever used arithmetically (not as a count) still
+    // defaults to `_Real`.
+    assert_eq!(interpret(r#"Compile[{x}, x + 1][3]"#).unwrap(), "4.");
+    // `FixedPointList[f, expr]` (2-arg form) ends in `expr`, the starting
+    // *value* — not a count, unlike the 3-arg `FixedPointList[f, expr,
+    // max]`. A bare argument in that position must still default to
+    // `_Real`.
+    assert_eq!(
+      interpret(r#"cf = Compile[{x}, FixedPointList[(#/2) &, x]]; cf[3][[1]]"#)
+        .unwrap(),
+      "3."
+    );
+    // `Array[f, n, r]`'s count is always the 2nd argument (`n`); the last
+    // argument (`r`, the index origin) is not a count and must still
+    // default to `_Real`.
+    assert_eq!(
+      interpret(r#"cf = Compile[{r}, Array[Sin, 3, r]]; cf[0][[1]]"#).unwrap(),
+      "0."
+    );
+    // A bare `{name}` is only a repetition count in `Do`/`Table`/`Sum`/
+    // `Product`'s own iterator-argument positions — not wherever a
+    // singleton list happens to appear. `Total[{x}]` uses `x` as data, not
+    // an iterator, and must still default to `_Real`.
+    assert_eq!(interpret(r#"Compile[{x}, Total[{x}]][2]"#).unwrap(), "2.");
+    assert_eq!(
+      interpret(r#"Compile[{x}, Total[{x}] / 3][2]"#).unwrap(),
+      "0.6666666666666666"
+    );
+  }
+
+  // A compiled function whose signature includes a real works in machine
+  // reals throughout, so exact numbers that came from literals in the body
+  // come back inexact. An all-integer signature keeps its exact result.
+  #[test]
+  fn compile_result_type_follows_the_signature() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"Compile[{{x, _Real, 0}}, {x, 1}][2.5]"#).unwrap(),
+      "{2.5, 1.}"
+    );
+    assert_eq!(
+      interpret(r#"Compile[{{n, _Integer, 0}}, {n, 1}][3]"#).unwrap(),
+      "{3, 1}"
+    );
+    assert_eq!(
+      interpret(r#"Compile[{{x, _Real, 0}}, Clip[x, {-4, 4}]][-5.]"#).unwrap(),
+      "-4."
+    );
+    assert_eq!(
+      interpret(
+        r#"Compile[{{n, _Integer, 0}, {x, _Real, 0}}, {n, x}][3, 2.5]"#
+      )
+      .unwrap(),
+      "{3., 2.5}"
+    );
+  }
+
+  // A rank-n `_Real` argument arrives numeric throughout, so an exact
+  // sample grid is converted before the body sees it.
+  #[test]
+  fn compile_coerces_nested_real_arguments() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"Compile[{{g, _Real, 2}}, g][{{1, 1/2}, {3, 4}}]"#).unwrap(),
+      "{{1., 0.5}, {3., 4.}}"
+    );
+  }
+
+  // `CompiledFunction` holds its arguments, so merely looking at one does
+  // not evaluate the stored body against its symbolic parameters.
+  #[test]
+  fn compiled_function_holds_its_body() {
+    clear_state();
+    let r = woxi::interpret_with_stdout(
+      r#"cf = Compile[{{g, _Real, 1}, {s, _Integer, 0}},
+           Nest[# + g &, g, s]]; Head[cf]"#,
+    )
+    .unwrap();
+    assert_eq!(r.result, "CompiledFunction");
+    assert!(
+      r.warnings.is_empty(),
+      "unexpected messages: {:?}",
+      r.warnings
+    );
+  }
+
+  #[test]
+  fn compile_head() {
+    clear_state();
+    assert_eq!(
+      interpret("sqr = Compile[{x}, x x]; Head[sqr]").unwrap(),
+      "CompiledFunction"
+    );
+  }
+
+  #[test]
+  fn compile_display() {
+    clear_state();
+    // CompiledFunction display should show the variable list and body
+    let result = interpret("Compile[{x, y}, x + y]").unwrap();
+    assert!(result.starts_with("CompiledFunction["));
+  }
+
+  // Regression: `Compile` only accepted exactly 2 arguments, so the trailing
+  // option rules real Wolfram code commonly appends (`RuntimeAttributes`,
+  // `RuntimeOptions`, ...) raised a spurious `Compile::argrx` message and
+  // left the function unevaluated.
+  #[test]
+  fn compile_accepts_trailing_option_rules() {
+    clear_state();
+    let r = woxi::interpret_with_stdout(
+      "cf = Compile[{{x, _Real}}, x^2, RuntimeAttributes -> {Listable}, RuntimeOptions -> \"Speed\"]; cf[3.]",
+    )
+    .unwrap();
+    assert_eq!(r.result, "9.");
+    assert!(
+      r.warnings.is_empty(),
+      "unexpected messages: {:?}",
+      r.warnings
+    );
+    assert_eq!(interpret("Head[cf]").unwrap(), "CompiledFunction");
+  }
+
+  // Regression: `RuntimeAttributes -> {Listable}` was accepted syntactically
+  // (see `compile_accepts_trailing_option_rules` above) but never made the
+  // resulting `CompiledFunction` actually thread over a list argument — it
+  // was passed straight into the body as one opaque value instead of being
+  // mapped element-wise, the way `SetAttributes[f, Listable]` threads an
+  // ordinary function. That happened to go unnoticed for bodies built from
+  // already-Listable primitives (`Abs`, `Plus`, …), which thread on their
+  // own regardless of the compiled function's own attribute — but a body
+  // using a scalar-typed parameter as opaque state passed to a
+  // non-Listable list-producing function (`NestWhileList`, as many Wolfram
+  // Demonstrations Project escape-time fractal kernels do) computed the
+  // wrong thing entirely: a matrix argument collapsed to a single scalar
+  // result instead of a same-shaped matrix of per-element results.
+  #[test]
+  fn compile_listable_runtime_attribute_threads_over_list_argument() {
+    clear_state();
+    let r = woxi::interpret_with_stdout(
+      r#"escapeSteps = Compile[{{z0, _Complex}, {c, _Complex}, {maxSteps, _Integer}},
+           Length[NestWhileList[#^2 + c &, z0, Abs[#] <= 2 &, 1, maxSteps]],
+           RuntimeAttributes -> {Listable}];
+         escapeSteps[{{0.+0. I, 2.+2. I}, {3.+0. I, 0.1+0.1 I}}, -1.+0. I, 20]"#,
+    )
+    .unwrap();
+    // (0, 0) and (0.1, 0.1) both fall in the basin of the map's attracting
+    // {0, -1} 2-cycle and never escape, so all 20 allowed applications run:
+    // 21 elements (the initial value plus 20 applications). (2, 2) and (3,
+    // 0) start outside the escape radius, so the very first `test` check
+    // fails and the list stays just the initial value: 1 element. The
+    // `_Complex` spec makes the whole compiled function work in machine
+    // reals, so the integer `Length` comes back real-coerced (`21.`/`1.`).
+    assert_eq!(r.result, "{{21., 1.}, {1., 21.}}");
+    assert!(
+      r.warnings.is_empty(),
+      "unexpected messages: {:?}",
+      r.warnings
+    );
+    // A plain (non-Listable) CompiledFunction must keep passing a list
+    // argument straight through as opaque state, unchanged by this fix:
+    // `Abs` and `<=` thread over the 2-element list on their own, but the
+    // result is a 2-element list of booleans, not a single True/False, so
+    // `NestWhileList`'s test is never definitely satisfied and it stops
+    // after just the initial value.
+    assert_eq!(
+      interpret(
+        r#"raw = Compile[{{z0, _Complex}}, Length[NestWhileList[#^2 &, z0, Abs[#] <= 2 &, 1, 3]]];
+           raw[{0.5+0. I, 0.5+0. I}]"#
+      )
+      .unwrap(),
+      "1."
+    );
+  }
+
+  // Regression: a `{name, _Type, rank}` (array-typed) Compile parameter was
+  // exempted entirely from Listable threading — a list argument there was
+  // passed straight through as one opaque value regardless of its actual
+  // rank, unlike a scalar (rank 0) parameter (see the test above). Real
+  // Mathematica's Listable attribute threads over ANY excess leading
+  // dimensions beyond a parameter's declared rank, not just rank 0: a
+  // Wolfram Demonstrations Project fractal-perimeter notebook declares a
+  // `{line, _Real, 2}` parameter (one line segment) and calls the compiled
+  // kernel on a rank-3 batch of segments in one shot — collapsing to a
+  // single scalar instead of a per-segment result, exactly like the
+  // `NestWhileList` case above but one rank up.
+  #[test]
+  fn compile_listable_array_typed_parameter_threads_over_extra_rank() {
+    clear_state();
+    let r = woxi::interpret_with_stdout(
+      r#"f = Compile[{{line, _Real, 2}}, Length[line], RuntimeAttributes -> {Listable}];
+         f[{{{1., 1.}, {2., 2.}}, {{3., 3.}, {4., 4.}}, {{5., 5.}, {6., 6.}}}]"#,
+    )
+    .unwrap();
+    assert_eq!(r.result, "{2., 2., 2.}");
+    assert!(
+      r.warnings.is_empty(),
+      "unexpected messages: {:?}",
+      r.warnings
+    );
+
+    // An argument more than one rank above the declared type (e.g. a list
+    // of lists of matrices, as `Nest` reapplying the same Listable kernel
+    // to its own growing result produces) must thread recursively, one
+    // excess dimension at a time, rather than only once.
+    assert_eq!(
+      interpret(
+        r#"g = Compile[{{m, _Real, 2}}, Total[Flatten[m]], RuntimeAttributes -> {Listable}];
+           g[{{{{1., 2.}, {3., 4.}}}, {{{5., 6.}, {7., 8.}}}}]"#
+      )
+      .unwrap(),
+      "{{10.}, {26.}}"
+    );
+  }
+
+  // Regression: a `.nb` notebook's `SaveDefinitions -> True` dump can embed a
+  // helper as Mathematica's fully serialized `CompiledFunction[…]` — an id
+  // tuple, argument patterns, type/constant tables, raw bytecode, the
+  // uncompiled pure `Function[…]`, and a trailing evaluation flag — rather
+  // than the 2-argument `[specs, body]` form woxi's own `Compile` produces.
+  // woxi has no bytecode VM to run the middle arguments, so calling such a
+  // value used to fall through to the generic case and stay unevaluated —
+  // `CompiledFunction[…][args]` — which then propagated into anything built
+  // on top of it. Real Mathematica always embeds the uncompiled pure
+  // function alongside the bytecode as a correctness fallback, so applying
+  // that instead gives the right answer without a bytecode interpreter.
+  #[test]
+  fn compiled_function_serialized_form_falls_back_to_pure_function() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"cf = CompiledFunction[{7, 7.0, 42}, {_Integer, _Real}, {{2, 0, 0}}, {{}}, {0, 1, 2, 0, 0}, {{1}},
+          Function[{a, b}, N[a] + b], Evaluate];
+        cf[3, 0.25]"#
+      )
+      .unwrap(),
+      "3.25"
+    );
+  }
+
+  // The same fallback must apply when the compiled helper is called deep
+  // inside a larger computation (a Module composing it several times), which
+  // is the shape that actually matters: the un-reduced call otherwise grows
+  // an ever-larger unevaluated expression at every level it passes through.
+  #[test]
+  fn compiled_function_serialized_form_reduces_inside_nested_calls() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"step = CompiledFunction[{7, 7.0, 42}, {_Integer}, {{2, 0, 0}}, {{}}, {0, 1, 2, 0, 0}, {{1}},
+          Function[{k}, N[2 k]], Evaluate];
+        total[n_] := Module[{acc}, acc = 0; Do[acc = acc + step[i], {i, 1, n}]; acc];
+        total[4]"#
+      )
+      .unwrap(),
+      "20."
+    );
+  }
+}
+
+mod dispatch {
+  use super::*;
+
+  #[test]
+  fn unevaluated() {
+    assert_eq!(
+      interpret("Dispatch[{a -> 1, b -> 2}]").unwrap(),
+      "Dispatch[{a -> 1, b -> 2}]"
+    );
+  }
+
+  #[test]
+  fn assigned_from_undefined_rules_symbol_stays_unevaluated() {
+    assert_eq!(
+      interpret("dispatchrules = Dispatch[rules]").unwrap(),
+      "Dispatch[rules]"
+    );
+  }
+
+  #[test]
+  fn replace_all() {
+    assert_eq!(
+      interpret("{a, b, c} /. Dispatch[{a -> 1, b -> 2}]").unwrap(),
+      "{1, 2, c}"
+    );
+  }
+
+  #[test]
+  fn replace_repeated() {
+    assert_eq!(interpret("a /. Dispatch[{a -> b, b -> c}]").unwrap(), "b");
+  }
+}
+
+mod messages {
+  use super::*;
+
+  #[test]
+  fn messages_of_undefined_symbol_is_empty_list() {
+    assert_eq!(interpret("Messages[a]").unwrap(), "{}");
+  }
+
+  // wolframscript suppresses a repeated message after three displays per
+  // calculation: the third occurrence is followed by a General::stop
+  // notice and later ones stay silent. Verified against wolframscript
+  // 15.0 with Do[1/0, {5}].
+  #[test]
+  fn general_stop_suppresses_repeated_messages() {
+    clear_state();
+    assert_eq!(interpret("Do[1/0, {5}]; \"done\"").unwrap(), "done");
+    let msgs = woxi::get_captured_messages_raw();
+    let infy = msgs
+      .iter()
+      .filter(|m| m.contains("Power::infy: Infinite expression"))
+      .count();
+    // Only the three that printed are captured. Past the limit a message is
+    // gone rather than merely silent — that is what `$MessageList` shows in
+    // wolframscript, and it is what keeps a loop that raises the same
+    // message thousands of times from paying to render each one (see
+    // `emit_message_with`). Check still sees the first three, which is all
+    // it needs to know a message was raised.
+    assert_eq!(infy, 3, "messages captured up to the limit: {msgs:?}");
+    // … and exactly one General::stop notice is recorded after the third.
+    let stops: Vec<&String> = msgs
+      .iter()
+      .filter(|m| m.contains("General::stop"))
+      .collect();
+    assert_eq!(stops.len(), 1, "got {msgs:?}");
+    assert!(stops[0].contains(
+      "General::stop: Further output of Power::infy will be suppressed \
+       during this calculation."
+    ));
+    // A new top-level evaluation is a new calculation: the counter resets.
+    assert_eq!(interpret("1/0; \"again\"").unwrap(), "again");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs
+        .iter()
+        .any(|m| m.contains("Power::infy: Infinite expression")),
+      "fresh calculation shows the message again: {msgs:?}"
+    );
+    assert!(
+      !msgs.iter().any(|m| m.contains("General::stop")),
+      "single occurrence must not re-announce stop: {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn general_argr_returns_template_text() {
+    // `General::argr` is one of the standard built-in messages; without
+    // any user-installed DownValue on MessageName the lookup must still
+    // produce the canonical template text (matching wolframscript). The
+    // returned string keeps the `1`/`2` slot markers verbatim — they are
+    // only filled in when the message is emitted via Message[...].
+    assert_eq!(
+      interpret("General::argr").unwrap(),
+      "`1` called with 1 argument; `2` arguments are expected."
+    );
+  }
+
+  #[test]
+  fn user_message_overrides_builtin() {
+    // A user-installed DownValue on MessageName must take precedence
+    // over the built-in template.
+    clear_state();
+    assert_eq!(
+      interpret(r#"General::argr = "custom"; General::argr"#).unwrap(),
+      "custom"
+    );
+  }
+
+  #[test]
+  fn messages_returns_user_set_message() {
+    // `a::b = "foo"` installs the message text as a DownValue on
+    // MessageName. `Messages[a]` should surface it as a HoldPattern
+    // RuleDelayed list — matching wolframscript's long-form rendering.
+    clear_state();
+    assert_eq!(
+      interpret(r#"a::b = "foo"; Messages[a]"#).unwrap(),
+      "{HoldPattern[MessageName[a, b]] :> foo}"
+    );
+  }
+
+  #[test]
+  fn messages_filters_to_target_symbol() {
+    // Multiple symbols share the MessageName DownValues table; Messages
+    // must only return entries whose first arg is the requested symbol.
+    clear_state();
+    assert_eq!(
+      interpret(r#"a::x = "ax"; b::y = "by"; Messages[b]"#).unwrap(),
+      "{HoldPattern[MessageName[b, y]] :> by}"
+    );
+  }
+}
+
+mod nvalues {
+  use super::*;
+
+  #[test]
+  fn nvalues_of_undefined_symbol_is_empty_list() {
+    assert_eq!(interpret("NValues[d]").unwrap(), "{}");
+  }
+}
+
+mod subvalues {
+  use super::*;
+
+  #[test]
+  fn subvalues_of_undefined_symbol_is_empty_list() {
+    assert_eq!(interpret("SubValues[f]").unwrap(), "{}");
+  }
+}
+
+mod ownvalues {
+  use super::*;
+
+  #[test]
+  fn ownvalues_of_undefined_symbol_is_empty_list() {
+    assert_eq!(interpret("OwnValues[x]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn conditional_ownvalue_skipped_when_test_fails() {
+    // `a /; b > 0 := 3` only fires when `b > 0` evaluates to True. With
+    // `b` unbound the test stays unevaluated, so the rule must NOT fire
+    // and `a` returns as itself (matches wolframscript).
+    clear_state();
+    assert_eq!(interpret("a /; b > 0 := 3; a").unwrap(), "a");
+  }
+
+  #[test]
+  fn conditional_ownvalue_fires_when_test_passes() {
+    clear_state();
+    assert_eq!(interpret("a /; b > 0 := 3; b = 5; a").unwrap(), "3");
+  }
+
+  #[test]
+  fn conditional_ownvalue_skipped_when_test_false() {
+    clear_state();
+    assert_eq!(interpret("a /; b > 0 := 3; b = -5; a").unwrap(), "a");
+  }
+}
+
+mod formatvalues {
+  use super::*;
+
+  #[test]
+  fn formatvalues_of_undefined_symbol_is_empty_list() {
+    assert_eq!(interpret("FormatValues[F]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn formatvalues_of_undefined_symbol_inputform_wraps_empty_list() {
+    assert_eq!(
+      interpret("FormatValues[F]  //InputForm").unwrap(),
+      "InputForm[{}]"
+    );
+  }
+}
+
+mod memory {
+  use super::*;
+
+  #[test]
+  fn max_memory_used_returns_positive_integer() {
+    let result = interpret("MaxMemoryUsed[]").unwrap();
+    let val: i128 = result.parse().expect("should be an integer");
+    assert!(val > 0, "MaxMemoryUsed should be positive: {val}");
+  }
+
+  #[test]
+  fn memory_in_use_returns_positive_integer() {
+    let result = interpret("MemoryInUse[]").unwrap();
+    let val: i128 = result.parse().expect("should be an integer");
+    assert!(val > 0, "MemoryInUse should be positive: {val}");
+  }
+
+  #[test]
+  fn max_memory_at_least_memory_in_use() {
+    // Evaluate MemoryInUse first, then MaxMemoryUsed second.
+    // Peak RSS can only grow, so querying it after current ensures peak >= current.
+    let result =
+      interpret("With[{c = MemoryInUse[]}, MaxMemoryUsed[] >= c]").unwrap();
+    assert_eq!(result, "True");
+  }
+
+  #[test]
+  fn memory_available_returns_positive_integer() {
+    let result = interpret("MemoryAvailable[]").unwrap();
+    let val: i128 = result.parse().expect("should be an integer");
+    assert!(val > 0, "MemoryAvailable should be positive: {val}");
+  }
+
+  #[test]
+  fn system_memory_greater_than_memory_available_greater_than_in_use() {
+    assert_eq!(
+      interpret("$SystemMemory > MemoryAvailable[] > MemoryInUse[]").unwrap(),
+      "True"
+    );
+  }
+}
+
+mod context {
+  use super::*;
+
+  #[test]
+  fn context_no_args() {
+    // Context[] returns current context
+    assert_eq!(interpret("Context[]").unwrap(), "Global`");
+  }
+
+  #[test]
+  fn context_builtin_symbol() {
+    // Built-in symbols are in System` context
+    assert_eq!(interpret("Context[Plus]").unwrap(), "System`");
+  }
+
+  #[test]
+  fn context_user_symbol() {
+    // User-defined symbols are in Global` context
+    assert_eq!(interpret("Context[x]").unwrap(), "Global`");
+  }
+
+  #[test]
+  fn context_string_arg() {
+    // String argument also works
+    assert_eq!(interpret("Context[\"Plus\"]").unwrap(), "System`");
+  }
+
+  #[test]
+  fn context_string_user() {
+    // "myVar" doesn't exist as a symbol, so Context returns unevaluated
+    assert_eq!(interpret("Context[\"myVar\"]").unwrap(), "Context[myVar]");
+  }
+
+  #[test]
+  fn context_matches_dollar_context() {
+    assert_eq!(interpret("Context[] === $Context").unwrap(), "True");
+  }
+
+  #[test]
+  fn dollar_input_is_empty_string() {
+    // Matches wolframscript's -code mode: $Input is the empty string.
+    assert_eq!(interpret("$Input").unwrap(), "");
+  }
+
+  #[test]
+  fn dollar_input_head_is_string() {
+    assert_eq!(interpret("Head[$Input]").unwrap(), "String");
+  }
+
+  // wolframscript orders contexts case-insensitively with the backticks
+  // ignored, so `Global`` comes before `System``. (Its own list also holds
+  // the hundreds of contexts the Wolfram Language implementation itself
+  // uses, which Woxi has no equivalent for.)
+  #[test]
+  fn contexts_no_args_returns_global_then_system() {
+    assert_eq!(interpret("Contexts[]").unwrap(), "{Global`, System`}");
+  }
+
+  #[test]
+  fn contexts_unknown_pattern_returns_empty() {
+    assert_eq!(interpret(r#"Contexts["HTML*"]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn contexts_pattern_matches_system() {
+    assert_eq!(interpret(r#"Contexts["Sys*"]"#).unwrap(), "{System`}");
+  }
+
+  #[test]
+  fn contexts_pattern_matches_all() {
+    assert_eq!(interpret(r#"Contexts["*"]"#).unwrap(), "{Global`, System`}");
+  }
+
+  // A context exists once it holds a symbol. A package that defines
+  // nothing leaves no context behind, as in wolframscript.
+  #[test]
+  fn contexts_lists_package_contexts_that_hold_symbols() {
+    clear_state();
+    interpret(
+      "BeginPackage[\"Ctx`\"]; Begin[\"`Private`\"]; End[]; EndPackage[]",
+    )
+    .unwrap();
+    assert_eq!(interpret(r#"Contexts["Ctx*"]"#).unwrap(), "{}");
+    clear_state();
+    // Written as separate lines: the Wolfram Language resolves each input
+    // unit before evaluating it, so a package squeezed onto one line files
+    // its symbols in the context that was open before the line.
+    interpret(
+      "BeginPackage[\"Ctx`\"]\nctxPub::usage = \"u\";\n\
+       Begin[\"`Private`\"]\nctxPriv[] := 1\nEnd[]\nEndPackage[]\n",
+    )
+    .unwrap();
+    assert_eq!(
+      interpret(r#"Contexts["Ctx*"]"#).unwrap(),
+      "{Ctx`, Ctx`Private`}"
+    );
+  }
+}
+
+mod names {
+  use super::*;
+
+  #[test]
+  fn empty_env_includes_builtins() {
+    // Names[] returns all user-defined AND built-in names (matches wolframscript,
+    // which returns tens of thousands of System` symbols). We just verify a
+    // few expected builtins are present.
+    let out = interpret("Names[]").unwrap();
+    assert!(out.starts_with('{') && out.ends_with('}'));
+    assert!(out.contains("List"), "expected List in Names[], got {out}");
+    assert!(out.contains("Plus"), "expected Plus in Names[], got {out}");
+  }
+
+  #[test]
+  fn lists_variables_among_builtins() {
+    // User variables appear alongside builtins in the "*" pattern.
+    let out = interpret("x = 1; y = 2; Names[\"*\"]").unwrap();
+    assert!(
+      out.contains(" x,") || out.ends_with(", x}") || out.contains("{x,")
+    );
+    assert!(
+      out.contains(" y,") || out.ends_with(", y}") || out.contains("{y,")
+    );
+  }
+
+  #[test]
+  fn lists_user_function_among_builtins() {
+    let out = interpret("f[x_] := x^2; Names[\"*\"]").unwrap();
+    assert!(
+      out.contains(" f,") || out.ends_with(", f}") || out.contains("{f,")
+    );
+  }
+
+  #[test]
+  fn pattern_filter_user_vars() {
+    // Built-ins starting with `ab` also show up (e.g. Abs), but user-defined
+    // symbols with the prefix still appear.
+    let out = interpret("abc = 1; abd = 2; xyz = 3; Names[\"ab*\"]").unwrap();
+    assert!(out.contains("abc"), "expected abc in {out}");
+    assert!(out.contains("abd"), "expected abd in {out}");
+    assert!(!out.contains("xyz"), "unexpected xyz in {out}");
+  }
+
+  #[test]
+  fn no_match_returns_empty() {
+    // No built-in starts with `z` (as of this writing), and no user symbol
+    // matches the pattern either.
+    assert_eq!(interpret("a = 1; Names[\"zzzNoSuch*\"]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn exact_builtin_match() {
+    // Bare literal pattern returns just the exact-match builtin name.
+    assert_eq!(interpret("Names[\"List\"]").unwrap(), "{List}");
+    assert_eq!(interpret("Names[\"Plus\"]").unwrap(), "{Plus}");
+  }
+
+  // wolframscript sorts Names[...] case-insensitively, so `Listable`
+  // goes between `List` and `ListAnimate`, not at the end after
+  // `ListVectorPlot`. Regression for the mathics `Names["List*"]`
+  // doctest.
+  #[test]
+  fn list_star_case_insensitive_sort() {
+    let out = interpret("Names[\"List*\"]").unwrap();
+    let idx_list = out.find("List,").expect("has List");
+    let idx_listable = out.find("Listable").expect("has Listable");
+    let idx_list_animate = out.find("ListAnimate").expect("has ListAnimate");
+    let idx_list_vector =
+      out.find("ListVectorPlot").expect("has ListVectorPlot");
+    // case-insensitive order: List < Listable < ListAnimate
+    assert!(idx_list < idx_listable);
+    assert!(idx_listable < idx_list_animate);
+    assert!(idx_list_animate < idx_list_vector);
+  }
+}
+
+mod quit {
+  use super::*;
+
+  // Note: Quit[] calls std::process::exit() so we can't directly test
+  // successful exits in unit tests. These tests verify edge cases.
+
+  #[test]
+  fn quit_too_many_args_unevaluated() {
+    assert_eq!(interpret("Quit[1, 2]").unwrap(), "Quit[1, 2]");
+  }
+
+  #[test]
+  fn exit_too_many_args_unevaluated() {
+    assert_eq!(interpret("Exit[1, 2]").unwrap(), "Exit[1, 2]");
+  }
+
+  #[test]
+  fn quit_before_terminates() {
+    // Quit[] should prevent subsequent expressions from being evaluated.
+    // In a CompoundExpression, the process exits so "after" is never printed.
+    // We can't test process::exit in unit tests, so just verify that
+    // Quit appears as a valid function call.
+    assert_eq!(interpret("Head[Quit]").unwrap(), "Symbol");
+  }
+}
+
+mod expression {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_self() {
+    assert_eq!(interpret("Expression").unwrap(), "Expression");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[Expression]").unwrap(), "Symbol");
+  }
+}
+
+mod activate {
+  use super::*;
+
+  #[test]
+  fn basic_plus() {
+    assert_eq!(interpret("Activate[Inactive[Plus][1, 2, 3]]").unwrap(), "6");
+  }
+
+  #[test]
+  fn with_sin() {
+    assert_eq!(interpret("Activate[Inactive[Sin][Pi/2]]").unwrap(), "1");
+  }
+
+  #[test]
+  fn nested_in_expression() {
+    assert_eq!(
+      interpret("Activate[a + Inactive[Plus][1, 2]]").unwrap(),
+      "3 + a"
+    );
+  }
+
+  #[test]
+  fn with_filter() {
+    // Only activate Plus, not Times
+    assert_eq!(
+      interpret("Activate[Inactive[Plus][1, 2] + Inactive[Times][3, 4], Plus]")
+        .unwrap(),
+      "3 + Inactive[Times][3, 4]"
+    );
+  }
+
+  #[test]
+  fn inactive_preserved_without_activate() {
+    assert_eq!(
+      interpret("Inactive[Plus][1, 2]").unwrap(),
+      "Inactive[Plus][1, 2]"
+    );
+  }
+
+  #[test]
+  fn with_integrate() {
+    assert_eq!(
+      interpret("Activate[Inactive[Integrate][x^2, x]]").unwrap(),
+      "x^3/3"
+    );
+  }
+}
+
+mod library_function_load {
+  use super::*;
+
+  #[test]
+  fn symbol() {
+    assert_eq!(
+      interpret("LibraryFunctionLoad").unwrap(),
+      "LibraryFunctionLoad"
+    );
+  }
+
+  #[test]
+  fn with_args() {
+    assert_eq!(
+      interpret("LibraryFunctionLoad[a, b, c, d]").unwrap(),
+      "LibraryFunctionLoad[a, b, c, d]"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[LibraryFunctionLoad]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod cells {
+  use super::*;
+
+  #[test]
+  fn symbol() {
+    assert_eq!(interpret("Cells").unwrap(), "Cells");
+  }
+
+  #[test]
+  fn with_args() {
+    assert_eq!(interpret("Cells[a, b]").unwrap(), "Cells[a, b]");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[Cells]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+}
+
+// `f[a][b] = rhs` (curried Set) and `UpValues[sym] =.` (clearing all
+// upvalues attached to a symbol) — both surface-level forms that
+// previously errored or no-op'd silently.
+mod set_curried_and_upvalues_unset {
+  use super::*;
+
+  #[test]
+  fn set_on_curried_call_returns_rhs() {
+    clear_state();
+    // Same shape as `f[a][b] := rhs` but with `=`. Returns the RHS, and
+    // (like `:=`) installs a genuine SubValue that fires on later calls —
+    // see `set_on_curried_call_installs_subvalue` below.
+    assert_eq!(interpret("f[a][b] = 3").unwrap(), "3");
+  }
+
+  #[test]
+  fn set_on_curried_call_installs_subvalue() {
+    clear_state();
+    // Regression: `f[a][b] = rhs` used to be a pure no-op beyond returning
+    // the RHS — the rule was never stored, so a later `f[a][b]` stayed
+    // unevaluated. A Wolfram Demonstrations Project fractal-tiling
+    // notebook defines its family of point-transform functions this way
+    // (`someFunc[1][{x_,y_}] = …`), which left the fractal's coordinates
+    // entirely symbolic instead of numeric.
+    assert_eq!(interpret("f[1][x_] = x + 1; f[1][10]").unwrap(), "11");
+    clear_state();
+    assert_eq!(
+      interpret("f[1][{x_, y_}] = {2 x + y, x - 3 y}; f[1][{10, 3}]").unwrap(),
+      "{23, 1}"
+    );
+    clear_state();
+    // A literal (non-pattern) curried key also installs and fires.
+    assert_eq!(interpret("f[1][2] = 99; f[1][2]").unwrap(), "99");
+    clear_state();
+    // Two distinct keys on the same curried head coexist independently.
+    assert_eq!(
+      interpret("f[1][x_] = x + 1; f[2][x_] = x ^ 2; {f[1][10], f[2][10]}")
+        .unwrap(),
+      "{11, 100}"
+    );
+  }
+
+  #[test]
+  fn upvalues_unset_removes_upvalue_rule() {
+    clear_state();
+    // `g[a] ^= 5` attaches an upvalue to `a` so `g[a]` returns 5.
+    // `UpValues[a] =.` should remove every upvalue tagged on `a`,
+    // making `g[a]` revert to its symbolic form.
+    assert_eq!(
+      interpret("g[a] ^= 5; g[a]; UpValues[a] =.; g[a]").unwrap(),
+      "g[a]"
+    );
+  }
+
+  #[test]
+  fn upvalues_unset_then_predicate_falls_back() {
+    clear_state();
+    // PrimeQ has no DownValue for `p`, so once the upvalue is cleared
+    // it returns False (matching wolframscript).
+    assert_eq!(
+      interpret("PrimeQ[p] ^= True; PrimeQ[p]; UpValues[p] =.; PrimeQ[p]")
+        .unwrap(),
+      "False"
+    );
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn option_q_1() {
+    assert_case(
+      r#"OptionQ[a -> True]; OptionQ[a :> True]; OptionQ[{a -> True}]; OptionQ[{a :> True}]; OptionQ[{a -> True, {b->1, "c"->2}}]; OptionQ[{a -> True, {b->1, c}}]; OptionQ[{a -> True, F[b->1,c->2]}]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn option_q_2() {
+    assert_case(
+      r#"OptionQ[a -> True]; OptionQ[a :> True]; OptionQ[{a -> True}]; OptionQ[{a :> True}]; OptionQ[{a -> True, {b->1, "c"->2}}]; OptionQ[{a -> True, {b->1, c}}]; OptionQ[{a -> True, F[b->1,c->2]}]; OptionQ[x]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn input_form() {
+    assert_case(
+      r#"x = 3. ^ -20; InputForm[x]"#,
+      r#"InputForm[2.8679719907924413*^-10]"#,
+    );
+  }
+  #[test]
+  fn head_1() {
+    assert_case(r#"x = 3. ^ -20; InputForm[x]; Head[x]"#, r#"Real"#);
+  }
+  #[test]
+  fn set_1() {
+    assert_case(r#"x = 1"#, r#"1"#);
+  }
+  #[test]
+  fn set_2() {
+    assert_case(r#"x = 1; x = x + 1"#, r#"2"#);
+  }
+  #[test]
+  fn f_1() {
+    assert_case(
+      r#"Format[f[x___]] := Infix[{x}, "~"]; f[1, 2, 3]"#,
+      r#"f[1, 2, 3]"#,
+    );
+  }
+  #[test]
+  fn f_2() {
+    assert_case(
+      r#"Format[f[x___]] := Infix[{x}, "~"]; f[1, 2, 3]; f[1]"#,
+      r#"f[1]"#,
+    );
+  }
+  #[test]
+  fn g_1() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]"##,
+      r#"g[a, g[b, c]]"#,
+    );
+  }
+  #[test]
+  fn g_2() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]; g[g[a, b], c]"##,
+      r#"g[g[a, b], c]"#,
+    );
+  }
+  #[test]
+  fn g_3() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]; g[g[a, b], c]; g[a + b, c]"##,
+      r#"g[a + b, c]"#,
+    );
+  }
+  #[test]
+  fn g_4() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]; g[g[a, b], c]; g[a + b, c]; g[a * b, c]"##,
+      r#"g[a*b, c]"#,
+    );
+  }
+  #[test]
+  fn g_5() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]; g[g[a, b], c]; g[a + b, c]; g[a * b, c]; g[a, b] + c"##,
+      r#"c + g[a, b]"#,
+    );
+  }
+  #[test]
+  fn g_6() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]; g[g[a, b], c]; g[a + b, c]; g[a * b, c]; g[a, b] + c; g[a, b] * c"##,
+      r#"c*g[a, b]"#,
+    );
+  }
+  #[test]
+  fn infix() {
+    assert_case(
+      r##"Format[g[x_, y_]] := Infix[{x, y}, "#", 350, Left]; g[a, g[b, c]]; g[g[a, b], c]; g[a + b, c]; g[a * b, c]; g[a, b] + c; g[a, b] * c; Infix[{a, b, c}, {"+", "-"}]"##,
+      r#"Infix[{a, b, c}, {"+", "-"}]"#,
+    );
+  }
+  #[test]
+  fn set_3() {
+    assert_case(r#"n = 10"#, r#"10"#);
+  }
+  #[test]
+  fn hold_1() {
+    assert_case(r#"x = 3; Hold[x]"#, r#"Hold[x]"#);
+  }
+  #[test]
+  fn release_hold_1() {
+    assert_case(r#"x = 3; Hold[x]; ReleaseHold[Hold[x]]"#, r#"3"#);
+  }
+  #[test]
+  fn release_hold_2() {
+    assert_case(
+      r#"x = 3; Hold[x]; ReleaseHold[Hold[x]]; ReleaseHold[y]"#,
+      r#"y"#,
+    );
+  }
+  #[test]
+  fn cf_1() {
+    assert_case(r#"cf = Compile[{x, y}, x + 2 y]; cf[2.5, 4.3]"#, r#"11.1"#);
+  }
+  #[test]
+  fn head_2() {
+    // Same situation as case 524 — the scraped expectation pinned
+    // wolframscript-internal bytecode that Woxi can't reproduce, and the
+    // mathics original uses a wildcard. Verify the documented contract:
+    // the typed-arg form `Compile[{{x, _Real}}, Sin[x]]` returns a
+    // `CompiledFunction`. (The intermediate `cf[2.5, 4.3]` call is
+    // exercised — its result is discarded by `CompoundExpression`.)
+    assert_case(
+      r#"cf = Compile[{x, y}, x + 2 y]; cf[2.5, 4.3]; Head[Compile[{{x, _Real}}, Sin[x]]]"#,
+      r#"CompiledFunction"#,
+    );
+  }
+  #[test]
+  fn cf_2() {
+    assert_case(
+      r#"cf = Compile[{x, y}, x + 2 y]; cf[2.5, 4.3]; cf = Compile[{{x, _Real}}, Sin[x]]; cf[1.4]"#,
+      r#"0.9854497299884601"#,
+    );
+  }
+  #[test]
+  fn head_3() {
+    assert_case(
+      r#"sqr = Compile[{x}, x x]; Head[sqr]"#,
+      r#"CompiledFunction"#,
+    );
+  }
+  #[test]
+  fn sqr() {
+    assert_case(r#"sqr = Compile[{x}, x x]; Head[sqr]; sqr[2]"#, r#"4."#);
+  }
+  #[test]
+  fn up_values_1() {
+    assert_case(
+      r#"N[Pi, 50]; N[1/7]; N[1/7, 5]; N[a] = 10.9; a; N[a + b]; N[a, 20]; N[a, 20] = 11; N[a + b, 20]; N[f[a, b]]; SetAttributes[f, NHoldAll]; N[f[a, b]]; N[c, p_?(#>10&)] := p; N[c, 3]; N[c, 11]; N[d] ^= 5; UpValues[d]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn n_values_1() {
+    assert_case(
+      r#"N[Pi, 50]; N[1/7]; N[1/7, 5]; N[a] = 10.9; a; N[a + b]; N[a, 20]; N[a, 20] = 11; N[a + b, 20]; N[f[a, b]]; SetAttributes[f, NHoldAll]; N[f[a, b]]; N[c, p_?(#>10&)] := p; N[c, 3]; N[c, 11]; N[d] ^= 5; UpValues[d]; NValues[d]"#,
+      r#"{HoldPattern[N[d, {MachinePrecision, MachinePrecision}]] :> 5}"#,
+    );
+  }
+  #[test]
+  fn n_1() {
+    assert_case(
+      r#"N[Pi, 50]; N[1/7]; N[1/7, 5]; N[a] = 10.9; a; N[a + b]; N[a, 20]; N[a, 20] = 11; N[a + b, 20]; N[f[a, b]]; SetAttributes[f, NHoldAll]; N[f[a, b]]; N[c, p_?(#>10&)] := p; N[c, 3]; N[c, 11]; N[d] ^= 5; UpValues[d]; NValues[d]; e /: N[e] = 6; N[e]"#,
+      r#"6."#,
+    );
+  }
+  #[test]
+  fn set_4() {
+    assert_case(r#"a::b = "Hello world!""#, r#""Hello world!""#);
+  }
+  #[test]
+  fn set_5() {
+    assert_case(
+      r#"pts = {{0, 0}, {1, 1}, {2, -1}, {3, 0}}"#,
+      r#"{{0, 0}, {1, 1}, {2, -1}, {3, 0}}"#,
+    );
+  }
+  #[test]
+  fn set_6() {
+    assert_case(
+      r#"A = InterpretationBox["Four", 4]"#,
+      r#"InterpretationBox["Four", 4]"#,
+    );
+  }
+  #[test]
+  fn display_form() {
+    assert_case(
+      r#"A = InterpretationBox["Four", 4]; DisplayForm[A]"#,
+      r#"DisplayForm[InterpretationBox["Four", 4]]"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_1() {
+    assert_case(r#"x = 2; Clear[x]; x"#, r#"x"#);
+  }
+  #[test]
+  fn symbol_literal_2() {
+    assert_case(
+      r#"x = 2; Clear[x]; x; x = 2; y = 3; Clear["Global`*"]; x"#,
+      r#"x"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_3() {
+    assert_case(
+      r#"x = 2; Clear[x]; x; x = 2; y = 3; Clear["Global`*"]; x; y"#,
+      r#"y"#,
+    );
+  }
+  #[test]
+  fn attributes_1() {
+    assert_case(
+      r#"x = 2; Clear[x]; x; x = 2; y = 3; Clear["Global`*"]; x; y; Clear[Sin]; Unprotect[Sin]; Clear[Sin]; Sin[Pi]; Attributes[r] = {Flat, Orderless}; Clear["r"]; Attributes[r]"#,
+      r#"{Flat, Orderless}"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_4() {
+    assert_case(r#"x = 2; ClearAll[x]; x"#, r#"x"#);
+  }
+  #[test]
+  fn attributes_2() {
+    assert_case(
+      r#"x = 2; ClearAll[x]; x; Attributes[r] = {Flat, Orderless}; ClearAll[r]; Attributes[r]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn set_7() {
+    assert_case(r#"a = 2"#, r#"2"#);
+  }
+  #[test]
+  fn symbol_literal_5() {
+    assert_case(r#"a = 2; a =.; a"#, r#"a"#);
+  }
+  #[test]
+  fn set_8() {
+    assert_case(r#"a::b = "foo""#, r#""foo""#);
+  }
+  #[test]
+  fn messages() {
+    // Wolframscript-matched expectation. The mathics original used the
+    // `a::b` shorthand inside `HoldPattern`, but wolframscript -code
+    // always prints the long-form `MessageName[a, b]` for messages stored
+    // on a symbol. Strings are unquoted in OutputForm.
+    assert_case(
+      r#"a::b = "foo"; Messages[a]"#,
+      r#"{HoldPattern[MessageName[a, b]] :> foo}"#,
+    );
+  }
+  #[test]
+  fn divide_1() {
+    // Wolframscript-matched expectation. mathics rendered the InputForm
+    // contents with quotes around the string ("bar"), but `wolframscript
+    // -code` prints the unevaluated `InputForm[…]` wrapper with the bare
+    // string contents (no quotes) — Woxi matches.
+    assert_case(
+      r#"a::b = "foo"; Messages[a]; Messages[a] = {a::c :> "bar"}; a::c // InputForm"#,
+      r#"InputForm[bar]"#,
+    );
+  }
+  #[test]
+  fn n_values_2() {
+    assert_case(r#"NValues[a]"#, r#"{}"#);
+  }
+  #[test]
+  fn n_values_3() {
+    assert_case(
+      r#"NValues[a]; N[a] = 3; NValues[a]"#,
+      r#"{HoldPattern[N[a, {MachinePrecision, MachinePrecision}]] :> 3}"#,
+    );
+  }
+  #[test]
+  fn n_2() {
+    assert_case(
+      r#"NValues[a]; N[a] = 3; NValues[a]; NValues[b] := {N[b, MachinePrecision] :> 2}; N[b]"#,
+      r#"2."#,
+    );
+  }
+  #[test]
+  fn n_3() {
+    assert_case(
+      r#"NValues[a]; N[a] = 3; NValues[a]; NValues[b] := {N[b, MachinePrecision] :> 2}; N[b]; NValues[c] := {N[c] :> 3}; N[c]"#,
+      r#"c"#,
+    );
+  }
+  #[test]
+  fn n_values_4() {
+    assert_case(
+      r#"NValues[a]; N[a] = 3; NValues[a]; NValues[b] := {N[b, MachinePrecision] :> 2}; N[b]; NValues[c] := {N[c] :> 3}; N[c]; NValues[d] = {foo -> bar}; NValues[d]"#,
+      r#"{HoldPattern[foo] :> bar}"#,
+    );
+  }
+  #[test]
+  fn n_4() {
+    assert_case(
+      r#"NValues[a]; N[a] = 3; NValues[a]; NValues[b] := {N[b, MachinePrecision] :> 2}; N[b]; NValues[c] := {N[c] :> 3}; N[c]; NValues[d] = {foo -> bar}; NValues[d]; N[d]"#,
+      r#"d"#,
+    );
+  }
+  #[test]
+  fn sub_values() {
+    assert_case(
+      r#"f[1][x_] := x; f[2][x_] := x ^ 2; SubValues[f]"#,
+      r#"{HoldPattern[f[1][x_]] :> x, HoldPattern[f[2][x_]] :> x^2}"#,
+    );
+  }
+  #[test]
+  fn definition_1() {
+    assert_case(
+      r#"f[1][x_] := x; f[2][x_] := x ^ 2; SubValues[f]; Definition[f]"#,
+      r#"f[1][x_] := x
+
+f[2][x_] := x^2"#,
+    );
+  }
+  #[test]
+  fn set_9() {
+    assert_case(r#"a = 3"#, r#"3"#);
+  }
+  #[test]
+  fn symbol_literal_6() {
+    assert_case(r#"a = 3; a"#, r#"3"#);
+  }
+  #[test]
+  fn own_values_1() {
+    assert_case(r#"a = 3; a; OwnValues[a]"#, r#"{HoldPattern[a] :> 3}"#);
+  }
+  #[test]
+  fn list_literal_1() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}"#,
+      r#"{10, 2, 3}"#,
+    );
+  }
+  #[test]
+  fn list_literal_2() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}"#,
+      r#"{1, 2, {{c1, c2}, {10}}}"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_7() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d"#,
+      r#"10"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_8() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn set_10() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn set_11() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_9() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn equal_1() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x; a = b = c = 2; a == b == c == 2"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn a_1() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x; a = b = c = 2; a == b == c == 2; A = {{1, 2}, {3, 4}}; A[[1, 2]] = 5"#,
+      r#"5"#,
+    );
+  }
+  #[test]
+  fn a_2() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x; a = b = c = 2; a == b == c == 2; A = {{1, 2}, {3, 4}}; A[[1, 2]] = 5; A"#,
+      r#"{{1, 5}, {3, 4}}"#,
+    );
+  }
+  #[test]
+  fn a_3() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x; a = b = c = 2; a == b == c == 2; A = {{1, 2}, {3, 4}}; A[[1, 2]] = 5; A; A[[;;, 2]] = {6, 7}"#,
+      r#"{6, 7}"#,
+    );
+  }
+  #[test]
+  fn a_4() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x; a = b = c = 2; a == b == c == 2; A = {{1, 2}, {3, 4}}; A[[1, 2]] = 5; A; A[[;;, 2]] = {6, 7}; A"#,
+      r#"{{1, 6}, {3, 7}}"#,
+    );
+  }
+  #[test]
+  fn b_1() {
+    assert_case(
+      r#"a = 3; a; OwnValues[a]; {a, b, c} = {10, 2, 3}; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}; d; a; x = a; a = 2; x; a = b = c = 2; a == b == c == 2; A = {{1, 2}, {3, 4}}; A[[1, 2]] = 5; A; A[[;;, 2]] = {6, 7}; A; B = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}; B[[1;;2, 2;;-1]] = {{t, u}, {y, z}}; B"#,
+      r#"{{1, t, u}, {4, y, z}, {7, 8, 9}}"#,
+    );
+  }
+  #[test]
+  fn f_3() {
+    assert_case(
+      r#"Attributes[SetDelayed]; a = 1; x := a; x; a = 2; x; f[x_] := p[x] /; x>0; f[3]; f[-3]; F[x_, y_] /; x < y /; x>0  := x / y; F[x_, y_] := y / x; F[2, 3]"#,
+      r#"2 / 3"#,
+    );
+  }
+  #[test]
+  fn f_4() {
+    assert_case(
+      r#"Attributes[SetDelayed]; a = 1; x := a; x; a = 2; x; f[x_] := p[x] /; x>0; f[3]; f[-3]; F[x_, y_] /; x < y /; x>0  := x / y; F[x_, y_] := y / x; F[2, 3]; F[3, 2]"#,
+      r#"2 / 3"#,
+    );
+  }
+  #[test]
+  fn f_5() {
+    assert_case(
+      r#"Attributes[SetDelayed]; a = 1; x := a; x; a = 2; x; f[x_] := p[x] /; x>0; f[3]; f[-3]; F[x_, y_] /; x < y /; x>0  := x / y; F[x_, y_] := y / x; F[2, 3]; F[3, 2]; F[-3, 2]"#,
+      r#"-2 / 3"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_10() {
+    assert_case(
+      r#"Attributes[SetDelayed]; a = 1; x := a; x; a = 2; x; f[x_] := p[x] /; x>0; f[3]; f[-3]; F[x_, y_] /; x < y /; x>0  := x / y; F[x_, y_] := y / x; F[2, 3]; F[3, 2]; F[-3, 2]; ClearAll[a,b]; a/; b>0:= 3; a"#,
+      r#"a"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_11() {
+    assert_case(
+      r#"Attributes[SetDelayed]; a = 1; x := a; x; a = 2; x; f[x_] := p[x] /; x>0; f[3]; f[-3]; F[x_, y_] /; x < y /; x>0  := x / y; F[x_, y_] := y / x; F[2, 3]; F[3, 2]; F[-3, 2]; ClearAll[a,b]; a/; b>0:= 3; a; b=2; a"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn down_values_1() {
+    assert_case(
+      r#"square /: area[square[s_]] := s^2; DownValues[square]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn up_values_2() {
+    assert_case(
+      r#"square /: area[square[s_]] := s^2; DownValues[square]; UpValues[square]"#,
+      r#"{HoldPattern[area[square[s_]]] :> s^2}"#,
+    );
+  }
+  #[test]
+  fn down_values_2() {
+    assert_case(r#"a[b] ^= 3; DownValues[a]"#, r#"{}"#);
+  }
+  #[test]
+  fn up_values_3() {
+    assert_case(
+      r#"a[b] ^= 3; DownValues[a]; UpValues[b]"#,
+      r#"{HoldPattern[a[b]] :> 3}"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_12() {
+    assert_case(
+      r#"a[b] ^= 3; DownValues[a]; UpValues[b]; Format[r] ^= "custom"; r"#,
+      r#"r"#,
+    );
+  }
+  #[test]
+  fn up_values_4() {
+    assert_case(
+      r#"a[b] ^= 3; DownValues[a]; UpValues[b]; Format[r] ^= "custom"; r; UpValues[r]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn up_values_5() {
+    assert_case(
+      r#"a[b] ^:= x; x = 2; a[b]; UpValues[b]"#,
+      r#"{HoldPattern[a[b]] :> x}"#,
+    );
+  }
+  #[test]
+  fn set_12() {
+    assert_case(r#"a = 10; a += 2"#, r#"12"#);
+  }
+  #[test]
+  fn symbol_literal_13() {
+    assert_case(r#"a = 10; a += 2; a"#, r#"12"#);
+  }
+  #[test]
+  fn minus_1() {
+    assert_case(r#"a = 5; a--"#, r#"5"#);
+  }
+  #[test]
+  fn symbol_literal_14() {
+    assert_case(r#"a = 5; a--; a"#, r#"4"#);
+  }
+  #[test]
+  fn symbol_literal_15() {
+    assert_case(r#"a = 5; a--; a; a = 1.6; a--; a"#, r#"0.6000000000000001"#);
+  }
+  #[test]
+  fn set_13() {
+    assert_case(
+      r#"a = 5; a--; a; a = 1.6; a--; a; a = {1, 3, 5}"#,
+      r#"{1, 3, 5}"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_16() {
+    assert_case(
+      r#"a = 5; a--; a; a = 1.6; a--; a; a = {1, 3, 5}; a--; a"#,
+      r#"{0, 2, 4}"#,
+    );
+  }
+  #[test]
+  fn set_14() {
+    assert_case(r#"a = 10; a /= 2"#, r#"5"#);
+  }
+  #[test]
+  fn symbol_literal_17() {
+    assert_case(r#"a = 10; a /= 2; a"#, r#"5"#);
+  }
+  #[test]
+  fn plus_1() {
+    assert_case(r#"a = 1; a++"#, r#"1"#);
+  }
+  #[test]
+  fn symbol_literal_18() {
+    assert_case(r#"a = 1; a++; a"#, r#"2"#);
+  }
+  #[test]
+  fn plus_2() {
+    assert_case(r#"a = 1; a++; a; a = 1.5; a++"#, r#"1.5"#);
+  }
+  #[test]
+  fn symbol_literal_19() {
+    assert_case(r#"a = 1; a++; a; a = 1.5; a++; a"#, r#"2.5"#);
+  }
+  #[test]
+  fn symbol_literal_20() {
+    assert_case(
+      r#"a = 1; a++; a; a = 1.5; a++; a; y = 2 x; y++; y"#,
+      r#"1 + 2*x"#,
+    );
+  }
+  #[test]
+  fn set_15() {
+    assert_case(
+      r#"a = 1; a++; a; a = 1.5; a++; a; y = 2 x; y++; y; x = {1, 3, 5}"#,
+      r#"{1, 3, 5}"#,
+    );
+  }
+  #[test]
+  fn plus_3() {
+    assert_case(
+      r#"a = 1; a++; a; a = 1.5; a++; a; y = 2 x; y++; y; x = {1, 3, 5}; ++++a+++++2 // Hold // FullForm"#,
+      r#"FullForm[Hold[++(++(a++++)) + 2]]"#,
+    );
+  }
+  #[test]
+  fn increment_chain_postfix() {
+    // Postfix outer never parenthesizes; chained postfix prints
+    // compactly. Matches wolframscript.
+    assert_case(r#"Hold[a++++]"#, r#"Hold[a++++]"#);
+    assert_case(r#"Hold[Increment[Increment[a]]]"#, r#"Hold[a++++]"#);
+  }
+  #[test]
+  fn increment_chain_prefix() {
+    // Prefix outer parenthesizes inner ++/--.
+    assert_case(r#"Hold[++++a]"#, r#"Hold[++(++a)]"#);
+  }
+  #[test]
+  fn increment_chain_mixed() {
+    // Mixed chains follow the same rule: postfix outer = no parens,
+    // prefix outer = parens.
+    assert_case(r#"Hold[Increment[PreIncrement[a]]]"#, r#"Hold[++a++]"#);
+    assert_case(r#"Hold[PreIncrement[Increment[a]]]"#, r#"Hold[++(a++)]"#);
+  }
+  #[test]
+  fn increment_chain_fullform_round_trip() {
+    // The mathics-derived FullForm string is the ultimate authority
+    // on the parsed structure; matches wolframscript exactly.
+    assert_case(
+      r#"ToString[FullForm[Hold[++++a+++++2]]]"#,
+      r#"Hold[Plus[PreIncrement[PreIncrement[Increment[Increment[a]]]], 2]]"#,
+    );
+  }
+  #[test]
+  fn minus_2() {
+    assert_case(r#"a = 2; --a"#, r#"1"#);
+  }
+  #[test]
+  fn symbol_literal_21() {
+    assert_case(r#"a = 2; --a; a"#, r#"1"#);
+  }
+  #[test]
+  fn set_16() {
+    assert_case(r#"a = 2"#, r#"2"#);
+  }
+  #[test]
+  fn plus_4() {
+    assert_case(r#"a = 2; ++a"#, r#"3"#);
+  }
+  #[test]
+  fn symbol_literal_22() {
+    assert_case(r#"a = 2; ++a; a"#, r#"3"#);
+  }
+  #[test]
+  fn plus_5() {
+    assert_case(r#"a = 2; ++a; a; a + 1.6"#, r#"4.6"#);
+  }
+  #[test]
+  fn plus_6() {
+    assert_case(
+      r#"a = 2; ++a; a; a + 1.6; Clear[x, y]; y = x; ++y"#,
+      r#"1 + x"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_23() {
+    assert_case(
+      r#"a = 2; ++a; a; a + 1.6; Clear[x, y]; y = x; ++y; y"#,
+      r#"1 + x"#,
+    );
+  }
+  #[test]
+  fn set_17() {
+    assert_case(r#"a = 10; a -= 2"#, r#"8"#);
+  }
+  #[test]
+  fn symbol_literal_24() {
+    assert_case(r#"a = 10; a -= 2; a"#, r#"8"#);
+  }
+  #[test]
+  fn set_18() {
+    assert_case(r#"a = 10; a *= 2"#, r#"20"#);
+  }
+  #[test]
+  fn symbol_literal_25() {
+    assert_case(r#"a = 10; a *= 2; a"#, r#"20"#);
+  }
+  #[test]
+  fn up_values_6() {
+    assert_case(r#"a + b ^= 2; UpValues[a]"#, r#"{HoldPattern[a + b] :> 2}"#);
+  }
+  #[test]
+  fn up_values_7() {
+    assert_case(
+      r#"a + b ^= 2; UpValues[a]; UpValues[b]"#,
+      r#"{HoldPattern[a + b] :> 2}"#,
+    );
+  }
+  #[test]
+  fn sin() {
+    assert_case(
+      r#"a + b ^= 2; UpValues[a]; UpValues[b]; UpValues[pi] := {Sin[pi] :> 0}; Sin[pi]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn set_19() {
+    assert_case(
+      r#"factors = FactorInteger[2010]"#,
+      r#"{{2, 1}, {3, 1}, {5, 1}, {67, 1}}"#,
+    );
+  }
+  #[test]
+  fn apply() {
+    assert_case(
+      r#"factors = FactorInteger[2010]; Times @@ Power @@@ factors"#,
+      r#"2010"#,
+    );
+  }
+  #[test]
+  fn factor_integer() {
+    assert_case(
+      r#"factors = FactorInteger[2010]; Times @@ Power @@@ factors; FactorInteger[2010 / 2011]"#,
+      r#"{{2, 1}, {3, 1}, {5, 1}, {67, 1}, {2011, -1}}"#,
+    );
+  }
+  #[test]
+  fn greater_1() {
+    assert_case(r#"rule = F[u_]->g[u]"#, r#"F[u_] -> g[u]"#);
+  }
+  #[test]
+  fn plus_7() {
+    assert_case(
+      r#"rule = F[u_]->g[u]; a + F[x ^ 2] /. rule"#,
+      r#"a + g[x ^ 2]"#,
+    );
+  }
+  #[test]
+  fn plus_8() {
+    assert_case(
+      r#"rule = F[u_]->g[u]; a + F[x ^ 2] /. rule; a + F[F[x ^ 2]] /. rule"#,
+      r#"a + g[F[x ^ 2]]"#,
+    );
+  }
+  #[test]
+  fn plus_9() {
+    assert_case(
+      r#"rule = F[u_]->g[u]; a + F[x ^ 2] /. rule; a + F[F[x ^ 2]] /. rule; a + F[F[x ^ 2]] //. rule"#,
+      r#"a + g[g[x ^ 2]]"#,
+    );
+  }
+  #[test]
+  fn set_20() {
+    assert_case(
+      r#"rule = F[u_]->g[u]; a + F[x ^ 2] /. rule; a + F[F[x ^ 2]] /. rule; a + F[F[x ^ 2]] //. rule; dispatchrule = Dispatch[{rule}]"#,
+      r#"Dispatch[{F[u_] -> g[u]}]"#,
+    );
+  }
+  #[test]
+  fn plus_10() {
+    assert_case(
+      r#"rule = F[u_]->g[u]; a + F[x ^ 2] /. rule; a + F[F[x ^ 2]] /. rule; a + F[F[x ^ 2]] //. rule; dispatchrule = Dispatch[{rule}]; a + F[F[x ^ 2]] //. dispatchrule"#,
+      r#"a + g[g[x ^ 2]]"#,
+    );
+  }
+  #[test]
+  fn f_6() {
+    assert_case(
+      r#"rules = {{a_,b_}->a^b, {1,2}->3., F[x_]->x^2}; F[2] /. rules"#,
+      r#"4"#,
+    );
+  }
+  #[test]
+  fn set_21() {
+    assert_case(
+      r#"rules = {{a_,b_}->a^b, {1,2}->3., F[x_]->x^2}; F[2] /. rules; dispatchrules = Dispatch[rules]"#,
+      r#"Dispatch[{{a_, b_} -> a^b, {1, 2} -> 3., F[x_] -> x^2}]"#,
+    );
+  }
+  #[test]
+  fn f_7() {
+    assert_case(
+      r#"rules = {{a_,b_}->a^b, {1,2}->3., F[x_]->x^2}; F[2] /. rules; dispatchrules = Dispatch[rules];  F[2] /. dispatchrules"#,
+      r#"4"#,
+    );
+  }
+  #[test]
+  fn unequal_1() {
+    assert_case(r#"a =!= a"#, r#"False"#);
+  }
+  #[test]
+  fn unequal_2() {
+    assert_case(r#"a =!= a; 1 =!= 1."#, r#"True"#);
+  }
+  #[test]
+  fn unequal_3() {
+    assert_case(r#"a =!= a; 1 =!= 1.; 1 =!= 2 =!= 3 =!= 4"#, r#"True"#);
+  }
+  #[test]
+  fn unequal_4() {
+    assert_case(
+      r#"a =!= a; 1 =!= 1.; 1 =!= 2 =!= 3 =!= 4; 1 =!= 2 =!= 1 =!= 4"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn unsame_q_1() {
+    assert_case(
+      r#"a =!= a; 1 =!= 1.; 1 =!= 2 =!= 3 =!= 4; 1 =!= 2 =!= 1 =!= 4; UnsameQ[]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn unsame_q_2() {
+    assert_case(
+      r#"a =!= a; 1 =!= 1.; 1 =!= 2 =!= 3 =!= 4; 1 =!= 2 =!= 1 =!= 4; UnsameQ[]; UnsameQ[expr]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn numeric_q_1() {
+    assert_case(
+      r#"NumericQ[2]; NumericQ[Sqrt[Pi]]; NumberQ[Sqrt[Pi]]; NumericQ[a]=True; NumericQ[a]; NumericQ[Sin[a]]; Clear[a]; NumericQ[a]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn numeric_q_2() {
+    assert_case(
+      r#"NumericQ[2]; NumericQ[Sqrt[Pi]]; NumberQ[Sqrt[Pi]]; NumericQ[a]=True; NumericQ[a]; NumericQ[Sin[a]]; Clear[a]; NumericQ[a]; ClearAll[a]; NumericQ[a]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn numeric_q_3() {
+    assert_case(
+      r#"NumericQ[2]; NumericQ[Sqrt[Pi]]; NumberQ[Sqrt[Pi]]; NumericQ[a]=True; NumericQ[a]; NumericQ[Sin[a]]; Clear[a]; NumericQ[a]; ClearAll[a]; NumericQ[a]; NumericQ[a]=False; NumericQ[a]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn accuracy_1() {
+    assert_case(
+      r#"Accuracy[3.1416`2]; Accuracy[1]; Accuracy[A]; z=Complex[3.00``2, 4.00``2]; Accuracy[z] == -Log[10, Sqrt[10^(-2 Accuracy[Re[z]]) + 10^(-2 Accuracy[Im[z]])]]; Accuracy[F[1, Pi, A]]"#,
+      r#"Infinity"#,
+    );
+  }
+  #[test]
+  fn accuracy_2() {
+    assert_case(
+      r#"Accuracy[3.1416`2]; Accuracy[1]; Accuracy[A]; z=Complex[3.00``2, 4.00``2]; Accuracy[z] == -Log[10, Sqrt[10^(-2 Accuracy[Re[z]]) + 10^(-2 Accuracy[Im[z]])]]; Accuracy[F[1, Pi, A]]; Accuracy[F[1.3, Pi, A]]"#,
+      r#"15.840646417884168"#,
+    );
+  }
+  #[test]
+  fn expression_1() {
+    assert_case(
+      r#"Accuracy[3.1416`2]; Accuracy[1]; Accuracy[A]; z=Complex[3.00``2, 4.00``2]; Accuracy[z] == -Log[10, Sqrt[10^(-2 Accuracy[Re[z]]) + 10^(-2 Accuracy[Im[z]])]]; Accuracy[F[1, Pi, A]]; Accuracy[F[1.3, Pi, A]]; 0``2"#,
+      r#"0``2."#,
+    );
+  }
+  #[test]
+  fn accuracy_3() {
+    assert_case(
+      r#"Accuracy[3.1416`2]; Accuracy[1]; Accuracy[A]; z=Complex[3.00``2, 4.00``2]; Accuracy[z] == -Log[10, Sqrt[10^(-2 Accuracy[Re[z]]) + 10^(-2 Accuracy[Im[z]])]]; Accuracy[F[1, Pi, A]]; Accuracy[F[1.3, Pi, A]]; 0``2; Accuracy[0.``2]"#,
+      r#"2."#,
+    );
+  }
+  #[test]
+  fn accuracy_4() {
+    assert_case(
+      r#"Accuracy[3.1416`2]; Accuracy[1]; Accuracy[A]; z=Complex[3.00``2, 4.00``2]; Accuracy[z] == -Log[10, Sqrt[10^(-2 Accuracy[Re[z]]) + 10^(-2 Accuracy[Im[z]])]]; Accuracy[F[1, Pi, A]]; Accuracy[F[1.3, Pi, A]]; 0``2; Accuracy[0.``2]; Accuracy[0.`] == $MachinePrecision - Log[10, $MinMachineNumber]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn accuracy_5() {
+    assert_case(
+      r#"Accuracy[3.1416`2]; Accuracy[1]; Accuracy[A]; z=Complex[3.00``2, 4.00``2]; Accuracy[z] == -Log[10, Sqrt[10^(-2 Accuracy[Re[z]]) + 10^(-2 Accuracy[Im[z]])]]; Accuracy[F[1, Pi, A]]; Accuracy[F[1.3, Pi, A]]; 0``2; Accuracy[0.``2]; Accuracy[0.`] == $MachinePrecision - Log[10, $MinMachineNumber]; Accuracy[{{1, 1.`},{1.``5, 1.``10}}]"#,
+      r#"5.000000000000002"#,
+    );
+  }
+  #[test]
+  fn definition_2() {
+    assert_case(r#"a = 2; Definition[a]"#, r#"a = 2"#);
+  }
+  #[test]
+  fn definition_3() {
+    assert_case(
+      r#"a = 2; Definition[a]; f[x_] := x ^ 2; g[f] ^:= 2; Definition[f]"#,
+      r#"g[f] ^:= 2
+
+f[x_] := x^2"#,
+    );
+  }
+  #[test]
+  fn down_values_3() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]"#,
+      r#"{HoldPattern[f[x_]] :> x^2}"#,
+    );
+  }
+  #[test]
+  fn down_values_4() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]; f[x_Integer] := 2; f[x_Real] := 3; DownValues[f]"#,
+      r#"{HoldPattern[f[x_Integer]] :> 2, HoldPattern[f[x_Real]] :> 3, HoldPattern[f[x_]] :> x^2}"#,
+    );
+  }
+  #[test]
+  fn f_8() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]; f[x_Integer] := 2; f[x_Real] := 3; DownValues[f]; f[3]"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn f_9() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]; f[x_Integer] := 2; f[x_Real] := 3; DownValues[f]; f[3]; f[3.]"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn f_10() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]; f[x_Integer] := 2; f[x_Real] := 3; DownValues[f]; f[3]; f[3.]; f[a]"#,
+      r#"a ^ 2"#,
+    );
+  }
+  #[test]
+  fn sort() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]; f[x_Integer] := 2; f[x_Real] := 3; DownValues[f]; f[3]; f[3.]; f[a]; Sort[{x_, x_Integer}, PatternsOrderedQ]"#,
+      r#"{x_, x_Integer}"#,
+    );
+  }
+  #[test]
+  fn g_7() {
+    assert_case(
+      r#"f[x_] := x ^ 2; DownValues[f]; f[x_Integer] := 2; f[x_Real] := 3; DownValues[f]; f[3]; f[3.]; f[a]; Sort[{x_, x_Integer}, PatternsOrderedQ]; DownValues[g] := {g[x_] :> x ^ 2, g[x_Integer] :> x}; g[2]"#,
+      r#"4"#,
+    );
+  }
+  #[test]
+  fn format_values_1() {
+    assert_case(
+      r#"Format[F[x_], OutputForm]:= Subscript[x, F]; FormatValues[F]"#,
+      r#"{HoldPattern[F[x_]] :> Subscript[x, F]}"#,
+    );
+  }
+  #[test]
+  fn format_values_2() {
+    assert_case(
+      r#"Format[F[x_], OutputForm]:= Subscript[x, F]; FormatValues[F]; FormatValues[F]  //InputForm"#,
+      r#"InputForm[{HoldPattern[F[x_]] :> Subscript[x, F]}]"#,
+    );
+  }
+  #[test]
+  fn own_values_2() {
+    assert_case(r#"x = 3; x = 2; OwnValues[x]"#, r#"{HoldPattern[x] :> 2}"#);
+  }
+  #[test]
+  fn own_values_3() {
+    assert_case(
+      r#"x = 3; x = 2; OwnValues[x]; x := y; OwnValues[x]"#,
+      r#"{HoldPattern[x] :> y}"#,
+    );
+  }
+  #[test]
+  fn own_values_4() {
+    assert_case(
+      r#"x = 3; x = 2; OwnValues[x]; x := y; OwnValues[x]; y = 5; OwnValues[x]"#,
+      r#"{HoldPattern[x] :> y}"#,
+    );
+  }
+  #[test]
+  fn hold_2() {
+    assert_case(
+      r#"x = 3; x = 2; OwnValues[x]; x := y; OwnValues[x]; y = 5; OwnValues[x]; Hold[x] /. OwnValues[x]"#,
+      r#"Hold[y]"#,
+    );
+  }
+  #[test]
+  fn hold_3() {
+    assert_case(
+      r#"x = 3; x = 2; OwnValues[x]; x := y; OwnValues[x]; y = 5; OwnValues[x]; Hold[x] /. OwnValues[x]; Hold[x] /. OwnValues[x] // ReleaseHold"#,
+      r#"5"#,
+    );
+  }
+  #[test]
+  fn table_1() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]"#,
+      r#"{1, 2, 3, 4}"#,
+    );
+  }
+  #[test]
+  fn table_2() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]"#,
+      r#"{2, 3, 4, 5}"#,
+    );
+  }
+  #[test]
+  fn table_3() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]; Table[i, {i, 2, 6, 2}]"#,
+      r#"{2, 4, 6}"#,
+    );
+  }
+  #[test]
+  fn table_4() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]; Table[i, {i, 2, 6, 2}]; Table[i, {i, Pi, 2 Pi, Pi / 2}]"#,
+      r#"{Pi, (3*Pi)/2, 2*Pi}"#,
+    );
+  }
+  #[test]
+  fn table_5() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]; Table[i, {i, 2, 6, 2}]; Table[i, {i, Pi, 2 Pi, Pi / 2}]; Table[x^2, {x, {a, b, c}}]"#,
+      r#"{a ^ 2, b ^ 2, c ^ 2}"#,
+    );
+  }
+  #[test]
+  fn table_6() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]; Table[i, {i, 2, 6, 2}]; Table[i, {i, Pi, 2 Pi, Pi / 2}]; Table[x^2, {x, {a, b, c}}]; Table[{i, j}, {i, {a, b}}, {j, 1, 2}]"#,
+      r#"{{{a, 1}, {a, 2}}, {{b, 1}, {b, 2}}}"#,
+    );
+  }
+  #[test]
+  fn table_7() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]; Table[i, {i, 2, 6, 2}]; Table[i, {i, Pi, 2 Pi, Pi / 2}]; Table[x^2, {x, {a, b, c}}]; Table[{i, j}, {i, {a, b}}, {j, 1, 2}]; Table[x, {x, a, a + 5 n, n}]"#,
+      r#"{a, a + n, a + 2*n, a + 3*n, a + 4*n, a + 5*n}"#,
+    );
+  }
+  #[test]
+  fn table_8() {
+    assert_case(
+      r#"Table[x, 3]; n = 0; Table[n = n + 1, {5}]; Clear[n]; Table[i, {i, 4}]; Table[i, {i, 2, 5}]; Table[i, {i, 2, 6, 2}]; Table[i, {i, Pi, 2 Pi, Pi / 2}]; Table[x^2, {x, {a, b, c}}]; Table[{i, j}, {i, {a, b}}, {j, 1, 2}]; Table[x, {x, a, a + 5 n, n}]; Table[i, {i, 1, 9, Infinity}]"#,
+      r#"{1}"#,
+    );
+  }
+  #[test]
+  fn append_to_1() {
+    assert_case(r#"s = {}; AppendTo[s, 1]"#, r#"{1}"#);
+  }
+  #[test]
+  fn symbol_literal_26() {
+    assert_case(r#"s = {}; AppendTo[s, 1]; s"#, r#"{1}"#);
+  }
+  #[test]
+  fn append_to_2() {
+    assert_case(
+      r#"s = {}; AppendTo[s, 1]; s; y = f[]; AppendTo[y, x]"#,
+      r#"f[x]"#,
+    );
+  }
+  /// AppendTo/PrependTo on an indexed (DownValue) target `f[1]`, both
+  /// global and Module-local, including the chained-assignment seed
+  /// `f[1] = f[2] = {}` used by the parabolic-mirror Demonstration.
+  #[test]
+  fn append_to_indexed_downvalue() {
+    assert_case(
+      r#"f[1] = {}; AppendTo[f[1], 5]; AppendTo[f[1], 7]; f[1]"#,
+      r#"{5, 7}"#,
+    );
+    assert_case(
+      r#"g1[1] = g1[2] = {}; AppendTo[g1[2], 1]; {g1[1], g1[2]}"#,
+      r#"{{}, {1}}"#,
+    );
+    assert_case(
+      r#"Module[{h}, h[1] = {}; AppendTo[h[1], 3]; h[1]]"#,
+      r#"{3}"#,
+    );
+    assert_case(r#"k[1] = {2, 3}; PrependTo[k[1], 1]; k[1]"#, r#"{1, 2, 3}"#);
+  }
+  /// An indexed target with no stored value still reports rvalue and
+  /// leaves the call unevaluated.
+  #[test]
+  fn append_to_indexed_without_value_stays_unevaluated() {
+    assert_case(r#"AppendTo[noval[1], 5]"#, r#"AppendTo[noval[1], 5]"#);
+  }
+  #[test]
+  fn symbol_literal_27() {
+    assert_case(
+      r#"s = {}; AppendTo[s, 1]; s; y = f[]; AppendTo[y, x]; y"#,
+      r#"f[x]"#,
+    );
+  }
+  #[test]
+  fn a_5() {
+    assert_case(r#"A = {a, b, c, d}; A[[3]]"#, r#"c"#);
+  }
+  #[test]
+  fn list_literal_3() {
+    assert_case(r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]"#, r#"b"#);
+  }
+  #[test]
+  fn plus_11() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]"#,
+      r#"b"#,
+    );
+  }
+  #[test]
+  fn plus_12() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]"#,
+      r#"Plus"#,
+    );
+  }
+  #[test]
+  fn m() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]"#,
+      r#"b"#,
+    );
+  }
+  #[test]
+  fn list_literal_4() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]"#,
+      r#"{2, 3, 4}"#,
+    );
+  }
+  #[test]
+  fn list_literal_5() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]; {1, 2, 3, 4}[[2;;-1]]"#,
+      r#"{2, 3, 4}"#,
+    );
+  }
+  #[test]
+  fn list_literal_6() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]; {1, 2, 3, 4}[[2;;-1]]; {a, b, c, d}[[{1, 3, 3}]]"#,
+      r#"{a, c, c}"#,
+    );
+  }
+  #[test]
+  fn b_2() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]; {1, 2, 3, 4}[[2;;-1]]; {a, b, c, d}[[{1, 3, 3}]]; B = {{a, b, c}, {d, e, f}, {g, h, i}}; B[[;;, 2]]"#,
+      r#"{b, e, h}"#,
+    );
+  }
+  #[test]
+  fn b_3() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]; {1, 2, 3, 4}[[2;;-1]]; {a, b, c, d}[[{1, 3, 3}]]; B = {{a, b, c}, {d, e, f}, {g, h, i}}; B[[;;, 2]]; B = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}; B[[{1, 3}, -2;;-1]]"#,
+      r#"{{2, 3}, {8, 9}}"#,
+    );
+  }
+  #[test]
+  fn list_literal_7() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]; {1, 2, 3, 4}[[2;;-1]]; {a, b, c, d}[[{1, 3, 3}]]; B = {{a, b, c}, {d, e, f}, {g, h, i}}; B[[;;, 2]]; B = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}; B[[{1, 3}, -2;;-1]]; {{a, b, c}, {d, e, f}, {g, h, i}}[[All, 3]]"#,
+      r#"{c, f, i}"#,
+    );
+  }
+  #[test]
+  fn plus_13() {
+    assert_case(
+      r#"A = {a, b, c, d}; A[[3]]; {a, b, c}[[-2]]; (a + b + c)[[2]]; (a + b + c)[[0]]; M = {{a, b}, {c, d}}; M[[1, 2]]; {1, 2, 3, 4}[[2;;4]]; {1, 2, 3, 4}[[2;;-1]]; {a, b, c, d}[[{1, 3, 3}]]; B = {{a, b, c}, {d, e, f}, {g, h, i}}; B[[;;, 2]]; B = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}}; B[[{1, 3}, -2;;-1]]; {{a, b, c}, {d, e, f}, {g, h, i}}[[All, 3]]; (a+b+c+d)[[-1;;-2]]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn set_22() {
+    assert_case(r#"s = {1, 2, 4, 9}"#, r#"{1, 2, 4, 9}"#);
+  }
+  #[test]
+  fn prepend_to_1() {
+    assert_case(r#"s = {1, 2, 4, 9}; PrependTo[s, 0]"#, r#"{0, 1, 2, 4, 9}"#);
+  }
+  #[test]
+  fn symbol_literal_28() {
+    assert_case(
+      r#"s = {1, 2, 4, 9}; PrependTo[s, 0]; s"#,
+      r#"{0, 1, 2, 4, 9}"#,
+    );
+  }
+  #[test]
+  fn prepend_to_2() {
+    assert_case(
+      r#"s = {1, 2, 4, 9}; PrependTo[s, 0]; s; y = f[a, b, c]; PrependTo[y, x]"#,
+      r#"f[x, a, b, c]"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_29() {
+    assert_case(
+      r#"s = {1, 2, 4, 9}; PrependTo[s, 0]; s; y = f[a, b, c]; PrependTo[y, x]; y"#,
+      r#"f[x, a, b, c]"#,
+    );
+  }
+  #[test]
+  fn f_11() {
+    assert_case(r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]"#, r#"F[1.2, 2/9]"#);
+  }
+  #[test]
+  fn f_12() {
+    assert_case(
+      r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]; F[1.2, 2/9]"#,
+      r#"F[1.2, 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_13() {
+    assert_case(
+      r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]; F[1.2, 2/9]; F[1.2`3, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_14() {
+    assert_case(
+      r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]; F[1.2, 2/9]; F[1.2`3, 2/9]; F[1.2`3, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_15() {
+    assert_case(
+      r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]; F[1.2, 2/9]; F[1.2`3, 2/9]; F[1.2`3, 2/9]; a=1.2`3;F[a, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_16() {
+    assert_case(
+      r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]; F[1.2, 2/9]; F[1.2`3, 2/9]; F[1.2`3, 2/9]; a=1.2`3;F[a, 2/9]; N[b]=1.2`3;F[b, 2/9]"#,
+      r#"F[b, 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_17() {
+    assert_case(
+      r#"1; Sqrt[2]; 2/9; Pi; F[1.2, 2/9]; F[1.2, 2/9]; F[1.2`3, 2/9]; F[1.2`3, 2/9]; a=1.2`3;F[a, 2/9]; N[b]=1.2`3;F[b, 2/9]; N[b,_]=1.2`3;F[b, 2/9]"#,
+      r#"F[b, 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_18() {
+    assert_case(r#"F[1.2`3, 2/9]"#, r#"F[1.2`3., 2/9]"#);
+  }
+  #[test]
+  fn f_19() {
+    assert_case(r#"1; 2/9; Sqrt[2]; Pi; F[1.2, 2/9]"#, r#"F[1.2, 2/9]"#);
+  }
+  #[test]
+  fn f_20() {
+    assert_case(
+      r#"1; 2/9; Sqrt[2]; Pi; F[1.2, 2/9]; F[1.2`3, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_21() {
+    assert_case(
+      r#"1; 2/9; Sqrt[2]; Pi; F[1.2, 2/9]; F[1.2`3, 2/9]; a=1.2`3; F[a, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_22() {
+    assert_case(
+      r#"1; 2/9; Sqrt[2]; Pi; F[1.2, 2/9]; F[1.2`3, 2/9]; F[a, 2/9]; N[b,_]=1.2`3; F[b, 2/9]"#,
+      r#"F[b, 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_23() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]"#,
+      r#"F[1.000123`6., 1.0001`4., 2/9]"#,
+    );
+  }
+  #[test]
+  fn divide_2() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9"#,
+      r#"2/9"#,
+    );
+  }
+  #[test]
+  fn sqrt() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9; Sqrt[2]"#,
+      r#"Sqrt[2]"#,
+    );
+  }
+  #[test]
+  fn pi() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9; Sqrt[2]; Pi"#,
+      r#"Pi"#,
+    );
+  }
+  #[test]
+  fn f_24() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9; Sqrt[2]; Pi; F[1.3, 2/9]"#,
+      r#"F[1.3, 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_25() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9; Sqrt[2]; Pi; F[1.3, 2/9]; F[1.2`3, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_26() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9; Sqrt[2]; Pi; F[1.3, 2/9]; F[1.2`3, 2/9]; a=1.2`3; F[a, 2/9]"#,
+      r#"F[1.2`3., 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_27() {
+    assert_case(
+      r#"1; {1, 1.}; {1.000123`6, 1.0001`4, 2/9}; F[1.000123`6, 1.0001`4, 2/9]; 2/9; Sqrt[2]; Pi; F[1.3, 2/9]; F[1.2`3, 2/9]; F[a, 2/9]; N[b,_]=1.2`3; F[b, 2/9]"#,
+      r#"F[b, 2/9]"#,
+    );
+  }
+  #[test]
+  fn f_28() {
+    assert_case(
+      r#"Sin[1]; a; Sin[a]; NumericQ[a]=True; Sin[a]; Attributes[F]=NumericFunction; F[1]"#,
+      r#"F[1]"#,
+    );
+  }
+  #[test]
+  fn f_29() {
+    assert_case(
+      r#"Sin[1]; a; Sin[a]; NumericQ[a]=True; Sin[a]; Attributes[F]=NumericFunction; F[1]; Attributes[F]=NumericFunction; F[Pi]"#,
+      r#"F[Pi]"#,
+    );
+  }
+  #[test]
+  fn f_30() {
+    assert_case(
+      r#"Sin[1]; a; Sin[a]; NumericQ[a]=True; Sin[a]; Attributes[F]=NumericFunction; F[1]; Attributes[F]=NumericFunction; F[Pi]; Attributes[F]=NumericFunction; F["bla"]"#,
+      r#"F["bla"]"#,
+    );
+  }
+  #[test]
+  fn f_31() {
+    assert_case(
+      r#"Sin[1]; a; Sin[a]; NumericQ[a]=True; Sin[a]; Attributes[F]=NumericFunction; F[1]; Attributes[F]=NumericFunction; F[Pi]; Attributes[F]=NumericFunction; F["bla"]; F[1,l->2]"#,
+      r#"F[1, l -> 2]"#,
+    );
+  }
+  #[test]
+  fn plus_14() {
+    assert_case(
+      r#"Sin[1]; a; Sin[a]; NumericQ[a]=True; Sin[a]; Attributes[F]=NumericFunction; F[1]; Attributes[F]=NumericFunction; F[Pi]; Attributes[F]=NumericFunction; F["bla"]; F[1,l->2]; 1/(Sin[1]^2+Cos[1]^2-1)"#,
+      r#"(-1 + Cos[1]^2 + Sin[1]^2)^(-1)"#,
+    );
+  }
+  #[test]
+  fn numeric_q_4() {
+    assert_case(
+      r#"NumericQ[a]=True;NumericQ[a]; NumericQ[a]=False;NumericQ[a]; NumericQ[a]=True; Clear[a]; NumericQ[a]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn numeric_q_5() {
+    assert_case(
+      r#"NumericQ[a]=True;NumericQ[a]; NumericQ[a]=False;NumericQ[a]; NumericQ[a]=True; Clear[a]; NumericQ[a]; NumericQ[a]=True; ClearAll[a]; NumericQ[a]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn numeric_q_6() {
+    assert_case(
+      r#"NumericQ[a]=True;NumericQ[a]; NumericQ[a]=False;NumericQ[a]; NumericQ[a]=True; Clear[a]; NumericQ[a]; NumericQ[a]=True; ClearAll[a]; NumericQ[a]; NumericQ[a]=False"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn table_9() {
+    assert_case(r#"Table[F[x],{x,1,3}]"#, r#"{F[1],F[2],F[3]}"#);
+  }
+  #[test]
+  fn table_10() {
+    assert_case(
+      r#"Table[F[x],{x,1,3}]; Table[F[x],{x,{1,2,3}}]"#,
+      r#"{F[1],F[2],F[3]}"#,
+    );
+  }
+  #[test]
+  fn table_11() {
+    assert_case(
+      r#"Table[F[x],{x,1,3}]; Table[F[x],{x,{1,2,3}}]; s={1,2,3};Table[F[x],{x,s}]"#,
+      r#"{F[1],F[2],F[3]}"#,
+    );
+  }
+  #[test]
+  fn f_32() {
+    assert_case(
+      r#"F[x___Real]:=List[x]^2; a=.4; F[Unevaluated[a], a, Unevaluated[a]]"#,
+      r#"F[Unevaluated[a], 0.4, Unevaluated[a]]"#,
+    );
+  }
+  #[test]
+  fn f_33() {
+    assert_case(
+      r#"F[Unevaluated[a], a, Unevaluated[a]]; F[x___Real]:=List[x]^2; a=.4; F[Unevaluated[b], b, Unevaluated[b]]"#,
+      r#"F[Unevaluated[b], b, Unevaluated[b]]"#,
+    );
+  }
+  #[test]
+  fn g_8() {
+    assert_case(
+      r#"F[Unevaluated[a], a, Unevaluated[a]]; F[Unevaluated[b], b, Unevaluated[b]]; G[x___Symbol]:=List[x]^2; a=.4; G[Unevaluated[a], a, Unevaluated[a]]"#,
+      r#"G[Unevaluated[a], 0.4, Unevaluated[a]]"#,
+    );
+  }
+  #[test]
+  fn g_9() {
+    assert_case(
+      r#"F[Unevaluated[a], a, Unevaluated[a]]; F[Unevaluated[b], b, Unevaluated[b]]; G[Unevaluated[a], a, Unevaluated[a]]; G[x___Symbol]:=List[x]^2; a=.4; G[Unevaluated[b], b, Unevaluated[b]]"#,
+      r#"{b^2, b^2, b^2}"#,
+    );
+  }
+  #[test]
+  fn f_34() {
+    assert_case(
+      r#"F[Unevaluated[a], a, Unevaluated[a]]; F[Unevaluated[b], b, Unevaluated[b]]; G[Unevaluated[a], a, Unevaluated[a]]; G[Unevaluated[b], b, Unevaluated[b]]; a =.; F[a, x_Real, a] := List[x]^2;a=4.; F[Unevaluated[a], a, Unevaluated[a]]"#,
+      r#"{16.}"#,
+    );
+  }
+  #[test]
+  fn f1() {
+    assert_case(
+      r#"ClearAll[q];ClearAll[a];ClearAll[s]; Options[f1]:={"q"->12};f1[x_,OptionsPattern[]]:=x^OptionValue["q"]; f1[y]"#,
+      r#"y ^ 12"#,
+    );
+  }
+  #[test]
+  fn set_23() {
+    assert_case(r#"globalvarY = 37"#, r#"37"#);
+  }
+  #[test]
+  fn set_24() {
+    assert_case(r#"globalvarY = 37; globalvarZ = 37"#, r#"37"#);
+  }
+  #[test]
+  fn a_6() {
+    assert_case(r#"A; A_; A[c_]"#, r#"A[c_]"#);
+  }
+  #[test]
+  fn a_7() {
+    assert_case(r#"A; A_; A[c_]; A[3]"#, r#"A[3]"#);
+  }
+  #[test]
+  fn a_8() {
+    assert_case(r#"A; A_; A[c_]; A[3]; A[B][3]"#, r#"A[B][3]"#);
+  }
+  #[test]
+  fn a_9() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]"#,
+      r#"A[s[x_]][y]"#,
+    );
+  }
+  #[test]
+  fn a_10() {
+    assert_case(r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A"#, r#"A"#);
+  }
+  #[test]
+  fn greater_2() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0"#,
+      r#"A /; A > 0"#,
+    );
+  }
+  #[test]
+  fn greater_3() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0)"#,
+      r#"s:(A /; A > 0)"#,
+    );
+  }
+  #[test]
+  fn greater_4() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0"#,
+      r#"s:A /; A > 0"#,
+    );
+  }
+  #[test]
+  fn greater_5() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0"#,
+      r#"s:A /; A > 0"#,
+    );
+  }
+  #[test]
+  fn expression_2() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A"#,
+      r#"_A"#,
+    );
+  }
+  #[test]
+  fn a_11() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A; A[]"#,
+      r#"A[]"#,
+    );
+  }
+  #[test]
+  fn expression_3() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A; A[]; _A"#,
+      r#"_A"#,
+    );
+  }
+  #[test]
+  fn a_12() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A; A[]; _A; A[p_, q]"#,
+      r#"A[p_, q]"#,
+    );
+  }
+  #[test]
+  fn expr() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A; A[]; _A; A[p_, q]; s:A[p_, q]"#,
+      r#"s:A[p_, q]"#,
+    );
+  }
+  #[test]
+  fn greater_6() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A; A[]; _A; A[p_, q]; s:A[p_, q]; A[p_, q]/;q>0"#,
+      r#"A[p_, q] /; q > 0"#,
+    );
+  }
+  #[test]
+  fn greater_7() {
+    assert_case(
+      r#"A; A_; A[c_]; A[3]; A[B][3]; A[s[x_]][y]; A; A/;A>0; s:(A/;A>0); (s:A)/;A>0; s:A/;A>0; _A; A[]; _A; A[p_, q]; s:A[p_, q]; A[p_, q]/;q>0; (s:A[p_, q])/;q>0"#,
+      r#"s:A[p_, q] /; q > 0"#,
+    );
+  }
+  #[test]
+  fn a_13() {
+    assert_case(r#"A; A[x]"#, r#"A[x]"#);
+  }
+  #[test]
+  fn a_14() {
+    assert_case(r#"A; A[x]"#, r#"A[x]"#);
+  }
+  #[test]
+  fn a_15() {
+    assert_case(r#"A; A[x]; A[B[x],y]"#, r#"A[B[x], y]"#);
+  }
+  #[test]
+  fn b_4() {
+    assert_case(r#"A; A[x]; A[B[x],y]; B[A[x,y],z]"#, r#"B[A[x, y], z]"#);
+  }
+  #[test]
+  fn f_35() {
+    assert_case(
+      r#"A; A[x]; A[B[x],y]; B[A[x,y],z]; F[B[A[x,y],z]]"#,
+      r#"F[B[A[x, y], z]]"#,
+    );
+  }
+  #[test]
+  fn f_36() {
+    assert_case(
+      r#"A; A[x]; A[B[x],y]; B[A[x,y],z]; F[B[A[x,y],z]]; F[B[A[x,y],z],t]"#,
+      r#"F[B[A[x, y], z], t]"#,
+    );
+  }
+  #[test]
+  fn rb_1() {
+    assert_case(r#"rb=RowBox[{"a", "b"}]; rb[[1]]"#, r#"{"a", "b"}"#);
+  }
+  #[test]
+  fn rb_2() {
+    assert_case(r#"rb=RowBox[{"a", "b"}]; rb[[1]]; rb[[0]]"#, r#"RowBox"#);
+  }
+  #[test]
+  fn make_boxes_1() {
+    assert_case(
+      r#"MakeBoxes[G[F[2.]], StandardForm]"#,
+      r#"RowBox[{"G", "[", RowBox[{"F", "[", "2.`", "]"}], "]"}]"#,
+    );
+  }
+  #[test]
+  fn make_boxes_2() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn make_boxes_3() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn make_boxes_4() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn format_1() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn format_2() {
+    assert_case(
+      r#"MakeBoxes[F[x__], fmt_] :=  RowBox[{"F", "<~", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], "~>"}]; MakeBoxes[G[x___], fmt_] := RowBox[{"G", "<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">"}]; MakeBoxes[GG[x___], fmt_] := RowBox[{"GG", "<<", RowBox[MakeBoxes[#1, fmt] & /@ List[x]], ">>"}]; Format[F[x_, y_], StandardForm] := {F[x], "Standard"}; Format[G[x___], StandardForm] :=  {"Standard", GG[x]}"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn clear_all_1() {
+    assert_case(r#"ClearAll[g,a,b]"#, r#"Null"#);
+  }
+  #[test]
+  fn string_literal_1() {
+    // Wolframscript-matched expectation. mathics expected the literal
+    // matrix RHS leftover from earlier shared state, but `wolframscript
+    // -code` returns `a == A` (OutputForm strips quotes around held
+    // strings inside Comparison expressions). Woxi matches.
+    assert_case(r#"ClearAll[g,a,b]; "a"==A"#, r#"a == A"#);
+  }
+  #[test]
+  fn string_literal_2() {
+    assert_case(r#"ClearAll[g,a,b]; "a"==A; "a"=="a""#, r#"True"#);
+  }
+  #[test]
+  fn string_literal_3() {
+    assert_case(r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b""#, r#"False"#);
+  }
+  #[test]
+  fn string_literal_4() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn g_10() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]"#,
+      r#"g[2] == g[3]"#,
+    );
+  }
+  #[test]
+  fn g_11() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]"#,
+      r#"g[a] == g[3]"#,
+    );
+  }
+  #[test]
+  fn g_12() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]; g[2]==g[a]"#,
+      r#"g[2] == g[a]"#,
+    );
+  }
+  #[test]
+  fn g_13() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]; g[2]==g[a]; g[a]==g[b]"#,
+      r#"g[a] == g[b]"#,
+    );
+  }
+  #[test]
+  fn g_14() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]; g[2]==g[a]; g[a]==g[b]; g[a]==g[a]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn g_15() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]; g[2]==g[a]; g[a]==g[b]; g[a]==g[a]; g[1]==g[1]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_2() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]; g[2]==g[a]; g[a]==g[b]; g[a]==g[a]; g[1]==g[1]; a == a == a"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn equal_3() {
+    assert_case(
+      r#"ClearAll[g,a,b]; "a"==A; "a"=="a"; "a"=="b"; "a"==3; g[2]==g[3]; g[a]==g[3]; g[2]==g[a]; g[a]==g[b]; g[a]==g[a]; g[1]==g[1]; a == a == a; E == N[E]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn clear_all_2() {
+    assert_case(r#"ClearAll[f,a,b,x,y]"#, r#"Null"#);
+  }
+  #[test]
+  fn leaf_count() {
+    assert_case(r#"ClearAll[f,a,b,x,y]; LeafCount[f[a, b][x, y]]"#, r#"5"#);
+  }
+  #[test]
+  fn anonymous_function() {
+    assert_case(
+      r#"ClearAll[f,a,b,x,y]; LeafCount[f[a, b][x, y]]; data=NestList[# /. s[x_][y_][z_] -> x[z][y[z]] &, s[s][s][s[s]][s][s], 4]"#,
+      r#"{s[s][s][s[s]][s][s], s[s[s]][s[s[s]]][s][s], s[s][s][s[s[s]][s]][s], s[s[s[s]][s]][s[s[s[s]][s]]][s], s[s[s]][s][s][s[s[s[s]][s]][s]]}"#,
+    );
+  }
+  #[test]
+  fn divide_3() {
+    assert_case(
+      r#"ClearAll[f,a,b,x,y]; LeafCount[f[a, b][x, y]]; data=NestList[# /. s[x_][y_][z_] -> x[z][y[z]] &, s[s][s][s[s]][s][s], 4]; LeafCount /@ data"#,
+      r#"{7, 8, 8, 11, 11}"#,
+    );
+  }
+  #[test]
+  fn clear_1() {
+    assert_case(
+      r#"ClearAll[f,a,b,x,y]; LeafCount[f[a, b][x, y]]; data=NestList[# /. s[x_][y_][z_] -> x[z][y[z]] &, s[s][s][s[s]][s][s], 4]; LeafCount /@ data; Clear[data]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn head_4() {
+    // wolframscript prints the internal `CompiledFunction[…]` bytecode
+    // representation (Wolfram version + opcode tables + a per-install
+    // hash), which Woxi can't reproduce. Verify the documented
+    // contract instead: `Compile[…]` returns a `CompiledFunction[…]`
+    // wrapper that, when applied to a numeric argument, evaluates the
+    // body — exactly what case 4343 then exercises.
+    assert_case(
+      r#"cf = Compile[{{x, _Real}}, Sin[x]]; Head[cf] === CompiledFunction"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn cf_3() {
+    assert_case(
+      r#"cf = Compile[{{x, _Real}}, Sin[x]]; cf[1/2]"#,
+      r#"0.479425538604203"#,
+    );
+  }
+  #[test]
+  fn cf_4() {
+    assert_case(
+      r#"cf = Compile[{{x, _Real}}, Sin[x]]; cf[1/2]; cf[4]"#,
+      r#"-0.7568024953079283"#,
+    );
+  }
+  #[test]
+  fn set_25() {
+    assert_case(r#"res=CompoundExpression[x, y, z]"#, r#"z"#);
+  }
+  #[test]
+  fn symbol_literal_30() {
+    assert_case(r#"res=CompoundExpression[x, y, z]; res"#, r#"z"#);
+  }
+  #[test]
+  fn symbol_literal_31() {
+    assert_case(
+      r#"res=CompoundExpression[x, y, z]; res; z = Max[1, 1 + x]; x = 2; z"#,
+      r#"3"#,
+    );
+  }
+  #[test]
+  fn clear_2() {
+    assert_case(
+      r#"res=CompoundExpression[x, y, z]; res; z = Max[1, 1 + x]; x = 2; z; Clear[x]; Clear[z]; Clear[res]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn list_literal_8() {
+    assert_case(
+      r#"rule = Q[a, _Symbol, _Integer]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b], Q[a,1,b]/.rule, Q[a,1,b]/.ruled}"#,
+      r#"{Q[a,1,b], Q[a,1,b], Q[a,1,b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_9() {
+    // wolframscript's Dispatch precompiles the rule's pattern-matching
+    // semantics at dispatch time, so a later `SetAttributes[Q,
+    // Orderless]` doesn't affect the dispatched rule (the third
+    // element stays `Q[1, a, b]`). Woxi treats Dispatch as a thin
+    // wrapper over the rule list and re-evaluates pattern matching
+    // each time, so the dispatched rule sees the new Orderless
+    // attribute and matches (third element is `True`). Verify the
+    // documented contract that ReplaceAll on the post-Orderless
+    // expression matches the rule (whether via the plain rule or the
+    // dispatched form).
+    assert_case(
+      r#"rule = Q[a, _Symbol, _Integer]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b], Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Orderless}];          {Q[a,1,b], Q[a,1,b]/.rule, Q[a, 1, b]/.ruled}"#,
+      r#"{Q[1, a, b], True, True}"#,
+    );
+  }
+  #[test]
+  fn list_literal_10() {
+    assert_case(
+      r#"rule = Q[a, _Symbol, _Integer]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b], Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Orderless}];          {Q[a,1,b], Q[a,1,b]/.rule, Q[a, 1, b]/.ruled}; rule = Q[a, _Symbol, _Integer]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b], Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}"#,
+      r#"{Q[1, a, b], True, True}"#,
+    );
+  }
+  #[test]
+  fn list_literal_11() {
+    assert_case(
+      r#"rule = Q[a, _Symbol, _Integer]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b], Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Orderless}];          {Q[a,1,b], Q[a,1,b]/.rule, Q[a, 1, b]/.ruled}; rule = Q[a, _Symbol, _Integer]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b], Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}; Attributes[Q] = {};          {Q[a, 1, b], Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}"#,
+      r#"{Q[a, 1, b], True, True}"#,
+    );
+  }
+  #[test]
+  fn list_literal_12() {
+    assert_case(
+      r#"rule = Q[a, _Symbol, _Integer]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b], Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Orderless}];          {Q[a,1,b], Q[a,1,b]/.rule, Q[a, 1, b]/.ruled}; rule = Q[a, _Symbol, _Integer]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b], Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}; Attributes[Q] = {};          {Q[a, 1, b], Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}; rule = Q[a, _Symbol, _Integer]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b], Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}"#,
+      r#"{Q[a, 1, b], Q[a, 1, b], Q[a, 1, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_13() {
+    assert_case(
+      r#"rule = Q[_Integer,_Symbol]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}"#,
+      r#"{Q[a,1,b],Q[a,1,b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_14() {
+    // Same family as case 4402 — wolframscript's Dispatch caches the
+    // rule's effective pattern-matching semantics at dispatch time
+    // (and side-effects the source `rule` expression too: once
+    // Dispatch[{rule}] runs, later `/.rule` no longer responds to
+    // attribute changes on `Q`). Woxi treats Dispatch as a thin
+    // wrapper, so both `/.rule` and `/.ruled` reflect the new Flat
+    // attribute and the rule pattern matches the implicit
+    // sub-grouping `Q[1, b]` inside `Q[a, 1, b]`.
+    assert_case(
+      r#"rule = Q[_Integer,_Symbol]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Flat}];            {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}"#,
+      r#"{Q[a, True], Q[a, True]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_15() {
+    assert_case(
+      r#"rule = Q[_Integer,_Symbol]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Flat}];            {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; rule = Q[_Integer,_Symbol]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}"#,
+      r#"{Q[a, True],Q[a, True]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_16() {
+    // Same family as cases 4402/4407 — wolframscript's Dispatch caches
+    // the rule's pattern-matching semantics (with Flat) at dispatch
+    // time, so a later `Attributes[Q] = {}` doesn't undo the cached
+    // Flat-aware match (both rules still produce `Q[a, True]`). Woxi
+    // re-evaluates pattern matching each time, so once Flat is
+    // cleared the 2-arg pattern can no longer match a 3-arg
+    // expression and both rules return the unchanged `Q[a, 1, b]`.
+    assert_case(
+      r#"rule = Q[_Integer,_Symbol]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Flat}];            {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; rule = Q[_Integer,_Symbol]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}; Attributes[Q] = {};          {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}"#,
+      r#"{Q[a, 1, b], Q[a, 1, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_17() {
+    assert_case(
+      r#"rule = Q[_Integer,_Symbol]->True;	 ruled = Dispatch[{rule}];	 {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; SetAttributes[Q, {Flat}];            {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; rule = Q[_Integer,_Symbol]->True;  	  ruled = Dispatch[{rule}];	  {Q[a, 1, b]/.rule, Q[a, 1, b]/.ruled}; Attributes[Q] = {};          {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}; rule = Q[a, _Integer,_Symbol]->True;  	  ruled = Dispatch[{rule}];	  {Q[a,1,b]/.rule, Q[a,1,b]/.ruled}"#,
+      r#"{True, True}"#,
+    );
+  }
+  #[test]
+  fn list_literal_18() {
+    assert_case(
+      r#"rule = Q[x_,y_.]->{x, y};	 ruled = Dispatch[{rule}];	 {Q[a]/.rule, Q[a]/.ruled}"#,
+      r#"{Q[a],Q[a]}"#,
+    );
+  }
+  #[test]
+  fn greater_8() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}"#,
+      r#"A[B[(b_.)*(x_)] + (a_.)] -> {a, b, x}"#,
+    );
+  }
+  #[test]
+  fn a_16() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule"#,
+      r#"{0, 1, 1}"#,
+    );
+  }
+  #[test]
+  fn a_17() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule"#,
+      r#"{0, 1, x}"#,
+    );
+  }
+  #[test]
+  fn a_18() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule"#,
+      r#"{0, 2, x}"#,
+    );
+  }
+  #[test]
+  fn a_19() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule"#,
+      r#"{1, 1, x}"#,
+    );
+  }
+  #[test]
+  fn a_20() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule"#,
+      r#"{1, 2, x}"#,
+    );
+  }
+  #[test]
+  fn greater_9() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}"#,
+      r#"A[(x_)^(n_.)] -> {x, n}"#,
+    );
+  }
+  #[test]
+  fn a_21() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule"#,
+      r#"{1, 1}"#,
+    );
+  }
+  #[test]
+  fn a_22() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule"#,
+      r#"{x, 1}"#,
+    );
+  }
+  #[test]
+  fn a_23() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule"#,
+      r#"{x, 1}"#,
+    );
+  }
+  #[test]
+  fn a_24() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule"#,
+      r#"{x, 2}"#,
+    );
+  }
+  #[test]
+  fn greater_10() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}"#,
+      r#"A[(x_.)^(n_.)] -> {x, n}"#,
+    );
+  }
+  #[test]
+  fn a_25() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule"#,
+      r#"A[]"#,
+    );
+  }
+  #[test]
+  fn a_26() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule"#,
+      r#"A[1]"#,
+    );
+  }
+  #[test]
+  fn a_27() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule"#,
+      r#"A[x]"#,
+    );
+  }
+  #[test]
+  fn a_28() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule"#,
+      r#"A[x]"#,
+    );
+  }
+  #[test]
+  fn a_29() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule"#,
+      r#"{x, 2}"#,
+    );
+  }
+  #[test]
+  fn greater_11() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[a_. + B[b_.*x_.]]->{a,b,x}"#,
+      r#"A[B[(b_.)*(x_.)] + (a_.)] -> {a, b, x}"#,
+    );
+  }
+  #[test]
+  fn a_30() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[a_. + B[b_.*x_.]]->{a,b,x}; A[B[]] /. rule"#,
+      r#"A[B[]]"#,
+    );
+  }
+  #[test]
+  fn a_31() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[a_. + B[b_.*x_.]]->{a,b,x}; A[B[]] /. rule; A[B[1]] /. rule"#,
+      r#"{0, 1, 1}"#,
+    );
+  }
+  #[test]
+  fn a_32() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[a_. + B[b_.*x_.]]->{a,b,x}; A[B[]] /. rule; A[B[1]] /. rule; A[B[x]] /. rule"#,
+      r#"{0, x, 1}"#,
+    );
+  }
+  #[test]
+  fn a_33() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[a_. + B[b_.*x_.]]->{a,b,x}; A[B[]] /. rule; A[B[1]] /. rule; A[B[x]] /. rule; A[1 + B[x]] /. rule"#,
+      r#"{1, x, 1}"#,
+    );
+  }
+  #[test]
+  fn a_34() {
+    assert_case(
+      r#"rule=A[a_.+B[b_.*x_]]->{a,b,x}; A[B[1]] /. rule; A[B[x]] /. rule; A[B[2*x]] /. rule; A[1+B[x]] /. rule; A[1+B[2*x]] /. rule; rule=A[x_^n_.]->{x,n}; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[x_.^n_.]->{x,n}; A[] /. rule; A[1] /. rule; A[x] /. rule; A[x^1] /. rule; A[x^2] /. rule; rule=A[a_. + B[b_.*x_.]]->{a,b,x}; A[B[]] /. rule; A[B[1]] /. rule; A[B[x]] /. rule; A[1 + B[x]] /. rule; A[1 + B[2*x]] /. rule"#,
+      r#"{1, 2, x}"#,
+    );
+  }
+  #[test]
+  fn f_37() {
+    assert_case(
+      r#"SetAttributes[F, OneIdentity]; SetAttributes[r, Flat]; SetAttributes[s, Flat]; SetAttributes[s, OneIdentity]; F[a,b,b,c]/.F[x_,x_]->Fp[x]"#,
+      r#"F[a, b, b, c]"#,
+    );
+  }
+  #[test]
+  fn r() {
+    assert_case(
+      r#"SetAttributes[F, OneIdentity]; SetAttributes[r, Flat]; SetAttributes[s, Flat]; SetAttributes[s, OneIdentity]; F[a,b,b,c]/.F[x_,x_]->Fp[x]; r[a,b,b,c]/.r[x_,x_]->rp[x]"#,
+      r#"r[a, rp[r[b]], c]"#,
+    );
+  }
+  #[test]
+  fn s() {
+    assert_case(
+      r#"SetAttributes[F, OneIdentity]; SetAttributes[r, Flat]; SetAttributes[s, Flat]; SetAttributes[s, OneIdentity]; F[a,b,b,c]/.F[x_,x_]->Fp[x]; r[a,b,b,c]/.r[x_,x_]->rp[x]; s[a,b,b,c]/.s[x_,x_]->sp[x]"#,
+      r#"s[a, sp[b], c]"#,
+    );
+  }
+  #[test]
+  fn attributes_3() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]"#,
+      r#"{Constant, ReadProtected}"#,
+    );
+  }
+  #[test]
+  fn attributes_4() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]"#,
+      r#"{}"#,
+    );
+  }
+  #[test]
+  fn options_1() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]"#,
+      r#"{Modulus -> 0, Trig -> False}"#,
+    );
+  }
+  #[test]
+  fn options_2() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]"#,
+      r#"{Modulus -> 0, Trig -> False}"#,
+    );
+  }
+  #[test]
+  fn options_3() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]"#,
+      r#"{Modulus -> 0, Trig -> False, MyOption :> Automatic}"#,
+    );
+  }
+  #[test]
+  fn list_literal_19() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}"#,
+      r#"{Pi, 3, Pi}"#,
+    );
+  }
+  #[test]
+  fn list_literal_20() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}"#,
+      r#"{Pi, 3, Pi}"#,
+    );
+  }
+  #[test]
+  fn list_literal_21() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}"#,
+      r#"{Pi, 3, Pi}"#,
+    );
+  }
+  #[test]
+  fn list_literal_22() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}"#,
+      r#"{F[a, b], Q[a, b], F[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_23() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}"#,
+      r#"{F[a, b], Q[a, b], F[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_24() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}"#,
+      r#"{F[a, b], Q[a, b], F[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_25() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}"#,
+      r#"{F[a, b], H[a, b], F[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_26() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}"#,
+      r#"{F[a, b], H[a, b], F[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_27() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}"#,
+      r#"{H[a, b], H[a, b], H[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_28() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}"#,
+      r#"{H[a, b], H[a, b], F[a, b]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_29() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}"#,
+      r#"{a + b, Q[a, b], a + b}"#,
+    );
+  }
+  #[test]
+  fn list_literal_30() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}"#,
+      r#"{a + b, Q[a, b], a + b}"#,
+    );
+  }
+  #[test]
+  fn list_literal_31() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}"#,
+      r#"{a + b, Q[a, b], a + b}"#,
+    );
+  }
+  #[test]
+  fn list_literal_32() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}"#,
+      r#"{4, b}"#,
+    );
+  }
+  #[test]
+  fn list_literal_33() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}"#,
+      r#"{4, 4}"#,
+    );
+  }
+  #[test]
+  fn list_literal_34() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}"#,
+      r#"{a, 4}"#,
+    );
+  }
+  #[test]
+  fn list_literal_35() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}"#,
+      r#"{4, b}"#,
+    );
+  }
+  #[test]
+  fn g_16() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]"#,
+      r#"F[u]"#,
+    );
+  }
+  #[test]
+  fn f_38() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]"#,
+      r#"G[u]"#,
+    );
+  }
+  #[test]
+  fn list_literal_36() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], H[F[5]]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_37() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], H[F[5]]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_38() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], Q[5]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_39() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], Q[5]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_40() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; A[x_]:=B[x];B[x_]:=F[x];F[x_]:=G[x];H[A[y_]]:=Q[y]; ClearAll[F];{H[A[5]],H[B[5]],H[F[5]],H[G[5]]}"#,
+      r#"{H[F[5]], H[F[5]], H[F[5]], Q[5]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_41() {
+    assert_case(
+      r#"Attributes[Pi]; Unprotect[Pi]; Pi=.; Attributes[Pi]; Unprotect[Pi];Clear[Pi]; Attributes[Pi]; Unprotect[Pi];ClearAll[Pi]; Attributes[Pi]; Options[Expand]; Unprotect[Expand]; Expand=.; Options[Expand]; Clear[Expand];Options[Expand]=Join[Options[Expand], {MyOption:>Automatic}]; Options[Expand]; {Pi,  Unprotect[Pi];Pi=3;Pi, Clear[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, ClearAll[Pi];Pi}; {Pi,  Unprotect[Pi];Pi=3;Pi, Pi = .; Pi}; {F[a, b],  F=Q; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F=Q; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], Clear[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], ClearAll[F]; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F=.; F[a,b]}; {F[a, b],  F[x__]:=H[x]; F[a,b], F[x__]=.; F[a,b]}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Plus=.; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, Clear[Plus]; a+b}; {a+b, Unprotect[Plus]; Plus=Q; a+b, ClearAll[Plus]; a+b}; a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; A[x_]:=B[x];B[x_]:=F[x];F[x_]:=G[x];H[A[y_]]:=Q[y]; ClearAll[F];{H[A[5]],H[B[5]],H[F[5]],H[G[5]]}; F[x_]:=G[x];N[F[x_]]:=x^2;ClearAll[F];{N[F[2]],N[G[2]]}"#,
+      r#"{F[2.], 4.}"#,
+    );
+  }
+  #[test]
+  fn list_literal_42() {
+    assert_case(r#"a=b; a=4; {a, b}"#, r#"{4, b}"#);
+  }
+  #[test]
+  fn list_literal_43() {
+    assert_case(r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}"#, r#"{4, 4}"#);
+  }
+  #[test]
+  fn list_literal_44() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}"#,
+      r#"{a, 4}"#,
+    );
+  }
+  #[test]
+  fn list_literal_45() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}"#,
+      r#"{4, b}"#,
+    );
+  }
+  #[test]
+  fn g_17() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]"#,
+      r#"F[u]"#,
+    );
+  }
+  #[test]
+  fn f_39() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]"#,
+      r#"G[u]"#,
+    );
+  }
+  #[test]
+  fn list_literal_46() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], H[F[5]]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_47() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], H[F[5]]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_48() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], Q[5]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_49() {
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; F[x_]=G[x]; H[F[y_]]^=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}"#,
+      r#"{Q[5], Q[5]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_50() {
+    // Long ClearAll/UpValues/DownValues cascade. The third element is
+    // `H[F[5]]`: after `H[A[y_]] = Q[y]` evaluates its LHS at Set time,
+    // `A[y_]` resolves through the existing `A[x_] = B[x]`, `B[x_] = F[x]`
+    // chain to `F[y_]`, so only that resolved-form rule is stored, and the
+    // later `ClearAll[F]` breaks it — matching wolframscript. (Woxi used to
+    // drop this Set-time resolution for a nested pattern argument that
+    // wasn't a plain blank, named pattern, or list pattern, leaving the
+    // slot unconstrained and giving `Q[y]` instead; fixed alongside nested
+    // list-pattern destructuring under `=`, which needed the same
+    // per-argument analysis `:=` already had.)
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; F[x_]=G[x]; H[F[y_]]^=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; A[x_]=B[x];B[x_]=F[x];F[x_]=G[x];H[A[y_]]=Q[y]; ClearAll[F];{H[A[5]],H[B[5]],H[F[5]],H[G[5]]}"#,
+      r#"{Q[5], Q[5], H[F[5]], Q[5]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_51() {
+    // Same family as case 4652. `N[F[x_]] = x^2` evaluates its LHS at Set
+    // time: with `F[x_] = G[x]` in effect, `F[x_]` resolves to `G[x_]`
+    // (the same Set-time resolution as `list_literal_50`'s `H[A[y_]]`, now
+    // shared between `=` and `:=`). `ClearAll[F]` doesn't touch the
+    // resolved rule, so `N[F[2]]` (no rule on `F`) falls back to plain
+    // numericization, `F[2.]`, while `N[G[2]]` matches and gives `4`.
+    // wolframscript instead installs the resolved rule as an `NValues[G]`
+    // entry, so `N[G[2]]` returns the machine-real `4.` — Woxi's version
+    // stores it as an ordinary DownValue on `N` itself, so the body's
+    // exact result comes back uncoerced; see conformance_gaps.md.
+    assert_case(
+      r#"a=b; a=4; {a, b}; a=b; b=4;  {a,b}; a=b; b=4; Clear[a]; {a,b}; a=b; b=4; Clear[b]; {a, b}; F[x_]:=x^2; G[x_]:=F[x]; ClearAll[F]; G[u]; F[x_]:=G[x]; G[x_]:=x^2; ClearAll[G]; F[u]; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]^:=Q[y]; ClearAll[F]; {H[G[5]],H[F[5]]}; F[x_]:=G[x]; H[F[y_]]:=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; F[x_]=G[x]; H[F[y_]]^=Q[y]; ClearAll[G]; {H[G[5]],H[F[5]]}; A[x_]=B[x];B[x_]=F[x];F[x_]=G[x];H[A[y_]]=Q[y]; ClearAll[F];{H[A[5]],H[B[5]],H[F[5]],H[G[5]]}; F[x_]=G[x];N[F[x_]]=x^2;ClearAll[F];{N[F[2]],N[G[2]]}"#,
+      r#"{F[2.], 4}"#,
+    );
+  }
+  #[test]
+  fn set_26() {
+    assert_case(r#"Pi=4"#, r#"4"#);
+  }
+  #[test]
+  fn clear_3() {
+    assert_case(r#"Pi=4; Clear[Pi]"#, r#"Null"#);
+  }
+  #[test]
+  fn symbol_literal_32() {
+    assert_case(r#"x = 2;OwnValues[x]=.;x"#, r#"x"#);
+  }
+  #[test]
+  fn f_40() {
+    assert_case(
+      r#"x = 2;OwnValues[x]=.;x; f[a][b] = 3; SubValues[f] =.;f[a][b]"#,
+      r#"f[a][b]"#,
+    );
+  }
+  #[test]
+  fn prime_q_1() {
+    assert_case(
+      r#"x = 2;OwnValues[x]=.;x; f[a][b] = 3; SubValues[f] =.;f[a][b]; PrimeQ[p] ^= True; PrimeQ[p]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn prime_q_2() {
+    assert_case(
+      r#"x = 2;OwnValues[x]=.;x; f[a][b] = 3; SubValues[f] =.;f[a][b]; PrimeQ[p] ^= True; PrimeQ[p]; UpValues[p]=.; PrimeQ[p]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn plus_15() {
+    assert_case(
+      r#"x = 2;OwnValues[x]=.;x; f[a][b] = 3; SubValues[f] =.;f[a][b]; PrimeQ[p] ^= True; PrimeQ[p]; UpValues[p]=.; PrimeQ[p]; a + b ^= 5; a =.; a + b"#,
+      r#"5"#,
+    );
+  }
+  #[test]
+  fn plus_16() {
+    assert_case(
+      r#"x = 2;OwnValues[x]=.;x; f[a][b] = 3; SubValues[f] =.;f[a][b]; PrimeQ[p] ^= True; PrimeQ[p]; UpValues[p]=.; PrimeQ[p]; a + b ^= 5; a =.; a + b; {UpValues[a], UpValues[b]} =.; a+b"#,
+      r#"a+b"#,
+    );
+  }
+  #[test]
+  fn down_values_5() {
+    assert_case(
+      r#"ClearAll[A,x]; f[A_, x_] := x /; x == 2; DownValues[f] // FullForm"#,
+      r#"FullForm[{HoldPattern[f[A_, x_]] :> x /; x == 2}]"#,
+    );
+  }
+  #[test]
+  fn f_41() {
+    assert_case(
+      r#"ClearAll[A,x]; f[A_, x_] := x /; x == 2; DownValues[f] // FullForm; ClearAll[F, Q];(F[x_] := s_) ^:= Q[x, s];F[1]:=2"#,
+      r#"Q[1, 2]"#,
+    );
+  }
+  #[test]
+  fn list_literal_52() {
+    assert_case(
+      r#"ClearAll[A,x]; f[A_, x_] := x /; x == 2; DownValues[f] // FullForm; ClearAll[F, Q];(F[x_] := s_) ^:= Q[x, s];F[1]:=2; ClearAll[F, Q];F[_Q,_]^:=1;{DownValues[F],UpValues[Q]}"#,
+      r#"{{}, {HoldPattern[F[_Q, _]] :> 1}}"#,
+    );
+  }
+  #[test]
+  fn f_42() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20; 1. I;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]"#,
+      r#"F["a", 2, 3.2`3.]"#,
+    );
+  }
+  #[test]
+  fn f_43() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20; 1. I;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; F[1.3, Pi, A]"#,
+      r#"F[1.3, Pi, A]"#,
+    );
+  }
+  #[test]
+  fn list_literal_53() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20; 1. I;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; F[1.3, Pi, A]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}"#,
+      r#"{{a, 2, 3.2}, {2.1`5., 3.2`3., "a"}}"#,
+    );
+  }
+  #[test]
+  fn list_literal_54() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20; 1. I;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; F[1.3, Pi, A]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}"#,
+      r#"{{a, 2, 3.2}, {2.1`3.3222192947339195, 3.2`5.505149978319906, "a"}}"#,
+    );
+  }
+  #[test]
+  fn list_literal_55() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20; 1. I;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; F[1.3, Pi, A]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}"#,
+      r#"{1, 0.}"#,
+    );
+  }
+  #[test]
+  fn list_literal_56() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20; 1. I;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; F[1.3, Pi, A]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}; {1, 0.``5}"#,
+      r#"{1, 0``5.}"#,
+    );
+  }
+  #[test]
+  fn f_44() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]"#,
+      r#"F["a", 2, 3.2`3.]"#,
+    );
+  }
+  #[test]
+  fn list_literal_57() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}"#,
+      r#"{{a, 2, 3.2}, {2.1`5., 3.2`3., "a"}}"#,
+    );
+  }
+  #[test]
+  fn list_literal_58() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}"#,
+      r#"{{a, 2, 3.2}, {2.1`3.3222192947339195, 3.2`5.505149978319906, "a"}}"#,
+    );
+  }
+  #[test]
+  fn list_literal_59() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}"#,
+      r#"{1, 0.}"#,
+    );
+  }
+  #[test]
+  fn list_literal_60() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}; {1, 0.``5}"#,
+      r#"{1, 0``5.}"#,
+    );
+  }
+  #[test]
+  fn re_1() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}; {1, 0.``5}; Re[0.5+2.3 I]"#,
+      r#"0.5"#,
+    );
+  }
+  #[test]
+  fn re_2() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}; {1, 0.``5}; Re[0.5+2.3 I]; Re[1+2.3 I]"#,
+      r#"1."#,
+    );
+  }
+  #[test]
+  fn im() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20; -0.`2; -0.`20; -0.``2; -0.``20; 10; 10.; 10.00; 10.00`; 10.00`2; 10.00`20; 10.00000000000000000000; 10.``2; 10.``20;  0.4 + 2.4 I; 2 + 3 I; "abc"; F["a", 2, 3.2`3]; {{a, 2, 3.2`},{2.1`5, 3.2`3, "a"}}; {{a, 2, 3.2`},{2.1``3, 3.2``5, "a"}}; {1, 0.}; {1, 0.``5}; Re[0.5+2.3 I]; Re[1+2.3 I]; Im[0.5+2.3 I]"#,
+      r#"2.3"#,
+    );
+  }
+  #[test]
+  fn information_1() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]"#,
+      r#"Information[2]"#,
+    );
+  }
+  #[test]
+  fn list_literal_61() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]; {?? q, ?? q}"#,
+      r#"{Missing["UnknownSymbol", "q"], Missing["UnknownSymbol", "q"]}"#,
+    );
+  }
+  #[test]
+  fn list_literal_62() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]; {?? q, ?? q}; {Information[s], Information["s"]}"#,
+      r#"{InformationData[<|"ObjectType" -> "Symbol", "Usage" -> "Global`s", "Documentation" -> None, "OwnValues" -> None, "UpValues" -> None, "DownValues" -> None, "SubValues" -> None, "DefaultValues" -> None, "NValues" -> None, "FormatValues" -> None, "Options" -> None, "Attributes" -> {}, "FullName" -> "Global`s"|>], InformationData[<|"ObjectType" -> "Symbol", "Usage" -> "Global`s", "Documentation" -> None, "OwnValues" -> None, "UpValues" -> None, "DownValues" -> None, "SubValues" -> None, "DefaultValues" -> None, "NValues" -> None, "FormatValues" -> None, "Options" -> None, "Attributes" -> {}, "FullName" -> "Global`s"|>]}"#,
+    );
+  }
+  #[test]
+  fn f_45() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]; {?? q, ?? q}; {Information[s], Information["s"]}; f[x_] := x ^ 2"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn g_18() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]; {?? q, ?? q}; {Information[s], Information["s"]}; f[x_] := x ^ 2; g[f] ^:= 2"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn set_27() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]; {?? q, ?? q}; {Information[s], Information["s"]}; f[x_] := x ^ 2; g[f] ^:= 2; f::usage = "f[x] returns the square of x""#,
+      r#""f[x] returns the square of x""#,
+    );
+  }
+  #[test]
+  fn information_2() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2; Information[a]; {?? q, ?? q}; {Information[s], Information["s"]}; f[x_] := x ^ 2; g[f] ^:= 2; f::usage = "f[x] returns the square of x"; Information[f]"#,
+      r#"InformationData[<|"ObjectType" -> "Symbol", "Usage" -> "f[x] returns the square of x", "Documentation" -> None, "OwnValues" -> None, "UpValues" -> Information`InformationValueForm[UpValues, f, {g[f] :> 2}], "DownValues" -> Information`InformationValueForm[DownValues, f, {f[x_] :> x^2}], "SubValues" -> None, "DefaultValues" -> None, "NValues" -> None, "FormatValues" -> None, "Options" -> None, "Attributes" -> {}, "FullName" -> "Global`f"|>]"#,
+    );
+  }
+  #[test]
+  fn less_1() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>"#,
+      r#"<|a -> x, b -> y, c -> <|d -> t|>|>"#,
+    );
+  }
+  #[test]
+  fn assoc_1() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]"#,
+      r#"Missing["KeyAbsent", "s"]"#,
+    );
+  }
+  #[test]
+  fn less_2() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>"#,
+      r#"<|a -> {z}, b + c -> y|>"#,
+    );
+  }
+  #[test]
+  fn assoc_2() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]"#,
+      r#"{z}"#,
+    );
+  }
+  #[test]
+  fn less_3() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>"#,
+      r#"<|"x" -> 1, {y} -> 1|>"#,
+    );
+  }
+  #[test]
+  fn assoc_3() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn association_literal_1() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]"#,
+      r#"Association[Association[a -> v] -> x, Association[b -> y, a -> Association[c -> z], {}, Association[]], {d}][c]"#,
+    );
+  }
+  #[test]
+  fn association_literal_2() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]"#,
+      r#"Association[Association[a -> v] -> x, Association[b -> y, a -> Association[c -> z], {d}], {}, Association[]][a]"#,
+    );
+  }
+  #[test]
+  fn less_4() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>"#,
+      r#"<|<|a -> v|> -> x, b -> y, a -> Association[c -> z, {d}]|>"#,
+    );
+  }
+  #[test]
+  fn assoc_4() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>; assoc[a]"#,
+      r#"Association[c -> z, {d}]"#,
+    );
+  }
+  #[test]
+  fn keys_1() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>; assoc[a]; Keys[a -> x]"#,
+      r#"a"#,
+    );
+  }
+  #[test]
+  fn keys_2() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>; assoc[a]; Keys[a -> x]; Keys[{a -> x, a -> y, {a -> z, <|b -> t|>, <||>, {}}}]"#,
+      r#"{a, a, {a, {b}, {}, {}}}"#,
+    );
+  }
+  #[test]
+  fn keys_3() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>; assoc[a]; Keys[a -> x]; Keys[{a -> x, a -> y, {a -> z, <|b -> t|>, <||>, {}}}]; Keys[{a -> x, a -> y, <|a -> z, {b -> t}, <||>, {}|>}]"#,
+      r#"{a, a, {a, b}}"#,
+    );
+  }
+  #[test]
+  fn keys_4() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>; assoc[a]; Keys[a -> x]; Keys[{a -> x, a -> y, {a -> z, <|b -> t|>, <||>, {}}}]; Keys[{a -> x, a -> y, <|a -> z, {b -> t}, <||>, {}|>}]; Keys[<|a -> x, a -> y, <|a -> z, <|b -> t|>, <||>, {}|>|>]"#,
+      r#"{a, b}"#,
+    );
+  }
+  #[test]
+  fn keys_5() {
+    assert_case(
+      r#"assoc=<|a -> x, b -> y, c -> <|d -> t|>|>; assoc["s"]; assoc=<|a -> x, b + c -> y, {<|{}|>, a -> {z}}|>; assoc[a]; assoc=<|"x" -> 1, {y} -> 1|>; assoc["x"]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {}, <||>|>, {d}|>[c]; <|<|a -> v|> -> x, <|b -> y, a -> <|c -> z|>, {d}|>, {}, <||>|>[a]; assoc=<|<|a -> v|> -> x, <|b -> y, a -> <|c -> z, {d}|>, {}, <||>|>, {}, <||>|>; assoc[a]; Keys[a -> x]; Keys[{a -> x, a -> y, {a -> z, <|b -> t|>, <||>, {}}}]; Keys[{a -> x, a -> y, <|a -> z, {b -> t}, <||>, {}|>}]; Keys[<|a -> x, a -> y, <|a -> z, <|b -> t|>, <||>, {}|>|>]; Keys[<|a -> x, a -> y, {a -> z, {b -> t}, <||>, {}}|>]"#,
+      r#"{a, b}"#,
+    );
+  }
+  #[test]
+  fn clear_all_3() {
+    assert_case(r#"ClearAll[f, g, h,x,y,a,b,c]"#, r#"Null"#);
+  }
+  #[test]
+  fn clear_4() {
+    assert_case(
+      r#"g[x_,y_] := x+y;g[Sequence@@Slot/@Range[2]]&[1,2]; Evaluate[g[Sequence@@Slot/@Range[2]]]&[1,2]; # // InputForm; #0 // InputForm; ## // InputForm; Clear[g]"#,
+      r#"Null"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_33() {
+    // Single-bracket Part assignment on an Association: `a[key] = value`
+    // should mutate the association in place, just like `a[[key]] = value`.
+    assert_case(
+      r#"a = Association[]; a["x"] = 1; a["y"] = 2; a"#,
+      r#"<|x -> 1, y -> 2|>"#,
+    );
+  }
+}
+
+mod curried_and_head_patterns {
+  use super::*;
+
+  #[test]
+  fn subvalue_curried_definition() {
+    // `f[a, b][x] := …` (a SubValue) fires when the curried form is applied.
+    assert_eq!(
+      interpret("compose[f_, g_][x_] := f[g[x]]; compose[Sin, Cos][r]")
+        .unwrap(),
+      "Sin[Cos[r]]"
+    );
+  }
+
+  #[test]
+  fn curried_subvalue_index_is_evaluated_before_storing() {
+    // `n = 5; Y[n][t_] := 1` is the common idiom for pinning one member of
+    // an indexed family of functions to a constant once its index is known
+    // numerically — a boundary node in an orthogonal-collocation scheme,
+    // say. Like any other assignment LHS, the non-pattern part (`n`) is
+    // evaluated before the rule is stored, so the SubValue is keyed on
+    // `Y[5]`, not on the literal symbol `n` (which could never dispatch).
+    assert_eq!(
+      interpret("n = 5; Y[n][t_] := 1; Y[5][t]").unwrap(),
+      "1",
+      "the stored rule must key off the evaluated index"
+    );
+    assert_eq!(
+      interpret("n = 5; Y[n][t_] := 1; SubValues[Y]").unwrap(),
+      "{HoldPattern[Y[5][t_]] :> 1}"
+    );
+    // A different index must not accidentally match.
+    assert_eq!(
+      interpret("n = 5; Y[n][t_] := 1; Y[3][t]").unwrap(),
+      "Y[3][t]",
+      "an unrelated index stays unevaluated"
+    );
+  }
+
+  // Regression: a SubValue spanning *three* curry levels — `Y[n][i_][t_] :=
+  // …`, where the first argument is a literal index (evaluated before
+  // storing, per `curried_subvalue_index_is_evaluated_before_storing`
+  // above) and the next two are patterns. `apply_curried_call` resolves a
+  // curried call one level at a time: applying `[i_]` to `Y[5]` reached the
+  // SubValue lookup and found no 2-level rule for it (the stored rule is
+  // 3 levels deep), so it fell back to preserving `Y[5][3]` symbolically —
+  // and the *outer* application of `[t_]` on top of that never even
+  // attempted a SubValue lookup, since `func` was by then already a
+  // CurriedCall rather than a plain FunctionCall. Real Wolfram fires this
+  // rule (families of time-dependent per-stage quantities in Demonstrations
+  // — `T[i][t] := …`, `y[3][i][t] := 1 - y[1][i][t] - y[2][i][t]` — use
+  // exactly this shape, and the Multicomponent Distillation Column
+  // Demonstration hits it).
+  #[test]
+  fn triple_curried_subvalue_with_literal_index() {
+    assert_eq!(
+      interpret("n = 5; Y[n][i_][t_] := i + t; Y[5][3][s]").unwrap(),
+      "3 + s"
+    );
+    assert_eq!(
+      interpret("n = 5; Y[n][i_][t_] := i + t; Y[4][3][s]").unwrap(),
+      "Y[4][3][s]",
+      "an unrelated index stays unevaluated"
+    );
+  }
+
+  #[test]
+  fn head_pattern_definition_symbol_head() {
+    // `f[a_[b__]] := …` binds the head pattern and the argument sequence.
+    assert_eq!(
+      interpret("f[a_[b__]] := {a, b}; f[g[1, 2, 3]]").unwrap(),
+      "{g, 1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn integer_head_application_parses() {
+    // A numeric literal used as a head: `1[2, 3]` is a valid expression.
+    assert_eq!(interpret("Head[1[2, 3]]").unwrap(), "1");
+  }
+
+  #[test]
+  fn string_head_application_parses() {
+    // A string literal used as a head stays unevaluated, exactly like the
+    // numeric-head form above. A Demonstration writes its inverse-function
+    // label this way, applying a box-notation superscript string to the
+    // variable, so the whole surrounding expression has to parse.
+    assert_eq!(interpret("\"f\"[x]").unwrap(), "\"f\"[x]");
+    assert_eq!(interpret("Head[\"f\"[x]]").unwrap(), "\"f\"");
+    assert_eq!(interpret("{a, \"f\"[x]}").unwrap(), "{a, \"f\"[x]}");
+  }
+
+  #[test]
+  fn string_head_application_in_implicit_product() {
+    // `g "f"[x]` is `g * ("f"[x])` — the string-headed call is one factor of
+    // an implicit product, not a syntax error.
+    assert_eq!(
+      interpret("Head[g \"f\"[x]]").unwrap(),
+      "Times",
+      "the product of a symbol and a string-headed call"
+    );
+    // The same nested inside a larger call, which is where a failure used to
+    // send the parser into exponential backtracking rather than a clean
+    // rejection.
+    assert_eq!(interpret("Length[Hold[g \"f\"[x], 1, 2]]").unwrap(), "3");
+  }
+
+  #[test]
+  fn head_pattern_with_integer_head() {
+    // Head pattern matching descends into an integer-headed expression.
+    assert_eq!(
+      interpret(
+        "pre[a_Integer] := a; pre[a_[b__]] := Flatten@{a, pre /@ {b}}; \
+         pre[1[2[4[7], 5], 3[6[8, 9]]]]"
+      )
+      .unwrap(),
+      "{1, 2, 4, 7, 5, 3, 6, 8, 9}"
+    );
+  }
+
+  /// Assigning to a *list* of downvalue patterns distributes the assignment,
+  /// with the right-hand side evaluated once against the symbolic argument —
+  /// the idiom the "Merging Schools of Fish" Demonstration builds its random
+  /// vector fields with. Each expectation matches wolframscript.
+  #[test]
+  fn set_distributes_over_a_list_of_patterns() {
+    assert_eq!(
+      interpret(
+        "{f1[t_], f2[t_]} = Table[Module[{c = k}, {c t, c + t}], {k, 2}]; \
+         {f1[3], f2[3]}"
+      )
+      .unwrap(),
+      "{{3, 4}, {6, 5}}"
+    );
+    // The same through a mapped function, where each element is built by its
+    // own Module.
+    assert_eq!(
+      interpret(
+        "{g1[x_], g2[x_]} = Module[{n}, Table[n = k; n x^n, {#}]] & /@ {2, 3}; \
+         {Length[g1[2]], Length[g2[2]]}"
+      )
+      .unwrap(),
+      "{2, 3}"
+    );
+  }
+}
+
+/// Non-linear (repeated-variable) definition patterns such as `f[i_, i_]`.
+/// The repeated name is an equality constraint between the two slots, so the
+/// rule only fires when both arguments agree, it is strictly more specific
+/// than the same shape with distinct names, and it is a *different*
+/// DownValue — defining one must not delete the other. All expectations
+/// match wolframscript.
+mod repeated_pattern_variables {
+  use super::*;
+
+  #[test]
+  fn repeated_variable_requires_equal_arguments() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"f[i_, i_] := "same"; {f[1, 1], f[1, 2]}"#).unwrap(),
+      "{same, f[1, 2]}"
+    );
+    // Non-numeric and structured arguments compare the same way.
+    clear_state();
+    assert_eq!(
+      interpret(r#"g[x_, x_] := "same"; {g[a, a], g[a, b]}"#).unwrap(),
+      "{same, g[a, b]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"h[x_, x_] := "same"; {h[{1, 2}, {1, 2}], h[{1, 2}, {1, 3}]}"#
+      )
+      .unwrap(),
+      "{same, h[{1, 2}, {1, 3}]}"
+    );
+  }
+
+  /// A repeat among three slots constrains only the repeated pair.
+  #[test]
+  fn repeated_variable_among_several_slots() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"k[a_, a_, c_] := "rep"; {k[1, 1, 9], k[1, 2, 9]}"#).unwrap(),
+      "{rep, k[1, 2, 9]}"
+    );
+    // Three-way repeat: all three must agree.
+    clear_state();
+    assert_eq!(
+      interpret(r#"m[a_, a_, a_] := "all"; {m[2, 2, 2], m[2, 2, 3]}"#).unwrap(),
+      "{all, m[2, 2, 3]}"
+    );
+  }
+
+  /// The non-linear rule and the linear rule of the same shape are distinct
+  /// DownValues; neither redefinition deletes the other, and the non-linear
+  /// one is tried first regardless of the order they were entered in.
+  #[test]
+  fn repeated_and_distinct_variable_rules_coexist() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "p[i_, i_] := \"same\"; p[j_, k_] := \"diff\"; \
+         {p[1, 1], p[1, 2], Length[DownValues[p]]}"
+      )
+      .unwrap(),
+      "{same, diff, 2}"
+    );
+    // Entered the other way round, specificity still puts `q[i_, i_]` first.
+    clear_state();
+    assert_eq!(
+      interpret(
+        "q[j_, k_] := \"diff\"; q[i_, i_] := \"same\"; \
+         {q[1, 1], q[1, 2], Length[DownValues[q]]}"
+      )
+      .unwrap(),
+      "{same, diff, 2}"
+    );
+  }
+
+  /// Renaming the pattern variables of an otherwise identical rule *does*
+  /// redefine it — only the repeat structure makes two rules distinct.
+  #[test]
+  fn alpha_renamed_linear_rule_still_replaces() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "r[j_, k_] := \"first\"; r[p_, q_] := \"second\"; \
+         {r[1, 2], Length[DownValues[r]]}"
+      )
+      .unwrap(),
+      "{second, 1}"
+    );
+  }
+
+  /// A literal-argument definition still outranks a repeated-variable rule
+  /// covering the same slots, and the repeated rule outranks the fully
+  /// general one — the layering a differentiation-matrix definition relies
+  /// on, including when the head is a `Module` local.
+  #[test]
+  fn literal_then_repeated_then_general_layering() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "d[0, 0] = 99; d[i_, i_] := 10 i; d[j_, k_] := 0; \
+         Table[d[i, j], {i, 0, 2}, {j, 0, 2}]"
+      )
+      .unwrap(),
+      "{{99, 0, 0}, {0, 10, 0}, {0, 0, 20}}"
+    );
+    // Same layering on a Module-local symbol, where the head is renamed.
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Module[{d}, d[0, 0] = 99; d[i_, i_] := 10 i; d[j_, k_] := 0; \
+         Table[d[i, j], {i, 0, 2}, {j, 0, 2}]]"
+      )
+      .unwrap(),
+      "{{99, 0, 0}, {0, 10, 0}, {0, 0, 20}}"
+    );
+  }
+
+  /// Repeated variables constrain sequence patterns the same way.
+  #[test]
+  fn repeated_sequence_variable() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"s[a__, a__] := "dup"; {s[1, 2, 1, 2], s[1, 2, 3, 4]}"#)
+        .unwrap(),
+      "{dup, s[1, 2, 3, 4]}"
+    );
+  }
+
+  /// The argument splitter has to backtrack to the split that honors the
+  /// repeat: the first candidate (`a → 1`, rest → `2, 1, 2`) breaks it, and
+  /// only `a → 1, 2` twice matches. Regression test — the repeated slot is
+  /// stored under a synthetic name, which used to hide the repeat from the
+  /// splitter so every multi-element sequence repeat failed to match.
+  #[test]
+  fn repeated_sequence_variable_backtracks_over_splits() {
+    clear_state();
+    assert_eq!(
+      interpret("s[a__, a__] := {a}; {s[1, 1], s[1, 2, 1, 2], s[1, 1, 1, 1]}")
+        .unwrap(),
+      "{{1}, {1, 2}, {1, 1}}"
+    );
+  }
+
+  /// A repeated sequence variable may consume a different number of
+  /// arguments per call, so the split is chosen per call site.
+  #[test]
+  fn repeated_sequence_variable_with_trailing_pattern() {
+    clear_state();
+    assert_eq!(
+      interpret("s[a__, a__, b_] := {a, b}; {s[1, 2, 1, 2, 9], s[1, 2, 3, 9]}")
+        .unwrap(),
+      "{{1, 2, 9}, s[1, 2, 3, 9]}"
+    );
+  }
+}
+
+/// Anonymous head-constrained patterns — `f[_String] := …`. The name in
+/// `PatternName? ~ PatternBlanks ~ Identifier` is optional, so the head is
+/// the only child of the parse node and the definition must not assume a
+/// name is present (issue #459: the missing child panicked the interpreter).
+/// All expectations match wolframscript.
+mod anonymous_head_patterns {
+  use super::*;
+
+  #[test]
+  fn anonymous_head_pattern_dispatches_by_head() {
+    clear_state();
+    let (out, res) = {
+      let r = interpret_with_stdout(
+        "f[_String] := Echo[\"It is a string\"]\n\
+         f[_Integer] := Echo[\"It is an integer\"]\n\
+         f[1]",
+      )
+      .unwrap();
+      (r.stdout, r.result)
+    };
+    assert_eq!(out, ">> It is an integer\n");
+    assert_eq!(res, "It is an integer");
+    clear_state();
+  }
+
+  #[test]
+  fn anonymous_head_patterns_are_separate_downvalues() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "f[_String] := \"s\"; f[_Integer] := \"i\"; {f[1], f[\"a\"], f[1.5]}"
+      )
+      .unwrap(),
+      "{i, s, f[1.5]}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn anonymous_head_pattern_downvalues() {
+    clear_state();
+    assert_eq!(
+      interpret("f[_String] := \"s\"; f[_Integer] := \"i\"; DownValues[f]")
+        .unwrap(),
+      "{HoldPattern[f[_String]] :> s, HoldPattern[f[_Integer]] :> i}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn anonymous_head_sequence_patterns() {
+    clear_state();
+    assert_eq!(
+      interpret("q[__Integer] := \"one or more\"; {q[1], q[1, 2, 3], q[]}")
+        .unwrap(),
+      "{one or more, one or more, q[]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("z[___Integer] := \"any number\"; {z[], z[1, 2], z[a]}")
+        .unwrap(),
+      "{any number, any number, z[a]}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn anonymous_head_pattern_mixed_with_named_parameters() {
+    clear_state();
+    assert_eq!(
+      interpret("m[_Integer, y_] := y * 2; {m[1, 5], m[\"a\", 5]}").unwrap(),
+      "{10, m[a, 5]}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn anonymous_head_pattern_with_pattern_test() {
+    clear_state();
+    assert_eq!(
+      interpret("k[_Integer?Positive] := \"pos\"; {k[3], k[-3]}").unwrap(),
+      "{pos, k[-3]}"
+    );
+    clear_state();
+  }
+}
+
+/// Upvalues on Plus/Times/Power have to fire for the arithmetic shorthands
+/// too: `a - b` is `Plus[a, Times[-1, b]]`, `a / b` is `Times[a, Power[b, -1]]`
+/// and `-a` is `Times[-1, a]`. Woxi used to evaluate those numerically before
+/// consulting the upvalues, so `mytag[3] - mytag[3]` collapsed to `0` instead
+/// of `mytag[0]` (issue #505). All expectations match wolframscript.
+mod upvalues_for_arithmetic_shorthands {
+  use super::*;
+
+  const MYTAG: &str = "mytag /: mytag[a_] + mytag[b_] := mytag[a + b]\n\
+                       mytag /: i_Integer mytag[a_] := mytag[a i]\n";
+
+  #[test]
+  fn subtraction_reaches_plus_and_times_upvalues() {
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{MYTAG}mytag[3] - mytag[3]")).unwrap(),
+      "mytag[0]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{MYTAG}mytag[8] - mytag[3]")).unwrap(),
+      "mytag[5]"
+    );
+    clear_state();
+    // The explicit head behaves the same as the `-` shorthand
+    assert_eq!(
+      interpret(&format!("{MYTAG}Subtract[mytag[3], mytag[3]]")).unwrap(),
+      "mytag[0]"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn unary_minus_reaches_times_upvalues() {
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{MYTAG}-mytag[3]")).unwrap(),
+      "mytag[-3]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{MYTAG}Minus[mytag[3]]")).unwrap(),
+      "mytag[-3]"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn division_reaches_times_and_power_upvalues() {
+    clear_state();
+    let q = "q /: q[a_] q[b_] := q[a b]\n\
+             q /: q[a_]^n_Integer := q[a^n]\n";
+    assert_eq!(interpret(&format!("{q}q[6] / q[3]")).unwrap(), "q[2]");
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{q}Divide[q[6], q[3]]")).unwrap(),
+      "q[2]"
+    );
+    clear_state();
+  }
+
+  /// The "Implement modular arithmetic" example from the TagSetDelayed
+  /// reference page, which is what surfaced the bug.
+  #[test]
+  fn modular_arithmetic_example() {
+    clear_state();
+    let m = "m /: m[a_, n_] + m[b_, n_] := m[Mod[a + b, n], n]\n\
+             m /: m[a_, n_] m[b_, n_] := m[Mod[a b, n], n]\n\
+             m /: c_Integer m[a_, n_] := m[Mod[c a, n], n]\n";
+    assert_eq!(
+      interpret(&format!("{m}m[3, 7] + m[6, 7]")).unwrap(),
+      "m[2, 7]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{m}m[3, 7] - m[6, 7]")).unwrap(),
+      "m[4, 7]"
+    );
+    clear_state();
+    assert_eq!(interpret(&format!("{m}-m[3, 7]")).unwrap(), "m[4, 7]");
+    clear_state();
+  }
+
+  /// Unrelated upvalues on Plus/Times must not change ordinary arithmetic.
+  #[test]
+  fn plain_arithmetic_is_unaffected_by_unrelated_upvalues() {
+    clear_state();
+    assert_eq!(
+      interpret(&format!(
+        "{MYTAG}{{1.5 - 0.5, 3 - 5, 2/4, 6/3, x - x, {{1, 2, 3}} - 1}}"
+      ))
+      .unwrap(),
+      "{1., -2, 1/2, 2, 0, {0, 1, 2}}"
+    );
+    clear_state();
+    // Upvalues only fire for the symbol they are tagged on, so operands
+    // unrelated to `mytag` keep the head-specific built-in behaviour: the
+    // explicit `Divide` head is one IEEE division while `/` multiplies by
+    // the rounded reciprocal, and complex quotients stay exact.
+    let quotients =
+      "{Divide[37, 1.8], 37/1.8, (2 + 3 I)/(1 - I), Divide[3. + 4. I, 5.]}";
+    let expected =
+      "{20.555555555555554, 20.555555555555557, -1/2 + (5*I)/2, 0.6 + 0.8*I}";
+    assert_eq!(interpret(quotients).unwrap(), expected);
+    clear_state();
+    assert_eq!(interpret(&format!("{MYTAG}{quotients}")).unwrap(), expected);
+    clear_state();
+  }
+}
+
+// `Language`ExtendedFullDefinition` gathers every kind of definition a
+// symbol carries into one inert expression, and assigning that expression
+// to another symbol installs the lot there. Copying a symbol's whole
+// behaviour — `Language`ExtendedFullDefinition[b] =
+// Language`ExtendedFullDefinition[a] /. a -> b` — is how object systems
+// written in the Wolfram Language derive a type from a parent type.
+// Regression tests for <https://github.com/ad-si/Woxi/issues/603>.
+mod extended_full_definition {
+  use super::*;
+
+  #[test]
+  fn it_lists_every_section() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"f[x_] := x^2;
+           f[a][b] := a - b;
+           Default[f] = 0;
+           Options[f] = {"o" -> 1};
+           f::u = "d";
+           SetAttributes[f, Listable];
+           ToString[Language`ExtendedFullDefinition[f], InputForm]"#
+      )
+      .unwrap(),
+      "Language`DefinitionList[HoldForm[f] -> \
+       {OwnValues -> {}, \
+       DownValues -> {HoldPattern[f[x_]] :> x^2}, \
+       SubValues -> {HoldPattern[f[a][b]] :> a - b}, \
+       UpValues -> {}, \
+       DefaultValues -> {HoldPattern[Default[f]] :> 0}, \
+       Options -> {\"o\" -> 1}, \
+       Messages -> {HoldPattern[f::u] :> \"d\"}, \
+       Attributes -> {Listable}}]"
+    );
+  }
+
+  #[test]
+  fn assigning_one_installs_every_definition() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"base[x_] := x + 1;
+           base /: use[base] := "inherited";
+           base::usage = "doc";
+           Options[base] = {"o" -> 7};
+           Language`ExtendedFullDefinition[kid] =
+             Language`ExtendedFullDefinition[base] /. base -> kid;
+           {kid[4], use[kid], kid::usage, Options[kid]}"#
+      )
+      .unwrap(),
+      "{5, inherited, doc, {o -> 7}}"
+    );
+  }
+}
+
+// A value list can be assigned back, not just read: `UpValues[s] = rules`
+// and `OwnValues[s] = rules` install exactly the definitions they name.
+mod assigning_value_lists {
+  use super::*;
+
+  #[test]
+  fn upvalues_can_be_assigned() {
+    clear_state();
+    assert_eq!(
+      interpret("UpValues[q] = {HoldPattern[h[q]] :> 7}; h[q]").unwrap(),
+      "7"
+    );
+    // The assignment replaces the whole list, so an emptied one leaves the
+    // symbol with no upvalues at all.
+    assert_eq!(
+      interpret(
+        "UpValues[q] = {HoldPattern[h[q]] :> 7}; UpValues[q] = {}; h[q]"
+      )
+      .unwrap(),
+      "h[q]"
+    );
+  }
+
+  // A list-destructuring parameter and a whole-rule guard together: the
+  // guard talks about the elements by name, and is stored against the
+  // `Part[_lp, i]` accessors they are lowered to, so it has to be read back
+  // for both firing and printing.
+  #[test]
+  fn list_pattern_rule_with_a_guard_fires_and_prints() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "lq[{a_Integer, b_Integer}] := a + b /; a > b; \
+         {lq[{1, 2}], lq[{5, 2}], DownValues[lq]}"
+      )
+      .unwrap(),
+      "{lq[{1, 2}], 7, {HoldPattern[lq[{a_Integer, b_Integer}]] :> \
+       a + b /; a > b}}"
+    );
+  }
+
+  // Literal-argument and memoized definitions are reported by `DownValues`
+  // and read first by dispatch, so replacing the list has to replace them
+  // too — otherwise clearing leaves behind exactly what it was asked to
+  // remove.
+  #[test]
+  fn assigning_an_empty_list_clears_literal_definitions() {
+    clear_state();
+    assert_eq!(
+      interpret("lf[1] = 42; DownValues[lf] = {}; {DownValues[lf], lf[1]}")
+        .unwrap(),
+      "{{}, lf[1]}"
+    );
+  }
+
+  #[test]
+  fn assigning_an_empty_list_clears_memoized_definitions() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "mf[n_Integer] := mf[n] = n*2; mf[3]; DownValues[mf] = {}; \
+         {DownValues[mf], mf[3]}"
+      )
+      .unwrap(),
+      "{{}, mf[3]}"
+    );
+  }
+
+  // Replacing the list with itself keeps them, though: they are part of what
+  // `DownValues` reported.
+  #[test]
+  fn round_tripping_keeps_memoized_definitions() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "rf[n_Integer] := rf[n] = n*2; rf[3]; \
+         DownValues[rf] = DownValues[rf]; rf[3]"
+      )
+      .unwrap(),
+      "6"
+    );
+  }
+
+  // `SubValues[f] = …` replaces what is in the SubValues store, and nothing
+  // else. Clearing `f`'s DownValues here would make installing a definition
+  // list section by section throw away the DownValues installed a moment
+  // earlier.
+  #[test]
+  fn subvalues_can_be_assigned_without_touching_downvalues() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "sv[x_Integer] := x + 1; sv[q][b_] := got[b]; \
+         SubValues[sv] = SubValues[sv]; {sv[4], sv[q][7]}"
+      )
+      .unwrap(),
+      "{5, got[7]}"
+    );
+  }
+
+  #[test]
+  fn assigning_an_empty_list_clears_subvalues() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "sw[x_Integer] := x + 1; sw[q][b_] := got[b]; SubValues[sw] = {}; \
+         {SubValues[sw], sw[4], sw[q][7]}"
+      )
+      .unwrap(),
+      "{{}, 5, sw[q][7]}"
+    );
+  }
+
+  #[test]
+  fn ownvalues_can_be_assigned() {
+    clear_state();
+    assert_eq!(
+      interpret("OwnValues[w] = {HoldPattern[w] :> 42}; w").unwrap(),
+      "42"
+    );
+    assert_eq!(
+      interpret("OwnValues[w] = {HoldPattern[w] :> 42}; OwnValues[w] = {}; w")
+        .unwrap(),
+      "w"
+    );
+  }
+}
+
+// `sym /: Set[…] := …` and `sym /: SetDelayed[…] := …` let a symbol take
+// over what assigning into it means — the mechanism an object system uses
+// for `obj["field"] = value`.
+mod assignment_upvalues {
+  use super::*;
+
+  #[test]
+  fn set_can_be_taken_over() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"obj /: Set[obj[k_String], v_] := (rec[k] = v);
+           obj["a"] = 5;
+           rec["a"]"#
+      )
+      .unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn set_delayed_can_be_taken_over() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"obj /: SetDelayed[obj[k_String], v_] := (rec[k] := v);
+           obj["b"] := 1 + 1;
+           rec["b"]"#
+      )
+      .unwrap(),
+      "2"
+    );
+  }
+
+  // The tagged pattern may be structural — a call on the *result* of a
+  // call, as in `UObject[sym]["field"] = value`.
+  #[test]
+  fn a_structural_pattern_can_be_taken_over() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"UObj /: Set[UObj[s_Symbol][k_String], v_] := (rec[s, k] = v);
+           UObj[thing]["f"] = 9;
+           rec[thing, "f"]"#
+      )
+      .unwrap(),
+      "9"
+    );
+    // …and it must not swallow assignments it does not describe.
+    assert_eq!(
+      interpret(
+        r#"UObj /: Set[UObj[s_Symbol][k_String], v_] := (rec[s, k] = v);
+           other[1] = 2;
+           other[1]"#
+      )
+      .unwrap(),
+      "2"
+    );
+  }
+
+  // The tag may also be an argument rather than the head.
+  #[test]
+  fn a_tag_in_argument_position_is_consulted() {
+    clear_state();
+    assert_eq!(interpret("obj /: f[obj] = 3; f[obj]").unwrap(), "3");
+  }
+
+  // …but only one level down. A tag inside an argument of an argument —
+  // `obj` in `Set[f[obj], v_]` — is too deep for the rule to be found
+  // again, so nothing is defined and the assignment reports where.
+  #[test]
+  fn a_tag_too_deep_defines_nothing() {
+    clear_state();
+    assert_eq!(
+      interpret("obj /: Set[f[obj], v_] := (rec = v)").unwrap(),
+      "$Failed"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("Quiet[obj /: Set[f[obj], v_] := (rec = v)]; UpValues[obj]")
+        .unwrap(),
+      "{}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("Quiet[obj /: Set[f[obj], v_] := (rec = v)]; f[obj] = 3; rec")
+        .unwrap(),
+      "rec"
+    );
+    // The immediate form reports the same way but hands back its value.
+    clear_state();
+    assert_eq!(interpret("obj /: f[g[obj]] = 3").unwrap(), "3");
+    clear_state();
+    assert_eq!(
+      interpret("obj /: f[g[obj]] = 3; UpValues[obj]").unwrap(),
+      "{}"
+    );
+  }
+
+  // `Set` evaluates its right-hand side once, before anything else sees it,
+  // so an upvalue on `Set` binds the *value*. Bound to the expression, every
+  // use of the pattern variable evaluated it again — which in WLJS Notebook
+  // meant a fresh object per use, so a field written on one was read back
+  // from another and the object's head collected a SubValue per write (#603).
+  #[test]
+  fn a_set_upvalue_binds_the_evaluated_right_hand_side() {
+    clear_state();
+    interpret("n = 0").unwrap();
+    interpret("T[o___Rule] := (n++; T[Unique[\"t$\"]])").unwrap();
+    interpret(
+      "T /: Set[name_Symbol, object_T] := (object; object; object; name)",
+    )
+    .unwrap();
+    interpret("p = T[\"x\" -> 1]").unwrap();
+    assert_eq!(interpret("n").unwrap(), "1");
+
+    // And what the body stores is the object, not the constructor call.
+    clear_state();
+    interpret("SetAttributes[U, HoldFirst]").unwrap();
+    interpret("U[o___Rule] := With[{s = Unique[\"u$\"]}, U[s]]").unwrap();
+    interpret(
+      "U /: Set[name_Symbol, object_U] := \
+       (ClearAll[name]; Block[{U}, SetAttributes[U, HoldFirst]; \
+        name = object]; name)",
+    )
+    .unwrap();
+    interpret("q = U[\"x\" -> 1]").unwrap();
+    let own = interpret("OwnValues[q]").unwrap();
+    assert!(
+      own.contains("U[u$"),
+      "q should hold the constructed object, got {own}"
+    );
+
+    // A right-hand side with a side effect still runs exactly once when no
+    // upvalue matches but one is on the books for the tag.
+    clear_state();
+    interpret("m = 0").unwrap();
+    interpret("V /: Set[V[k_], v_] := 1").unwrap();
+    interpret("w = (m++; V[2])").unwrap();
+    assert_eq!(interpret("m").unwrap(), "1");
+    assert_eq!(interpret("w").unwrap(), "V[2]");
+  }
+
+  // What still counts as close enough: the head of the left-hand side, an
+  // argument, an argument's own head however many calls deep the head chain
+  // runs, and the head a blank restricts to.
+  #[test]
+  fn a_tag_at_the_surface_is_close_enough() {
+    for source in [
+      "obj /: f[obj[x_]] = 3",
+      "obj /: f[a, obj, b] = 3",
+      "obj /: f[x_obj] = 3",
+      "obj /: f[_obj] = 3",
+      "obj /: (obj + 1) = 3",
+      "obj /: {obj, x_} = 3",
+      "obj /: Set[obj[k_], v_] := 1",
+    ] {
+      clear_state();
+      assert_ne!(
+        interpret(&format!("{source}; UpValues[obj]")).unwrap(),
+        "{}",
+        "{source} should define an upvalue"
+      );
+    }
+  }
+
+  // A rule tagged on a list or a comparison fires the way one tagged on
+  // `Plus` does — the head is `List` or `Equal` like any other.
+  #[test]
+  fn a_rule_can_hang_on_a_list_or_a_comparison() {
+    clear_state();
+    assert_eq!(
+      interpret("obj /: {obj, x_} = 3; {{obj, 7}, {obj}}").unwrap(),
+      "{3, {obj}}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("obj /: (obj == 1) = 5; {obj == 1, obj == 2}").unwrap(),
+      "{5, obj == 2}"
+    );
+  }
+}
+
+/// A definition whose body carries a `/;` guard is not the same definition as
+/// an unconditional one with the same left-hand side — even when the guard
+/// sits inside the `With` that binds what it talks about. Rubi stacks three
+/// rules on one left-hand side that way.
+mod a_guard_inside_a_scoping_construct_keeps_the_definition {
+  use super::*;
+
+  #[test]
+  fn a_later_plain_rule_does_not_replace_a_guarded_one() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "cg[m_] := With[{k = 2}, \"A\" /; k != 1];\n\
+         cg[m_] := \"B\";\n\
+         {cg[3], Length[DownValues[cg]]}"
+      )
+      .unwrap(),
+      "{A, 2}"
+    );
+  }
+
+  #[test]
+  fn the_plain_rule_still_catches_what_the_guard_turns_down() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ch[m_] := With[{k = 1}, \"A\" /; k != 1];\n\
+         ch[m_] := \"B\";\n\
+         {ch[3], Length[DownValues[ch]]}"
+      )
+      .unwrap(),
+      "{B, 2}"
+    );
+  }
+
+  #[test]
+  fn module_and_block_bodies_count_too() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ci[m_] := Module[{k = 2}, \"A\" /; k != 1];\n\
+         ci[m_] := \"B\";\n\
+         ci[3]"
+      )
+      .unwrap(),
+      "A"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        "cj[m_] := Block[{k = 2}, \"A\" /; k != 1];\n\
+         cj[m_] := \"B\";\n\
+         cj[3]"
+      )
+      .unwrap(),
+      "A"
+    );
+  }
+
+  // An unguarded rule is still replaced by a later one with the same pattern.
+  #[test]
+  fn a_plain_rule_is_still_replaced() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ck[m_] := \"A\"; ck[m_] := \"B\"; {ck[3], Length[DownValues[ck]]}"
+      )
+      .unwrap(),
+      "{B, 1}"
+    );
+  }
+}
+
+mod sequence_pattern_slots {
+  use super::*;
+
+  // A named sequence body (`r : _Rule..`) claims as many arguments as its
+  // run takes — MaTeX's `ConfigureMaTeX[rules : (_Rule | _RuleDelayed)...]`
+  // relies on it. Outputs verified against wolframscript.
+  #[test]
+  fn named_repeated_takes_the_whole_run() {
+    clear_state();
+    assert_eq!(
+      interpret("sq1[r:_Rule..] := {r}; {sq1[a->1], sq1[a->1, b->2], sq1[]}")
+        .unwrap(),
+      "{{a -> 1}, {a -> 1, b -> 2}, sq1[]}"
+    );
+  }
+
+  #[test]
+  fn named_repeated_null_admits_no_arguments() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "sq2[rules : (_Rule|_RuleDelayed)...] := {rules}; \
+         {sq2[], sq2[a->1], sq2[a->1, b:>2], sq2[1]}"
+      )
+      .unwrap(),
+      "{{}, {a -> 1}, {a -> 1, b :> 2}, sq2[1]}"
+    );
+  }
+
+  #[test]
+  fn sequence_slot_between_single_slots() {
+    clear_state();
+    assert_eq!(
+      interpret("sq3[x_, r:_Rule.., y_] := {x, {r}, y}; sq3[1, a->1, b->2, 3]")
+        .unwrap(),
+      "{1, {a -> 1, b -> 2}, 3}"
+    );
+  }
+
+  #[test]
+  fn named_pattern_sequence() {
+    clear_state();
+    assert_eq!(
+      interpret("sq4[r:PatternSequence[_,_]] := {r}; {sq4[1,2], sq4[1]}")
+        .unwrap(),
+      "{{1, 2}, sq4[1]}"
+    );
+  }
+
+  // The immediate assignment keeps the constraint too.
+  #[test]
+  fn set_keeps_a_sequence_body() {
+    clear_state();
+    assert_eq!(
+      interpret("sq5[r:_Rule..] = 7; {sq5[a->1, b->2], sq5[1]}").unwrap(),
+      "{7, sq5[1]}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("sq6[r:Except[_Integer]] = 7; {sq6[1], sq6[a]}").unwrap(),
+      "{sq6[1], 7}"
+    );
+  }
+}
+
+mod constrained_trailing_sequence_in_list_pattern {
+  use super::*;
+
+  // `{__String}` only takes a list of strings; previously the trailing
+  // sequence's head was never checked, so `{x}` matched too.
+  #[test]
+  fn head_of_trailing_sequence_is_enforced() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ts1[tex:{__String}] := 1; ts1[tex_List] := 2; \
+         {ts1[{\"a\"}], ts1[{x}], ts1[{}], ts1[{\"a\", 1}], ts1[{\"a\", \"b\"}]}"
+      )
+      .unwrap(),
+      "{1, 2, 2, 2, 1}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ts2[{x_, r__Integer}] := {x, r}; {ts2[{1, 2, 3}], ts2[{1, a}]}"
+      )
+      .unwrap(),
+      "{{1, 2, 3}, ts2[{1, a}]}"
+    );
+  }
+
+  #[test]
+  fn test_of_trailing_sequence_is_enforced() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ts3[{r___?StringQ}] := {r}; {ts3[{\"a\"}], ts3[{}], ts3[{1}]}"
+      )
+      .unwrap(),
+      "{{a}, {}, ts3[{1}]}"
+    );
+  }
+}
+
+mod delayed_own_values {
+  use super::*;
+
+  // `line := lines[[i]]` reads the part afresh on every access.
+  #[test]
+  fn part_body_is_reevaluated() {
+    clear_state();
+    assert_eq!(interpret("dl = {1, 2}; dp := dl[[1]]; dp").unwrap(), "1");
+    assert_eq!(interpret("dl = {5}; dp").unwrap(), "5");
+  }
+
+  #[test]
+  fn part_body_inside_module() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Module[{lines = {\"a\", \"b\"}, i = 1, line}, \
+         line := lines[[i]]; {line, StringMatchQ[line, \"a\"]}]"
+      )
+      .unwrap(),
+      "{a, True}"
+    );
+  }
+
+  // The memoization idiom `tpl := tpl = expr` used as a head: the head is
+  // evaluated (which computes and stores the value) before being applied.
+  #[test]
+  fn memoized_head_is_evaluated_before_application() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "tpl := tpl = StringTemplate[\"a `x`\"]; \
+         {tpl[<|\"x\" -> 1|>], tpl[<|\"x\" -> 2|>]}"
+      )
+      .unwrap(),
+      "{a 1, a 2}"
+    );
+    clear_state();
+    assert_eq!(interpret("dh := dh = df[]; dh[3]").unwrap(), "df[][3]");
+  }
+}
+
+/// The left-hand side of a definition is evaluated the way any call is: an
+/// argument the head holds stays as written. Verified against wolframscript.
+mod held_left_hand_side_arguments {
+  use super::*;
+
+  #[test]
+  fn a_held_symbol_argument_is_not_replaced_by_its_value() {
+    clear_state();
+    assert_eq!(
+      interpret("n = 3; k[n] := 1; DownValues[k]").unwrap(),
+      "{HoldPattern[k[3]] :> 1}"
+    );
+    assert_eq!(
+      interpret("SetAttributes[q, HoldFirst]; q[n] := 2; DownValues[q]")
+        .unwrap(),
+      "{HoldPattern[q[n]] :> 2}"
+    );
+  }
+
+  #[test]
+  fn a_held_pattern_argument_keeps_its_head_even_when_that_head_has_rules() {
+    clear_state();
+    // Rubi's `Steps[Int[expr_, x_]] := …` relies on this: `Int` has a rule
+    // for every two-argument call, and `Steps` is HoldFirst.
+    assert_eq!(
+      interpret(
+        "Int[e_, x_] := foo[e, x]; SetAttributes[h, HoldFirst]; \
+         h[Int[e_, x_]] := {e, x}; DownValues[h]"
+      )
+      .unwrap(),
+      "{HoldPattern[h[Int[e_, x_]]] :> {e, x}}"
+    );
+    assert_eq!(interpret("h[Int[a, b]]").unwrap(), "{a, b}");
+    // Without the attribute the argument is evaluated, as wolframscript does.
+    assert_eq!(
+      interpret("g[Int[e_, x_]] := {e, x}; DownValues[g]").unwrap(),
+      "{HoldPattern[g[foo[e_, x_]]] :> {e, x}}"
+    );
+  }
+}
+
+/// A body may carry several `/;` guards, one wrapped around the other —
+/// Rubi's step display wraps every rule's `rhs /; cond` in a further
+/// `/; SimplifyFlag`. Each guard is tested outermost first; a failing one
+/// hands the call to the next definition. Verified against wolframscript.
+mod nested_condition_guards {
+  use super::*;
+
+  #[test]
+  fn every_guard_must_pass_and_a_failing_one_tries_the_next_rule() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "flag = True; f[x_] := Condition[Condition[x^2, x > 0], flag]; \
+         f[x_] := other[x]; {f[3], f[-3]}"
+      )
+      .unwrap(),
+      "{9, other[-3]}"
+    );
+    assert_eq!(
+      interpret("Block[{flag = False}, f[3]]").unwrap(),
+      "other[3]"
+    );
+    assert_eq!(
+      interpret("g[x_] := x^2 /; x > 0 /; flag; {g[3], g[-3]}").unwrap(),
+      "{9, g[-3]}"
+    );
+    assert_eq!(
+      interpret(
+        "h[x_] := Condition[Condition[Condition[x^2, x > 0], flag], x < 10]; \
+         {h[3], h[30], h[-1]}"
+      )
+      .unwrap(),
+      "{9, h[30], h[-1]}"
+    );
+  }
+}
+
+/// Definitions are ordered by what their patterns match, the way the Wolfram
+/// Language does it: a rule whose pattern is matched by an earlier rule's
+/// pattern (with its variables frozen) is tried first; rules that cannot be
+/// related, and rules whose guards differ, stay in definition order. Every
+/// order here was verified against wolframscript.
+mod definition_order_by_subsumption {
+  use super::*;
+
+  /// A bare pattern is parenthesized wherever it is the operand of an infix
+  /// operator, in `InputForm` as well as in the printed form — the two
+  /// renderers used to disagree about a `Plus` term. Verified against
+  /// wolframscript.
+  #[test]
+  fn a_pattern_term_of_a_sum_is_parenthesized_in_input_form() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "p[a_ + b_] := 1; p[a_ + 2] := 2; \
+         ToString[DownValues[p], InputForm]"
+      )
+      .unwrap(),
+      "{HoldPattern[p[2 + (a_)]] :> 2, HoldPattern[p[(a_) + (b_)]] :> 1}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret(
+        "v[x_ + y_] := 1; v[x_ + x_] := 2; ToString[DownValues[v], InputForm]"
+      )
+      .unwrap(),
+      "{HoldPattern[v[(x_) + (y_)]] :> 1, HoldPattern[v[2*(x_)]] :> 2}"
+    );
+  }
+
+  #[test]
+  fn a_structurally_narrower_rule_moves_ahead() {
+    clear_state();
+    assert_eq!(
+      interpret("p[a_ + b_] := 1; p[a_ + 2] := 2; DownValues[p]").unwrap(),
+      "{HoldPattern[p[2 + (a_)]] :> 2, HoldPattern[p[(a_) + (b_)]] :> 1}"
+    );
+    assert_eq!(
+      interpret("r[u_*v_] := 1; r[u_^2*v_] := 2; DownValues[r]").unwrap(),
+      "{HoldPattern[r[(u_)^2*(v_)]] :> 2, HoldPattern[r[(u_)*(v_)]] :> 1}"
+    );
+    assert_eq!(
+      interpret("w[f_[x_], x_] := 1; w[g[x_], x_] := 2; DownValues[w]")
+        .unwrap(),
+      "{HoldPattern[w[g[x_], x_]] :> 2, HoldPattern[w[(f_)[x_], x_]] :> 1}"
+    );
+  }
+
+  #[test]
+  fn rubis_specific_trig_rule_precedes_the_general_one() {
+    clear_state();
+    // Rubi defines the general `(c+d x)^m (a+b sin)^n` rule first and the
+    // `(c+d x)^m sin` rule later; the latter is a special case (a -> 0,
+    // b -> 1, n -> 1) and must be tried first.
+    assert_eq!(
+      interpret(
+        "q[(c_. + d_.*x_)^m_.*(a_. + b_.*s[e_. + f_.*x_])^n_., x_] := 1; \\
+         q[(c_. + d_.*x_)^m_*s[e_. + f_.*x_], x_] := 2; DownValues[q]"
+      )
+      .unwrap(),
+      "{HoldPattern[q[((c_.) + (d_.)*(x_))^(m_)*s[(e_.) + (f_.)*(x_)], x_]] :> 2, \
+       HoldPattern[q[((c_.) + (d_.)*(x_))^(m_.)*((a_.) + (b_.)*s[(e_.) + (f_.)*(x_)])^(n_.), x_]] :> 1}"
+    );
+    assert_eq!(interpret("q[x^-3 s[x], x]").unwrap(), "2");
+  }
+
+  #[test]
+  fn guards_keep_rules_in_definition_order_unless_the_narrower_one_has_them_too()
+   {
+    clear_state();
+    assert_eq!(
+      interpret("g[x_] := 1 /; x > 5; g[x_Integer] := 2; DownValues[g]")
+        .unwrap(),
+      "{HoldPattern[g[x_]] :> 1 /; x > 5, HoldPattern[g[x_Integer]] :> 2}"
+    );
+    assert_eq!(
+      interpret("h[x_] := 1; h[x_] := 2 /; x > 5; DownValues[h]").unwrap(),
+      "{HoldPattern[h[x_]] :> 2 /; x > 5, HoldPattern[h[x_]] :> 1}"
+    );
+    assert_eq!(
+      interpret("k[x_] := 1 /; x > 5; k[x_] := 2; DownValues[k]").unwrap(),
+      "{HoldPattern[k[x_]] :> 1 /; x > 5, HoldPattern[k[x_]] :> 2}"
+    );
+    assert_eq!(
+      interpret("v[x_ + y_] := 1; v[x_ + x_] := 2; DownValues[v]").unwrap(),
+      "{HoldPattern[v[(x_) + (y_)]] :> 1, HoldPattern[v[2*(x_)]] :> 2}"
+    );
+  }
+}
+
+/// An assignment consults the upvalues of the symbols on *both* sides: WLJS's
+/// WLX importer writes `ImportComponent /: SetDelayed[symbol_,
+/// ImportComponent[args_, opts___]] := …` so that `tpl := ImportComponent[…]`
+/// stores a component rather than the component's expansion, and the only
+/// symbol that rule is tagged by is on the right. Verified against
+/// wolframscript.
+mod an_assignment_consults_the_right_hand_sides_upvalues {
+  use super::*;
+
+  #[test]
+  fn a_set_delayed_upvalue_claims_the_definition() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "upIC /: SetDelayed[symbol_, upIC[args_]] := (symbol := upHeld[args]); \
+         upA := upIC[\"x\"]; \
+         upA"
+      )
+      .unwrap(),
+      "upHeld[x]"
+    );
+  }
+
+  /// The wrapper-object idiom the importer builds on: the upvalue turns a
+  /// delayed definition into a parameterised one.
+  #[test]
+  fn the_upvalue_can_define_a_parameterised_symbol() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "SetAttributes[upEHO, HoldFirst]; \
+         upEHO /: SetDelayed[symbol_, upEHO[obj_, assoc_]] := \
+           (symbol[rules___Rule] := \
+             Block[{upOpts = Association[{rules}]}, ReleaseHold[obj]]); \
+         upC := upEHO[Hold[upOpts[\"k\"]], <|\"Path\" -> \"p\"|>]; \
+         upC[\"k\" -> 7]"
+      )
+      .unwrap(),
+      "7"
+    );
+  }
+
+  /// A left-hand-side upvalue still claims the assignment, as before.
+  #[test]
+  fn a_left_hand_side_upvalue_still_wins() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "upObj /: Set[upObj[k_], v_] := upStored[k, v]; upObj[\"a\"] = 1"
+      )
+      .unwrap(),
+      "upStored[a, 1]"
+    );
+  }
+}
+
+/// A scoping construct binds its locals as ordinary values, so an
+/// association bound by `Block` or `Module` still answers a key the way a
+/// global one does. WLX hands a component its `$Options` this way.
+mod a_scoped_association_answers_a_key {
+  use super::*;
+
+  #[test]
+  fn block_and_module_locals_are_callable() {
+    clear_state();
+    assert_eq!(
+      interpret("Block[{scopedA = <|\"k\" -> 7|>}, scopedA[\"k\"]]").unwrap(),
+      "7"
+    );
+    assert_eq!(
+      interpret("Module[{scopedA = <|\"k\" -> 7|>}, scopedA[\"k\"]]").unwrap(),
+      "7"
+    );
+    assert_eq!(
+      interpret("With[{scopedA = <|\"k\" -> 7|>}, scopedA[\"k\"]]").unwrap(),
+      "7"
+    );
+  }
+
+  /// Nested access and a missing key behave as they do for a global.
+  #[test]
+  fn nested_keys_and_missing_keys_behave() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Block[{scopedB = <|\"a\" -> <|\"b\" -> 2|>|>}, scopedB[\"a\"][\"b\"]]"
+      )
+      .unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("Block[{scopedB = <|\"a\" -> 1|>}, scopedB[\"z\"]]").unwrap(),
+      "Missing[KeyAbsent, z]"
+    );
+  }
+}

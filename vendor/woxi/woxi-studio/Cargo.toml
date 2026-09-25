@@ -1,0 +1,22 @@
+[package]
+name = "woxi-studio"
+description = "A notebook editor for Wolfram Language .nb files"
+version = "0.3.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/ad-si/Woxi"
+
+[dependencies]
+woxi = { path = ".." }
+base64 = "0.22"
+iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced"] }
+resvg = "0.45"
+tiny-skia = "0.11"
+dark-light = "2"
+svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
+rfd = "0.15"
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"

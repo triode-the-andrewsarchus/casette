@@ -1,0 +1,10076 @@
+use super::*;
+use crate::functions::list_helpers_ast;
+use crate::functions::string_ast::{Overlaps, parse_overlaps_option};
+
+/// Parse the `m` argument of NestWhile[f, x, test, m, ...]. Returns `All` for
+/// the symbol `All`, `Last(n)` for a positive integer, and `None` otherwise.
+/// Extract the function `f` from a `SameTest -> f` option, given as either a
+/// bare `SameTest -> f` rule or a singleton list `{SameTest -> f}`.
+fn same_test_option(opt: &Expr) -> Option<&Expr> {
+  let rule = match opt {
+    Expr::List(items) if items.len() == 1 => &items[0],
+    other => other,
+  };
+  match rule {
+    Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } if matches!(pattern.as_ref(), Expr::Identifier(n) if n == "SameTest") => {
+      Some(replacement)
+    }
+    _ => None,
+  }
+}
+
+/// Whether `test[a, b]` evaluates to `True`.
+fn same_test_true(test: &Expr, a: &Expr, b: &Expr) -> bool {
+  matches!(
+    list_helpers_ast::apply_func_to_two_args(test, a, b),
+    Ok(Expr::Identifier(ref s)) if s == "True"
+  )
+}
+
+/// True for an argument that is a concrete non-list value the list-difference
+/// family (Differences, Ratios) must reject with ::listrp — any NumericQ atom
+/// (numbers, I, Pi, Sin[2], …) plus strings, associations, and the booleans
+/// True/False. Lists, bare symbols, and unknown function heads return false
+/// (they are processed or left to evaluate further).
+fn listrp_invalid_atom(e: &Expr) -> bool {
+  match e {
+    Expr::List(_) => false,
+    Expr::String(_) | Expr::Association(_) => true,
+    Expr::Identifier(s) if s == "True" || s == "False" => true,
+    _ => crate::functions::predicate_ast::is_numeric_q(e),
+  }
+}
+
+fn parse_nest_while_m(expr: &Expr) -> Option<list_helpers_ast::NestWhileM> {
+  match expr {
+    Expr::Identifier(s) if s == "All" => {
+      Some(list_helpers_ast::NestWhileM::All)
+    }
+    Expr::Integer(n) if *n >= 1 => {
+      Some(list_helpers_ast::NestWhileM::Last(*n as usize))
+    }
+    _ => None,
+  }
+}
+
+/// Validate the sequence-specification arguments of Take/Drop. On the
+/// first argument that is not a valid spec shape, emits ::seqs naming
+/// its position and returns the unevaluated call.
+fn invalid_seq_spec(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  for (i, spec) in args.iter().enumerate().skip(1) {
+    if !list_helpers_ast::seq_spec_shape_ok(spec) {
+      crate::emit_message(&format!(
+        "{}::seqs: Sequence specification (+n, -n, {{+n}}, {{-n}}, {{m, n}} or {{m, n, s}}) expected at position {} in {}.",
+        name,
+        i + 1,
+        crate::syntax::format_expr(
+          &unevaluated(name, args),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+      return Some(Ok(unevaluated(name, args)));
+    }
+  }
+  None
+}
+
+/// Validate the optional third argument `n` of `MaximalBy`/`MinimalBy`, which
+/// Wolfram requires to be a non-negative integer. Returns `Ok(n)` when valid,
+/// or `Err(unevaluated)` after emitting `<name>::arg3` for anything else
+/// (`All`, negative integers, non-integers, …).
+fn extremal_by_count(name: &str, args: &[Expr]) -> Result<i128, Expr> {
+  let arg3 = &args[2];
+  let valid = match arg3 {
+    Expr::Integer(_) | Expr::BigInteger(_) => {
+      expr_to_i128(arg3).filter(|k| *k >= 0)
+    }
+    _ => None,
+  };
+  if let Some(n) = valid {
+    Ok(n)
+  } else {
+    crate::emit_message(&format!(
+      "{}::arg3: The third argument {} is expected to be a non-negative integer.",
+      name,
+      crate::syntax::format_expr(arg3, crate::syntax::ExprForm::Output)
+    ));
+    Err(unevaluated(name, args))
+  }
+}
+
+/// A non-negative machine-sized integer, or None.
+fn nonneg_machine_int(e: &Expr) -> Option<i128> {
+  match e {
+    Expr::Integer(n) if (0..=i64::MAX as i128).contains(n) => Some(*n),
+    _ => None,
+  }
+}
+
+/// Resolve a count spec that may be a plain integer or `UpTo[n]`.
+/// A plain integer is returned as-is; `UpTo[n]` is clamped to the length of
+/// `list` (so "take up to n" never asks for more than is available).
+fn count_or_upto(spec: &Expr, list: &Expr) -> Option<i128> {
+  if let Some(n) = expr_to_i128(spec) {
+    return Some(n);
+  }
+  if let Expr::FunctionCall { name, args } = spec
+    && name == "UpTo"
+    && args.len() == 1
+    && let Some(n) = expr_to_i128(&args[0])
+  {
+    let len = match list {
+      Expr::List(items) => items.len() as i128,
+      Expr::Association(pairs) => pairs.len() as i128,
+      _ => return Some(n),
+    };
+    return Some(n.min(len));
+  }
+  None
+}
+
+/// Validation outcome for a `TakeLargest`/`TakeSmallest` count spec.
+enum TakeExtreme {
+  /// A valid, in-range count of elements to take.
+  Take(i128),
+  /// The spec was invalid or exceeded the list; the message has already been
+  /// emitted and this unevaluated call should be returned.
+  Reject(Expr),
+}
+
+/// Validate the count spec of a two-argument `TakeLargest`/`TakeSmallest`
+/// call over a plain list, emitting wolframscript's messages:
+///   * `innfup` when the spec is not a non-negative integer, `Infinity`, or a
+///     valid `UpTo[k]` (e.g. `-1`, `2.5`, `{2}`);
+///   * `insuff` when more elements than the list holds are requested (a plain
+///     integer larger than the length, or `Infinity`).
+///     Returns `None` when the first argument is not a plain list, so the caller's
+///     other paths (associations, operator forms) are left untouched.
+fn validate_take_extreme(name: &str, args: &[Expr]) -> Option<TakeExtreme> {
+  let Expr::List(items) = &args[0] else {
+    return None;
+  };
+  let len = items.len() as i128;
+  let spec = &args[1];
+
+  // UpTo[k] with a non-negative k clamps to the available length.
+  if let Expr::FunctionCall {
+    name: fname,
+    args: fargs,
+  } = spec
+    && fname == "UpTo"
+    && fargs.len() == 1
+    && let Some(k) = expr_to_i128(&fargs[0])
+    && k >= 0
+  {
+    return Some(TakeExtreme::Take(k.min(len)));
+  }
+
+  let reject = |suffix: String| -> TakeExtreme {
+    let call = unevaluated(name, args);
+    crate::emit_message(&format!("{name}::{suffix}"));
+    TakeExtreme::Reject(call)
+  };
+  let spec_str =
+    crate::syntax::format_expr(spec, crate::syntax::ExprForm::Output);
+
+  if is_infinity_symbol(spec) {
+    return Some(reject(format!(
+      "insuff: Cannot take Infinity element(s) from a list of length {len}."
+    )));
+  }
+  if let Some(n) = expr_to_i128(spec) {
+    if n < 0 {
+      return Some(reject(format!(
+        "innfup: Non-negative integer, Infinity or valid UpTo specification expected instead of {spec_str}."
+      )));
+    }
+    if n > len {
+      return Some(reject(format!(
+        "insuff: Cannot take {n} element(s) from a list of length {len}."
+      )));
+    }
+    return Some(TakeExtreme::Take(n));
+  }
+  Some(reject(format!(
+    "innfup: Non-negative integer, Infinity or valid UpTo specification expected instead of {spec_str}."
+  )))
+}
+
+/// Whether the expression is the symbol Infinity (or DirectedInfinity[1]).
+fn is_infinity_symbol(e: &Expr) -> bool {
+  matches!(e, Expr::Identifier(s) | Expr::Constant(s) if s == "Infinity")
+    || matches!(e, Expr::FunctionCall { name, args }
+      if name == "DirectedInfinity" && args.len() == 1
+      && matches!(&args[0], Expr::Integer(1)))
+}
+
+/// Emit `<F>::intnm: Non-negative machine-sized integer expected at
+/// position <pos> in <call>.` and return the unevaluated call.
+fn intnm_message(name: &str, args: &[Expr], pos: usize) -> Expr {
+  let call = unevaluated(name, args);
+  crate::emit_message(&format!(
+    "{}::intnm: Non-negative machine-sized integer expected at position {} in {}.",
+    name,
+    pos,
+    crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+  ));
+  call
+}
+
+/// Emit `<Parallel><F>::nopar1: <serial call> cannot be parallelized;
+/// proceeding with sequential evaluation.` — what wolframscript reports for a
+/// `Parallel*` call whose argument form has no parallel implementation.
+fn emit_nopar1(name: &str, serial: &str, args: &[Expr]) {
+  crate::emit_message_to_stdout(&format!(
+    "{name}::nopar1: {} cannot be parallelized; proceeding with \
+     sequential evaluation.",
+    expr_to_string(&unevaluated(serial, args))
+  ));
+}
+
+/// Split a trailing `SameTest -> f` option off an argument list
+/// (FixedPoint / FixedPointList).
+fn split_same_test_option(args: &[Expr]) -> (Vec<Expr>, Option<Expr>) {
+  let same_test_value = |opt: &Expr| -> Option<Expr> {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = opt
+      && matches!(pattern.as_ref(), Expr::Identifier(s) if s == "SameTest")
+    {
+      return Some(replacement.as_ref().clone());
+    }
+    if let Expr::FunctionCall { name, args: ra } = opt
+      && (name == "Rule" || name == "RuleDelayed")
+      && ra.len() == 2
+      && matches!(&ra[0], Expr::Identifier(s) if s == "SameTest")
+    {
+      return Some(ra[1].clone());
+    }
+    None
+  };
+  match args.last().and_then(same_test_value) {
+    Some(test) => (args[..args.len() - 1].to_vec(), Some(test)),
+    None => (args.to_vec(), None),
+  }
+}
+
+/// Check recursively whether an expression contains pattern elements (Blank, Pattern, etc.)
+fn has_pattern_element(expr: &Expr) -> bool {
+  match expr {
+    Expr::Pattern { .. }
+    | Expr::PatternOptional { .. }
+    | Expr::PatternTest { .. } => true,
+    Expr::FunctionCall { name, args } => {
+      matches!(
+        name.as_str(),
+        "Blank"
+          | "BlankSequence"
+          | "BlankNullSequence"
+          | "Pattern"
+          | "Alternatives"
+          | "PatternTest"
+          | "Condition"
+          | "Repeated"
+          | "RepeatedNull"
+          | "Except"
+      ) || args.iter().any(has_pattern_element)
+    }
+    Expr::List(items) => items.iter().any(has_pattern_element),
+    _ => false,
+  }
+}
+
+/// Check if a pattern contains sequence-matching elements (BlankSequence, BlankNullSequence,
+/// Repeated, RepeatedNull) that can match variable numbers of list elements.
+fn has_sequence_pattern(expr: &Expr) -> bool {
+  match expr {
+    Expr::Pattern { blank_type, .. } => *blank_type >= 2,
+    Expr::PatternTest { blank_type, .. } => *blank_type >= 2,
+    Expr::FunctionCall { name, .. } => matches!(
+      name.as_str(),
+      "BlankSequence" | "BlankNullSequence" | "Repeated" | "RepeatedNull"
+    ),
+    _ => false,
+  }
+}
+
+/// A single SequenceReplace rule: the full match pattern (kept so bindings flow
+/// through `match_pattern`), the inner list pattern elements (for length
+/// calculation), and the optional replacement RHS.
+struct SeqRule<'a> {
+  match_pat: &'a Expr,
+  sub: &'a [Expr],
+  replacement: Option<&'a Expr>,
+}
+
+/// A bare list pattern used as a subsequence matcher, with no replacement.
+/// Returns `None` unless the pattern is a list (possibly wrapped in
+/// `Pattern[name, …]` / `Condition[…, test]`).
+fn parse_seq_pattern(match_pat: &Expr) -> Option<SeqRule<'_>> {
+  // Unwrap `Pattern[name, inner]` and `Condition[inner, test]` to reach the
+  // underlying list pattern for length calculations.
+  let mut list_pat = match_pat;
+  loop {
+    match list_pat {
+      Expr::FunctionCall { name, args }
+        if name == "Pattern" && args.len() == 2 =>
+      {
+        list_pat = &args[1];
+      }
+      Expr::FunctionCall { name, args }
+        if name == "Condition" && args.len() == 2 =>
+      {
+        list_pat = &args[0];
+      }
+      _ => break,
+    }
+  }
+
+  let sub = match list_pat {
+    Expr::List(items) => items.as_ref(),
+    _ => return None,
+  };
+
+  Some(SeqRule {
+    match_pat,
+    sub,
+    replacement: None,
+  })
+}
+
+/// Extract the list-pattern elements and replacement from a `lhs -> rhs` or
+/// `lhs :> rhs` rule. Returns `None` if `arg` is not a rule whose LHS is a list
+/// pattern (or a Pattern/Condition-wrapped list pattern).
+fn parse_seq_rule(arg: &Expr) -> Option<SeqRule<'_>> {
+  let (match_pat, replacement) = match arg {
+    Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => (pattern.as_ref(), Some(replacement.as_ref())),
+    Expr::FunctionCall { name, args }
+      if (name == "Rule" || name == "RuleDelayed") && args.len() == 2 =>
+    {
+      (&args[0], Some(&args[1]))
+    }
+    _ => return None,
+  };
+
+  let mut rule = parse_seq_pattern(match_pat)?;
+  rule.replacement = replacement;
+  Some(rule)
+}
+
+/// Parse `ExcludedForms -> {pat1, pat2, ...}` into the list of patterns.
+/// Returns `None` if the argument is not an `ExcludedForms` rule.
+fn parse_excluded_forms(arg: &Expr) -> Option<Vec<Expr>> {
+  let (lhs, rhs) = match arg {
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => (pattern.as_ref(), replacement.as_ref()),
+    Expr::FunctionCall { name, args } if name == "Rule" && args.len() == 2 => {
+      (&args[0], &args[1])
+    }
+    _ => return None,
+  };
+  match lhs {
+    Expr::Identifier(s) if s == "ExcludedForms" => {}
+    _ => return None,
+  }
+  match rhs {
+    Expr::List(items) => Some(items.to_vec()),
+    other => Some(vec![other.clone()]),
+  }
+}
+
+/// Splice the children of `expr` at the given position vectors. Positions are
+/// 1-based, may be negative (counted from the end), and apply at the level of
+/// the position's last index. Used by FlattenAt.
+/// Children of a node for FlattenAt traversal and splicing. Returns None
+/// for expressions without parts (atoms and associations, which are not
+/// integer-indexable here).
+fn flatten_at_children(expr: &Expr) -> Option<Vec<Expr>> {
+  use crate::functions::expr_form::{ExprForm, decompose_expr};
+  match expr {
+    Expr::List(items) => Some(items.to_vec()),
+    Expr::FunctionCall { args, .. } => Some(args.to_vec()),
+    Expr::CurriedCall { args, .. } => Some(args.clone()),
+    Expr::Association(_) => None,
+    other => match decompose_expr(other) {
+      ExprForm::Composite { children, .. } => Some(children),
+      ExprForm::Atom(_) => None,
+    },
+  }
+}
+
+fn flatten_at_rebuild(expr: &Expr, children: Vec<Expr>) -> Expr {
+  use crate::functions::expr_form::{ExprForm, decompose_expr};
+  match expr {
+    Expr::List(_) => Expr::List(children.into()),
+    Expr::FunctionCall { name, .. } => Expr::FunctionCall {
+      name: name.clone(),
+      args: children.into(),
+    },
+    Expr::CurriedCall { func, .. } => Expr::CurriedCall {
+      func: func.clone(),
+      args: children,
+    },
+    other => match decompose_expr(other) {
+      ExprForm::Composite { head, .. } => Expr::FunctionCall {
+        name: head,
+        args: children.into(),
+      },
+      ExprForm::Atom(_) => other.clone(),
+    },
+  }
+}
+
+/// Apply validated flatten positions (paths into the original `expr`).
+fn flatten_at_apply(expr: &Expr, positions: &[Vec<i128>]) -> Expr {
+  let Some(children) = flatten_at_children(expr) else {
+    return expr.clone();
+  };
+  let len = children.len() as i128;
+  let mut groups: std::collections::HashMap<usize, Vec<Vec<i128>>> =
+    std::collections::HashMap::default();
+  let mut flatten_here: std::collections::HashSet<usize> =
+    std::collections::HashSet::default();
+  for pos in positions {
+    if pos.is_empty() {
+      continue;
+    }
+    let first = pos[0];
+    let idx = if first < 0 { len + first + 1 } else { first };
+    if idx < 1 || idx > len {
+      continue;
+    }
+    let i = idx as usize;
+    if pos.len() == 1 {
+      flatten_here.insert(i);
+    } else {
+      groups.entry(i).or_default().push(pos[1..].to_vec());
+    }
+  }
+  let mut result: Vec<Expr> = Vec::new();
+  for (i, child) in children.iter().enumerate() {
+    let idx = i + 1;
+    let new_child = if let Some(deeper) = groups.get(&idx) {
+      flatten_at_apply(child, deeper)
+    } else {
+      child.clone()
+    };
+    if flatten_here.contains(&idx) {
+      match flatten_at_children(&new_child) {
+        Some(parts) => result.extend(parts),
+        None => result.push(new_child),
+      }
+    } else {
+      result.push(new_child);
+    }
+  }
+  flatten_at_rebuild(expr, result)
+}
+
+/// Unified FlattenAt: validates every position against the original
+/// expression — ::psl for non-position specs, ::partw for missing parts,
+/// ::flatp for parts without parts — aborting on the first failure, then
+/// splices the parts at the surviving (deduplicated) positions.
+fn flatten_at_unified(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let original = || unevaluated("FlattenAt", args);
+  let show =
+    |e: &Expr| crate::syntax::format_expr(e, crate::syntax::ExprForm::Output);
+  let subject = &args[0];
+  let spec = &args[1];
+
+  let strict_int = |e: &Expr| -> Option<i128> {
+    match e {
+      Expr::Integer(n) => Some(*n),
+      Expr::BigInteger(n) => {
+        use num_traits::ToPrimitive;
+        n.to_i128()
+      }
+      _ => None,
+    }
+  };
+  let psl = || {
+    crate::emit_message(&format!(
+      "FlattenAt::psl: Position specification {} in {} is not a machine-sized integer or a list of machine-sized integers.",
+      show(spec),
+      show(subject)
+    ));
+    Ok(original())
+  };
+
+  let positions: Vec<Vec<i128>> = match spec {
+    Expr::List(items) if items.is_empty() => return Ok(subject.clone()),
+    Expr::List(items) if items.iter().all(|e| matches!(e, Expr::List(_))) => {
+      let mut multi = Vec::new();
+      for item in items {
+        let Expr::List(comps) = item else {
+          unreachable!()
+        };
+        match comps.iter().map(strict_int).collect::<Option<Vec<i128>>>() {
+          Some(path) if !path.is_empty() => multi.push(path),
+          _ => return psl(),
+        }
+      }
+      multi
+    }
+    Expr::List(items) => {
+      match items.iter().map(strict_int).collect::<Option<Vec<i128>>>() {
+        Some(path) => vec![path],
+        None => return psl(),
+      }
+    }
+    other => match strict_int(other) {
+      Some(n) => vec![vec![n]],
+      None => return psl(),
+    },
+  };
+
+  // Validate every path against the original subject; the first failure
+  // emits its message and leaves the whole call unevaluated.
+  for path in &positions {
+    let path_expr = Expr::List(
+      path
+        .iter()
+        .map(|n| Expr::Integer(*n))
+        .collect::<Vec<_>>()
+        .into(),
+    );
+    let mut current = subject.clone();
+    let mut failed: Option<&str> = None;
+    for (ci, comp) in path.iter().enumerate() {
+      let is_last = ci == path.len() - 1;
+      if *comp == 0 {
+        // Position 0 is the head: it never has parts to flatten.
+        current = match &current {
+          Expr::CurriedCall { func, .. } => (**func).clone(),
+          other => Expr::Identifier(
+            crate::evaluator::pattern_matching::get_expr_head(other),
+          ),
+        };
+        if is_last {
+          failed = Some("flatp");
+          break;
+        }
+        continue;
+      }
+      let Some(children) = flatten_at_children(&current) else {
+        failed = Some("partw");
+        break;
+      };
+      let len = children.len() as i128;
+      let idx = if *comp < 0 { len + comp } else { comp - 1 };
+      if idx < 0 || idx >= len {
+        failed = Some("partw");
+        break;
+      }
+      current = children[idx as usize].clone();
+      if is_last && flatten_at_children(&current).is_none() {
+        failed = Some("flatp");
+        break;
+      }
+    }
+    match failed {
+      Some("partw") => {
+        crate::emit_message(&format!(
+          "FlattenAt::partw: Part {} of {} does not exist.",
+          show(&path_expr),
+          show(subject)
+        ));
+        return Ok(original());
+      }
+      Some("flatp") => {
+        crate::emit_message(&format!(
+          "FlattenAt::flatp: Expression {} at position {} of {} has no parts and cannot be flattened.",
+          show(&current),
+          show(&path_expr),
+          show(subject)
+        ));
+        return Ok(original());
+      }
+      _ => {}
+    }
+  }
+
+  // Deduplicate repeated paths, then splice.
+  let mut seen: std::collections::HashSet<Vec<i128>> =
+    std::collections::HashSet::default();
+  let deduped: Vec<Vec<i128>> = positions
+    .into_iter()
+    .filter(|p| seen.insert(p.clone()))
+    .collect();
+  Ok(flatten_at_apply(subject, &deduped))
+}
+
+// ArrayFilter[f, array, r]: apply `f` to every radius-`r` block of a 1D list
+// or 2D array. Boundaries are handled by replicating the edge elements, so
+// every block has exactly 2r+1 elements per dimension, and the whole block
+// (a List or List of Lists) is passed to `f`. Returns None for inputs not in
+// the supported integer-radius 1D/2D shape (left unevaluated by the caller).
+fn array_filter(
+  f: &Expr,
+  array: &Expr,
+  r: usize,
+) -> Option<Result<Expr, InterpreterError>> {
+  let Expr::List(elems) = array else {
+    return None;
+  };
+  if elems.is_empty() {
+    return None;
+  }
+  let clamp =
+    |k: i64, len: usize| -> usize { k.clamp(0, len as i64 - 1) as usize };
+  // 2D when every row is a List of the same non-zero length.
+  let row_len = |e: &Expr| match e {
+    Expr::List(items) => Some(items.len()),
+    _ => None,
+  };
+  let is_2d = row_len(&elems[0])
+    .is_some_and(|w| w > 0 && elems.iter().all(|row| row_len(row) == Some(w)));
+  let r = r as i64;
+  if is_2d {
+    let h = elems.len();
+    let w = row_len(&elems[0]).unwrap();
+    let get = |y: usize, x: usize| match &elems[y] {
+      Expr::List(row) => row[x].clone(),
+      _ => unreachable!(),
+    };
+    let mut rows = Vec::with_capacity(h);
+    for y in 0..h {
+      let mut new_row = Vec::with_capacity(w);
+      for x in 0..w {
+        let mut block = Vec::with_capacity((2 * r + 1) as usize);
+        for dy in -r..=r {
+          let yy = clamp(y as i64 + dy, h);
+          let mut brow = Vec::with_capacity((2 * r + 1) as usize);
+          for dx in -r..=r {
+            brow.push(get(yy, clamp(x as i64 + dx, w)));
+          }
+          block.push(Expr::List(brow.into()));
+        }
+        match list_helpers_ast::apply_func_ast(f, &Expr::List(block.into())) {
+          Ok(v) => new_row.push(v),
+          Err(e) => return Some(Err(e)),
+        }
+      }
+      rows.push(Expr::List(new_row.into()));
+    }
+    return Some(Ok(Expr::List(rows.into())));
+  }
+  // 1D path.
+  let n = elems.len();
+  let mut result = Vec::with_capacity(n);
+  for i in 0..n {
+    let mut block = Vec::with_capacity((2 * r + 1) as usize);
+    for d in -r..=r {
+      block.push(elems[clamp(i as i64 + d, n)].clone());
+    }
+    match list_helpers_ast::apply_func_ast(f, &Expr::List(block.into())) {
+      Ok(v) => result.push(v),
+      Err(e) => return Some(Err(e)),
+    }
+  }
+  Some(Ok(Expr::List(result.into())))
+}
+
+// MaxDetect/MinDetect (1-arg): binary mask of regional extrema. A maximal run
+// of equal values is a regional maximum (resp. minimum) when both
+// out-of-run neighbours are strictly smaller (resp. larger); a run at the
+// boundary treats the missing neighbour as satisfying the condition.
+fn regional_extrema(values: &[f64], find_max: bool) -> Vec<Expr> {
+  let n = values.len();
+  let mut result = vec![Expr::Integer(0); n];
+  let mut i = 0;
+  while i < n {
+    let mut j = i;
+    while j + 1 < n && values[j + 1] == values[i] {
+      j += 1;
+    }
+    let v = values[i];
+    let beats = |x: f64| if find_max { x < v } else { x > v };
+    let left_ok = i == 0 || beats(values[i - 1]);
+    let right_ok = j + 1 == n || beats(values[j + 1]);
+    if left_ok && right_ok {
+      for slot in result.iter_mut().take(j + 1).skip(i) {
+        *slot = Expr::Integer(1);
+      }
+    }
+    i = j + 1;
+  }
+  result
+}
+
+/// Parse `items` as a rectangular numeric matrix (each element a non-empty
+/// list of equal length of real numbers); None if the shape is irregular or a
+/// value is non-numeric.
+fn parse_numeric_matrix(items: &[Expr]) -> Option<Vec<Vec<f64>>> {
+  let mut mat: Vec<Vec<f64>> = Vec::with_capacity(items.len());
+  let mut ncols: Option<usize> = None;
+  for it in items {
+    let Expr::List(cells) = it else {
+      return None;
+    };
+    if cells.is_empty() {
+      return None;
+    }
+    let row: Vec<f64> = cells
+      .iter()
+      .map(expr_to_f64)
+      .collect::<Option<Vec<f64>>>()?;
+    match ncols {
+      Some(nc) if nc != row.len() => return None,
+      _ => ncols = Some(row.len()),
+    }
+    mat.push(row);
+  }
+  Some(mat)
+}
+
+/// 2-D regional extrema (MaxDetect / MinDetect on a matrix): a 0/1 mask marking
+/// each 8-connected flat zone whose every external neighbour is strictly lower
+/// (maxima) or strictly higher (minima) than the zone's value.
+fn regional_extrema_2d(mat: &[Vec<f64>], find_max: bool) -> Expr {
+  let h = mat.len();
+  let w = mat[0].len();
+  const OFF: [(i64, i64); 8] = [
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+  ];
+  let mut zone = vec![vec![-1i64; w]; h];
+  let mut mask = vec![vec![0i64; w]; h];
+  let mut next_zone = 0i64;
+  for y0 in 0..h {
+    for x0 in 0..w {
+      if zone[y0][x0] != -1 {
+        continue;
+      }
+      let v = mat[y0][x0];
+      let id = next_zone;
+      next_zone += 1;
+      // Flood-fill the equal-valued 8-connected flat zone.
+      let mut cells = vec![(y0, x0)];
+      zone[y0][x0] = id;
+      let mut qi = 0;
+      while qi < cells.len() {
+        let (cy, cx) = cells[qi];
+        qi += 1;
+        for (dy, dx) in OFF {
+          let ny = cy as i64 + dy;
+          let nx = cx as i64 + dx;
+          if ny < 0 || nx < 0 || ny >= h as i64 || nx >= w as i64 {
+            continue;
+          }
+          let (ny, nx) = (ny as usize, nx as usize);
+          if zone[ny][nx] == -1 && mat[ny][nx] == v {
+            zone[ny][nx] = id;
+            cells.push((ny, nx));
+          }
+        }
+      }
+      // A flat zone is an extremum unless an external neighbour beats it.
+      let mut is_extremum = true;
+      'scan: for &(cy, cx) in &cells {
+        for (dy, dx) in OFF {
+          let ny = cy as i64 + dy;
+          let nx = cx as i64 + dx;
+          if ny < 0 || nx < 0 || ny >= h as i64 || nx >= w as i64 {
+            continue;
+          }
+          let (ny, nx) = (ny as usize, nx as usize);
+          if zone[ny][nx] != id {
+            let nv = mat[ny][nx];
+            if (find_max && nv > v) || (!find_max && nv < v) {
+              is_extremum = false;
+              break 'scan;
+            }
+          }
+        }
+      }
+      if is_extremum {
+        for &(cy, cx) in &cells {
+          mask[cy][cx] = 1;
+        }
+      }
+    }
+  }
+  Expr::List(
+    mask
+      .into_iter()
+      .map(|row| {
+        Expr::List(
+          row
+            .into_iter()
+            .map(|v| Expr::Integer(v as i128))
+            .collect::<Vec<_>>()
+            .into(),
+        )
+      })
+      .collect::<Vec<_>>()
+      .into(),
+  )
+}
+
+// LongestOrderedSequence[list] / [list, p]: longest subsequence whose
+// consecutive elements are "in order" per the comparator `p` (default
+// non-decreasing). Uses an O(n^2) DP; ties resolve to the largest predecessor
+// index and the largest end index, matching wolframscript. A string argument
+// is processed character-wise and the result is rebuilt as a string.
+fn longest_ordered_sequence(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let symbolic = || unevaluated("LongestOrderedSequence", args);
+  // A string is accepted only in the one-argument form; the two-argument form
+  // requires a List. Anything else emits ::list and stays unevaluated.
+  let (elements, is_string): (Vec<Expr>, bool) = match &args[0] {
+    Expr::List(items) => (items.to_vec(), false),
+    Expr::String(s) if args.len() == 1 => (
+      s.chars().map(|c| Expr::String(c.to_string())).collect(),
+      true,
+    ),
+    _ => {
+      crate::emit_message(&format!(
+        "LongestOrderedSequence::list: List expected at position 1 in {}.",
+        expr_to_string(&symbolic())
+      ));
+      return Ok(symbolic());
+    }
+  };
+  let build = |idxs: &[usize]| -> Expr {
+    if is_string {
+      let s: String = idxs
+        .iter()
+        .map(|&i| match &elements[i] {
+          Expr::String(c) => c.as_str(),
+          _ => "",
+        })
+        .collect();
+      Expr::String(s)
+    } else {
+      Expr::List(idxs.iter().map(|&i| elements[i].clone()).collect())
+    }
+  };
+  let n = elements.len();
+  if n == 0 {
+    return Ok(build(&[]));
+  }
+  // True when (x, y) are in order per the comparator.
+  let in_order = |x: &Expr, y: &Expr| -> Result<bool, InterpreterError> {
+    let r = if args.len() == 2 {
+      list_helpers_ast::apply_func_to_two_args(&args[1], x, y)?
+    } else {
+      crate::evaluator::evaluate_function_call_ast(
+        "OrderedQ",
+        &[Expr::List(vec![x.clone(), y.clone()].into())],
+      )?
+    };
+    Ok(matches!(r, Expr::Identifier(ref s) if s == "True"))
+  };
+  let mut len = vec![1usize; n];
+  let mut pred = vec![usize::MAX; n];
+  for i in 0..n {
+    for j in 0..i {
+      if in_order(&elements[j], &elements[i])? && len[j] + 1 >= len[i] {
+        len[i] = len[j] + 1;
+        pred[i] = j;
+      }
+    }
+  }
+  // End at the largest index achieving the maximum length.
+  let mut best = 0;
+  for i in 1..n {
+    if len[i] >= len[best] {
+      best = i;
+    }
+  }
+  let mut idxs = Vec::new();
+  let mut cur = best;
+  while cur != usize::MAX {
+    idxs.push(cur);
+    cur = pred[cur];
+  }
+  idxs.reverse();
+  Ok(build(&idxs))
+}
+
+// View a canonical tree node `Tree[data, children]` as (data, child subtrees).
+// A leaf is `Tree[data, None]` (no children). Returns None if `e` is not a Tree.
+/// The leaf subtrees of a tree, left to right. A tree with no children is
+/// its own only leaf.
+fn tree_leaves(e: &Expr) -> Option<Vec<Expr>> {
+  let (_, children) = tree_node(e)?;
+  if children.is_empty() {
+    return Some(vec![e.clone()]);
+  }
+  let mut out = Vec::new();
+  for c in &children {
+    out.extend(tree_leaves(c)?);
+  }
+  Some(out)
+}
+
+/// The subtrees whose data matches `pattern`, bottom-up (children before
+/// their parent), optionally restricted to a level. Returns the matches and
+/// the height of `e`, mirroring `tree_count`.
+fn tree_cases(
+  e: &Expr,
+  pattern: &Expr,
+  depth: i128,
+  bounds: Option<(i128, Option<i128>)>,
+) -> Option<(Vec<Expr>, i128)> {
+  let (data, children) = tree_node(e)?;
+  let mut out = Vec::new();
+  let mut height = 0;
+  for c in &children {
+    let (sub, h) = tree_cases(c, pattern, depth + 1, bounds)?;
+    out.extend(sub);
+    height = height.max(h + 1);
+  }
+  let in_level =
+    bounds.is_none_or(|(lo, hi)| tree_level_in_spec(depth, height + 1, lo, hi));
+  if in_level && list_helpers_ast::matches_pattern_ast(data, pattern) {
+    out.push(e.clone());
+  }
+  Some((out, height))
+}
+
+/// Apply `func` to the data of every node bottom-up, for effect only.
+fn tree_scan(func: &Expr, e: &Expr) -> Result<Option<()>, InterpreterError> {
+  let Some((data, children)) = tree_node(e) else {
+    return Ok(None);
+  };
+  for c in &children {
+    if tree_scan(func, c)?.is_none() {
+      return Ok(None);
+    }
+  }
+  crate::evaluator::apply_function_to_arg(func, data)?;
+  Ok(Some(()))
+}
+
+fn tree_node(e: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
+  if let Expr::FunctionCall { name, args } = e
+    && name == "Tree"
+    && args.len() == 2
+  {
+    let children = match &args[1] {
+      Expr::List(cs) => cs.iter().collect(),
+      _ => Vec::new(), // None or any other spec → leaf
+    };
+    return Some((&args[0], children));
+  }
+  None
+}
+
+/// Decompose an expression into (head, args) for `ExpressionTree`. Returns
+/// None for atoms (which become leaves). `Rational`/`Complex` are atoms even
+/// though they have a FunctionCall head.
+fn expr_tree_decompose(e: &Expr) -> Option<(Expr, Vec<Expr>)> {
+  match e {
+    Expr::FunctionCall { name, .. }
+      if name == "Rational" || name == "Complex" =>
+    {
+      None
+    }
+    Expr::FunctionCall { name, args } => {
+      Some((Expr::Identifier(name.clone()), args.to_vec()))
+    }
+    Expr::List(items) => Some((id_expr("List"), items.to_vec())),
+    Expr::CurriedCall { func, args } => Some(((**func).clone(), args.clone())),
+    Expr::BinaryOp { .. }
+    | Expr::UnaryOp { .. }
+    | Expr::Rule { .. }
+    | Expr::RuleDelayed { .. } => {
+      let (h, a) = crate::functions::expr_to_head_args(e)?;
+      Some((Expr::Identifier(h), a))
+    }
+    _ => None,
+  }
+}
+
+/// Build the canonical `Tree[...]` form of `expr` for `ExpressionTree`.
+/// `structure` is one of "Heads" (default), "Subexpressions", "Atoms",
+/// "HeadTrees" (see ExpressionTree docs).
+fn build_expression_tree(e: &Expr, structure: &str) -> Expr {
+  match expr_tree_decompose(e) {
+    None => call("Tree", vec![e.clone(), id_expr("None")]),
+    Some((head, args)) => {
+      let children: Vec<Expr> = args
+        .iter()
+        .map(|a| build_expression_tree(a, structure))
+        .collect();
+      let data = match structure {
+        "Subexpressions" => e.clone(),
+        "Atoms" => null_expr(),
+        // A compound head becomes its own tree; an atomic head stays as-is.
+        "HeadTrees" if expr_tree_decompose(&head).is_some() => {
+          build_expression_tree(&head, "HeadTrees")
+        }
+        _ => head, // "Heads", "HeadTrees" with atomic head
+      };
+      call("Tree", vec![data, Expr::List(children.into())])
+    }
+  }
+}
+
+/// Inverse of `ExpressionTree`: reconstruct the expression a `Tree` represents.
+/// A leaf `Tree[data, None]` gives `data`; an internal node `Tree[head,
+/// {children}]` gives `head[TreeExpression[child], …]`, evaluated. A `head`
+/// that is itself a tree (the "HeadTrees" structure) is reconstructed too.
+fn tree_to_expression(e: &Expr) -> Option<Expr> {
+  let (data, children) = tree_node(e)?;
+  if children.is_empty() {
+    return Some(data.clone());
+  }
+  let child_exprs: Vec<Expr> = children
+    .iter()
+    .map(|c| tree_to_expression(c))
+    .collect::<Option<_>>()?;
+  let head = if tree_node(data).is_some() {
+    tree_to_expression(data)?
+  } else {
+    data.clone()
+  };
+  let call = match &head {
+    Expr::Identifier(name) => Expr::FunctionCall {
+      name: name.clone(),
+      args: child_exprs.into(),
+    },
+    _ => Expr::CurriedCall {
+      func: Box::new(head),
+      args: child_exprs,
+    },
+  };
+  crate::evaluator::evaluate_expr_to_expr(&call).ok()
+}
+
+/// `TreeRules[tree]`: a leaf `Tree[x, None]` becomes `x`, and an inner node
+/// `Tree[x, {children}]` becomes `x -> {tree_rules(child), …}`. So
+/// `Tree[1, {Tree[2, None], Tree[3, {Tree[4, None]}]}]` → `1 -> {2, 3 -> {4}}`.
+fn tree_rules(e: &Expr) -> Option<Expr> {
+  let (data, children) = tree_node(e)?;
+  if children.is_empty() {
+    return Some(data.clone());
+  }
+  let child_rules: Vec<Expr> = children
+    .iter()
+    .map(|c| tree_rules(c))
+    .collect::<Option<_>>()?;
+  Some(Expr::Rule {
+    pattern: Box::new(data.clone()),
+    replacement: Box::new(Expr::List(child_rules.into())),
+  })
+}
+
+// Number of edges on the longest path from the root to a leaf (leaf → 0).
+fn tree_depth(e: &Expr) -> Option<i128> {
+  let (_data, children) = tree_node(e)?;
+  if children.is_empty() {
+    return Some(0);
+  }
+  let mut max = 0;
+  for c in children {
+    max = max.max(tree_depth(c)?);
+  }
+  Some(1 + max)
+}
+
+// Number of leaf nodes (a leaf counts as 1).
+fn tree_leaf_count(e: &Expr) -> Option<i128> {
+  let (_data, children) = tree_node(e)?;
+  if children.is_empty() {
+    return Some(1);
+  }
+  let mut total = 0;
+  for c in children {
+    total += tree_leaf_count(c)?;
+  }
+  Some(total)
+}
+
+// Total number of nodes in the tree (root + all descendants).
+fn tree_size(e: &Expr) -> Option<i128> {
+  let (_data, children) = tree_node(e)?;
+  let mut total = 1;
+  for c in children {
+    total += tree_size(c)?;
+  }
+  Some(total)
+}
+
+// RootTree truncation: keep `e` down to level `n` (None = Infinity, no
+// truncation). A node at or below the cutoff loses its children — an internal
+// node becomes `Tree[data, {}]`, a leaf `Tree[data, None]` keeps its None.
+fn root_tree(e: &Expr, depth: i128, n: Option<i128>) -> Expr {
+  let Expr::FunctionCall { name, args } = e else {
+    return e.clone();
+  };
+  if name != "Tree" || args.len() != 2 {
+    return e.clone();
+  }
+  let truncate = n.is_some_and(|n| depth >= n);
+  let new_children = match &args[1] {
+    Expr::List(_) if truncate => Expr::List(vec![].into()),
+    Expr::List(cs) => Expr::List(
+      cs.iter()
+        .map(|c| root_tree(c, depth + 1, n))
+        .collect::<Vec<_>>()
+        .into(),
+    ),
+    other => other.clone(), // None leaf stays a leaf
+  };
+  call("Tree", vec![args[0].clone(), new_children])
+}
+
+// Parse a TreeLevel/Level spec into (lo, hi) bounds, where `hi == None` means
+// Infinity. A bare integer n means {1, n}; {n} means {n, n}; {n1, n2} is a
+// range; Infinity means {1, Infinity}. Negative bounds count from the bottom.
+fn parse_tree_level_spec(e: &Expr) -> Option<(i128, Option<i128>)> {
+  let as_bound = |x: &Expr| -> Option<Option<i128>> {
+    match x {
+      Expr::Integer(n) => Some(Some(*n)),
+      _ if is_infinity_symbol(x) => Some(None),
+      _ => None,
+    }
+  };
+  match e {
+    Expr::Integer(n) => Some((1, Some(*n))),
+    _ if is_infinity_symbol(e) => Some((1, None)),
+    Expr::List(items) if items.len() == 1 => {
+      if let Expr::Integer(n) = &items[0] {
+        Some((*n, Some(*n)))
+      } else {
+        None
+      }
+    }
+    Expr::List(items) if items.len() == 2 => {
+      let lo = match &items[0] {
+        Expr::Integer(n) => *n,
+        _ => return None,
+      };
+      let hi = as_bound(&items[1])?;
+      Some((lo, hi))
+    }
+    _ => None,
+  }
+}
+
+// Does a node at top-depth `l` with subtree depth `dpt` (= height + 1) fall
+// within the level bounds (`lo`, `hi`)? Non-negative bounds measure from the
+// root via `l`; negative bounds measure from the leaves via `dpt`.
+fn tree_level_in_spec(l: i128, dpt: i128, lo: i128, hi: Option<i128>) -> bool {
+  let lower_ok = if lo >= 0 { l >= lo } else { dpt <= -lo };
+  let upper_ok = match hi {
+    None => true,
+    Some(h) if h >= 0 => l <= h,
+    Some(h) => dpt >= -h,
+  };
+  lower_ok && upper_ok
+}
+
+// Collect the subtrees whose level falls within (`lo`, `hi`), in post-order
+// (descendants before their parent, left to right). Returns the node's height
+// (0 for a leaf), or None if `e` is not a tree.
+fn tree_level(
+  e: &Expr,
+  depth: i128,
+  lo: i128,
+  hi: Option<i128>,
+  out: &mut Vec<Expr>,
+) -> Option<i128> {
+  let (_data, children) = tree_node(e)?;
+  let mut height = 0;
+  for child in &children {
+    let ch = tree_level(child, depth + 1, lo, hi, out)?;
+    height = height.max(ch + 1);
+  }
+  if tree_level_in_spec(depth, height + 1, lo, hi) {
+    out.push(e.clone());
+  }
+  Some(height)
+}
+
+// Collect positions of nodes whose data matches `pattern`, in post-order
+// (descendants before their parent, left to right). The root's position is the
+// empty path. `path` accumulates the current 1-based child indices; each
+// emitted position is an Expr::List of integers. When `bounds` is `Some`, only
+// nodes within that level spec are collected. Returns the node's height
+// (0 for a leaf), or None if `e` is not a tree (so the caller can emit ::tree).
+fn tree_position(
+  e: &Expr,
+  pattern: &Expr,
+  depth: i128,
+  bounds: Option<(i128, Option<i128>)>,
+  path: &mut Vec<Expr>,
+  out: &mut Vec<Expr>,
+) -> Option<i128> {
+  let (data, children) = tree_node(e)?;
+  let mut height = 0;
+  for (i, child) in children.iter().enumerate() {
+    path.push(Expr::Integer((i + 1) as i128));
+    let h = tree_position(child, pattern, depth + 1, bounds, path, out)?;
+    height = height.max(h + 1);
+    path.pop();
+  }
+  let in_level =
+    bounds.is_none_or(|(lo, hi)| tree_level_in_spec(depth, height + 1, lo, hi));
+  if in_level && list_helpers_ast::matches_pattern_ast(data, pattern) {
+    out.push(Expr::List(path.clone().into()));
+  }
+  Some(height)
+}
+
+// Replace the subtree at `path` (1-based child indices) with `value`,
+// returning the rebuilt tree. Returns None if `path` runs out of range or
+// descends into a leaf (so the caller leaves the tree unchanged).
+fn tree_set_at(tree: &Expr, path: &[i128], value: &Expr) -> Option<Expr> {
+  if path.is_empty() {
+    return Some(value.clone());
+  }
+  let Expr::FunctionCall { name, args } = tree else {
+    return None;
+  };
+  if name != "Tree" || args.len() != 2 {
+    return None;
+  }
+  let Expr::List(children) = &args[1] else {
+    return None; // leaf: cannot descend
+  };
+  let idx = path[0];
+  if idx < 1 || idx as usize > children.len() {
+    return None;
+  }
+  let i = (idx - 1) as usize;
+  let replaced = tree_set_at(&children[i], &path[1..], value)?;
+  let mut new_children: Vec<Expr> = children.to_vec();
+  new_children[i] = replaced;
+  Some(call(
+    "Tree",
+    vec![args[0].clone(), Expr::List(new_children.into())],
+  ))
+}
+
+// Canonicalize a TreeReplacePart replacement value: a Tree stays as-is (it has
+// already been canonicalized by evaluation), any other value becomes a leaf.
+fn tree_replacement_value(v: &Expr) -> Expr {
+  if matches!(v, Expr::FunctionCall { name, args }
+    if name == "Tree" && args.len() == 2)
+  {
+    v.clone()
+  } else {
+    call("Tree", vec![v.clone(), id_expr("None")])
+  }
+}
+
+// Interpret a TreeInsert/TreeDelete position spec, which may be a bare integer
+// `n` (shorthand for `{n}`) or a list of integers, as a 1-based path.
+fn tree_pos_to_path(e: &Expr) -> Option<Vec<i128>> {
+  match e {
+    Expr::Integer(n) => Some(vec![*n]),
+    Expr::List(_) => tree_position_path(e),
+    _ => None,
+  }
+}
+
+// Resolve a (possibly negative) 1-based index against a list of length `len`.
+// `extra` is the count of slots beyond the end that the index may address:
+// insertion allows index `len + 1` (append), deletion only `len`. Negative
+// indices count from the end (-1 = the last existing slot). Returns the
+// 0-based slot, or None if out of range.
+fn resolve_tree_index(idx: i128, len: i128, extra: i128) -> Option<usize> {
+  let pos = if idx < 0 { len + idx + 1 + extra } else { idx };
+  if pos < 1 || pos > len + extra {
+    None
+  } else {
+    Some((pos - 1) as usize)
+  }
+}
+
+// TreeInsert[tree, child, pos]: insert `child` (wrapped as a leaf when it is not
+// already a Tree) among the children reached by `path`; the last index gives the
+// 1-based sibling position (supporting append at `len + 1` and negative indices
+// counting from the end). Returns None when the path runs out of range or
+// descends into a leaf, so the caller leaves the expression unevaluated.
+fn tree_insert_at(tree: &Expr, path: &[i128], value: &Expr) -> Option<Expr> {
+  let Expr::FunctionCall { name, args } = tree else {
+    return None;
+  };
+  if name != "Tree" || args.len() != 2 {
+    return None;
+  }
+  let Expr::List(children) = &args[1] else {
+    return None; // leaf: cannot insert
+  };
+  let len = children.len() as i128;
+  let mut new_children: Vec<Expr> = children.to_vec();
+  if path.len() == 1 {
+    let slot = resolve_tree_index(path[0], len, 1)?;
+    new_children.insert(slot, tree_replacement_value(value));
+  } else {
+    let i = resolve_tree_index(path[0], len, 0)?;
+    new_children[i] = tree_insert_at(&children[i], &path[1..], value)?;
+  }
+  Some(call(
+    "Tree",
+    vec![args[0].clone(), Expr::List(new_children.into())],
+  ))
+}
+
+// TreeDelete[tree, pos]: remove the child reached by `path` (the last index
+// selects the sibling, the rest navigate into the children). The parent keeps a
+// possibly-empty children list, so deleting a node's only child yields
+// `Tree[data, {}]` rather than a leaf. Returns None on out-of-range or leaf
+// descent.
+fn tree_delete_at(tree: &Expr, path: &[i128]) -> Option<Expr> {
+  let Expr::FunctionCall { name, args } = tree else {
+    return None;
+  };
+  if name != "Tree" || args.len() != 2 {
+    return None;
+  }
+  let Expr::List(children) = &args[1] else {
+    return None; // leaf: cannot delete
+  };
+  let len = children.len() as i128;
+  let i = resolve_tree_index(path[0], len, 0)?;
+  let mut new_children: Vec<Expr> = children.to_vec();
+  if path.len() == 1 {
+    new_children.remove(i);
+  } else {
+    new_children[i] = tree_delete_at(&children[i], &path[1..])?;
+  }
+  Some(call(
+    "Tree",
+    vec![args[0].clone(), Expr::List(new_children.into())],
+  ))
+}
+
+// Destructure a rule `lhs -> rhs` (or :>) into its two parts. Also matches
+// `Rule`/`RuleDelayed` written as a plain `FunctionCall` — the shape
+// `Uncompress` reconstructs a stored rule as, rather than the dedicated
+// `Expr::Rule`/`Expr::RuleDelayed` variant the parser produces for literal
+// `->`/`:>` syntax.
+pub(crate) fn as_rule(e: &Expr) -> Option<(&Expr, &Expr)> {
+  match e {
+    Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => Some((pattern, replacement)),
+    Expr::FunctionCall { name, args }
+      if (name == "Rule" || name == "RuleDelayed") && args.len() == 2 =>
+    {
+      Some((&args[0], &args[1]))
+    }
+    _ => None,
+  }
+}
+
+// Navigate from `tree` along `path` (1-based child indices) to a subtree.
+// Returns None if any index is out of range or steps into a leaf.
+fn tree_navigate(tree: &Expr, path: &[i128]) -> Option<Expr> {
+  if path.is_empty() {
+    return Some(tree.clone());
+  }
+  let (_data, children) = tree_node(tree)?;
+  let idx = path[0];
+  if idx < 1 || idx as usize > children.len() {
+    return None;
+  }
+  let child = children[(idx - 1) as usize];
+  tree_navigate(child, &path[1..])
+}
+
+// Interpret an Expr::List of integers as a position path. Returns None if any
+// element is not an integer.
+fn tree_position_path(e: &Expr) -> Option<Vec<i128>> {
+  if let Expr::List(items) = e {
+    items
+      .iter()
+      .map(|x| match x {
+        Expr::Integer(n) => Some(*n),
+        _ => None,
+      })
+      .collect()
+  } else {
+    None
+  }
+}
+
+// TreeMap[f, tree]: apply `func` to the data of every node, preserving the
+// tree structure (the `None` leaf-marker is kept as-is). Returns Ok(None) if
+// `e` is not a tree.
+fn tree_map(func: &Expr, e: &Expr) -> Result<Option<Expr>, InterpreterError> {
+  let Expr::FunctionCall { name, args } = e else {
+    return Ok(None);
+  };
+  if name != "Tree" || args.len() != 2 {
+    return Ok(None);
+  }
+  let new_data = list_helpers_ast::apply_func_ast(func, &args[0])?;
+  let new_children = match &args[1] {
+    Expr::List(cs) => {
+      let mut mapped = Vec::with_capacity(cs.len());
+      for c in cs {
+        match tree_map(func, c)? {
+          Some(x) => mapped.push(x),
+          None => return Ok(None),
+        }
+      }
+      Expr::List(mapped.into())
+    }
+    other => other.clone(), // None (leaf) or other spec kept verbatim
+  };
+  Ok(Some(call("Tree", vec![new_data, new_children])))
+}
+
+// Count nodes (root + all descendants) whose data matches `pattern`. When
+// `bounds` is `Some`, only nodes within that level spec are counted. Returns
+// (count, height) where height is 0 for a leaf, or None if `e` is not a tree.
+fn tree_count(
+  e: &Expr,
+  pattern: &Expr,
+  depth: i128,
+  bounds: Option<(i128, Option<i128>)>,
+) -> Option<(i128, i128)> {
+  let (data, children) = tree_node(e)?;
+  let mut count = 0;
+  let mut height = 0;
+  for c in &children {
+    let (sub, h) = tree_count(c, pattern, depth + 1, bounds)?;
+    count += sub;
+    height = height.max(h + 1);
+  }
+  let in_level =
+    bounds.is_none_or(|(lo, hi)| tree_level_in_spec(depth, height + 1, lo, hi));
+  if in_level && list_helpers_ast::matches_pattern_ast(data, pattern) {
+    count += 1;
+  }
+  Some((count, height))
+}
+
+// TreeFold[f, tree]: a leaf folds to its data; an inner node with data `d`
+// and children `c1..cn` folds to f[d, {fold(c1), ..., fold(cn)}].
+// Returns Ok(None) if `e` is not a tree.
+fn tree_fold(func: &Expr, e: &Expr) -> Result<Option<Expr>, InterpreterError> {
+  let Some((data, children)) = tree_node(e) else {
+    return Ok(None);
+  };
+  if children.is_empty() {
+    return Ok(Some(data.clone()));
+  }
+  let mut folded = Vec::with_capacity(children.len());
+  for c in children {
+    match tree_fold(func, c)? {
+      Some(v) => folded.push(v),
+      None => return Ok(None),
+    }
+  }
+  let result = list_helpers_ast::apply_func_to_two_args(
+    func,
+    data,
+    &Expr::List(folded.into()),
+  )?;
+  Ok(Some(result))
+}
+
+/// Extract (values, weights) from a canonical
+/// `WeightedData[Automatic, {data, weights}]` object.
+pub(crate) fn weighted_data_parts(e: &Expr) -> Option<(Vec<Expr>, Vec<Expr>)> {
+  if let Expr::FunctionCall { name, args } = e
+    && name == "WeightedData"
+    && args.len() == 2
+    && matches!(&args[0], Expr::Identifier(s) if s == "Automatic")
+    && let Expr::List(pair) = &args[1]
+    && pair.len() == 2
+    && let (Expr::List(d), Expr::List(w)) = (&pair[0], &pair[1])
+    && d.len() == w.len()
+    && !d.is_empty()
+  {
+    return Some((d.to_vec(), w.to_vec()));
+  }
+  None
+}
+
+/// Build `Plus[terms...]` and evaluate it.
+fn eval_plus(terms: Vec<Expr>) -> Result<Expr, InterpreterError> {
+  evaluate_expr_to_expr(&call("Plus", terms))
+}
+
+/// Mean/Variance/StandardDeviation/Median of a WeightedData object, computed
+/// exactly. The weighted mean is Σwᵢxᵢ/Σwᵢ and the (population) weighted
+/// variance is Σwᵢ(xᵢ−μ)²/Σwᵢ. The weighted median is the smallest value, in
+/// value order, whose cumulative weight reaches half the total.
+fn weighted_data_stat(
+  stat: &str,
+  data: &[Expr],
+  weights: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let total_w = eval_plus(weights.to_vec())?;
+  // Weighted mean μ = Σ(wᵢ xᵢ) / Σwᵢ.
+  let times = |a: Expr, b: Expr| call("Times", vec![a, b]);
+  let weighted_sum = eval_plus(
+    data
+      .iter()
+      .zip(weights)
+      .map(|(x, w)| times(w.clone(), x.clone()))
+      .collect(),
+  )?;
+  let mean = evaluate_expr_to_expr(&call(
+    "Divide",
+    vec![weighted_sum, total_w.clone()],
+  ))?;
+  match stat {
+    "Mean" => Ok(mean),
+    "Variance" | "StandardDeviation" => {
+      // Σ wᵢ (xᵢ − μ)².
+      let diff = |x| call("Subtract", vec![x, mean.clone()]);
+      let sq = |x| pow(x, Expr::Integer(2));
+      let sq_sum = eval_plus(
+        data
+          .iter()
+          .zip(weights)
+          .map(|(x, w)| times(w.clone(), sq(diff(x.clone()))))
+          .collect(),
+      )?;
+      let variance =
+        evaluate_expr_to_expr(&call("Divide", vec![sq_sum, total_w]))?;
+      if stat == "Variance" {
+        Ok(variance)
+      } else {
+        evaluate_expr_to_expr(&call1("Sqrt", variance))
+      }
+    }
+    "Median" => {
+      // Sort (value, weight) by numeric value, then take the first value whose
+      // running weight reaches half of the total.
+      let val = |e: &Expr| -> f64 {
+        crate::functions::math_ast::expr_to_f64(e)
+          .or_else(|| {
+            evaluate_expr_to_expr(&call1("N", e.clone()))
+              .ok()
+              .and_then(|n| crate::functions::math_ast::expr_to_f64(&n))
+          })
+          .unwrap_or(f64::INFINITY)
+      };
+      let mut pairs: Vec<(Expr, Expr, f64)> = data
+        .iter()
+        .zip(weights)
+        .map(|(x, w)| (x.clone(), w.clone(), val(x)))
+        .collect();
+      pairs.sort_by(|a, b| {
+        a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+      });
+      let total = pairs
+        .iter()
+        .filter_map(|(_, w, _)| crate::functions::math_ast::expr_to_f64(w))
+        .sum::<f64>();
+      let half = total / 2.0;
+      let mut cum = 0.0;
+      for (x, w, _) in &pairs {
+        cum += crate::functions::math_ast::expr_to_f64(w).unwrap_or(0.0);
+        if cum >= half {
+          return Ok(x.clone());
+        }
+      }
+      Ok(pairs.last().map_or(Expr::Integer(0), |(x, _, _)| x.clone()))
+    }
+    _ => unreachable!(),
+  }
+}
+
+/// Can `e` be joined at `level`? It must be a List nested deeply enough that
+/// its parts down to level `level - 1` are themselves Lists (so the level-`level`
+/// parts exist and are joinable).
+fn has_join_depth(e: &Expr, level: usize) -> bool {
+  match e {
+    Expr::List(_) if level <= 1 => true,
+    Expr::List(items) => items.iter().all(|it| has_join_depth(it, level - 1)),
+    _ => false,
+  }
+}
+
+/// Evaluate `result` when it was pulled out of a held expression.
+///
+/// Extracting a part of `Hold[1 + 1]` lifts the subexpression out of the
+/// wrapper that was suppressing evaluation, so `First[Hold[1 + 1]]` is 2.
+/// Results extracted from an ordinary expression are already evaluated, so
+/// they are returned untouched rather than paying for a second traversal.
+/// HoldRest keeps First's / Last's default argument unevaluated, so it is only
+/// computed when there is no element to return (`First[{1, 2}, Print["x"]]`
+/// prints nothing). Once it *is* the answer it has to evaluate.
+fn evaluate_used_default(
+  result: Expr,
+  default: Option<&Expr>,
+) -> Result<Expr, InterpreterError> {
+  let render =
+    |e: &Expr| crate::syntax::format_expr(e, crate::syntax::ExprForm::Input);
+  match default {
+    Some(d) if render(&result) == render(d) => evaluate_expr_to_expr(&result),
+    _ => Ok(result),
+  }
+}
+
+fn evaluate_if_unheld(
+  name: &str,
+  source: &Expr,
+  result: Expr,
+) -> Result<Expr, InterpreterError> {
+  // A call that declined to extract anything (and has already reported why)
+  // must be left alone; re-evaluating it would just repeat the message.
+  let render =
+    |e: &Expr| crate::syntax::format_expr(e, crate::syntax::ExprForm::Input);
+  let declined = match &result {
+    Expr::FunctionCall { name: n, args } if n == name => {
+      args.first().is_some_and(|a| render(a) == render(source))
+    }
+    _ => false,
+  };
+  if declined || !crate::evaluator::core_eval::head_holds_arguments(source) {
+    return Ok(result);
+  }
+  evaluate_expr_to_expr(&result)
+}
+
+/// The list a `NumericArray[data, type]` holds, for the operations that
+/// report on the array rather than on the wrapper — `Dimensions`,
+/// `ArrayDepth`, `Normal`. Returns None for anything else.
+fn numeric_array_payload(expr: &Expr) -> Option<&Expr> {
+  match expr {
+    Expr::FunctionCall { name, args }
+      if name == "NumericArray"
+        && (args.len() == 1 || args.len() == 2)
+        && matches!(&args[0], Expr::List(_)) =>
+    {
+      Some(&args[0])
+    }
+    _ => None,
+  }
+}
+
+pub fn dispatch_list_operations(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  // The set-membership predicates compare associations by their VALUES as sets
+  // (like SubsetQ/DisjointQ), and either argument may be a list or association.
+  // Convert association operands to their value lists and retry.
+  if matches!(
+    name,
+    "ContainsAll"
+      | "ContainsAny"
+      | "ContainsNone"
+      | "ContainsOnly"
+      | "ContainsExactly"
+  ) && (args.len() == 2 || args.len() == 3)
+    && args[..2].iter().any(|a| matches!(a, Expr::Association(_)))
+  {
+    let converted: Vec<Expr> = args
+      .iter()
+      .enumerate()
+      .map(|(i, a)| match a {
+        Expr::Association(pairs) if i < 2 => {
+          Expr::List(pairs.iter().map(|(_, v)| v.clone()).collect())
+        }
+        other => other.clone(),
+      })
+      .collect();
+    return dispatch_list_operations(name, &converted);
+  }
+
+  // Shape-preserving list operations that take a SparseArray as their first
+  // argument return a SparseArray in wolframscript. Densify it via Normal, run
+  // the operation on the dense elements, then re-wrap the list result as a
+  // SparseArray. Without this the operation would mangle the SparseArray's
+  // internal representation instead of its elements.
+  if matches!(
+    name,
+    "Take"
+      | "Drop"
+      | "Most"
+      | "Rest"
+      | "Reverse"
+      | "RotateLeft"
+      | "RotateRight"
+      | "Flatten"
+      | "Append"
+      | "Prepend"
+      | "Insert"
+      | "Delete"
+      | "Partition"
+      | "PadLeft"
+      | "PadRight"
+      | "ArrayPad"
+      | "Diagonal"
+  ) && !args.is_empty()
+    && matches!(&args[0], Expr::FunctionCall { name: h, .. } if h == "SparseArray")
+  {
+    let normal = match crate::evaluator::evaluate_function_call_ast(
+      "Normal",
+      &[args[0].clone()],
+    ) {
+      Ok(n) => n,
+      Err(e) => return Some(Err(e)),
+    };
+    let mut new_args = args.to_vec();
+    new_args[0] = normal;
+    let result = dispatch_list_operations(name, &new_args)?;
+    return Some(result.and_then(|r| {
+      if matches!(&r, Expr::List(_)) {
+        crate::evaluator::evaluate_function_call_ast("SparseArray", &[r])
+      } else {
+        Ok(r)
+      }
+    }));
+  }
+
+  match name {
+    "Map" | "ParallelMap" if args.len() == 2 => {
+      return Some(list_helpers_ast::map_ast(&args[0], &args[1]));
+    }
+    "Map" | "ParallelMap" if args.len() == 3 => {
+      return Some(list_helpers_ast::map_with_level_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "MapAll" if args.len() == 2 => {
+      return Some(map_all_ast(&args[0], &args[1]));
+    }
+    "MapAt" if args.len() == 3 => {
+      return Some(list_helpers_ast::map_at_ast(&args[0], &args[1], &args[2]));
+    }
+    // ReplaceAt[expr, rules, pos] — apply `rules` to the parts of expr at
+    // position pos, using the same position specification as Position/MapAt.
+    // It is exactly MapAt[Replace[#, rules] &, expr, pos]: each targeted part
+    // is transformed by the first matching rule (unmatched parts are left
+    // unchanged). The 2-argument operator form ReplaceAt[rules, pos] is left
+    // unevaluated here and resolved when applied to an expression.
+    "ReplaceAt" if args.len() == 3 => {
+      let replace_fn = Expr::Function {
+        body: Box::new(call("Replace", vec![Expr::Slot(1), args[1].clone()])),
+      };
+      let result = list_helpers_ast::map_at_ast_named(
+        "ReplaceAt",
+        &replace_fn,
+        &args[0],
+        &args[2],
+      );
+      // On an invalid position MapAt returns itself unevaluated; surface the
+      // original ReplaceAt call instead of leaking the delegate's head.
+      return Some(result.map(|r| match &r {
+        Expr::FunctionCall { name, .. } if name == "MapAt" => {
+          unevaluated("ReplaceAt", args)
+        }
+        _ => r,
+      }));
+    }
+    "SelectFirst" if args.len() >= 2 && args.len() <= 3 => {
+      return Some(list_helpers_ast::select_first_ast(args));
+    }
+    "DuplicateFreeQ" if args.len() == 1 => {
+      if let Expr::List(items) = &args[0] {
+        let mut seen = std::collections::HashSet::new();
+        for item in items {
+          let s = expr_to_string(item);
+          if !seen.insert(s) {
+            return Some(Ok(bool_expr(false)));
+          }
+        }
+        return Some(Ok(bool_expr(true)));
+      }
+    }
+    // DuplicateFreeQ[list, test] — True iff no two elements are equivalent
+    // under `test`, i.e. test[e_i, e_j] is never True for any pair i < j.
+    "DuplicateFreeQ" if args.len() == 2 => {
+      if let Expr::List(items) = &args[0] {
+        let test = &args[1];
+        for i in 0..items.len() {
+          for j in (i + 1)..items.len() {
+            let res =
+              crate::functions::list_helpers_ast::apply_func_to_two_args(
+                test, &items[i], &items[j],
+              );
+            if matches!(res, Ok(Expr::Identifier(ref s)) if s == "True") {
+              return Some(Ok(bool_expr(false)));
+            }
+          }
+        }
+        return Some(Ok(bool_expr(true)));
+      }
+    }
+    "TakeList" if args.len() == 2 => {
+      // Pull the children of args[0] and remember its head so each sublist
+      // can be wrapped in the same head (List or any other symbol).
+      let (head, items): (Option<String>, Vec<Expr>) = match &args[0] {
+        Expr::List(xs) => (None, xs.to_vec()),
+        Expr::FunctionCall { name, args: xs } => {
+          (Some(name.clone()), xs.to_vec())
+        }
+        _ => {
+          return Some(Ok(unevaluated("TakeList", args)));
+        }
+      };
+      let Expr::List(specs) = &args[1] else {
+        return Some(Ok(unevaluated("TakeList", args)));
+      };
+      let wrap = |slice: Vec<Expr>| -> Expr {
+        match &head {
+          None => Expr::List(slice.into()),
+          Some(h) => Expr::FunctionCall {
+            name: h.clone(),
+            args: slice.into(),
+          },
+        }
+      };
+      // Unevaluated TakeList[...] result, reused by every error path.
+      let unevaluated = unevaluated("TakeList", args);
+      // An overrun (an integer spec demanding more than is left) aborts the
+      // whole call with TakeList::iseqs, referencing the entire spec list and
+      // the original input — matching wolframscript.
+      let iseqs = || {
+        crate::emit_message(&format!(
+          "TakeList::iseqs: Cannot take list {} of sequence specifications at level 1 of {}.",
+          expr_to_string(&args[1]),
+          expr_to_string(&args[0])
+        ));
+      };
+      // Walk a (start, end) window over `items`, consuming front or back
+      // depending on the sign / form of each spec.
+      let mut start: usize = 0;
+      let mut end: usize = items.len();
+      let mut result: Vec<Expr> = Vec::with_capacity(specs.len());
+      for (idx, spec) in specs.iter().enumerate() {
+        let remaining = end - start;
+        match spec {
+          Expr::Integer(n) if *n >= 0 => {
+            let n = *n as usize;
+            if n > remaining {
+              iseqs();
+              return Some(Ok(unevaluated));
+            }
+            let chunk: Vec<Expr> = items[start..start + n].to_vec();
+            start += n;
+            result.push(wrap(chunk));
+          }
+          Expr::Integer(n) => {
+            // n < 0: take last |n| of the remaining slice
+            let k = (-*n) as usize;
+            if k > remaining {
+              iseqs();
+              return Some(Ok(unevaluated));
+            }
+            let chunk: Vec<Expr> = items[end - k..end].to_vec();
+            end -= k;
+            result.push(wrap(chunk));
+          }
+          Expr::Identifier(s) if s == "All" => {
+            let chunk: Vec<Expr> = items[start..end].to_vec();
+            start = end;
+            result.push(wrap(chunk));
+          }
+          Expr::FunctionCall {
+            name: upto,
+            args: uargs,
+          } if upto == "UpTo" && uargs.len() == 1 => {
+            let Some(m) = (match &uargs[0] {
+              Expr::Integer(n) if *n >= 0 => Some(*n as usize),
+              _ => None,
+            }) else {
+              return Some(Ok(unevaluated));
+            };
+            let take = m.min(remaining);
+            let chunk: Vec<Expr> = items[start..start + take].to_vec();
+            start += take;
+            result.push(wrap(chunk));
+          }
+          // List-form specs ({n}, {m, n}, {m, n, s}) are a valid Take grammar
+          // that this window model doesn't implement yet; leave them
+          // unevaluated rather than emit a spurious error.
+          Expr::List(_) => {
+            return Some(Ok(unevaluated));
+          }
+          // Any other atom is not a sequence specification: TakeList::seqs
+          // reports the offending 1-based position, matching wolframscript.
+          _ => {
+            crate::emit_message(&format!(
+              "TakeList::seqs: Sequence specification (+n, -n, {{+n}}, {{-n}}, {{m, n}} or {{m, n, s}}) expected at position {} in {}.",
+              idx + 1,
+              expr_to_string(&args[1])
+            ));
+            return Some(Ok(unevaluated));
+          }
+        }
+      }
+      return Some(Ok(Expr::List(result.into())));
+    }
+    "FlattenAt" if args.len() == 1 => {
+      // Operator form FlattenAt[pos] — return unevaluated for currying.
+      return Some(Ok(unevaluated("FlattenAt", args)));
+    }
+    "FlattenAt" if args.len() == 2 => {
+      return Some(flatten_at_unified(args));
+    }
+    "InversePermutation" if args.len() == 1 => {
+      if matches!(&args[0], Expr::List(_)) {
+        // A repeated image would leave a hole in the inverse, so the list
+        // has to be a genuine permutation.
+        if let Some(indices) =
+          permutation_list_indices("InversePermutation", &args[0], true)
+        {
+          let mut inverse = vec![Expr::Integer(0); indices.len()];
+          for (i, &image) in indices.iter().enumerate() {
+            inverse[image] = Expr::Integer((i + 1) as i128);
+          }
+          return Some(Ok(Expr::List(inverse.into())));
+        }
+        return Some(Ok(unevaluated("InversePermutation", args)));
+      }
+      // InversePermutation[Cycles[{cycle1, cycle2, ...}]] — reverse each
+      // cycle, rotate so its smallest element is first, drop fixed points,
+      // and sort cycles by their smallest element.
+      if let Expr::FunctionCall {
+        name: cname,
+        args: cargs,
+      } = &args[0]
+        && cname == "Cycles"
+        && cargs.len() == 1
+        && let Expr::List(cycle_list) = &cargs[0]
+      {
+        let mut out_cycles: Vec<Vec<i128>> =
+          Vec::with_capacity(cycle_list.len());
+        let mut valid = true;
+        for cycle in cycle_list {
+          let Expr::List(c) = cycle else {
+            valid = false;
+            break;
+          };
+          let mut ints: Vec<i128> = Vec::with_capacity(c.len());
+          for e in c {
+            if let Expr::Integer(n) = e {
+              ints.push(*n);
+            } else {
+              valid = false;
+              break;
+            }
+          }
+          if !valid {
+            break;
+          }
+          if ints.len() < 2 {
+            continue;
+          }
+          ints.reverse();
+          let min_idx = ints
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| *v)
+            .map_or(0, |(i, _)| i);
+          ints.rotate_left(min_idx);
+          out_cycles.push(ints);
+        }
+        if valid {
+          out_cycles.sort_by_key(|c| c[0]);
+          let cycle_exprs: Vec<Expr> = out_cycles
+            .into_iter()
+            .map(|c| Expr::List(c.into_iter().map(Expr::Integer).collect()))
+            .collect();
+          return Some(Ok(call1("Cycles", Expr::List(cycle_exprs.into()))));
+        }
+      }
+    }
+    "MovingMedian" if args.len() == 2 => {
+      if let Expr::List(items) = &args[0]
+        && let Some(r) = match &args[1] {
+          Expr::Integer(n) if *n >= 1 => Some(*n as usize),
+          _ => None,
+        }
+      {
+        let n = items.len();
+        if r > n {
+          crate::emit_message(&format!(
+            "MovingMedian::arg2: The second argument {r} must be a positive integer less than or equal to the length {n} of the first argument."
+          ));
+          return Some(Ok(unevaluated("MovingMedian", args)));
+        }
+        let mut result = Vec::with_capacity(n - r + 1);
+        for i in 0..=(n - r) {
+          let window = Expr::List(items[i..i + r].to_vec().into());
+          match list_helpers_ast::median_ast(&window) {
+            Ok(val) => result.push(val),
+            Err(e) => return Some(Err(e)),
+          }
+        }
+        return Some(Ok(Expr::List(result.into())));
+      }
+    }
+    // MovingMap[f, list, n] — apply f to each sublist of length n+1.
+    // MovingMap[f, list, n, padding] — pad the data on the left by n elements
+    // first, so every input position contributes a window and the result has
+    // the same length as the input.
+    "MovingMap" if args.len() == 3 || args.len() == 4 => {
+      // A time series windows by time rather than by count.
+      if let Some(result) =
+        crate::functions::timeseries_ast::moving_map_series_ast(args)
+      {
+        return Some(result);
+      }
+      if let Expr::List(items) = &args[1]
+        && let Some(n) = match &args[2] {
+          Expr::Integer(n) => Some(*n as usize),
+          // A single-element window spec {r} is the same as the scalar r for
+          // a one-dimensional list, matching wolframscript.
+          Expr::List(spec) if spec.len() == 1 => match &spec[0] {
+            Expr::Integer(r) if *r >= 0 => Some(*r as usize),
+            _ => None,
+          },
+          _ => None,
+        }
+      {
+        let items: Vec<Expr> = items.iter().cloned().collect();
+        let windows = match args.get(3) {
+          None => {
+            if n + 1 > items.len() {
+              return Some(Ok(Expr::List(vec![].into())));
+            }
+            (0..(items.len() - n))
+              .map(|i| items[i..=(i + n)].to_vec())
+              .collect()
+          }
+          Some(padding) => moving_map_padded_windows(&items, n, padding)?,
+        };
+        let f = &args[0];
+        let mut results = Vec::new();
+        for window in windows {
+          let sublist = Expr::List(window.into());
+          // Apply f[sublist]; this handles named functions, pure functions
+          // (`#[[1]] + #[[2]] &`), and explicit `Function[...]` alike.
+          match crate::evaluator::function_application::apply_function_to_arg(
+            f, &sublist,
+          ) {
+            Ok(val) => results.push(val),
+            Err(e) => return Some(Err(e)),
+          }
+        }
+        return Some(Ok(Expr::List(results.into())));
+      }
+    }
+    // ParallelSelect is the serial Select in Woxi (evaluated sequentially).
+    "Select" | "ParallelSelect" if args.len() == 2 => {
+      return Some(list_helpers_ast::select_ast(&args[0], &args[1], None));
+    }
+    // Capping the number of matches is what the parallel form cannot do:
+    // wolframscript reports `::nopar1` and evaluates the serial `Select`.
+    "Select" | "ParallelSelect" if args.len() == 3 => {
+      if name == "ParallelSelect" {
+        emit_nopar1(name, "Select", args);
+      }
+      return Some(list_helpers_ast::select_ast(
+        &args[0],
+        &args[1],
+        Some(&args[2]),
+      ));
+    }
+    "Discard" if args.len() == 2 => {
+      return Some(list_helpers_ast::discard_ast(&args[0], &args[1], None));
+    }
+    "Discard" if args.len() == 3 => {
+      return Some(list_helpers_ast::discard_ast(
+        &args[0],
+        &args[1],
+        Some(&args[2]),
+      ));
+    }
+    "AllSameBy" if args.len() == 2 => {
+      return Some(list_helpers_ast::all_same_by_ast(args));
+    }
+    "AllTrue" if args.len() == 2 || args.len() == 3 => {
+      return Some(list_helpers_ast::all_true_ast(args));
+    }
+    "AllMatch" if (2..=3).contains(&args.len()) => {
+      return Some(list_helpers_ast::all_match_ast(args));
+    }
+    "AllMatch" if args.len() == 1 => {
+      // Operator form: return unevaluated for currying
+      return Some(Ok(unevaluated("AllMatch", args)));
+    }
+    "AnyTrue" if args.len() == 2 || args.len() == 3 => {
+      return Some(list_helpers_ast::any_true_ast(args));
+    }
+    "AnyMatch" if (2..=3).contains(&args.len()) => {
+      return Some(list_helpers_ast::any_match_ast(args));
+    }
+    "AnyMatch" if args.len() == 1 => {
+      // Operator form: return unevaluated for currying
+      return Some(Ok(unevaluated("AnyMatch", args)));
+    }
+    "NoneTrue" if args.len() == 2 || args.len() == 3 => {
+      return Some(list_helpers_ast::none_true_ast(args));
+    }
+    "Fold" if args.len() == 2 || args.len() == 3 => {
+      if args.len() == 3 {
+        return Some(list_helpers_ast::fold_ast(&args[0], &args[1], &args[2]));
+      }
+      // Fold[f, {a, b, c, ...}] = Fold[f, a, {b, c, ...}]
+      // Also handles Fold[f, g[a, b, c, ...]] with arbitrary heads.
+      let (items, head): (&[Expr], Option<&str>) = match &args[1] {
+        Expr::List(items) => (items.as_slice(), None),
+        Expr::FunctionCall { name, args: fargs } => {
+          (fargs.as_slice(), Some(name.as_str()))
+        }
+        _ => {
+          return Some(Ok(unevaluated("Fold", args)));
+        }
+      };
+      if items.is_empty() {
+        // Fold[f, {}] is unevaluated in Wolfram Language
+        return Some(Ok(unevaluated("Fold", args)));
+      }
+      let init = items[0].clone();
+      let rest = match head {
+        Some(h) => unevaluated(h, &items[1..]),
+        None => Expr::List(items[1..].to_vec().into()),
+      };
+      return Some(list_helpers_ast::fold_ast(&args[0], &init, &rest));
+    }
+    "FoldWhile" | "FoldWhileList" if (3..=6).contains(&args.len()) => {
+      // FoldWhile[f, x, {a1, …}, test, m, n]  — full form
+      // FoldWhile[f, list, test]  ==  FoldWhile[f, First[list], Rest[list], test]
+      let func = &args[0];
+      let echo = || Some(Ok(unevaluated(name, args)));
+      // The 3-arg form takes the initial value from the head of the list.
+      let (init, items, tail): (Expr, Vec<Expr>, &[Expr]) = if args.len() == 3 {
+        let list_items: &[Expr] = match &args[1] {
+          Expr::List(items) => items.as_slice(),
+          Expr::FunctionCall { args: fargs, .. } => fargs.as_slice(),
+          _ => return echo(),
+        };
+        if list_items.is_empty() {
+          return echo();
+        }
+        (list_items[0].clone(), list_items[1..].to_vec(), &args[2..3])
+      } else {
+        let list_items: Vec<Expr> = match &args[2] {
+          Expr::List(items) => items.to_vec(),
+          Expr::FunctionCall { args: fargs, .. } => fargs.to_vec(),
+          _ => return echo(),
+        };
+        (args[1].clone(), list_items, &args[3..])
+      };
+      // `tail` = [test, (m), (n)].
+      let test = &tail[0];
+      let m = if tail.len() >= 2 {
+        match parse_nest_while_m(&tail[1]) {
+          Some(m) => m,
+          None => return echo(),
+        }
+      } else {
+        list_helpers_ast::NestWhileM::Last(1)
+      };
+      let extra_n = if tail.len() == 3 {
+        expr_to_i128(&tail[2]).unwrap_or(0)
+      } else {
+        0
+      };
+      let history = match list_helpers_ast::fold_while_history_ast(
+        func, &init, &items, test, m, extra_n,
+      ) {
+        Ok(h) => h,
+        Err(e) => return Some(Err(e)),
+      };
+      // FoldWhile reports where the fold stopped; FoldWhileList the way there.
+      return Some(Ok(if name == "FoldWhileList" {
+        Expr::List(history.into())
+      } else {
+        history.last().cloned().unwrap_or(init)
+      }));
+    }
+    "GroupBy" if args.len() == 2 || args.len() == 3 => {
+      // GroupBy needs a list (incl. list of rules) or an association as its
+      // first argument; anything else emits ::list1 and stays unevaluated
+      // (preserving all arguments), matching wolframscript.
+      if !matches!(&args[0], Expr::List(_) | Expr::Association(_)) {
+        crate::emit_message(&format!(
+          "GroupBy::list1: The argument {} is not a valid list of Associations or rules or lists of rules.",
+          crate::syntax::format_expr(&args[0], crate::syntax::ExprForm::Output)
+        ));
+        return Some(Ok(unevaluated("GroupBy", args)));
+      }
+      let result = list_helpers_ast::group_by_ast(&args[0], &args[1]);
+      if args.len() == 3 {
+        // GroupBy[list, spec, reducer] — the reducer runs on the innermost
+        // groups, which a `{f1, …, fk}` spec nests k levels deep.
+        let depth = match &args[1] {
+          Expr::List(specs) => specs.len(),
+          _ => 1,
+        };
+        return Some(result.and_then(|grouped| {
+          list_helpers_ast::reduce_groups_ast(&grouped, &args[2], depth)
+        }));
+      }
+      return Some(result);
+    }
+    "SortBy" if args.len() == 2 => {
+      return Some(list_helpers_ast::sort_by_ast(&args[0], &args[1]));
+    }
+    // SortBy[list, f, p] — order the keys f produces with the comparison
+    // function p rather than canonically.
+    "SortBy" if args.len() == 3 => {
+      return Some(list_helpers_ast::sort_by_with_ordering_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "Ordering" if !args.is_empty() && args.len() <= 3 => {
+      return Some(list_helpers_ast::ordering_ast(args));
+    }
+    "PositionLargest" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::position_extreme_ast(args, true));
+    }
+    "PositionSmallest" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::position_extreme_ast(args, false));
+    }
+    "OrderingBy" if (2..=4).contains(&args.len()) => {
+      return Some(list_helpers_ast::ordering_by_ast(args));
+    }
+    "Nest" if args.len() == 3 => {
+      let Some(n) = nonneg_machine_int(&args[2]) else {
+        return Some(Ok(intnm_message(name, args, 3)));
+      };
+      return Some(list_helpers_ast::nest_ast(&args[0], &args[1], n));
+    }
+    "NestList" if args.len() == 3 => {
+      let Some(n) = nonneg_machine_int(&args[2]) else {
+        return Some(Ok(intnm_message(name, args, 3)));
+      };
+      return Some(list_helpers_ast::nest_list_ast(&args[0], &args[1], n));
+    }
+    "FixedPoint" if args.len() >= 2 => {
+      // A trailing `SameTest -> f` option replaces the default SameQ
+      // convergence test.
+      let (pos, same_test) = split_same_test_option(args);
+      // The optional third argument accepts Infinity (the default) or a
+      // non-negative machine integer; anything else emits ::intnm.
+      let max_iter = if pos.len() == 3 {
+        if is_infinity_symbol(&pos[2]) {
+          None
+        } else {
+          match nonneg_machine_int(&pos[2]) {
+            Some(n) => Some(n),
+            None => return Some(Ok(intnm_message(name, args, 3))),
+          }
+        }
+      } else {
+        None
+      };
+      return Some(list_helpers_ast::fixed_point_ast(
+        &pos[0],
+        &pos[1],
+        max_iter,
+        same_test.as_ref(),
+      ));
+    }
+    // ParallelCases is the serial Cases in Woxi (evaluated sequentially).
+    "Cases" | "ParallelCases" if args.len() >= 2 && args.len() <= 5 => {
+      return Some(list_helpers_ast::cases_unified_ast(args));
+    }
+    // A call the serial function itself cannot make sense of has nothing to
+    // parallelize: wolframscript reports `::nopar1` and hands the arguments
+    // to that serial function, which then stays unevaluated.
+    "ParallelCases" | "ParallelSelect" if args.len() == 1 => {
+      let serial = name.trim_start_matches("Parallel");
+      emit_nopar1(name, serial, args);
+      return Some(Ok(unevaluated(serial, args)));
+    }
+    // FirstCase[list, pattern] or FirstCase[list, pattern, default]
+    // FirstCase[list, pattern :> rhs] or FirstCase[list, pattern :> rhs, default]
+    "FirstCase" if args.len() >= 2 && args.len() <= 4 => {
+      return Some(list_helpers_ast::first_case_ast(args));
+    }
+    "Position" if args.len() >= 2 && args.len() <= 5 => {
+      return Some(list_helpers_ast::position_unified_ast(args));
+    }
+    "FirstPosition" if args.len() >= 2 => {
+      return Some(list_helpers_ast::first_position_ast(args));
+    }
+    "MapIndexed" if args.len() == 2 => {
+      return Some(list_helpers_ast::map_indexed_ast(&args[0], &args[1]));
+    }
+    "MapIndexed" if args.len() == 3 => {
+      return Some(list_helpers_ast::map_indexed_with_level_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "MapIndexed" if args.len() == 4 => {
+      return Some(list_helpers_ast::map_indexed_with_level_heads_ast(
+        &args[0], &args[1], &args[2], &args[3],
+      ));
+    }
+    "Tally" if args.len() == 1 => {
+      return Some(list_helpers_ast::tally_ast(&args[0]));
+    }
+    "Tally" if args.len() == 2 => {
+      return Some(list_helpers_ast::tally_with_test_ast(&args[0], &args[1]));
+    }
+    "Counts" if args.len() == 1 => {
+      return Some(list_helpers_ast::counts_ast(&args[0]));
+    }
+    "BinCounts" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::bin_counts_ast(args));
+    }
+    "BinLists" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::bin_lists_ast(args));
+    }
+    "HistogramList" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::histogram_list_ast(args));
+    }
+    "DeleteDuplicates" if args.len() == 1 => {
+      return Some(list_helpers_ast::delete_duplicates_ast(&args[0], None));
+    }
+    "DeleteDuplicates" if args.len() == 2 => {
+      return Some(list_helpers_ast::delete_duplicates_ast(
+        &args[0],
+        Some(&args[1]),
+      ));
+    }
+    "Union" => {
+      return Some(list_helpers_ast::union_ast(args));
+    }
+    "Intersection" => {
+      return Some(list_helpers_ast::intersection_ast(args));
+    }
+    "Complement" => {
+      return Some(list_helpers_ast::complement_ast(args));
+    }
+    "SymmetricDifference" if args.len() >= 2 => {
+      return Some(list_helpers_ast::symmetric_difference_ast(args));
+    }
+    "UniqueElements" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::unique_elements_ast(args));
+    }
+    "DeleteElements" if args.len() == 2 => {
+      return Some(list_helpers_ast::delete_elements_ast(args));
+    }
+    "Dimensions" | "TensorDimensions" if args.len() == 1 || args.len() == 2 => {
+      // A NumericArray reports on the array it holds, not on the two-element
+      // `NumericArray[data, type]` wrapper.
+      if let Some(payload) = numeric_array_payload(&args[0]) {
+        let mut unwrapped = args.to_vec();
+        unwrapped[0] = payload.clone();
+        return Some(list_helpers_ast::dimensions_ast(&unwrapped));
+      }
+      // A SymmetrizedArray reports on the dense array it stands for, whose
+      // positions the symmetry only stores one representative of.
+      if let Some(dense) =
+        crate::functions::linear_algebra_ast::symmetrized_array_to_dense(
+          &args[0],
+        )
+      {
+        let mut densified = args.to_vec();
+        densified[0] = match dense {
+          Ok(d) => d,
+          Err(err) => return Some(Err(err)),
+        };
+        return Some(list_helpers_ast::dimensions_ast(&densified));
+      }
+      // A structured-matrix wrapper (CauchyMatrix[…], BlockDiagonalMatrix[…],
+      // …) reports the dimensions of the matrix it represents, not of the
+      // wrapper expression.
+      if let Some(dense) =
+        crate::functions::linear_algebra_ast::structured_matrix_to_dense(
+          &args[0],
+        )
+      {
+        let mut densified = args.to_vec();
+        densified[0] = dense;
+        return Some(list_helpers_ast::dimensions_ast(&densified));
+      }
+      return Some(list_helpers_ast::dimensions_ast(args));
+    }
+    "Delete" if args.len() == 2 => {
+      return Some(list_helpers_ast::delete_ast(args));
+    }
+    "Order" if args.len() == 2 => {
+      // Order[e1, e2]: 1 if e1 < e2, -1 if e1 > e2, 0 if equal (canonical ordering)
+      let result =
+        crate::functions::list_helpers_ast::compare_exprs(&args[0], &args[1]);
+      return Some(Ok(Expr::Integer(result as i128)));
+    }
+    "NumericalOrder" if args.len() == 2 => {
+      // Like Order, but numerically comparable operands are compared by value:
+      // NumericalOrder[2.5, 5/2] = 0 where Order[2.5, 5/2] = 1. Falls back to
+      // canonical ordering when the operands are not numerically comparable.
+      use crate::functions::math_ast::try_eval_to_f64;
+      let result =
+        match (try_eval_to_f64(&args[0]), try_eval_to_f64(&args[1])) {
+          (Some(a), Some(b)) if a < b => 1,
+          (Some(a), Some(b)) if a > b => -1,
+          (Some(_), Some(_)) => 0,
+          _ => crate::functions::list_helpers_ast::compare_exprs(
+            &args[0], &args[1],
+          ) as i128,
+        };
+      return Some(Ok(Expr::Integer(result)));
+    }
+    // LexicographicOrder[a, b] — true lexicographic order: Order of the first
+    // non-coinciding element pair (element-wise first, then shorter-list-first
+    // on a tie), unlike canonical Order which compares length first.
+    // LexicographicOrder[a, b, p] uses the ordering function p on each pair.
+    "LexicographicOrder" if args.len() == 2 || args.len() == 3 => {
+      let as_elems = |e: &Expr| -> Vec<Expr> {
+        match e {
+          Expr::List(items) => items.to_vec(),
+          other => vec![other.clone()],
+        }
+      };
+      let a = as_elems(&args[0]);
+      let b = as_elems(&args[1]);
+      let mut result: i128 = 0;
+      for (ai, bi) in a.iter().zip(b.iter()) {
+        let o: i128 = if args.len() == 3 {
+          match crate::functions::list_helpers_ast::apply_func_to_two_args(
+            &args[2], ai, bi,
+          ) {
+            Ok(Expr::Integer(n)) => n,
+            _ => 0,
+          }
+        } else {
+          crate::functions::list_helpers_ast::compare_exprs(ai, bi) as i128
+        };
+        if o != 0 {
+          result = o;
+          break;
+        }
+      }
+      if result == 0 {
+        // On an element-wise tie the shorter list comes first.
+        result = match a.len().cmp(&b.len()) {
+          std::cmp::Ordering::Less => 1,
+          std::cmp::Ordering::Greater => -1,
+          std::cmp::Ordering::Equal => 0,
+        };
+      }
+      return Some(Ok(Expr::Integer(result)));
+    }
+    "OrderedQ" if args.len() == 1 => {
+      return Some(list_helpers_ast::ordered_q_ast(args));
+    }
+    // OrderedQ[list, p] — True iff p[e_i, e_{i+1}] does not return False for
+    // every consecutive pair (a symbolic/non-False result counts as ordered).
+    "OrderedQ" if args.len() == 2 => {
+      let elems: Option<&[Expr]> = match &args[0] {
+        Expr::List(items) => Some(items),
+        Expr::FunctionCall { args: items, .. } => Some(items),
+        _ => None,
+      };
+      if let Some(elems) = elems {
+        let comparator = &args[1];
+        let mut ordered = true;
+        for pair in elems.windows(2) {
+          let res = crate::functions::list_helpers_ast::apply_func_to_two_args(
+            comparator, &pair[0], &pair[1],
+          );
+          if matches!(res, Ok(Expr::Identifier(ref s)) if s == "False") {
+            ordered = false;
+            break;
+          }
+        }
+        return Some(Ok(bool_expr(ordered)));
+      }
+    }
+    "DeleteAdjacentDuplicates" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::delete_adjacent_duplicates_ast(args));
+    }
+    "Commonest" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::commonest_ast(args));
+    }
+    "CommonestFilter" if args.len() == 2 => {
+      return Some(list_helpers_ast::commonest_filter_ast(args));
+    }
+    "ClusteringComponents" if args.len() == 1 => {
+      return Some(list_helpers_ast::clustering_components_ast(&args[0]));
+    }
+    "ClusteringComponents" if args.len() == 2 => {
+      return Some(list_helpers_ast::clustering_components_n_ast(
+        &args[0], &args[1],
+      ));
+    }
+    "FindClusters" if !args.is_empty() && args.len() <= 3 => {
+      return Some(list_helpers_ast::find_clusters_ast_n(args));
+    }
+    "ComposeList" if args.len() == 2 => {
+      return Some(list_helpers_ast::compose_list_ast(args));
+    }
+    "ContainsOnly" if args.len() == 2 || args.len() == 3 => {
+      return Some(list_helpers_ast::contains_only_ast(args));
+    }
+    "Pick" if args.len() == 2 || args.len() == 3 => {
+      return Some(list_helpers_ast::pick_ast(args));
+    }
+    "LengthWhile" if args.len() == 2 => {
+      return Some(list_helpers_ast::length_while_ast(args));
+    }
+    "TakeLargestBy" if args.len() == 3 => {
+      return Some(list_helpers_ast::take_largest_by_ast(args));
+    }
+    "TakeSmallestBy" if args.len() == 3 => {
+      return Some(list_helpers_ast::take_smallest_by_ast(args));
+    }
+
+    // Additional AST-native list functions
+    // `Table[expr]` — no iterator at all — is the degenerate case of the
+    // multi-dimensional form and simply evaluates the body once, the way
+    // wolframscript does (`Table[1 + 1]` is `2`, with no message).
+    "Table" | "ParallelTable" if args.len() == 1 => {
+      return Some(crate::evaluator::evaluate_expr_to_expr(&args[0]));
+    }
+    "Table" | "ParallelTable" if args.len() >= 2 => {
+      // An iterator with non-numeric bounds leaves the whole call unevaluated
+      // (matching wolframscript's ::iterb / ::nliter) rather than erroring.
+      if let Some(msg) =
+        list_helpers_ast::table_iterators_invalid(name, &args[1..])
+      {
+        crate::emit_message(&msg);
+        return Some(Ok(unevaluated(name, args)));
+      }
+      if args.len() == 2 {
+        return Some(list_helpers_ast::table_ast(&args[0], &args[1]));
+      }
+      // Multi-dimensional Table: Table[expr, iter1, iter2, ...]
+      return Some(list_helpers_ast::table_multi_ast(&args[0], &args[1..]));
+    }
+    "MapThread" if args.len() == 2 || args.len() == 3 => {
+      let level = if args.len() == 3 {
+        match &args[2] {
+          // Level 0 means "no threading": f is applied directly to the
+          // top-level arguments (handled inside map_thread_ast).
+          Expr::Integer(n) if *n >= 0 => Some(*n as usize),
+          _ => None,
+        }
+      } else {
+        None
+      };
+      return Some(
+        match list_helpers_ast::map_thread_ast(&args[0], &args[1], level) {
+          Err(InterpreterError::EvaluationError(msg))
+            if msg.contains("same length") =>
+          {
+            // wolframscript names the first offending pair and their
+            // dimensions: ... at positions {2, 1} and {2, j} of <call>;
+            // dimensions are d1 and dj.
+            let lvl = level.unwrap_or(1);
+            let dims_of = |e: &Expr| -> Vec<usize> {
+              let mut out = Vec::new();
+              let mut cur = e;
+              for _ in 0..lvl {
+                match cur {
+                  Expr::List(items) => {
+                    out.push(items.len());
+                    match items.first() {
+                      Some(first) => cur = first,
+                      None => break,
+                    }
+                  }
+                  _ => break,
+                }
+              }
+              out
+            };
+            // The first *adjacent* pair with differing dimensions is
+            // reported (wolframscript compares neighbors, not vs the
+            // first element).
+            let mismatch = if let Expr::List(tensors) = &args[1] {
+              let all_dims: Vec<Vec<usize>> =
+                tensors.iter().map(dims_of).collect();
+              let mut found = None;
+              'levels: for l in 0..lvl {
+                for j in 1..all_dims.len() {
+                  let da = all_dims[j - 1].get(l);
+                  let db = all_dims[j].get(l);
+                  if da != db
+                    && let (Some(da), Some(db)) = (da, db)
+                  {
+                    found = Some((j, j + 1, *da, *db));
+                    break 'levels;
+                  }
+                }
+              }
+              found
+            } else {
+              None
+            };
+            let call = crate::syntax::format_expr(
+              &unevaluated("MapThread", args),
+              crate::syntax::ExprForm::Output,
+            );
+            match mismatch {
+              Some((i, j, da, db)) => crate::emit_message(&format!(
+                "MapThread::mptc: Incompatible dimensions of objects at positions {{2, {i}}} and {{2, {j}}} of {call}; dimensions are {da} and {db}."
+              )),
+              None => crate::emit_message(&format!(
+                "MapThread::mptc: Incompatible dimensions of objects in {call}."
+              )),
+            }
+            Ok(unevaluated("MapThread", args))
+          }
+          other => other,
+        },
+      );
+    }
+    "Downsample" if args.len() == 2 || args.len() == 3 => {
+      if let Expr::List(items) = &args[0]
+        && let Some(n) = expr_to_i128(&args[1])
+        && n >= 1
+      {
+        let offset = if args.len() == 3 {
+          expr_to_i128(&args[2]).unwrap_or(1)
+        } else {
+          1
+        };
+        let n = n as usize;
+        let offset = (offset - 1).max(0) as usize;
+        let result: Vec<Expr> =
+          items.iter().skip(offset).step_by(n).cloned().collect();
+        return Some(Ok(Expr::List(result.into())));
+      }
+    }
+    "BlockMap" if args.len() == 3 || args.len() == 4 => {
+      // BlockMap[f, list, n] or BlockMap[f, list, n, offset]. A single-element
+      // block specification {n} is equivalent to the integer n (non-overlapping
+      // blocks of size n), matching wolframscript.
+      let block_size = match &args[2] {
+        Expr::List(spec) if spec.len() == 1 => expr_to_i128(&spec[0]),
+        other => expr_to_i128(other),
+      };
+      if let Some(n) = block_size {
+        let d = if args.len() == 4 {
+          expr_to_i128(&args[3])
+        } else {
+          None
+        };
+        return Some(
+          list_helpers_ast::partition_ast(&args[1], n, d, None, None).and_then(
+            |partitioned| list_helpers_ast::map_ast(&args[0], &partitioned),
+          ),
+        );
+      }
+    }
+    // Partition[list, n, d, {kL, kR}, padding, h] wraps every output block in
+    // the head h instead of List.
+    "Partition" if args.len() == 6 => {
+      let Expr::Identifier(head) = &args[5] else {
+        return Some(Ok(unevaluated("Partition", args)));
+      };
+      let partitioned = dispatch_list_operations("Partition", &args[..5])?;
+      let Ok(Expr::List(blocks)) = &partitioned else {
+        return Some(partitioned);
+      };
+      let rewrapped: Vec<Expr> = blocks
+        .iter()
+        .map(|b| match b {
+          Expr::List(elems) => Expr::FunctionCall {
+            name: head.clone(),
+            args: elems.clone(),
+          },
+          other => other.clone(),
+        })
+        .collect();
+      return Some(Ok(Expr::List(rewrapped.into())));
+    }
+    "Partition" if args.len() >= 2 && args.len() <= 5 => {
+      // The subject must be nonatomic; its head is kept on the result.
+      let (items, subject_head): (&[Expr], Option<&str>) = match &args[0] {
+        Expr::List(items) => (items.as_slice(), None),
+        Expr::FunctionCall {
+          name: fc_name,
+          args: fc_args,
+        } => (fc_args.as_slice(), Some(fc_name.as_str())),
+        _ => {
+          crate::emit_message(&format!(
+            "Partition::npart: The expression {} cannot be partitioned.",
+            crate::syntax::format_expr(
+              &args[0],
+              crate::syntax::ExprForm::Output
+            )
+          ));
+          return Some(Ok(unevaluated("Partition", args)));
+        }
+      };
+      let uneval = || Some(Ok(unevaluated("Partition", args)));
+      let ilsmp = |position: usize| {
+        crate::emit_message(&format!(
+          "Partition::ilsmp: Single or list of positive machine-sized integers expected at position {} of {}.",
+          position,
+          crate::syntax::format_expr(
+            &unevaluated("Partition", args),
+            crate::syntax::ExprForm::Output
+          )
+        ));
+      };
+      let positive_machine = |e: &Expr| -> Option<i128> {
+        match e {
+          Expr::Integer(n) if (1..=i64::MAX as i128).contains(n) => Some(*n),
+          _ => None,
+        }
+      };
+      // Partition[list, UpTo[n]] — chunks of up to n, last chunk may be short.
+      if args.len() == 2
+        && let Expr::FunctionCall {
+          name: ut_name,
+          args: ut_args,
+        } = &args[1]
+        && ut_name == "UpTo"
+        && ut_args.len() == 1
+        && let Some(n) = positive_machine(&ut_args[0])
+      {
+        let n_usize = n as usize;
+        let wrap = |elems: Vec<Expr>| -> Expr {
+          match subject_head {
+            Some(h) => call(h, elems),
+            None => Expr::List(elems.into()),
+          }
+        };
+        let mut chunks: Vec<Expr> = Vec::new();
+        let mut i = 0usize;
+        while i < items.len() {
+          let end = (i + n_usize).min(items.len());
+          chunks.push(wrap(items[i..end].to_vec()));
+          i = end;
+        }
+        return Some(Ok(wrap(chunks)));
+      }
+      // Degenerate block size 0 with an explicit positive offset d yields
+      // Floor[Length/d] + 1 empty blocks (Partition[{1,2,3}, 0, 1] ->
+      // {{}, {}, {}, {}}), matching Wolfram. The 2-argument form still errors.
+      if args.len() == 3
+        && matches!(&args[1], Expr::Integer(0))
+        && let Some(d) = positive_machine(&args[2])
+      {
+        let wrap = |elems: Vec<Expr>| -> Expr {
+          match subject_head {
+            Some(h) => call(h, elems),
+            None => Expr::List(elems.into()),
+          }
+        };
+        let count = items.len() as i128 / d + 1;
+        let blocks: Vec<Expr> = (0..count).map(|_| wrap(Vec::new())).collect();
+        return Some(Ok(wrap(blocks)));
+      }
+      if let Some(n) = positive_machine(&args[1]) {
+        let d = if args.len() >= 3 {
+          if let Some(d) = positive_machine(&args[2]) {
+            Some(d)
+          } else {
+            ilsmp(3);
+            return uneval();
+          }
+        } else {
+          None
+        };
+        // args[3] is alignment spec {kL, kR}, args[4] is pad element
+        let (align, pad) = if args.len() == 5 {
+          (Some(&args[3]), Some(&args[4]))
+        } else if args.len() == 4 {
+          (Some(&args[3]), None)
+        } else {
+          (None, None)
+        };
+        return Some(list_helpers_ast::partition_ast(
+          &args[0], n, d, align, pad,
+        ));
+      }
+      // Multi-dimensional form: Partition[tensor, {n1, n2, ...}, d]
+      // partitions each dimension in turn with block sizes `n_i` and a
+      // uniform offset `d`.
+      if let Expr::List(ns) = &args[1] {
+        let Some(sizes) =
+          ns.iter().map(positive_machine).collect::<Option<Vec<_>>>()
+        else {
+          ilsmp(2);
+          return uneval();
+        };
+        let offsets: Option<Vec<i128>> = if args.len() >= 3 {
+          match &args[2] {
+            Expr::List(ds) if ds.len() == sizes.len() => {
+              ds.iter().map(positive_machine).collect()
+            }
+            e => positive_machine(e).map(|n| vec![n; sizes.len()]),
+          }
+        } else {
+          Some(sizes.clone())
+        };
+        let Some(offsets) = offsets else {
+          ilsmp(3);
+          return uneval();
+        };
+        {
+          // Depth check: a {n1, ..., nk} size spec needs a depth-k
+          // rectangular object, else Partition::pdep
+          let mut dims: Vec<usize> = Vec::new();
+          let mut cursor = &args[0];
+          while let Expr::List(rows) = cursor {
+            dims.push(rows.len());
+            match rows.first() {
+              Some(first)
+                if rows.iter().all(|r| {
+                  matches!(r, Expr::List(a) if matches!(first, Expr::List(b) if a.len() == b.len()))
+                }) =>
+              {
+                cursor = first;
+              }
+              _ => break,
+            }
+          }
+          if dims.len() < sizes.len() {
+            let dims_expr = Expr::List(
+              dims
+                .iter()
+                .map(|&d| Expr::Integer(d as i128))
+                .collect::<Vec<_>>()
+                .into(),
+            );
+            crate::emit_message(&format!(
+              "Partition::pdep: Depth {} requested in object with dimensions {}.",
+              sizes.len(),
+              expr_to_string(&dims_expr)
+            ));
+            return Some(Ok(unevaluated("Partition", args)));
+          }
+          return Some(list_helpers_ast::partition_multi_dim_ast(
+            &args[0], &sizes, &offsets,
+          ));
+        }
+      }
+      // Any other second argument is an invalid size spec. The message
+      // displays an UpTo wrapper's content; the return keeps the wrapper.
+      let mut display_args = args.to_vec();
+      if let Expr::FunctionCall {
+        name: ut_name,
+        args: ut_args,
+      } = &args[1]
+        && ut_name == "UpTo"
+        && ut_args.len() == 1
+      {
+        display_args[1] = ut_args[0].clone();
+      }
+      crate::emit_message(&format!(
+        "Partition::ilsmp: Single or list of positive machine-sized integers expected at position 2 of {}.",
+        crate::syntax::format_expr(
+          &call("Partition", display_args),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+      return uneval();
+    }
+    "Permutations" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::permutations_ast(args));
+    }
+    "Combinatorica`UnrankPermutation" if args.len() == 2 => {
+      return Some(list_helpers_ast::combinatorica_unrank_permutation_ast(
+        args,
+      ));
+    }
+    "Combinatorica`Partitions" if args.len() == 1 => {
+      return Some(crate::functions::math_ast::integer_partitions_ast(args));
+    }
+    "Combinatorica`Permutations" if args.len() == 1 => {
+      return Some(list_helpers_ast::combinatorica_permutations_ast(args));
+    }
+    "Combinatorica`Derangements" if args.len() == 1 => {
+      return Some(list_helpers_ast::combinatorica_derangements_ast(args));
+    }
+    "Signature" if args.len() == 1 => {
+      use crate::functions::list_helpers_ast::sorting::canonical_cmp;
+      // Signature operates on any non-atomic expression: it treats the
+      // level-1 parts (the arguments, regardless of head — `List`, `Cycles`,
+      // `f`, …) as a sequence and returns the sign of the permutation that
+      // canonically sorts them, or 0 if two parts are equal. `Rational`/
+      // `Complex` are atoms despite their FunctionCall head, so they don't
+      // qualify. Ordering uses the canonical Order (numeric, not string — so
+      // `Signature[{10, 2}]` is -1, not the old string-compare 1).
+      let parts: Option<Vec<&Expr>> = match &args[0] {
+        Expr::FunctionCall { name, .. }
+          if name == "Rational" || name == "Complex" =>
+        {
+          None
+        }
+        Expr::List(items) => Some(items.iter().collect()),
+        Expr::FunctionCall { args: a, .. } => Some(a.iter().collect()),
+        _ => None,
+      };
+      if let Some(items) = parts {
+        let mut inversions: u64 = 0;
+        for i in 0..items.len() {
+          for j in (i + 1)..items.len() {
+            match canonical_cmp(items[i], items[j]) {
+              std::cmp::Ordering::Equal => return Some(Ok(Expr::Integer(0))),
+              std::cmp::Ordering::Greater => inversions += 1,
+              std::cmp::Ordering::Less => {}
+            }
+          }
+        }
+        return Some(Ok(Expr::Integer(if inversions.is_multiple_of(2) {
+          1
+        } else {
+          -1
+        })));
+      }
+      // Atomic argument (Integer, Real, String, Symbol, Rational, …): emit the
+      // Wolfram `normal` message and leave the call unevaluated.
+      let is_atom = crate::functions::predicate_ast::atom_q_ast(
+        std::slice::from_ref(&args[0]),
+      )
+      .is_ok_and(|r| matches!(r, Expr::Identifier(ref s) if s == "True"));
+      if is_atom {
+        crate::emit_message(&format!(
+          "Signature::normal: Nonatomic expression expected at position 1 in Signature[{}].",
+          expr_to_output(&args[0])
+        ));
+      }
+      return Some(Ok(unevaluated("Signature", args)));
+    }
+    "Subsets" if !args.is_empty() && args.len() <= 3 => {
+      return Some(list_helpers_ast::subsets_ast(args));
+    }
+    "SubsetPosition" if args.len() == 2 => {
+      return Some(list_helpers_ast::subset_position_ast(&args[0], &args[1]));
+    }
+    "SubsetCases" if args.len() == 2 || args.len() == 3 => {
+      let max_count = if args.len() == 3 {
+        match &args[2] {
+          Expr::Integer(n) => Some(*n as usize),
+          Expr::Identifier(s) if s == "Infinity" => None,
+          _ => None,
+        }
+      } else {
+        None
+      };
+      return Some(list_helpers_ast::subset_cases_ast(
+        &args[0], &args[1], max_count,
+      ));
+    }
+    "SubsetCount" if args.len() == 2 => {
+      return Some(list_helpers_ast::subset_count_ast(&args[0], &args[1]));
+    }
+    "Subsequences" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::subsequences_ast(args));
+    }
+    "Groupings" if args.len() == 2 => {
+      return Some(list_helpers_ast::groupings_ast(args));
+    }
+    "PeakDetect" if !args.is_empty() && args.len() <= 2 => {
+      return Some(list_helpers_ast::peak_detect_ast(args));
+    }
+    "SparseArray" if !args.is_empty() => {
+      // Normalize to canonical form: SparseArray[Automatic, dims, default, rules].
+      // Use Normal[] to expand to a dense nested list.
+      return Some(list_helpers_ast::sparse_array_normalize_ast(args));
+    }
+    "Normal" if args.len() == 1 => {
+      // Normal[FittedModel[...]] extracts the fitted expression
+      if let Expr::FunctionCall {
+        name,
+        args: fm_args,
+      } = &args[0]
+        && name == "FittedModel"
+      {
+        return Some(
+          crate::functions::linear_algebra_ast::fitted_model_normal(fm_args),
+        );
+      }
+      // A SymmetrizedArray reports on the dense array it stands for, whose
+      // positions the symmetry only stores one representative of.
+      if let Some(dense) =
+        crate::functions::linear_algebra_ast::symmetrized_array_to_dense(
+          &args[0],
+        )
+      {
+        return Some(dense);
+      }
+      // Normal[LowerTriangularMatrix[…]] (and the other structured-matrix
+      // wrappers produced by LUDecomposition) expands to the dense list.
+      if let Some(dense) =
+        crate::functions::linear_algebra_ast::structured_matrix_to_dense(
+          &args[0],
+        )
+      {
+        return Some(Ok(dense));
+      }
+      // Normal[NumericArray[list, type]] returns the underlying list
+      // (`{{1,2},{3,4}}`), discarding the dtype tag — wolframscript does
+      // the same.
+      if let Expr::FunctionCall {
+        name,
+        args: na_args,
+      } = &args[0]
+        && name == "NumericArray"
+        && (na_args.len() == 1 || na_args.len() == 2)
+        && matches!(&na_args[0], Expr::List(_))
+      {
+        return Some(Ok(na_args[0].clone()));
+      }
+      // Normal[ByteArray["base64"]] extracts the byte list
+      if let Expr::FunctionCall {
+        name,
+        args: ba_args,
+      } = &args[0]
+        && name == "ByteArray"
+        && ba_args.len() == 1
+      {
+        if let Expr::String(b64) = &ba_args[0] {
+          use base64::Engine;
+          let engine = base64::engine::general_purpose::STANDARD;
+          if let Ok(decoded) = engine.decode(b64) {
+            let bytes: Vec<Expr> =
+              decoded.iter().map(|b| Expr::Integer(*b as i128)).collect();
+            return Some(Ok(Expr::List(bytes.into())));
+          }
+        }
+        // Fallback: if it's already a list (shouldn't happen but be safe)
+        if matches!(&ba_args[0], Expr::List(_)) {
+          return Some(Ok(ba_args[0].clone()));
+        }
+      }
+      // Normal[SparseArray[...]] expands to a regular list
+      if let Expr::FunctionCall {
+        name,
+        args: sa_args,
+      } = &args[0]
+        && name == "SparseArray"
+      {
+        return Some(list_helpers_ast::sparse_array_ast(sa_args));
+      }
+      // Normal[Dataset[data, ...]] extracts the data
+      if let Expr::FunctionCall {
+        name,
+        args: ds_args,
+      } = &args[0]
+        && name == "Dataset"
+        && !ds_args.is_empty()
+      {
+        return Some(Ok(ds_args[0].clone()));
+      }
+      // Normal[Tabular[data, ...]] extracts the data
+      if let Expr::FunctionCall {
+        name,
+        args: tab_args,
+      } = &args[0]
+        && name == "Tabular"
+        && !tab_args.is_empty()
+      {
+        // For column-oriented data (Association with list values), transpose to rows
+        if let Expr::Association(pairs) = &tab_args[0]
+          && !pairs.is_empty()
+          && pairs.iter().all(|(_, v)| matches!(v, Expr::List(_)))
+        {
+          // Determine number of rows from the longest column
+          let num_rows = pairs
+            .iter()
+            .map(|(_, v)| {
+              if let Expr::List(items) = v {
+                items.len()
+              } else {
+                0
+              }
+            })
+            .max()
+            .unwrap_or(0);
+          // Build row-oriented associations
+          let mut rows = Vec::new();
+          for i in 0..num_rows {
+            let mut row_pairs = Vec::new();
+            for (k, v) in pairs {
+              let val = if let Expr::List(items) = v {
+                items.get(i).cloned().unwrap_or(call0("Missing"))
+              } else {
+                v.clone()
+              };
+              row_pairs.push((k.clone(), val));
+            }
+            rows.push(Expr::Association(row_pairs));
+          }
+          return Some(Ok(Expr::List(rows.into())));
+        }
+        return Some(Ok(tab_args[0].clone()));
+      }
+      // Normal[SeriesData[x, x0, {c0, c1, ...}, nmin, nmax, den]]
+      // => sum(c_i * (x - x0)^(nmin + i), i=0..len-1) when den=1
+      if let Expr::FunctionCall {
+        name,
+        args: sd_args,
+      } = &args[0]
+        && name == "SeriesData"
+        && sd_args.len() == 6
+      {
+        let var = &sd_args[0];
+        let x0 = &sd_args[1];
+        let Expr::List(coeffs) = &sd_args[2] else {
+          return Some(Ok(args[0].clone()));
+        };
+        let nmin = match &sd_args[3] {
+          Expr::Integer(n) => *n,
+          _ => return Some(Ok(args[0].clone())),
+        };
+
+        if coeffs.is_empty() {
+          return Some(Ok(Expr::Integer(0)));
+        }
+
+        let is_zero_center = matches!(x0, Expr::Integer(0));
+        // A series expanded at Infinity is a series in 1/x: the i-th term is
+        // `c_i * x^(-(nmin + i))`. The base is just `x` and the exponents are
+        // negated (handled where `power` is computed below).
+        let is_infinity = matches!(x0, Expr::Identifier(s) if s == "Infinity");
+
+        // Build the base expression: x, (-x0 + x), or x (at Infinity).
+        let base = if is_zero_center || is_infinity {
+          var.clone()
+        } else {
+          plus2(neg1(x0.clone()), var.clone())
+        };
+
+        // Build terms: c_i * base^(nmin + i). Recursively apply Normal to
+        // any inner `SeriesData` coefficient so multivariate Series like
+        // `Series[Exp[x-y], {x,0,2}, {y,0,2}] // Normal` collapse to a
+        // genuine bivariate polynomial.
+        let mut terms: Vec<Expr> = Vec::new();
+        for (i, coeff) in coeffs.iter().enumerate() {
+          if matches!(coeff, Expr::Integer(0)) {
+            continue;
+          }
+          let coeff_normalised = if matches!(
+            coeff,
+            Expr::FunctionCall { name, args } if name == "SeriesData" && args.len() == 6
+          ) {
+            let inner = call1("Normal", coeff.clone());
+            match evaluate_expr_to_expr(&inner) {
+              Ok(v) => v,
+              Err(e) => return Some(Err(e)),
+            }
+          } else {
+            coeff.clone()
+          };
+          let raw_power = nmin + i as i128;
+          let power = if is_infinity { -raw_power } else { raw_power };
+          // base^power
+          let base_pow = if power == 0 {
+            None
+          } else if power == 1 {
+            Some(base.clone())
+          } else {
+            Some(pow2(base.clone(), Expr::Integer(power)))
+          };
+
+          // Build c * x^n in Mathematica's canonical form:
+          // Rational[-a,b]*x^n => -(a*x^n)/b  which prints as -(a*x^n)/b
+          let term = match base_pow {
+            None => coeff_normalised,
+            Some(bp) => {
+              // Evaluate the Times to get canonical form
+              let t = times2(coeff_normalised, bp);
+              match evaluate_expr_to_expr(&t) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+              }
+            }
+          };
+          terms.push(term);
+        }
+
+        if terms.is_empty() {
+          return Some(Ok(Expr::Integer(0)));
+        }
+
+        // At Infinity the terms are powers of 1/x; let the evaluator put them
+        // in canonical Plus order (most-negative exponent first, matching
+        // wolframscript). For a finite center the natural low-to-high build
+        // order is already canonical, so keep it to avoid disturbing it.
+        if is_infinity {
+          let plus = call("Plus", terms);
+          return Some(evaluate_expr_to_expr(&plus));
+        }
+
+        // Combine terms with Plus, preserving order (low to high power)
+        let result = terms.into_iter().reduce(plus2).unwrap();
+        return Some(Ok(result));
+      }
+      // Normal[<|k -> v, ...|>] converts Association to List of rules.
+      // A `RuleDelayed { pattern == key, replacement }` value is the marker
+      // for an entry that was originally `key :> value`; preserve it as
+      // `key :> value` in the output list.
+      if let Expr::Association(pairs) = &args[0] {
+        let rules: Vec<Expr> = pairs
+          .iter()
+          .map(|(k, v)| match v {
+            Expr::RuleDelayed {
+              pattern,
+              replacement,
+            } if crate::syntax::assoc_marker_matches(k, pattern) => {
+              Expr::RuleDelayed {
+                pattern: Box::new(k.clone()),
+                replacement: replacement.clone(),
+              }
+            }
+            _ => Expr::Rule {
+              pattern: Box::new(k.clone()),
+              replacement: Box::new(v.clone()),
+            },
+          })
+          .collect();
+        return Some(Ok(Expr::List(rules.into())));
+      }
+      // Normal[FunctionCall{Association, args}] converts to List
+      if let Expr::FunctionCall {
+        name,
+        args: assoc_args,
+      } = &args[0]
+        && name == "Association"
+      {
+        return Some(Ok(Expr::List(assoc_args.clone())));
+      }
+      // Normal[GraphicsComplex[pts, data]] substitutes point indices with
+      // their coordinates in `data`, returning "an ordinary list of
+      // graphics primitives and directives".
+      if let Expr::FunctionCall {
+        name,
+        args: gc_args,
+      } = &args[0]
+        && name == "GraphicsComplex"
+        && gc_args.len() >= 2
+        && let Expr::List(pts) = &gc_args[0]
+      {
+        return Some(Ok(
+          crate::functions::graphics::graphics_complex_to_normal_form(
+            pts,
+            &gc_args[1],
+            &gc_args[2..],
+          ),
+        ));
+      }
+      // For other expressions, recursively densify Associations/SparseArrays
+      // in the arguments, then re-evaluate so structural operations over the
+      // densified pieces resolve — e.g. Normal[SparseArray[..] + SparseArray[..]]
+      // densifies each to a list and then evaluates the `{..} + {..}` sum.
+      let converted = normal_convert_associations(&args[0]);
+      // Only re-evaluate when densification actually changed the expression,
+      // to avoid disturbing the plain `Normal[expr]` (no Association/
+      // SparseArray) pass-through.
+      if expr_to_string(&converted) == expr_to_string(&args[0]) {
+        return Some(Ok(converted));
+      }
+      return Some(Ok(evaluate_expr_to_expr(&converted).unwrap_or(converted)));
+    }
+    // Normal[expr, h] normalizes only objects whose head is h (or in the list
+    // h), leaving everything else — including the values of an untouched
+    // Association — as-is.
+    "Normal" if args.len() == 2 => {
+      let heads = normal_head_spec_names(&args[1]);
+      if heads.is_empty() {
+        return Some(Ok(unevaluated("Normal", args)));
+      }
+      return Some(Ok(normal_with_heads(&args[0], &heads)));
+    }
+    "First" if args.len() == 1 || args.len() == 2 => {
+      let default = if args.len() == 2 {
+        Some(&args[1])
+      } else {
+        None
+      };
+      return Some(
+        list_helpers_ast::first_ast(&args[0], default)
+          .and_then(|r| evaluate_if_unheld(name, &args[0], r))
+          .and_then(|r| evaluate_used_default(r, default)),
+      );
+    }
+    "Last" if args.len() == 1 || args.len() == 2 => {
+      let default = if args.len() == 2 {
+        Some(&args[1])
+      } else {
+        None
+      };
+      return Some(
+        list_helpers_ast::last_ast(&args[0], default)
+          .and_then(|r| evaluate_if_unheld(name, &args[0], r))
+          .and_then(|r| evaluate_used_default(r, default)),
+      );
+    }
+    "Rest" if args.len() == 1 => {
+      return Some(list_helpers_ast::rest_ast(&args[0]));
+    }
+    "Most" if args.len() == 1 => {
+      return Some(list_helpers_ast::most_ast(&args[0]));
+    }
+    // Take[expr] and Drop[expr] have no sequence specification, so they take
+    // and drop nothing and give back the expression itself. (In particular
+    // they are not operator forms — `Drop[1][list]` is `1[list]`.)
+    "Take" | "Drop" if args.len() == 1 => {
+      return Some(Ok(args[0].clone()));
+    }
+    "Take" if args.len() >= 2 => {
+      if let Some(r) = invalid_seq_spec(name, args) {
+        return Some(r);
+      }
+      return Some(list_helpers_ast::take_multi_ast(&args[0], &args[1..]));
+    }
+    "Drop" if args.len() == 2 => {
+      if let Some(r) = invalid_seq_spec(name, args) {
+        return Some(r);
+      }
+      return Some(list_helpers_ast::drop_ast(&args[0], &args[1]));
+    }
+    "Drop" if args.len() == 3 => {
+      if let Some(r) = invalid_seq_spec(name, args) {
+        return Some(r);
+      }
+      return Some(list_helpers_ast::drop_multi_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "ArrayRules" if args.len() == 1 || args.len() == 2 => {
+      // A SymmetrizedArray reports on the dense array it stands for, whose
+      // positions the symmetry only stores one representative of.
+      if let Some(dense) =
+        crate::functions::linear_algebra_ast::symmetrized_array_to_dense(
+          &args[0],
+        )
+      {
+        let mut densified = args.to_vec();
+        densified[0] = match dense {
+          Ok(d) => d,
+          Err(err) => return Some(Err(err)),
+        };
+        return Some(array_rules_ast(&densified));
+      }
+      // Structured matrices report the rules of the matrix they represent.
+      if let Some(dense) =
+        crate::functions::linear_algebra_ast::structured_matrix_to_dense(
+          &args[0],
+        )
+      {
+        let mut densified = args.to_vec();
+        densified[0] = dense;
+        return Some(array_rules_ast(&densified));
+      }
+      return Some(array_rules_ast(args));
+    }
+    "TakeDrop" if args.len() == 2 => {
+      let taken = list_helpers_ast::take_multi_ast(&args[0], &args[1..]);
+      let dropped = list_helpers_ast::drop_ast(&args[0], &args[1]);
+      return Some(match (taken, dropped) {
+        (Ok(t), Ok(d)) => Ok(Expr::List(vec![t, d].into())),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+      });
+    }
+    "ArrayFlatten" if args.len() == 1 => {
+      return Some(Ok(array_flatten_ast(&args[0])));
+    }
+    // ArrayFlatten[a, r] glues a depth-2r block array. It is defined as
+    // Flatten[a, {{1, r+1}, {2, r+2}, ..., {r, 2r}}]. r = 2 is the default,
+    // whose dedicated path also pads scalar (e.g. 0) blocks; other ranks use
+    // the level-spec Flatten equivalence.
+    "ArrayFlatten" if args.len() == 2 => {
+      let Some(r) = expr_to_i128(&args[1]).filter(|r| *r >= 1) else {
+        return Some(Ok(unevaluated("ArrayFlatten", args)));
+      };
+      if r == 2 {
+        return Some(Ok(array_flatten_ast(&args[0])));
+      }
+      let spec: Vec<Expr> = (1..=r)
+        .map(|i| {
+          Expr::List(vec![Expr::Integer(i), Expr::Integer(i + r)].into())
+        })
+        .collect();
+      return Some(list_helpers_ast::flatten_unified_ast(&[
+        args[0].clone(),
+        Expr::List(spec.into()),
+      ]));
+    }
+    "Flatten" if !args.is_empty() && args.len() <= 3 => {
+      return Some(list_helpers_ast::flatten_unified_ast(args));
+    }
+    "Level" if args.len() >= 2 && args.len() <= 4 => {
+      return Some(list_helpers_ast::level_unified_ast(args));
+    }
+    "Reverse" if args.len() == 1 => {
+      return Some(list_helpers_ast::reverse_ast(&args[0]));
+    }
+    "Reverse" if args.len() == 2 => {
+      return Some(list_helpers_ast::reverse_level_ast(&args[0], &args[1]));
+    }
+    "LexicographicSort" if args.len() == 1 => {
+      // Atomic arg: emit ::normal and stay unevaluated (matches Sort).
+      if list_helpers_ast::is_atomic_arg(&args[0]) {
+        list_helpers_ast::emit_nonatomic_normal_message(
+          "LexicographicSort",
+          args,
+        );
+        return Some(Ok(unevaluated("LexicographicSort", args)));
+      }
+      // LexicographicSort compares lists element by element (shorter lists are
+      // NOT pulled to the front the way the canonical Sort does).
+      return Some(list_helpers_ast::lexicographic_sort_ast(&args[0]));
+    }
+    "Sort" if args.len() == 1 => {
+      return Some(list_helpers_ast::sort_ast(&args[0]));
+    }
+    "Sort" if args.len() == 2 => {
+      // Sort[atom, p] is invalid: emit ::normal and stay unevaluated.
+      if list_helpers_ast::is_atomic_arg(&args[0]) {
+        list_helpers_ast::emit_nonatomic_normal_message("Sort", args);
+        return Some(Ok(unevaluated("Sort", args)));
+      }
+      // Sort[assoc, p] - sort the association entries by their values using p,
+      // mirroring Sort[assoc] (which orders by value). Keys ride along.
+      if let Expr::Association(entries) = &args[0] {
+        let comparator = args[1].clone();
+        let mut take_left = |a: &(Expr, Expr), b: &(Expr, Expr)| {
+          crate::functions::list_helpers_ast::comparator_keeps_order(
+            &comparator,
+            &a.1,
+            &b.1,
+          )
+        };
+        let sorted = match crate::functions::list_helpers_ast::wl_ordering_sort(
+          entries,
+          &mut take_left,
+        ) {
+          Ok(v) => v,
+          Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(Expr::Association(sorted)));
+      }
+      // Sort[list, p] - sort using comparator p
+      // p[a, b] returns True if a should come before b
+      let (items, head_name) = match &args[0] {
+        Expr::List(items) => (Some(items.clone()), None),
+        Expr::FunctionCall { name, args } => {
+          (Some(args.clone()), Some(name.clone()))
+        }
+        _ => (None, None),
+      };
+      if let Some(sorted) = items {
+        let wrap = |items: Vec<Expr>| -> Expr {
+          match &head_name {
+            None => Expr::List(items.into()),
+            Some(name) => Expr::FunctionCall {
+              name: name.clone(),
+              args: items.into(),
+            },
+          }
+        };
+        // Apply the comparator p[a, b] via the normal function-application
+        // machinery (so Less/Greater, pure Functions like `#1 > #2 &`,
+        // NamedFunctions and curried calls all work), through the merge order
+        // wolframscript uses: the pair stays as it is unless p[a, b] is a
+        // definite False. A symbolic non-Boolean result (`c < a`) leaves the
+        // order alone — hence Sort[{c, a, b}, Less] is {c, a, b}, not the
+        // canonical {a, b, c} — while a definite False swaps it.
+        let comparator = args[1].clone();
+        let mut take_left = |a: &Expr, b: &Expr| {
+          crate::functions::list_helpers_ast::comparator_keeps_order(
+            &comparator,
+            a,
+            b,
+          )
+        };
+        let ordered = match crate::functions::list_helpers_ast::wl_ordering_sort(
+          &sorted,
+          &mut take_left,
+        ) {
+          Ok(v) => v,
+          Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(wrap(ordered)));
+      }
+    }
+    "ReverseSort" if args.len() == 1 || args.len() == 2 => {
+      // ReverseSort[list] sorts then reverses
+      // ReverseSort[list, p] sorts by p then reverses
+      let mut sorted = match evaluate_expr_to_expr(&unevaluated("Sort", args)) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+      };
+      if let Expr::List(ref mut items) = sorted {
+        items.reverse();
+        return Some(Ok(Expr::List(std::mem::take(items))));
+      }
+      // On an association, Sort orders the pairs ascending by value; reverse
+      // them so ReverseSort is descending by value.
+      if let Expr::Association(ref mut pairs) = sorted {
+        pairs.reverse();
+        return Some(Ok(Expr::Association(std::mem::take(pairs))));
+      }
+      return Some(Ok(sorted));
+    }
+    "List" => {
+      // List[a, b, c] is equivalent to {a, b, c}
+      return Some(Ok(Expr::List(args.to_vec().into())));
+    }
+    "Range" => {
+      return Some(list_helpers_ast::range_ast(args));
+    }
+    "PowerRange" if args.len() == 2 || args.len() == 3 => {
+      return Some(list_helpers_ast::power_range_ast(args));
+    }
+    "Accumulate" if args.len() == 1 => {
+      return Some(list_helpers_ast::accumulate_ast(&args[0]));
+    }
+    "AnglePath" => {
+      return Some(list_helpers_ast::angle_path_ast(args));
+    }
+    "AnglePath3D" if args.len() == 1 => {
+      return Some(list_helpers_ast::angle_path_3d_ast(args));
+    }
+    "FindPeaks" if (1..=4).contains(&args.len()) => {
+      return Some(list_helpers_ast::find_peaks_ast(args));
+    }
+    // A concrete non-list argument (a number, string, association, boolean,
+    // or any NumericQ atom such as Pi or Sin[2]) can never be differenced:
+    // emit Differences::listrp and stay unevaluated, matching wolframscript.
+    // Bare symbols and unknown function heads are left alone (they may still
+    // acquire a list value), so they fall through to the arms below.
+    "Differences"
+      if (1..=3).contains(&args.len()) && listrp_invalid_atom(&args[0]) =>
+    {
+      let call = unevaluated("Differences", args);
+      crate::emit_message(&format!(
+        "Differences::listrp: List, SparseArray object, or structured array expected at position 1 in {}.",
+        crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+      ));
+      return Some(Ok(call));
+    }
+    "Differences" if args.len() == 1 => {
+      return Some(list_helpers_ast::differences_ast(&args[0]));
+    }
+    "Differences" if args.len() == 2 => {
+      if let Some(n) = expr_to_i128(&args[1]) {
+        return Some(list_helpers_ast::differences_n_ast(&args[0], n as usize));
+      }
+      if let Expr::List(spec_items) = &args[1] {
+        let spec: Option<Vec<usize>> = spec_items
+          .iter()
+          .map(|e| expr_to_i128(e).map(|n| n as usize))
+          .collect();
+        if let Some(spec) = spec {
+          // A multi-level spec deeper than the array emits ::depth, mirroring
+          // wolframscript, rather than recursing into scalar elements.
+          let depth = array_depth(&args[0]);
+          if spec.len() > depth {
+            let call = unevaluated("Differences", args);
+            crate::emit_message(&format!(
+              "Differences::depth: Requested differences {} exceeds the array depth, {}, of the input.",
+              crate::syntax::format_expr(
+                &args[1],
+                crate::syntax::ExprForm::Output
+              ),
+              depth
+            ));
+            return Some(Ok(call));
+          }
+          return Some(list_helpers_ast::differences_spec_ast(&args[0], &spec));
+        }
+      }
+    }
+    "Differences" if args.len() == 3 => {
+      // Differences[list, n, s] — n-th differences with step s.
+      if let (Some(n), Some(s)) =
+        (expr_to_i128(&args[1]), expr_to_i128(&args[2]))
+        && n >= 0
+        && s >= 1
+      {
+        return Some(list_helpers_ast::differences_step_ast(
+          &args[0], n as usize, s as usize,
+        ));
+      }
+    }
+    // Like Differences, a concrete non-list argument is rejected with
+    // Ratios::listrp; bare symbols / unknown heads fall through.
+    "Ratios"
+      if (1..=2).contains(&args.len()) && listrp_invalid_atom(&args[0]) =>
+    {
+      let call = unevaluated("Ratios", args);
+      crate::emit_message(&format!(
+        "Ratios::listrp: List, SparseArray object, or structured array expected at position 1 in {}.",
+        crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+      ));
+      return Some(Ok(call));
+    }
+    "Ratios" if args.len() == 3 => {
+      // Ratios[list, n, s] — n-th successive ratios with step s.
+      if let (Some(n), Some(s)) =
+        (expr_to_i128(&args[1]), expr_to_i128(&args[2]))
+        && n >= 0
+        && s >= 1
+      {
+        return Some(list_helpers_ast::ratios_step_ast(
+          &args[0], n as usize, s as usize,
+        ));
+      }
+    }
+    "Ratios" if args.len() == 1 || args.len() == 2 => {
+      let n = if args.len() == 2 {
+        match expr_to_i128(&args[1]) {
+          Some(n) if n >= 0 => n as usize,
+          _ => {
+            return Some(Ok(unevaluated("Ratios", args)));
+          }
+        }
+      } else {
+        1
+      };
+      if let Expr::List(items) = &args[0] {
+        let mut current = items.clone();
+        for _ in 0..n {
+          if current.len() < 2 {
+            return Some(Ok(Expr::List(vec![].into())));
+          }
+          let mut next = Vec::with_capacity(current.len() - 1);
+          for i in 1..current.len() {
+            // Through the `Divide` head, not `a * b^-1`: a zero denominator
+            // has to report `Divide::infy` / `Divide::indet`, which is what
+            // wolframscript's `Ratios` emits. The `Times`/`Power` route
+            // reports `Power::infy` plus `Infinity::indet` instead.
+            let ratio = match evaluate_function_call_ast(
+              "Divide",
+              &[current[i].clone(), current[i - 1].clone()],
+            ) {
+              Ok(v) => v,
+              Err(e) => return Some(Err(e)),
+            };
+            next.push(ratio);
+          }
+          current = next.into();
+        }
+        return Some(Ok(Expr::List(current)));
+      }
+      return Some(Ok(unevaluated("Ratios", args)));
+    }
+    "Scan" if args.len() == 2 => {
+      return Some(list_helpers_ast::scan_ast(&args[0], &args[1]));
+    }
+    "Scan" if args.len() == 3 => {
+      return Some(list_helpers_ast::scan_levelspec_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "SequenceFold" if args.len() == 3 || args.len() == 4 => {
+      return Some(list_helpers_ast::sequence_fold_ast(args));
+    }
+    "SequenceFoldList" if args.len() == 3 || args.len() == 4 => {
+      return Some(list_helpers_ast::sequence_fold_list_ast(args));
+    }
+    "FoldList" if args.len() == 2 || args.len() == 3 => {
+      if args.len() == 3 {
+        return Some(list_helpers_ast::fold_list_ast(
+          &args[0], &args[1], &args[2],
+        ));
+      }
+      // FoldList[f, {a, b, c, ...}] = FoldList[f, a, {b, c, ...}]
+      // Also handles FoldList[f, g[a, b, c, ...]] with arbitrary heads.
+      let (items, head): (&[Expr], Option<&str>) = match &args[1] {
+        Expr::List(items) => (items.as_slice(), None),
+        Expr::FunctionCall { name, args: fargs } => {
+          (fargs.as_slice(), Some(name.as_str()))
+        }
+        _ => {
+          return Some(Ok(unevaluated("FoldList", args)));
+        }
+      };
+      if items.is_empty() {
+        return Some(Ok(match head {
+          Some(h) => call0(h),
+          None => Expr::List(vec![].into()),
+        }));
+      }
+      let init = items[0].clone();
+      let rest = match head {
+        Some(h) => unevaluated(h, &items[1..]),
+        None => Expr::List(items[1..].to_vec().into()),
+      };
+      return Some(list_helpers_ast::fold_list_ast(&args[0], &init, &rest));
+    }
+    "FixedPointList" if args.len() >= 2 => {
+      let (pos, same_test) = split_same_test_option(args);
+      let max_iter = if pos.len() == 3 {
+        // The iteration bound must be a non-negative integer; anything else
+        // (e.g. All) is rejected with intnm rather than silently ignored,
+        // which would otherwise run to the internal iteration cap.
+        match expr_to_i128(&pos[2]) {
+          Some(n) if n >= 0 => Some(n),
+          _ => {
+            crate::emit_message(&format!(
+              "FixedPointList::intnm: Non-negative machine-sized integer expected at position 3 in {}.",
+              expr_to_string(&unevaluated("FixedPointList", args))
+            ));
+            return Some(Ok(unevaluated("FixedPointList", args)));
+          }
+        }
+      } else {
+        None
+      };
+      return Some(list_helpers_ast::fixed_point_list_ast(
+        &pos[0],
+        &pos[1],
+        max_iter,
+        same_test.as_ref(),
+      ));
+    }
+    "Transpose" if args.len() == 1 => {
+      return Some(match list_helpers_ast::transpose_ast(&args[0]) {
+        // A ragged list, or one whose "rows" are not all lists, cannot be
+        // transposed: emit Transpose::nmtx and stay unevaluated rather than
+        // aborting with a hard error (matching wolframscript).
+        Err(InterpreterError::EvaluationError(msg))
+          if msg.contains("same length")
+            || msg.contains("argument must be a matrix") =>
+        {
+          crate::emit_message(&format!(
+            "Transpose::nmtx: The first two levels of {} cannot be transposed.",
+            expr_to_string(&args[0])
+          ));
+          Ok(unevaluated("Transpose", args))
+        }
+        other => other,
+      });
+    }
+    "Transpose" if args.len() == 2 => {
+      if let Expr::List(perm) = &args[1] {
+        return Some(list_helpers_ast::transpose_perm_ast(&args[0], perm));
+      }
+    }
+    "TensorTranspose" if args.len() == 1 || args.len() == 2 => {
+      use list_helpers_ast::TensorTransposeResult;
+      let perm: Option<Vec<Expr>> = if args.len() == 2 {
+        if let Expr::List(perm) = &args[1] {
+          Some(perm.to_vec())
+        } else {
+          crate::emit_message(&format!(
+            "TensorTranspose::symmperm: Invalid permutation or symmetry generator {}.",
+            expr_to_string(&args[1])
+          ));
+          return Some(Ok(unevaluated("TensorTranspose", args)));
+        }
+      } else {
+        None
+      };
+      let result =
+        list_helpers_ast::tensor_transpose_ast(&args[0], perm.as_deref());
+      return Some(Ok(match result {
+        TensorTransposeResult::Ok(e) => e,
+        TensorTransposeResult::RankError { rank } => {
+          let perm_str = match perm {
+            Some(p) => expr_to_string(&Expr::List(p.into())),
+            None => "{2, 1}".to_string(),
+          };
+          crate::emit_message(&format!(
+            "TensorTranspose::ttrank: Permutation {perm_str} moves slots beyond tensor rank {rank}."
+          ));
+          unevaluated("TensorTranspose", args)
+        }
+        TensorTransposeResult::SymmPerm => {
+          let perm_str = match perm {
+            Some(p) => expr_to_string(&Expr::List(p.into())),
+            None => "{2, 1}".to_string(),
+          };
+          crate::emit_message(&format!(
+            "TensorTranspose::symmperm: Invalid permutation or symmetry generator {perm_str}."
+          ));
+          unevaluated("TensorTranspose", args)
+        }
+      }));
+    }
+    "Diagonal" if args.len() == 1 || args.len() == 2 => {
+      let offset = if args.len() == 2 {
+        match &args[1] {
+          Expr::Integer(n) => *n as i64,
+          _ => {
+            return Some(Ok(unevaluated("Diagonal", args)));
+          }
+        }
+      } else {
+        0
+      };
+      if let Expr::List(rows) = &args[0] {
+        let mut result = Vec::new();
+        let nrows = rows.len() as i64;
+        for (i, row) in rows.iter().enumerate() {
+          if let Expr::List(cols) = row {
+            let j = i as i64 + offset;
+            if j >= 0 && (j as usize) < cols.len() && (i as i64) < nrows {
+              result.push(cols[j as usize].clone());
+            }
+          }
+        }
+        return Some(Ok(Expr::List(result.into())));
+      }
+    }
+    "Riffle" if args.len() == 2 || args.len() == 3 => {
+      // A SparseArray first argument is riffled by its dense elements; the
+      // result is a plain List (wolframscript does not keep it sparse).
+      if matches!(&args[0], Expr::FunctionCall { name, .. } if name == "SparseArray")
+      {
+        let normal = match crate::evaluator::evaluate_function_call_ast(
+          "Normal",
+          &[args[0].clone()],
+        ) {
+          Ok(n) => n,
+          Err(e) => return Some(Err(e)),
+        };
+        let mut new_args = args.to_vec();
+        new_args[0] = normal;
+        return Some(list_helpers_ast::riffle_unified_ast(&new_args));
+      }
+      return Some(list_helpers_ast::riffle_unified_ast(args));
+    }
+    "RotateLeft" | "RotateRight" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::rotate_unified_ast(name, args));
+    }
+    "PadLeft" | "PadRight" if !args.is_empty() && args.len() <= 4 => {
+      return Some(list_helpers_ast::pad_ast(name, args));
+    }
+    "Join" => {
+      // SparseArray arguments join by their dense elements. Densify any sparse
+      // argument, join, then re-wrap as a SparseArray only when every argument
+      // was a SparseArray (a mixed join yields a plain List in wolframscript).
+      let is_sparse = |a: &Expr| matches!(a, Expr::FunctionCall { name, .. } if name == "SparseArray");
+      let is_level_spec =
+        args.len() >= 2 && matches!(&args[args.len() - 1], Expr::Integer(_));
+      if args.iter().any(is_sparse) && !is_level_spec {
+        let all_sparse = args.iter().all(is_sparse);
+        let mut dense = Vec::with_capacity(args.len());
+        for a in args {
+          if is_sparse(a) {
+            match crate::evaluator::evaluate_function_call_ast(
+              "Normal",
+              std::slice::from_ref(a),
+            ) {
+              Ok(n) => dense.push(n),
+              Err(e) => return Some(Err(e)),
+            }
+          } else {
+            dense.push(a.clone());
+          }
+        }
+        let joined = match dispatch_list_operations("Join", &dense) {
+          Some(Ok(r)) => r,
+          other => return other,
+        };
+        if all_sparse && matches!(&joined, Expr::List(_)) {
+          return Some(crate::evaluator::evaluate_function_call_ast(
+            "SparseArray",
+            &[joined],
+          ));
+        }
+        return Some(Ok(joined));
+      }
+      // Join[expr, n] — a single expression with a trailing positive-integer
+      // level. Joining one expression yields that expression unchanged for any
+      // valid level (no depth requirement), provided it is nonatomic. An atomic
+      // first argument or a non-positive level leaves the call unevaluated.
+      // (wolframscript: Join[{1,2}, 3] -> {1, 2}, Join[5, 2] -> Join[5, 2].)
+      if args.len() == 2
+        && let Expr::Integer(n) = &args[1]
+      {
+        if *n >= 1
+          && matches!(&args[0], Expr::List(_) | Expr::FunctionCall { .. })
+        {
+          return Some(Ok(args[0].clone()));
+        }
+        return Some(Ok(unevaluated("Join", args)));
+      }
+      // Check if last argument is an integer level spec
+      if args.len() >= 3
+        && let Expr::Integer(n) = &args[args.len() - 1]
+      {
+        let level = *n as usize;
+        let lists = &args[..args.len() - 1];
+        // For a level >= 2 join every argument must be nested Lists down to
+        // the join level. The first argument that is too shallow triggers
+        // Join::normal1; a later argument whose parts are not Lists triggers
+        // Join::headsd. Both leave the call unevaluated, matching
+        // wolframscript.
+        if level >= 2 {
+          let unevaluated = || unevaluated("Join", args);
+          for (i, a) in lists.iter().enumerate() {
+            if !has_join_depth(a, level) {
+              let tag = if i == 0 {
+                format!(
+                  "Join::normal1: Expression {} at position 1 is expected to \
+                   have nonatomic subexpression at level {}.",
+                  expr_to_string(a),
+                  level
+                )
+              } else {
+                format!(
+                  "Join::headsd: Expression {} at position {} is expected to \
+                   have head List for all expressions at level {}.",
+                  expr_to_string(a),
+                  i + 1,
+                  level
+                )
+              };
+              crate::emit_message(&tag);
+              return Some(Ok(unevaluated()));
+            }
+          }
+        }
+        return Some(list_helpers_ast::join_at_level_ast(lists, level));
+      }
+      return Some(list_helpers_ast::join_ast(args));
+    }
+    "Append" if args.len() == 2 => {
+      return Some(list_helpers_ast::append_ast(&args[0], &args[1]));
+    }
+    "Prepend" if args.len() == 2 => {
+      return Some(list_helpers_ast::prepend_ast(&args[0], &args[1]));
+    }
+    "DeleteDuplicatesBy" if args.len() == 2 => {
+      return Some(list_helpers_ast::delete_duplicates_by_ast(
+        &args[0], &args[1],
+      ));
+    }
+    // WeightedData[data, weights] canonicalizes to the internal form
+    // WeightedData[Automatic, {data, weights}] (matching wolframscript).
+    "WeightedData" if args.len() == 2 => {
+      // Already canonical: leave as-is.
+      if weighted_data_parts(&unevaluated("WeightedData", args)).is_some() {
+        return None;
+      }
+      if let (Expr::List(d), Expr::List(w)) = (&args[0], &args[1])
+        && d.len() == w.len()
+        && !d.is_empty()
+      {
+        let vals = vec![args[0].clone(), args[1].clone()];
+        let data = vec![id_expr("Automatic"), Expr::List(vals.into())];
+        return Some(Ok(call("WeightedData", data)));
+      }
+      return None;
+    }
+    // Mean/Variance/StandardDeviation/Median of a WeightedData object.
+    "Mean" | "Variance" | "StandardDeviation" | "Median"
+      if args.len() == 1 && weighted_data_parts(&args[0]).is_some() =>
+    {
+      let (data, weights) = weighted_data_parts(&args[0]).unwrap();
+      return Some(weighted_data_stat(name, &data, &weights));
+    }
+    "Median" if args.len() == 1 => {
+      // Median of an empirical DataDistribution is its 1/2 quantile
+      if let Expr::FunctionCall { name: dn, args: da } = &args[0]
+        && dn == "DataDistribution"
+        && let Some(result) =
+          crate::functions::quantile_distribution_closed_form(
+            dn,
+            da,
+            &crate::functions::math_ast::make_rational(1, 2),
+          )
+      {
+        return Some(Ok(result));
+      }
+      return Some(list_helpers_ast::median_ast(&args[0]));
+    }
+    "Count" if args.len() >= 2 && args.len() <= 4 => {
+      return Some(list_helpers_ast::count_unified_ast(args));
+    }
+    "LongestOrderedSequence" if args.len() == 1 || args.len() == 2 => {
+      return Some(longest_ordered_sequence(args));
+    }
+    // ArrayFilter[f, array, r]: apply f to every radius-r block of a list or
+    // matrix (edges replicated). Non-integer radius / template forms are left
+    // unevaluated.
+    "ArrayFilter" if args.len() == 3 => {
+      if let Some(r) = expr_to_i128(&args[2])
+        && r >= 0
+        && let Some(result) = array_filter(&args[0], &args[1], r as usize)
+      {
+        return Some(result);
+      }
+      return Some(Ok(unevaluated("ArrayFilter", args)));
+    }
+    // MaxDetect[list] / MinDetect[list]: regional-extrema mask of a numeric
+    // list. The 2-argument h-maxima form is left for the morphology code.
+    "MaxDetect" | "MinDetect" if args.len() == 1 => {
+      if let Expr::List(items) = &args[0]
+        && !items.is_empty()
+      {
+        // A rectangular numeric matrix uses 2-D (8-connected) detection.
+        if let Some(mat) = parse_numeric_matrix(items) {
+          return Some(Ok(regional_extrema_2d(&mat, name == "MaxDetect")));
+        }
+        // Otherwise a flat numeric list.
+        if let Some(values) =
+          items.iter().map(expr_to_f64).collect::<Option<Vec<f64>>>()
+        {
+          let mask = regional_extrema(&values, name == "MaxDetect");
+          return Some(Ok(Expr::List(mask.into())));
+        }
+      }
+      // Empty list, non-list, or non-numeric entries: leave unevaluated.
+      return Some(Ok(unevaluated(name, args)));
+    }
+    "ConstantArray" if args.len() == 2 => {
+      return Some(list_helpers_ast::constant_array_ast(&args[0], &args[1]));
+    }
+    "NestWhile" if (3..=6).contains(&args.len()) => {
+      // NestWhile[f, x, test]              — plain (m = 1)
+      // NestWhile[f, x, test, m]           — m = number of recent values to
+      //                                        pass to test (positive integer
+      //                                        or `All`)
+      // NestWhile[f, x, test, m, max]      — max is the maximum iteration cap
+      // NestWhile[f, x, test, m, max, n]   — n extra iterations (or -|n|
+      //                                        steps back) once test fails
+      let m = if args.len() >= 4 {
+        parse_nest_while_m(&args[3])?
+      } else {
+        list_helpers_ast::NestWhileM::Last(1)
+      };
+      let max_iter = if args.len() >= 5 {
+        expr_to_i128(&args[4])
+      } else {
+        None
+      };
+      let extra_n = if args.len() == 6 {
+        expr_to_i128(&args[5])?
+      } else {
+        0
+      };
+      return Some(list_helpers_ast::nest_while_ast(
+        &args[0], &args[1], &args[2], m, max_iter, extra_n,
+      ));
+    }
+    "NestWhileList" if (3..=6).contains(&args.len()) => {
+      let m = if args.len() >= 4 {
+        parse_nest_while_m(&args[3])?
+      } else {
+        list_helpers_ast::NestWhileM::Last(1)
+      };
+      let max_iter = if args.len() >= 5 {
+        expr_to_i128(&args[4])
+      } else {
+        None
+      };
+      let extra_n = if args.len() == 6 {
+        expr_to_i128(&args[5])?
+      } else {
+        0
+      };
+      return Some(list_helpers_ast::nest_while_list_ast(
+        &args[0], &args[1], &args[2], m, max_iter, extra_n,
+      ));
+    }
+    "Thread" if args.len() == 1 => {
+      return Some(match list_helpers_ast::thread_ast(&args[0], None) {
+        Err(InterpreterError::EvaluationError(msg))
+          if msg.contains("same length") =>
+        {
+          crate::emit_message(&format!(
+            "Thread::tdlen: Objects of unequal length in {} cannot be combined.",
+            expr_to_string(&args[0])
+          ));
+          Ok(args[0].clone())
+        }
+        other => other,
+      });
+    }
+    "Thread" if args.len() == 2 => {
+      let head = if let Expr::Identifier(head) = &args[1] {
+        Some(head.as_str())
+      } else {
+        None
+      };
+      return Some(match list_helpers_ast::thread_ast(&args[0], head) {
+        Err(InterpreterError::EvaluationError(msg))
+          if msg.contains("same length") =>
+        {
+          crate::emit_message(&format!(
+            "Thread::tdlen: Objects of unequal length in {} cannot be combined.",
+            expr_to_string(&args[0])
+          ));
+          Ok(args[0].clone())
+        }
+        other => other,
+      });
+    }
+    // Thread[expr, h, n] / Thread[expr, h, {m, n}] — thread only over the
+    // given argument positions (n means positions 1 through n), holding the
+    // rest constant.
+    "Thread" if args.len() == 3 => {
+      let unevaluated = || Ok(unevaluated("Thread", args));
+      let head = if let Expr::Identifier(h) = &args[1] {
+        Some(h.as_str())
+      } else {
+        None
+      };
+      // Parse the position spec into a 1-based range [lo, hi].
+      let range: Option<(usize, usize)> = match &args[2] {
+        Expr::Integer(n) if *n >= 1 => Some((1, *n as usize)),
+        Expr::List(items) if items.len() == 1 => match &items[0] {
+          Expr::Integer(n) if *n >= 1 => Some((*n as usize, *n as usize)),
+          _ => None,
+        },
+        Expr::List(items) if items.len() == 2 => match (&items[0], &items[1]) {
+          (Expr::Integer(m), Expr::Integer(n)) if *m >= 1 && *n >= *m => {
+            Some((*m as usize, *n as usize))
+          }
+          _ => None,
+        },
+        _ => None,
+      };
+      let Some((lo, hi)) = range else {
+        return Some(unevaluated());
+      };
+      let positions: Vec<usize> = (lo..=hi).collect();
+      // The positions must all exist among the expression's arguments.
+      let arg_count = match &args[0] {
+        Expr::FunctionCall { args: fargs, .. } => Some(fargs.len()),
+        _ => None,
+      };
+      if let Some(k) = arg_count
+        && hi > k
+      {
+        crate::emit_message(&format!(
+          "Thread::tpos: Cannot thread over positions {} through {} in {}.",
+          lo,
+          hi,
+          expr_to_string(&args[0])
+        ));
+        return Some(unevaluated());
+      }
+      return Some(
+        match list_helpers_ast::thread_ast_positions(
+          &args[0],
+          head,
+          Some(&positions),
+        ) {
+          Err(InterpreterError::EvaluationError(msg))
+            if msg.contains("same length") =>
+          {
+            crate::emit_message(&format!(
+              "Thread::tdlen: Objects of unequal length in {} cannot be combined.",
+              expr_to_string(&args[0])
+            ));
+            Ok(args[0].clone())
+          }
+          other => other,
+        },
+      );
+    }
+    // Tree[data, children] — canonicalize each child that is not already a
+    // Tree into a leaf Tree[child, None]. A leaf is Tree[data, None].
+    "Tree" if args.len() == 2 => {
+      let is_tree = |e: &Expr| {
+        matches!(e, Expr::FunctionCall { name, args: ta }
+          if name == "Tree" && ta.len() == 2)
+      };
+      if let Expr::List(children) = &args[1] {
+        let canon: Vec<Expr> = children
+          .iter()
+          .map(|c| {
+            if is_tree(c) {
+              c.clone()
+            } else {
+              call("Tree", vec![c.clone(), id_expr("None")])
+            }
+          })
+          .collect();
+        return Some(Ok(call(
+          "Tree",
+          vec![args[0].clone(), Expr::List(canon.into())],
+        )));
+      }
+      // Leaf (children given as None) or any other spec: keep as-is.
+      return Some(Ok(unevaluated("Tree", args)));
+    }
+    // TreeQ[expr] -> True iff expr is a valid Tree object (head Tree with two
+    // arguments whose second is None or a list of valid Trees), else False.
+    // Any non-Tree expression (number, symbol, list, graph, ...) is False.
+    "TreeQ" if args.len() == 1 => {
+      fn is_valid_tree(e: &Expr) -> bool {
+        if let Expr::FunctionCall { name, args } = e
+          && name == "Tree"
+          && args.len() == 2
+        {
+          match &args[1] {
+            Expr::Identifier(n) if n == "None" => true,
+            Expr::List(children) => children.iter().all(is_valid_tree),
+            _ => false,
+          }
+        } else {
+          false
+        }
+      }
+      return Some(Ok(Expr::Identifier(
+        if is_valid_tree(&args[0]) {
+          "True"
+        } else {
+          "False"
+        }
+        .to_string(),
+      )));
+    }
+    // TreeData[Tree[d, _]] -> d ; TreeChildren[Tree[_, c]] -> c.
+    "TreeData" | "TreeChildren" if args.len() == 1 => {
+      if let Expr::FunctionCall { name: tn, args: ta } = &args[0]
+        && tn == "Tree"
+        && ta.len() == 2
+      {
+        return Some(Ok(if name == "TreeData" {
+          ta[0].clone()
+        } else {
+          ta[1].clone()
+        }));
+      }
+      crate::emit_message(&format!(
+        "{name}::tree: Tree expected at position 1 in {}.",
+        expr_to_string(&unevaluated(name, args)),
+      ));
+      return Some(Ok(unevaluated(name, args)));
+    }
+    // ExpressionTree[expr] builds the canonical Tree form of expr; an optional
+    // second argument selects the node-data structure ("Heads" (default),
+    // "Subexpressions", "Atoms", "HeadTrees").
+    "ExpressionTree" if args.len() == 1 || args.len() == 2 => {
+      let structure = if args.len() == 2 {
+        match &args[1] {
+          Expr::String(s) => s.clone(),
+          _ => String::new(),
+        }
+      } else {
+        "Heads".to_string()
+      };
+      if !matches!(
+        structure.as_str(),
+        "Heads" | "HeadTrees" | "Subexpressions" | "Atoms"
+      ) {
+        crate::emit_message(&format!(
+          "ExpressionTree::struct: {} is not a valid expression structure. Valid structures include \"HeadTrees\", \"Heads\", \"Subexpressions\" and \"Atoms\".",
+          expr_to_output(&args[1])
+        ));
+        return Some(Ok(unevaluated("ExpressionTree", args)));
+      }
+      return Some(Ok(build_expression_tree(&args[0], &structure)));
+    }
+    // TreeExpression[tree] reconstructs the expression that the tree
+    // represents — the inverse of ExpressionTree.
+    "TreeExpression" if args.len() == 1 => {
+      return Some(Ok(
+        tree_to_expression(&args[0])
+          .unwrap_or_else(|| unevaluated("TreeExpression", args)),
+      ));
+    }
+    // TreeRules[tree] gives the nested-rule representation of a tree.
+    "TreeRules" if args.len() == 1 => {
+      return Some(Ok(
+        tree_rules(&args[0]).unwrap_or_else(|| unevaluated("TreeRules", args)),
+      ));
+    }
+    // RootTree[tree] gives the root truncated to level 0; RootTree[tree, n]
+    // keeps the tree down to level n (n a non-negative integer or Infinity).
+    "RootTree" if args.len() == 1 || args.len() == 2 => {
+      let unevaluated = || unevaluated("RootTree", args);
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "RootTree::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      let n: Option<i128> = if args.len() == 2 {
+        match &args[1] {
+          Expr::Integer(k) if *k >= 0 => Some(*k),
+          e if is_infinity_symbol(e) => None,
+          _ => return Some(Ok(unevaluated())),
+        }
+      } else {
+        Some(0)
+      };
+      return Some(Ok(root_tree(&args[0], 0, n)));
+    }
+    // TreeLeafQ[x]: True iff x is a leaf Tree[data, None]; False otherwise
+    // (including non-trees and trees with a children list). No ::tree message.
+    "TreeLeafQ" if args.len() == 1 => {
+      let is_leaf = matches!(&args[0], Expr::FunctionCall { name: tn, args: ta }
+        if tn == "Tree"
+          && ta.len() == 2
+          && matches!(&ta[1], Expr::Identifier(s) if s == "None"));
+      return Some(Ok(bool_expr(is_leaf)));
+    }
+    // Structural recursions over a canonical Tree. Each emits ::tree and stays
+    // unevaluated when given a non-tree (matching TreeData/TreeChildren).
+    "TreeDepth" | "TreeLeafCount" | "TreeSize" if args.len() == 1 => {
+      let result = match name {
+        "TreeDepth" => tree_depth(&args[0]),
+        "TreeLeafCount" => tree_leaf_count(&args[0]),
+        _ => tree_size(&args[0]),
+      };
+      if let Some(n) = result {
+        return Some(Ok(Expr::Integer(n)));
+      }
+      crate::emit_message(&format!(
+        "{name}::tree: Tree expected at position 1 in {}.",
+        expr_to_string(&unevaluated(name, args)),
+      ));
+      return Some(Ok(unevaluated(name, args)));
+    }
+    // TreeMap[f] operator form: kept symbolic so TreeMap[f][tree] can apply it.
+    "TreeMap" if args.len() == 1 => {
+      return Some(Ok(unevaluated("TreeMap", args)));
+    }
+    // TreeReplacePart[rules] operator form: kept symbolic so the curried call
+    // TreeReplacePart[rules][tree] can apply it.
+    "TreeReplacePart" if args.len() == 1 => {
+      return Some(Ok(unevaluated("TreeReplacePart", args)));
+    }
+    // TreeReplacePart[tree, pos -> value] replaces the subtree at pos; a list
+    // of rules applies them in order. A scalar value becomes a leaf. The root
+    // position {} and out-of-range positions are silent no-ops.
+    "TreeReplacePart" if args.len() == 2 => {
+      let unevaluated = || unevaluated("TreeReplacePart", args);
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "TreeReplacePart::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      // Collect rules: a single rule, or a list of rules.
+      let rules: Vec<&Expr> = match &args[1] {
+        Expr::List(items)
+          if !items.is_empty()
+            && items.iter().all(|it| as_rule(it).is_some()) =>
+        {
+          items.iter().collect()
+        }
+        single if as_rule(single).is_some() => vec![single],
+        _ => return Some(Ok(unevaluated())),
+      };
+      let mut current = args[0].clone();
+      for rule in rules {
+        let (pos, value) = as_rule(rule).unwrap();
+        let Some(path) = tree_position_path(pos) else {
+          continue; // non-integer position spec: skip
+        };
+        if path.is_empty() {
+          continue; // the root position {} is a no-op
+        }
+        let canon = tree_replacement_value(value);
+        // out-of-range positions leave the tree unchanged
+        if let Some(updated) = tree_set_at(&current, &path, &canon) {
+          current = updated;
+        }
+      }
+      return Some(Ok(current));
+    }
+    // TreeInsert[tree, child, pos]: insert `child` at the position `pos` (the
+    // last index selects the sibling slot, earlier indices navigate into the
+    // children). A scalar child becomes a leaf. Out-of-range or leaf-descending
+    // positions leave the expression unevaluated.
+    "TreeInsert" if args.len() == 3 => {
+      let unevaluated = || unevaluated("TreeInsert", args);
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "TreeInsert::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      let Some(path) = tree_pos_to_path(&args[2]) else {
+        return Some(Ok(unevaluated()));
+      };
+      if path.is_empty() {
+        return Some(Ok(unevaluated()));
+      }
+      if let Some(updated) = tree_insert_at(&args[0], &path, &args[1]) {
+        return Some(Ok(updated));
+      }
+      crate::emit_message(&format!(
+        "TreeInsert::ins: Cannot insert at position {} in {}.",
+        expr_to_string(&args[2]),
+        expr_to_string(&args[0])
+      ));
+      return Some(Ok(unevaluated()));
+    }
+    // TreeDelete[tree, pos]: remove the subtree at `pos`. The root position {}
+    // and out-of-range positions leave the expression unevaluated.
+    "TreeDelete" if args.len() == 2 => {
+      let unevaluated = || unevaluated("TreeDelete", args);
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "TreeDelete::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      let Some(path) = tree_pos_to_path(&args[1]) else {
+        return Some(Ok(unevaluated()));
+      };
+      if path.is_empty() {
+        return Some(Ok(unevaluated()));
+      }
+      match tree_delete_at(&args[0], &path) {
+        Some(updated) => return Some(Ok(updated)),
+        None => return Some(Ok(unevaluated())),
+      }
+    }
+    // TreeLevel[tree, spec]: subtrees at the levels selected by spec, in
+    // post-order (descendants before their parent).
+    "TreeLevel" if args.len() == 2 => {
+      let unevaluated = || unevaluated("TreeLevel", args);
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "TreeLevel::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      let Some((lo, hi)) = parse_tree_level_spec(&args[1]) else {
+        return Some(Ok(unevaluated()));
+      };
+      let mut out = Vec::new();
+      tree_level(&args[0], 0, lo, hi, &mut out);
+      return Some(Ok(Expr::List(out.into())));
+    }
+    // TreeSelect[crit] operator form: kept symbolic so TreeSelect[crit][tree]
+    // can apply it (handled in apply_curried_call).
+    "TreeSelect" if args.len() == 1 => {
+      return Some(Ok(unevaluated("TreeSelect", args)));
+    }
+    // TreeSelect[tree, crit] picks the subtrees (post-order, root included)
+    // for which crit[subtree] is True. The optional third argument limits the
+    // result to the first n; the four-argument form restricts to a level spec
+    // first. n must be a non-negative integer or Infinity.
+    "TreeSelect" if (2..=4).contains(&args.len()) => {
+      let unevaluated = || unevaluated("TreeSelect", args);
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "TreeSelect::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      // Determine the level bounds and the count limit per arity.
+      let (bounds, n_arg) = match args.len() {
+        2 => ((0i128, None), None),
+        3 => ((0i128, None), Some(&args[2])),
+        _ => match parse_tree_level_spec(&args[2]) {
+          Some(b) => (b, Some(&args[3])),
+          None => return Some(Ok(unevaluated())),
+        },
+      };
+      // Validate n (non-negative integer or Infinity) if present.
+      let limit: Option<usize> = match n_arg {
+        None => None,
+        Some(Expr::Integer(k)) if *k >= 0 => Some(*k as usize),
+        Some(e) if is_infinity_symbol(e) => None,
+        Some(_) => {
+          let mut rest = args.to_vec();
+          let tree_str = "-Tree-".to_string();
+          rest[0] = Expr::Identifier(tree_str);
+          crate::emit_message(&format!(
+            "TreeSelect::innf: Non-negative integer or Infinity expected at position -1 in {}.",
+            expr_to_string(&call("TreeSelect", rest))
+          ));
+          return Some(Ok(unevaluated()));
+        }
+      };
+      let (lo, hi) = bounds;
+      let mut candidates = Vec::new();
+      tree_level(&args[0], 0, lo, hi, &mut candidates);
+      let mut selected = Vec::new();
+      for sub in candidates {
+        if limit.is_some_and(|n| selected.len() >= n) {
+          break;
+        }
+        match list_helpers_ast::apply_func_ast(&args[1], &sub) {
+          Ok(r) => {
+            if matches!(&r, Expr::Identifier(s) if s == "True") {
+              selected.push(sub);
+            }
+          }
+          Err(e) => return Some(Err(e)),
+        }
+      }
+      return Some(Ok(Expr::List(selected.into())));
+    }
+    // TreePosition[tree, patt]: positions of nodes whose data matches patt,
+    // in post-order (descendants before parent); the root's position is {}.
+    // The optional third argument restricts positions to a level spec.
+    "TreePosition" if args.len() == 2 || args.len() == 3 => {
+      let unevaluated = || unevaluated("TreePosition", args);
+      let bounds = if args.len() == 3 {
+        match parse_tree_level_spec(&args[2]) {
+          Some(b) => Some(b),
+          None => return Some(Ok(unevaluated())),
+        }
+      } else {
+        None
+      };
+      let mut path = Vec::new();
+      let mut out = Vec::new();
+      if tree_position(&args[0], &args[1], 0, bounds, &mut path, &mut out)
+        .is_some()
+      {
+        return Some(Ok(Expr::List(out.into())));
+      }
+      crate::emit_message(&format!(
+        "TreePosition::tree: Tree expected at position 1 in {}.",
+        expr_to_string(&unevaluated())
+      ));
+      return Some(Ok(unevaluated()));
+    }
+    // TreeExtract[tree, pos]: extract the subtree(s) at position(s) `pos`.
+    // A position is a list of 1-based child indices. `pos` is either a single
+    // position ({i, j, ...}, all integers) giving one subtree, or a list of
+    // positions ({{...}, {...}}) giving a list of subtrees ({} gives {}).
+    "TreeExtract" if args.len() == 2 => {
+      let unevaluated = || unevaluated("TreeExtract", args);
+      // First argument must be a tree.
+      if tree_node(&args[0]).is_none() {
+        crate::emit_message(&format!(
+          "TreeExtract::tree: Tree expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      }
+      // psl1 message uses the short `-Tree-` form for the tree.
+      let psl1 = || {
+        crate::emit_message(&format!(
+          "TreeExtract::psl1: Position specification {} in TreeExtract[-Tree-, {}] is not applicable.",
+          expr_to_string(&args[1]),
+          expr_to_string(&args[1])
+        ));
+        unevaluated()
+      };
+      match &args[1] {
+        Expr::List(elems) if elems.is_empty() => {
+          return Some(Ok(Expr::List(vec![].into())));
+        }
+        // List of positions → list of subtrees.
+        Expr::List(elems)
+          if elems.iter().all(|e| matches!(e, Expr::List(_))) =>
+        {
+          let mut out = Vec::with_capacity(elems.len());
+          for e in elems {
+            match tree_position_path(e)
+              .and_then(|p| tree_navigate(&args[0], &p))
+            {
+              Some(st) => out.push(st),
+              None => return Some(Ok(psl1())),
+            }
+          }
+          return Some(Ok(Expr::List(out.into())));
+        }
+        // Single position (all integers) → one subtree.
+        Expr::List(elems)
+          if elems.iter().all(|e| matches!(e, Expr::Integer(_))) =>
+        {
+          match tree_position_path(&args[1])
+            .and_then(|p| tree_navigate(&args[0], &p))
+          {
+            Some(st) => return Some(Ok(st)),
+            None => return Some(Ok(psl1())),
+          }
+        }
+        _ => return Some(Ok(psl1())),
+      }
+    }
+    // TreeMap[f, tree]: apply f to the data of every node.
+    "TreeMap" if args.len() == 2 => match tree_map(&args[0], &args[1]) {
+      Ok(Some(v)) => return Some(Ok(v)),
+      Ok(None) => {
+        crate::emit_message(&format!(
+          "TreeMap::tree: Tree expected at position 2 in {}.",
+          expr_to_string(&unevaluated("TreeMap", args)),
+        ));
+        return Some(Ok(unevaluated("TreeMap", args)));
+      }
+      Err(e) => return Some(Err(e)),
+    },
+    // TreeCount[tree, pattern]: count nodes whose data matches pattern.
+    // TreeCount[tree, patt] counts all matching nodes; the optional third
+    // argument restricts the count to the given level spec.
+    // TreeLeaves[tree] — the leaf subtrees, left to right.
+    "TreeLeaves" if args.len() == 1 => {
+      if let Some(leaves) = tree_leaves(&args[0]) {
+        return Some(Ok(Expr::List(leaves.into())));
+      }
+      crate::emit_message(&format!(
+        "TreeLeaves::tree: Tree expected at position 1 in {}.",
+        expr_to_string(&unevaluated("TreeLeaves", args))
+      ));
+      return Some(Ok(unevaluated("TreeLeaves", args)));
+    }
+    // TreeCases[tree, patt] — the subtrees whose data matches, bottom-up.
+    "TreeCases" if args.len() == 2 || args.len() == 3 => {
+      let unevaluated = || unevaluated("TreeCases", args);
+      let bounds = if args.len() == 3 {
+        match parse_tree_level_spec(&args[2]) {
+          Some(b) => Some(b),
+          None => return Some(Ok(unevaluated())),
+        }
+      } else {
+        None
+      };
+      if let Some((matches, _)) = tree_cases(&args[0], &args[1], 0, bounds) {
+        return Some(Ok(Expr::List(matches.into())));
+      }
+      crate::emit_message(&format!(
+        "TreeCases::tree: Tree expected at position 1 in {}.",
+        expr_to_string(&unevaluated())
+      ));
+      return Some(Ok(unevaluated()));
+    }
+    // TreeScan[f, tree] — apply f to every node's data bottom-up, for effect.
+    "TreeScan" if args.len() == 2 => match tree_scan(&args[0], &args[1]) {
+      Ok(Some(())) => return Some(Ok(null_expr())),
+      Ok(None) => {
+        crate::emit_message(&format!(
+          "TreeScan::tree: Tree expected at position 2 in {}.",
+          expr_to_string(&unevaluated("TreeScan", args))
+        ));
+        return Some(Ok(unevaluated("TreeScan", args)));
+      }
+      Err(e) => return Some(Err(e)),
+    },
+    "TreeCount" if args.len() == 2 || args.len() == 3 => {
+      let unevaluated = || unevaluated("TreeCount", args);
+      let bounds = if args.len() == 3 {
+        match parse_tree_level_spec(&args[2]) {
+          Some(b) => Some(b),
+          None => return Some(Ok(unevaluated())),
+        }
+      } else {
+        None
+      };
+      if let Some((n, _)) = tree_count(&args[0], &args[1], 0, bounds) {
+        return Some(Ok(Expr::Integer(n)));
+      }
+      crate::emit_message(&format!(
+        "TreeCount::tree: Tree expected at position 1 in {}.",
+        expr_to_string(&unevaluated())
+      ));
+      return Some(Ok(unevaluated()));
+    }
+    // TreeFold[f] is the operator form: keep it symbolic so the curried call
+    // TreeFold[f][tree] can apply it (handled in apply_curried_call).
+    "TreeFold" if args.len() == 1 => {
+      return Some(Ok(unevaluated("TreeFold", args)));
+    }
+    // TreeFold[f, tree] folds f over the tree bottom-up; TreeFold[f] is the
+    // operator form applied via the curried call TreeFold[f][tree].
+    "TreeFold" if args.len() == 2 => match tree_fold(&args[0], &args[1]) {
+      Ok(Some(v)) => return Some(Ok(v)),
+      Ok(None) => {
+        return Some(Ok(unevaluated("TreeFold", args)));
+      }
+      Err(e) => return Some(Err(e)),
+    },
+    "Through" if args.len() == 1 => {
+      return Some(list_helpers_ast::through_ast(&args[0], None));
+    }
+    "Through" if args.len() == 2 => {
+      // Through[expr, h] - only apply if head of expr matches h
+      let head_filter = expr_to_string(&args[1]);
+      return Some(list_helpers_ast::through_ast(&args[0], Some(&head_filter)));
+    }
+    "Comap" if args.len() == 1 => {
+      // Operator form: Comap[funs] stays symbolic until applied to an argument
+      // via the curried form Comap[funs][x].
+      return Some(Ok(unevaluated("Comap", args)));
+    }
+    "Comap" if args.len() == 2 => {
+      return Some(list_helpers_ast::comap_ast(&args[0], &args[1], None));
+    }
+    "Comap" if args.len() == 3 => {
+      return Some(list_helpers_ast::comap_ast(
+        &args[0],
+        &args[1],
+        Some(&args[2]),
+      ));
+    }
+    "ComapApply" if args.len() == 1 => {
+      // Operator form: ComapApply[funs] stays symbolic until applied via the
+      // curried form ComapApply[funs][args].
+      return Some(Ok(unevaluated("ComapApply", args)));
+    }
+    "ComapApply" if args.len() == 2 => {
+      return Some(list_helpers_ast::comap_apply_ast(&args[0], &args[1]));
+    }
+    "Operate" if args.len() == 2 || args.len() == 3 => {
+      let p = &args[0];
+      let expr = &args[1];
+      let n = if args.len() == 3 {
+        expr_to_i128(&args[2]).unwrap_or(1)
+      } else {
+        1
+      };
+      if n == 0 {
+        return Some(
+          Ok(Expr::FunctionCall {
+            name: String::new(),
+            args: vec![expr.clone()].into(),
+          })
+          .map(|_| Expr::FunctionCall {
+            name: expr_to_string(p),
+            args: vec![expr.clone()].into(),
+          }),
+        );
+      }
+      // For n >= 1, we need to wrap the head at depth n.
+      // For n == 1 (default): f[a, b] -> p[f][a, b]
+      // When depth exceeds the expression's nesting (including atoms at any
+      // depth), return the expression unchanged (matches wolframscript).
+      //
+      // Expressions like `f[a][b][c]` can arrive as a FunctionCall whose
+      // `name` field is a literal string "f[a][b]" (the Woxi parser leaves
+      // some deeply-nested calls in this form). Detect that shape and
+      // re-parse the name so the recursion can peel the nesting correctly.
+      fn decode_complex_head(name: &str) -> Option<Expr> {
+        if !name.contains('[') {
+          return None;
+        }
+        crate::syntax::string_to_expr(name).ok()
+      }
+      fn wrap_head_at_depth(expr: &Expr, p: &Expr, depth: i128) -> Expr {
+        if depth == 0 {
+          // Apply the operator p to the head. A bare symbol becomes the new
+          // head `p[head]`; any other operator (pure function, Composition,
+          // …) is applied as `p[head]` so it can actually reduce.
+          match p {
+            Expr::Identifier(name) | Expr::Constant(name) => {
+              Expr::FunctionCall {
+                name: name.clone(),
+                args: vec![expr.clone()].into(),
+              }
+            }
+            _ => Expr::CurriedCall {
+              func: Box::new(p.clone()),
+              args: vec![expr.clone()],
+            },
+          }
+        } else {
+          match expr {
+            Expr::FunctionCall { name, args } => {
+              let head_expr = decode_complex_head(name)
+                .unwrap_or_else(|| Expr::Identifier(name.clone()));
+              let wrapped_head = wrap_head_at_depth(&head_expr, p, depth - 1);
+              Expr::CurriedCall {
+                func: Box::new(wrapped_head),
+                args: args.to_vec(),
+              }
+            }
+            Expr::CurriedCall { func, args } => {
+              let wrapped_func = wrap_head_at_depth(func, p, depth - 1);
+              Expr::CurriedCall {
+                func: Box::new(wrapped_func),
+                args: args.clone(),
+              }
+            }
+            _ => expr.clone(),
+          }
+        }
+      }
+      // Evaluate so an applied operator (e.g. a pure function on the head)
+      // reduces: Operate[D[#, x] &, f[x]] -> (D[f, x])[x] -> 0[x].
+      let wrapped = wrap_head_at_depth(expr, p, n);
+      return Some(crate::evaluator::evaluate_expr_to_expr(&wrapped));
+    }
+    "TakeLargest" if args.len() == 2 => {
+      match validate_take_extreme("TakeLargest", args) {
+        Some(TakeExtreme::Take(n)) => {
+          return Some(list_helpers_ast::take_largest_ast(&args[0], n));
+        }
+        Some(TakeExtreme::Reject(call)) => return Some(Ok(call)),
+        // Non-list first argument (association / operator form): fall back to
+        // the previous spec parsing.
+        None => {
+          if let Some(n) = count_or_upto(&args[1], &args[0]) {
+            return Some(list_helpers_ast::take_largest_ast(&args[0], n));
+          }
+        }
+      }
+    }
+    "TakeLargest" if args.len() == 3 => {
+      if let Some(n) = expr_to_i128(&args[1])
+        && let Some(forms) = parse_excluded_forms(&args[2])
+      {
+        return Some(list_helpers_ast::take_largest_excluded_ast(
+          &args[0], n, &forms,
+        ));
+      }
+    }
+    "TakeSmallest" if args.len() == 2 => {
+      match validate_take_extreme("TakeSmallest", args) {
+        Some(TakeExtreme::Take(n)) => {
+          return Some(list_helpers_ast::take_smallest_ast(&args[0], n));
+        }
+        Some(TakeExtreme::Reject(call)) => return Some(Ok(call)),
+        None => {
+          if let Some(n) = count_or_upto(&args[1], &args[0]) {
+            return Some(list_helpers_ast::take_smallest_ast(&args[0], n));
+          }
+        }
+      }
+    }
+    "TakeSmallest" if args.len() == 3 => {
+      if let Some(n) = expr_to_i128(&args[1])
+        && let Some(forms) = parse_excluded_forms(&args[2])
+      {
+        return Some(list_helpers_ast::take_smallest_excluded_ast(
+          &args[0], n, &forms,
+        ));
+      }
+    }
+    "MinimalBy" if args.len() == 2 || args.len() == 3 => {
+      let n = if args.len() == 3 {
+        match extremal_by_count("MinimalBy", args) {
+          Ok(n) => Some(n),
+          Err(unevaluated) => return Some(Ok(unevaluated)),
+        }
+      } else {
+        None
+      };
+      return Some(list_helpers_ast::minimal_by_ast(&args[0], &args[1], n));
+    }
+    "MaximalBy" if args.len() == 2 || args.len() == 3 => {
+      let n = if args.len() == 3 {
+        match extremal_by_count("MaximalBy", args) {
+          Ok(n) => Some(n),
+          Err(unevaluated) => return Some(Ok(unevaluated)),
+        }
+      } else {
+        None
+      };
+      return Some(list_helpers_ast::maximal_by_ast(&args[0], &args[1], n));
+    }
+    "ArrayDepth" if args.len() == 1 => {
+      let target = numeric_array_payload(&args[0]).unwrap_or(&args[0]);
+      return Some(list_helpers_ast::array_depth_ast(target));
+    }
+    "Developer`ToPackedArray" => {
+      return Some(list_helpers_ast::to_packed_array_ast(args));
+    }
+    "ArrayComponents" if !args.is_empty() && args.len() <= 3 => {
+      return Some(list_helpers_ast::array_components_ast(args));
+    }
+    "TensorRank" if args.len() == 1 => {
+      return Some(list_helpers_ast::tensor_rank_ast(&args[0]));
+    }
+    "TensorSymmetry" if args.len() == 1 => {
+      return Some(list_helpers_ast::tensor_symmetry_ast(&args[0]));
+    }
+    "TensorContract" if args.len() == 2 => {
+      return Some(list_helpers_ast::tensor_contract_ast(args));
+    }
+    // A SparseArray is an array, a vector and a matrix just like its dense
+    // form, so these predicates look at that form.
+    "SparseArrayQ" if args.len() == 1 => {
+      let is_sparse = matches!(&args[0], Expr::FunctionCall { name, args: sa }
+        if name == "SparseArray"
+          && sa.len() == 4
+          && matches!(&sa[0], Expr::Identifier(s) if s == "Automatic"));
+      return Some(Ok(bool_expr(is_sparse)));
+    }
+    "ArrayQ" | "VectorQ" | "MatrixQ"
+      if !args.is_empty()
+        && list_helpers_ast::densify_sparse_array(&args[0]).is_some() =>
+    {
+      let mut dense_args = args.to_vec();
+      dense_args[0] = list_helpers_ast::densify_sparse_array(&args[0])?;
+      return Some(crate::evaluator::evaluate_function_call_ast(
+        name,
+        &dense_args,
+      ));
+    }
+    "ArrayQ" if !args.is_empty() && args.len() <= 3 => {
+      let is_array = match list_helpers_ast::array_q_ast(&args[0]) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+      };
+      if !matches!(&is_array, Expr::Identifier(s) if s == "True") {
+        return Some(Ok(is_array));
+      }
+      // Determine array depth.
+      let depth = match list_helpers_ast::dimensions_ast(&[args[0].clone()]) {
+        Ok(Expr::List(ref d)) => d.len(),
+        _ => return Some(Ok(is_array)),
+      };
+      if args.len() >= 2 {
+        // ArrayQ[expr, n] - depth must equal n
+        if let Some(n) = expr_to_i128(&args[1]) {
+          if depth != n as usize {
+            return Some(Ok(bool_expr(false)));
+          }
+        } else {
+          return Some(Ok(is_array));
+        }
+      }
+      if args.len() == 3 {
+        // ArrayQ[expr, n, test] - every leaf at depth `n` must pass `test`
+        let test = &args[2];
+        let leaves_pass =
+          list_helpers_ast::all_leaves_pass_test(&args[0], depth, test);
+        return Some(Ok(bool_expr(leaves_pass)));
+      }
+      return Some(Ok(bool_expr(true)));
+    }
+    "VectorQ" if args.len() == 1 => {
+      return Some(list_helpers_ast::vector_q_ast(&args[0]));
+    }
+    "VectorQ" if args.len() == 2 => {
+      return Some(list_helpers_ast::vector_q_with_test_ast(
+        &args[0], &args[1],
+      ));
+    }
+    "MatrixQ" if args.len() == 1 => {
+      return Some(list_helpers_ast::matrix_q_ast(&args[0]));
+    }
+    "MatrixQ" if args.len() == 2 => {
+      return Some(list_helpers_ast::matrix_q_with_test_ast(
+        &args[0], &args[1],
+      ));
+    }
+    // ContainsAny[a, b] — some element of b is in a. With SameTest -> f,
+    // membership uses f[a_elem, b_elem].
+    "ContainsAny" if args.len() == 2 || args.len() == 3 => {
+      if let (Expr::List(list1), Expr::List(list2)) = (&args[0], &args[1]) {
+        if let Some(opt) = args.get(2) {
+          let Some(test) = same_test_option(opt) else {
+            return Some(Ok(unevaluated("ContainsAny", args)));
+          };
+          let result = list2
+            .iter()
+            .any(|y| list1.iter().any(|x| same_test_true(test, x, y)));
+          return Some(Ok(bool_expr(result)));
+        }
+        let set1: std::collections::HashSet<String> =
+          list1.iter().map(expr_to_string).collect();
+        let result = list2.iter().any(|x| set1.contains(&expr_to_string(x)));
+        return Some(Ok(bool_expr(result)));
+      }
+    }
+    // ContainsAll[a, b] — every element of b is in a.
+    "ContainsAll" if args.len() == 2 || args.len() == 3 => {
+      if let (Expr::List(list1), Expr::List(list2)) = (&args[0], &args[1]) {
+        if let Some(opt) = args.get(2) {
+          let Some(test) = same_test_option(opt) else {
+            return Some(Ok(unevaluated("ContainsAll", args)));
+          };
+          let result = list2
+            .iter()
+            .all(|y| list1.iter().any(|x| same_test_true(test, x, y)));
+          return Some(Ok(bool_expr(result)));
+        }
+        let set1: std::collections::HashSet<String> =
+          list1.iter().map(expr_to_string).collect();
+        let result = list2.iter().all(|x| set1.contains(&expr_to_string(x)));
+        return Some(Ok(bool_expr(result)));
+      }
+    }
+    // ContainsNone[a, b] — no element of b is in a.
+    "ContainsNone" if args.len() == 2 || args.len() == 3 => {
+      if let (Expr::List(list1), Expr::List(list2)) = (&args[0], &args[1]) {
+        if let Some(opt) = args.get(2) {
+          let Some(test) = same_test_option(opt) else {
+            return Some(Ok(unevaluated("ContainsNone", args)));
+          };
+          let result = !list2
+            .iter()
+            .any(|y| list1.iter().any(|x| same_test_true(test, x, y)));
+          return Some(Ok(bool_expr(result)));
+        }
+        let set1: std::collections::HashSet<String> =
+          list1.iter().map(expr_to_string).collect();
+        let result = !list2.iter().any(|x| set1.contains(&expr_to_string(x)));
+        return Some(Ok(bool_expr(result)));
+      }
+    }
+    // ContainsExactly[list1, list2] — True if the two Lists contain exactly
+    // the same elements as sets (duplicates ignored). With SameTest -> f
+    // this is ContainsAll[a, b] && ContainsOnly[a, b] under f[a_elem, b_elem].
+    "ContainsExactly" if args.len() == 2 || args.len() == 3 => {
+      if let (Expr::List(list1), Expr::List(list2)) = (&args[0], &args[1]) {
+        if let Some(opt) = args.get(2) {
+          let Some(test) = same_test_option(opt) else {
+            return Some(Ok(unevaluated("ContainsExactly", args)));
+          };
+          let all = list2
+            .iter()
+            .all(|y| list1.iter().any(|x| same_test_true(test, x, y)));
+          let only = list1
+            .iter()
+            .all(|x| list2.iter().any(|y| same_test_true(test, x, y)));
+          return Some(Ok(bool_expr(all && only)));
+        }
+        let set1: std::collections::HashSet<String> =
+          list1.iter().map(expr_to_string).collect();
+        let set2: std::collections::HashSet<String> =
+          list2.iter().map(expr_to_string).collect();
+        return Some(Ok(bool_expr(set1 == set2)));
+      }
+    }
+    // ContainsExactly[list2] — operator form, returns a callable.
+    "ContainsExactly" if args.len() == 1 => {
+      return Some(Ok(unevaluated("ContainsExactly", args)));
+    }
+    "SquareMatrixQ" if args.len() == 1 => {
+      let result = match &args[0] {
+        Expr::List(rows) if !rows.is_empty() => {
+          let nrows = rows.len();
+          rows
+            .iter()
+            .all(|r| matches!(r, Expr::List(cols) if cols.len() == nrows))
+        }
+        _ => false,
+      };
+      return Some(Ok(if result {
+        bool_expr(true)
+      } else {
+        bool_expr(false)
+      }));
+    }
+    "TakeWhile" if args.len() == 2 => {
+      return Some(list_helpers_ast::take_while_ast(&args[0], &args[1]));
+    }
+    // Parallelize[expr] evaluates expr in parallel and returns the same result
+    // as the sequential evaluation. Woxi runs single-threaded, so the argument
+    // (already evaluated by the time it reaches here) is returned unchanged.
+    "Parallelize" if args.len() == 1 => {
+      return Some(Ok(args[0].clone()));
+    }
+    // ParallelDo has no real parallel kernels in Woxi, so it evaluates
+    // sequentially exactly like Do (matching the rest of the Parallel*
+    // family, which are implemented as their sequential counterparts).
+    // `Do[expr]` with no iterator evaluates its body once for the side
+    // effects and returns Null, matching wolframscript.
+    "Do" | "ParallelDo" if args.len() == 1 => {
+      return Some(
+        crate::evaluator::evaluate_expr_to_expr(&args[0]).map(|_| null_expr()),
+      );
+    }
+    "Do" | "ParallelDo" if args.len() >= 2 => {
+      // A non-numeric iterator bound leaves the whole call unevaluated
+      // (matching wolframscript's ::iterb / ::nliter) rather than erroring.
+      if let Some(msg) =
+        list_helpers_ast::table_iterators_invalid(name, &args[1..])
+      {
+        crate::emit_message(&msg);
+        return Some(Ok(unevaluated(name, args)));
+      }
+      if args.len() == 2 {
+        return Some(list_helpers_ast::do_ast(&args[0], &args[1]));
+      }
+      // Multi-iterator Do: Do[body, {i, ...}, {j, ...}, ...] is a single
+      // construct in Wolfram. Break[] and Return[] exit the entire Do, not
+      // just the innermost iterator, so we cannot lower it to nested Do
+      // calls (each of which would catch Break/Return at its own level).
+      return Some(list_helpers_ast::do_multi_ast(&args[0], &args[1..]));
+    }
+    "For" if args.len() == 3 || args.len() == 4 => {
+      return Some(for_ast(args));
+    }
+    "DeleteCases" if args.len() >= 2 && args.len() <= 4 => {
+      return Some(list_helpers_ast::delete_cases_unified_ast(args));
+    }
+    "MinMax" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::min_max_ast(args));
+    }
+    // Indexed[expr, i]            ≡ Part[expr, i]     for a concrete List expr
+    // Indexed[expr, {i, j, ...}]  ≡ Part[expr, i, j, ...]
+    // Otherwise the call stays unevaluated, with the index normalised
+    // into a singleton list (matching wolframscript's canonical form).
+    "Indexed" if args.len() == 2 => {
+      let unevaluated_with_list_index = || {
+        let idx = match &args[1] {
+          Expr::List(_) => args[1].clone(),
+          other => Expr::List(vec![other.clone()].into()),
+        };
+        call("Indexed", vec![args[0].clone(), idx])
+      };
+      // Collect the indices from the second arg. A non-list index is
+      // treated as a single-element index list.
+      let idx_specs: Vec<&Expr> = match &args[1] {
+        Expr::List(items) => items.iter().collect(),
+        other => vec![other],
+      };
+      if idx_specs.is_empty() {
+        return Some(Ok(args[0].clone()));
+      }
+      // Validate every index is a nonzero integer; otherwise stay
+      // unevaluated (the original unsimplified call).
+      let mut ints: Vec<i128> = Vec::with_capacity(idx_specs.len());
+      for spec in &idx_specs {
+        match spec {
+          Expr::Integer(n) if *n != 0 => ints.push(*n),
+          Expr::Integer(_) => {
+            crate::emit_message(
+              "Indexed::ind: The index 0 is not a nonzero integer.",
+            );
+            return Some(Ok(unevaluated("Indexed", args)));
+          }
+          _ => {
+            return Some(Ok(unevaluated_with_list_index()));
+          }
+        }
+      }
+      // Walk into the data one level per index. A non-List head means
+      // we can't resolve concretely — fall back to canonical Indexed.
+      let mut current = args[0].clone();
+      for n in &ints {
+        let Expr::List(items) = &current else {
+          return Some(Ok(unevaluated_with_list_index()));
+        };
+        let len = items.len() as i128;
+        let pos: i128 = if *n > 0 { *n - 1 } else { len + *n };
+        if pos < 0 || pos >= len {
+          crate::emit_message(&format!(
+            "Indexed::partw: Part {} of {} does not exist.",
+            n,
+            expr_to_string(&current)
+          ));
+          return Some(Ok(unevaluated("Indexed", args)));
+        }
+        current = items[pos as usize].clone();
+      }
+      return Some(Ok(current));
+    }
+    "Part" if args.len() >= 2 => {
+      let mut part_expr = Expr::Part {
+        expr: Box::new(args[0].clone()),
+        index: Box::new(args[1].clone()),
+      };
+      for idx in &args[2..] {
+        part_expr = Expr::Part {
+          expr: Box::new(part_expr),
+          index: Box::new(idx.clone()),
+        };
+      }
+      return Some(evaluate_expr_to_expr(&part_expr));
+    }
+    "Insert" if args.len() == 3 => {
+      return Some(list_helpers_ast::insert_ast(&args[0], &args[1], &args[2]));
+    }
+    // ParallelArray is the serial Array (Woxi evaluates sequentially).
+    "Array" | "ParallelArray" if args.len() >= 2 && args.len() <= 4 => {
+      let valid_spec = match &args[1] {
+        Expr::List(ns) => ns.iter().all(|e| nonneg_machine_int(e).is_some()),
+        e => nonneg_machine_int(e).is_some(),
+      };
+      if !valid_spec {
+        let call = unevaluated(name, args);
+        crate::emit_message(&format!(
+          "{name}::ilsmn: Single or list of non-negative machine-sized integers expected at position 2 of {}.",
+          crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+        ));
+        return Some(Ok(call));
+      }
+      if args.len() == 2
+        && let Some(n) = expr_to_i128(&args[1])
+      {
+        return Some(list_helpers_ast::array_ast(&args[0], n));
+      }
+      if matches!(&args[1], Expr::List(_)) || args.len() > 2 {
+        return Some(list_helpers_ast::array_multi_ast(args));
+      }
+    }
+    "Gather" if args.len() == 1 => {
+      return Some(list_helpers_ast::gather_ast(&args[0]));
+    }
+    "Gather" if args.len() == 2 => {
+      return Some(list_helpers_ast::gather_with_test_ast(&args[0], &args[1]));
+    }
+    "GatherBy" if args.len() >= 2 => {
+      // GatherBy[list, f1, f2, ...] is equivalent to GatherBy[list, {f1, f2, ...}]
+      let func = if args.len() == 2 {
+        args[1].clone()
+      } else {
+        Expr::List(args[1..].to_vec().into())
+      };
+      return Some(list_helpers_ast::gather_by_ast(&func, &args[0]));
+    }
+    "Split" if args.len() == 1 || args.len() == 2 => {
+      if args.len() == 1 {
+        return Some(list_helpers_ast::split_ast(&args[0]));
+      }
+      return Some(list_helpers_ast::split_with_test_ast(&args[0], &args[1]));
+    }
+    "SplitBy" if args.len() == 2 => {
+      return Some(list_helpers_ast::split_by_ast(&args[1], &args[0]));
+    }
+    "Extract" if args.len() == 2 || args.len() == 3 => {
+      return Some(
+        list_helpers_ast::extract_unified_ast(args)
+          .and_then(|r| evaluate_if_unheld(name, &args[0], r)),
+      );
+    }
+    "Catenate" if args.len() == 1 => {
+      return Some(list_helpers_ast::catenate_ast(&args[0]));
+    }
+    "ArrayReduce" if args.len() == 3 => {
+      return Some(list_helpers_ast::array_reduce_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "FindRepeat" if args.len() == 1 || args.len() == 2 => {
+      return Some(list_helpers_ast::find_repeat_ast(args));
+    }
+    "FindTransientRepeat" if args.len() == 2 => {
+      return Some(list_helpers_ast::find_transient_repeat_ast(args));
+    }
+    "Apply" if args.len() == 2 => {
+      return Some(list_helpers_ast::apply_ast(&args[0], &args[1]));
+    }
+    "Apply" if args.len() == 3 => {
+      return Some(list_helpers_ast::apply_at_level_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "MapApply" if args.len() == 2 => {
+      return Some(
+        crate::evaluator::function_application::apply_map_apply_ast(
+          &args[0], &args[1],
+        ),
+      );
+    }
+    "Identity" if args.len() == 1 => {
+      return Some(list_helpers_ast::identity_ast(&args[0]));
+    }
+    // Once[expr] / Once[expr, loc] evaluates expr once and returns the result.
+    // Woxi is stateless per evaluation, so caching is a no-op: just unwrap the
+    // (already-evaluated) argument.
+    "Once" if args.len() == 1 || args.len() == 2 => {
+      return Some(Ok(args[0].clone()));
+    }
+    // Composition[] -> Identity
+    "Composition" if args.is_empty() => {
+      return Some(Ok(id_expr("Identity")));
+    }
+    // Composition[f] -> f
+    "Composition" if args.len() == 1 => {
+      return Some(Ok(args[0].clone()));
+    }
+    // Composition[f, Composition[g, h], k] -> Composition[f, g, h, k]
+    "Composition" if args.len() >= 2 => {
+      let mut flat = Vec::new();
+      for arg in args {
+        if let Expr::FunctionCall { name: n, args: a } = arg
+          && n == "Composition"
+        {
+          flat.extend(a.iter().cloned());
+          continue;
+        }
+        flat.push(arg.clone());
+      }
+      // Composing geometric transforms multiplies their matrices, so the
+      // chain collapses back to a single TransformationFunction.
+      if let Some(folded) = compose_transformation_functions(&flat) {
+        return Some(Ok(folded));
+      }
+      return Some(Ok(call("Composition", flat)));
+    }
+    // RightComposition[] -> Identity
+    "RightComposition" if args.is_empty() => {
+      return Some(Ok(id_expr("Identity")));
+    }
+    // RightComposition[f] -> f
+    "RightComposition" if args.len() == 1 => {
+      return Some(Ok(args[0].clone()));
+    }
+    // RightComposition[f, RightComposition[g, h], k] -> RightComposition[f, g, h, k]
+    "RightComposition" if args.len() >= 2 => {
+      let mut flat = Vec::new();
+      for arg in args {
+        if let Expr::FunctionCall { name: n, args: a } = arg
+          && n == "RightComposition"
+        {
+          flat.extend(a.iter().cloned());
+          continue;
+        }
+        flat.push(arg.clone());
+      }
+      return Some(Ok(call("RightComposition", flat)));
+    }
+    // With no list to range over, Outer[f] applies f to nothing.
+    "Outer" if args.len() == 1 => {
+      return Some(crate::evaluator::function_application::apply_curried_call(
+        &args[0],
+        &[],
+      ));
+    }
+    "Outer" if args.len() >= 2 => {
+      // Outer[f, list1, list2, ..., n] or Outer[f, list1, list2, ..., n1, n2, ...]
+      // Detect trailing integer level specifications.
+      let rest = &args[1..];
+      // Count how many list args there are (at least 1).
+      // Lists come first, then optional integer level specs at the end.
+      // We need at least 1 list. Find where integers start from the end.
+      let num_rest = rest.len();
+      let mut num_level_args = 0;
+      for i in (0..num_rest).rev() {
+        if matches!(&rest[i], Expr::Integer(_)) {
+          num_level_args += 1;
+        } else {
+          break;
+        }
+      }
+      // Must have at least 1 list arg
+      let num_lists = num_rest - num_level_args;
+      if num_lists == 0 {
+        num_level_args = 0; // all args are lists (integers can be list elements)
+      }
+      let (lists_in, level_args) = if num_level_args > 0 {
+        (&rest[..num_lists], &rest[num_lists..])
+      } else {
+        (rest, &rest[0..0])
+      };
+
+      // Every argument ranged over must be nonatomic — Outer takes the parts
+      // of each one, so an atom (a number, string or symbol) is reported.
+      for (i, l) in lists_in.iter().enumerate() {
+        let nonatomic = match l {
+          Expr::List(_) => true,
+          Expr::FunctionCall { name: h, .. } => {
+            !matches!(h.as_str(), "Rational" | "Complex")
+          }
+          _ => false,
+        };
+        if !nonatomic {
+          crate::emit_message(&format!(
+            "Outer::normal: Nonatomic expression expected at position {} in {}.",
+            i + 2,
+            crate::syntax::format_expr(
+              &unevaluated("Outer", args),
+              crate::syntax::ExprForm::Output
+            )
+          ));
+          return Some(Ok(unevaluated("Outer", args)));
+        }
+      }
+
+      // All of them must share one head; the first mismatch is reported
+      // against the head of the first argument.
+      // Array objects count as lists here: wolframscript ranges over their
+      // elements just like over a List.
+      let head_of = |e: &Expr| match e {
+        Expr::FunctionCall { name: h, .. }
+          if !matches!(
+            h.as_str(),
+            "SparseArray"
+              | "NumericArray"
+              | "QuantityArray"
+              | "StructuredArray"
+          ) =>
+        {
+          h.clone()
+        }
+        _ => "List".to_string(),
+      };
+      if let Some(first) = lists_in.first() {
+        let expected = head_of(first);
+        if let Some((i, offender)) = lists_in
+          .iter()
+          .enumerate()
+          .skip(1)
+          .find(|(_, l)| head_of(l) != expected)
+        {
+          crate::emit_message(&format!(
+            "Outer::heads: Heads {} and {} at positions {} and 2 are expected to be the same.",
+            head_of(offender),
+            expected,
+            i + 2
+          ));
+          return Some(Ok(unevaluated("Outer", args)));
+        }
+      }
+
+      // Parse level specs
+      let levels: Vec<usize> = level_args
+        .iter()
+        .filter_map(|e| {
+          if let Expr::Integer(n) = e {
+            Some(*n as usize)
+          } else {
+            None
+          }
+        })
+        .collect();
+
+      // Convert any SparseArray argument to its Normal (dense-list) form so
+      // Outer can treat it as a regular nested list. Wolfram handles the
+      // mixed case `Outer[Times, SparseArray[...], {c, d}]` the same way.
+      let mut had_sparse = false;
+      let lists_owned: Vec<Expr> = lists_in
+        .iter()
+        .map(|e| {
+          if let Expr::FunctionCall {
+            name,
+            args: sa_args,
+          } = e
+            && name == "SparseArray"
+          {
+            had_sparse = true;
+            list_helpers_ast::sparse_array_ast(sa_args)
+              .unwrap_or_else(|_| e.clone())
+          } else {
+            e.clone()
+          }
+        })
+        .collect();
+
+      let dense = list_helpers_ast::outer_ast_with_levels(
+        &args[0],
+        &lists_owned,
+        &levels,
+      );
+      // For `Times` over any SparseArray input, wolframscript collapses the
+      // result into a single SparseArray with default 0 (since Times[…, 0]
+      // = 0 makes every product involving a zero default to zero).
+      // Other heads keep the dense nested form.
+      if had_sparse
+        && matches!(&args[0], Expr::Identifier(s) if s == "Times")
+        && let Ok(d) = &dense
+        && let Some(sparse) =
+          dense_to_sparse_array_with_default(d, &Expr::Integer(0))
+      {
+        return Some(Ok(sparse));
+      }
+      // For non-Times functions, when the LAST argument is a SparseArray,
+      // wolframscript wraps the leaf level (corresponding to that last
+      // SparseArray's dims) as SparseArray with the function applied.
+      // Outer dense iteration is unchanged for the earlier args.
+      if !lists_in.is_empty()
+        && matches!(lists_in.last(), Some(Expr::FunctionCall { name, .. }) if name == "SparseArray")
+        && !matches!(&args[0], Expr::Identifier(s) if s == "Times")
+        && let Some(sparse_last) = lists_in.last()
+        && let Some(sa_data) = parse_sparse_array_data(sparse_last)
+        && let Some(nested) = build_outer_with_sparse_last(
+          &args[0],
+          &lists_owned[..lists_owned.len() - 1],
+          &sa_data,
+        )
+      {
+        return Some(Ok(nested));
+      }
+      return Some(dense);
+    }
+    "TensorProduct" if !args.is_empty() => {
+      return Some(list_helpers_ast::tensor_product_ast(args));
+    }
+    "TensorExpand" if args.len() == 1 => {
+      return Some(list_helpers_ast::tensor_expand_ast(&args[0]));
+    }
+    "Inner" if args.len() == 3 => {
+      let plus = id_expr("Plus");
+      return Some(list_helpers_ast::inner_ast(
+        &args[0], &args[1], &args[2], &plus,
+      ));
+    }
+    "Inner" if args.len() == 4 => {
+      return Some(list_helpers_ast::inner_ast(
+        &args[0], &args[1], &args[2], &args[3],
+      ));
+    }
+    "ReplacePart" if args.len() == 2 => {
+      return Some(list_helpers_ast::replace_part_ast(&args[0], &args[1]));
+    }
+    // ReplacePart[expr, new, pos] — the same replacement written the other way
+    // round. Unlike the rule form it accepts only machine integers, so a
+    // pattern position or an association key is rejected with ::psl, and a
+    // position that does not exist is reported with ::partw rather than
+    // silently skipped.
+    "ReplacePart" if args.len() == 3 => {
+      return Some(list_helpers_ast::replace_part_positional_ast(
+        &args[0], &args[1], &args[2],
+      ));
+    }
+    "Nearest" if (2..=5).contains(&args.len()) => {
+      return Some(nearest_ast(args));
+    }
+    // ArrayPad[array, n] — pad with 0
+    // ArrayPad[array, n, val] — pad with val
+    // ArrayPad[array, {left, right}] — asymmetric padding
+    // ArrayPad[array, {left, right}, val] — asymmetric padding with val
+    // Negative padding trims elements
+    "ArrayPad" if args.len() >= 2 && args.len() <= 3 => {
+      return Some(array_pad_ast(args));
+    }
+    // ArrayReshape[list, {d1, d2, ...}] — reshape a flat list into given dimensions
+    // ArrayReshape[list, dims, padding] — pad trailing slots with the given value(s)
+    "ArrayReshape" if args.len() == 2 || args.len() == 3 => {
+      return Some(array_reshape_ast(args));
+    }
+    // PositionIndex[list] — association mapping values to their positions
+    "PositionIndex" if args.len() == 1 => {
+      return Some(Ok(position_index_ast(&args[0])));
+    }
+    // ListConvolve[kernel, list] — discrete convolution
+    "ListConvolve" if args.len() == 2 => {
+      return Some(list_convolve_ast(&args[0], &args[1]));
+    }
+    // ListConvolve[ker, list, k] / [ker, list, {kL, kR}] — cyclic convolution
+    // with an alignment (overhang) spec; an optional 4th argument supplies a
+    // scalar padding used instead of cyclic wraparound.
+    "ListConvolve" if (3..=6).contains(&args.len()) => {
+      return Some(list_convolve_overhang(
+        &args[0],
+        &args[1],
+        &args[2],
+        args.get(3),
+        args.get(4),
+        args.get(5),
+        args,
+      ));
+    }
+    // ListCorrelate[kernel, list] — discrete cross-correlation
+    "ListCorrelate" if args.len() == 2 => {
+      return Some(list_correlate_ast(&args[0], &args[1]));
+    }
+    // ListCorrelate[ker, list, k] / [ker, list, {kL, kR}] — cyclic
+    // cross-correlation with an alignment (overhang) spec; an optional 4th
+    // argument supplies a scalar padding used instead of cyclic wraparound.
+    "ListCorrelate" if (3..=6).contains(&args.len()) => {
+      return Some(list_correlate_overhang(
+        &args[0],
+        &args[1],
+        &args[2],
+        args.get(3),
+        args.get(4),
+        args.get(5),
+        args,
+      ));
+    }
+    // CountsBy[list, f] — count elements grouped by f
+    "CountsBy" if args.len() == 2 => {
+      if let Expr::List(ref elems) = args[0] {
+        let f = &args[1];
+        let mut keys: Vec<Expr> = Vec::new();
+        let mut counts: Vec<i128> = Vec::new();
+        for elem in elems {
+          let key = crate::evaluator::apply_function_to_arg(f, elem)
+            .unwrap_or_else(|_| elem.clone());
+          let key_str = expr_to_string(&key);
+          if let Some(pos) =
+            keys.iter().position(|k| expr_to_string(k) == key_str)
+          {
+            counts[pos] += 1;
+          } else {
+            keys.push(key);
+            counts.push(1);
+          }
+        }
+        let pairs: Vec<(Expr, Expr)> = keys
+          .into_iter()
+          .zip(counts)
+          .map(|(k, c)| (k, Expr::Integer(c)))
+          .collect();
+        return Some(Ok(Expr::Association(pairs)));
+      }
+    }
+    // FoldPair[f, x, {e1, …}] — like Fold, but f[state, ei] returns a pair
+    // {emit, newState}; the result is the *last* emitted value. The 4-argument
+    // form FoldPair[f, x, list, g] returns g applied to the final
+    // {emit, newState} pair.
+    // FoldPair[f, {a0, a1, ...}] == FoldPair[f, a0, {a1, ...}] (and likewise
+    // for FoldPairList): the first list element seeds the initial state.
+    // wolframscript's rule needs at least two elements (a0 and a1); a
+    // zero- or one-element list leaves the 2-argument form unevaluated.
+    "FoldPair" | "FoldPairList" if args.len() == 2 => {
+      if let Expr::List(ref elems) = args[1]
+        && elems.len() >= 2
+      {
+        let init = elems[0].clone();
+        let rest = Expr::List(elems[1..].to_vec().into());
+        let new_args = vec![args[0].clone(), init, rest];
+        return Some(crate::evaluator::evaluate_function_call_ast(
+          name, &new_args,
+        ));
+      }
+    }
+    "FoldPair" if args.len() == 3 || args.len() == 4 => {
+      if let Expr::List(ref elems) = args[2] {
+        // FoldPair on an empty list stays unevaluated (matching wolframscript).
+        if elems.is_empty() {
+          return Some(Ok(unevaluated("FoldPair", args)));
+        }
+        let f = &args[0];
+        let mut state = args[1].clone();
+        // Always overwritten on the first (guaranteed) iteration.
+        let mut last_emit = args[1].clone();
+        let apply2 = |func: &Expr, a: &Expr, b: &Expr| -> Expr {
+          match func {
+            Expr::Function { body } => {
+              crate::syntax::substitute_slots(body, &[a.clone(), b.clone()])
+            }
+            Expr::Identifier(fname) => Expr::FunctionCall {
+              name: fname.clone(),
+              args: vec![a.clone(), b.clone()].into(),
+            },
+            _ => Expr::FunctionCall {
+              name: expr_to_string(func),
+              args: vec![a.clone(), b.clone()].into(),
+            },
+          }
+        };
+        for elem in elems {
+          let applied = apply2(f, &state, elem);
+          let result = crate::evaluator::evaluate_expr_to_expr(&applied)
+            .unwrap_or_else(|_| applied.clone());
+          match &result {
+            Expr::List(pair) if pair.len() == 2 => {
+              last_emit = pair[0].clone();
+              state = pair[1].clone();
+            }
+            // f did not return a length-2 list: emit FoldPair::pair and
+            // leave unevaluated, matching wolframscript.
+            _ => {
+              crate::emit_message(&format!(
+                "FoldPair::pair: Function application {} returned {}; a list of two elements is expected.",
+                crate::syntax::format_expr(
+                  &applied,
+                  crate::syntax::ExprForm::Output
+                ),
+                crate::syntax::format_expr(
+                  &result,
+                  crate::syntax::ExprForm::Output
+                )
+              ));
+              return Some(Ok(unevaluated("FoldPair", args)));
+            }
+          }
+        }
+        if args.len() == 4 {
+          // Apply the post-processing function g to the final pair.
+          let pair = Expr::List(vec![last_emit, state].into());
+          let applied = match &args[3] {
+            Expr::Function { body } => {
+              crate::syntax::substitute_slots(body, &[pair])
+            }
+            Expr::Identifier(gname) => Expr::FunctionCall {
+              name: gname.clone(),
+              args: vec![pair].into(),
+            },
+            other => Expr::FunctionCall {
+              name: expr_to_string(other),
+              args: vec![pair].into(),
+            },
+          };
+          return Some(Ok(
+            crate::evaluator::evaluate_expr_to_expr(&applied)
+              .unwrap_or(applied),
+          ));
+        }
+        return Some(Ok(last_emit));
+      }
+    }
+    // FoldPairList[f, x, list] — fold with pair output {emit, newState}.
+    // FoldPairList[f, x, list, g] emits g applied to the whole {emit, newState}
+    // pair instead of just the first element.
+    "FoldPairList" if args.len() == 3 || args.len() == 4 => {
+      if let Expr::List(ref elems) = args[2] {
+        let f = &args[0];
+        let g = if args.len() == 4 {
+          Some(&args[3])
+        } else {
+          None
+        };
+        let mut state = args[1].clone();
+        let mut results = Vec::new();
+        for elem in elems {
+          // Apply f[state, elem] — build function call expression
+          let applied = match f {
+            Expr::Function { body } => crate::syntax::substitute_slots(
+              body,
+              &[state.clone(), elem.clone()],
+            ),
+            Expr::Identifier(fname) => Expr::FunctionCall {
+              name: fname.clone(),
+              args: vec![state.clone(), elem.clone()].into(),
+            },
+            _ => Expr::FunctionCall {
+              name: expr_to_string(f),
+              args: vec![state.clone(), elem.clone()].into(),
+            },
+          };
+          let result = crate::evaluator::evaluate_expr_to_expr(&applied)
+            .unwrap_or(applied);
+          if let Expr::List(ref pair) = result {
+            if pair.len() == 2 {
+              let pair_expr = result.clone();
+              // Emit g[pair] for the 4-argument form, else the first element.
+              let emitted = match g {
+                Some(g) => {
+                  let g_applied = match g {
+                    Expr::Function { body } => crate::syntax::substitute_slots(
+                      body,
+                      std::slice::from_ref(&pair_expr),
+                    ),
+                    Expr::Identifier(gname) => Expr::FunctionCall {
+                      name: gname.clone(),
+                      args: vec![pair_expr.clone()].into(),
+                    },
+                    _ => Expr::FunctionCall {
+                      name: expr_to_string(g),
+                      args: vec![pair_expr.clone()].into(),
+                    },
+                  };
+                  crate::evaluator::evaluate_expr_to_expr(&g_applied)
+                    .unwrap_or(g_applied)
+                }
+                None => pair[0].clone(),
+              };
+              results.push(emitted);
+              state = pair[1].clone();
+            } else {
+              return Some(Ok(result));
+            }
+          } else {
+            return Some(Ok(result));
+          }
+        }
+        return Some(Ok(Expr::List(results.into())));
+      }
+    }
+    // JoinAcross[list1, list2, key] — join associations on a common key
+    "JoinAcross" if args.len() == 3 => {
+      if let (Expr::List(l1), Expr::List(l2)) = (&args[0], &args[1]) {
+        let key_str = expr_to_string(&args[2]);
+        let mut results = Vec::new();
+        for a1 in l1 {
+          let key_val = get_assoc_value(a1, &key_str);
+          if let Some(ref kv) = key_val {
+            for a2 in l2 {
+              let key_val2 = get_assoc_value(a2, &key_str);
+              if let Some(ref kv2) = key_val2
+                && expr_to_string(kv) == expr_to_string(kv2)
+              {
+                // Merge the two associations
+                let merged = merge_associations(a1, a2);
+                results.push(merged);
+              }
+            }
+          }
+        }
+        return Some(Ok(Expr::List(results.into())));
+      }
+    }
+    // CountDistinct[list] — count unique elements
+    // CountDistinct[list] counts distinct elements (an association's values);
+    // CountDistinct[list, test] counts the elements DeleteDuplicates keeps
+    // under that sameness test, which is not a transitive grouping:
+    // CountDistinct[{1, 2, 3, 4, 5}, Abs[#1 - #2] < 2 &] is 3, not 1.
+    "CountDistinct" if args.len() == 1 || args.len() == 2 => {
+      let elems: Option<Vec<Expr>> = match &args[0] {
+        Expr::List(elems) => Some(elems.to_vec()),
+        Expr::Association(pairs) => {
+          Some(pairs.iter().map(|(_, v)| v.clone()).collect())
+        }
+        _ => None,
+      };
+      if let Some(elems) = elems {
+        if let Some(test) = args.get(1) {
+          let kept = list_helpers_ast::delete_duplicates_ast(
+            &Expr::List(elems.into()),
+            Some(test),
+          );
+          return Some(kept.map(|k| match &k {
+            Expr::List(items) => Expr::Integer(items.len() as i128),
+            _ => k,
+          }));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for e in &elems {
+          seen.insert(expr_to_string(e));
+        }
+        return Some(Ok(Expr::Integer(seen.len() as i128)));
+      }
+    }
+    // CountDistinctBy[list, f] — count distinct values of f applied to each
+    // element.
+    "CountDistinctBy" if args.len() == 2 => {
+      if let Expr::List(ref elems) = args[0] {
+        let mut seen = std::collections::HashSet::new();
+        for e in elems {
+          let key = match list_helpers_ast::apply_func_ast(&args[1], e) {
+            Ok(k) => k,
+            Err(err) => return Some(Err(err)),
+          };
+          seen.insert(expr_to_string(&key));
+        }
+        return Some(Ok(Expr::Integer(seen.len() as i128)));
+      }
+    }
+    // SequencePosition[list, sublist] — find positions of subsequence (overlapping)
+    "SequencePosition" if (2..=4).contains(&args.len()) => {
+      if !matches!(&args[0], Expr::List(_)) {
+        crate::emit_message(&format!(
+          "SequencePosition::list: List expected at position 1 in SequencePosition[{}, {}].",
+          expr_to_string(&args[0]),
+          expr_to_string(&args[1])
+        ));
+        return Some(Ok(unevaluated("SequencePosition", args)));
+      }
+      // Trailing arguments: an optional count limit (Integer/Infinity) and an
+      // `Overlaps -> True | False | All` option. Unlike SequenceCases,
+      // SequencePosition reports overlapping matches by default.
+      let mut max_count: usize = usize::MAX;
+      let mode = parse_overlaps_option(&args[2..], Overlaps::Yes);
+      let overlaps = mode.overlapping();
+      for a in &args[2..] {
+        match a {
+          Expr::Integer(n) if *n >= 0 => max_count = *n as usize,
+          Expr::Identifier(id) if id == "Infinity" => max_count = usize::MAX,
+          _ => {}
+        }
+      }
+      if let Expr::List(list) = &args[0] {
+        // The pattern may be wrapped in `Pattern[name, …]` (from `name : …`)
+        // or `Condition[…, test]`; unwrap to the inner list for length
+        // calculations while keeping the full pattern for matching.
+        let match_pat = &args[1];
+        let mut list_pat = match_pat;
+        loop {
+          match list_pat {
+            Expr::FunctionCall {
+              name,
+              args: inner_args,
+            } if name == "Pattern" && inner_args.len() == 2 => {
+              list_pat = &inner_args[1];
+            }
+            Expr::FunctionCall {
+              name,
+              args: cond_args,
+            } if name == "Condition" && cond_args.len() == 2 => {
+              list_pat = &cond_args[0];
+            }
+            _ => break,
+          }
+        }
+        let Expr::List(sub) = list_pat else {
+          return Some(Ok(Expr::List(vec![].into())));
+        };
+        if sub.is_empty() {
+          return Some(Ok(Expr::List(vec![].into())));
+        }
+
+        let has_patterns = sub.iter().any(has_pattern_element);
+        let has_sequence = sub.iter().any(has_sequence_pattern);
+        let mut results: Vec<Expr> = Vec::new();
+        let pos = |start: usize, len: usize| -> Expr {
+          Expr::List(
+            vec![
+              Expr::Integer((start + 1) as i128),
+              Expr::Integer((start + len) as i128),
+            ]
+            .into(),
+          )
+        };
+
+        if has_patterns {
+          let mut i = 0;
+          while i < list.len() && results.len() < max_count {
+            let mut matched = false;
+            let remaining = list.len() - i;
+            let min_len = if has_sequence { 1 } else { sub.len() };
+            let try_max = if has_sequence { remaining } else { sub.len() };
+            if remaining < min_len {
+              break;
+            }
+            let try_max = try_max.min(remaining);
+            for len in (min_len..=try_max).rev() {
+              let subseq = Expr::List(list[i..i + len].to_vec().into());
+              if crate::evaluator::pattern_matching::match_pattern(
+                &subseq, match_pat,
+              )
+              .is_some()
+              {
+                results.push(pos(i, len));
+                matched = true;
+                // `Overlaps -> All` keeps looking for shorter matches at this
+                // same start position instead of moving on.
+                if mode == Overlaps::All {
+                  if results.len() >= max_count {
+                    break;
+                  }
+                  continue;
+                }
+                i += if overlaps { 1 } else { len };
+                break;
+              }
+            }
+            if !matched || mode == Overlaps::All {
+              i += 1;
+            }
+          }
+        } else {
+          // Literal subsequence match.
+          let sub_len = sub.len();
+          let sub_strs: Vec<String> = sub.iter().map(expr_to_string).collect();
+          let mut i = 0;
+          while i + sub_len <= list.len() && results.len() < max_count {
+            let mut is_match = true;
+            for j in 0..sub_len {
+              if expr_to_string(&list[i + j]) != sub_strs[j] {
+                is_match = false;
+                break;
+              }
+            }
+            if is_match {
+              results.push(pos(i, sub_len));
+              i += if overlaps { 1 } else { sub_len };
+            } else {
+              i += 1;
+            }
+          }
+        }
+        return Some(Ok(Expr::List(results.into())));
+      }
+    }
+    // SequenceCases[list, sublist] — find matching subsequences
+    // Supports: plain list, Condition[list, test], Rule/RuleDelayed[list, rhs]
+    "SequenceCases" if (2..=4).contains(&args.len()) => {
+      if !matches!(&args[0], Expr::List(_)) {
+        crate::emit_message(&format!(
+          "SequenceCases::list: List expected at position 1 in SequenceCases[{}, {}].",
+          expr_to_string(&args[0]),
+          expr_to_string(&args[1])
+        ));
+        return Some(Ok(unevaluated("SequenceCases", args)));
+      }
+      // Trailing arguments: an optional count limit (Integer/Infinity) and an
+      // `Overlaps -> True | False | All` option (default: non-overlapping).
+      let mut max_count: usize = usize::MAX;
+      let mode = parse_overlaps_option(&args[2..], Overlaps::No);
+      let overlaps = mode.overlapping();
+      for a in &args[2..] {
+        match a {
+          Expr::Integer(n) if *n >= 0 => max_count = *n as usize,
+          Expr::Identifier(id) if id == "Infinity" => max_count = usize::MAX,
+          _ => {}
+        }
+      }
+      if let Expr::List(list) = &args[0] {
+        // Extract the list pattern and optional replacement from
+        // Condition, Rule, or RuleDelayed wrappers
+        let (match_pat, replacement) = match &args[1] {
+          Expr::Rule {
+            pattern,
+            replacement,
+          }
+          | Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } => (pattern.as_ref(), Some(replacement.as_ref())),
+          _ => (&args[1], None),
+        };
+
+        // Unwrap `Pattern[name, inner]` (from `name : inner` binding) so the
+        // inner list-pattern controls length calculations; `match_pat` keeps
+        // the Pattern so bindings still flow through `match_pattern`.
+        let mut list_pat = match_pat;
+        loop {
+          match list_pat {
+            Expr::FunctionCall {
+              name,
+              args: inner_args,
+            } if name == "Pattern" && inner_args.len() == 2 => {
+              list_pat = &inner_args[1];
+            }
+            Expr::FunctionCall {
+              name,
+              args: cond_args,
+            } if name == "Condition" && cond_args.len() == 2 => {
+              list_pat = &cond_args[0];
+            }
+            _ => break,
+          }
+        }
+
+        // Get the sub-elements for length calculations
+        let Expr::List(sub) = list_pat else {
+          return Some(Ok(Expr::List(vec![].into())));
+        };
+
+        if sub.is_empty() {
+          return Some(Ok(Expr::List(vec![].into())));
+        }
+
+        let has_patterns = sub.iter().any(has_pattern_element);
+        let has_sequence = sub.iter().any(has_sequence_pattern);
+
+        if has_patterns {
+          let mut results: Vec<Expr> = Vec::new();
+          let mut i = 0;
+          while i < list.len() && results.len() < max_count {
+            let mut matched = false;
+            let remaining = list.len() - i;
+            let min_len = if has_sequence { 1 } else { sub.len() };
+            let try_max = if has_sequence { remaining } else { sub.len() };
+            if remaining < min_len {
+              break;
+            }
+            let try_max = try_max.min(remaining);
+            let range: Vec<usize> = (min_len..=try_max).rev().collect();
+            for len in range {
+              let subseq = Expr::List(list[i..i + len].to_vec().into());
+              // Use match_pattern which handles Condition properly
+              if let Some(bindings) =
+                crate::evaluator::pattern_matching::match_pattern(
+                  &subseq, match_pat,
+                )
+              {
+                // Rule/RuleDelayed: instantiate the replacement; a failing
+                // `/;` guard on it means this subsequence is not a match.
+                let produced = match replacement {
+                  Some(repl) => {
+                    match crate::evaluator::pattern_matching::instantiate_replacement(
+                      repl, &bindings,
+                    ) {
+                      Ok(r) => r,
+                      Err(_) => Some(subseq),
+                    }
+                  }
+                  None => Some(subseq),
+                };
+                let Some(produced) = produced else {
+                  continue;
+                };
+                results.push(produced);
+                matched = true;
+                // `Overlaps -> All` keeps looking for shorter matches at this
+                // same start position instead of moving on.
+                if mode == Overlaps::All {
+                  if results.len() >= max_count {
+                    break;
+                  }
+                  continue;
+                }
+                // Overlapping matches advance one element past the start; the
+                // default skips the whole matched subsequence.
+                i += if overlaps { 1 } else { len };
+                break;
+              }
+            }
+            if !matched || mode == Overlaps::All {
+              i += 1;
+            }
+          }
+          return Some(Ok(Expr::List(results.into())));
+        }
+        // Literal subsequence match
+        let sub_len = sub.len();
+        let sub_strs: Vec<String> = sub.iter().map(expr_to_string).collect();
+        let mut results: Vec<Expr> = Vec::new();
+        let mut i = 0;
+        while i + sub_len <= list.len() && results.len() < max_count {
+          let mut matches = true;
+          for j in 0..sub_len {
+            if expr_to_string(&list[i + j]) != sub_strs[j] {
+              matches = false;
+              break;
+            }
+          }
+          if matches {
+            results.push(Expr::List(list[i..i + sub_len].to_vec().into()));
+            i += if overlaps { 1 } else { sub_len };
+          } else {
+            i += 1;
+          }
+        }
+        return Some(Ok(Expr::List(results.into())));
+      }
+    }
+    // SequenceSplit[list, patt] — split list into segments separated by the
+    // (non-overlapping, left-to-right) subsequences matching patt. The
+    // separators are dropped; empty segments are dropped too, except that when
+    // patt matches nothing the whole list is returned as a single segment.
+    //
+    // `patt -> rhs` / `patt :> rhs` (or a list of such rules) keeps `rhs` at
+    // the position of each match instead of dropping it, and the optional
+    // third argument caps the number of sublists.
+    "SequenceSplit" if args.len() == 2 || args.len() == 3 => {
+      if !matches!(&args[0], Expr::List(_)) {
+        crate::emit_message(&format!(
+          "SequenceSplit::list: List expected at position 1 in SequenceSplit[{}, {}].",
+          expr_to_string(&args[0]),
+          expr_to_string(&args[1])
+        ));
+        return Some(Ok(unevaluated("SequenceSplit", args)));
+      }
+      // Maximum number of sublists; Infinity means unlimited.
+      let n_limit: Option<usize> = match args.get(2) {
+        None => None,
+        Some(Expr::Integer(n)) if *n >= 1 => Some(*n as usize),
+        Some(Expr::Identifier(s)) if s == "Infinity" => None,
+        Some(_) => {
+          let call = unevaluated("SequenceSplit", args);
+          crate::emit_message(&format!(
+            "SequenceSplit::ipnf: Positive integer or Infinity expected at position 3 in {}.",
+            expr_to_string(&call)
+          ));
+          return Some(Ok(call));
+        }
+      };
+      if let Expr::List(list) = &args[0] {
+        // A list every element of which is a rule is a list of delimiter
+        // rules; anything else is a single delimiter (rule or bare pattern).
+        let is_rule = |e: &Expr| {
+          matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. })
+            || matches!(e, Expr::FunctionCall { name, args }
+              if (name == "Rule" || name == "RuleDelayed") && args.len() == 2)
+        };
+        let rules: Vec<SeqRule> = match &args[1] {
+          Expr::List(items)
+            if !items.is_empty() && items.iter().all(is_rule) =>
+          {
+            items.iter().filter_map(parse_seq_rule).collect()
+          }
+          single => parse_seq_rule(single)
+            .or_else(|| parse_seq_pattern(single))
+            .into_iter()
+            .collect(),
+        };
+        if rules.is_empty() {
+          return Some(Ok(unevaluated("SequenceSplit", args)));
+        }
+
+        // Collect non-overlapping matches left to right with the replacement
+        // each one produces. At a given position the rules are tried in order
+        // and the longest subsequence first within a rule — wolframscript
+        // prefers the earlier rule even when a later one would match more.
+        let mut matches: Vec<(usize, usize, Option<Expr>)> = Vec::new();
+        let mut i = 0usize;
+        while i < list.len() {
+          let mut hit: Option<(usize, Option<Expr>)> = None;
+          'rules: for rule in &rules {
+            if rule.sub.is_empty() {
+              continue;
+            }
+            let has_seq = rule.sub.iter().any(has_sequence_pattern);
+            let has_pat = rule.sub.iter().any(has_pattern_element);
+            let remaining = list.len() - i;
+            let min_len = if has_seq { 1 } else { rule.sub.len() };
+            let max_len = if has_seq {
+              remaining
+            } else {
+              rule.sub.len().min(remaining)
+            };
+            if remaining < min_len {
+              continue;
+            }
+            for len in (min_len..=max_len).rev() {
+              let subseq = Expr::List(list[i..i + len].to_vec().into());
+              let bindings = if has_pat {
+                crate::evaluator::pattern_matching::match_pattern(
+                  &subseq,
+                  rule.match_pat,
+                )
+              } else if len == rule.sub.len()
+                && (0..len).all(|j| {
+                  expr_to_string(&list[i + j]) == expr_to_string(&rule.sub[j])
+                })
+              {
+                Some(Vec::new())
+              } else {
+                None
+              };
+              if let Some(bindings) = bindings {
+                let repl = match rule.replacement {
+                  Some(repl) => {
+                    match crate::evaluator::pattern_matching::instantiate_replacement(
+                      repl, &bindings,
+                    ) {
+                      // A failing `/;` guard on the replacement: no match.
+                      Ok(None) => continue,
+                      Ok(Some(r)) => Some(
+                        evaluate_expr_to_expr(&r)
+                          .unwrap_or_else(|_| subseq.clone()),
+                      ),
+                      Err(_) => Some(subseq.clone()),
+                    }
+                  }
+                  None => None,
+                };
+                hit = Some((i + len, repl));
+                break 'rules;
+              }
+            }
+          }
+          match hit {
+            Some((end, repl)) => {
+              matches.push((i, end, repl));
+              i = end;
+            }
+            None => i += 1,
+          }
+        }
+
+        // No match: the whole list is a single segment (kept even if empty).
+        if matches.is_empty() {
+          return Some(Ok(Expr::List(vec![Expr::List(list.clone())].into())));
+        }
+
+        // Emit the non-empty segments between separators, interleaved with the
+        // replacements. `n` caps the number of sublists, the last of which is
+        // the unsplit remainder; an empty *leading* sublist is skipped without
+        // counting toward it, while later empty ones count but are dropped.
+        let mut segments: Vec<Expr> = Vec::new();
+        let mut prev = 0usize;
+        let mut committed = 0usize;
+        let mut leading = true;
+        for (s, e, repl) in &matches {
+          if n_limit == Some(committed + 1) {
+            break;
+          }
+          if *s > prev {
+            segments.push(Expr::List(list[prev..*s].to_vec().into()));
+            committed += 1;
+          } else if !leading {
+            committed += 1;
+          }
+          leading = false;
+          if let Some(r) = repl
+            && !matches!(r, Expr::Identifier(s) if s == "Nothing")
+          {
+            segments.push(r.clone());
+          }
+          prev = *e;
+        }
+        if prev < list.len() {
+          segments.push(Expr::List(list[prev..].to_vec().into()));
+        }
+        return Some(Ok(Expr::List(segments.into())));
+      }
+    }
+    // SequenceCount[list, sublist] — count non-overlapping occurrences. The
+    // sublist elements may be patterns (e.g. `_Symbol`, `{__Symbol}`).
+    "SequenceCount" if args.len() == 2 || args.len() == 3 => {
+      // Unlike SequenceCases/SequencePosition/SequenceReplace, SequenceCount
+      // has no max-count argument: any third argument must be an option (a
+      // rule, or a list of rules). A bare non-rule value is rejected with
+      // nonopt and the call stays unevaluated, matching wolframscript.
+      if let Some(opt) = args.get(2)
+        && !matches!(opt, Expr::Rule { .. } | Expr::List(_))
+      {
+        let call = unevaluated("SequenceCount", args);
+        crate::emit_message(&format!(
+          "SequenceCount::nonopt: Options expected (instead of {}) beyond position 2 in {}. An option must be a rule or a list of rules.",
+          expr_to_string(opt),
+          expr_to_string(&call)
+        ));
+        return Some(Ok(call));
+      }
+      if let (Expr::List(list), Expr::List(sub)) = (&args[0], &args[1]) {
+        if sub.is_empty() {
+          return Some(Ok(Expr::Integer(0)));
+        }
+        use crate::evaluator::pattern_matching::match_pattern;
+
+        // A single-element-version of a BlankSequence pattern (`__h` -> `_h`),
+        // or None if the pattern is not a one-or-more sequence pattern.
+        fn single_of_blank_sequence(p: &Expr) -> Option<Expr> {
+          match p {
+            Expr::Pattern {
+              name,
+              head,
+              blank_type: 2,
+            } => Some(Expr::Pattern {
+              name: name.clone(),
+              head: head.clone(),
+              blank_type: 1,
+            }),
+            Expr::PatternTest {
+              name,
+              head,
+              blank_type: 2,
+              test,
+            } => Some(Expr::PatternTest {
+              name: name.clone(),
+              head: head.clone(),
+              blank_type: 1,
+              test: test.clone(),
+            }),
+            _ => None,
+          }
+        }
+        let is_seq_pattern = |p: &Expr| {
+          matches!(
+            p,
+            Expr::Pattern { blank_type, .. }
+              | Expr::PatternTest { blank_type, .. }
+              if *blank_type == 2 || *blank_type == 3
+          )
+        };
+
+        // Optional `Overlaps -> True | All` option (default: non-overlapping).
+        let mode = parse_overlaps_option(&args[2..], Overlaps::No);
+        let overlaps = mode.overlapping();
+
+        // Overlapping counts of a variable-length pattern need the general
+        // start-position scan below rather than either of the shortcuts: the
+        // greedy-run count collapses a whole run into one match, and the
+        // fixed-length window assumes one length per start position.
+        if overlaps && sub.iter().any(is_seq_pattern) {
+          let mut count = 0i128;
+          for i in 0..list.len() {
+            for len in (1..=list.len() - i).rev() {
+              let subseq = Expr::List(list[i..i + len].to_vec().into());
+              if match_pattern(&subseq, &args[1]).is_some() {
+                count += 1;
+                if mode == Overlaps::Yes {
+                  break;
+                }
+              }
+            }
+          }
+          return Some(Ok(Expr::Integer(count)));
+        }
+
+        // Special case: the pattern is exactly one BlankSequence (`{__h}`) —
+        // count maximal greedy runs of consecutive matching elements.
+        if sub.len() == 1
+          && let Some(single) = single_of_blank_sequence(&sub[0])
+        {
+          let mut count = 0i128;
+          let mut i = 0;
+          while i < list.len() {
+            if match_pattern(&list[i], &single).is_some() {
+              count += 1;
+              while i < list.len() && match_pattern(&list[i], &single).is_some()
+              {
+                i += 1;
+              }
+            } else {
+              i += 1;
+            }
+          }
+          return Some(Ok(Expr::Integer(count)));
+        }
+
+        // General fixed-length window matching (no variable-length sequence
+        // patterns). Each sublist element matches exactly one list element.
+        if !sub.iter().any(is_seq_pattern) {
+          let sub_len = sub.len();
+          let mut count = 0i128;
+          let mut i = 0;
+          while i + sub_len <= list.len() {
+            let matches = (0..sub_len)
+              .all(|j| match_pattern(&list[i + j], &sub[j]).is_some());
+            if matches {
+              count += 1;
+              i += if overlaps { 1 } else { sub_len };
+            } else {
+              i += 1;
+            }
+          }
+          return Some(Ok(Expr::Integer(count)));
+        }
+        // Otherwise (mixed variable-length sequence patterns) — leave the call
+        // unevaluated rather than return a wrong count.
+      }
+    }
+    // SequenceReplace[list, rule] / SequenceReplace[list, rule, n] —
+    // replace non-overlapping subsequences matching the rule LHS with its RHS.
+    // `rule` may be a single Rule/RuleDelayed or a list of them (tried in order).
+    "SequenceReplace" if args.len() == 2 || args.len() == 3 => {
+      if !matches!(&args[0], Expr::List(_)) {
+        crate::emit_message(&format!(
+          "SequenceReplace::list: List expected at position 1 in {}.",
+          expr_to_string(&unevaluated("SequenceReplace", args)),
+        ));
+        return Some(Ok(unevaluated("SequenceReplace", args)));
+      }
+
+      // Optional max-replacement count.
+      let max_reps: Option<usize> = if args.len() == 3 {
+        match &args[2] {
+          Expr::Integer(n) if *n >= 0 => Some(*n as usize),
+          // Infinity / All → unlimited (None below). Anything else → bail out.
+          Expr::Identifier(s) if s == "Infinity" || s == "All" => None,
+          _ => {
+            return Some(Ok(unevaluated("SequenceReplace", args)));
+          }
+        }
+      } else {
+        None
+      };
+
+      // Collect the rules: either a list of rules, or a single rule.
+      let rule_exprs: Vec<&Expr> = match &args[1] {
+        Expr::List(items)
+          if !items.is_empty()
+            && items.iter().all(|it| {
+              matches!(
+                it,
+                Expr::Rule { .. } | Expr::RuleDelayed { .. }
+              ) || matches!(
+                it,
+                Expr::FunctionCall { name, args }
+                  if (name == "Rule" || name == "RuleDelayed") && args.len() == 2
+              )
+            }) =>
+        {
+          items.iter().collect()
+        }
+        single => vec![single],
+      };
+
+      let rules: Vec<SeqRule> = rule_exprs
+        .iter()
+        .filter_map(|r| parse_seq_rule(r))
+        .collect();
+
+      // If no parseable rules, return unevaluated.
+      if rules.is_empty() {
+        return Some(Ok(unevaluated("SequenceReplace", args)));
+      }
+
+      let Expr::List(list) = &args[0] else {
+        unreachable!()
+      };
+
+      let mut result: Vec<Expr> = Vec::new();
+      let mut reps_done: usize = 0;
+      let mut i = 0;
+      while i < list.len() {
+        let mut matched = false;
+        if max_reps.is_none_or(|m| reps_done < m) {
+          'rules: for rule in &rules {
+            // Empty list pattern never matches (WL leaves the list unchanged).
+            if rule.sub.is_empty() {
+              continue;
+            }
+            let has_seq = rule.sub.iter().any(has_sequence_pattern);
+            let has_pat = rule.sub.iter().any(has_pattern_element);
+            let remaining = list.len() - i;
+            let min_len = if has_seq { 1 } else { rule.sub.len() };
+            let max_len = if has_seq {
+              remaining
+            } else {
+              rule.sub.len().min(remaining)
+            };
+            if remaining < min_len {
+              continue;
+            }
+            // Greedy: try the longest subsequence first.
+            for len in (min_len..=max_len).rev() {
+              let subseq = Expr::List(list[i..i + len].to_vec().into());
+              let bindings = if has_pat {
+                crate::evaluator::pattern_matching::match_pattern(
+                  &subseq,
+                  rule.match_pat,
+                )
+              } else {
+                // Literal subsequence: compare element-by-element.
+                if len == rule.sub.len()
+                  && (0..len).all(|j| {
+                    expr_to_string(&list[i + j]) == expr_to_string(&rule.sub[j])
+                  })
+                {
+                  Some(Vec::new())
+                } else {
+                  None
+                }
+              };
+              if let Some(bindings) = bindings {
+                let replaced = match rule.replacement {
+                  Some(repl) => {
+                    match crate::evaluator::pattern_matching::instantiate_replacement(
+                      repl, &bindings,
+                    ) {
+                      // A failing `/;` guard on the replacement: no match.
+                      Ok(None) => continue,
+                      Ok(Some(r)) => {
+                        evaluate_expr_to_expr(&r).unwrap_or(subseq)
+                      }
+                      Err(_) => subseq,
+                    }
+                  }
+                  None => subseq,
+                };
+                result.push(replaced);
+                i += len;
+                reps_done += 1;
+                matched = true;
+                break 'rules;
+              }
+            }
+          }
+        }
+        if !matched {
+          result.push(list[i].clone());
+          i += 1;
+        }
+      }
+      return Some(Ok(Expr::List(result.into())));
+    }
+    // SubsetReplace[rule] — operator form, kept symbolic so it can later be
+    // applied to a list (handled in function_application as f[rule][list]).
+    "SubsetReplace" if args.len() == 1 => {
+      return Some(Ok(unevaluated("SubsetReplace", args)));
+    }
+    // SubsetReplace[list, rule] — replace non-overlapping subsets (combinations,
+    // not just contiguous runs) whose element values match a rule's LHS. Rules
+    // are applied in the given order; within a rule, the k-element subsets (k =
+    // the LHS list length) are enumerated in lexicographic order and matched
+    // greedily, consuming their positions. The RHS is emitted at the smallest
+    // position of each matched subset.
+    "SubsetReplace" if args.len() == 2 => {
+      let unevaluated = || unevaluated("SubsetReplace", args);
+      let Expr::List(list) = &args[0] else {
+        crate::emit_message(&format!(
+          "SubsetReplace::list: List expected at position 1 in {}.",
+          expr_to_string(&unevaluated())
+        ));
+        return Some(Ok(unevaluated()));
+      };
+
+      // Collect the rules: a single rule, or a list of rules.
+      let rule_exprs: Vec<&Expr> = match &args[1] {
+        Expr::List(items)
+          if !items.is_empty()
+            && items.iter().all(|it| {
+              matches!(it, Expr::Rule { .. } | Expr::RuleDelayed { .. })
+                || matches!(it, Expr::FunctionCall { name, args }
+                  if (name == "Rule" || name == "RuleDelayed") && args.len() == 2)
+            }) =>
+        {
+          items.iter().collect()
+        }
+        single => vec![single],
+      };
+      let rules: Vec<SeqRule> = rule_exprs
+        .iter()
+        .filter_map(|r| parse_seq_rule(r))
+        .collect();
+      // Every rule must have a list LHS; otherwise leave it unevaluated.
+      if rules.len() != rule_exprs.len() || rules.is_empty() {
+        return Some(Ok(unevaluated()));
+      }
+
+      let n = list.len();
+      let mut consumed = vec![false; n];
+      // Replacement placed at the smallest position of each matched subset.
+      let mut replacement_at: Vec<Option<Expr>> = vec![None; n];
+
+      for rule in &rules {
+        let k = rule.sub.len();
+        // Variable-length and zero-length list patterns are unsupported here;
+        // a fixed k-element subset is required.
+        if k == 0 || k > n || rule.sub.iter().any(has_sequence_pattern) {
+          continue;
+        }
+        let has_pat = rule.sub.iter().any(has_pattern_element);
+        // Enumerate k-combinations of 0..n in lexicographic order.
+        let mut combo: Vec<usize> = (0..k).collect();
+        loop {
+          if !combo.iter().any(|&idx| consumed[idx]) {
+            let values =
+              Expr::List(combo.iter().map(|&idx| list[idx].clone()).collect());
+            let bindings = if has_pat {
+              crate::evaluator::pattern_matching::match_pattern(
+                &values,
+                rule.match_pat,
+              )
+            } else if combo.iter().enumerate().all(|(j, &idx)| {
+              expr_to_string(&list[idx]) == expr_to_string(&rule.sub[j])
+            }) {
+              Some(Vec::new())
+            } else {
+              None
+            };
+            if let Some(bindings) = bindings {
+              let replaced = match rule.replacement {
+                Some(repl) => {
+                  match crate::evaluator::pattern_matching::instantiate_replacement(
+                    repl, &bindings,
+                  ) {
+                    // A failing `/;` guard on the replacement: no match.
+                    Ok(None) => None,
+                    Ok(Some(r)) => {
+                      Some(evaluate_expr_to_expr(&r).unwrap_or(values.clone()))
+                    }
+                    Err(_) => Some(values.clone()),
+                  }
+                }
+                None => Some(values.clone()),
+              };
+              if let Some(replaced) = replaced {
+                replacement_at[combo[0]] = Some(replaced);
+                for &idx in &combo {
+                  consumed[idx] = true;
+                }
+              }
+            }
+          }
+          // Advance to the next k-combination in lexicographic order; stop
+          // once no position can be incremented (the last combination).
+          let mut advanced = false;
+          let mut i = k;
+          while i > 0 {
+            i -= 1;
+            if combo[i] != i + n - k {
+              combo[i] += 1;
+              for j in i + 1..k {
+                combo[j] = combo[j - 1] + 1;
+              }
+              advanced = true;
+              break;
+            }
+          }
+          if !advanced {
+            break;
+          }
+        }
+      }
+
+      let mut result: Vec<Expr> = Vec::with_capacity(n);
+      for i in 0..n {
+        if let Some(rhs) = &replacement_at[i] {
+          result.push(rhs.clone());
+        } else if !consumed[i] {
+          result.push(list[i].clone());
+        }
+      }
+      return Some(Ok(Expr::List(result.into())));
+    }
+    // KeySortBy[assoc, f] — sort association by applying f to keys
+    "KeySortBy" if args.len() == 2 => {
+      if let Expr::Association(pairs) = &args[0] {
+        let func = &args[1];
+        // Compute the sort key for a key `k`. A list of functions
+        // `{f1, …, fn}` yields the tuple `{f1[k], …, fn[k]}` for a
+        // lexicographic multi-criteria sort; any other function is applied
+        // directly. Both named and pure functions are supported.
+        let apply =
+          crate::evaluator::function_application::apply_function_to_arg;
+        let key_of = |k: &Expr| -> Expr {
+          if let Expr::List(funcs) = func {
+            Expr::List(
+              funcs
+                .iter()
+                .map(|f| apply(f, k).unwrap_or_else(|_| k.clone()))
+                .collect(),
+            )
+          } else {
+            apply(func, k).unwrap_or_else(|_| k.clone())
+          }
+        };
+        // Sort by the computed key, breaking ties by the canonical order of
+        // the key itself (matching SortBy, which orders by {f[x], x}).
+        let mut indexed: Vec<(usize, Expr, Expr)> = pairs
+          .iter()
+          .enumerate()
+          .map(|(i, (k, _))| (i, key_of(k), k.clone()))
+          .collect();
+        indexed.sort_by(|a, b| {
+          list_helpers_ast::canonical_cmp(&a.1, &b.1)
+            .then_with(|| list_helpers_ast::canonical_cmp(&a.2, &b.2))
+        });
+        let sorted_pairs: Vec<(Expr, Expr)> =
+          indexed.iter().map(|(i, _, _)| pairs[*i].clone()).collect();
+        return Some(Ok(Expr::Association(sorted_pairs)));
+      }
+    }
+
+    // CenterArray[nspec]            ≡ CenterArray[1, nspec]
+    // CenterArray[a, nspec]         centers a within an array of dimensions nspec
+    // CenterArray[a, nspec, pad]    pads with `pad` instead of 0
+    //
+    // a is either a scalar or a nested rectangular list; nspec is an
+    // Integer (1-D) or a list of Integers (multi-D). For each dimension,
+    // left padding is floor((n - k)/2) and right padding is the rest, so
+    // scalars in an even-length dimension sit just left of middle.
+    "CenterArray" if (1..=3).contains(&args.len()) => {
+      // Normalise to (a, nspec, pad).
+      let (a, nspec, pad) = if args.len() == 1 {
+        (Expr::Integer(1), args[0].clone(), Expr::Integer(0))
+      } else if args.len() == 2 {
+        (args[0].clone(), args[1].clone(), Expr::Integer(0))
+      } else {
+        (args[0].clone(), args[1].clone(), args[2].clone())
+      };
+      // Parse nspec into a list of dimension lengths.
+      let dims: Vec<usize> = match &nspec {
+        Expr::Integer(n) if *n >= 0 => vec![*n as usize],
+        Expr::List(items) => {
+          let mut out = Vec::with_capacity(items.len());
+          let mut ok = true;
+          for item in items {
+            if let Expr::Integer(n) = item
+              && *n >= 0
+            {
+              out.push(*n as usize);
+            } else {
+              ok = false;
+              break;
+            }
+          }
+          if !ok {
+            return None;
+          }
+          out
+        }
+        _ => return None,
+      };
+      // Inspect the block's shape against the requested rank. A scalar
+      // input is treated as a rank-0 block; lists must be exactly as
+      // deeply nested as `dims` and rectangular at every level.
+      fn block_shape(e: &Expr, depth: usize) -> Option<Vec<usize>> {
+        if depth == 0 {
+          if matches!(e, Expr::List(_)) {
+            return None;
+          }
+          return Some(Vec::new());
+        }
+        let Expr::List(items) = e else {
+          return None;
+        };
+        let mut shape = vec![items.len()];
+        if items.is_empty() {
+          shape.resize(depth.max(1), 0);
+          return Some(shape);
+        }
+        let inner_shape = block_shape(&items[0], depth - 1)?;
+        for child in items.iter().skip(1) {
+          if block_shape(child, depth - 1).as_deref() != Some(&inner_shape) {
+            return None;
+          }
+        }
+        shape.extend(inner_shape);
+        Some(shape)
+      }
+      // If a is a scalar (non-List), it's a rank-0 block. If a is a
+      // list, we expect its rank to match `dims.len()`.
+      let block_dims: Vec<usize> = if matches!(a, Expr::List(_)) {
+        block_shape(&a, dims.len())?
+      } else {
+        vec![1; dims.len()]
+      };
+      // Per-dimension layout: how much to truncate from the block's
+      // front (block_start), the effective block size after truncation
+      // (effective_k), and how many pad cells go before/after the block
+      // along this axis.
+      struct Axis {
+        block_start: usize,
+        effective_k: usize,
+        left_pad: usize,
+      }
+      let axes: Vec<Axis> = dims
+        .iter()
+        .zip(block_dims.iter())
+        .map(|(d, k)| {
+          if *k <= *d {
+            Axis {
+              block_start: 0,
+              effective_k: *k,
+              left_pad: (*d - *k) / 2,
+            }
+          } else {
+            // Truncate the block; div_ceil matches wolframscript on
+            // odd parity (CenterArray[{a,b,c}, 2] == {b, c}).
+            Axis {
+              block_start: (*k - *d).div_ceil(2),
+              effective_k: *d,
+              left_pad: 0,
+            }
+          }
+        })
+        .collect();
+      // Fetch an element of the (possibly nested) block at a multi-index.
+      fn fetch(block: &Expr, idx: &[usize]) -> Expr {
+        if idx.is_empty() {
+          return block.clone();
+        }
+        if let Expr::List(items) = block {
+          return fetch(&items[idx[0]], &idx[1..]);
+        }
+        block.clone()
+      }
+      fn build(
+        dims: &[usize],
+        axes: &[Axis],
+        block: &Expr,
+        pad: &Expr,
+        block_idx: &mut Vec<usize>,
+        is_scalar_block: bool,
+      ) -> Expr {
+        if dims.is_empty() {
+          if is_scalar_block {
+            return block.clone();
+          }
+          return fetch(block, block_idx);
+        }
+        let n = dims[0];
+        let ax = &axes[0];
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+          if i >= ax.left_pad && i < ax.left_pad + ax.effective_k {
+            block_idx.push(ax.block_start + (i - ax.left_pad));
+            out.push(build(
+              &dims[1..],
+              &axes[1..],
+              block,
+              pad,
+              block_idx,
+              is_scalar_block,
+            ));
+            block_idx.pop();
+          } else {
+            out.push(pad_block(&dims[1..], pad));
+          }
+        }
+        Expr::List(out.into())
+      }
+      fn pad_block(dims: &[usize], pad: &Expr) -> Expr {
+        if dims.is_empty() {
+          return pad.clone();
+        }
+        let inner = pad_block(&dims[1..], pad);
+        Expr::List(vec![inner; dims[0]].into())
+      }
+      let is_scalar = !matches!(a, Expr::List(_));
+      let mut block_idx = Vec::with_capacity(dims.len());
+      return Some(Ok(build(
+        &dims,
+        &axes,
+        &a,
+        &pad,
+        &mut block_idx,
+        is_scalar,
+      )));
+    }
+    // ReverseSortBy[list, f] — sort list in reverse order by applying f
+    "ReverseSortBy" if args.len() == 2 || args.len() == 3 => {
+      // ReverseSortBy[list, f] == Reverse[SortBy[list, f]] — this reuses
+      // SortBy's stable, canonical, multi-criteria-aware key sorting (a list
+      // of functions sorts by each in turn) and reverses the whole result, so
+      // ties are reversed too (matching wolframscript).
+      let sorted = match args.get(2) {
+        Some(p) => {
+          list_helpers_ast::sort_by_with_ordering_ast(&args[0], &args[1], p)
+        }
+        None => list_helpers_ast::sort_by_ast(&args[0], &args[1]),
+      };
+      return Some(sorted.map(|s| {
+        if let Expr::List(items) = &s {
+          Expr::List(items.iter().rev().cloned().collect::<Vec<_>>().into())
+        } else if let Expr::Association(pairs) = &s {
+          Expr::Association(pairs.iter().rev().cloned().collect())
+        } else {
+          s
+        }
+      }));
+    }
+    // IntersectingQ[list1, list2] — True if lists share any element
+    "IntersectingQ" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::predicate_ast::intersecting_q_ast(args));
+    }
+    // DisjointQ[list1, list2] — True if lists share no common elements
+    "DisjointQ" if args.len() == 2 || args.len() == 3 => {
+      return Some(crate::functions::predicate_ast::disjoint_q_ast(args));
+    }
+    // FindPermutation[e1, e2] — find permutation that maps e1 to e2.
+    // Accepts Lists or any two FunctionCalls with the same head.
+    "FindPermutation" if args.len() == 1 => {
+      // FindPermutation[list] is the permutation taking Sort[list] to list.
+      let inner = call(
+        "FindPermutation",
+        vec![call1("Sort", args[0].clone()), args[0].clone()],
+      );
+      return Some(evaluate_expr_to_expr(&inner));
+    }
+    "FindPermutation" if args.len() == 2 => {
+      // Pull `&[Expr]` from a List or from a FunctionCall, requiring both
+      // sides to share the same head (List vs List, or head[..] vs head[..]).
+      fn elements(expr: &Expr) -> Option<(Option<&str>, &[Expr])> {
+        match expr {
+          Expr::List(items) => Some((None, items)),
+          Expr::FunctionCall { name, args } => {
+            Some((Some(name.as_str()), args))
+          }
+          _ => None,
+        }
+      }
+      let (left, right) = (elements(&args[0]), elements(&args[1]));
+      if let (Some((hl, a)), Some((hr, b))) = (left, right)
+        && hl == hr
+        && a.len() == b.len()
+      {
+        let n = a.len();
+        let a_strs: Vec<String> = a.iter().map(expr_to_string).collect();
+        let b_strs: Vec<String> = b.iter().map(expr_to_string).collect();
+        // Each element of the target is matched to a position not already
+        // spoken for, so repeated elements pair up one to one instead of
+        // all claiming the first match and leaving holes in the
+        // permutation.
+        let mut perm = vec![0usize; n];
+        let mut used = vec![false; n];
+        let mut valid = true;
+        for (i, bs) in b_strs.iter().enumerate() {
+          if let Some(pos) = a_strs
+            .iter()
+            .enumerate()
+            .position(|(j, x)| !used[j] && x == bs)
+          {
+            used[pos] = true;
+            perm[pos] = i + 1;
+          } else {
+            valid = false;
+            break;
+          }
+        }
+        if valid {
+          // Convert to cycles notation
+          let mut visited = vec![false; n];
+          let mut cycles = Vec::new();
+          for start in 0..n {
+            if visited[start] || perm[start] == start + 1 {
+              visited[start] = true;
+              continue;
+            }
+            let mut cycle = Vec::new();
+            let mut curr = start;
+            while !visited[curr] {
+              visited[curr] = true;
+              cycle.push(Expr::Integer((curr + 1) as i128));
+              curr = perm[curr] - 1;
+            }
+            if cycle.len() > 1 {
+              cycles.push(Expr::List(cycle.into()));
+            }
+          }
+          return Some(Ok(call1("Cycles", Expr::List(cycles.into()))));
+        }
+      }
+    }
+    // KeyMemberQ[assoc, key] — True if key exists in association
+    "KeyMemberQ" if args.len() == 2 => {
+      if let Expr::Association(pairs) = &args[0] {
+        let key_str = expr_to_string(&args[1]);
+        let found = pairs.iter().any(|(k, _)| expr_to_string(k) == key_str);
+        return Some(Ok(bool_expr(found)));
+      }
+    }
+    // Cycles[{cyc1, ...}] — canonicalise: drop length-1 cycles, rotate
+    // each cycle to start with its smallest element, sort cycles by
+    // that first element. Matches Mathematica's canonical form so
+    // structurally distinct inputs like Cycles[{{4, 10, 2, 5}, {9}}]
+    // and Cycles[{{2, 5, 4, 10}}] compare equal.
+    "Cycles" if args.len() == 1 => {
+      if let Some(cycles) = cycles_arg(&unevaluated("Cycles", args)) {
+        let mut canonical: Vec<Vec<i128>> = Vec::with_capacity(cycles.len());
+        for cycle in &cycles {
+          if cycle.len() <= 1 {
+            continue;
+          }
+          // Rotate so the smallest element comes first.
+          let (min_idx, _) =
+            cycle.iter().enumerate().min_by_key(|(_, v)| **v).unwrap();
+          let mut rotated: Vec<i128> = cycle[min_idx..].to_vec();
+          rotated.extend_from_slice(&cycle[..min_idx]);
+          canonical.push(rotated);
+        }
+        // Sort cycles by their first element.
+        canonical.sort_by_key(|c| c[0]);
+        let cycle_exprs: Vec<Expr> = canonical
+          .into_iter()
+          .map(|c| {
+            Expr::List(
+              c.into_iter().map(Expr::Integer).collect::<Vec<_>>().into(),
+            )
+          })
+          .collect();
+        return Some(Ok(call1("Cycles", Expr::List(cycle_exprs.into()))));
+      }
+    }
+
+    // PermutationOrder[perm] — order (smallest n such that perm^n = identity)
+    "PermutationOrder" if args.len() == 1 => {
+      // Cycles[{cycle1, ...}] form: order is LCM of cycle lengths.
+      if let Some(cycles) = cycles_arg(&args[0]) {
+        let mut order: i128 = 1;
+        for cycle in cycles {
+          let len = cycle.len() as i128;
+          if len > 0 {
+            order = lcm_i128(order, len);
+          }
+        }
+        return Some(Ok(Expr::Integer(order)));
+      }
+      if matches!(&args[0], Expr::List(_)) {
+        // Permutation as list form: the order is the lcm of the cycle
+        // lengths.
+        let Some(indices) =
+          permutation_list_indices("PermutationOrder", &args[0], true)
+        else {
+          return Some(Ok(unevaluated("PermutationOrder", args)));
+        };
+        let n = indices.len();
+        let mut visited = vec![false; n];
+        let mut order: i128 = 1;
+        for start in 0..n {
+          if visited[start] {
+            continue;
+          }
+          let mut cycle_len: i128 = 0;
+          let mut curr = start;
+          while !visited[curr] {
+            visited[curr] = true;
+            cycle_len += 1;
+            curr = indices[curr];
+          }
+          order = lcm_i128(order, cycle_len);
+        }
+        return Some(Ok(Expr::Integer(order)));
+      }
+    }
+    // PermutationPower[perm, n] — apply permutation n times
+    "PermutationPower" if args.len() == 2 => {
+      if let (Expr::List(perm), Some(n)) = (&args[0], expr_to_i128(&args[1])) {
+        let len = perm.len();
+        let mut indices = Vec::with_capacity(len);
+        let mut valid = true;
+        for p in perm {
+          if let Expr::Integer(v) = p {
+            indices.push(*v as usize);
+          } else {
+            valid = false;
+            break;
+          }
+        }
+        if valid {
+          // For negative n, use inverse first
+          let (indices, n) = if n < 0 {
+            // Compute inverse
+            let mut inv = vec![0usize; len];
+            for (i, &idx) in indices.iter().enumerate() {
+              inv[idx - 1] = i + 1;
+            }
+            (inv, -n)
+          } else {
+            (indices, n)
+          };
+          // Apply permutation n times efficiently using cycle decomposition
+          let mut result = vec![0usize; len];
+          let mut visited = vec![false; len];
+          for start in 0..len {
+            if visited[start] {
+              continue;
+            }
+            // Trace cycle
+            let mut cycle = Vec::new();
+            let mut curr = start;
+            while !visited[curr] {
+              visited[curr] = true;
+              cycle.push(curr);
+              curr = indices[curr] - 1;
+            }
+            let cycle_len = cycle.len();
+            let shift = (n as usize) % cycle_len;
+            for (i, &pos) in cycle.iter().enumerate() {
+              result[pos] = cycle[(i + shift) % cycle_len] + 1;
+            }
+          }
+          let result_exprs: Vec<Expr> = result
+            .into_iter()
+            .map(|v| Expr::Integer(v as i128))
+            .collect();
+          return Some(Ok(Expr::List(result_exprs.into())));
+        }
+      }
+      // PermutationPower[Cycles[{...}], n] — apply cycle-form permutation n times,
+      // returning canonical Cycles form.
+      if let (
+        Expr::FunctionCall {
+          name: cname,
+          args: cargs,
+        },
+        Some(n),
+      ) = (&args[0], expr_to_i128(&args[1]))
+        && cname == "Cycles"
+        && cargs.len() == 1
+        && let Expr::List(cycle_list) = &cargs[0]
+      {
+        let mut max_elem: usize = 0;
+        let mut valid = true;
+        for cycle in cycle_list {
+          let Expr::List(c) = cycle else {
+            valid = false;
+            break;
+          };
+          for e in c {
+            if let Expr::Integer(v) = e {
+              if *v >= 1 {
+                let u = *v as usize;
+                if u > max_elem {
+                  max_elem = u;
+                }
+              } else {
+                valid = false;
+                break;
+              }
+            } else {
+              valid = false;
+              break;
+            }
+          }
+          if !valid {
+            break;
+          }
+        }
+        if valid {
+          // Build the underlying permutation map perm[i] = σ(i) for i in 1..=N
+          let mut perm: Vec<usize> = (0..=max_elem).collect();
+          for cycle in cycle_list {
+            if let Expr::List(c) = cycle {
+              let ints: Vec<usize> = c
+                .iter()
+                .filter_map(|e| {
+                  if let Expr::Integer(v) = e {
+                    Some(*v as usize)
+                  } else {
+                    None
+                  }
+                })
+                .collect();
+              if ints.len() >= 2 {
+                for i in 0..ints.len() - 1 {
+                  perm[ints[i]] = ints[i + 1];
+                }
+                perm[ints[ints.len() - 1]] = ints[0];
+              }
+            }
+          }
+          // Invert if n < 0
+          let (perm, n_abs) = if n < 0 {
+            let mut inv = vec![0usize; max_elem + 1];
+            for i in 1..=max_elem {
+              inv[perm[i]] = i;
+            }
+            inv[0] = 0;
+            (inv, (-n) as u128)
+          } else {
+            (perm, n as u128)
+          };
+          // Compute σ^n_abs by decomposing into disjoint cycles and shifting
+          // each cycle by n_abs mod cycle_len. This is the same trick used
+          // for the list-form branch but adapted to a 1-indexed map.
+          let mut result: Vec<usize> = (0..=max_elem).collect();
+          let mut visited = vec![false; max_elem + 1];
+          visited[0] = true;
+          for start in 1..=max_elem {
+            if visited[start] {
+              continue;
+            }
+            let mut cycle = Vec::new();
+            let mut curr = start;
+            while !visited[curr] {
+              visited[curr] = true;
+              cycle.push(curr);
+              curr = perm[curr];
+            }
+            let cycle_len = cycle.len();
+            let shift = (n_abs % cycle_len as u128) as usize;
+            for (i, &pos) in cycle.iter().enumerate() {
+              result[pos] = cycle[(i + shift) % cycle_len];
+            }
+          }
+          // Build canonical Cycles from result: extract cycles, skip fixed
+          // points, rotate each so its smallest element comes first, and
+          // sort cycles by smallest element.
+          let mut visited2 = vec![false; max_elem + 1];
+          visited2[0] = true;
+          let mut out_cycles: Vec<Vec<i128>> = Vec::new();
+          for start in 1..=max_elem {
+            if visited2[start] {
+              continue;
+            }
+            let mut cycle = Vec::new();
+            let mut curr = start;
+            while !visited2[curr] {
+              visited2[curr] = true;
+              cycle.push(curr as i128);
+              curr = result[curr];
+            }
+            if cycle.len() >= 2 {
+              let min_idx = cycle
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| *v)
+                .map_or(0, |(i, _)| i);
+              cycle.rotate_left(min_idx);
+              out_cycles.push(cycle);
+            }
+          }
+          out_cycles.sort_by_key(|c| c[0]);
+          let cycle_exprs: Vec<Expr> = out_cycles
+            .into_iter()
+            .map(|c| Expr::List(c.into_iter().map(Expr::Integer).collect()))
+            .collect();
+          return Some(Ok(call1("Cycles", Expr::List(cycle_exprs.into()))));
+        }
+      }
+    }
+    // PermutationLength[perm] — number of non-fixed points
+    "PermutationLength" if args.len() == 1 => {
+      // Cycles form: sum of cycle lengths (Cycles canonicalises away
+      // length-1 cycles, so every listed element is moved).
+      if let Some(cycles) = cycles_arg(&args[0]) {
+        let total: i128 = cycles.iter().map(|c| c.len() as i128).sum();
+        return Some(Ok(Expr::Integer(total)));
+      }
+      if let Expr::List(perm) = &args[0] {
+        let mut count: i128 = 0;
+        for (i, p) in perm.iter().enumerate() {
+          if let Expr::Integer(v) = p
+            && *v as usize != i + 1
+          {
+            count += 1;
+          }
+        }
+        return Some(Ok(Expr::Integer(count)));
+      }
+    }
+    // PermutationListQ[list] — True if list is a valid permutation
+    "PermutationListQ" if args.len() == 1 => {
+      if let Expr::List(perm) = &args[0] {
+        let n = perm.len();
+        let mut seen = vec![false; n + 1];
+        let mut valid = true;
+        for p in perm {
+          if let Expr::Integer(v) = p {
+            let v = *v as usize;
+            if v >= 1 && v <= n && !seen[v] {
+              seen[v] = true;
+            } else {
+              valid = false;
+              break;
+            }
+          } else {
+            valid = false;
+            break;
+          }
+        }
+        return Some(Ok(bool_expr(valid)));
+      }
+      // Non-list input
+      return Some(Ok(bool_expr(false)));
+    }
+    // (legacy 4-arg FoldWhileList arm, superseded above)
+    "FoldWhileListLegacy" if args.len() == 4 => {
+      if let Expr::List(items) = &args[2] {
+        let f = &args[0];
+        let mut acc = args[1].clone();
+        let test = &args[3];
+        let mut results = vec![acc.clone()];
+        for item in items {
+          // Build f[acc, item] and evaluate
+          let call = match f {
+            Expr::Identifier(name) => Expr::FunctionCall {
+              name: name.clone(),
+              args: vec![acc.clone(), item.clone()].into(),
+            },
+            Expr::Function { body } => crate::syntax::substitute_slots(
+              body,
+              &[acc.clone(), item.clone()],
+            ),
+            _ => Expr::FunctionCall {
+              name: expr_to_string(f),
+              args: vec![acc.clone(), item.clone()].into(),
+            },
+          };
+          let new_acc = evaluate_expr_to_expr(&call).unwrap_or(call);
+          // Test the new value
+          // Include the new value, then check the test.
+          // If the test fails, we still include this value (Wolfram behavior).
+          acc = new_acc;
+          results.push(acc.clone());
+          let test_result =
+            apply_function_to_arg(test, &acc).unwrap_or(bool_expr(false));
+          let test_str = expr_to_string(&test_result);
+          if test_str != "True" {
+            break;
+          }
+        }
+        return Some(Ok(Expr::List(results.into())));
+      }
+    }
+    // PermutationCyclesQ[Cycles[{...}]] — True if valid Cycles form
+    "PermutationCyclesQ" if args.len() == 1 => {
+      if let Expr::FunctionCall {
+        name: cname,
+        args: cargs,
+      } = &args[0]
+        && cname == "Cycles"
+        && cargs.len() == 1
+        && let Expr::List(cycles) = &cargs[0]
+      {
+        let mut valid = true;
+        let mut seen = std::collections::HashSet::new();
+        for cycle in cycles {
+          if let Expr::List(c) = cycle {
+            for elem in c {
+              if let Expr::Integer(v) = elem {
+                if *v < 1 || !seen.insert(*v) {
+                  valid = false;
+                  break;
+                }
+              } else {
+                valid = false;
+                break;
+              }
+            }
+          } else {
+            valid = false;
+          }
+          if !valid {
+            break;
+          }
+        }
+        return Some(Ok(bool_expr(valid)));
+      }
+      return Some(Ok(bool_expr(false)));
+    }
+    // PermutationSupport[perm] — set of elements moved by the permutation
+    "PermutationSupport" if args.len() == 1 => {
+      // Cycles form: sorted union of integers across all cycles.
+      if let Some(cycles) = cycles_arg(&args[0]) {
+        let mut support: Vec<i128> = cycles.iter().flatten().copied().collect();
+        support.sort_unstable();
+        support.dedup();
+        return Some(Ok(Expr::List(
+          support
+            .into_iter()
+            .map(Expr::Integer)
+            .collect::<Vec<_>>()
+            .into(),
+        )));
+      }
+      if matches!(&args[0], Expr::List(_)) {
+        let Some(indices) =
+          permutation_list_indices("PermutationSupport", &args[0], true)
+        else {
+          return Some(Ok(unevaluated("PermutationSupport", args)));
+        };
+        let support: Vec<Expr> = indices
+          .iter()
+          .enumerate()
+          .filter(|&(i, &image)| image != i)
+          .map(|(i, _)| Expr::Integer((i + 1) as i128))
+          .collect();
+        return Some(Ok(Expr::List(support.into())));
+      }
+    }
+    // PermutationMax[perm] — largest element moved by the permutation
+    "PermutationMax" if args.len() == 1 => {
+      // Cycles form: max element across all cycles.
+      if let Some(cycles) = cycles_arg(&args[0]) {
+        let max_val = cycles.iter().flatten().copied().max();
+        return Some(Ok(Expr::Integer(max_val.unwrap_or(0))));
+      }
+      if let Expr::List(perm) = &args[0] {
+        let mut max_val: Option<i128> = None;
+        for (i, p) in perm.iter().enumerate() {
+          if let Expr::Integer(v) = p
+            && *v as usize != i + 1
+          {
+            let idx = (i + 1) as i128;
+            max_val = Some(max_val.map_or(idx, |m: i128| m.max(idx)));
+          }
+        }
+        if let Some(m) = max_val {
+          return Some(Ok(Expr::Integer(m)));
+        }
+        return Some(Ok(Expr::Integer(0)));
+      }
+    }
+    // PermutationMin[perm] — smallest element moved by the permutation
+    "PermutationMin" if args.len() == 1 => {
+      // Cycles form: min element across all cycles.
+      if let Some(cycles) = cycles_arg(&args[0]) {
+        if let Some(min_val) = cycles.iter().flatten().copied().min() {
+          return Some(Ok(Expr::Integer(min_val)));
+        }
+        // Empty Cycles → wolframscript returns Infinity (no moved points).
+        return Some(Ok(id_expr("Infinity")));
+      }
+      if let Expr::List(perm) = &args[0] {
+        let mut min_val: Option<i128> = None;
+        for (i, p) in perm.iter().enumerate() {
+          if let Expr::Integer(v) = p
+            && *v as usize != i + 1
+          {
+            let idx = (i + 1) as i128;
+            min_val = Some(min_val.map_or(idx, |m: i128| m.min(idx)));
+          }
+        }
+        if let Some(m) = min_val {
+          return Some(Ok(Expr::Integer(m)));
+        }
+        return Some(Ok(call0("Infinity")));
+      }
+    }
+    // Splice[list] and Splice[list, head] — stay unevaluated; splicing is done
+    // by the enclosing context (List evaluation or flatten_sequences).
+    "Splice" if args.len() == 1 || args.len() == 2 => {
+      return Some(Ok(unevaluated("Splice", args)));
+    }
+    // SubsetMap[f, list, positions] — apply f to the elements at `positions`
+    // collectively and put the results back. `positions` may be:
+    //   * a Span (`2 ;; 5`) or `All` → level-1 positions
+    //   * a flat list of integers (`{2, 4}`) → separate level-1 positions
+    //   * a list of position paths (`{{1,1},{2,2}}` or `{{2},{4}}`)
+    //   * a Part-style multi-level spec (`{All, 2}`, `{1 ;; 2, 3}`) → the
+    //     covered deep positions, in row-major order
+    "SubsetMap" if args.len() == 3 => {
+      if matches!(&args[1], Expr::List(_)) {
+        let f = &args[0];
+        let subject = &args[1];
+        let paths = subsetmap_positions(subject, &args[2])?;
+        // Extract the elements at those positions, in spec order.
+        let subset: Vec<Expr> = paths
+          .iter()
+          .filter_map(|p| get_at_path(subject, p))
+          .collect();
+        // Apply f to the extracted sublist (as a single list argument).
+        let mapped =
+          apply_function_to_arg(f, &Expr::List(subset.clone().into()))
+            .unwrap_or_else(|_| unevaluated("SubsetMap", args));
+        // The result must be a list of the same length as the extracted
+        // sublist; otherwise SubsetMap can't put the elements back and emits
+        // `newls`, leaving the call unevaluated (matching wolframscript).
+        match &mapped {
+          Expr::List(mapped_items)
+            if mapped_items.len() == subset.len()
+              && subset.len() == paths.len() =>
+          {
+            let mut result = subject.clone();
+            for (path, val) in paths.iter().zip(mapped_items.iter()) {
+              if let Some(updated) = set_at_path(&result, path, val) {
+                result = updated;
+              }
+            }
+            return Some(Ok(result));
+          }
+          _ => {
+            crate::emit_message(&format!(
+              "SubsetMap::newls: The function {} does not give a list of the same length when applied to list {}.",
+              crate::syntax::expr_to_message_form(f),
+              crate::syntax::format_expr(
+                &Expr::List(subset.into()),
+                crate::syntax::ExprForm::Output
+              )
+            ));
+            return Some(Ok(unevaluated("SubsetMap", args)));
+          }
+        }
+      }
+    }
+    // Assert — returns unevaluated (matches Wolfram default behavior without AssertTools package)
+    _ => {}
+  }
+  None
+}
+
+/// Expand a `Span[start, end, step]` (the parsed form of `start ;; end ;; step`)
+/// into a list of 1-based positions within a list of length `len`. Supports
+/// `All` and negative endpoints (counting from the end) and an optional step.
+/// Returns None for non-integer / unsupported endpoints.
+fn span_to_positions(span_args: &[Expr], len: usize) -> Option<Vec<usize>> {
+  let len_i = len as i128;
+  let resolve = |e: Option<&Expr>, default: i128| -> Option<i128> {
+    match e {
+      None => Some(default),
+      Some(Expr::Integer(n)) => Some(if *n < 0 { len_i + n + 1 } else { *n }),
+      Some(Expr::Identifier(s)) if s == "All" => Some(default),
+      _ => None,
+    }
+  };
+  let start = resolve(span_args.first(), 1)?;
+  let end = resolve(span_args.get(1), len_i)?;
+  let step = match span_args.get(2) {
+    None => 1,
+    Some(Expr::Integer(s)) if *s != 0 => *s,
+    _ => return None,
+  };
+
+  let mut positions = Vec::new();
+  let mut i = start;
+  if step > 0 {
+    while i <= end {
+      if i >= 1 && i <= len_i {
+        positions.push(i as usize);
+      }
+      i += step;
+    }
+  } else {
+    while i >= end {
+      if i >= 1 && i <= len_i {
+        positions.push(i as usize);
+      }
+      i += step;
+    }
+  }
+  Some(positions)
+}
+
+/// Length of a `List` expression (children count), or `None` for non-lists.
+fn list_len_expr(e: &Expr) -> Option<usize> {
+  match e {
+    Expr::List(items) => Some(items.len()),
+    _ => None,
+  }
+}
+
+/// Fetch the 1-based child of a `List` (negative counts from the end).
+fn list_child(e: &Expr, one_based: i128) -> Option<Expr> {
+  if let Expr::List(items) = e {
+    let n = items.len() as i128;
+    let idx = if one_based < 0 {
+      n + one_based
+    } else {
+      one_based - 1
+    };
+    if idx >= 0 && idx < n {
+      return Some(items[idx as usize].clone());
+    }
+  }
+  None
+}
+
+/// Follow a 1-based position path into nested `List`s.
+fn get_at_path(e: &Expr, path: &[i128]) -> Option<Expr> {
+  let mut cur = e.clone();
+  for &p in path {
+    cur = list_child(&cur, p)?;
+  }
+  Some(cur)
+}
+
+/// Return a copy of `e` with the element at `path` replaced by `val`.
+fn set_at_path(e: &Expr, path: &[i128], val: &Expr) -> Option<Expr> {
+  let Some((&head, rest)) = path.split_first() else {
+    return Some(val.clone());
+  };
+  if let Expr::List(items) = e {
+    let n = items.len() as i128;
+    let idx = if head < 0 { n + head } else { head - 1 };
+    if idx < 0 || idx >= n {
+      return None;
+    }
+    let mut v = items.to_vec();
+    let child = set_at_path(&v[idx as usize], rest, val)?;
+    v[idx as usize] = child;
+    return Some(Expr::List(v.into()));
+  }
+  None
+}
+
+/// Resolve a SubsetMap position specification into concrete 1-based position
+/// paths (see the `"SubsetMap"` dispatch arm for the accepted spec forms).
+fn subsetmap_positions(subject: &Expr, spec: &Expr) -> Option<Vec<Vec<i128>>> {
+  match spec {
+    // `All` selects every level-1 position.
+    Expr::Identifier(s) if s == "All" => {
+      let n = list_len_expr(subject)? as i128;
+      Some((1..=n).map(|i| vec![i]).collect())
+    }
+    // A Span expands to the level-1 positions it covers.
+    Expr::FunctionCall { name, args: sp } if name == "Span" => {
+      let n = list_len_expr(subject)?;
+      Some(
+        span_to_positions(sp, n)?
+          .into_iter()
+          .map(|i| vec![i as i128])
+          .collect(),
+      )
+    }
+    // A bare integer is a single level-1 position.
+    Expr::Integer(n) => Some(vec![vec![*n]]),
+    // A flat list of integers: each is a separate level-1 position. (This is
+    // where SubsetMap diverges from Part/Extract, which read `{2, 4}` as one
+    // deep position.)
+    Expr::List(items)
+      if !items.is_empty()
+        && items.iter().all(|e| matches!(e, Expr::Integer(_))) =>
+    {
+      Some(
+        items
+          .iter()
+          .map(|e| match e {
+            Expr::Integer(n) => vec![*n],
+            _ => unreachable!(),
+          })
+          .collect(),
+      )
+    }
+    // A list whose entries are all lists: each inner list is one position
+    // path (`{{1,1},{2,2}}` deep, `{{2},{4}}` level-1).
+    Expr::List(items) if items.iter().all(|e| matches!(e, Expr::List(_))) => {
+      let mut paths = Vec::with_capacity(items.len());
+      for item in items {
+        let Expr::List(inner) = item else {
+          unreachable!()
+        };
+        let mut path = Vec::with_capacity(inner.len());
+        for c in inner {
+          match c {
+            Expr::Integer(n) => path.push(*n),
+            _ => return None,
+          }
+        }
+        paths.push(path);
+      }
+      Some(paths)
+    }
+    // Any other list is a Part-style multi-level spec (e.g. `{All, 2}`).
+    Expr::List(items) => expand_part_spec(subject, &items.to_vec()),
+    _ => None,
+  }
+}
+
+/// Expand a Part-style multi-level position spec (each level being an
+/// integer, `All`, a Span, or a list of integers) into the covered position
+/// paths, in row-major order.
+fn expand_part_spec(
+  subject: &Expr,
+  level_specs: &[Expr],
+) -> Option<Vec<Vec<i128>>> {
+  fn indices_at(node: &Expr, spec: &Expr) -> Option<Vec<i128>> {
+    let n = list_len_expr(node)? as i128;
+    let clamp = |k: i128| -> Option<i128> {
+      let idx = if k < 0 { n + k + 1 } else { k };
+      (idx >= 1 && idx <= n).then_some(idx)
+    };
+    match spec {
+      Expr::Identifier(s) if s == "All" => Some((1..=n).collect()),
+      Expr::Integer(k) => clamp(*k).map(|i| vec![i]),
+      Expr::FunctionCall { name, args: sp } if name == "Span" => Some(
+        span_to_positions(sp, n as usize)?
+          .into_iter()
+          .map(|i| i as i128)
+          .collect(),
+      ),
+      Expr::List(ks) => {
+        let mut out = Vec::with_capacity(ks.len());
+        for k in ks {
+          match k {
+            Expr::Integer(k) => out.push(clamp(*k)?),
+            _ => return None,
+          }
+        }
+        Some(out)
+      }
+      _ => None,
+    }
+  }
+  fn recurse(
+    node: &Expr,
+    specs: &[Expr],
+    prefix: &mut Vec<i128>,
+    out: &mut Vec<Vec<i128>>,
+  ) -> Option<()> {
+    let Some((first, rest)) = specs.split_first() else {
+      out.push(prefix.clone());
+      return Some(());
+    };
+    for i in indices_at(node, first)? {
+      let child = list_child(node, i)?;
+      prefix.push(i);
+      recurse(&child, rest, prefix, out)?;
+      prefix.pop();
+    }
+    Some(())
+  }
+  let mut out = Vec::new();
+  recurse(subject, level_specs, &mut Vec::new(), &mut out)?;
+  Some(out)
+}
+
+use crate::functions::math_ast::lcm_i128;
+
+/// If `expr` is `Cycles[{{...}, {...}, ...}]` with all-integer cycles,
+/// return each cycle as `Vec<i128>`. Returns `None` for any other shape
+/// so callers can fall through to list-form handling.
+fn cycles_arg(expr: &Expr) -> Option<Vec<Vec<i128>>> {
+  let Expr::FunctionCall { name, args } = expr else {
+    return None;
+  };
+  if name != "Cycles" || args.len() != 1 {
+    return None;
+  }
+  let Expr::List(cycles) = &args[0] else {
+    return None;
+  };
+  let mut result = Vec::with_capacity(cycles.len());
+  for cycle in cycles {
+    let Expr::List(items) = cycle else {
+      return None;
+    };
+    let mut nums = Vec::with_capacity(items.len());
+    for item in items {
+      if let Expr::Integer(n) = item {
+        nums.push(*n);
+      } else {
+        return None;
+      }
+    }
+    result.push(nums);
+  }
+  Some(result)
+}
+
+fn get_assoc_value(assoc: &Expr, key: &str) -> Option<Expr> {
+  if let Expr::Association(pairs) = assoc {
+    for (k, v) in pairs {
+      let k_str = expr_to_string(k);
+      if k_str == key || k_str == key.trim_matches('"') {
+        return Some(v.clone());
+      }
+    }
+  }
+  None
+}
+
+/// Merge two associations, with the first taking priority for duplicate keys
+fn merge_associations(a1: &Expr, a2: &Expr) -> Expr {
+  let mut pairs: Vec<(Expr, Expr)> = Vec::new();
+  let mut seen_keys: Vec<String> = Vec::new();
+
+  if let Expr::Association(items) = a1 {
+    for (k, v) in items {
+      let k_str = expr_to_string(k);
+      seen_keys.push(k_str);
+      pairs.push((k.clone(), v.clone()));
+    }
+  }
+
+  if let Expr::Association(items) = a2 {
+    for (k, v) in items {
+      let k_str = expr_to_string(k);
+      if !seen_keys.contains(&k_str) {
+        pairs.push((k.clone(), v.clone()));
+      }
+    }
+  }
+
+  Expr::Association(pairs)
+}
+
+fn array_pad_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let arr = &args[0];
+  let pad_val = if args.len() >= 3 {
+    args[2].clone()
+  } else {
+    Expr::Integer(0)
+  };
+  let unevaluated = || unevaluated("ArrayPad", args);
+  // Named padding schemes ("Periodic", "Reflected") for a one-dimensional flat
+  // list: ArrayPad[{1,2,3}, 2, "Periodic"] extends the list cyclically on both
+  // sides; "Reflected" reflects it at the boundaries.
+  if let Expr::List(items) = arr
+    && !items.is_empty()
+    && items.iter().all(|e| !matches!(e, Expr::List(_)))
+    && let Expr::String(scheme) = &pad_val
+    && matches!(scheme.as_str(), "Periodic" | "Cyclic" | "Reflected")
+  {
+    let (left, right) = match &args[1] {
+      Expr::Integer(n) if *n >= 0 => (*n, *n),
+      Expr::List(lr) if lr.len() == 2 => match (&lr[0], &lr[1]) {
+        (Expr::Integer(l), Expr::Integer(r)) if *l >= 0 && *r >= 0 => (*l, *r),
+        _ => return Ok(unevaluated()),
+      },
+      _ => return Ok(unevaluated()),
+    };
+    let len = items.len() as i128;
+    // "Cyclic" is an alias for "Periodic".
+    let at = |v: i128| -> Expr {
+      let idx = if scheme == "Periodic" || scheme == "Cyclic" {
+        v.rem_euclid(len)
+      } else if len == 1 {
+        0
+      } else {
+        let period = 2 * (len - 1);
+        let j = v.rem_euclid(period);
+        if j < len { j } else { 2 * (len - 1) - j }
+      };
+      items[idx as usize].clone()
+    };
+    let total = left + len + right;
+    let result: Vec<Expr> = (0..total).map(|p| at(p - left)).collect();
+    return Ok(Expr::List(result.into()));
+  }
+  // Try per-dimension form: {{m1, n1}, {m2, n2}, ...} or {{m1}, {m2}, ...}
+  // where the spec list has length equal to the array's rank.
+  if let Expr::List(spec_items) = &args[1]
+    && spec_items.iter().all(|s| matches!(s, Expr::List(_)))
+    && !spec_items.is_empty()
+  {
+    let mut per_dim: Vec<(i128, i128)> = Vec::with_capacity(spec_items.len());
+    for s in spec_items {
+      let Expr::List(inner) = s else {
+        return Ok(unevaluated());
+      };
+      let pair = match inner.len() {
+        1 => match &inner[0] {
+          Expr::Integer(n) => (*n, *n),
+          _ => return Ok(unevaluated()),
+        },
+        2 => match (&inner[0], &inner[1]) {
+          (Expr::Integer(l), Expr::Integer(r)) => (*l, *r),
+          _ => return Ok(unevaluated()),
+        },
+        _ => return Ok(unevaluated()),
+      };
+      per_dim.push(pair);
+    }
+    return pad_array_per_dim(arr, &per_dim, &pad_val);
+  }
+
+  // Parse padding spec: integer n or {left, right}
+  let (left, right) = match &args[1] {
+    Expr::Integer(n) => {
+      let n = *n;
+      (n, n)
+    }
+    Expr::List(items) if items.len() == 2 => {
+      let l = match &items[0] {
+        Expr::Integer(n) => *n,
+        _ => return Ok(unevaluated()),
+      };
+      let r = match &items[1] {
+        Expr::Integer(n) => *n,
+        _ => return Ok(unevaluated()),
+      };
+      (l, r)
+    }
+    _ => return Ok(unevaluated()),
+  };
+
+  pad_array(arr, left, right, &pad_val)
+}
+
+/// Apply `(left, right)` padding per outer dimension. `per_dim[0]` pads the
+/// outermost dim; remaining entries pad inner dims. If the spec is shorter
+/// than the array's rank, inner dims are left unchanged.
+fn pad_array_per_dim(
+  arr: &Expr,
+  per_dim: &[(i128, i128)],
+  pad_val: &Expr,
+) -> Result<Expr, InterpreterError> {
+  if per_dim.is_empty() {
+    return Ok(arr.clone());
+  }
+  let (left, right) = per_dim[0];
+  let rest = &per_dim[1..];
+
+  let Expr::List(items) = arr else {
+    return Ok(arr.clone());
+  };
+
+  // First recursively pad each child along the remaining dimensions.
+  let mut padded_children: Vec<Expr> = items
+    .iter()
+    .map(|item| pad_array_per_dim(item, rest, pad_val))
+    .collect::<Result<Vec<_>, _>>()?;
+
+  // Build a pad element for this dimension: a fully-zero block with the
+  // shape of one padded child.
+  let pad_block = if let Some(first) = padded_children.first() {
+    zero_block_like(first, pad_val)
+  } else {
+    pad_val.clone()
+  };
+
+  // Add or trim entries at the front.
+  if left >= 0 {
+    let mut prefix: Vec<Expr> = vec![pad_block.clone(); left as usize];
+    prefix.append(&mut padded_children);
+    padded_children = prefix;
+  } else {
+    let trim = (-left) as usize;
+    if trim < padded_children.len() {
+      padded_children = padded_children[trim..].to_vec();
+    } else {
+      padded_children = vec![];
+    }
+  }
+
+  // Add or trim entries at the back.
+  if right >= 0 {
+    for _ in 0..right {
+      padded_children.push(pad_block.clone());
+    }
+  } else {
+    let trim = (-right) as usize;
+    if trim < padded_children.len() {
+      padded_children.truncate(padded_children.len() - trim);
+    } else {
+      padded_children = vec![];
+    }
+  }
+
+  Ok(Expr::List(padded_children.into()))
+}
+
+/// Build an Expr with the same nested-List shape as `template`, filled with `pad_val`.
+fn zero_block_like(template: &Expr, pad_val: &Expr) -> Expr {
+  match template {
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(|it| zero_block_like(it, pad_val))
+        .collect::<Vec<_>>()
+        .into(),
+    ),
+    _ => pad_val.clone(),
+  }
+}
+
+fn pad_array(
+  arr: &Expr,
+  left: i128,
+  right: i128,
+  pad_val: &Expr,
+) -> Result<Expr, InterpreterError> {
+  match arr {
+    Expr::List(items) => {
+      // Check if this is a multi-dimensional array (items are lists)
+      let is_nested = items.iter().all(|item| matches!(item, Expr::List(_)));
+
+      if is_nested && !items.is_empty() {
+        // Multi-dimensional: pad each sub-array, then add padding rows
+        let mut padded_items: Vec<Expr> = items
+          .iter()
+          .map(|item| pad_array(item, left, right, pad_val))
+          .collect::<Result<Vec<_>, _>>()?;
+
+        // Figure out the width of padded sub-arrays
+        let inner_len = if let Expr::List(inner) = &padded_items[0] {
+          inner.len()
+        } else {
+          0
+        };
+
+        // Create padding row
+        let pad_row = Expr::List(vec![pad_val.clone(); inner_len].into());
+
+        // Add/remove rows at top and bottom
+        if left >= 0 {
+          let mut prefix = vec![pad_row.clone(); left as usize];
+          prefix.append(&mut padded_items);
+          padded_items = prefix;
+        } else {
+          let trim = (-left) as usize;
+          if trim < padded_items.len() {
+            padded_items = padded_items[trim..].to_vec();
+          } else {
+            padded_items = vec![];
+          }
+        }
+
+        if right >= 0 {
+          for _ in 0..right {
+            padded_items.push(pad_row.clone());
+          }
+        } else {
+          let trim = (-right) as usize;
+          if trim < padded_items.len() {
+            padded_items.truncate(padded_items.len() - trim);
+          } else {
+            padded_items = vec![];
+          }
+        }
+
+        Ok(Expr::List(padded_items.into()))
+      } else {
+        // 1D array
+        let mut result = items.clone();
+
+        if left >= 0 {
+          let mut prefix: Vec<Expr> = vec![pad_val.clone(); left as usize];
+          prefix.extend(result.iter().cloned());
+          result = prefix.into();
+        } else {
+          let trim = (-left) as usize;
+          if trim < result.len() {
+            result = result.slice(trim..);
+          } else {
+            result = crate::ExprList::new();
+          }
+        }
+
+        if right >= 0 {
+          for _ in 0..right {
+            result.push(pad_val.clone());
+          }
+        } else {
+          let trim = (-right) as usize;
+          let cur_len = result.len();
+          if trim < cur_len {
+            result.truncate(cur_len - trim);
+          } else {
+            result = crate::ExprList::new();
+          }
+        }
+
+        Ok(Expr::List(result))
+      }
+    }
+    _ => Ok(call1("ArrayPad", arr.clone())),
+  }
+}
+
+/// Convert Associations to Lists of rules within an expression.
+/// Recurses into FunctionCall args and List items but not into Rule values,
+/// matching Wolfram's Normal behavior.
+/// The head-name string of `expr` for `Normal[expr, h]` matching.
+fn normal_head_name(expr: &Expr) -> &str {
+  match expr {
+    Expr::Association(_) => "Association",
+    Expr::List(_) => "List",
+    Expr::FunctionCall { name, .. } => name,
+    _ => "",
+  }
+}
+
+/// Extract the requested head name(s) from the second argument of
+/// `Normal[expr, h]`: either a single symbol or a list of symbols.
+fn normal_head_spec_names(spec: &Expr) -> Vec<String> {
+  match spec {
+    Expr::List(items) => items
+      .iter()
+      .filter_map(|x| match x {
+        Expr::Identifier(n) => Some(n.clone()),
+        _ => None,
+      })
+      .collect(),
+    Expr::Identifier(n) => vec![n.clone()],
+    _ => Vec::new(),
+  }
+}
+
+/// Shallowly normalize a matched object: an Association becomes its list of
+/// rules (values untouched) and a SparseArray/NumericArray/ByteArray unwraps
+/// to its dense/list payload. Other heads are returned unchanged.
+fn normal_shallow(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Association(pairs) => {
+      let rules: Vec<Expr> = pairs
+        .iter()
+        .map(|(k, v)| match v {
+          Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } if crate::syntax::assoc_marker_matches(k, pattern) => {
+            Expr::RuleDelayed {
+              pattern: Box::new(k.clone()),
+              replacement: replacement.clone(),
+            }
+          }
+          _ => Expr::Rule {
+            pattern: Box::new(k.clone()),
+            replacement: Box::new(v.clone()),
+          },
+        })
+        .collect();
+      Expr::List(rules.into())
+    }
+    Expr::FunctionCall { name, args } if name == "Association" => {
+      Expr::List(args.clone())
+    }
+    Expr::FunctionCall { name, args } if name == "SparseArray" => {
+      list_helpers_ast::sparse_array_ast(args).unwrap_or_else(|_| expr.clone())
+    }
+    Expr::FunctionCall { name, args }
+      if (name == "NumericArray" || name == "ByteArray") && args.len() == 1 =>
+    {
+      normal_convert_associations(&args[0])
+    }
+    _ => expr.clone(),
+  }
+}
+
+/// `Normal[expr, heads]` — recursively normalize only objects whose head is in
+/// `heads`. A matched object is converted shallowly (its contents are not
+/// re-processed); otherwise recursion descends into List elements and ordinary
+/// (non-hold) function arguments but not into the values of an unmatched
+/// Association.
+fn normal_with_heads(expr: &Expr, heads: &[String]) -> Expr {
+  if heads.iter().any(|h| h == normal_head_name(expr)) {
+    return normal_shallow(expr);
+  }
+  let is_hold = |name: &str| {
+    matches!(
+      name,
+      "Hold"
+        | "HoldForm"
+        | "HoldComplete"
+        | "HoldCompleteForm"
+        | "HoldPattern"
+        | "HoldAllComplete"
+    )
+  };
+  match expr {
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(|e| normal_with_heads(e, heads))
+        .collect::<Vec<_>>()
+        .into(),
+    ),
+    Expr::FunctionCall { name, args } if !is_hold(name) => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(|e| normal_with_heads(e, heads))
+        .collect::<Vec<_>>()
+        .into(),
+    },
+    _ => expr.clone(),
+  }
+}
+
+fn normal_convert_associations(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Association(pairs) => {
+      // See `Normal` dispatch: `RuleDelayed{pattern==key, replacement}` is the
+      // marker for an originally-delayed entry.
+      let rules: Vec<Expr> = pairs
+        .iter()
+        .map(|(k, v)| match v {
+          Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } if crate::syntax::assoc_marker_matches(k, pattern) => {
+            Expr::RuleDelayed {
+              pattern: Box::new(k.clone()),
+              replacement: replacement.clone(),
+            }
+          }
+          _ => Expr::Rule {
+            pattern: Box::new(k.clone()),
+            replacement: Box::new(v.clone()),
+          },
+        })
+        .collect();
+      Expr::List(rules.into())
+    }
+    Expr::FunctionCall { name, args } if name == "Association" => {
+      Expr::List(args.clone())
+    }
+    // NumericArray / ByteArray unwrap to their underlying list payload.
+    Expr::FunctionCall { name, args }
+      if (name == "NumericArray" || name == "ByteArray") && args.len() == 1 =>
+    {
+      normal_convert_associations(&args[0])
+    }
+    // A SparseArray nested inside a container densifies, then we keep recursing
+    // (Normal acts at all levels, so `Normal[{SparseArray[..], ..}]` returns a
+    // list of dense lists — e.g. Normal[CoefficientArrays[...]]).
+    Expr::FunctionCall { name, args } if name == "SparseArray" => {
+      match list_helpers_ast::sparse_array_ast(args) {
+        Ok(dense) => normal_convert_associations(&dense),
+        Err(_) => Expr::FunctionCall {
+          name: name.clone(),
+          args: args.iter().map(normal_convert_associations).collect(),
+        },
+      }
+    }
+    // A nested SeriesData collapses to its polynomial via the full Normal path.
+    Expr::FunctionCall { name, args }
+      if name == "SeriesData" && args.len() == 6 =>
+    {
+      let normalized = call1("Normal", expr.clone());
+      match evaluate_expr_to_expr(&normalized) {
+        Ok(r) if expr_to_string(&r) != expr_to_string(expr) => {
+          normal_convert_associations(&r)
+        }
+        _ => expr.clone(),
+      }
+    }
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.iter().map(normal_convert_associations).collect(),
+    },
+    Expr::List(items) => {
+      Expr::List(items.iter().map(normal_convert_associations).collect())
+    }
+    _ => expr.clone(),
+  }
+}
+
+/// ArrayFlatten[{{block11, block12, ...}, {block21, ...}, ...}]
+/// Combines a matrix of sub-matrices (blocks) into a single matrix.
+/// Scalar entries (e.g. 0) are expanded to zero/constant matrices
+/// of the appropriate dimensions inferred from neighboring blocks.
+fn array_flatten_ast(arg: &Expr) -> Expr {
+  // arg should be a list of rows, where each row is a list of blocks (sub-matrices)
+  let Expr::List(block_rows) = arg else {
+    return call1("ArrayFlatten", arg.clone());
+  };
+
+  if block_rows.is_empty() {
+    return Expr::List(vec![].into());
+  }
+
+  // First, determine the grid dimensions (number of block rows and columns)
+  let n_block_rows = block_rows.len();
+  let mut n_block_cols = 0;
+
+  // Collect all blocks as raw expressions in a 2D grid
+  let mut block_grid: Vec<Vec<&Expr>> = Vec::new();
+  for block_row in block_rows {
+    let Expr::List(blocks_in_row) = block_row else {
+      return call1("ArrayFlatten", arg.clone());
+    };
+    if n_block_cols == 0 {
+      n_block_cols = blocks_in_row.len();
+    }
+    block_grid.push(blocks_in_row.iter().collect());
+  }
+
+  // Helper: get the dimensions (rows, cols) of a block if it's a matrix
+  fn block_dims(block: &Expr) -> Option<(usize, usize)> {
+    match block {
+      Expr::List(rows) => {
+        if rows.is_empty() {
+          return Some((0, 0));
+        }
+        match &rows[0] {
+          Expr::List(cols) => Some((rows.len(), cols.len())),
+          _ => None, // 1D list, not a matrix block
+        }
+      }
+      _ => None, // Scalar
+    }
+  }
+
+  // Determine the row height for each block-row and column width
+  // for each block-column by scanning actual matrix blocks.
+  let mut row_heights: Vec<Option<usize>> = vec![None; n_block_rows];
+  let mut col_widths: Vec<Option<usize>> = vec![None; n_block_cols];
+
+  for (i, row) in block_grid.iter().enumerate() {
+    for (j, block) in row.iter().enumerate() {
+      if let Some((h, w)) = block_dims(block) {
+        if row_heights[i].is_none() {
+          row_heights[i] = Some(h);
+        }
+        if col_widths[j].is_none() {
+          col_widths[j] = Some(w);
+        }
+      }
+    }
+  }
+
+  // Default any undetermined dimension to 1
+  let row_heights: Vec<usize> =
+    row_heights.into_iter().map(|h| h.unwrap_or(1)).collect();
+  let col_widths: Vec<usize> =
+    col_widths.into_iter().map(|w| w.unwrap_or(1)).collect();
+
+  // Parse each block into a matrix, expanding scalars to the
+  // appropriate size
+  let mut all_block_rows: Vec<Vec<Vec<Vec<Expr>>>> = Vec::new();
+
+  for (i, row) in block_grid.iter().enumerate() {
+    let mut parsed_blocks: Vec<Vec<Vec<Expr>>> = Vec::new();
+    for (j, block) in row.iter().enumerate() {
+      let matrix = match block {
+        Expr::List(rows) => {
+          let mut m: Vec<Vec<Expr>> = Vec::new();
+          for r in rows {
+            match r {
+              Expr::List(cols) => m.push(cols.to_vec()),
+              other => m.push(vec![other.clone()]),
+            }
+          }
+          m
+        }
+        // Scalar: expand to a matrix of the right size filled
+        // with this value (commonly 0)
+        scalar => {
+          let h = row_heights[i];
+          let w = col_widths[j];
+          vec![vec![(*scalar).clone(); w]; h]
+        }
+      };
+      parsed_blocks.push(matrix);
+    }
+    all_block_rows.push(parsed_blocks);
+  }
+
+  // Build the result matrix by combining blocks
+  let mut result: Vec<Vec<Expr>> = Vec::new();
+
+  for block_row in &all_block_rows {
+    if block_row.is_empty() {
+      continue;
+    }
+    // Number of rows in this block-row (determined by first block)
+    let n_rows = block_row[0].len();
+
+    for r in 0..n_rows {
+      let mut result_row: Vec<Expr> = Vec::new();
+      for block in block_row {
+        if r < block.len() {
+          result_row.extend_from_slice(&block[r]);
+        }
+      }
+      result.push(result_row);
+    }
+  }
+
+  Expr::List(result.into_iter().map(|v| Expr::List(v.into())).collect())
+}
+
+thread_local! {
+  /// The `DistanceFunction` in force for the `Nearest` call being evaluated.
+  static NEAREST_DISTANCE_FUNCTION: std::cell::RefCell<Option<Expr>> =
+    const { std::cell::RefCell::new(None) };
+}
+
+/// Distance between two expressions. Falls back to absolute scalar difference
+/// and, for equal-length numeric lists, the Euclidean norm.
+fn nearest_distance(a: &Expr, b: &Expr) -> Option<f64> {
+  // A DistanceFunction replaces the built-in metric entirely.
+  if let Some(f) = NEAREST_DISTANCE_FUNCTION.with(|slot| slot.borrow().clone())
+  {
+    let value = list_helpers_ast::apply_func_to_two_args(&f, a, b).ok()?;
+    return expr_to_f64(&crate::evaluator::evaluate_expr_to_expr(&value).ok()?);
+  }
+  // Colors compare via Euclidean distance on their RGB triple.
+  // `GrayLevel[g]` is treated as `RGBColor[g, g, g]`. Mixed
+  // RGBColor↔GrayLevel comparisons work because both lift to a
+  // 3-element float vector.
+  if let (Some(ra), Some(rb)) = (color_to_rgb(a), color_to_rgb(b)) {
+    let mut sum = 0.0;
+    for (x, y) in ra.iter().zip(rb.iter()) {
+      let dx = x - y;
+      sum += dx * dx;
+    }
+    return Some(sum.sqrt());
+  }
+  match (a, b) {
+    (Expr::List(va), Expr::List(vb)) if va.len() == vb.len() => {
+      let mut sum = 0.0;
+      for (x, y) in va.iter().zip(vb.iter()) {
+        let dx = expr_to_f64(x)? - expr_to_f64(y)?;
+        sum += dx * dx;
+      }
+      Some(sum.sqrt())
+    }
+    // Strings compare via EditDistance (Wolfram's default string metric).
+    (Expr::String(_), Expr::String(_)) => {
+      match crate::functions::string_ast::edit_distance_ast(&[
+        a.clone(),
+        b.clone(),
+      ]) {
+        Ok(Expr::Integer(d)) => Some(d as f64),
+        _ => None,
+      }
+    }
+    _ => {
+      let av = expr_to_f64(a)?;
+      let bv = expr_to_f64(b)?;
+      Some((av - bv).abs())
+    }
+  }
+}
+
+/// Lift a colour expression to a 3-element RGB float vector.
+/// Recognises `RGBColor[r, g, b]`, `RGBColor[r, g, b, a]` (alpha
+/// dropped), and `GrayLevel[g]` (mapped to `[g, g, g]`).
+fn color_to_rgb(e: &Expr) -> Option<[f64; 3]> {
+  if let Expr::FunctionCall { name, args } = e {
+    if name == "RGBColor" && (args.len() == 3 || args.len() == 4) {
+      let r = expr_to_f64(&args[0])?;
+      let g = expr_to_f64(&args[1])?;
+      let b = expr_to_f64(&args[2])?;
+      return Some([r, g, b]);
+    }
+    if name == "GrayLevel" && (args.len() == 1 || args.len() == 2) {
+      let g = expr_to_f64(&args[0])?;
+      return Some([g, g, g]);
+    }
+  }
+  None
+}
+
+/// Split `Nearest`'s trailing options off its positional arguments. Only the
+/// slots past the data and the target can hold one: the data itself may be a
+/// `points -> labels` rule, and the count spec is an integer, `All`, or a
+/// two-element list — never a rule.
+fn split_nearest_options(args: &[Expr]) -> (Vec<Expr>, Vec<Expr>) {
+  let is_rule = |e: &Expr| {
+    matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. })
+      || matches!(e, Expr::FunctionCall { name, args }
+        if (name == "Rule" || name == "RuleDelayed") && args.len() == 2)
+  };
+  let mut positional = Vec::with_capacity(args.len());
+  let mut options = Vec::new();
+  for (i, arg) in args.iter().enumerate() {
+    let option = i >= 2
+      && match arg {
+        Expr::List(items) => !items.is_empty() && items.iter().all(&is_rule),
+        other => is_rule(other),
+      };
+    if option {
+      match arg {
+        Expr::List(items) => options.extend(items.iter().cloned()),
+        other => options.push(other.clone()),
+      }
+    } else {
+      positional.push(arg.clone());
+    }
+  }
+  (positional, options)
+}
+
+/// The `DistanceFunction` setting of a `Nearest` call, if it names one.
+fn distance_function_option(options: &[Expr]) -> Option<Expr> {
+  options.iter().find_map(|opt| {
+    let (pattern, replacement) = match opt {
+      Expr::Rule {
+        pattern,
+        replacement,
+      }
+      | Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } => (pattern.as_ref(), replacement.as_ref()),
+      Expr::FunctionCall { name, args }
+        if (name == "Rule" || name == "RuleDelayed") && args.len() == 2 =>
+      {
+        (&args[0], &args[1])
+      }
+      _ => return None,
+    };
+    if !matches!(pattern, Expr::Identifier(n) if n == "DistanceFunction") {
+      return None;
+    }
+    match replacement {
+      Expr::Identifier(s) if s == "Automatic" => None,
+      other => Some(other.clone()),
+    }
+  })
+}
+
+/// Nearest[list, x] - find elements of list nearest to x
+/// Nearest[list, x, n] - find n nearest elements
+/// Nearest[points -> values, x] - return the labels whose points are closest
+///
+/// `DistanceFunction -> f` measures with `f[element, target]` instead of the
+/// built-in metric, which is what lets a named metric (`ManhattanDistance`),
+/// a pure function, or `EditDistance` on strings choose the neighbour. The
+/// remaining options are accepted and ignored.
+fn nearest_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let (positional, options) = split_nearest_options(args);
+  let distance_function = distance_function_option(&options);
+  if !options.is_empty() {
+    if positional.len() < 2 {
+      return Ok(unevaluated("Nearest", args));
+    }
+    // Re-enter without the options, carrying the metric through a thread-local
+    // so every recursive path (per-target threading, the label views) uses it.
+    return NEAREST_DISTANCE_FUNCTION.with(|slot| {
+      let previous = slot.replace(distance_function);
+      let result = nearest_ast(&positional);
+      slot.replace(previous);
+      result
+    });
+  }
+  // Data that is not a list of points — including an empty list, which is
+  // unusable rather than "nothing is near" — is reported and stood down on.
+  // Woxi used to answer `{}` for the empty case and stay silent for the rest.
+  let usable = match &args[0] {
+    Expr::List(v) => !v.is_empty(),
+    Expr::Rule { pattern, .. } => {
+      matches!(pattern.as_ref(), Expr::List(v) if !v.is_empty())
+    }
+    _ => false,
+  };
+  if !usable {
+    crate::emit_message(&format!(
+      "Nearest::near1: {} is neither a list of real points nor a valid list \
+       of rules.",
+      expr_to_output(&args[0])
+    ));
+    return Ok(unevaluated("Nearest", args));
+  }
+  // View modes for the Rule form `points -> "Index" | "Distance" | "Element"`.
+  #[derive(Clone, Copy, PartialEq)]
+  enum View {
+    Items,
+    Index,
+    Distance,
+    Element,
+  }
+  fn prop_view(s: &str) -> Option<View> {
+    match s {
+      "Index" => Some(View::Index),
+      "Distance" => Some(View::Distance),
+      "Element" => Some(View::Element),
+      _ => None,
+    }
+  }
+  let mut view = View::Items;
+  // When the Rule's RHS is a list of property names (e.g. {"Element",
+  // "Index"}), each result becomes a list of those properties.
+  let mut multi_props: Option<Vec<View>> = None;
+  // Rule form: Nearest[points -> labels, target]. Distances are measured on
+  // the `points` list, but the result is drawn from the matching `labels`.
+  let (items_owned, labels): (Vec<Expr>, Option<Vec<Expr>>) = match &args[0] {
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => {
+      let pts = match pattern.as_ref() {
+        Expr::List(v) => v.clone(),
+        _ => {
+          return Ok(unevaluated("Nearest", args));
+        }
+      };
+      // points -> Automatic: label each point by its 1-based position, so the
+      // result is the indices of the nearest points (same as the "Index" view).
+      if matches!(replacement.as_ref(),
+        Expr::Identifier(s) | Expr::Constant(s) if s == "Automatic")
+      {
+        view = View::Index;
+        (pts.to_vec(), None)
+      } else if let Expr::String(s) = replacement.as_ref() {
+        match s.as_str() {
+          "Index" => {
+            view = View::Index;
+            (pts.to_vec(), None)
+          }
+          "Distance" => {
+            view = View::Distance;
+            (pts.to_vec(), None)
+          }
+          "Element" => {
+            view = View::Element;
+            (pts.to_vec(), None)
+          }
+          _ => {
+            return Ok(unevaluated("Nearest", args));
+          }
+        }
+      } else if let Expr::List(plist) = replacement.as_ref()
+        && !plist.is_empty()
+        && let Some(views) = plist
+          .iter()
+          .map(|p| match p {
+            Expr::String(s) => prop_view(s),
+            _ => None,
+          })
+          .collect::<Option<Vec<View>>>()
+      {
+        // points -> {prop1, prop2, …}: multi-property result.
+        multi_props = Some(views);
+        (pts.to_vec(), None)
+      } else {
+        let lbls = match replacement.as_ref() {
+          Expr::List(v) if v.len() == pts.len() => v.clone(),
+          _ => {
+            return Ok(unevaluated("Nearest", args));
+          }
+        };
+        (pts.to_vec(), Some(lbls.to_vec()))
+      }
+    }
+    Expr::List(v) => {
+      // `{point1 -> label1, point2 -> label2, …}` is the list-of-rules
+      // form: split into separate point and label vectors. If every
+      // element is a `Rule` / `RuleDelayed`, treat this as the labelled
+      // form so the result is drawn from the labels rather than the
+      // points themselves.
+      let all_rules = !v.is_empty()
+        && v
+          .iter()
+          .all(|e| matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. }));
+      if all_rules {
+        let mut pts = Vec::with_capacity(v.len());
+        let mut lbls = Vec::with_capacity(v.len());
+        for r in v {
+          match r {
+            Expr::Rule {
+              pattern,
+              replacement,
+            }
+            | Expr::RuleDelayed {
+              pattern,
+              replacement,
+            } => {
+              pts.push((**pattern).clone());
+              lbls.push((**replacement).clone());
+            }
+            _ => unreachable!(),
+          }
+        }
+        (pts, Some(lbls))
+      } else {
+        (v.to_vec(), None)
+      }
+    }
+    _ => {
+      return Ok(unevaluated("Nearest", args));
+    }
+  };
+  let items = &items_owned;
+
+  if items.is_empty() {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  // Multi-target form: when `target` is a List and each item in it
+  // produces a valid distance against `items[0]`, recurse per-target
+  // and return a list of results — `Nearest[items, {t1, t2, …}]` →
+  // `{Nearest[items, t1], Nearest[items, t2], …}`. This handles e.g.
+  // `Nearest[{colors…}, {Orange, Gray}]` where each target is itself
+  // a colour. We skip this branch when `target` matches `items[0]`
+  // dimensionally as a single vector (the common scalar-list case).
+  if let Expr::List(targets) = &args[1]
+    && !targets.is_empty()
+    && nearest_distance(&items[0], &args[1]).is_none()
+    && targets
+      .iter()
+      .all(|t| nearest_distance(&items[0], t).is_some())
+  {
+    let mut sub_args = args.to_vec();
+    let mut results = Vec::with_capacity(targets.len());
+    for t in targets {
+      sub_args[1] = t.clone();
+      results.push(nearest_ast(&sub_args)?);
+    }
+    return Ok(Expr::List(results.into()));
+  }
+
+  let target = &args[1];
+
+  // Parse the optional third argument. Accepts:
+  //   n            — up to n closest elements
+  //   All          — all elements, sorted by distance
+  //   {n, r}       — up to n elements within radius r
+  //   {All, r}     — all elements within radius r
+  let (n, radius) = if args.len() >= 3 {
+    match &args[2] {
+      Expr::Integer(k) => (Some(*k as usize), None),
+      Expr::Identifier(s) if s == "All" => (None, None),
+      Expr::List(pair) if pair.len() == 2 => {
+        let count = match &pair[0] {
+          Expr::Integer(k) if *k >= 1 => Some(*k as usize),
+          Expr::Identifier(s) if s == "All" => None,
+          _ => {
+            return Ok(unevaluated("Nearest", args));
+          }
+        };
+        let r = match expr_to_f64(&pair[1]) {
+          Some(r) if r >= 0.0 => r,
+          _ => {
+            return Ok(unevaluated("Nearest", args));
+          }
+        };
+        (count, Some(r))
+      }
+      _ => {
+        return Ok(unevaluated("Nearest", args));
+      }
+    }
+  } else {
+    (Some(1), None) // default is just the single closest (and ties)
+  };
+
+  // Compute distance for each element (scalar or equal-length vector)
+  let mut distances: Vec<(usize, f64)> = items
+    .iter()
+    .enumerate()
+    .filter_map(|(i, item)| nearest_distance(item, target).map(|d| (i, d)))
+    .collect();
+
+  if distances.is_empty() {
+    return Ok(unevaluated("Nearest", args));
+  }
+
+  // Sort by distance, then by original order for ties
+  distances
+    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+  // Apply the radius filter first, then the count limit.
+  let filtered: Vec<&(usize, f64)> = match radius {
+    Some(r) => distances
+      .iter()
+      .take_while(|(_, d)| *d <= r + 1e-15)
+      .collect(),
+    None => distances.iter().collect(),
+  };
+
+  let pick_single = |v: View, i: usize, d: f64| -> Expr {
+    match v {
+      View::Index => Expr::Integer((i + 1) as i128),
+      View::Distance => Expr::Real(d),
+      View::Element => items[i].clone(),
+      View::Items => match &labels {
+        Some(l) => l[i].clone(),
+        None => items[i].clone(),
+      },
+    }
+  };
+  let pick = |i: usize, d: f64| -> Expr {
+    match &multi_props {
+      Some(views) => {
+        Expr::List(views.iter().map(|v| pick_single(*v, i, d)).collect())
+      }
+      None => pick_single(view, i, d),
+    }
+  };
+
+  match (args.len() >= 3, n) {
+    // Bare 2-arg Nearest: return the tied-for-closest group.
+    (false, _) => {
+      let min_dist = filtered[0].1;
+      let result: Vec<Expr> = filtered
+        .iter()
+        .take_while(|(_, d)| (*d - min_dist).abs() < 1e-15)
+        .map(|(i, d)| pick(*i, *d))
+        .collect();
+      Ok(Expr::List(result.into()))
+    }
+    // Count limit provided (possibly together with a radius).
+    (true, Some(k)) => {
+      let result: Vec<Expr> =
+        filtered.iter().take(k).map(|(i, d)| pick(*i, *d)).collect();
+      Ok(Expr::List(result.into()))
+    }
+    // `All` (possibly together with a radius): keep everything that passed
+    // the radius filter.
+    (true, None) => {
+      let result: Vec<Expr> =
+        filtered.iter().map(|(i, d)| pick(*i, *d)).collect();
+      Ok(Expr::List(result.into()))
+    }
+  }
+}
+
+/// Try to convert an Expr to f64 for distance computation
+use crate::functions::math_ast::expr_to_f64;
+
+fn array_reshape_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // A SparseArray input is reshaped by its dense elements, not its internal
+  // representation, so densify it via Normal first. The reshaped result is
+  // re-wrapped as a SparseArray below to match wolframscript's head.
+  let is_sparse = matches!(&args[0], Expr::FunctionCall { name, .. } if name == "SparseArray");
+  let source = if is_sparse {
+    crate::evaluator::evaluate_function_call_ast("Normal", &[args[0].clone()])?
+  } else {
+    args[0].clone()
+  };
+  // Flatten the input list
+  let flat = flatten_to_vec(&source);
+
+  // Parse dimensions
+  let dims = match &args[1] {
+    Expr::List(items) => {
+      let mut d = Vec::new();
+      for item in items {
+        match item {
+          // A zero dimension is valid: the reshaped array has an empty axis
+          // there (ArrayReshape[src, {2, 0}] = {{}, {}}).
+          Expr::Integer(n) if *n >= 0 => d.push(*n as usize),
+          _ => {
+            return Ok(unevaluated("ArrayReshape", args));
+          }
+        }
+      }
+      d
+    }
+    _ => {
+      return Ok(unevaluated("ArrayReshape", args));
+    }
+  };
+
+  if dims.is_empty() {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  // Optional padding: a scalar or a list of elements to cycle through.
+  // `ArrayReshape[list, dims, pad]` fills trailing slots with the padding
+  // values, cycling through the list if needed. Defaults to `0`.
+  let pad: Vec<Expr> = if args.len() >= 3 {
+    match &args[2] {
+      Expr::List(items) if !items.is_empty() => items.to_vec(),
+      Expr::List(_) => vec![Expr::Integer(0)],
+      other => vec![other.clone()],
+    }
+  } else {
+    vec![Expr::Integer(0)]
+  };
+
+  // Build the reshaped array, padding with `pad` if needed
+  let mut idx = 0;
+  let reshaped = build_reshaped(&flat, &dims, 0, &mut idx, &pad);
+  // Preserve sparseness: SparseArray in → SparseArray out (matches WS).
+  if is_sparse {
+    return crate::evaluator::evaluate_function_call_ast(
+      "SparseArray",
+      &[reshaped],
+    );
+  }
+  Ok(reshaped)
+}
+
+fn flatten_to_vec(expr: &Expr) -> Vec<Expr> {
+  match expr {
+    Expr::List(items) => items.iter().flat_map(flatten_to_vec).collect(),
+    _ => vec![expr.clone()],
+  }
+}
+
+fn build_reshaped(
+  flat: &[Expr],
+  dims: &[usize],
+  depth: usize,
+  idx: &mut usize,
+  pad: &[Expr],
+) -> Expr {
+  if depth == dims.len() - 1 {
+    // Leaf level: collect dims[depth] elements
+    let n = dims[depth];
+    let mut row = Vec::with_capacity(n);
+    for _ in 0..n {
+      if *idx < flat.len() {
+        row.push(flat[*idx].clone());
+      } else {
+        let pad_idx = (*idx - flat.len()) % pad.len();
+        row.push(pad[pad_idx].clone());
+      }
+      *idx += 1;
+    }
+    Expr::List(row.into())
+  } else {
+    let n = dims[depth];
+    let mut result = Vec::with_capacity(n);
+    for _ in 0..n {
+      result.push(build_reshaped(flat, dims, depth + 1, idx, pad));
+    }
+    Expr::List(result.into())
+  }
+}
+
+/// The windows `MovingMap[f, items, n, padding]` applies `f` to: one per input
+/// position, each of length `n + 1`, taken from `items` extended `n` elements
+/// to the left by `padding`.
+///
+/// `"Fixed"` repeats the first element, `"Periodic"` wraps around from the end,
+/// `"Reflected"` mirrors about the first element, `None` leaves the leading
+/// windows short, and anything else is used as a constant fill. Returns `None`
+/// for an empty list, so the caller leaves the call unevaluated.
+fn moving_map_padded_windows(
+  items: &[Expr],
+  n: usize,
+  padding: &Expr,
+) -> Option<Vec<Vec<Expr>>> {
+  if items.is_empty() {
+    return None;
+  }
+  let len = items.len();
+  let named = match padding {
+    Expr::String(s) | Expr::Identifier(s) => Some(s.as_str()),
+    _ => None,
+  };
+
+  if named == Some("None") {
+    // No fill: the first windows are simply shorter.
+    return Some(
+      (0..len)
+        .map(|i| items[i.saturating_sub(n)..=i].to_vec())
+        .collect(),
+    );
+  }
+
+  // `pad[k]` is the element `k` places to the left of the data (k = 1..n).
+  let pad = |k: usize| -> Expr {
+    match named {
+      Some("Fixed") => items[0].clone(),
+      Some("Periodic") => {
+        items[(len * n.div_ceil(len) + len - k) % len].clone()
+      }
+      // Mirror about the first element: a triangle wave over the data,
+      // 1 -> items[1], 2 -> items[2], … turning around at either end.
+      Some("Reflected") if len > 1 => {
+        let period = 2 * (len - 1);
+        let m = k % period;
+        items[if m > len - 1 { period - m } else { m }].clone()
+      }
+      Some("Reflected") => items[0].clone(),
+      _ => padding.clone(),
+    }
+  };
+
+  let mut padded: Vec<Expr> = (1..=n).rev().map(pad).collect();
+  padded.extend(items.iter().cloned());
+  Some((0..len).map(|i| padded[i..=(i + n)].to_vec()).collect())
+}
+
+/// Fold a composition chain of `TransformationFunction[m]`s into the single
+/// transform with the product matrix (leftmost applied last, so the matrices
+/// multiply in the order given). Returns `None` unless every element is a
+/// TransformationFunction, leaving mixed chains as an ordinary Composition.
+fn compose_transformation_functions(parts: &[Expr]) -> Option<Expr> {
+  let matrices: Vec<Expr> = parts
+    .iter()
+    .map(|p| match p {
+      Expr::FunctionCall { name, args }
+        if name == "TransformationFunction" && args.len() == 1 =>
+      {
+        Some(args[0].clone())
+      }
+      _ => None,
+    })
+    .collect::<Option<_>>()?;
+  if matrices.len() < 2 {
+    return None;
+  }
+  let product =
+    crate::evaluator::evaluate_expr_to_expr(&call("Dot", matrices)).ok()?;
+  matches!(product, Expr::List(_))
+    .then(|| call1("TransformationFunction", product))
+}
+
+fn position_index_ast(expr: &Expr) -> Expr {
+  // `PositionIndex[list]` indexes values by their integer positions;
+  // `PositionIndex[assoc]` indexes the association's values by their keys.
+  let pairs: Vec<(Expr, Expr)> = match expr {
+    Expr::List(items) => items
+      .iter()
+      .enumerate()
+      .map(|(i, item)| (Expr::Integer((i + 1) as i128), item.clone()))
+      .collect(),
+    Expr::Association(rules) => {
+      rules.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+    other => {
+      crate::emit_message(&format!(
+        "PositionIndex::invrp: The argument {} is not a valid Association or a list.",
+        crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+      ));
+      return call1("PositionIndex", expr.clone());
+    }
+  };
+
+  // Build ordered map: value -> list of positions/keys, in order of the
+  // value's first appearance.
+  let mut map: Vec<(Expr, Vec<Expr>)> = Vec::new();
+  for (pos, item) in pairs {
+    let item_str = expr_to_string(&item);
+    if let Some(entry) =
+      map.iter_mut().find(|(k, _)| expr_to_string(k) == item_str)
+    {
+      entry.1.push(pos);
+    } else {
+      map.push((item, vec![pos]));
+    }
+  }
+
+  // Convert to Association
+  let rules: Vec<(Expr, Expr)> = map
+    .into_iter()
+    .map(|(key, positions)| (key, Expr::List(positions.into())))
+    .collect();
+
+  Expr::Association(rules)
+}
+
+/// Two-dimensional (valid, no-overhang) ListCorrelate / ListConvolve. Returns
+/// `None` when either argument is not a rectangular matrix (so the caller falls
+/// back to the 1-D path). For convolution the kernel is reversed in both
+/// dimensions; the output has shape `(dr - kr + 1) × (dc - kc + 1)`.
+fn try_2d_conv_corr(
+  ker: &[Expr],
+  data: &[Expr],
+  flip: bool,
+) -> Option<Result<Expr, InterpreterError>> {
+  fn as_matrix(rows: &[Expr]) -> Option<Vec<Vec<Expr>>> {
+    let mut m = Vec::with_capacity(rows.len());
+    let mut cols = None;
+    for r in rows {
+      let Expr::List(c) = r else { return None };
+      // Rows must be flat (a 2-D array), and rectangular.
+      if c.iter().any(|e| matches!(e, Expr::List(_))) {
+        return None;
+      }
+      match cols {
+        None => cols = Some(c.len()),
+        Some(w) if w != c.len() => return None,
+        _ => {}
+      }
+      m.push(c.to_vec());
+    }
+    if m.is_empty() { None } else { Some(m) }
+  }
+  let km = as_matrix(ker)?;
+  let dm = as_matrix(data)?;
+  let (kr, kc) = (km.len(), km[0].len());
+  let (dr, dc) = (dm.len(), dm[0].len());
+  if kc == 0 || kr > dr || kc > dc {
+    return Some(Ok(Expr::List(vec![].into())));
+  }
+  let (out_r, out_c) = (dr - kr + 1, dc - kc + 1);
+  let mut rows = Vec::with_capacity(out_r);
+  for i in 0..out_r {
+    let mut row = Vec::with_capacity(out_c);
+    for j in 0..out_c {
+      let mut terms = Vec::with_capacity(kr * kc);
+      for a in 0..kr {
+        for b in 0..kc {
+          let ke = if flip {
+            &km[kr - 1 - a][kc - 1 - b]
+          } else {
+            &km[a][b]
+          };
+          terms.push(call("Times", vec![ke.clone(), dm[i + a][j + b].clone()]));
+        }
+      }
+      let sum = call("Plus", terms);
+      match evaluate_expr_to_expr(&sum) {
+        Ok(v) => row.push(v),
+        Err(e) => return Some(Err(e)),
+      }
+    }
+    rows.push(Expr::List(row.into()));
+  }
+  Some(Ok(Expr::List(rows.into())))
+}
+
+fn list_convolve_ast(
+  kernel: &Expr,
+  list: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let Expr::List(ker) = kernel else {
+    return Ok(call("ListConvolve", vec![kernel.clone(), list.clone()]));
+  };
+  let Expr::List(data) = list else {
+    return Ok(call("ListConvolve", vec![kernel.clone(), list.clone()]));
+  };
+
+  // Matrix arguments: 2-D convolution (kernel reversed in both dimensions).
+  if let Some(r) = try_2d_conv_corr(ker, data, true) {
+    return r;
+  }
+
+  let k = ker.len();
+  let n = data.len();
+  if k == 0 || n == 0 || k > n {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  let out_len = n - k + 1;
+  let mut result = Vec::with_capacity(out_len);
+
+  for i in 0..out_len {
+    // Sum kernel[k-1-j] * data[i+j] for j in 0..k (kernel is reversed for convolution)
+    let mut terms = Vec::with_capacity(k);
+    for j in 0..k {
+      let product =
+        call("Times", vec![ker[k - 1 - j].clone(), data[i + j].clone()]);
+      terms.push(product);
+    }
+    let sum = call("Plus", terms);
+    let evaluated = evaluate_expr_to_expr(&sum).unwrap_or(sum);
+    result.push(evaluated);
+  }
+
+  Ok(Expr::List(result.into()))
+}
+
+/// `ListConvolve[ker, list, {kL, kR}]` (and the `k` shorthand and optional
+/// scalar padding). The overhang spec `{kL, kR}` aligns kernel element `kL`
+/// with the first list element and `kR` with the last (kernel indices may be
+/// negative, counting from the end). The output has length
+/// `n + kR_pos - kL_pos`, and
+/// `result[t] = sum_i ker[i] * list[t + kL_pos - i]`,
+/// where out-of-range list indices wrap cyclically — or take the padding
+/// value when a 4th argument is given.
+/// The element at 1-based index `idx` of the data list conceptually extended
+/// past both ends. With no padding argument the extension wraps cyclically
+/// through the data; with a padding value it repeats that value; with a
+/// padding *list* the extension cycles through its elements, aligned so that
+/// index `i` takes element `(i - 1) mod L` — position n+1 of a 4-element list
+/// therefore takes the first padding element when there are two of them and
+/// the second when there are three.
+fn correlate_element(data: &[Expr], idx: i128, padding: Option<&Expr>) -> Expr {
+  let n = data.len() as i128;
+  if (1..=n).contains(&idx) {
+    return data[(idx - 1) as usize].clone();
+  }
+  match padding {
+    None => data[(idx - 1).rem_euclid(n) as usize].clone(),
+    Some(Expr::List(pads)) if !pads.is_empty() => {
+      pads[(idx - 1).rem_euclid(pads.len() as i128) as usize].clone()
+    }
+    Some(p) => p.clone(),
+  }
+}
+
+/// One output element of a (generalized) correlation: `h[g[k1, d1], …]`,
+/// with the kernel entry first in each `g` call. `g` and `h` default to
+/// Times and Plus.
+fn correlate_combine(
+  terms: Vec<(Expr, Expr)>,
+  g: Option<&Expr>,
+  h: Option<&Expr>,
+) -> Expr {
+  let apply = |f: Option<&Expr>, dflt: &str, args: Vec<Expr>| -> Expr {
+    match f {
+      Some(Expr::Identifier(name)) => Expr::FunctionCall {
+        name: name.clone(),
+        args: args.into(),
+      },
+      Some(other) => Expr::CurriedCall {
+        func: Box::new(other.clone()),
+        args,
+      },
+      None => call(dflt, args),
+    }
+  };
+  let products: Vec<Expr> = terms
+    .into_iter()
+    .map(|(k, d)| apply(g, "Times", vec![k, d]))
+    .collect();
+  apply(h, "Plus", products)
+}
+
+/// True when either operand has list elements, i.e. the correlation would be
+/// multi-dimensional. The overhang forms below are one-dimensional; a
+/// multi-dimensional pair falls through to `correlate_convolve_overhang_nd`
+/// instead (matching kernel/data rank, a per-dimension offset spec).
+fn correlate_is_multidimensional(ker: &[Expr], data: &[Expr]) -> bool {
+  ker
+    .iter()
+    .chain(data.iter())
+    .any(|e| matches!(e, Expr::List(_)))
+}
+
+/// Verify `expr` is a rectangular N-dimensional array of non-list leaves and
+/// return its shape together with its elements flattened in row-major
+/// order. `None` for anything ragged (rows of differing length at any
+/// level) or not a list at all.
+fn nd_shape_and_flatten(expr: &Expr) -> Option<(Vec<usize>, Vec<Expr>)> {
+  fn dims_of(expr: &Expr) -> Option<Vec<usize>> {
+    let Expr::List(items) = expr else { return None };
+    if items.is_empty() {
+      return Some(vec![0]);
+    }
+    let all_lists = items.iter().all(|e| matches!(e, Expr::List(_)));
+    let any_list = items.iter().any(|e| matches!(e, Expr::List(_)));
+    if any_list && !all_lists {
+      return None;
+    }
+    if !all_lists {
+      return Some(vec![items.len()]);
+    }
+    let mut sub: Option<Vec<usize>> = None;
+    for it in items {
+      let d = dims_of(it)?;
+      match &sub {
+        None => sub = Some(d),
+        Some(prev) if *prev == d => {}
+        _ => return None,
+      }
+    }
+    let mut dims = vec![items.len()];
+    dims.extend(sub.unwrap());
+    Some(dims)
+  }
+  fn flatten_into(expr: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::List(items) = expr {
+      for it in items {
+        if matches!(it, Expr::List(_)) {
+          flatten_into(it, out);
+        } else {
+          out.push(it.clone());
+        }
+      }
+    }
+  }
+  let dims = dims_of(expr)?;
+  let mut flat = Vec::new();
+  flatten_into(expr, &mut flat);
+  Some((dims, flat))
+}
+
+/// Row-major strides for an array of the given shape (last dimension varies
+/// fastest).
+fn nd_strides(dims: &[usize]) -> Vec<usize> {
+  let mut strides = vec![1usize; dims.len()];
+  for d in (0..dims.len().saturating_sub(1)).rev() {
+    strides[d] = strides[d + 1] * dims[d + 1];
+  }
+  strides
+}
+
+/// Every 1-based multi-index into an array of the given shape, in row-major
+/// order.
+fn nd_multi_indices(dims: &[usize]) -> Vec<Vec<usize>> {
+  let mut result = vec![vec![]];
+  for &d in dims {
+    let mut next = Vec::with_capacity(result.len() * d);
+    for prefix in &result {
+      for v in 1..=d {
+        let mut p = prefix.clone();
+        p.push(v);
+        next.push(p);
+      }
+    }
+    result = next;
+  }
+  result
+}
+
+/// Rebuild a flat row-major buffer into nested `Expr::List`s of the given
+/// shape (the inverse of `nd_shape_and_flatten`).
+fn nd_nest(flat: &[Expr], dims: &[usize]) -> Expr {
+  if dims.len() <= 1 {
+    return Expr::List(flat.to_vec().into());
+  }
+  let chunk = dims[1..].iter().product::<usize>().max(1);
+  let rows: Vec<Expr> =
+    flat.chunks(chunk).map(|c| nd_nest(c, &dims[1..])).collect();
+  Expr::List(rows.into())
+}
+
+/// The data element at a (possibly out-of-range, per dimension) 1-based
+/// multi-index, extended past the edges: cyclically when `padding` is
+/// `None` (each out-of-range dimension wraps independently), or by
+/// broadcasting the padding value whenever any dimension is out of range.
+fn nd_correlate_element(
+  data_flat: &[Expr],
+  strides: &[usize],
+  dims: &[usize],
+  idx: &[i128],
+  padding: Option<&Expr>,
+) -> Expr {
+  let out_of_range =
+    idx.iter().zip(dims).any(|(&i, &n)| i < 1 || i > n as i128);
+  if out_of_range && let Some(p) = padding {
+    return p.clone();
+  }
+  let mut flat = 0usize;
+  for (d, &i) in idx.iter().enumerate() {
+    let n = dims[d] as i128;
+    let wrapped = (i - 1).rem_euclid(n) as usize;
+    flat += wrapped * strides[d];
+  }
+  data_flat[flat].clone()
+}
+
+/// General N-dimensional `ListCorrelate`/`ListConvolve` overhang form
+/// (`reverse = true` for convolve) — the rank ≥ 2 case the 1-D-only
+/// `list_correlate_overhang`/`list_convolve_overhang` above leave
+/// unevaluated. Matches the periodic-boundary Demonstrations idiom
+/// `ListCorrelate[{{0, 1}, {0, -1}}, matrix, {2, 2}]`: a kernel and array of
+/// equal rank, with one offset entry per dimension (each a scalar or a
+/// `{kL, kR}` pair, exactly like the 1-D spec but per axis). `None` when the
+/// inputs don't fit this form (mismatched rank, a spec that isn't a
+/// per-dimension list, a per-dimension padding array, an empty output
+/// dimension, …), so the caller falls back to leaving the call unevaluated.
+#[allow(clippy::too_many_arguments)]
+fn correlate_convolve_overhang_nd(
+  ker_dims: &[usize],
+  ker_flat: &[Expr],
+  data_dims: &[usize],
+  data_flat: &[Expr],
+  spec: &Expr,
+  padding: Option<&Expr>,
+  g: Option<&Expr>,
+  h: Option<&Expr>,
+  reverse: bool,
+) -> Option<Expr> {
+  let rank = ker_dims.len();
+  if rank < 2 || data_dims.len() != rank {
+    return None;
+  }
+  if let Some(Expr::List(_)) = padding {
+    return None;
+  }
+
+  let norm = |k: i128, m: usize| -> Option<usize> {
+    let pos = if k < 0 { m as i128 + 1 + k } else { k };
+    if (1..=m as i128).contains(&pos) {
+      Some(pos as usize)
+    } else {
+      None
+    }
+  };
+  let per_dim_spec: Vec<Expr> = match spec {
+    Expr::Integer(_) => vec![spec.clone(); rank],
+    Expr::List(items) if items.len() == rank => items.to_vec(),
+    _ => return None,
+  };
+  let mut kl = vec![0usize; rank];
+  let mut kr = vec![0usize; rank];
+  for d in 0..rank {
+    match &per_dim_spec[d] {
+      Expr::Integer(k) => {
+        let p = norm(*k, ker_dims[d])?;
+        kl[d] = p;
+        kr[d] = p;
+      }
+      Expr::List(items) if items.len() == 2 => {
+        let (Expr::Integer(a), Expr::Integer(b)) = (&items[0], &items[1])
+        else {
+          return None;
+        };
+        kl[d] = norm(*a, ker_dims[d])?;
+        kr[d] = norm(*b, ker_dims[d])?;
+      }
+      _ => return None,
+    }
+  }
+
+  let out_dims_i: Vec<i128> = (0..rank)
+    .map(|d| {
+      let n = data_dims[d] as i128;
+      if reverse {
+        n + kr[d] as i128 - kl[d] as i128
+      } else {
+        n + kl[d] as i128 - kr[d] as i128
+      }
+    })
+    .collect();
+  if out_dims_i.iter().any(|&d| d <= 0) {
+    return None;
+  }
+  let out_dims: Vec<usize> = out_dims_i.iter().map(|&d| d as usize).collect();
+
+  let ker_strides = nd_strides(ker_dims);
+  let data_strides = nd_strides(data_dims);
+  let out_strides = nd_strides(&out_dims);
+  let ker_multi_indices = nd_multi_indices(ker_dims);
+
+  let mut out_flat = vec![Expr::Integer(0); out_dims.iter().product()];
+  for t in nd_multi_indices(&out_dims) {
+    let mut terms: Vec<(Expr, Expr)> = Vec::with_capacity(ker_flat.len());
+    for i in &ker_multi_indices {
+      let mut data_idx = vec![0i128; rank];
+      for d in 0..rank {
+        data_idx[d] = if reverse {
+          t[d] as i128 + kl[d] as i128 - i[d] as i128
+        } else {
+          t[d] as i128 + i[d] as i128 - kl[d] as i128
+        };
+      }
+      let ker_flat_idx: usize = i
+        .iter()
+        .enumerate()
+        .map(|(d, &v)| (v - 1) * ker_strides[d])
+        .sum();
+      let data_val = nd_correlate_element(
+        data_flat,
+        &data_strides,
+        data_dims,
+        &data_idx,
+        padding,
+      );
+      terms.push((ker_flat[ker_flat_idx].clone(), data_val));
+    }
+    if reverse {
+      terms.reverse();
+    }
+    let sum = correlate_combine(terms, g, h);
+    let evaluated = evaluate_expr_to_expr(&sum).unwrap_or(sum);
+    let out_flat_idx: usize = t
+      .iter()
+      .enumerate()
+      .map(|(d, &v)| (v - 1) * out_strides[d])
+      .sum();
+    out_flat[out_flat_idx] = evaluated;
+  }
+
+  Some(nd_nest(&out_flat, &out_dims))
+}
+
+fn list_convolve_overhang(
+  kernel: &Expr,
+  list: &Expr,
+  spec: &Expr,
+  padding: Option<&Expr>,
+  g: Option<&Expr>,
+  h: Option<&Expr>,
+  all_args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("ListConvolve", all_args));
+  let (Expr::List(ker), Expr::List(data)) = (kernel, list) else {
+    return unevaluated();
+  };
+  let m = ker.len();
+  let n = data.len();
+  if m == 0 || n == 0 {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  // Normalise a (possibly negative) kernel index into 1..=m.
+  let norm = |k: i128| -> Option<usize> {
+    let pos = if k < 0 { m as i128 + 1 + k } else { k };
+    if (1..=m as i128).contains(&pos) {
+      Some(pos as usize)
+    } else {
+      None
+    }
+  };
+  let (kl, kr) = match spec {
+    Expr::Integer(k) => {
+      let Some(p) = norm(*k) else {
+        return unevaluated();
+      };
+      (p, p)
+    }
+    Expr::List(items) if items.len() == 2 => match (&items[0], &items[1]) {
+      (Expr::Integer(a), Expr::Integer(b)) => match (norm(*a), norm(*b)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return unevaluated(),
+      },
+      _ => return unevaluated(),
+    },
+    _ => return unevaluated(),
+  };
+  if correlate_is_multidimensional(ker, data) {
+    if let (Some((kd, kf)), Some((dd, df))) =
+      (nd_shape_and_flatten(kernel), nd_shape_and_flatten(list))
+      && let Some(result) = correlate_convolve_overhang_nd(
+        &kd, &kf, &dd, &df, spec, padding, g, h, true,
+      )
+    {
+      return Ok(result);
+    }
+    return unevaluated();
+  }
+
+  let out_len = n as i128 + kr as i128 - kl as i128;
+  if out_len <= 0 {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  let mut result = Vec::with_capacity(out_len as usize);
+  for t in 1..=out_len {
+    let mut terms: Vec<(Expr, Expr)> = Vec::with_capacity(m);
+    for i in 1..=m {
+      let idx = t + kl as i128 - i as i128; // 1-based index into data
+      terms.push((ker[i - 1].clone(), correlate_element(data, idx, padding)));
+    }
+    // Convolution walks the kernel backwards over the data, and
+    // wolframscript lists the terms in data order, which only shows up once
+    // `g`/`h` are something other than Times and Plus.
+    terms.reverse();
+    let sum = correlate_combine(terms, g, h);
+    result.push(evaluate_expr_to_expr(&sum).unwrap_or(sum));
+  }
+  Ok(Expr::List(result.into()))
+}
+
+/// `ListCorrelate[ker, list, {kL, kR}]` (and the `k` shorthand and optional
+/// scalar padding). Like `ListConvolve` but the kernel is not reversed: the
+/// overhang spec `{kL, kR}` aligns kernel element `kL` with the first list
+/// element and `kR` with the last (indices may be negative, counting from
+/// the end). The output has length `n + kL_pos - kR_pos`, and
+/// `result[t] = sum_i ker[i] * list[t + i - kL_pos]`,
+/// where out-of-range list indices wrap cyclically — or take the padding
+/// value when a 4th argument is given.
+fn list_correlate_overhang(
+  kernel: &Expr,
+  list: &Expr,
+  spec: &Expr,
+  padding: Option<&Expr>,
+  g: Option<&Expr>,
+  h: Option<&Expr>,
+  all_args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("ListCorrelate", all_args));
+  let (Expr::List(ker), Expr::List(data)) = (kernel, list) else {
+    return unevaluated();
+  };
+  let m = ker.len();
+  let n = data.len();
+  if m == 0 || n == 0 {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  // Normalise a (possibly negative) kernel index into 1..=m.
+  let norm = |k: i128| -> Option<usize> {
+    let pos = if k < 0 { m as i128 + 1 + k } else { k };
+    if (1..=m as i128).contains(&pos) {
+      Some(pos as usize)
+    } else {
+      None
+    }
+  };
+  let (kl, kr) = match spec {
+    Expr::Integer(k) => {
+      let Some(p) = norm(*k) else {
+        return unevaluated();
+      };
+      (p, p)
+    }
+    Expr::List(items) if items.len() == 2 => match (&items[0], &items[1]) {
+      (Expr::Integer(a), Expr::Integer(b)) => match (norm(*a), norm(*b)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return unevaluated(),
+      },
+      _ => return unevaluated(),
+    },
+    _ => return unevaluated(),
+  };
+  if correlate_is_multidimensional(ker, data) {
+    if let (Some((kd, kf)), Some((dd, df))) =
+      (nd_shape_and_flatten(kernel), nd_shape_and_flatten(list))
+      && let Some(result) = correlate_convolve_overhang_nd(
+        &kd, &kf, &dd, &df, spec, padding, g, h, false,
+      )
+    {
+      return Ok(result);
+    }
+    return unevaluated();
+  }
+
+  let out_len = n as i128 + kl as i128 - kr as i128;
+  if out_len <= 0 {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  let mut result = Vec::with_capacity(out_len as usize);
+  for t in 1..=out_len {
+    let mut terms: Vec<(Expr, Expr)> = Vec::with_capacity(m);
+    for i in 1..=m {
+      let idx = t + i as i128 - kl as i128; // 1-based index into data
+      terms.push((ker[i - 1].clone(), correlate_element(data, idx, padding)));
+    }
+    let sum = correlate_combine(terms, g, h);
+    result.push(evaluate_expr_to_expr(&sum).unwrap_or(sum));
+  }
+  Ok(Expr::List(result.into()))
+}
+
+fn list_correlate_ast(
+  kernel: &Expr,
+  list: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let Expr::List(ker) = kernel else {
+    return Ok(call("ListCorrelate", vec![kernel.clone(), list.clone()]));
+  };
+  let Expr::List(data) = list else {
+    return Ok(call("ListCorrelate", vec![kernel.clone(), list.clone()]));
+  };
+
+  // Matrix arguments: 2-D cross-correlation.
+  if let Some(r) = try_2d_conv_corr(ker, data, false) {
+    return r;
+  }
+
+  let k = ker.len();
+  let n = data.len();
+  if k == 0 || n == 0 || k > n {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  let out_len = n - k + 1;
+  let mut result = Vec::with_capacity(out_len);
+
+  for i in 0..out_len {
+    // Sum kernel[j] * data[i+j] for j in 0..k (no reversal)
+    let mut terms = Vec::with_capacity(k);
+    for j in 0..k {
+      let product = call("Times", vec![ker[j].clone(), data[i + j].clone()]);
+      terms.push(product);
+    }
+    let sum = call("Plus", terms);
+    let evaluated = evaluate_expr_to_expr(&sum).unwrap_or(sum);
+    result.push(evaluated);
+  }
+
+  Ok(Expr::List(result.into()))
+}
+
+/// ArrayRules[array] - returns non-default elements as position -> value rules
+fn array_rules_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let default_val = if args.len() == 2 {
+    args[1].clone()
+  } else {
+    Expr::Integer(0)
+  };
+
+  // Handle SparseArray[...] — normalize to canonical form and emit
+  // sorted rules plus a trailing `{_, _, ...} -> default` pattern rule.
+  if let Expr::FunctionCall {
+    name,
+    args: sa_args,
+  } = &args[0]
+    && name == "SparseArray"
+    && !sa_args.is_empty()
+  {
+    let normalized =
+      crate::functions::list_helpers_ast::sparse_array_normalize_ast(sa_args)?;
+    if let Expr::FunctionCall { name: n2, args: na } = &normalized
+      && n2 == "SparseArray"
+      && na.len() == 4
+      && matches!(&na[0], Expr::Identifier(s) if s == "Automatic")
+    {
+      let dims: Vec<usize> = match &na[1] {
+        Expr::List(items) => items
+          .iter()
+          .filter_map(|it| match it {
+            Expr::Integer(n) if *n >= 0 => Some(*n as usize),
+            _ => None,
+          })
+          .collect(),
+        _ => Vec::new(),
+      };
+      let depth = dims.len().max(1);
+      let sa_default = if args.len() == 2 {
+        default_val.clone()
+      } else {
+        na[2].clone()
+      };
+      // Extract (position, value) pairs from the CSR-form fourth argument.
+      let extracted =
+        crate::functions::list_helpers_ast::sparse_array_extract_rules(
+          &dims, &na[3],
+        );
+      let mut rules: Vec<Expr> = extracted
+        .into_iter()
+        .map(|(pos, val)| Expr::Rule {
+          pattern: Box::new(Expr::List(
+            pos.into_iter().map(Expr::Integer).collect(),
+          )),
+          replacement: Box::new(val),
+        })
+        .collect();
+      let blanks: Vec<Expr> = (0..depth)
+        .map(|_| Expr::Pattern {
+          name: String::new(),
+          head: None,
+          blank_type: 1,
+        })
+        .collect();
+      rules.push(Expr::Rule {
+        pattern: Box::new(Expr::List(blanks.into())),
+        replacement: Box::new(sa_default),
+      });
+      return Ok(Expr::List(rules.into()));
+    }
+    // Normalization failed — fall through to the default-value handling.
+  }
+
+  let mut rules: Vec<Expr> = Vec::new();
+
+  fn collect_rules(
+    expr: &Expr,
+    indices: &mut Vec<i128>,
+    rules: &mut Vec<Expr>,
+    default_val: &Expr,
+  ) {
+    match expr {
+      Expr::List(items) => {
+        for (i, item) in items.iter().enumerate() {
+          indices.push((i + 1) as i128);
+          collect_rules(item, indices, rules, default_val);
+          indices.pop();
+        }
+      }
+      _ => {
+        if expr_to_string(expr) != expr_to_string(default_val) {
+          let pos =
+            Expr::List(indices.iter().map(|&i| Expr::Integer(i)).collect());
+          rules.push(Expr::Rule {
+            pattern: Box::new(pos),
+            replacement: Box::new(expr.clone()),
+          });
+        }
+      }
+    }
+  }
+
+  let mut indices = Vec::new();
+  collect_rules(&args[0], &mut indices, &mut rules, &default_val);
+
+  // Add the default pattern rule: {_, _, ...} -> default
+  let depth = array_depth(&args[0]);
+  let blanks: Vec<Expr> = (0..depth)
+    .map(|_| Expr::Pattern {
+      name: String::new(),
+      head: None,
+      blank_type: 1,
+    })
+    .collect();
+  rules.push(Expr::Rule {
+    pattern: Box::new(Expr::List(blanks.into())),
+    replacement: Box::new(default_val),
+  });
+
+  Ok(Expr::List(rules.into()))
+}
+
+fn array_depth(expr: &Expr) -> usize {
+  match expr {
+    Expr::List(items) => {
+      if items.is_empty() {
+        1
+      } else {
+        1 + array_depth(&items[0])
+      }
+    }
+    _ => 0,
+  }
+}
+
+/// Convert a fully-dense nested-list `expr` into a `SparseArray[Automatic, …]`
+/// with the given default value. Only used by Outer's `Times` collapse path
+/// (cases 470 and 473), so the layout exactly matches wolframscript's
+/// CSR-like inner form: `{1, {{rowPtr}, {colIndices…}}, {values…}}` for
+/// rank ≥ 2 and `{1, {{0, count}, {{idx}…}}, {values…}}` for rank 1.
+pub(crate) fn dense_to_sparse_array_with_default(
+  expr: &Expr,
+  default: &Expr,
+) -> Option<Expr> {
+  let dims = sparse_dims(expr)?;
+  if dims.is_empty() {
+    return None;
+  }
+  let default_str = expr_to_string(default);
+  let mut entries: Vec<(Vec<usize>, Expr)> = Vec::new();
+  let mut idx_buf: Vec<usize> = Vec::with_capacity(dims.len());
+  collect_non_default_entries(expr, &mut idx_buf, &mut entries, &default_str);
+  Some(build_sparse_array_csr(&dims, default, &entries))
+}
+
+/// Walk a nested-list `expr`, collecting the dimension at each level.
+/// Returns `None` if any sublist's length disagrees with its sibling — i.e.
+/// the expression isn't a proper rectangular tensor and can't be sparsified.
+fn sparse_dims(expr: &Expr) -> Option<Vec<usize>> {
+  match expr {
+    Expr::List(items) => {
+      let mut dims = vec![items.len()];
+      if items.is_empty() {
+        return Some(dims);
+      }
+      let inner = sparse_dims(&items[0])?;
+      for it in &items[1..] {
+        let other = sparse_dims(it)?;
+        if other != inner {
+          return None;
+        }
+      }
+      dims.extend(inner);
+      Some(dims)
+    }
+    _ => Some(vec![]),
+  }
+}
+
+fn collect_non_default_entries(
+  expr: &Expr,
+  idx: &mut Vec<usize>,
+  out: &mut Vec<(Vec<usize>, Expr)>,
+  default_str: &str,
+) {
+  match expr {
+    Expr::List(items) => {
+      for (i, it) in items.iter().enumerate() {
+        idx.push(i + 1);
+        collect_non_default_entries(it, idx, out, default_str);
+        idx.pop();
+      }
+    }
+    _ => {
+      if expr_to_string(expr) != default_str {
+        out.push((idx.clone(), expr.clone()));
+      }
+    }
+  }
+}
+
+fn build_sparse_array_csr(
+  dims: &[usize],
+  default: &Expr,
+  entries: &[(Vec<usize>, Expr)],
+) -> Expr {
+  let dims_list =
+    Expr::List(dims.iter().map(|&d| Expr::Integer(d as i128)).collect());
+  let k = dims.len();
+  let n = dims[0];
+  let make_array = |inner: Expr| {
+    vec![
+      id_expr("Automatic"),
+      dims_list.clone(),
+      default.clone(),
+      inner,
+    ]
+  };
+  let make_outer = |inner: Expr| call("SparseArray", make_array(inner));
+  if entries.is_empty() {
+    let row_ptr = if k == 1 {
+      Expr::List(vec![Expr::Integer(0), Expr::Integer(0)].into())
+    } else {
+      Expr::List(vec![Expr::Integer(0); n + 1].into())
+    };
+    let inner = Expr::List(
+      vec![
+        Expr::Integer(1),
+        Expr::List(vec![row_ptr, Expr::List(vec![].into())].into()),
+        Expr::List(vec![].into()),
+      ]
+      .into(),
+    );
+    return make_outer(inner);
+  }
+  let mut sorted: Vec<(Vec<usize>, Expr)> = entries.to_vec();
+  sorted.sort_by(|a, b| a.0.cmp(&b.0));
+  if k == 1 {
+    let row_ptr = Expr::List(
+      vec![Expr::Integer(0), Expr::Integer(sorted.len() as i128)].into(),
+    );
+    let col_indices = Expr::List(
+      sorted
+        .iter()
+        .map(|(idx, _)| Expr::List(vec![Expr::Integer(idx[0] as i128)].into()))
+        .collect(),
+    );
+    let values = Expr::List(sorted.iter().map(|(_, v)| v.clone()).collect());
+    let inner = Expr::List(
+      vec![
+        Expr::Integer(1),
+        Expr::List(vec![row_ptr, col_indices].into()),
+        values,
+      ]
+      .into(),
+    );
+    return make_outer(inner);
+  }
+  let mut row_counts = vec![0i128; n];
+  let mut col_indices_list: Vec<Expr> = Vec::with_capacity(sorted.len());
+  let mut values_list: Vec<Expr> = Vec::with_capacity(sorted.len());
+  for (idx, v) in &sorted {
+    let row = idx[0] - 1;
+    row_counts[row] += 1;
+    let col_idx: Vec<Expr> =
+      idx[1..].iter().map(|&i| Expr::Integer(i as i128)).collect();
+    col_indices_list.push(Expr::List(col_idx.into()));
+    values_list.push(v.clone());
+  }
+  let mut row_ptr = vec![Expr::Integer(0)];
+  let mut acc = 0i128;
+  for c in row_counts {
+    acc += c;
+    row_ptr.push(Expr::Integer(acc));
+  }
+  let inner = Expr::List(
+    vec![
+      Expr::Integer(1),
+      Expr::List(
+        vec![
+          Expr::List(row_ptr.into()),
+          Expr::List(col_indices_list.into()),
+        ]
+        .into(),
+      ),
+      Expr::List(values_list.into()),
+    ]
+    .into(),
+  );
+  make_outer(inner)
+}
+
+/// Parsed structure of a `SparseArray[Automatic, dims, default, payload]`
+/// expression — used by Outer's nested-leaf path to apply the user
+/// function to each non-default value while preserving the default-vs-
+/// non-default distinction.
+struct ParsedSparseArray {
+  dims: Vec<usize>,
+  default: Expr,
+  /// Each entry: (1-based multi-index, value).
+  entries: Vec<(Vec<usize>, Expr)>,
+}
+
+fn parse_sparse_array_data(expr: &Expr) -> Option<ParsedSparseArray> {
+  let Expr::FunctionCall { name, args: sa } = expr else {
+    return None;
+  };
+  if name != "SparseArray" {
+    return None;
+  }
+  // Re-normalize so we always start from canonical 4-arg form.
+  let canonical = list_helpers_ast::sparse_array_normalize_ast(sa).ok()?;
+  let Expr::FunctionCall {
+    name: cname,
+    args: ca,
+  } = &canonical
+  else {
+    return None;
+  };
+  if cname != "SparseArray" || ca.len() != 4 {
+    return None;
+  }
+  if !matches!(&ca[0], Expr::Identifier(s) if s == "Automatic") {
+    return None;
+  }
+  let dims: Vec<usize> = match &ca[1] {
+    Expr::List(items) => {
+      let mut d = Vec::with_capacity(items.len());
+      for it in items {
+        match it {
+          Expr::Integer(n) if *n >= 0 => d.push(*n as usize),
+          _ => return None,
+        }
+      }
+      d
+    }
+    _ => return None,
+  };
+  let default = ca[2].clone();
+  let raw_entries = list_helpers_ast::sparse_array_extract_rules(&dims, &ca[3]);
+  let entries: Vec<(Vec<usize>, Expr)> = raw_entries
+    .into_iter()
+    .map(|(idx, v)| (idx.into_iter().map(|i| i as usize).collect(), v))
+    .collect();
+  Some(ParsedSparseArray {
+    dims,
+    default,
+    entries,
+  })
+}
+
+/// Build the `Outer[func, lists…, sa]` result where `sa` is the last
+/// argument and stays as `SparseArray` at the leaves. Walks each dense
+/// `lists` arg through every nest level (accumulating one scalar at each
+/// leaf), then once all outer args have contributed a scalar, builds the
+/// inner `SparseArray` with `func` applied to the accumulated values and
+/// each entry/default of `sa`.
+fn build_outer_with_sparse_last(
+  func: &Expr,
+  outer_lists: &[Expr],
+  sa: &ParsedSparseArray,
+) -> Option<Expr> {
+  fn walk_arg(
+    func: &Expr,
+    arg: &Expr,
+    accumulated: &mut Vec<Expr>,
+    rest: &[Expr],
+    sa: &ParsedSparseArray,
+  ) -> Option<Expr> {
+    if let Expr::List(items) = arg {
+      let mut results = Vec::with_capacity(items.len());
+      for it in items {
+        results.push(walk_arg(func, it, accumulated, rest, sa)?);
+      }
+      Some(Expr::List(results.into()))
+    } else {
+      accumulated.push(arg.clone());
+      let r = process_outer_args(func, rest, accumulated, sa);
+      accumulated.pop();
+      r
+    }
+  }
+
+  fn process_outer_args(
+    func: &Expr,
+    rest: &[Expr],
+    accumulated: &mut Vec<Expr>,
+    sa: &ParsedSparseArray,
+  ) -> Option<Expr> {
+    if rest.is_empty() {
+      return Some(build_inner_sparse(func, accumulated, sa));
+    }
+    walk_arg(func, &rest[0], accumulated, &rest[1..], sa)
+  }
+
+  let mut acc = Vec::with_capacity(outer_lists.len());
+  process_outer_args(func, outer_lists, &mut acc, sa)
+}
+
+fn build_inner_sparse(
+  func: &Expr,
+  outer_vals: &[Expr],
+  sa: &ParsedSparseArray,
+) -> Expr {
+  let func_name = match func {
+    Expr::Identifier(s) => s.clone(),
+    _ => expr_to_string(func),
+  };
+  let make_call = |trailing: Expr| {
+    let mut call_args = Vec::with_capacity(outer_vals.len() + 1);
+    call_args.extend(outer_vals.iter().cloned());
+    call_args.push(trailing);
+    let call = Expr::FunctionCall {
+      name: func_name.clone(),
+      args: call_args.into(),
+    };
+    crate::evaluator::evaluate_expr_to_expr(&call).unwrap_or(call)
+  };
+  let new_default = make_call(sa.default.clone());
+  let new_entries: Vec<(Vec<usize>, Expr)> = sa
+    .entries
+    .iter()
+    .map(|(idx, v)| (idx.clone(), make_call(v.clone())))
+    .collect();
+  build_sparse_array_csr(&sa.dims, &new_default, &new_entries)
+}
+
+/// The zero-based images of a permutation list, or `None` for an argument
+/// that names no permutation. A permutation list has to be a
+/// rearrangement of `1..n`; a repeat, a zero or a value past the end used
+/// to index straight off the end of the working vector. When every
+/// element is an integer but the list is not a permutation, wolframscript
+/// reports `<head>::permlist`, which `report` asks for; a list holding
+/// anything else stays quiet.
+pub fn permutation_list_indices(
+  head: &str,
+  expr: &Expr,
+  report: bool,
+) -> Option<Vec<usize>> {
+  let Expr::List(items) = expr else {
+    return None;
+  };
+  let mut values: Vec<i128> = Vec::with_capacity(items.len());
+  for item in items {
+    let Expr::Integer(value) = item else {
+      return None;
+    };
+    values.push(*value);
+  }
+  let mut sorted = values.clone();
+  sorted.sort_unstable();
+  if sorted
+    .iter()
+    .enumerate()
+    .any(|(i, &value)| value != i as i128 + 1)
+  {
+    if report {
+      crate::emit_message(&format!(
+        "{head}::permlist: Invalid permutation list {}.",
+        crate::syntax::format_expr(expr, crate::syntax::ExprForm::Output)
+      ));
+    }
+    return None;
+  }
+  Some(values.iter().map(|&value| (value - 1) as usize).collect())
+}

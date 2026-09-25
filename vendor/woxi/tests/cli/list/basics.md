@@ -1,0 +1,27 @@
+# List Basics
+
+Core functions for accessing list elements and building simple lists.
+
+- [`Append`](basics/Append.md)
+- [`Array`](basics/Array.md)
+- [`Catenate`](basics/Catenate.md)
+- [`ConstantArray`](basics/ConstantArray.md)
+- [`Delete`](basics/Delete.md)
+- [`Dimensions`](basics/Dimensions.md)
+- [`Drop`](basics/Drop.md)
+- [`Extract`](basics/Extract.md)
+- [`First`](basics/First.md)
+- [`Insert`](basics/Insert.md)
+- [`Join`](basics/Join.md)
+- [`Last`](basics/Last.md)
+- [`Length`](basics/Length.md)
+- [`Most`](basics/Most.md)
+- [`Part`](basics/Part.md)
+- [`Prepend`](basics/Prepend.md)
+- [`Range`](basics/Range.md)
+- [`Rest`](basics/Rest.md)
+- [`Reverse`](basics/Reverse.md)
+- [`Riffle`](basics/Riffle.md)
+- [`Sort`](basics/Sort.md)
+- [`Take`](basics/Take.md)
+- [`Table`](basics/Table.md)

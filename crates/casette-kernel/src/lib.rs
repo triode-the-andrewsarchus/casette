@@ -10,6 +10,7 @@ pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod protocol;
+pub mod woxi_kernel;
 
 pub use client::{boot_prelude, KernelConfig, SageKernel, BOOT_VARIABLE_NAMES};
 pub use discovery::{SageDiscovery, SageEnvironment};
@@ -18,3 +19,4 @@ pub use protocol::{
     ArtifactPayload, ErrorPayload, MatrixPropertyPayload, SymbolPayload, TruncationPayload,
     WorkerRequest, WorkerResponse,
 };
+pub use woxi_kernel::{normalize_for_woxi, WoxiKernel};

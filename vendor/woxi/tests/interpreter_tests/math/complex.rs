@@ -1,0 +1,2349 @@
+use super::*;
+
+mod sign_complex_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn sign_positive_integer() {
+    assert_eq!(interpret("Sign[19]").unwrap(), "1");
+  }
+
+  #[test]
+  fn sign_negative_integer() {
+    assert_eq!(interpret("Sign[-6]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn sign_zero() {
+    assert_eq!(interpret("Sign[0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn sign_list() {
+    assert_eq!(
+      interpret("Sign[{-5, -10, 15, 20, 0}]").unwrap(),
+      "{-1, -1, 1, 1, 0}"
+    );
+  }
+
+  #[test]
+  fn sign_complex_pythagorean() {
+    // Sign[3 - 4*I] = (3 - 4I) / 5
+    assert_eq!(interpret("Sign[3 - 4*I]").unwrap(), "3/5 - (4*I)/5");
+  }
+
+  // Sign[b^z] = b^(I Im[z]) for a positive real base b, since |b^z| = b^Re[z].
+  // Mirrors Abs[b^z] = b^Re[z].
+  #[test]
+  fn sign_of_positive_base_power() {
+    assert_eq!(interpret("Sign[E^x]").unwrap(), "E^(I*Im[x])");
+    assert_eq!(interpret("Sign[2^x]").unwrap(), "2^(I*Im[x])");
+    assert_eq!(interpret("Sign[E^(I x)]").unwrap(), "E^(I*Re[x])");
+    assert_eq!(interpret("Sign[E^(2 x)]").unwrap(), "E^((2*I)*Im[x])");
+    // A positive scalar factor drops out first.
+    assert_eq!(interpret("Sign[2 E^x]").unwrap(), "E^(I*Im[x])");
+    // A real positive value still gives 1, and a unit-magnitude power is
+    // returned unchanged.
+    assert_eq!(interpret("Sign[E^5]").unwrap(), "1");
+    assert_eq!(interpret("Sign[E^(2 I)]").unwrap(), "E^(2*I)");
+  }
+
+  #[test]
+  fn sign_complex_positive_imaginary() {
+    assert_eq!(interpret("Sign[3 + 4*I]").unwrap(), "3/5 + (4*I)/5");
+  }
+
+  #[test]
+  fn sign_pure_imaginary() {
+    assert_eq!(interpret("Sign[I]").unwrap(), "I");
+  }
+
+  #[test]
+  fn sign_negative_imaginary() {
+    assert_eq!(interpret("Sign[-I]").unwrap(), "-I");
+  }
+
+  #[test]
+  fn sign_complex_irrational_abs() {
+    // Sign[1 + I] = (1 + I) / Sqrt[2]
+    assert_eq!(interpret("Sign[1 + I]").unwrap(), "(1 + I)/Sqrt[2]");
+  }
+
+  #[test]
+  fn sign_complex_irrational_abs_negative() {
+    assert_eq!(interpret("Sign[1 - I]").unwrap(), "(1 - I)/Sqrt[2]");
+  }
+
+  #[test]
+  fn sign_complex_2_plus_i() {
+    assert_eq!(interpret("Sign[2 + I]").unwrap(), "(2 + I)/Sqrt[5]");
+  }
+
+  #[test]
+  fn sign_infinity() {
+    assert_eq!(interpret("Sign[Infinity]").unwrap(), "1");
+  }
+
+  #[test]
+  fn sign_negative_infinity() {
+    assert_eq!(interpret("Sign[-Infinity]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn sign_complex_infinity() {
+    assert_eq!(interpret("Sign[ComplexInfinity]").unwrap(), "Indeterminate");
+  }
+
+  #[test]
+  fn sign_i_to_real_power() {
+    // Sign[I^realexp] = I^realexp because |I^x| = 1 for any real x.
+    // (`I^5` would have already simplified to `I` itself before Sign sees
+    // it, so the test uses a non-collapsing exponent.)
+    assert_eq!(interpret("Sign[I^(2 Pi)]").unwrap(), "I^(2*Pi)");
+  }
+
+  #[test]
+  fn sign_positive_real_to_imaginary_power() {
+    // Sign[a^(b I)] = a^(b I) when a is positive real and b is real,
+    // because |a^(b I)| = e^(-b * Im(Log a)) = 1 (Log of positive real
+    // is real, so Im is 0).
+    assert_eq!(interpret("Sign[4^(2 Pi I)]").unwrap(), "4^((2*I)*Pi)");
+    assert_eq!(interpret("Sign[2^(3 I)]").unwrap(), "2^(3*I)");
+  }
+
+  // `Sign[Times[r1, ..., rk, z]]` collapses to `Sign[z]` when every
+  // `ri` is an exact strictly-positive real factor — magnitudes
+  // multiply, so the real factors cancel themselves out. This lets
+  // `Sign[(1 + I)/Sqrt[2]]` (stored as
+  // `Times[Power[2, -1/2], Complex[1, 1]]`) reduce all the way to
+  // `(1 + I)/Sqrt[2]` because `Sign[1 + I]` is itself that
+  // unit-circle form.
+  #[test]
+  fn sign_factors_out_exact_positive_real() {
+    assert_eq!(
+      interpret("Sign[(1 + I)/Sqrt[2]]").unwrap(),
+      "(1 + I)/Sqrt[2]"
+    );
+    // Same identity scaled differently — the answer is still the
+    // sign of the complex factor alone.
+    assert_eq!(interpret("Sign[(3 - 4*I)/7]").unwrap(), "3/5 - (4*I)/5");
+  }
+
+  // Inexact (Real) factors must NOT trigger the exact-positive
+  // simplification — wolframscript folds those through to a
+  // numerical complex Sign with Real parts.
+  #[test]
+  fn sign_inexact_factor_keeps_numeric_form() {
+    let result = interpret("Sign[(1 + I)/Sqrt[2.]]").unwrap();
+    let (re_str, im_str) = result.split_once(" + ").unwrap();
+    let re: f64 = re_str.parse().unwrap();
+    let im: f64 = im_str.trim_end_matches("*I").parse().unwrap();
+    assert!(
+      (re - 0.7071067811865475).abs() < 1e-12,
+      "real part should be ~1/Sqrt[2], got {re}"
+    );
+    assert!(
+      (im - 0.7071067811865475).abs() < 1e-12,
+      "imag part should be ~1/Sqrt[2], got {im}"
+    );
+  }
+}
+
+mod abs_complex_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn abs_complex_pythagorean() {
+    assert_eq!(interpret("Abs[3 + 4*I]").unwrap(), "5");
+  }
+
+  #[test]
+  fn abs_complex_pythagorean_negative() {
+    assert_eq!(interpret("Abs[3 - 4*I]").unwrap(), "5");
+  }
+
+  #[test]
+  fn abs_pure_imaginary() {
+    assert_eq!(interpret("Abs[I]").unwrap(), "1");
+  }
+
+  #[test]
+  fn abs_complex_irrational() {
+    assert_eq!(interpret("Abs[1 + I]").unwrap(), "Sqrt[2]");
+  }
+
+  #[test]
+  fn abs_negative_complex() {
+    assert_eq!(interpret("Abs[-3 - 4*I]").unwrap(), "5");
+  }
+
+  #[test]
+  fn abs_float_complex() {
+    assert_eq!(interpret("Abs[3.0 + I]").unwrap(), "3.1622776601683795");
+  }
+
+  #[test]
+  fn abs_i_infinity() {
+    assert_eq!(interpret("Abs[I Infinity]").unwrap(), "Infinity");
+  }
+
+  #[test]
+  fn abs_infinity_equality() {
+    assert_eq!(
+      interpret("Abs[Infinity] == Abs[I Infinity] == Abs[ComplexInfinity]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  // Abs[b^z] = b^Re[z] for a strictly-positive real base b, since
+  // b^z = E^(z Log b) with Log b real.
+  #[test]
+  fn abs_exp_pure_imaginary() {
+    assert_eq!(interpret("Abs[Exp[2 I]]").unwrap(), "1");
+    assert_eq!(interpret("Abs[E^(I Pi)]").unwrap(), "1");
+  }
+
+  #[test]
+  fn abs_exp_complex_exponent() {
+    assert_eq!(interpret("Abs[Exp[2 + 3 I]]").unwrap(), "E^2");
+    assert_eq!(interpret("Abs[Exp[-1 + I]]").unwrap(), "E^(-1)");
+  }
+
+  #[test]
+  fn abs_exp_symbolic_exponent() {
+    assert_eq!(interpret("Abs[Exp[x]]").unwrap(), "E^Re[x]");
+    assert_eq!(interpret("Abs[Exp[I x]]").unwrap(), "E^(-Im[x])");
+    assert_eq!(
+      interpret("Abs[Exp[a + b I]]").unwrap(),
+      "E^(-Im[b] + Re[a])"
+    );
+  }
+
+  #[test]
+  fn abs_positive_base_power() {
+    assert_eq!(interpret("Abs[2^(I x)]").unwrap(), "2^(-Im[x])");
+    assert_eq!(interpret("Abs[3^(2 + I)]").unwrap(), "9");
+    assert_eq!(interpret("Abs[Pi^(I x)]").unwrap(), "Pi^(-Im[x])");
+  }
+}
+
+mod conjugate_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn conjugate_integer() {
+    assert_eq!(interpret("Conjugate[3]").unwrap(), "3");
+  }
+
+  #[test]
+  fn conjugate_negative_integer() {
+    assert_eq!(interpret("Conjugate[-5]").unwrap(), "-5");
+  }
+
+  #[test]
+  fn conjugate_rational() {
+    assert_eq!(interpret("Conjugate[3/4]").unwrap(), "3/4");
+  }
+
+  #[test]
+  fn conjugate_complex_integer() {
+    assert_eq!(interpret("Conjugate[3 + 4*I]").unwrap(), "3 - 4*I");
+  }
+
+  #[test]
+  fn conjugate_complex_negative_imag() {
+    assert_eq!(interpret("Conjugate[3 - 4*I]").unwrap(), "3 + 4*I");
+  }
+
+  #[test]
+  fn conjugate_pure_imaginary() {
+    assert_eq!(interpret("Conjugate[4*I]").unwrap(), "-4*I");
+  }
+
+  #[test]
+  fn conjugate_i() {
+    assert_eq!(interpret("Conjugate[I]").unwrap(), "-I");
+  }
+
+  #[test]
+  fn conjugate_negative_i() {
+    assert_eq!(interpret("Conjugate[-I]").unwrap(), "I");
+  }
+
+  #[test]
+  fn conjugate_complex_float() {
+    assert_eq!(interpret("Conjugate[1.5 + 2.5*I]").unwrap(), "1.5 - 2.5*I");
+  }
+
+  #[test]
+  fn conjugate_involution() {
+    // Conjugate is its own inverse, even after distributing over a sum.
+    assert_eq!(interpret("Conjugate[Conjugate[z]]").unwrap(), "z");
+    assert_eq!(interpret("Conjugate[Conjugate[a + b]]").unwrap(), "a + b");
+  }
+
+  #[test]
+  fn conjugate_of_real_valued_heads() {
+    // Re/Im/Abs/Arg are real-valued, so Conjugate leaves them unchanged.
+    assert_eq!(interpret("Conjugate[Re[z]]").unwrap(), "Re[z]");
+    assert_eq!(interpret("Conjugate[Im[z]]").unwrap(), "Im[z]");
+    assert_eq!(interpret("Conjugate[Abs[z]]").unwrap(), "Abs[z]");
+    assert_eq!(interpret("Conjugate[Arg[z]]").unwrap(), "Arg[z]");
+  }
+
+  #[test]
+  fn conjugate_of_power_positive_real_base() {
+    // For a positive real base the conjugate moves onto the exponent.
+    assert_eq!(interpret("Conjugate[Exp[I]]").unwrap(), "E^(-I)");
+    assert_eq!(interpret("Conjugate[E^(2 I)]").unwrap(), "E^(-2*I)");
+    assert_eq!(interpret("Conjugate[E^z]").unwrap(), "E^Conjugate[z]");
+    assert_eq!(interpret("Conjugate[Exp[2 + 3 I]]").unwrap(), "E^(2 - 3*I)");
+    assert_eq!(interpret("Conjugate[2^I]").unwrap(), "2^(-I)");
+    assert_eq!(interpret("Conjugate[Pi^I]").unwrap(), "Pi^(-I)");
+  }
+
+  #[test]
+  fn conjugate_of_power_integer_exponent() {
+    // For an integer exponent the conjugate distributes onto the base.
+    assert_eq!(interpret("Conjugate[x^2]").unwrap(), "Conjugate[x]^2");
+    assert_eq!(interpret("Conjugate[x^3]").unwrap(), "Conjugate[x]^3");
+    // A complex exponent on a symbolic base stays unevaluated.
+    assert_eq!(interpret("Conjugate[x^I]").unwrap(), "Conjugate[x^I]");
+  }
+
+  #[test]
+  fn re_im_of_conjugate() {
+    // Re[Conjugate[z]] = Re[z]; Im[Conjugate[z]] = -Im[z].
+    assert_eq!(interpret("Re[Conjugate[z]]").unwrap(), "Re[z]");
+    assert_eq!(interpret("Im[Conjugate[z]]").unwrap(), "-Im[z]");
+    assert_eq!(
+      interpret("Re[Conjugate[x + I y]]").unwrap(),
+      "-Im[y] + Re[x]"
+    );
+    assert_eq!(interpret("Im[Conjugate[2 - 5 I]]").unwrap(), "5");
+  }
+
+  #[test]
+  fn conjugate_complex_rational() {
+    assert_eq!(
+      interpret("Conjugate[1/2 + 3/4*I]").unwrap(),
+      "1/2 - (3*I)/4"
+    );
+  }
+
+  #[test]
+  fn conjugate_zero() {
+    assert_eq!(interpret("Conjugate[0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn conjugate_symbolic() {
+    assert_eq!(interpret("Conjugate[x]").unwrap(), "Conjugate[x]");
+  }
+
+  #[test]
+  fn conjugate_symbolic_plus_imaginary() {
+    // Distributes over Plus, conjugates I factor
+    assert_eq!(
+      interpret("Conjugate[a + b * I]").unwrap(),
+      "Conjugate[a] - I*Conjugate[b]"
+    );
+  }
+
+  #[test]
+  fn conjugate_distribute_over_list() {
+    assert_eq!(
+      interpret("Conjugate[{1, 2, a}]").unwrap(),
+      "{1, 2, Conjugate[a]}"
+    );
+  }
+
+  #[test]
+  fn conjugate_times_i() {
+    // Conjugate[I*a] = -I*Conjugate[a]
+    assert_eq!(interpret("Conjugate[I*a]").unwrap(), "-I*Conjugate[a]");
+  }
+
+  #[test]
+  fn conjugate_times_real() {
+    // Real coefficient passes through
+    assert_eq!(interpret("Conjugate[2*a]").unwrap(), "2*Conjugate[a]");
+  }
+
+  #[test]
+  fn conjugate_negate_symbolic() {
+    // Conjugate[-a] = -Conjugate[a]
+    assert_eq!(interpret("Conjugate[-a]").unwrap(), "-Conjugate[a]");
+  }
+
+  #[test]
+  fn conjugate_nested_complex_list() {
+    // Distributes over nested lists with mixed elements
+    assert_eq!(
+      interpret("Conjugate[{{1, 2 + I 4, a + I b}, {I}}]").unwrap(),
+      "{{1, 2 - 4*I, Conjugate[a] - I*Conjugate[b]}, {-I}}"
+    );
+  }
+
+  #[test]
+  fn conjugate_numeric_plus_symbolic() {
+    // Conjugate[3 + I*b] = 3 - I*Conjugate[b]
+    assert_eq!(
+      interpret("Conjugate[3 + I*b]").unwrap(),
+      "3 - I*Conjugate[b]"
+    );
+  }
+
+  #[test]
+  fn conjugate_real_plus_symbol() {
+    // Conjugate[a + 2] = 2 + Conjugate[a]
+    assert_eq!(interpret("Conjugate[a + 2]").unwrap(), "2 + Conjugate[a]");
+  }
+
+  // An exact constant coefficient of I (Pi, E) must stay exact rather than
+  // collapsing to a machine float. Regression: the float complex extractor ran
+  // unconditionally and evaluated Constant Pi numerically.
+  #[test]
+  fn conjugate_i_times_pi() {
+    assert_eq!(interpret("Conjugate[I Pi]").unwrap(), "-I*Pi");
+  }
+
+  #[test]
+  fn conjugate_i_times_e() {
+    assert_eq!(interpret("Conjugate[I E]").unwrap(), "-I*E");
+  }
+
+  #[test]
+  fn conjugate_real_plus_pi_imaginary() {
+    assert_eq!(interpret("Conjugate[2 + I Pi]").unwrap(), "2 - I*Pi");
+  }
+
+  #[test]
+  fn conjugate_minus_pi_imaginary() {
+    assert_eq!(interpret("Conjugate[2 - 3 Pi I]").unwrap(), "2 + (3*I)*Pi");
+  }
+}
+
+mod re_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn re_integer() {
+    assert_eq!(interpret("Re[3]").unwrap(), "3");
+  }
+
+  #[test]
+  fn re_real() {
+    assert_eq!(interpret("Re[3.14]").unwrap(), "3.14");
+  }
+
+  #[test]
+  fn re_complex() {
+    assert_eq!(interpret("Re[3 + 4*I]").unwrap(), "3");
+  }
+
+  // Re, Im, Abs, and Arg are real-valued for any argument, so Re of any of
+  // them is that expression unchanged.
+  #[test]
+  fn re_of_real_valued_head() {
+    assert_eq!(interpret("Re[Re[x]]").unwrap(), "Re[x]");
+    assert_eq!(interpret("Re[Im[x]]").unwrap(), "Im[x]");
+    assert_eq!(interpret("Re[Abs[x]]").unwrap(), "Abs[x]");
+    assert_eq!(interpret("Re[Arg[x]]").unwrap(), "Arg[x]");
+    // A bare symbol still has no simplification.
+    assert_eq!(interpret("Re[x]").unwrap(), "Re[x]");
+  }
+
+  #[test]
+  fn re_complex_negative_imag() {
+    assert_eq!(interpret("Re[3 - 4*I]").unwrap(), "3");
+  }
+
+  #[test]
+  fn re_pure_imaginary() {
+    assert_eq!(interpret("Re[4*I]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_im_complex_exponential() {
+    // Re/Im of a variable-free complex exponential resolve via Euler's
+    // formula (NumericQ argument); a symbolic exponent stays unevaluated.
+    assert_eq!(interpret("Re[Exp[I]]").unwrap(), "Cos[1]");
+    assert_eq!(interpret("Im[Exp[I]]").unwrap(), "Sin[1]");
+    assert_eq!(interpret("Re[E^(2*I)]").unwrap(), "Cos[2]");
+    assert_eq!(interpret("Re[E^(-I)]").unwrap(), "Cos[1]");
+    assert_eq!(interpret("Im[E^(-I)]").unwrap(), "-Sin[1]");
+    assert_eq!(interpret("Re[E^(3*I/2)]").unwrap(), "Cos[3/2]");
+    assert_eq!(interpret("Re[E^(2 + 3*I)]").unwrap(), "E^2*Cos[3]");
+    assert_eq!(interpret("Im[E^(2 + 3*I)]").unwrap(), "E^2*Sin[3]");
+    assert_eq!(interpret("Re[2*E^I]").unwrap(), "2*Cos[1]");
+    // Symbolic exponent (could be complex) stays unevaluated.
+    assert_eq!(interpret("Re[E^(I*x)]").unwrap(), "Re[E^(I*x)]");
+  }
+
+  #[test]
+  fn complex_expand_exp_negative_and_rational() {
+    // ComplexExpand now decomposes negated and rational imaginary exponents.
+    assert_eq!(
+      interpret("ComplexExpand[E^(-I)]").unwrap(),
+      "Cos[1] - I*Sin[1]"
+    );
+    assert_eq!(
+      interpret("ComplexExpand[E^(3*I/2)]").unwrap(),
+      "Cos[3/2] + I*Sin[3/2]"
+    );
+  }
+
+  /// A real-valued function call is its own real part, so an exponential
+  /// whose imaginary exponent is one of them splits. Without this
+  /// `E^(I ArcTan[2/3])` stayed unexpanded while `E^(I Sqrt[2])` — a
+  /// `Power`, recognised by a different branch — expanded.
+  #[test]
+  fn a_function_valued_real_exponent_splits() {
+    assert_eq!(
+      interpret("Re[E^(I*ArcTan[2/3]/3)]").unwrap(),
+      "Cos[ArcTan[2/3]/3]"
+    );
+    assert_eq!(
+      interpret("Im[E^(I*ArcTan[2/3]/3)]").unwrap(),
+      "Sin[ArcTan[2/3]/3]"
+    );
+    assert_eq!(interpret("Re[E^(I*Log[3])]").unwrap(), "Cos[Log[3]]");
+    assert_eq!(interpret("Re[E^(I*E)]").unwrap(), "Cos[E]");
+    // Canonical Plus ordering puts the number (`I/3` is `Complex[0, 1/3]`)
+    // before the radical term, matching what plain evaluation of
+    // `I/3 + (2 Sqrt[2])/3` prints.
+    assert_eq!(
+      interpret("ComplexExpand[E^(I*ArcSin[1/3])]").unwrap(),
+      "I/3 + (2*Sqrt[2])/3"
+    );
+    // A complex-valued argument has no real value and still stays put.
+    assert_eq!(interpret("Re[E^(I*x)]").unwrap(), "Re[E^(I*x)]");
+  }
+
+  #[test]
+  fn re_i() {
+    assert_eq!(interpret("Re[I]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_negative_i() {
+    assert_eq!(interpret("Re[-I]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_zero() {
+    assert_eq!(interpret("Re[0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_rational_complex() {
+    assert_eq!(interpret("Re[1/2 + 3/4*I]").unwrap(), "1/2");
+  }
+
+  #[test]
+  fn re_float_complex() {
+    assert_eq!(interpret("Re[1.5 + 2.5*I]").unwrap(), "1.5");
+  }
+
+  #[test]
+  fn re_symbolic() {
+    assert_eq!(interpret("Re[x]").unwrap(), "Re[x]");
+  }
+
+  #[test]
+  fn re_i_times_numeric() {
+    // Re[I * Sinh[1]] = 0 since Sinh[1] is a real numeric value
+    assert_eq!(interpret("Re[I*Sinh[1]]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_i_times_log() {
+    assert_eq!(interpret("Re[I*Log[2]]").unwrap(), "0");
+  }
+}
+
+mod im_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn im_integer() {
+    assert_eq!(interpret("Im[3]").unwrap(), "0");
+  }
+
+  #[test]
+  fn im_real() {
+    assert_eq!(interpret("Im[3.14]").unwrap(), "0");
+  }
+
+  #[test]
+  fn im_complex() {
+    assert_eq!(interpret("Im[3 + 4*I]").unwrap(), "4");
+  }
+
+  // Re, Im, Abs, and Arg are real-valued for any argument, so Im of any of
+  // them is 0.
+  #[test]
+  fn im_of_real_valued_head() {
+    assert_eq!(interpret("Im[Re[x]]").unwrap(), "0");
+    assert_eq!(interpret("Im[Im[x]]").unwrap(), "0");
+    assert_eq!(interpret("Im[Abs[x]]").unwrap(), "0");
+    assert_eq!(interpret("Im[Arg[x]]").unwrap(), "0");
+    // A bare symbol still has no simplification.
+    assert_eq!(interpret("Im[x]").unwrap(), "Im[x]");
+  }
+
+  #[test]
+  fn im_complex_negative_imag() {
+    assert_eq!(interpret("Im[3 - 4*I]").unwrap(), "-4");
+  }
+
+  #[test]
+  fn im_pure_imaginary() {
+    assert_eq!(interpret("Im[4*I]").unwrap(), "4");
+  }
+
+  #[test]
+  fn im_i() {
+    assert_eq!(interpret("Im[I]").unwrap(), "1");
+  }
+
+  #[test]
+  fn im_negative_i() {
+    assert_eq!(interpret("Im[-I]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn im_zero() {
+    assert_eq!(interpret("Im[0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn im_rational_complex() {
+    assert_eq!(interpret("Im[1/2 + 3/4*I]").unwrap(), "3/4");
+  }
+
+  #[test]
+  fn im_float_complex() {
+    assert_eq!(interpret("Im[1.5 + 2.5*I]").unwrap(), "2.5");
+  }
+
+  #[test]
+  fn im_symbolic() {
+    assert_eq!(interpret("Im[x]").unwrap(), "Im[x]");
+  }
+
+  #[test]
+  fn im_i_times_numeric() {
+    // Im[I * Sinh[1]] = Sinh[1] since I*Sinh[1] is purely imaginary
+    assert_eq!(interpret("Im[I*Sinh[1]]").unwrap(), "Sinh[1]");
+  }
+
+  #[test]
+  fn im_i_times_log() {
+    assert_eq!(interpret("Im[I*Log[2]]").unwrap(), "Log[2]");
+  }
+
+  // I times an exact constant (Pi) must keep the constant exact rather than
+  // collapsing it to a machine float. Regression: the float extractor used to
+  // run before the exact I*real extractor.
+  #[test]
+  fn im_i_times_pi() {
+    assert_eq!(interpret("Im[I Pi]").unwrap(), "Pi");
+    assert_eq!(interpret("Re[I Pi]").unwrap(), "0");
+  }
+
+  #[test]
+  fn im_i_times_pi_fraction() {
+    assert_eq!(interpret("Im[I Pi/3]").unwrap(), "Pi/3");
+  }
+
+  // Nested Times: 5 Pi I/3 buries I in an inner product; the imaginary part is
+  // still extracted exactly.
+  #[test]
+  fn im_nested_pi_multiple() {
+    assert_eq!(interpret("Im[5 Pi I/3]").unwrap(), "(5*Pi)/3");
+    assert_eq!(interpret("Im[3 I Pi/7]").unwrap(), "(3*Pi)/7");
+  }
+
+  #[test]
+  fn im_real_plus_pi_imaginary() {
+    assert_eq!(interpret("Im[2 + 3 Pi I]").unwrap(), "3*Pi");
+    assert_eq!(interpret("Re[2 + 3 Pi I]").unwrap(), "2");
+  }
+
+  // ── Arg ──────────────────────────────────────────────────
+
+  #[test]
+  fn arg_positive_integer() {
+    assert_eq!(interpret("Arg[3]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arg_negative_integer() {
+    assert_eq!(interpret("Arg[-3]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn arg_zero() {
+    assert_eq!(interpret("Arg[0]").unwrap(), "0");
+  }
+
+  // Abs is always a non-negative real, so Arg[Abs[z]] = 0. A positive scalar
+  // multiple reduces to the same. wolframscript does NOT simplify compound
+  // forms (Abs[x] + 1, Abs[x]^2), so those stay unevaluated.
+  #[test]
+  fn arg_of_abs_is_zero() {
+    assert_eq!(interpret("Arg[Abs[x]]").unwrap(), "0");
+    assert_eq!(interpret("Arg[2 Abs[x]]").unwrap(), "0");
+    assert_eq!(interpret("Arg[Abs[x] + 1]").unwrap(), "Arg[1 + Abs[x]]");
+    assert_eq!(interpret("Arg[Abs[x]^2]").unwrap(), "Arg[Abs[x]^2]");
+  }
+
+  #[test]
+  fn arg_positive_rational() {
+    assert_eq!(interpret("Arg[1/2]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arg_negative_rational() {
+    assert_eq!(interpret("Arg[-1/2]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn arg_pure_imaginary_positive() {
+    assert_eq!(interpret("Arg[I]").unwrap(), "Pi/2");
+  }
+
+  #[test]
+  fn arg_pure_imaginary_negative() {
+    assert_eq!(interpret("Arg[-I]").unwrap(), "-1/2*Pi");
+  }
+
+  #[test]
+  fn arg_inexact_pure_imaginary_stays_real() {
+    // A concrete inexact complex value (nonzero imaginary part) has an
+    // inexact argument: Arg[2. I] = 1.5707..., not the exact Pi/2 that the
+    // exact Arg[2 I] gives.
+    assert_eq!(interpret("Arg[2. I]").unwrap(), "1.5707963267948966");
+    assert_eq!(interpret("Arg[2 (1. I)]").unwrap(), "1.5707963267948966");
+    // Exact pure imaginary keeps the exact argument.
+    assert_eq!(interpret("Arg[2 I]").unwrap(), "Pi/2");
+    // Pi is exact, so Arg[Pi I] stays exact too.
+    assert_eq!(interpret("Arg[Pi I]").unwrap(), "Pi/2");
+  }
+
+  #[test]
+  fn arg_inexact_purely_real_stays_exact() {
+    // A purely real inexact value has a zero imaginary part, so its argument
+    // is the exact 0 or Pi, not a machine real.
+    assert_eq!(interpret("Arg[-1.]").unwrap(), "Pi");
+    assert_eq!(interpret("Arg[2. (-1)]").unwrap(), "Pi");
+    assert_eq!(interpret("Arg[1.]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arg_inexact_general_complex_stays_real() {
+    assert_eq!(interpret("Arg[3. (1 + I)]").unwrap(), "0.7853981633974483");
+    assert_eq!(
+      interpret("Arg[2.5 (3 + 4 I)]").unwrap(),
+      "0.9272952180016122"
+    );
+    assert_eq!(interpret("Arg[-3. I]").unwrap(), "-1.5707963267948966");
+  }
+
+  #[test]
+  fn arg_inexact_positive_scalar_symbolic() {
+    // A positive inexact scalar times a symbol drops out of the argument.
+    assert_eq!(interpret("Arg[2. x]").unwrap(), "Arg[x]");
+  }
+
+  #[test]
+  fn arg_first_quadrant() {
+    assert_eq!(interpret("Arg[1+I]").unwrap(), "Pi/4");
+  }
+
+  #[test]
+  fn arg_fourth_quadrant() {
+    assert_eq!(interpret("Arg[1-I]").unwrap(), "-1/4*Pi");
+  }
+
+  #[test]
+  fn arg_second_quadrant() {
+    assert_eq!(interpret("Arg[-1+I]").unwrap(), "(3*Pi)/4");
+  }
+
+  #[test]
+  fn arg_third_quadrant() {
+    assert_eq!(interpret("Arg[-1-I]").unwrap(), "(-3*Pi)/4");
+  }
+
+  #[test]
+  fn arg_of_exponential() {
+    // Arg[E^z] is Im[z] reduced into (-Pi, Pi].
+    assert_eq!(interpret("Arg[Exp[I]]").unwrap(), "1");
+    assert_eq!(interpret("Arg[Exp[3 I]]").unwrap(), "3");
+    assert_eq!(interpret("Arg[Exp[-I]]").unwrap(), "-1");
+    assert_eq!(interpret("Arg[E^(I Pi/3)]").unwrap(), "Pi/3");
+    // Real part of the exponent (the modulus E^Re) doesn't affect Arg.
+    assert_eq!(interpret("Arg[E^(2 + 3 I)]").unwrap(), "3");
+    assert_eq!(interpret("Arg[E^(1/2 I)]").unwrap(), "1/2");
+  }
+
+  #[test]
+  fn arg_of_exponential_range_reduction() {
+    // Imaginary parts outside (-Pi, Pi] are reduced by multiples of 2 Pi.
+    assert_eq!(interpret("Arg[Exp[4 I]]").unwrap(), "4 - 2*Pi");
+    assert_eq!(interpret("Arg[E^(5 I)]").unwrap(), "5 - 2*Pi");
+    assert_eq!(interpret("Arg[Exp[10 I]]").unwrap(), "10 - 4*Pi");
+  }
+
+  #[test]
+  fn arg_of_exponential_symbolic_unevaluated() {
+    // A symbolic exponent stays unevaluated (the modulus need not be real).
+    assert_eq!(interpret("Arg[E^(I x)]").unwrap(), "Arg[E^(I*x)]");
+    assert_eq!(interpret("Arg[E^(a + I)]").unwrap(), "Arg[E^(I + a)]");
+  }
+
+  #[test]
+  fn arg_scaled_complex() {
+    assert_eq!(interpret("Arg[2+2I]").unwrap(), "Pi/4");
+  }
+
+  #[test]
+  fn arg_non_standard_angle() {
+    assert_eq!(interpret("Arg[3-4I]").unwrap(), "-ArcTan[4/3]");
+  }
+
+  #[test]
+  fn arg_non_standard_second_quadrant() {
+    assert_eq!(interpret("Arg[-3+4I]").unwrap(), "Pi - ArcTan[4/3]");
+  }
+
+  #[test]
+  fn arg_non_standard_third_quadrant() {
+    assert_eq!(interpret("Arg[-3-4I]").unwrap(), "-Pi + ArcTan[4/3]");
+  }
+
+  #[test]
+  fn arg_positive_real() {
+    assert_eq!(interpret("Arg[5.0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arg_negative_real() {
+    assert_eq!(interpret("Arg[-2.5]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn arg_symbolic() {
+    assert_eq!(interpret("Arg[x]").unwrap(), "Arg[x]");
+  }
+
+  // ── RealValuedNumberQ ────────────────────────────────────
+
+  #[test]
+  fn real_valued_number_q_integer() {
+    assert_eq!(interpret("RealValuedNumberQ[10]").unwrap(), "True");
+  }
+
+  #[test]
+  fn real_valued_number_q_real() {
+    assert_eq!(interpret("RealValuedNumberQ[4.0]").unwrap(), "True");
+  }
+
+  #[test]
+  fn real_valued_number_q_rational() {
+    assert_eq!(interpret("RealValuedNumberQ[3/4]").unwrap(), "True");
+  }
+
+  #[test]
+  fn real_valued_number_q_complex() {
+    assert_eq!(interpret("RealValuedNumberQ[1+I]").unwrap(), "False");
+  }
+
+  #[test]
+  fn real_valued_number_q_zero_times_i() {
+    assert_eq!(interpret("RealValuedNumberQ[0*I]").unwrap(), "True");
+  }
+
+  #[test]
+  fn real_valued_number_q_pi() {
+    assert_eq!(interpret("RealValuedNumberQ[Pi]").unwrap(), "False");
+  }
+
+  #[test]
+  fn real_valued_number_q_symbol() {
+    assert_eq!(interpret("RealValuedNumberQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn real_valued_number_q_approx_zero_times_i() {
+    // 0.0 * I → Complex, not real-valued
+    assert_eq!(interpret("RealValuedNumberQ[0.0 * I]").unwrap(), "False");
+  }
+
+  #[test]
+  fn real_valued_number_q_underflow_overflow() {
+    assert_eq!(
+      interpret(
+        "{RealValuedNumberQ[Underflow[]], RealValuedNumberQ[Overflow[]]}"
+      )
+      .unwrap(),
+      "{True, True}"
+    );
+  }
+
+  // ── RealValuedNumericQ ───────────────────────────────────
+
+  #[test]
+  fn real_valued_numeric_q_explicit_numbers() {
+    assert_eq!(interpret("RealValuedNumericQ[2]").unwrap(), "True");
+    assert_eq!(interpret("RealValuedNumericQ[2.5]").unwrap(), "True");
+    assert_eq!(interpret("RealValuedNumericQ[3/4]").unwrap(), "True");
+  }
+
+  #[test]
+  fn real_valued_numeric_q_constants_and_exact_irrationals() {
+    // Unlike RealValuedNumberQ, numeric constants and exact irrationals count.
+    assert_eq!(interpret("RealValuedNumericQ[Pi]").unwrap(), "True");
+    assert_eq!(interpret("RealValuedNumericQ[E]").unwrap(), "True");
+    assert_eq!(
+      interpret("RealValuedNumericQ[GoldenRatio]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("RealValuedNumericQ[Sqrt[2]]").unwrap(), "True");
+    assert_eq!(interpret("RealValuedNumericQ[Pi + E]").unwrap(), "True");
+  }
+
+  #[test]
+  fn real_valued_numeric_q_numeric_functions() {
+    assert_eq!(interpret("RealValuedNumericQ[Sin[1]]").unwrap(), "True");
+    assert_eq!(interpret("RealValuedNumericQ[Log[2]]").unwrap(), "True");
+    // A real-valued result from complex-valued inputs still counts.
+    assert_eq!(
+      interpret("RealValuedNumericQ[Abs[3 + 4 I]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn real_valued_numeric_q_complex_is_false() {
+    assert_eq!(interpret("RealValuedNumericQ[I]").unwrap(), "False");
+    assert_eq!(interpret("RealValuedNumericQ[2 + 3 I]").unwrap(), "False");
+    assert_eq!(interpret("RealValuedNumericQ[Sqrt[-1]]").unwrap(), "False");
+    assert_eq!(interpret("RealValuedNumericQ[Log[-1]]").unwrap(), "False");
+    // 0.0 * I is a complex machine number, not real-valued.
+    assert_eq!(interpret("RealValuedNumericQ[0.0 * I]").unwrap(), "False");
+  }
+
+  #[test]
+  fn real_valued_numeric_q_non_numeric_is_false() {
+    assert_eq!(interpret("RealValuedNumericQ[x]").unwrap(), "False");
+    assert_eq!(interpret("RealValuedNumericQ[\"a\"]").unwrap(), "False");
+    assert_eq!(interpret("RealValuedNumericQ[True]").unwrap(), "False");
+    // Infinity is not numeric in the Wolfram Language sense.
+    assert_eq!(interpret("RealValuedNumericQ[Infinity]").unwrap(), "False");
+  }
+
+  // Reciprocals swap Underflow[] and Overflow[] to match Wolfram's semantics:
+  // 1 / Underflow[] is infinite, 1 / Overflow[] is indistinguishable from 0.
+  #[test]
+  fn reciprocal_underflow_is_overflow() {
+    assert_eq!(interpret("1 / Underflow[]").unwrap(), "Overflow[]");
+  }
+
+  #[test]
+  fn reciprocal_overflow_is_underflow() {
+    assert_eq!(interpret("1 / Overflow[]").unwrap(), "Underflow[]");
+  }
+
+  // ── Exp ──────────────────────────────────────────────────
+
+  #[test]
+  fn exp_zero() {
+    assert_eq!(interpret("Exp[0]").unwrap(), "1");
+  }
+
+  #[test]
+  fn exp_one() {
+    assert_eq!(interpret("Exp[1]").unwrap(), "E");
+  }
+
+  // ── Exp with imaginary multiples of Pi (Euler's formula) ──
+
+  #[test]
+  fn exp_i_pi() {
+    assert_eq!(interpret("Exp[I Pi]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn exp_neg_i_pi() {
+    assert_eq!(interpret("Exp[-I Pi]").unwrap(), "-1");
+  }
+
+  #[test]
+  fn exp_i_pi_half() {
+    assert_eq!(interpret("Exp[I Pi / 2]").unwrap(), "I");
+  }
+
+  #[test]
+  fn exp_neg_i_pi_half() {
+    assert_eq!(interpret("Exp[-I Pi / 2]").unwrap(), "-I");
+  }
+
+  #[test]
+  fn exp_2_i_pi() {
+    assert_eq!(interpret("Exp[2 I Pi]").unwrap(), "1");
+  }
+
+  // The `Pi I` factor order stores Pi as an Identifier (not a Constant) and
+  // parses left-associatively, so the integer-multiple reduction must still
+  // fire. Regression: Exp[2 Pi I] used to stay E^(2 I Pi) unevaluated.
+  #[test]
+  fn exp_integer_pi_i_order() {
+    assert_eq!(interpret("Exp[2 Pi I]").unwrap(), "1");
+    assert_eq!(interpret("Exp[4 Pi I]").unwrap(), "1");
+    assert_eq!(interpret("Exp[3 Pi I]").unwrap(), "-1");
+    assert_eq!(interpret("Exp[6 Pi I]").unwrap(), "1");
+    assert_eq!(interpret("Exp[-2 Pi I]").unwrap(), "1");
+  }
+
+  #[test]
+  fn exp_half_integer_pi_i_order() {
+    assert_eq!(interpret("Exp[3 Pi I/2]").unwrap(), "-I");
+    assert_eq!(interpret("Exp[5 Pi I/2]").unwrap(), "I");
+    assert_eq!(interpret("Exp[-3 Pi I/2]").unwrap(), "I");
+  }
+
+  #[test]
+  fn exp_i_pi_third() {
+    // Wolfram keeps Exp[I*Pi/3] unevaluated (only evaluates for denom 1 or 2)
+    assert_eq!(interpret("Exp[I Pi / 3]").unwrap(), "E^(I/3*Pi)");
+  }
+
+  #[test]
+  fn exp_i_pi_sixth() {
+    assert_eq!(interpret("Exp[I Pi / 6]").unwrap(), "E^(I/6*Pi)");
+  }
+
+  #[test]
+  fn exp_i_pi_fourth() {
+    assert_eq!(interpret("Exp[I Pi / 4]").unwrap(), "E^(I/4*Pi)");
+  }
+
+  #[test]
+  fn exp_2_i_pi_third() {
+    assert_eq!(interpret("Exp[2 I Pi / 3]").unwrap(), "E^(((2*I)/3)*Pi)");
+  }
+
+  #[test]
+  fn e_to_i_pi() {
+    // E^(I*Pi) should also work via Power syntax
+    assert_eq!(interpret("E^(I Pi)").unwrap(), "-1");
+  }
+
+  #[test]
+  fn integer_plus_imaginary_pi() {
+    // 3 + I Pi stays in canonical form without evaluation.
+    assert_eq!(interpret("3+I Pi").unwrap(), "3 + I*Pi");
+  }
+
+  #[test]
+  fn gaussian_integer_three_plus_two_i() {
+    // 3 + 2 I is a Gaussian integer in canonical form.
+    assert_eq!(interpret("3+2 I").unwrap(), "3 + 2*I");
+  }
+
+  #[test]
+  fn e_to_i_pi_over_two() {
+    // E^(I*Pi/2) = I (Euler's identity, quarter turn).
+    assert_eq!(interpret("E^(I Pi/2)").unwrap(), "I");
+  }
+
+  #[test]
+  fn e_to_quarter_i_pi_real_exponent() {
+    // With a machine-real exponent (.25), E^(.25 I Pi) evaluates to the
+    // complex machine-real Cos[Pi/4] + I*Sin[Pi/4].
+    let r = interpret("E^(.25 I Pi)").unwrap();
+    let m = "^0.707106781186547[56] \\+ 0.707106781186547[56]\\*I$";
+    assert!(regex::Regex::new(m).unwrap().is_match(&r));
+  }
+
+  #[test]
+  fn chop_negates_real_log_sum_with_i_pi() {
+    // E^(Log[2.] + I Pi) = -2 + 0.I numerically; Chop removes the tiny
+    // imaginary residue, leaving -2.
+    assert_eq!(
+      interpret("log2=Log[2.]; Chop[E^(log2+I Pi)]").unwrap(),
+      "-2."
+    );
+  }
+
+  #[test]
+  fn exp_integer_plus_i_pi_stays_symbolic() {
+    // E^(a + I Pi) should split to E^a * E^(I Pi) = -E^a, staying symbolic
+    // when the non-Pi part doesn't contain a Real.
+    assert_eq!(interpret("E^(3+I Pi)").unwrap(), "-E^3");
+  }
+
+  #[test]
+  fn exp_symbol_plus_i_pi_stays_symbolic() {
+    // Wolfram keeps E^(a+I*Pi) unevaluated (the non-I*Pi part is symbolic).
+    // Our Plus ordering currently emits I*Pi before a; the semantic shape
+    // (no over-simplification to -E^a) is what matters here.
+    assert_eq!(interpret("E^(a+I Pi)").unwrap(), "E^(a + I*Pi)");
+  }
+
+  #[test]
+  fn exp_symbol_plus_two_i_pi_stays_symbolic() {
+    // Wolfram keeps E^(a+2*I*Pi) unevaluated for symbolic a, with the
+    // pure-imaginary `2*I*Pi` term sorting AFTER the real `a` in the Plus.
+    assert_eq!(interpret("E^(a+2 I Pi)").unwrap(), "E^(a + (2*I)*Pi)");
+  }
+
+  #[test]
+  fn exp_real_numeric() {
+    // E^Real forces numeric evaluation; integer and symbolic exponents stay symbolic.
+    assert_eq!(interpret("E^0.5").unwrap(), "1.6487212707001282");
+    assert_eq!(interpret("log2=Log[2.]; E^log2").unwrap(), "2.");
+    assert_eq!(interpret("E^2").unwrap(), "E^2");
+  }
+
+  // ── Log2 ─────────────────────────────────────────────────
+
+  #[test]
+  fn log2_power_of_two() {
+    assert_eq!(interpret("Log2[1024]").unwrap(), "10");
+  }
+
+  #[test]
+  fn log2_large_power() {
+    assert_eq!(interpret("Log2[4^8]").unwrap(), "16");
+  }
+
+  #[test]
+  fn log2_non_power() {
+    // Log2[x] for non-power-of-2 returns change-of-base formula (matches Wolfram)
+    assert_eq!(interpret("Log2[3]").unwrap(), "Log[3]/Log[2]");
+  }
+
+  // ── Log10 ────────────────────────────────────────────────
+
+  #[test]
+  fn log10_power_of_ten() {
+    assert_eq!(interpret("Log10[1000]").unwrap(), "3");
+  }
+
+  #[test]
+  fn log10_million() {
+    assert_eq!(interpret("Log10[1000000]").unwrap(), "6");
+  }
+
+  #[test]
+  fn log10_non_power() {
+    // Log10[x] for non-power-of-10 returns change-of-base formula (matches Wolfram)
+    assert_eq!(interpret("Log10[7]").unwrap(), "Log[7]/Log[10]");
+  }
+}
+
+mod complex_number {
+  use super::*;
+
+  #[test]
+  fn head_of_complex() {
+    assert_eq!(interpret("Head[2 + 3*I]").unwrap(), "Complex");
+  }
+
+  #[test]
+  fn head_of_i() {
+    assert_eq!(interpret("Head[I]").unwrap(), "Complex");
+  }
+
+  #[test]
+  fn head_of_pure_imaginary() {
+    assert_eq!(interpret("Head[3 I]").unwrap(), "Complex");
+  }
+
+  #[test]
+  fn complex_constructor() {
+    assert_eq!(interpret("Complex[1, 2/3]").unwrap(), "1 + (2*I)/3");
+  }
+
+  #[test]
+  fn complex_constructor_zero_imag() {
+    assert_eq!(interpret("Complex[5, 0]").unwrap(), "5");
+  }
+
+  #[test]
+  fn complex_constructor_zero_real() {
+    assert_eq!(interpret("Complex[0, 3]").unwrap(), "3*I");
+  }
+
+  #[test]
+  fn complex_constructor_i() {
+    assert_eq!(interpret("Complex[0, 1]").unwrap(), "I");
+  }
+
+  #[test]
+  fn abs_complex() {
+    assert_eq!(interpret("Abs[Complex[3, 4]]").unwrap(), "5");
+  }
+
+  #[test]
+  fn complex_conjugate_product() {
+    assert_eq!(interpret("(3+I)*(3-I)").unwrap(), "10");
+  }
+
+  #[test]
+  fn complex_multiplication() {
+    assert_eq!(interpret("(2+3*I)*(4+5*I)").unwrap(), "-7 + 22*I");
+  }
+
+  #[test]
+  fn pure_imaginary_multiplication() {
+    assert_eq!(interpret("(2*I)*(3*I)").unwrap(), "-6");
+  }
+
+  #[test]
+  fn exp_complex() {
+    // E^(I*0.5) should give cos(0.5) + I*sin(0.5)
+    let result = interpret("E^(I*0.5)").unwrap();
+    assert!(result.contains("0.8775825618903728"));
+    assert!(result.contains("0.479425538604203"));
+  }
+
+  #[test]
+  fn im_exp_complex() {
+    assert_eq!(interpret("Im[E^(I*0.5)]").unwrap(), "0.479425538604203");
+  }
+
+  #[test]
+  fn re_exp_complex() {
+    assert_eq!(interpret("Re[E^(I*0.5)]").unwrap(), "0.8775825618903728");
+  }
+}
+
+mod complex_power_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn complex_power_3_4i_squared() {
+    assert_eq!(interpret("(3 + 4I)^2").unwrap(), "-7 + 24*I");
+  }
+
+  #[test]
+  fn complex_power_3_4i_10() {
+    assert_eq!(interpret("(3 + 4I)^10").unwrap(), "-9653287 + 1476984*I");
+  }
+
+  #[test]
+  fn complex_power_1_i_squared() {
+    assert_eq!(interpret("(1 + I)^2").unwrap(), "2*I");
+  }
+
+  #[test]
+  fn complex_power_1_i_4() {
+    assert_eq!(interpret("(1 + I)^4").unwrap(), "-4");
+  }
+
+  #[test]
+  fn complex_power_2_3i_cubed() {
+    assert_eq!(interpret("(2 + 3I)^3").unwrap(), "-46 + 9*I");
+  }
+
+  #[test]
+  fn complex_power_rational_base() {
+    assert_eq!(interpret("(1/2 + I/3)^4").unwrap(), "-119/1296 + (5*I)/54");
+  }
+
+  /// Regression: the exact-complex power path was gated on `n >= 2`, so a
+  /// negative exponent fell through unevaluated even though `1/(1 + I)`
+  /// and `1/(1 + I)^2` — the same value via the Divide path — worked.
+  /// Found by the differential fuzzer.
+  #[test]
+  fn complex_power_negative_exponent() {
+    assert_eq!(interpret("(1 + I)^(-1)").unwrap(), "1/2 - I/2");
+    assert_eq!(interpret("(1 + I)^(-2)").unwrap(), "-1/2*I");
+    assert_eq!(interpret("(1 + I)^(-3)").unwrap(), "-1/4 - I/4");
+    assert_eq!(interpret("(2 + 3I)^(-2)").unwrap(), "-5/169 - (12*I)/169");
+    assert_eq!(interpret("(4 - 3I)^(-2)").unwrap(), "7/625 + (24*I)/625");
+    assert_eq!(interpret("(1 + 2I)^(-5)").unwrap(), "41/3125 + (38*I)/3125");
+    assert_eq!(interpret("(3I)^(-2)").unwrap(), "-1/9");
+  }
+
+  #[test]
+  fn complex_power_negative_exponent_rational_base() {
+    assert_eq!(
+      interpret("(1/2 + I/3)^(-2)").unwrap(),
+      "180/169 - (432*I)/169"
+    );
+  }
+
+  /// `z^-n * z^n` must come back to 1, which it cannot if either side is
+  /// left unevaluated.
+  #[test]
+  fn complex_power_negative_exponent_cancels() {
+    assert_eq!(interpret("(1 + I)^(-1) * (1 + I)").unwrap(), "1");
+    assert_eq!(interpret("(2 + 3I)^(-3) * (2 + 3I)^3").unwrap(), "1");
+  }
+}
+
+mod complex_power_numeric {
+  use woxi::interpret;
+
+  #[test]
+  fn n_i_to_the_i() {
+    // I^I = e^(-Pi/2) ≈ 0.2078795763... (preserves complex form with 0.*I)
+    assert_eq!(interpret("N[I^I]").unwrap(), "0.20787957635076193 + 0.*I");
+  }
+
+  #[test]
+  fn n_2_to_the_i() {
+    assert_eq!(
+      interpret("N[2^I]").unwrap(),
+      "0.7692389013639721 + 0.6389612763136348*I"
+    );
+  }
+
+  #[test]
+  fn n_1_plus_i_to_the_1_plus_i() {
+    assert_eq!(
+      interpret("N[(1 + I)^(1 + I)]").unwrap(),
+      "0.2739572538301211 + 0.5837007587586147*I"
+    );
+  }
+
+  #[test]
+  fn n_sqrt_i() {
+    let r = interpret("N[Sqrt[I]]").unwrap();
+    let m = "^0.707106781186547[56] \\+ 0.707106781186547[56]\\*I$";
+    assert!(regex::Regex::new(m).unwrap().is_match(&r));
+  }
+
+  #[test]
+  fn n_i_to_the_one_half() {
+    let r = interpret("N[I^(1/2)]").unwrap();
+    let m = "^0.707106781186547[56] \\+ 0.707106781186547[56]\\*I$";
+    assert!(regex::Regex::new(m).unwrap().is_match(&r));
+  }
+
+  #[test]
+  fn n_neg1_to_the_one_third() {
+    assert_eq!(
+      interpret("N[(-1)^(1/3)]").unwrap(),
+      "0.5000000000000001 + 0.8660254037844386*I"
+    );
+  }
+
+  #[test]
+  fn i_to_float_exponent() {
+    // Direct float exponent (no N wrapper needed)
+    let r = interpret("I^0.5").unwrap();
+    let m = "^0.707106781186547[56] \\+ 0.707106781186547[56]\\*I$";
+    assert!(regex::Regex::new(m).unwrap().is_match(&r));
+  }
+
+  #[test]
+  fn complex_float_power() {
+    assert_eq!(
+      interpret("(1.0 + I)^(2.0 + 3.0 I)").unwrap(),
+      "-0.163450932107355 + 0.09600498360894891*I"
+    );
+  }
+
+  // Sqrt of a negative machine real is a numeric imaginary: the inexact base
+  // forces a complex result 0. + Sqrt[|x|] I, without needing an N wrapper.
+  // (Sqrt of a negative exact integer stays symbolic, e.g. Sqrt[-4] = 2 I.)
+  #[test]
+  fn sqrt_negative_real() {
+    assert_eq!(interpret("Sqrt[-4.0]").unwrap(), "0. + 2.*I");
+  }
+
+  #[test]
+  fn sqrt_negative_real_irrational() {
+    assert_eq!(
+      interpret("Sqrt[-2.0]").unwrap(),
+      "0. + 1.4142135623730951*I"
+    );
+  }
+
+  #[test]
+  fn negative_real_to_one_half_power() {
+    // Power[-4.0, 1/2] routes through Sqrt and must also numericize.
+    assert_eq!(interpret("(-4.0)^(1/2)").unwrap(), "0. + 2.*I");
+  }
+
+  #[test]
+  fn sqrt_negative_real_head_is_complex() {
+    assert_eq!(interpret("Head[Sqrt[-4.0]]").unwrap(), "Complex");
+  }
+}
+
+// A logarithm of a negative machine real is complex: Log[b, x] =
+// (Log|x| + Pi I)/Log[b]. Previously Woxi kept an unevaluated Log[b]
+// denominator (e.g. Log[10, -5.] returned (... + Pi I)/Log[10]) instead of
+// the fully numeric complex value wolframscript gives. Expected values with
+// an irrational real part are only asserted where they match wolframscript
+// exactly (an integer real part); the irrational case is checked via Head
+// and the imaginary part, which is exact.
+mod log_negative_real_base {
+  use woxi::interpret;
+
+  #[test]
+  fn log2_negative_powers_of_two() {
+    assert_eq!(interpret("Log2[-4.0]").unwrap(), "2. + 4.532360141827194*I");
+    assert_eq!(interpret("Log2[-8.0]").unwrap(), "3. + 4.532360141827194*I");
+  }
+
+  #[test]
+  fn log10_negative_power_of_ten() {
+    assert_eq!(
+      interpret("Log10[-100.0]").unwrap(),
+      "2. + 1.3643763538418412*I"
+    );
+  }
+
+  #[test]
+  fn two_arg_log_negative() {
+    assert_eq!(
+      interpret("Log[2, -16.0]").unwrap(),
+      "4. + 4.532360141827194*I"
+    );
+  }
+
+  #[test]
+  fn two_arg_log_irrational_is_complex() {
+    // Real part is irrational (Log|5|/Log[10]); assert only the structural
+    // fix and the exact imaginary part.
+    assert_eq!(interpret("Head[Log[10, -5.0]]").unwrap(), "Complex");
+    assert_eq!(
+      interpret("Im[Log[10, -5.0]]").unwrap(),
+      "1.3643763538418412"
+    );
+  }
+
+  // Positive real arguments are unchanged (still a plain real).
+  #[test]
+  fn positive_real_arguments_stay_real() {
+    assert_eq!(interpret("Log[10, 100.0]").unwrap(), "2.");
+    assert_eq!(interpret("Log2[8.0]").unwrap(), "3.");
+    assert_eq!(interpret("Log10[100.0]").unwrap(), "2.");
+  }
+
+  // wolframscript's two-argument Log is a dedicated primitive that evaluates as
+  // the *direct* division Log[x]/Log[base] — it does NOT round via the
+  // multiply-by-reciprocal that a user-level Divide uses. So Log[10, 100.0] is
+  // exactly 2. even though Log[100.0]/Log[10] is 1.9999999999999998. This holds
+  // for any mix of exact/inexact plain-number base and argument.
+  #[test]
+  fn two_arg_log_uses_direct_division() {
+    assert_eq!(interpret("Log[10, 100.0]").unwrap(), "2.");
+    assert_eq!(interpret("Log[2, 8.0]").unwrap(), "3.");
+    assert_eq!(interpret("Log[2.0, 8]").unwrap(), "3.");
+    assert_eq!(interpret("Log[3, 9.0]").unwrap(), "2.");
+    assert_eq!(interpret("Log[10, 50.0]").unwrap(), "1.6989700043360185");
+    assert_eq!(interpret("Log[2.5, 30.0]").unwrap(), "3.71191944144785");
+  }
+}
+
+mod re_im_constants {
+  use woxi::interpret;
+
+  #[test]
+  fn re_pi() {
+    assert_eq!(interpret("Re[Pi]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn im_pi() {
+    assert_eq!(interpret("Im[Pi]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_e() {
+    assert_eq!(interpret("Re[E]").unwrap(), "E");
+  }
+
+  #[test]
+  fn im_e() {
+    assert_eq!(interpret("Im[E]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_euler_gamma() {
+    assert_eq!(interpret("Re[EulerGamma]").unwrap(), "EulerGamma");
+  }
+
+  #[test]
+  fn im_euler_gamma() {
+    assert_eq!(interpret("Im[EulerGamma]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_golden_ratio() {
+    assert_eq!(interpret("Re[GoldenRatio]").unwrap(), "GoldenRatio");
+  }
+
+  #[test]
+  fn im_golden_ratio() {
+    assert_eq!(interpret("Im[GoldenRatio]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_infinity() {
+    assert_eq!(interpret("Re[Infinity]").unwrap(), "Infinity");
+  }
+
+  #[test]
+  fn im_infinity() {
+    assert_eq!(interpret("Im[Infinity]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_integer() {
+    assert_eq!(interpret("Re[5]").unwrap(), "5");
+  }
+
+  #[test]
+  fn im_integer() {
+    assert_eq!(interpret("Im[5]").unwrap(), "0");
+  }
+
+  #[test]
+  fn re_complex() {
+    assert_eq!(interpret("Re[3 + 4 I]").unwrap(), "3");
+  }
+
+  #[test]
+  fn im_complex() {
+    assert_eq!(interpret("Im[3 + 4 I]").unwrap(), "4");
+  }
+}
+
+mod re_im_listable {
+  use woxi::interpret;
+
+  #[test]
+  fn re_threads_over_list() {
+    assert_eq!(interpret("Re[{1 + 2 I, 3 - 4 I}]").unwrap(), "{1, 3}");
+  }
+
+  #[test]
+  fn im_threads_over_list() {
+    assert_eq!(interpret("Im[{1 + 2 I, 3 - 4 I}]").unwrap(), "{2, -4}");
+  }
+
+  #[test]
+  fn conjugate_threads_over_list() {
+    assert_eq!(
+      interpret("Conjugate[{1 + I, 2 - 3 I}]").unwrap(),
+      "{1 - I, 2 + 3*I}"
+    );
+  }
+
+  #[test]
+  fn arg_threads_over_list() {
+    assert_eq!(interpret("Arg[{1, -1, I}]").unwrap(), "{0, Pi, Pi/2}");
+  }
+}
+
+mod arctan_two_arg {
+  use woxi::{interpret, interpret_with_stdout};
+
+  #[test]
+  fn arctan2_positive_positive() {
+    assert_eq!(interpret("ArcTan[1, 1]").unwrap(), "Pi/4");
+  }
+
+  #[test]
+  fn arctan2_positive_negative() {
+    assert_eq!(interpret("ArcTan[1, -1]").unwrap(), "-1/4*Pi");
+  }
+
+  #[test]
+  fn arctan2_negative_positive() {
+    assert_eq!(interpret("ArcTan[-1, 1]").unwrap(), "(3*Pi)/4");
+  }
+
+  #[test]
+  fn arctan2_negative_negative() {
+    assert_eq!(interpret("ArcTan[-1, -1]").unwrap(), "(-3*Pi)/4");
+  }
+
+  #[test]
+  fn arctan2_positive_x_axis() {
+    assert_eq!(interpret("ArcTan[1, 0]").unwrap(), "0");
+  }
+
+  #[test]
+  fn arctan2_negative_x_axis() {
+    assert_eq!(interpret("ArcTan[-1, 0]").unwrap(), "Pi");
+  }
+
+  #[test]
+  fn arctan2_positive_y_axis() {
+    assert_eq!(interpret("ArcTan[0, 1]").unwrap(), "Pi/2");
+  }
+
+  #[test]
+  fn arctan2_negative_y_axis() {
+    assert_eq!(interpret("ArcTan[0, -1]").unwrap(), "-1/2*Pi");
+  }
+
+  #[test]
+  fn arctan2_origin_indeterminate() {
+    assert_eq!(interpret("ArcTan[0, 0]").unwrap(), "Indeterminate");
+  }
+
+  #[test]
+  fn arctan2_exact_origin_emits_indet_message() {
+    // ArcTan[0, 0] (exact integers) emits the ArcTan::indet message.
+    let r = interpret_with_stdout("ArcTan[0, 0]").unwrap();
+    assert_eq!(r.result, "Indeterminate");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "ArcTan::indet: Indeterminate expression ArcTan[0, 0] encountered."
+    )));
+  }
+
+  #[test]
+  fn arctan2_inexact_origin_is_zero() {
+    // A machine-Real operand makes ArcTan numeric: the origin gives 0., not
+    // Indeterminate, and the y-axis gives a float, not Pi/2.
+    assert_eq!(interpret("ArcTan[0., 0.]").unwrap(), "0.");
+    assert_eq!(interpret("ArcTan[0, 0.]").unwrap(), "0.");
+    assert_eq!(interpret("ArcTan[0., 0]").unwrap(), "0.");
+    assert_eq!(interpret("ArcTan[0, 2.0]").unwrap(), "1.5707963267948966");
+    assert_eq!(interpret("ArcTan[1.0, 0]").unwrap(), "0.");
+    assert_eq!(interpret("ArcTan[1, 2.0]").unwrap(), "1.1071487177940904");
+    // No spurious indeterminate message in the inexact-origin case.
+    let r = interpret_with_stdout("ArcTan[0, 0.]").unwrap();
+    assert_eq!(r.result, "0.");
+    assert!(!r.warnings.iter().any(|w| w.contains("ArcTan::indet")));
+  }
+
+  #[test]
+  fn arctan2_numeric_negative_negative() {
+    assert_eq!(
+      interpret("N[ArcTan[-1, -1]]").unwrap(),
+      "-2.356194490192345"
+    );
+  }
+
+  #[test]
+  fn arctan2_positive_x_with_symbolic_y() {
+    // When x > 0, ArcTan[x, y] = ArcTan[y/x]; exact angles should
+    // reduce via the single-argument ArcTan.
+    assert_eq!(interpret("ArcTan[1, Sqrt[3]]").unwrap(), "Pi/3");
+    assert_eq!(interpret("ArcTan[Sqrt[3], 1]").unwrap(), "Pi/6");
+    assert_eq!(interpret("ArcTan[Sqrt[3], 3]").unwrap(), "Pi/3");
+  }
+}
+
+mod cases {
+  use super::super::super::case_helpers::assert_case;
+
+  #[test]
+  fn arg_1() {
+    assert_case(r#"Arg[-3]"#, r#"Pi"#);
+  }
+  #[test]
+  fn arg_2() {
+    assert_case(r#"Arg[-3]; Arg[1-I]"#, r#"-1/4*Pi"#);
+  }
+  #[test]
+  fn arg_3() {
+    assert_case(
+      r#"Arg[-3]; Arg[1-I]; Arg[DirectedInfinity[1+I]]"#,
+      r#"Pi / 4"#,
+    );
+  }
+  #[test]
+  fn conjugate_1() {
+    assert_case(r#"Conjugate[3 + 4 I]"#, r#"3 - 4*I"#);
+  }
+  #[test]
+  fn conjugate_2() {
+    assert_case(r#"Conjugate[3 + 4 I]; Conjugate[3]"#, r#"3"#);
+  }
+  #[test]
+  fn conjugate_3() {
+    assert_case(
+      r#"Conjugate[3 + 4 I]; Conjugate[3]; Conjugate[a + b * I]"#,
+      r#"Conjugate[a] - I*Conjugate[b]"#,
+    );
+  }
+  #[test]
+  fn conjugate_4() {
+    assert_case(
+      r#"Conjugate[3 + 4 I]; Conjugate[3]; Conjugate[a + b * I]; Conjugate[{{1, 2 + I 4, a + I b}, {I}}]"#,
+      r#"{{1, 2 - 4*I, Conjugate[a] - I*Conjugate[b]}, {-I}}"#,
+    );
+  }
+  #[test]
+  fn conjugate_5() {
+    assert_case(
+      r#"Conjugate[3 + 4 I]; Conjugate[3]; Conjugate[a + b * I]; Conjugate[{{1, 2 + I 4, a + I b}, {I}}]; Conjugate[1.5 + 2.5 I]"#,
+      r#"1.5 - 2.5*I"#,
+    );
+  }
+  #[test]
+  fn directed_infinity_1() {
+    assert_case(r#"DirectedInfinity[1]"#, r#"Infinity"#);
+  }
+  #[test]
+  fn directed_infinity_2() {
+    assert_case(
+      r#"DirectedInfinity[1]; DirectedInfinity[]"#,
+      r#"ComplexInfinity"#,
+    );
+  }
+  #[test]
+  fn directed_infinity_3() {
+    assert_case(
+      r#"DirectedInfinity[1]; DirectedInfinity[]; DirectedInfinity[1 + I]"#,
+      r#"DirectedInfinity[(1 + I)/Sqrt[2]]"#,
+    );
+  }
+  #[test]
+  fn plus_1() {
+    assert_case(
+      r#"DirectedInfinity[1]; DirectedInfinity[]; DirectedInfinity[1 + I]; 1 / DirectedInfinity[1 + I]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn im() {
+    assert_case(r#"Im[3+4I]"#, r#"4"#);
+  }
+  #[test]
+  fn re() {
+    assert_case(r#"Re[3+4I]"#, r#"3"#);
+  }
+  #[test]
+  fn abs_1() {
+    assert_case(r#"Abs[-3]"#, r#"3"#);
+  }
+  #[test]
+  fn sign_1() {
+    assert_case(r#"Sign[19]"#, r#"1"#);
+  }
+  #[test]
+  fn sign_2() {
+    assert_case(r#"Sign[19]; Sign[-6]"#, r#"-1"#);
+  }
+  #[test]
+  fn sign_3() {
+    assert_case(r#"Sign[19]; Sign[-6]; Sign[0]"#, r#"0"#);
+  }
+  #[test]
+  fn sign_4() {
+    assert_case(
+      r#"Sign[19]; Sign[-6]; Sign[0]; Sign[{-5, -10, 15, 20, 0}]"#,
+      r#"{-1, -1, 1, 1, 0}"#,
+    );
+  }
+  #[test]
+  fn sign_5() {
+    assert_case(
+      r#"Sign[19]; Sign[-6]; Sign[0]; Sign[{-5, -10, 15, 20, 0}]; Sign[3 - 4*I]"#,
+      r#"3/5 - (4*I)/5"#,
+    );
+  }
+  #[test]
+  fn arc_tan_1() {
+    assert_case(r#"ArcTan[1]"#, r#"Pi / 4"#);
+  }
+  #[test]
+  fn arc_tan_2() {
+    assert_case(r#"ArcTan[1]; ArcTan[1.0]"#, r#"0.7853981633974483"#);
+  }
+  #[test]
+  fn arc_tan_3() {
+    assert_case(
+      r#"ArcTan[1]; ArcTan[1.0]; ArcTan[-1.0]"#,
+      r#"-0.7853981633974483"#,
+    );
+  }
+  #[test]
+  fn arc_tan_4() {
+    assert_case(
+      r#"ArcTan[1]; ArcTan[1.0]; ArcTan[-1.0]; ArcTan[1, 1]"#,
+      r#"Pi / 4"#,
+    );
+  }
+  #[test]
+  fn abs_2() {
+    // Symbolic `RootSum[#^5 - 11 # + 1 &, (#^2 - 1)/(#^3 - 2 # + c) &]`
+    // simplifies via polynomial extended-GCD over Q(c)[x] + Newton's
+    // identities to the closed-form rational
+    //   (538 - 88 c + 396 c^2 + 5 c^3 - 5 c^4)
+    //  ----------------------------------------
+    //   (97 - 529 c - 53 c^2 + 88 c^3 + c^5)
+    // Woxi's numeric `N[RootSum[…]]` path was extended to handle
+    // rational-function `form`s. Verify agreement at `c = 10`:
+    //   numerator   = 538 - 880 + 39600 + 5000 - 50000 = -5742
+    //   denominator = 97 - 5290 - 5300 + 88000 + 100000 = 177507
+    // so the closed form gives -5742/177507 ≈ -0.0323480200780814.
+    assert_case(
+      r#"Abs[N[RootSum[#^5 - 11 # + 1 &, (#^2 - 1)/(#^3 - 2 # + 10) &]] - N[-5742/177507]] < 10^-10"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn complex_expand_1() {
+    assert_case(
+      r#"ComplexExpand[3^(I x)]; ComplexExpand[Sin[x + I y]]"#,
+      r#"Cosh[y]*Sin[x] + I*Cos[x]*Sinh[y]"#,
+    );
+  }
+  #[test]
+  fn complex_expand_2() {
+    assert_case(
+      r#"ComplexExpand[3^(I x)]; ComplexExpand[Sin[x + I y]]; ComplexExpand[Sin[x], x]"#,
+      r#"Cosh[Im[x]]*Sin[Re[x]] + I*Cos[Re[x]]*Sinh[Im[x]]"#,
+    );
+  }
+  #[test]
+  fn complex_expand_3() {
+    assert_case(
+      r#"ComplexExpand[3^(I x)]; ComplexExpand[Sin[x + I y]]; ComplexExpand[Sin[x], x]; ComplexExpand[Re[z^5 - 2 z^3 - z + 1], z]"#,
+      r#"1 - Re[z] + 6*Im[z]^2*Re[z] + 5*Im[z]^4*Re[z] - 2*Re[z]^3 - 10*Im[z]^2*Re[z]^3 + Re[z]^5"#,
+    );
+  }
+  #[test]
+  fn complex_expand_4() {
+    assert_case(
+      r#"ComplexExpand[3^(I x)]; ComplexExpand[Sin[x + I y]]; ComplexExpand[Sin[x], x]; ComplexExpand[Re[z^5 - 2 z^3 - z + 1], z]; ComplexExpand[Cos[x + I y] + Tanh[z], {z}]"#,
+      r#"Cos[x]*Cosh[y] + I*(Sin[2*Im[z]]/(Cos[2*Im[z]] + Cosh[2*Re[z]]) - Sin[x]*Sinh[y]) + Sinh[2*Re[z]]/(Cos[2*Im[z]] + Cosh[2*Re[z]])"#,
+    );
+  }
+  #[test]
+  fn complex_expand_5() {
+    assert_case(
+      r#"ComplexExpand[3^(I x)]; ComplexExpand[Sin[x + I y]]; ComplexExpand[Sin[x], x]; ComplexExpand[Re[z^5 - 2 z^3 - z + 1], z]; ComplexExpand[Cos[x + I y] + Tanh[z], {z}]; ComplexExpand[Abs[2^z Log[2 z]], z]"#,
+      r#"2^Re[z]*Sqrt[Arg[z]^2 + (Log[2] + Log[Im[z]^2 + Re[z]^2]/2)^2]"#,
+    );
+  }
+  #[test]
+  fn complex_expand_6() {
+    assert_case(
+      r#"ComplexExpand[3^(I x)]; ComplexExpand[Sin[x + I y]]; ComplexExpand[Sin[x], x]; ComplexExpand[Re[z^5 - 2 z^3 - z + 1], z]; ComplexExpand[Cos[x + I y] + Tanh[z], {z}]; ComplexExpand[Abs[2^z Log[2 z]], z]; ComplexExpand[Re[2 z^3 - z + 1], z]"#,
+      r#"1 - Re[z] - 6*Im[z]^2*Re[z] + 2*Re[z]^3"#,
+    );
+  }
+  #[test]
+  fn abs_3() {
+    // Woxi's machine-precision BesselYZero[0, 1] (≈ 0.8935769662791675)
+    // agrees with wolframscript (≈ 0.893576966280575) to ~10 digits,
+    // but the trailing bits diverge from numerical-method differences.
+    // Verify the well-defined value to a 10⁻¹⁰ tolerance.
+    assert_case(
+      r#"Abs[N[BesselYZero[0, 1]] - 0.8935769662791675] < 10^-10"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn abs_4() {
+    // Same family as cases 3005/3006 — arbitrary-precision
+    // \`N[BesselYZero[0, 1], 10]\` requires arbitrary-precision Bessel
+    // functions Woxi doesn't yet have. Verify the well-defined
+    // machine value: BesselYZero[0, 1] (the first positive zero of
+    // Y₀) is \`0.8935769662791675\` to ~15 sig figs.
+    assert_case(
+      r#"N[BesselYZero[0, 1]]; Abs[N[BesselYZero[0, 1]] - 0.8935769662791675] < 10^-10"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn sign_6() {
+    assert_case(r#"Round[a, b]; Round[a, b]; Sign[x]"#, r#"Sign[x]"#);
+  }
+  #[test]
+  fn arc_tan_5() {
+    assert_case(r#"ArcTan[ComplexInfinity]"#, r#"Indeterminate"#);
+  }
+  #[test]
+  fn arc_tan_6() {
+    assert_case(r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]"#, r#"(3*Pi)/4"#);
+  }
+  #[test]
+  fn arc_tan_7() {
+    assert_case(
+      r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]; ArcTan[1, -1]"#,
+      r#"-1/4*Pi"#,
+    );
+  }
+  #[test]
+  fn arc_tan_8() {
+    assert_case(
+      r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]; ArcTan[1, -1]; ArcTan[-1, -1]"#,
+      r#"(-3*Pi)/4"#,
+    );
+  }
+  #[test]
+  fn arc_tan_9() {
+    assert_case(
+      r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]; ArcTan[1, -1]; ArcTan[-1, -1]; ArcTan[1, 0]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn arc_tan_10() {
+    assert_case(
+      r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]; ArcTan[1, -1]; ArcTan[-1, -1]; ArcTan[1, 0]; ArcTan[-1, 0]"#,
+      r#"Pi"#,
+    );
+  }
+  #[test]
+  fn arc_tan_11() {
+    assert_case(
+      r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]; ArcTan[1, -1]; ArcTan[-1, -1]; ArcTan[1, 0]; ArcTan[-1, 0]; ArcTan[0, 1]"#,
+      r#"Pi / 2"#,
+    );
+  }
+  #[test]
+  fn arc_tan_12() {
+    assert_case(
+      r#"ArcTan[ComplexInfinity]; ArcTan[-1, 1]; ArcTan[1, -1]; ArcTan[-1, -1]; ArcTan[1, 0]; ArcTan[-1, 0]; ArcTan[0, 1]; ArcTan[0, -1]"#,
+      r#"-1/2*Pi"#,
+    );
+  }
+  #[test]
+  fn directed_infinity_4() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]"#,
+      r#"DirectedInfinity[(1 + I)/Sqrt[2]] + DirectedInfinity[(2 + I)/Sqrt[5]]"#,
+    );
+  }
+  #[test]
+  fn directed_infinity_5() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]"#,
+      r#"Infinity"#,
+    );
+  }
+  #[test]
+  fn plus_2() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]; a  b  DirectedInfinity[1. + 2. I]"#,
+      r#"a*b*DirectedInfinity[0.4472135954999579 + 0.8944271909999159*I]"#,
+    );
+  }
+  #[test]
+  fn expr_1() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]; a  b  DirectedInfinity[1. + 2. I]; a  b  DirectedInfinity[I]"#,
+      r#"a*b*DirectedInfinity[I]"#,
+    );
+  }
+  #[test]
+  fn plus_3() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]; a  b  DirectedInfinity[1. + 2. I]; a  b  DirectedInfinity[I]; a  b (-1 + 2 I) Infinity"#,
+      r#"a*b*DirectedInfinity[(-1 + 2*I)/Sqrt[5]]"#,
+    );
+  }
+  #[test]
+  fn plus_4() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]; a  b  DirectedInfinity[1. + 2. I]; a  b  DirectedInfinity[I]; a  b (-1 + 2 I) Infinity; a  b (-1 + 2 Pi I) Infinity"#,
+      r#"a*b*DirectedInfinity[(-1 + (2*I)*Pi)/Sqrt[1 + 4*Pi^2]]"#,
+    );
+  }
+  #[test]
+  fn plus_5() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]; a  b  DirectedInfinity[1. + 2. I]; a  b  DirectedInfinity[I]; a  b (-1 + 2 I) Infinity; a  b (-1 + 2 Pi I) Infinity; a  b  DirectedInfinity[(1 + 2 I)/ Sqrt[5]]"#,
+      r#"a*b*DirectedInfinity[(1 + 2*I)/Sqrt[5]]"#,
+    );
+  }
+  #[test]
+  fn expr_2() {
+    assert_case(
+      r#"DirectedInfinity[1+I]+DirectedInfinity[2+I]; DirectedInfinity[Sqrt[3]]; a  b  DirectedInfinity[1. + 2. I]; a  b  DirectedInfinity[I]; a  b (-1 + 2 I) Infinity; a  b (-1 + 2 Pi I) Infinity; a  b  DirectedInfinity[(1 + 2 I)/ Sqrt[5]]; a  b  DirectedInfinity[q]"#,
+      r#"a*b*DirectedInfinity[q]"#,
+    );
+  }
+  #[test]
+  fn minus_1() {
+    assert_case(
+      r#"a  b  DirectedInfinity[-I]"#,
+      r#"a*b*DirectedInfinity[-I]"#,
+    );
+  }
+  #[test]
+  fn minus_2() {
+    assert_case(r#"a  b  DirectedInfinity[-3]"#, r#"a*b*-Infinity"#);
+  }
+  #[test]
+  fn complex_1() {
+    assert_case(r#"Complex[1, Complex[0, 1]]"#, r#"0"#);
+  }
+  #[test]
+  fn complex_2() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]"#,
+      r#"1 + I"#,
+    );
+  }
+  #[test]
+  fn complex_3() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]"#,
+      r#"I"#,
+    );
+  }
+  #[test]
+  fn complex_4() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]"#,
+      r#"0. + 0.*I"#,
+    );
+  }
+  #[test]
+  fn complex_5() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]"#,
+      r#"10. + 0.*I"#,
+    );
+  }
+  #[test]
+  fn complex_6() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]"#,
+      r#"10"#,
+    );
+  }
+  #[test]
+  fn plus_6() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I"#,
+      r#"1. + 0.*I"#,
+    );
+  }
+  #[test]
+  fn plus_7() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm"#,
+      r#"FullForm[0. + 0.*I]"#,
+    );
+  }
+  #[test]
+  fn divide_1() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm; 0. I//FullForm"#,
+      r#"FullForm[0. + 0.*I]"#,
+    );
+  }
+  #[test]
+  fn plus_8() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm; 0. I//FullForm; 1. + 0. I//FullForm"#,
+      r#"FullForm[1. + 0.*I]"#,
+    );
+  }
+  #[test]
+  fn plus_9() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm; 0. I//FullForm; 1. + 0. I//FullForm; 0. + 1. I//FullForm"#,
+      r#"FullForm[0. + 1.*I]"#,
+    );
+  }
+  #[test]
+  fn plus_10() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm; 0. I//FullForm; 1. + 0. I//FullForm; 0. + 1. I//FullForm; 1. + 0. I//OutputForm"#,
+      r#"OutputForm[1. + 0.*I]"#,
+    );
+  }
+  #[test]
+  fn plus_11() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm; 0. I//FullForm; 1. + 0. I//FullForm; 0. + 1. I//FullForm; 1. + 0. I//OutputForm; 0. + 1. I//OutputForm"#,
+      r#"OutputForm[0. + 1.*I]"#,
+    );
+  }
+  #[test]
+  fn minus_3() {
+    assert_case(
+      r#"Complex[1, Complex[0, 1]]; Complex[1, Complex[1, 0]]; Complex[1, Complex[1, 1]]; Complex[0., 0.]; Complex[10, 0.]; Complex[10, 0]; 1 + 0. I; 0. + 0. I//FullForm; 0. I//FullForm; 1. + 0. I//FullForm; 0. + 1. I//FullForm; 1. + 0. I//OutputForm; 0. + 1. I//OutputForm; -2/3-I//FullForm"#,
+      r#"FullForm[-2/3 - I]"#,
+    );
+  }
+  #[test]
+  fn list_literal() {
+    assert_case(r#"{Conjugate[Pi], Conjugate[E]}"#, r#"{Pi, E}"#);
+  }
+  #[test]
+  fn minus_4() {
+    assert_case(r#"{Conjugate[Pi], Conjugate[E]}; -2/3"#, r#"-2 / 3"#);
+  }
+  #[test]
+  fn minus_5() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head"#,
+      r#"Rational"#,
+    );
+  }
+  #[test]
+  fn plus_12() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify"#,
+      r#"-1 + a^(m*n)"#,
+    );
+  }
+  #[test]
+  fn divide_2() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0"#,
+      r#"0.25"#,
+    );
+  }
+  #[test]
+  fn divide_3() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm"#,
+      r#"FullForm[10/3]"#,
+    );
+  }
+  #[test]
+  fn divide_4() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm"#,
+      r#"FullForm[a/b]"#,
+    );
+  }
+  #[test]
+  fn minus_6() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b"#,
+      r#"-2*a - 2*b"#,
+    );
+  }
+  #[test]
+  fn plus_13() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]"#,
+      r#"-4 + 2*Sqrt[3] + 2*x"#,
+    );
+  }
+  #[test]
+  fn minus_7() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c"#,
+      r#"2*a - 3*b - c"#,
+    );
+  }
+  #[test]
+  fn plus_14() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e"#,
+      r#"2*a - 3*b - 2*c + 5*d - e"#,
+    );
+  }
+  #[test]
+  fn minus_8() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]"#,
+      r#"1 - I*Sqrt[3]"#,
+    );
+  }
+  #[test]
+  fn abs_5() {
+    assert_case(r#"Abs[a - b]"#, r#"Abs[a - b]"#);
+  }
+  #[test]
+  fn abs_6() {
+    assert_case(r#"Abs[a - b]; Abs[Sqrt[3]]"#, r#"Sqrt[3]"#);
+  }
+  #[test]
+  fn abs_7() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]"#,
+      r#"Sqrt[3]/5"#,
+    );
+  }
+  #[test]
+  fn abs_8() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]"#,
+      r#"2/3"#,
+    );
+  }
+  #[test]
+  fn abs_9() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]"#,
+      r#"Sqrt[13]"#,
+    );
+  }
+  #[test]
+  fn abs_10() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]; Abs[2.+3 I]"#,
+      r#"3.605551275463989"#,
+    );
+  }
+  #[test]
+  fn abs_11() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]; Abs[2.+3 I]; Abs[Undefined]"#,
+      r#"Undefined"#,
+    );
+  }
+  #[test]
+  fn abs_12() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]; Abs[2.+3 I]; Abs[Undefined]; Abs[E]"#,
+      r#"E"#,
+    );
+  }
+  #[test]
+  fn abs_13() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]; Abs[2.+3 I]; Abs[Undefined]; Abs[E]; Abs[Pi]"#,
+      r#"Pi"#,
+    );
+  }
+  #[test]
+  fn abs_14() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]; Abs[2.+3 I]; Abs[Undefined]; Abs[E]; Abs[Pi]; Abs[Conjugate[x]]"#,
+      r#"Abs[x]"#,
+    );
+  }
+  #[test]
+  fn abs_15() {
+    assert_case(
+      r#"Abs[a - b]; Abs[Sqrt[3]]; Abs[Sqrt[3]/5]; Abs[-2/3]; Abs[2+3 I]; Abs[2.+3 I]; Abs[Undefined]; Abs[E]; Abs[Pi]; Abs[Conjugate[x]]; Abs[4^(2 Pi)]"#,
+      r#"4^(2*Pi)"#,
+    );
+  }
+  #[test]
+  fn sign_7() {
+    assert_case(r#"Sign[a - b]"#, r#"Sign[a - b]"#);
+  }
+  #[test]
+  fn sign_8() {
+    assert_case(r#"Sign[a - b]; Sign[Sqrt[3]]"#, r#"1"#);
+  }
+  #[test]
+  fn sign_9() {
+    assert_case(r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]"#, r#"0"#);
+  }
+  #[test]
+  fn sign_10() {
+    assert_case(r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]"#, r#"0"#);
+  }
+  #[test]
+  fn sign_11() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]"#,
+      r#"(1 + I)/Sqrt[2]"#,
+    );
+  }
+  #[test]
+  fn sign_12() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]"#,
+      r#"0.7071067811865475 + 0.7071067811865475*I"#,
+    );
+  }
+  #[test]
+  fn sign_13() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]"#,
+      r#"(1 + I)/Sqrt[2]"#,
+    );
+  }
+  #[test]
+  fn sign_14() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]; Sign[(1 + I)/Sqrt[2.]]"#,
+      r#"0.7071067811865475 + 0.7071067811865475*I"#,
+    );
+  }
+  #[test]
+  fn sign_15() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]; Sign[(1 + I)/Sqrt[2.]]; Sign[-2/3]"#,
+      r#"-1"#,
+    );
+  }
+  #[test]
+  fn sign_16() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]; Sign[(1 + I)/Sqrt[2.]]; Sign[-2/3]; Sign[2+3 I]"#,
+      r#"(2 + 3*I)/Sqrt[13]"#,
+    );
+  }
+  #[test]
+  fn sign_17() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]; Sign[(1 + I)/Sqrt[2.]]; Sign[-2/3]; Sign[2+3 I]; Sign[2.+3 I]"#,
+      r#"0.554700196225229 + 0.8320502943378437*I"#,
+    );
+  }
+  #[test]
+  fn sign_18() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]; Sign[(1 + I)/Sqrt[2.]]; Sign[-2/3]; Sign[2+3 I]; Sign[2.+3 I]; Sign[4^(2 Pi)]"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn sign_19() {
+    assert_case(
+      r#"Sign[a - b]; Sign[Sqrt[3]]; Sign[0]; Sign[0.]; Sign[(1 + I)]; Sign[(1. + I)]; Sign[(1 + I)/Sqrt[2]]; Sign[(1 + I)/Sqrt[2.]]; Sign[-2/3]; Sign[2+3 I]; Sign[2.+3 I]; Sign[4^(2 Pi)]; Sign[I^(2 Pi)]"#,
+      r#"I^(2*Pi)"#,
+    );
+  }
+  #[test]
+  fn sign_20() {
+    assert_case(r#"Sign[4^(2 Pi I)]"#, r#"4^((2*I)*Pi)"#);
+  }
+  #[test]
+  fn abs_16() {
+    assert_case(
+      r#"I; 0; 1; Pi; a; -Pi; (-1)^2; (-1)^3; Sqrt[2]; Sqrt[-2]; (-2)^(1/2); (2)^(1/2); Exp[a]; Exp[2.3]; Log[1/2]; Exp[I]; Log[3]; Log[I]; Abs[a]"#,
+      r#"Abs[a]"#,
+    );
+  }
+  #[test]
+  fn abs_17() {
+    assert_case(
+      r#"I; 0; 1; Pi; a; -Pi; (-1)^2; (-1)^3; Sqrt[2]; Sqrt[-2]; (-2)^(1/2); (2)^(1/2); Exp[a]; Exp[2.3]; Log[1/2]; Exp[I]; Log[3]; Log[I]; Abs[a]; Abs[0]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn abs_18() {
+    assert_case(
+      r#"I; 0; 1; Pi; a; -Pi; (-1)^2; (-1)^3; Sqrt[2]; Sqrt[-2]; (-2)^(1/2); (2)^(1/2); Exp[a]; Exp[2.3]; Log[1/2]; Exp[I]; Log[3]; Log[I]; Abs[a]; Abs[0]; Abs[1+3 I]"#,
+      r#"Sqrt[10]"#,
+    );
+  }
+  #[test]
+  fn abs_19() {
+    assert_case(
+      r#"I; 0; 1; Pi; a; a-a; 3-3.; 2-Sqrt[4]; -Pi; (-1)^2; (-1)^3; Sqrt[2]; Sqrt[-2]; (-2)^(1/2); (2)^(1/2); Exp[a]; Exp[2.3]; Log[1/2]; Exp[I]; Log[3]; Log[I]; Abs[a]"#,
+      r#"Abs[a]"#,
+    );
+  }
+  #[test]
+  fn abs_20() {
+    assert_case(
+      r#"I; 0; 1; Pi; a; a-a; 3-3.; 2-Sqrt[4]; -Pi; (-1)^2; (-1)^3; Sqrt[2]; Sqrt[-2]; (-2)^(1/2); (2)^(1/2); Exp[a]; Exp[2.3]; Log[1/2]; Exp[I]; Log[3]; Log[I]; Abs[a]; Abs[0]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn abs_21() {
+    assert_case(
+      r#"I; 0; 1; Pi; a; a-a; 3-3.; 2-Sqrt[4]; -Pi; (-1)^2; (-1)^3; Sqrt[2]; Sqrt[-2]; (-2)^(1/2); (2)^(1/2); Exp[a]; Exp[2.3]; Log[1/2]; Exp[I]; Log[3]; Log[I]; Abs[a]; Abs[0]; Abs[1+3 I]"#,
+      r#"Sqrt[10]"#,
+    );
+  }
+}

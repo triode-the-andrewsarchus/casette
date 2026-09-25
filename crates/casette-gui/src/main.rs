@@ -2,7 +2,7 @@
 
 use casette_gui::app::CasetteApp;
 use casette_gui::model::{AsyncMessage, GuiAction, WorkerStatus};
-use casette_kernel::SageKernel;
+use casette_kernel::WoxiKernel;
 use eframe::NativeOptions;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -52,18 +52,18 @@ fn main() -> anyhow::Result<()> {
 
     let msg_tx_clone = msg_tx.clone();
     rt.spawn(async move {
-        info!("launching SageKernel background manager");
-        let kernel = match SageKernel::launch_discovered().await {
+        info!("launching WoxiKernel background manager");
+        let kernel = match WoxiKernel::launch().await {
             Ok(k) => {
                 let pid = k.worker_pid().unwrap_or(0);
                 let _ = msg_tx_clone.send(AsyncMessage::WorkerReady {
                     pid,
-                    version: "SageMath (Linux)".into(),
+                    version: "Woxi Engine (Wolfram Language)".into(),
                 });
                 k
             }
             Err(e) => {
-                error!("failed to launch Sage kernel: {}", e);
+                error!("failed to launch Woxi kernel: {}", e);
                 let _ = msg_tx_clone.send(AsyncMessage::ErrorOccurred(e.to_string()));
                 return;
             }
@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
                 GuiAction::ClearTape => {
                     tape_refs.clear();
                     row_counter = 1;
-                    let _ = kernel.eval("__casette_tape_refs = {}\n", false, None).await;
+                    let _ = kernel.eval("Clear[__casette_tape_refs];", false, None).await;
                 }
                 GuiAction::Ping => {
                     let _ = kernel.ping().await;
@@ -169,7 +169,7 @@ fn main() -> anyhow::Result<()> {
                         let pid = kernel.worker_pid().unwrap_or(0);
                         let _ = msg_tx_clone.send(AsyncMessage::WorkerReady {
                             pid,
-                            version: "SageMath (Linux)".into(),
+                            version: "Woxi Engine (Wolfram Language)".into(),
                         });
                     }
                 }

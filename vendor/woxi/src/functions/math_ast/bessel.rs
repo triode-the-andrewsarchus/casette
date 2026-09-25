@@ -1,0 +1,2129 @@
+use super::*;
+
+/// `J_n(-z) = (-1)^n J_n(z)`, and the same for `I_n` — the parity both have
+/// in their *argument* at integer order, which is separate from the parity
+/// in their order. `BesselY` and `BesselK` have no such rule: a negative
+/// argument puts them on the other side of their branch cut, and
+/// wolframscript leaves those unevaluated.
+///
+/// Returns `None` when the rule does not apply (non-integer order, or an
+/// argument that is not a negation). Machine reals never reach here —
+/// `strip_negation` skips them, and their numeric kernels are already
+/// sign-correct.
+fn negated_argument_parity(
+  n_expr: &Expr,
+  z_expr: &Expr,
+  reduce: fn(&[Expr]) -> Result<Expr, InterpreterError>,
+) -> Result<Option<Expr>, InterpreterError> {
+  let Expr::Integer(n) = n_expr else {
+    return Ok(None);
+  };
+  let Some(positive_z) = strip_negation(z_expr) else {
+    return Ok(None);
+  };
+  let reduced = reduce(&[n_expr.clone(), positive_z])?;
+  if n.unsigned_abs() & 1 == 0 {
+    return Ok(Some(reduced));
+  }
+  Ok(Some(crate::evaluator::evaluate_function_call_ast(
+    "Times",
+    &[Expr::Integer(-1), reduced],
+  )?))
+}
+
+/// True if `z_expr` is `<zero_name>[order, k, ...]` whose first argument equals
+/// `n_expr` AND both `order` and `k` are concrete positive integers — the only
+/// case where wolframscript simplifies `BesselJ[n, BesselJZero[n, k, ...]]` to
+/// 0. For symbolic n or k, the simplification is not applied.
+fn is_matching_bessel_zero(
+  n_expr: &Expr,
+  z_expr: &Expr,
+  zero_name: &str,
+) -> bool {
+  if let Expr::FunctionCall { name, args } = z_expr
+    && name == zero_name
+    && args.len() >= 2
+    && exprs_equal_simple(&args[0], n_expr)
+    && matches!(n_expr, Expr::Integer(n) if *n >= 0)
+    && matches!(&args[1], Expr::Integer(k) if *k >= 1)
+  {
+    return true;
+  }
+  false
+}
+
+/// Conservative structural equality for the order argument: enough to match
+/// the common cases `Integer == Integer`, `Real == Real`, and identical
+/// symbolic forms.
+fn exprs_equal_simple(a: &Expr, b: &Expr) -> bool {
+  match (a, b) {
+    (Expr::Integer(x), Expr::Integer(y)) => x == y,
+    (Expr::Real(x), Expr::Real(y)) => x == y,
+    (Expr::Identifier(x), Expr::Identifier(y)) => x == y,
+    _ => expr_to_string(a) == expr_to_string(b),
+  }
+}
+
+/// BesselJ[n, z] - Bessel function of the first kind
+pub fn bessel_j_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "BesselJ expects exactly 2 arguments".into(),
+    ));
+  }
+  let n_expr = &args[0];
+  let z_expr = &args[1];
+
+  // BesselJ[n, BesselJZero[n, k, ...]] = 0 by definition of the zeros.
+  if is_matching_bessel_zero(n_expr, z_expr, "BesselJZero") {
+    return Ok(Expr::Integer(0));
+  }
+
+  // Extract numeric values
+  let n_val = match n_expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    _ => None,
+  };
+  let z_val = match z_expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    _ => None,
+  };
+
+  // Special case: BesselJ[n, 0] for integer n
+  if matches!(z_expr, Expr::Integer(0))
+    && let Expr::Integer(n) = n_expr
+  {
+    return if *n == 0 {
+      Ok(Expr::Integer(1))
+    } else {
+      Ok(Expr::Integer(0))
+    };
+  }
+
+  // Numeric evaluation when both args are numeric and at least one is Real
+  let is_numeric_eval = n_val.is_some()
+    && z_val.is_some()
+    && (matches!(z_expr, Expr::Real(_)) || matches!(n_expr, Expr::Real(_)));
+
+  if is_numeric_eval {
+    let n = n_val.unwrap();
+    let z = z_val.unwrap();
+    let result = bessel_j(n, z);
+    return Ok(Expr::Real(result));
+  }
+
+  // Closed-form rules at half-integer orders. Use the standard recurrence
+  //   J_{n+1}(z) = (2n/z) J_n(z) - J_{n-1}(z)
+  // anchored at J_{±1/2}. Walks numerically through the integer m in n = m/2.
+  // wolframscript only expands when the argument contains free symbols;
+  // exact numeric arguments (6, 2/3, Pi) stay unevaluated.
+  if let Some((n_num, n_den)) = expr_to_rational(n_expr)
+    && n_den == 2
+    && (n_num.unsigned_abs() <= 51)
+    && try_eval_to_f64(z_expr).is_none()
+    && let Some(result) = half_int_bessel_j(n_num, z_expr)?
+  {
+    return Ok(result);
+  }
+
+  // Negative argument at integer order: J_n(-z) = (-1)^n * J_n(z). Runs
+  // after the half-integer rules so `BesselJ[1/2, -x]` still expands.
+  if let Some(reduced) = negated_argument_parity(n_expr, z_expr, bessel_j_ast)?
+  {
+    return Ok(reduced);
+  }
+
+  // Negative integer order: J_{-n}(z) = (-1)^n * J_n(z).
+  if let Expr::Integer(n) = n_expr
+    && *n < 0
+  {
+    let pos_n = -n;
+    let parity = pos_n.unsigned_abs() & 1;
+    let positive_call =
+      call("BesselJ", vec![Expr::Integer(pos_n), z_expr.clone()]);
+    return if parity == 0 {
+      Ok(positive_call)
+    } else {
+      crate::evaluator::evaluate_expr_to_expr(&call(
+        "Times",
+        vec![Expr::Integer(-1), positive_call],
+      ))
+    };
+  }
+
+  // Return unevaluated
+  Ok(unevaluated("BesselJ", args))
+}
+
+/// Compute BesselJ[m/2, z] for odd integer m using the recurrence
+/// J_{n+1}(z) = (2n/z) J_n(z) - J_{n-1}(z).
+///
+/// We work in the factored form J_{m/2}(z) = (Sqrt[2/Pi]/Sqrt[z]) * P_m(z),
+/// where P_1 = Sin[z], P_{-1} = Cos[z], and the recurrence transfers to
+/// P_{m+2} = (m/z) * P_m - P_{m-2}. Computing only P keeps the result a
+/// single Times expression after the final wrap, matching wolframscript's
+/// canonical print form.
+fn half_int_bessel_j(
+  m: i128,
+  z_expr: &Expr,
+) -> Result<Option<Expr>, InterpreterError> {
+  if m % 2 == 0 {
+    return Ok(None);
+  }
+  let p = half_int_bessel_polynomial(m, z_expr, "Sin", "Cos", BesselSign::J)?;
+  Ok(Some(wrap_with_sqrt_factor(&p, z_expr)?))
+}
+
+/// Compute BesselI[m/2, z] for odd integer m. Anchors P_1 = Sinh[z],
+/// P_{-1} = Cosh[z]; recurrence P_{m+2} = -(m/z) * P_m + P_{m-2}.
+fn half_int_bessel_i(
+  m: i128,
+  z_expr: &Expr,
+) -> Result<Option<Expr>, InterpreterError> {
+  if m % 2 == 0 {
+    return Ok(None);
+  }
+  let p = half_int_bessel_polynomial(m, z_expr, "Sinh", "Cosh", BesselSign::I)?;
+  // For multi-term polynomials wolframscript prints BesselI in the rationalised
+  // form `Distribute[2*P, Plus] / (Sqrt[2*Pi] Sqrt[z])` instead of the bare
+  // `Sqrt[2/Pi]*P/Sqrt[z]`. Single-term P (e.g. BesselI[1/2,z] = Sinh[z]) keeps
+  // the original `Sqrt[2/Pi]*Sinh[z]/Sqrt[z]` form.
+  if is_plus_expr(&p) {
+    Ok(Some(wrap_with_sqrt_factor_rationalised(&p, z_expr)?))
+  } else {
+    Ok(Some(wrap_with_sqrt_factor(&p, z_expr)?))
+  }
+}
+
+fn is_plus_expr(e: &Expr) -> bool {
+  match e {
+    Expr::FunctionCall { name, .. } if name == "Plus" => true,
+    Expr::BinaryOp { op, .. } => {
+      matches!(op, BinaryOperator::Plus | BinaryOperator::Minus)
+    }
+    _ => false,
+  }
+}
+
+fn wrap_with_sqrt_factor_rationalised(
+  p: &Expr,
+  z_expr: &Expr,
+) -> Result<Expr, InterpreterError> {
+  // Build Distribute[2*p, Plus] / (Sqrt[2*Pi] * Sqrt[z]).
+  let two_p = call("Times", vec![Expr::Integer(2), p.clone()]);
+  let distributed = call("Distribute", vec![two_p, id_expr("Plus")]);
+  let denom = call(
+    "Times",
+    vec![
+      call1("Sqrt", call("Times", vec![Expr::Integer(2), id_expr("Pi")])),
+      call1("Sqrt", z_expr.clone()),
+    ],
+  );
+  let expr = call("Times", vec![distributed, pow(denom, Expr::Integer(-1))]);
+  crate::evaluator::evaluate_expr_to_expr(&expr)
+}
+
+/// Sign convention for the half-integer Bessel polynomial recurrence.
+#[derive(Clone, Copy)]
+enum BesselSign {
+  /// Forward: P_{m+2} = (m/z) * P_m - P_{m-2}; backward: P_{m-2} = (m/z) P_m - P_{m+2}
+  J,
+  /// Forward: P_{m+2} = -(m/z) * P_m + P_{m-2}; backward: P_{m-2} = (m/z) P_m + P_{m+2}
+  I,
+}
+
+/// Compute `P_{m}` for the half-integer Bessel recurrence, parameterised on
+/// the two trig anchors (P_1 and P_{-1}) and the sign convention
+/// (J vs I family).
+fn half_int_bessel_polynomial(
+  m: i128,
+  z_expr: &Expr,
+  trig_pos: &str,
+  trig_neg: &str,
+  sign: BesselSign,
+) -> Result<Expr, InterpreterError> {
+  let mut prev = call1(trig_neg, z_expr.clone()); // P_{-1}
+  let mut curr = call1(trig_pos, z_expr.clone()); // P_{1}
+  let raw = if m == 1 {
+    curr
+  } else if m == -1 {
+    prev
+  } else if m > 1 {
+    let mut m_cur: i128 = 1;
+    while m_cur < m {
+      let next =
+        bessel_poly_recurrence(&curr, &prev, m_cur, z_expr, sign, true)?;
+      prev = curr;
+      curr = next;
+      m_cur += 2;
+    }
+    curr
+  } else {
+    let mut a = prev; // P_{-1}
+    let mut b = curr; // P_{1}
+    let mut m_cur: i128 = -1;
+    while m_cur > m {
+      let next = bessel_poly_recurrence(&a, &b, m_cur, z_expr, sign, false)?;
+      b = a;
+      a = next;
+      m_cur -= 2;
+    }
+    a
+  };
+  // For the J family (BesselJ and BesselY) wolframscript prints the polynomial
+  // fully expanded, so distribute the nested `(k/z) * P_k` factors produced by
+  // the recurrence into separate monomials, e.g. (3 (-Cos[z] + Sin[z]/z))/z ->
+  // (-3 Cos[z])/z + (3 Sin[z])/z^2 (matching BesselJ[5/2, z]). The I family
+  // keeps trig coefficients collected and is wrapped separately, so leave it.
+  // For |m| <= 3 the polynomial is already flat and Expand is a no-op anyway.
+  if matches!(sign, BesselSign::J) {
+    crate::evaluator::evaluate_function_call_ast("Expand", &[raw])
+  } else {
+    Ok(raw)
+  }
+}
+
+/// One step of the half-integer Bessel polynomial recurrence.
+///
+/// J family, forward: P_{m+2} = (m/z) * P_m - P_{m-2}
+/// J family, backward: P_{m-2} = (m/z) * P_m - P_{m+2}
+/// I family, forward: P_{m+2} = -(m/z) * P_m + P_{m-2}
+/// I family, backward: P_{m-2} = (m/z) * P_m + P_{m+2}
+fn bessel_poly_recurrence(
+  p_n: &Expr,
+  p_other: &Expr,
+  coef: i128,
+  z_expr: &Expr,
+  sign: BesselSign,
+  forward: bool,
+) -> Result<Expr, InterpreterError> {
+  // Coefficient on the (m/z) * P_m term and on P_{other}.
+  let (a_coef, b_coef): (i128, i128) = match (sign, forward) {
+    (BesselSign::J, _) => (coef, -1), // (m/z) P_m - P_other
+    (BesselSign::I, true) => (-coef, 1), // -(m/z) P_m + P_other
+    (BesselSign::I, false) => (coef, 1), // (m/z) P_m + P_other
+  };
+  let expr = call(
+    "Plus",
+    vec![
+      call(
+        "Times",
+        vec![
+          Expr::Integer(a_coef),
+          pow(z_expr.clone(), Expr::Integer(-1)),
+          p_n.clone(),
+        ],
+      ),
+      call("Times", vec![Expr::Integer(b_coef), p_other.clone()]),
+    ],
+  );
+  crate::evaluator::evaluate_expr_to_expr(&expr)
+}
+
+/// Wrap a half-integer Bessel polynomial as Sqrt[2/Pi] * P / Sqrt[z].
+fn wrap_with_sqrt_factor(
+  p: &Expr,
+  z_expr: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let expr = call(
+    "Times",
+    vec![
+      call1(
+        "Sqrt",
+        call(
+          "Times",
+          vec![Expr::Integer(2), pow(id_expr("Pi"), Expr::Integer(-1))],
+        ),
+      ),
+      p.clone(),
+      pow(call1("Sqrt", z_expr.clone()), Expr::Integer(-1)),
+    ],
+  );
+  crate::evaluator::evaluate_expr_to_expr(&expr)
+}
+
+/// BesselJZero[n, k] — k-th positive zero of the Bessel function J_n.
+/// BesselJZero[n, k, x0] — same, with an initial-guess hint x0 (Wolfram
+/// accepts this 3-arg form and leaves it unevaluated until used numerically).
+pub fn bessel_j_zero_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "BesselJZero expects 2 or 3 arguments".into(),
+    ));
+  }
+
+  // Extract numeric values, accepting Integer / Real / BigFloat (so that
+  // N[BesselJZero[n, k], precision] flows through after N propagates the
+  // precision marker to each arg).
+  let n_val = match &args[0] {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    Expr::BigFloat(digits, _) => digits.parse::<f64>().ok(),
+    _ => None,
+  };
+  let k_val = match &args[1] {
+    Expr::Integer(k) => Some(*k),
+    Expr::Real(f) if *f == f.floor() && *f > 0.0 => Some(*f as i128),
+    Expr::BigFloat(digits, _) => digits.parse::<f64>().ok().and_then(|f| {
+      if f == f.floor() && f > 0.0 {
+        Some(f as i128)
+      } else {
+        None
+      }
+    }),
+    _ => None,
+  };
+
+  // Numeric evaluation when n or k carries a numeric type beyond a bare
+  // Integer (Real or BigFloat from N[…, prec]).
+  let has_numeric = matches!(&args[0], Expr::Real(_) | Expr::BigFloat(_, _))
+    || matches!(&args[1], Expr::Real(_) | Expr::BigFloat(_, _));
+  if has_numeric
+    && let (Some(n), Some(k)) = (n_val, k_val)
+    && k >= 1
+  {
+    let result = bessel_j_zero(n, k as usize);
+    return Ok(Expr::Real(result));
+  }
+
+  // Return unevaluated (symbolic)
+  Ok(unevaluated("BesselJZero", args))
+}
+
+/// BesselYZero[n, k] — k-th positive zero of the Bessel function Y_n
+pub fn bessel_y_zero_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "BesselYZero expects exactly 2 arguments".into(),
+    ));
+  }
+  // Same Integer/Real/BigFloat extraction as bessel_j_zero_ast so that
+  // N[BesselYZero[n, k], precision] flows through to the numeric path.
+  let n_val = match &args[0] {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    Expr::BigFloat(digits, _) => digits.parse::<f64>().ok(),
+    _ => None,
+  };
+  let k_val = match &args[1] {
+    Expr::Integer(k) => Some(*k),
+    Expr::Real(f) if *f == f.floor() && *f > 0.0 => Some(*f as i128),
+    Expr::BigFloat(digits, _) => digits.parse::<f64>().ok().and_then(|f| {
+      if f == f.floor() && f > 0.0 {
+        Some(f as i128)
+      } else {
+        None
+      }
+    }),
+    _ => None,
+  };
+  let has_numeric = matches!(&args[0], Expr::Real(_) | Expr::BigFloat(_, _))
+    || matches!(&args[1], Expr::Real(_) | Expr::BigFloat(_, _));
+  if has_numeric
+    && let (Some(n), Some(k)) = (n_val, k_val)
+    && k >= 1
+  {
+    let result = bessel_y_zero(n, k as usize);
+    return Ok(Expr::Real(result));
+  }
+  Ok(unevaluated("BesselYZero", args))
+}
+
+/// Find the k-th positive zero of Y_n(x) using bisection + Newton's method.
+/// Y_n(x) is a Bessel function of the second kind; its first zero for n=0
+/// is `0.8935776066…`. The implementation mirrors `bessel_j_zero` but
+/// evaluates `bessel_y` and uses the recurrence
+/// `Y'_n(x) = n/x · Y_n(x) − Y_{n+1}(x)` for Newton refinement.
+fn bessel_y_zero(n: f64, k: usize) -> f64 {
+  let step = 0.5;
+  // Y_n diverges at x = 0, so start the scan past a small positive
+  // value (and past `n * 0.5` for large `n`, where the first zero
+  // tracks the order).
+  let start = if n > 0.0 { (n * 0.5).max(step) } else { step };
+  let mut x = start;
+  let mut prev_val = bessel_y(n, x);
+  let mut zeros_found = 0;
+  loop {
+    let next_x = x + step;
+    let next_val = bessel_y(n, next_x);
+    if prev_val * next_val < 0.0 {
+      zeros_found += 1;
+      if zeros_found == k {
+        let mut lo = x;
+        let mut hi = next_x;
+        for _ in 0..60 {
+          let mid = f64::midpoint(lo, hi);
+          let mid_val = bessel_y(n, mid);
+          if mid_val == 0.0 {
+            return mid;
+          }
+          if bessel_y(n, lo) * mid_val < 0.0 {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+        let mut root = f64::midpoint(lo, hi);
+        for _ in 0..20 {
+          let yn = bessel_y(n, root);
+          let yn1 = bessel_y(n + 1.0, root);
+          let deriv = (n / root) * yn - yn1;
+          if deriv.abs() < 1e-300 {
+            break;
+          }
+          let delta = yn / deriv;
+          root -= delta;
+          if delta.abs() < 1e-15 * root.abs() {
+            break;
+          }
+        }
+        return root;
+      }
+    }
+    prev_val = next_val;
+    x = next_x;
+    if x > n + (k as f64) * std::f64::consts::PI + 100.0 {
+      break;
+    }
+  }
+  f64::NAN
+}
+
+/// Find the k-th positive zero of J_n(x) using bisection + Newton's method
+fn bessel_j_zero(n: f64, k: usize) -> f64 {
+  // Find zeros by scanning for sign changes, then refining with bisection
+  let step = 0.5;
+  let start = if n > 0.0 { n * 0.5 } else { step };
+  let mut x = start;
+  let mut prev_val = bessel_j(n, x);
+  let mut zeros_found = 0;
+
+  loop {
+    let next_x = x + step;
+    let next_val = bessel_j(n, next_x);
+
+    if prev_val * next_val < 0.0 {
+      // Sign change: there's a zero in [x, next_x]
+      zeros_found += 1;
+      if zeros_found == k {
+        // Refine using bisection then Newton
+        let mut lo = x;
+        let mut hi = next_x;
+
+        // Bisection to get close
+        for _ in 0..60 {
+          let mid = f64::midpoint(lo, hi);
+          let mid_val = bessel_j(n, mid);
+          if mid_val == 0.0 {
+            return mid;
+          }
+          if bessel_j(n, lo) * mid_val < 0.0 {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+
+        // Newton's method to polish
+        let mut root = f64::midpoint(lo, hi);
+        for _ in 0..20 {
+          let jn = bessel_j(n, root);
+          // J'_n(x) = n/x * J_n(x) - J_{n+1}(x)
+          let jn1 = bessel_j(n + 1.0, root);
+          let deriv = (n / root) * jn - jn1;
+          if deriv.abs() < 1e-300 {
+            break;
+          }
+          let delta = jn / deriv;
+          root -= delta;
+          if delta.abs() < 1e-15 * root.abs() {
+            break;
+          }
+        }
+        return root;
+      }
+    }
+
+    prev_val = next_val;
+    x = next_x;
+
+    // Safety: if we've searched very far, give up
+    if x > n + (k as f64) * std::f64::consts::PI + 100.0 {
+      break;
+    }
+  }
+
+  f64::NAN
+}
+
+/// Compute Bessel J_n(z) using series expansion
+pub fn bessel_j(n: f64, z: f64) -> f64 {
+  // Handle negative integer orders: J_{-n}(z) = (-1)^n * J_n(z)
+  if n < 0.0 && n == n.floor() {
+    let n_abs = -n;
+    let sign = if n_abs as i64 % 2 == 0 { 1.0 } else { -1.0 };
+    return sign * bessel_j(n_abs, z);
+  }
+
+  // Special case: z = 0
+  if z == 0.0 {
+    return if n == 0.0 { 1.0 } else { 0.0 };
+  }
+
+  // Series: J_n(z) = sum_{m=0}^{inf} (-1)^m / (m! * Gamma(n+m+1)) * (z/2)^(2m+n)
+  let half_z = z / 2.0;
+  let mut sum = 0.0;
+  let mut term = half_z.powf(n) / gamma_fn(n + 1.0);
+  sum += term;
+
+  for m in 1..300 {
+    term *= -half_z * half_z / (m as f64 * (n + m as f64));
+    sum += term;
+    if term.abs() < 1e-17 * sum.abs().max(1e-300) {
+      break;
+    }
+  }
+  sum
+}
+
+/// BesselI[n, z] - Modified Bessel function of the first kind
+pub fn bessel_i_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "BesselI expects exactly 2 arguments".into(),
+    ));
+  }
+  let n_expr = &args[0];
+  let z_expr = &args[1];
+
+  // BesselI[n, 0] for integer n: I_0(0) = 1, I_n(0) = 0 for n != 0
+  if matches!(z_expr, Expr::Integer(0))
+    && let Expr::Integer(n) = n_expr
+  {
+    return if *n == 0 {
+      Ok(Expr::Integer(1))
+    } else {
+      Ok(Expr::Integer(0))
+    };
+  }
+
+  // Integer-order symmetry: BesselI[-n, z] = BesselI[n, z] for integer n.
+  if let Expr::Integer(n) = n_expr
+    && *n < 0
+  {
+    return bessel_i_ast(&[Expr::Integer(-*n), z_expr.clone()]);
+  }
+
+  // Numeric evaluation
+  let n_val = expr_to_f64(n_expr);
+  let z_val = expr_to_f64(z_expr);
+  let is_numeric_eval = n_val.is_some()
+    && z_val.is_some()
+    && (matches!(z_expr, Expr::Real(_)) || matches!(n_expr, Expr::Real(_)));
+
+  if is_numeric_eval {
+    let result = bessel_i(n_val.unwrap(), z_val.unwrap());
+    return Ok(Expr::Real(result));
+  }
+
+  // Closed-form rules at half-integer orders. Anchored at I_{±1/2}; the
+  // recurrence I_{n+1}(z) = I_{n-1}(z) - (2n/z) I_n(z) (sign-flipped vs J).
+  // Exact numeric arguments stay unevaluated (wolframscript).
+  if let Some((n_num, n_den)) = expr_to_rational(n_expr)
+    && n_den == 2
+    && (n_num.unsigned_abs() <= 51)
+    && try_eval_to_f64(z_expr).is_none()
+    && let Some(result) = half_int_bessel_i(n_num, z_expr)?
+  {
+    return Ok(result);
+  }
+
+  // Negative argument at integer order: I_n(-z) = (-1)^n * I_n(z).
+  if let Some(reduced) = negated_argument_parity(n_expr, z_expr, bessel_i_ast)?
+  {
+    return Ok(reduced);
+  }
+
+  Ok(unevaluated("BesselI", args))
+}
+
+/// Compute I_n(z) using series: I_n(z) = Σ (z/2)^{2m+n} / (m! * Γ(n+m+1))
+pub fn bessel_i(n: f64, z: f64) -> f64 {
+  if n < 0.0 && n == n.floor() {
+    // I_{-n}(z) = I_n(z) for integer n
+    return bessel_i(-n, z);
+  }
+
+  if z == 0.0 {
+    return if n == 0.0 { 1.0 } else { 0.0 };
+  }
+
+  let half_z = z / 2.0;
+  let mut sum = 0.0;
+  let mut term = half_z.powf(n) / gamma_fn(n + 1.0);
+  sum += term;
+
+  for m in 1..300 {
+    term *= half_z * half_z / (m as f64 * (n + m as f64));
+    sum += term;
+    if term.abs() < 1e-17 * sum.abs().max(1e-300) {
+      break;
+    }
+  }
+  sum
+}
+
+/// BesselK[n, z] - Modified Bessel function of the second kind
+pub fn bessel_k_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "BesselK expects exactly 2 arguments".into(),
+    ));
+  }
+  let n_expr = &args[0];
+  let z_expr = &args[1];
+
+  // BesselK[n, 0]: K_0(0) = Infinity, K_n(0) = ComplexInfinity for n > 0
+  if matches!(z_expr, Expr::Integer(0))
+    && let Expr::Integer(n) = n_expr
+  {
+    return if *n == 0 {
+      Ok(id_expr("Infinity"))
+    } else {
+      Ok(id_expr("ComplexInfinity"))
+    };
+  }
+
+  // Numeric evaluation
+  let n_val = expr_to_f64(n_expr);
+  let z_val = expr_to_f64(z_expr);
+  let is_numeric_eval = n_val.is_some()
+    && z_val.is_some()
+    && (matches!(z_expr, Expr::Real(_)) || matches!(n_expr, Expr::Real(_)));
+
+  if is_numeric_eval {
+    let n = n_val.unwrap();
+    let z = z_val.unwrap();
+    // At the origin K_0(0) = Infinity, but every other order diverges as
+    // ComplexInfinity (the numeric series would give NaN/0 there). The n = 0
+    // case falls through to bessel_k, which returns Infinity.
+    if z == 0.0 && n != 0.0 {
+      return Ok(id_expr("ComplexInfinity"));
+    }
+    let result = bessel_k(n, z);
+    return Ok(Expr::Real(result));
+  }
+
+  // Closed-form rules at half-integer orders. K_{1/2}(z) = K_{-1/2}(z) =
+  // Sqrt[Pi/(2z)] * E^(-z); K_{n+1}(z) = (2n/z) K_n(z) + K_{n-1}(z).
+  // K is symmetric: K_{-n}(z) = K_n(z).
+  // Exact numeric arguments stay unevaluated (wolframscript).
+  if let Some((n_num, n_den)) = expr_to_rational(n_expr)
+    && n_den == 2
+    && (n_num.unsigned_abs() <= 51)
+    && try_eval_to_f64(z_expr).is_none()
+    && let Some(result) = half_int_bessel_k(n_num, z_expr)?
+  {
+    return Ok(result);
+  }
+
+  // Negative integer order: K is symmetric, K_{-n}(z) = K_n(z).
+  if let Expr::Integer(n) = n_expr
+    && *n < 0
+  {
+    return Ok(call("BesselK", vec![Expr::Integer(-n), z_expr.clone()]));
+  }
+
+  Ok(unevaluated("BesselK", args))
+}
+
+/// Compute BesselK[m/2, z] for odd integer m. Anchors P_1 = P_{-1} = 1
+/// (since K_{1/2} = K_{-1/2} = Sqrt[Pi/(2z)] E^(-z)); recurrence is
+/// P_{m+2} = (m/z) P_m + P_{m-2}. Result is wrapped as
+/// Sqrt[Pi/2] * P / (E^z * Sqrt[z]).
+fn half_int_bessel_k(
+  m: i128,
+  z_expr: &Expr,
+) -> Result<Option<Expr>, InterpreterError> {
+  if m % 2 == 0 {
+    return Ok(None);
+  }
+  // K is symmetric in n; reduce to |m|.
+  let m = m.unsigned_abs() as i128;
+  let p = bessel_k_polynomial(m, z_expr)?;
+  Ok(Some(wrap_bessel_k_factor(&p, z_expr)?))
+}
+
+/// Compute the K-family polynomial P_m. Anchors P_1 = P_{-1} = 1.
+/// Recurrence: P_{m+2} = (m/z) P_m + P_{m-2}.
+fn bessel_k_polynomial(
+  m: i128,
+  z_expr: &Expr,
+) -> Result<Expr, InterpreterError> {
+  if m == 1 {
+    return Ok(Expr::Integer(1));
+  }
+  let mut prev = Expr::Integer(1); // P_{-1}
+  let mut curr = Expr::Integer(1); // P_{1}
+  let mut m_cur: i128 = 1;
+  while m_cur < m {
+    // P_{m_cur+2} = (m_cur/z) * curr + prev
+    let next_expr = call(
+      "Plus",
+      vec![
+        call(
+          "Times",
+          vec![
+            Expr::Integer(m_cur),
+            pow(z_expr.clone(), Expr::Integer(-1)),
+            curr.clone(),
+          ],
+        ),
+        prev.clone(),
+      ],
+    );
+    let next = crate::evaluator::evaluate_expr_to_expr(&next_expr)?;
+    prev = curr;
+    curr = next;
+    m_cur += 2;
+  }
+  // Expand so the nested `(k/z) * P_k` factors distribute into separate
+  // monomials, matching wolframscript's BesselK[5/2, z] = ... (1 + 3/z^2 + 3/z).
+  crate::evaluator::evaluate_function_call_ast("Expand", &[curr])
+}
+
+/// Wrap K-polynomial: Sqrt[Pi/2] * P / (E^z * Sqrt[z]).
+fn wrap_bessel_k_factor(
+  p: &Expr,
+  z_expr: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let expr = call(
+    "Times",
+    vec![
+      // Sqrt[Pi/2]
+      call1(
+        "Sqrt",
+        call(
+          "Times",
+          vec![id_expr("Pi"), pow(Expr::Integer(2), Expr::Integer(-1))],
+        ),
+      ),
+      p.clone(),
+      // 1 / E^z = E^(-z)
+      pow(
+        const_expr("E"),
+        call("Times", vec![Expr::Integer(-1), z_expr.clone()]),
+      ),
+      // 1 / Sqrt[z]
+      pow(call1("Sqrt", z_expr.clone()), Expr::Integer(-1)),
+    ],
+  );
+  crate::evaluator::evaluate_expr_to_expr(&expr)
+}
+
+/// Compute K_n(z) for integer n using the Temme method for small z
+/// and the recurrence relation for integer orders.
+pub fn bessel_k(n: f64, z: f64) -> f64 {
+  let n_int = n.round() as i64;
+  let n_abs = n_int.unsigned_abs();
+
+  // K_{-n}(z) = K_n(z)
+  let n_abs_f = n_abs as f64;
+
+  // Compute K_0 and K_1 directly, then use recurrence for higher orders
+  let (k0, k1) = bessel_k01(z);
+  if n_abs == 0 {
+    return k0;
+  }
+  if n_abs == 1 {
+    return k1;
+  }
+
+  // Recurrence: K_{n+1}(z) = (2n/z) * K_n(z) + K_{n-1}(z)
+  let mut km1 = k0;
+  let mut k = k1;
+  for i in 1..n_abs {
+    let kp1 = (2.0 * i as f64 / z) * k + km1;
+    km1 = k;
+    k = kp1;
+  }
+
+  // If original n was non-integer, we'd need a different approach
+  // but for now we handle integer n via recurrence
+  if (n - n_abs_f).abs() > 1e-10 && n >= 0.0 {
+    // Non-integer order: use K_v(z) = (π/2) * (I_{-v}(z) - I_v(z)) / sin(vπ)
+    let pi = std::f64::consts::PI;
+    let i_neg = bessel_i(-n, z);
+    let i_pos = bessel_i(n, z);
+    return (pi / 2.0) * (i_neg - i_pos) / (n * pi).sin();
+  }
+
+  k
+}
+
+/// Compute K_0(z) and K_1(z) simultaneously using the Temme series for small z
+/// and asymptotic expansion for large z.
+fn bessel_k01(z: f64) -> (f64, f64) {
+  if z <= 2.0 {
+    // Series for K_0 and K_1
+    let euler_gamma = 0.5772156649015329;
+    let lnz2 = (z / 2.0).ln();
+    let t = z * z / 4.0;
+
+    // K_0(z) = -(ln(z/2) + γ) * I_0(z) + Σ_{m=1}^∞ (z/2)^{2m} * H_m / (m!)^2
+    let i0 = bessel_i(0.0, z);
+    let mut k0 = -(lnz2 + euler_gamma) * i0;
+    let mut term0 = 1.0;
+    let mut hm = 0.0;
+    for m in 1..100 {
+      let mf = m as f64;
+      term0 *= t / (mf * mf);
+      hm += 1.0 / mf;
+      k0 += term0 * hm;
+      if (term0 * hm).abs() < 1e-17 * k0.abs().max(1e-300) {
+        break;
+      }
+    }
+
+    // K_1(z) = (1/z) + (ln(z/2) + γ - 1) * I_1(z)
+    //   - (z/2) * Σ_{m=0}^∞ (z²/4)^m * (H_m + H_{m+1}) / (2 * m! * (m+1)!)
+    // But the correct form is:
+    // K_1(z) = (1/z) - (ln(z/2) + γ) * I_1(z) + (z/4) * Σ_{m=0}^∞ ...
+    // Let's use recurrence from K_0 instead: K_1 = -K_0' (for the derivative)
+    // Or more reliably, compute via the Wronskian: I_n * K_{n+1} + I_{n+1} * K_n = 1/z
+    // So K_1 = (1/z - I_1 * K_0) / I_0
+    let i1 = bessel_i(1.0, z);
+    let k1 = (1.0 / z - i1 * k0) / i0;
+
+    (k0, k1)
+  } else {
+    // Asymptotic: K_n(z) ~ sqrt(π/(2z)) * e^{-z} * P_n(z)
+    // where P_n(z) = 1 + (4n²-1)/(8z) + (4n²-1)(4n²-9)/(2!(8z)²) + ...
+    let pi = std::f64::consts::PI;
+    let prefactor = (pi / (2.0 * z)).sqrt() * (-z).exp();
+
+    // K_0 asymptotic (μ = 0)
+    let mut sum0 = 1.0;
+    let mut term0 = 1.0;
+    for m in 1..30 {
+      let mf = m as f64;
+      let factor = -(0.0 - (2.0 * mf - 1.0).powi(2)) / (8.0 * z * mf);
+      term0 *= factor;
+      if term0.abs() < 1e-17 {
+        break;
+      }
+      sum0 += term0;
+    }
+
+    // K_1 asymptotic (μ = 4)
+    let mut sum1 = 1.0;
+    let mut term1 = 1.0;
+    for m in 1..30 {
+      let mf = m as f64;
+      let factor = (4.0 - (2.0 * mf - 1.0).powi(2)) / (8.0 * z * mf);
+      term1 *= factor;
+      if term1.abs() < 1e-17 {
+        break;
+      }
+      sum1 += term1;
+    }
+
+    (prefactor * sum0, prefactor * sum1)
+  }
+}
+
+/// BesselY[n, z] - Bessel function of the second kind
+pub fn bessel_y_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "BesselY expects exactly 2 arguments".into(),
+    ));
+  }
+  let n_expr = &args[0];
+  let z_expr = &args[1];
+
+  // BesselY[n, BesselYZero[n, k, ...]] = 0 by definition of the zeros.
+  if is_matching_bessel_zero(n_expr, z_expr, "BesselYZero") {
+    return Ok(Expr::Integer(0));
+  }
+
+  // BesselY[n, 0]: Y_0(0) = -Infinity, Y_n(0) = ComplexInfinity for n > 0
+  if matches!(z_expr, Expr::Integer(0))
+    && let Expr::Integer(n) = n_expr
+  {
+    return if *n == 0 {
+      Ok(call("Times", vec![Expr::Integer(-1), id_expr("Infinity")]))
+    } else {
+      Ok(id_expr("ComplexInfinity"))
+    };
+  }
+
+  // Numeric evaluation
+  let n_val = expr_to_f64(n_expr);
+  let z_val = expr_to_f64(z_expr);
+  let is_numeric_eval = n_val.is_some()
+    && z_val.is_some()
+    && (matches!(z_expr, Expr::Real(_)) || matches!(n_expr, Expr::Real(_)));
+
+  if is_numeric_eval {
+    let n = n_val.unwrap();
+    let z = z_val.unwrap();
+    // At the origin Y_0(0) = -Infinity, but every other order diverges as
+    // ComplexInfinity (the numeric series would give NaN/0 there). The n = 0
+    // case falls through to bessel_y, which returns -Infinity.
+    if z == 0.0 && n != 0.0 {
+      return Ok(id_expr("ComplexInfinity"));
+    }
+    let result = bessel_y(n, z);
+    return Ok(Expr::Real(result));
+  }
+
+  // Closed-form rules at half-integer orders.
+  // Y_{m/2}(z) = -(-1)^k * J_{-m/2}(z) where k = (m-1)/2,
+  // derived from Y_n = (J_n cos(n*Pi) - J_{-n}) / sin(n*Pi) at n = m/2.
+  // We bake the sign into J_{-m/2}'s inner polynomial so the result
+  // displays as Sqrt[2/Pi] * P / Sqrt[z] without an outer negation
+  // wrapper (matching wolframscript).
+  if let Some((n_num, n_den)) = expr_to_rational(n_expr)
+    && n_den == 2
+    && (n_num.unsigned_abs() <= 51)
+    && (-n_num) % 2 != 0
+    && try_eval_to_f64(z_expr).is_none()
+  {
+    let k = (n_num - 1).div_euclid(2);
+    let sign: i128 = if k.rem_euclid(2) == 0 { -1 } else { 1 };
+    let p =
+      half_int_bessel_polynomial(-n_num, z_expr, "Sin", "Cos", BesselSign::J)?;
+    let p_signed = if sign < 0 {
+      crate::evaluator::evaluate_expr_to_expr(&call(
+        "Times",
+        vec![Expr::Integer(-1), p],
+      ))?
+    } else {
+      p
+    };
+    return wrap_with_sqrt_factor(&p_signed, z_expr);
+  }
+
+  // Negative integer order: Y_{-n}(z) = (-1)^n * Y_n(z).
+  if let Expr::Integer(n) = n_expr
+    && *n < 0
+  {
+    let pos_n = -n;
+    let positive_call =
+      call("BesselY", vec![Expr::Integer(pos_n), z_expr.clone()]);
+    return if pos_n.unsigned_abs() & 1 == 0 {
+      Ok(positive_call)
+    } else {
+      crate::evaluator::evaluate_expr_to_expr(&call(
+        "Times",
+        vec![Expr::Integer(-1), positive_call],
+      ))
+    };
+  }
+
+  Ok(unevaluated("BesselY", args))
+}
+
+/// Compute Bessel Y_n(z) (second kind)
+pub fn bessel_y(n: f64, z: f64) -> f64 {
+  // Handle negative integer orders: Y_{-n}(z) = (-1)^n * Y_n(z)
+  if n < 0.0 && n == n.floor() {
+    let n_abs = -n;
+    let sign = if n_abs as i64 % 2 == 0 { 1.0 } else { -1.0 };
+    return sign * bessel_y(n_abs, z);
+  }
+
+  if n == n.floor() && n >= 0.0 {
+    // Integer order: use Y_0, Y_1 from series, then recurrence
+    let n_int = n as i64;
+    let y0 = bessel_y0(z);
+    if n_int == 0 {
+      return y0;
+    }
+    let y1 = bessel_y1(z);
+    if n_int == 1 {
+      return y1;
+    }
+    // Recurrence: Y_{n+1}(z) = (2n/z) * Y_n(z) - Y_{n-1}(z)
+    let mut y_prev = y0;
+    let mut y_curr = y1;
+    for k in 1..n_int {
+      let y_next = (2.0 * k as f64 / z) * y_curr - y_prev;
+      y_prev = y_curr;
+      y_curr = y_next;
+    }
+    y_curr
+  } else {
+    // Non-integer order: Y_n(z) = (J_n(z)*cos(nπ) - J_{-n}(z)) / sin(nπ)
+    let j_n = bessel_j(n, z);
+    let j_neg_n = bessel_j(-n, z);
+    let n_pi = n * std::f64::consts::PI;
+    (j_n * n_pi.cos() - j_neg_n) / n_pi.sin()
+  }
+}
+
+/// Y_0(z) = (2/π) * (J_0(z) * (ln(z/2) + γ) + Σ (-1)^{m+1} H_m * (z/2)^{2m} / (m!)^2)
+fn bessel_y0(z: f64) -> f64 {
+  let two_over_pi = 2.0 / std::f64::consts::PI;
+  let euler_gamma = 0.5772156649015329;
+  let half_z = z / 2.0;
+
+  let j0 = bessel_j(0.0, z);
+
+  // Series part: Σ_{m=1}^{∞} (-1)^{m+1} * H_m * (z/2)^{2m} / (m!)^2
+  let mut series_sum = 0.0;
+  let mut term = 1.0; // (z/2)^{2m} / (m!)^2 starting value
+  let mut h_m = 0.0; // harmonic number H_m
+
+  for m in 1..300 {
+    let mf = m as f64;
+    h_m += 1.0 / mf;
+    term *= half_z * half_z / (mf * mf);
+    let sign = if m % 2 == 0 { -1.0 } else { 1.0 };
+    series_sum += sign * h_m * term;
+    if (h_m * term).abs() < 1e-17 * series_sum.abs().max(1e-300) {
+      break;
+    }
+  }
+
+  two_over_pi * (j0 * (half_z.ln() + euler_gamma) + series_sum)
+}
+
+/// Y_1(z) = (2/π) * (J_1(z) * ln(z/2) - 1/z + Σ ...)
+fn bessel_y1(z: f64) -> f64 {
+  let two_over_pi = 2.0 / std::f64::consts::PI;
+  let euler_gamma = 0.5772156649015329;
+  let half_z = z / 2.0;
+
+  let j1 = bessel_j(1.0, z);
+
+  // Y_1(z) = (2/π) * (J_1(z)*(ln(z/2) + γ) - 1/z - (1/2) Σ_{m=0}^∞ (-1)^m (H_m + H_{m+1}) (z/2)^{2m+1} / (m!(m+1)!))
+  let mut series_sum = 0.0;
+  let mut term = half_z; // (z/2)^{2m+1} / (m! * (m+1)!) starting with m=0: (z/2)^1 / (0! * 1!) = z/2
+  let mut h_m = 0.0; // H_0 = 0
+  let mut h_m1 = 1.0; // H_1 = 1
+
+  series_sum += (h_m + h_m1) * term; // m=0 term (sign = +1 for (-1)^0)
+
+  for m in 1..300 {
+    let mf = m as f64;
+    h_m += 1.0 / mf;
+    h_m1 += 1.0 / (mf + 1.0);
+    term *= -half_z * half_z / (mf * (mf + 1.0));
+    series_sum += (h_m + h_m1) * term;
+    if ((h_m + h_m1) * term).abs() < 1e-17 * series_sum.abs().max(1e-300) {
+      break;
+    }
+  }
+
+  two_over_pi
+    * (j1 * ((half_z).ln() + euler_gamma) - 1.0 / z - 0.5 * series_sum)
+}
+
+/// SphericalBesselJ[n, z] — spherical Bessel function of the first kind.
+/// SphericalBesselJ[n, z] = Sqrt[Pi/(2z)] * BesselJ[n + 1/2, z]
+/// The four Coulomb wave functions, distinguished only by which spherical
+/// function they reduce to at eta == 0 and the leading coefficient.
+#[derive(Clone, Copy)]
+enum CoulombKind {
+  F,
+  G,
+  H1,
+  H2,
+}
+
+/// CoulombF/G/H1/H2[L, eta, z]. At eta == 0 the Coulomb wave functions reduce
+/// to spherical Bessel/Hankel functions, matching wolframscript:
+///   CoulombF[L, 0, z]  =  z SphericalBesselJ[L, z]      (= Sin[z]    at L == 0)
+///   CoulombG[L, 0, z]  = -z SphericalBesselY[L, z]      (= Cos[z]    at L == 0)
+///   CoulombH1[L, 0, z] = I z SphericalHankelH1[L, z]    (= E^(I z)   at L == 0)
+///   CoulombH2[L, 0, z] = -I z SphericalHankelH2[L, z]   (= E^(-I z)  at L == 0)
+/// Nonzero eta (the genuine Coulomb regime) is left unevaluated, as wolframscript
+/// keeps it symbolic.
+pub fn coulomb_f_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  coulomb_wave_reduce(args, CoulombKind::F)
+}
+
+pub fn coulomb_g_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  coulomb_wave_reduce(args, CoulombKind::G)
+}
+
+pub fn coulomb_h1_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  coulomb_wave_reduce(args, CoulombKind::H1)
+}
+
+pub fn coulomb_h2_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  coulomb_wave_reduce(args, CoulombKind::H2)
+}
+
+fn coulomb_wave_reduce(
+  args: &[Expr],
+  kind: CoulombKind,
+) -> Result<Expr, InterpreterError> {
+  let name = match kind {
+    CoulombKind::F => "CoulombF",
+    CoulombKind::G => "CoulombG",
+    CoulombKind::H1 => "CoulombH1",
+    CoulombKind::H2 => "CoulombH2",
+  };
+  let uneval = || Ok(unevaluated(name, args));
+  if args.len() != 3 {
+    return uneval();
+  }
+  let (l, eta, z) = (&args[0], &args[1], &args[2]);
+  // The elementary reduction only applies at eta == 0.
+  let eta_zero = matches!(eta, Expr::Integer(0))
+    || matches!(eta, Expr::Real(f) if *f == 0.0);
+  if !eta_zero {
+    // Nonzero eta (the genuine Coulomb regime). With a non-negative integer
+    // order and numeric arguments (at least one inexact), evaluate numerically.
+    // The regular F uses its confluent-hypergeometric form; the irregular G and
+    // the outgoing/incoming H1/H2 derive from the outgoing wave
+    //   H+ = (-i)^L e^(pi eta/2) e^(i sigma_L) W_{-i eta, L+1/2}(-2 i rho)
+    // with sigma_L = Arg[Gamma[L+1+i eta]]. Then G = Re(H+), H1 = H+,
+    // H2 = Conjugate(H+).
+    if let Some(l_int) = expr_to_i128(l)
+      && l_int >= 0
+      && (contains_inexact_real(eta) || contains_inexact_real(z))
+      && try_eval_to_f64(eta).is_some()
+      && try_eval_to_f64(z).is_some()
+    {
+      return match kind {
+        CoulombKind::F => coulomb_f_numeric(l_int, eta, z),
+        CoulombKind::G => {
+          let hplus = coulomb_hplus_expr(l_int, eta, z);
+          crate::evaluator::evaluate_expr_to_expr(&call1("Re", hplus))
+        }
+        CoulombKind::H1 => crate::evaluator::evaluate_expr_to_expr(
+          &coulomb_hplus_expr(l_int, eta, z),
+        ),
+        CoulombKind::H2 => {
+          let hplus = coulomb_hplus_expr(l_int, eta, z);
+          crate::evaluator::evaluate_expr_to_expr(&call1("Conjugate", hplus))
+        }
+      };
+    }
+    return uneval();
+  }
+  let i_unit = || id_expr("I");
+  // L == 0: the spherical functions collapse to elementary form.
+  if matches!(l, Expr::Integer(0)) {
+    let elem = match kind {
+      CoulombKind::F => call1("Sin", z.clone()),
+      CoulombKind::G => call1("Cos", z.clone()),
+      // E^(I z) and E^(-I z).
+      CoulombKind::H1 => call1("Exp", call("Times", vec![i_unit(), z.clone()])),
+      CoulombKind::H2 => call1(
+        "Exp",
+        call("Times", vec![Expr::Integer(-1), i_unit(), z.clone()]),
+      ),
+    };
+    return crate::evaluator::evaluate_expr_to_expr(&elem);
+  }
+  // General order: (coefficient) * z * SphericalXxx[L, z].
+  let sph_name = match kind {
+    CoulombKind::F => "SphericalBesselJ",
+    CoulombKind::G => "SphericalBesselY",
+    CoulombKind::H1 => "SphericalHankelH1",
+    CoulombKind::H2 => "SphericalHankelH2",
+  };
+  let sph = call(sph_name, vec![l.clone(), z.clone()]);
+  // Leading factors before z: F -> none, G -> -1, H1 -> I, H2 -> -I.
+  let mut factors: Vec<Expr> = match kind {
+    CoulombKind::F => vec![],
+    CoulombKind::G => vec![Expr::Integer(-1)],
+    CoulombKind::H1 => vec![i_unit()],
+    CoulombKind::H2 => vec![Expr::Integer(-1), i_unit()],
+  };
+  factors.push(z.clone());
+  factors.push(sph);
+  let result = call("Times", factors);
+  crate::evaluator::evaluate_expr_to_expr(&result)
+}
+
+/// The outgoing Coulomb wave H+_L(eta, rho) = G_L + i F_L, as an (unevaluated)
+/// expression:
+///   H+ = (-i)^L e^(pi eta/2) e^(i sigma_L) W_{-i eta, L+1/2}(-2 i rho)
+/// with sigma_L = Arg[Gamma[L+1+i eta]] the Coulomb phase shift. G = Re(H+),
+/// H1 = H+, H2 = Conjugate(H+). Uses the evaluator's complex WhittakerW/Gamma.
+fn coulomb_hplus_expr(l: i128, eta: &Expr, rho: &Expr) -> Expr {
+  let i_unit = id_expr("I");
+  // (-i)^L
+  let neg_i_pow = pow(
+    call("Times", vec![Expr::Integer(-1), i_unit.clone()]),
+    Expr::Integer(l),
+  );
+  // e^(pi eta / 2)
+  let exp_norm = call1(
+    "Exp",
+    call(
+      "Times",
+      vec![
+        call("Rational", vec![Expr::Integer(1), Expr::Integer(2)]),
+        const_expr("Pi"),
+        eta.clone(),
+      ],
+    ),
+  );
+  // e^(i sigma_L), sigma_L = Arg[Gamma[L+1 + i eta]]
+  let sigma = call1(
+    "Arg",
+    call1(
+      "Gamma",
+      call(
+        "Plus",
+        vec![
+          Expr::Integer(l + 1),
+          call("Times", vec![i_unit.clone(), eta.clone()]),
+        ],
+      ),
+    ),
+  );
+  let exp_phase = call1("Exp", call("Times", vec![i_unit.clone(), sigma]));
+  // WhittakerW[-i eta, L+1/2, -2 i rho]
+  let whittaker = call(
+    "WhittakerW",
+    vec![
+      call(
+        "Times",
+        vec![Expr::Integer(-1), i_unit.clone(), eta.clone()],
+      ),
+      call(
+        "Plus",
+        vec![
+          Expr::Integer(l),
+          call("Rational", vec![Expr::Integer(1), Expr::Integer(2)]),
+        ],
+      ),
+      call("Times", vec![Expr::Integer(-2), i_unit, rho.clone()]),
+    ],
+  );
+  call("Times", vec![neg_i_pow, exp_norm, exp_phase, whittaker])
+}
+
+/// Numeric CoulombF[L, eta, rho] for a non-negative integer order L and real
+/// eta, rho (at least one inexact), using the confluent-hypergeometric form
+///   F_L(eta, rho) = C_L(eta) rho^(L+1) e^(-i rho) 1F1(L+1-i eta; 2L+2; 2 i rho)
+///   C_L(eta) = 2^L e^(-pi eta/2) |Gamma[L+1+i eta]| / Gamma[2L+2]
+/// The imaginary parts cancel, so the real part is taken. The expression is
+/// assembled and handed to the evaluator, which already carries complex Gamma
+/// and Hypergeometric1F1.
+fn coulomb_f_numeric(
+  l: i128,
+  eta: &Expr,
+  rho: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let i_unit = id_expr("I");
+  let l1 = Expr::Integer(l + 1);
+  let two_l2 = Expr::Integer(2 * l + 2);
+
+  // C_L(eta) factors.
+  let two_pow_l = pow(Expr::Integer(2), Expr::Integer(l));
+  // e^(-pi eta / 2)
+  let exp_norm = call1(
+    "Exp",
+    call(
+      "Times",
+      vec![
+        call("Rational", vec![Expr::Integer(-1), Expr::Integer(2)]),
+        const_expr("Pi"),
+        eta.clone(),
+      ],
+    ),
+  );
+  // |Gamma[L+1 + i eta]|
+  let abs_gamma = call1(
+    "Abs",
+    call1(
+      "Gamma",
+      call(
+        "Plus",
+        vec![l1.clone(), call("Times", vec![i_unit.clone(), eta.clone()])],
+      ),
+    ),
+  );
+  let inv_gamma_2l2 = pow(call1("Gamma", two_l2.clone()), Expr::Integer(-1));
+
+  // rho^(L+1) e^(-i rho) 1F1(L+1 - i eta; 2L+2; 2 i rho)
+  let rho_pow = pow(rho.clone(), l1.clone());
+  let exp_rho = call1(
+    "Exp",
+    call(
+      "Times",
+      vec![Expr::Integer(-1), i_unit.clone(), rho.clone()],
+    ),
+  );
+  let hyp = call(
+    "Hypergeometric1F1",
+    vec![
+      call(
+        "Plus",
+        vec![
+          l1,
+          call(
+            "Times",
+            vec![Expr::Integer(-1), i_unit.clone(), eta.clone()],
+          ),
+        ],
+      ),
+      two_l2,
+      call("Times", vec![Expr::Integer(2), i_unit, rho.clone()]),
+    ],
+  );
+
+  let product = call(
+    "Times",
+    vec![
+      two_pow_l,
+      exp_norm,
+      abs_gamma,
+      inv_gamma_2l2,
+      rho_pow,
+      exp_rho,
+      hyp,
+    ],
+  );
+  crate::evaluator::evaluate_expr_to_expr(&call1("Re", product))
+}
+
+pub fn spherical_bessel_j_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("SphericalBesselJ", args));
+  }
+
+  let n_expr = &args[0];
+  let z_expr = &args[1];
+
+  // Handle z = 0 case: SphericalBesselJ[0, 0] = 1, SphericalBesselJ[n, 0] = 0 for n > 0
+  if matches!(z_expr, Expr::Integer(0))
+    && let Some(n) = expr_to_i128(n_expr)
+  {
+    if n == 0 {
+      return Ok(Expr::Integer(1));
+    } else if n > 0 {
+      return Ok(Expr::Integer(0));
+    }
+  }
+
+  // For numeric evaluation, compute Sqrt[Pi/(2z)] * BesselJ[n + 1/2, z]
+  let has_real =
+    matches!(n_expr, Expr::Real(_)) || matches!(z_expr, Expr::Real(_));
+  let n_f64 = try_eval_to_f64(n_expr);
+  let z_f64 = try_eval_to_f64(z_expr);
+
+  // For a non-negative integer order with a real argument, evaluate the exact
+  // elementary closed form rather than routing through the half-integer Bessel
+  // series (which loses several ULPs even for n = 0). Spherical Bessel
+  // functions of the first kind satisfy
+  //   j_0(z) = Sin[z]/z,  j_1(z) = Sin[z]/z^2 - Cos[z]/z,
+  //   j_{k+1}(z) = (2k+1)/z * j_k(z) - j_{k-1}(z),
+  // so the upward recurrence reproduces wolframscript's value to machine
+  // precision in the well-conditioned regime.
+  if has_real
+    && let (Some(n_val), Some(z_val)) = (n_f64, z_f64)
+    && n_val >= 0.0
+    && n_val.fract() == 0.0
+    && z_val != 0.0
+  {
+    let s = z_val.sin();
+    let c = z_val.cos();
+    let result = if n_val == 0.0 {
+      s / z_val
+    } else {
+      let mut j_prev = s / z_val; // j_0
+      let mut j_curr = s / (z_val * z_val) - c / z_val; // j_1
+      for k in 1..(n_val as u32) {
+        let j_next = (2 * k + 1) as f64 / z_val * j_curr - j_prev;
+        j_prev = j_curr;
+        j_curr = j_next;
+      }
+      j_curr
+    };
+    return Ok(Expr::Real(result));
+  }
+
+  if has_real && let (Some(n_val), Some(z_val)) = (n_f64, z_f64) {
+    let bessel_result = crate::evaluator::evaluate_expr_to_expr(&call(
+      "BesselJ",
+      vec![Expr::Real(n_val + 0.5), Expr::Real(z_val)],
+    ))?;
+    if let Some(bj) = try_eval_to_f64(&bessel_result) {
+      let result = (std::f64::consts::PI / (2.0 * z_val)).sqrt() * bj;
+      return Ok(Expr::Real(result));
+    }
+  }
+
+  // Return unevaluated for symbolic case
+  Ok(unevaluated("SphericalBesselJ", args))
+}
+
+/// Helper to build a Hankel-type function from two Bessel-type results
+fn build_hankel(
+  name: &str,
+  j_name: &str,
+  y_name: &str,
+  sign: i128,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(format!(
+      "{name} expects exactly 2 arguments"
+    )));
+  }
+  // Try numeric evaluation: compute BesselJ + sign*I*BesselY
+  let j_result =
+    crate::evaluator::evaluate_expr_to_expr(&call(j_name, args.to_vec()))?;
+  let y_result =
+    crate::evaluator::evaluate_expr_to_expr(&call(y_name, args.to_vec()))?;
+  // Only proceed if both evaluated to numbers
+  let j_val = try_eval_to_f64(&j_result);
+  let y_val = try_eval_to_f64(&y_result);
+  if let (Some(j), Some(y)) = (j_val, y_val)
+    && j.is_finite()
+    && y.is_finite()
+  {
+    let expr = call(
+      "Plus",
+      vec![
+        Expr::Real(j),
+        call(
+          "Times",
+          vec![
+            call("Complex", vec![Expr::Integer(0), Expr::Integer(sign)]),
+            Expr::Real(y),
+          ],
+        ),
+      ],
+    );
+    return crate::evaluator::evaluate_expr_to_expr(&expr);
+  }
+  Ok(unevaluated(name, args))
+}
+
+/// SphericalBesselY[n, z] — spherical Bessel function of the second kind.
+/// For non-negative integer `n` and positive real `z`, evaluate via the
+/// closed-form base cases and the standard upward three-term recurrence
+///   y_{n+1}(x) = (2n+1)/x · y_n(x) - y_{n-1}(x)
+/// with y_0(x) = -cos(x)/x, y_1(x) = -sin(x)/x - cos(x)/x^2.
+/// Falls back to Sqrt[Pi/(2z)] * BesselY[n + 1/2, z] for non-integer `n`.
+pub fn spherical_bessel_y_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("SphericalBesselY", args));
+  }
+
+  let n_expr = &args[0];
+  let z_expr = &args[1];
+
+  let has_real =
+    matches!(n_expr, Expr::Real(_)) || matches!(z_expr, Expr::Real(_));
+  let z_f64 = try_eval_to_f64(z_expr);
+
+  // Integer-order direct evaluation (more accurate than the BesselY route).
+  if has_real
+    && let Some(n) = expr_to_i128(n_expr)
+    && n >= 0
+    && let Some(z) = z_f64
+    && z > 0.0
+  {
+    let s = z.sin();
+    let c = z.cos();
+    let mut prev = -c / z; // y_0
+    let mut curr = -s / z - c / (z * z); // y_1
+    if n == 0 {
+      return Ok(Expr::Real(prev));
+    }
+    if n == 1 {
+      return Ok(Expr::Real(curr));
+    }
+    for k in 1..n {
+      let next = (2.0 * k as f64 + 1.0) / z * curr - prev;
+      prev = curr;
+      curr = next;
+    }
+    return Ok(Expr::Real(curr));
+  }
+
+  // Fallback: Sqrt[Pi/(2z)] * BesselY[n + 1/2, z] for non-integer order.
+  let n_f64 = try_eval_to_f64(n_expr);
+  if has_real
+    && let (Some(n_val), Some(z_val)) = (n_f64, z_f64)
+    && z_val > 0.0
+  {
+    let bessel_result = crate::evaluator::evaluate_expr_to_expr(&call(
+      "BesselY",
+      vec![Expr::Real(n_val + 0.5), Expr::Real(z_val)],
+    ))?;
+    if let Some(by) = try_eval_to_f64(&bessel_result) {
+      let result = (std::f64::consts::PI / (2.0 * z_val)).sqrt() * by;
+      return Ok(Expr::Real(result));
+    }
+  }
+
+  // Return unevaluated for symbolic case
+  Ok(unevaluated("SphericalBesselY", args))
+}
+
+/// HankelH1[n, z] = BesselJ[n, z] + I * BesselY[n, z]
+pub fn hankel_h1_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  build_hankel("HankelH1", "BesselJ", "BesselY", 1, args)
+}
+
+/// HankelH2[n, z] = BesselJ[n, z] - I * BesselY[n, z]
+pub fn hankel_h2_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  build_hankel("HankelH2", "BesselJ", "BesselY", -1, args)
+}
+
+/// SphericalHankelH1[n, z] = SphericalBesselJ[n, z] + I * SphericalBesselY[n, z]
+pub fn spherical_hankel_h1_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  build_hankel(
+    "SphericalHankelH1",
+    "SphericalBesselJ",
+    "SphericalBesselY",
+    1,
+    args,
+  )
+}
+
+/// SphericalHankelH2[n, z] = SphericalBesselJ[n, z] - I * SphericalBesselY[n, z]
+pub fn spherical_hankel_h2_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  build_hankel(
+    "SphericalHankelH2",
+    "SphericalBesselJ",
+    "SphericalBesselY",
+    -1,
+    args,
+  )
+}
+
+// ─── Kelvin functions ─────────────────────────────────────────────────
+// Defined via BesselJ on a rotated argument:
+//   ber(x) + I·bei(x) = BesselJ[0, x·e^(3 Pi I/4)]
+//   ker(x) + I·kei(x) = e^(-Pi·I/2)·BesselK[0, x·e^(Pi I/4)]
+// The real-valued series for ber and bei are used directly.
+
+/// Real-valued `ber(x)` via its power series.
+fn ber_series(x: f64) -> f64 {
+  let u = (x * 0.5) * (x * 0.5);
+  let mut term = 1.0; // k=0 term
+  let mut sum = term;
+  for k in 1..200usize {
+    let k2 = (2 * k) as f64;
+    term *= -u * u / ((k2 - 1.0) * k2 * (k2 - 1.0) * k2);
+    sum += term;
+    if term.abs() < 1e-18 * sum.abs().max(1.0) {
+      break;
+    }
+  }
+  sum
+}
+
+/// Real-valued `bei(x)` via its power series.
+fn bei_series(x: f64) -> f64 {
+  let u = (x * 0.5) * (x * 0.5);
+  let mut term = u; // k=0 term = (x/2)^2
+  let mut sum = term;
+  for k in 1..200usize {
+    let k2 = (2 * k) as f64;
+    term *= -u * u / (k2 * (k2 + 1.0) * k2 * (k2 + 1.0));
+    sum += term;
+    if term.abs() < 1e-18 * sum.abs().max(1.0) {
+      break;
+    }
+  }
+  sum
+}
+
+/// Complex-valued `ber(z)` via its power series; same series as the real
+/// version but with complex arithmetic.
+fn ber_series_complex(re: f64, im: f64) -> (f64, f64) {
+  let half_re = re * 0.5;
+  let half_im = im * 0.5;
+  // u = (z/2)^2
+  let u_re = half_re * half_re - half_im * half_im;
+  let u_im = 2.0 * half_re * half_im;
+  // u_sq = (z/2)^4
+  let u_sq_re = u_re * u_re - u_im * u_im;
+  let u_sq_im = 2.0 * u_re * u_im;
+
+  let mut term_re = 1.0_f64; // k=0 term = 1
+  let mut term_im = 0.0_f64;
+  let mut sum_re = term_re;
+  let mut sum_im = term_im;
+  for k in 1..200usize {
+    let k2 = (2 * k) as f64;
+    let denom = (k2 - 1.0) * k2 * (k2 - 1.0) * k2;
+    let factor = -1.0 / denom;
+    let new_re = (term_re * u_sq_re - term_im * u_sq_im) * factor;
+    let new_im = (term_re * u_sq_im + term_im * u_sq_re) * factor;
+    term_re = new_re;
+    term_im = new_im;
+    sum_re += term_re;
+    sum_im += term_im;
+    let term_mag2 = term_re * term_re + term_im * term_im;
+    let sum_mag2 = sum_re * sum_re + sum_im * sum_im;
+    if term_mag2 < 1e-36 * sum_mag2.max(1.0) {
+      break;
+    }
+  }
+  (sum_re, sum_im)
+}
+
+/// Complex-valued `bei(z)` via its power series; same series as the real
+/// version but with complex arithmetic.
+fn bei_series_complex(re: f64, im: f64) -> (f64, f64) {
+  let half_re = re * 0.5;
+  let half_im = im * 0.5;
+  // u = (z/2)^2
+  let u_re = half_re * half_re - half_im * half_im;
+  let u_im = 2.0 * half_re * half_im;
+  // u_sq = (z/2)^4
+  let u_sq_re = u_re * u_re - u_im * u_im;
+  let u_sq_im = 2.0 * u_re * u_im;
+
+  let mut term_re = u_re; // k=0 term = (z/2)^2
+  let mut term_im = u_im;
+  let mut sum_re = term_re;
+  let mut sum_im = term_im;
+  for k in 1..200usize {
+    let k2 = (2 * k) as f64;
+    let denom = k2 * (k2 + 1.0) * k2 * (k2 + 1.0);
+    let factor = -1.0 / denom;
+    let new_re = (term_re * u_sq_re - term_im * u_sq_im) * factor;
+    let new_im = (term_re * u_sq_im + term_im * u_sq_re) * factor;
+    term_re = new_re;
+    term_im = new_im;
+    sum_re += term_re;
+    sum_im += term_im;
+    let term_mag2 = term_re * term_re + term_im * term_im;
+    let sum_mag2 = sum_re * sum_re + sum_im * sum_im;
+    if term_mag2 < 1e-36 * sum_mag2.max(1.0) {
+      break;
+    }
+  }
+  (sum_re, sum_im)
+}
+
+/// 2-arg `ber_ν(x)`/`bei_ν(x)` via the series:
+///   J_ν(x e^{3πI/4}) = (x/2)^ν e^{3πIν/4} Σ_{k≥0} (-1)^k (x/2)^{2k}/(k! Γ(ν+k+1)) e^{3πIk/2}
+/// Splitting the inner sum by `k mod 2` into real/imaginary parts gives:
+///   ber_ν(x) = (x/2)^ν (cos(3πν/4) S_re - sin(3πν/4) S_im)
+///   bei_ν(x) = (x/2)^ν (sin(3πν/4) S_re + cos(3πν/4) S_im)
+/// where
+///   S_re = Σ_{m≥0} (-1)^m (x/2)^{4m} / ((2m)! Γ(ν+2m+1))
+///   S_im = Σ_{m≥0} (-1)^m (x/2)^{4m+2} / ((2m+1)! Γ(ν+2m+2))
+fn ber_bei_nu_series(nu: f64, x: f64) -> (f64, f64) {
+  use std::f64::consts::PI;
+  let half = x * 0.5;
+  let half2 = half * half;
+  let half4 = half2 * half2;
+
+  let mut s_re = 0.0_f64;
+  let mut s_im = 0.0_f64;
+  // term_re: (x/2)^(4m) / ((2m)! Γ(ν+2m+1))
+  // term_im: (x/2)^(4m+2) / ((2m+1)! Γ(ν+2m+2))
+  let mut term_re = (-ln_gamma(nu + 1.0)).exp(); // m=0
+  let mut term_im = half2 * (-ln_gamma(nu + 2.0)).exp(); // m=0
+  s_re += term_re;
+  s_im += term_im;
+  for m in 1..200usize {
+    let m2 = (2 * m) as f64;
+    let m2p1 = (2 * m + 1) as f64;
+    // term_re_m = -term_re_{m-1} * half4 / ((2m-1)*(2m)*(ν+2m-1)*(ν+2m))
+    term_re *= -half4 / (m2 * (m2 - 1.0) * (nu + m2 - 1.0) * (nu + m2));
+    // term_im_m = -term_im_{m-1} * half4 / ((2m)*(2m+1)*(ν+2m)*(ν+2m+1))
+    term_im *= -half4 / (m2 * m2p1 * (nu + m2) * (nu + m2p1));
+    s_re += term_re;
+    s_im += term_im;
+    if term_re.abs() < 1e-18 * s_re.abs().max(1.0)
+      && term_im.abs() < 1e-18 * s_im.abs().max(1.0)
+    {
+      break;
+    }
+  }
+  let pref = half.powf(nu);
+  let theta = 0.75 * PI * nu;
+  let c = theta.cos();
+  let s = theta.sin();
+  let ber = pref * (c * s_re - s * s_im);
+  let bei = pref * (s * s_re + c * s_im);
+  (ber, bei)
+}
+
+/// KelvinBer[x] - real part of BesselJ[0, x·e^(3πI/4)].
+pub fn kelvin_ber_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if !(args.len() == 1 || args.len() == 2) {
+    return Err(InterpreterError::EvaluationError(
+      "KelvinBer expects 1 or 2 arguments".into(),
+    ));
+  }
+  if args.len() == 2 {
+    let nu = match &args[0] {
+      Expr::Integer(n) => Some(*n as f64),
+      Expr::Real(f) => Some(*f),
+      _ => None,
+    };
+    let x = match &args[1] {
+      Expr::Integer(n) if *n > 0 => Some(*n as f64),
+      Expr::Real(f) if *f > 0.0 => Some(*f),
+      _ => None,
+    };
+    // Only numericize when an argument is inexact (a Real). With exact integer
+    // / symbolic arguments wolframscript keeps the symbolic two-argument form.
+    let any_real =
+      matches!(&args[0], Expr::Real(_)) || matches!(&args[1], Expr::Real(_));
+    if any_real && let (Some(nu), Some(x)) = (nu, x) {
+      let (ber, _) = ber_bei_nu_series(nu, x);
+      return Ok(Expr::Real(ber));
+    }
+    return Ok(unevaluated("KelvinBer", args));
+  }
+  if let Some(x) = match &args[0] {
+    Expr::Real(f) => Some(*f),
+    _ => None,
+  } {
+    return Ok(Expr::Real(ber_series(x)));
+  }
+  if let Some((re, im)) = try_extract_complex_f64(&args[0])
+    && im != 0.0
+  {
+    let (rr, ri) = ber_series_complex(re, im);
+    return Ok(build_complex_float_expr(rr, ri));
+  }
+  // KelvinBer[z] = KelvinBer[0, z] for exact/symbolic z (matches wolframscript).
+  Ok(call("KelvinBer", vec![Expr::Integer(0), args[0].clone()]))
+}
+
+/// KelvinBei[x] - imaginary part of BesselJ[0, x·e^(3πI/4)].
+pub fn kelvin_bei_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if !(args.len() == 1 || args.len() == 2) {
+    return Err(InterpreterError::EvaluationError(
+      "KelvinBei expects 1 or 2 arguments".into(),
+    ));
+  }
+  if args.len() == 2 {
+    let nu = match &args[0] {
+      Expr::Integer(n) => Some(*n as f64),
+      Expr::Real(f) => Some(*f),
+      _ => None,
+    };
+    let x = match &args[1] {
+      Expr::Integer(n) if *n > 0 => Some(*n as f64),
+      Expr::Real(f) if *f > 0.0 => Some(*f),
+      _ => None,
+    };
+    // Only numericize when an argument is inexact (a Real). With exact integer
+    // / symbolic arguments wolframscript keeps the symbolic two-argument form.
+    let any_real =
+      matches!(&args[0], Expr::Real(_)) || matches!(&args[1], Expr::Real(_));
+    if any_real && let (Some(nu), Some(x)) = (nu, x) {
+      let (_, bei) = ber_bei_nu_series(nu, x);
+      return Ok(Expr::Real(bei));
+    }
+    return Ok(unevaluated("KelvinBei", args));
+  }
+  if let Some(x) = match &args[0] {
+    Expr::Real(f) => Some(*f),
+    _ => None,
+  } {
+    return Ok(Expr::Real(bei_series(x)));
+  }
+  if let Some((re, im)) = try_extract_complex_f64(&args[0])
+    && im != 0.0
+  {
+    let (rr, ri) = bei_series_complex(re, im);
+    return Ok(build_complex_float_expr(rr, ri));
+  }
+  // KelvinBei[z] = KelvinBei[0, z] for exact/symbolic z (matches wolframscript).
+  Ok(call("KelvinBei", vec![Expr::Integer(0), args[0].clone()]))
+}
+
+/// Real-valued `ker(x)` via the standard power series (DLMF 10.65.6).
+///   ker(x) = -[γ + ln(x/2)] ber(x) + (π/4) bei(x)
+///          + Σ_{k=1..} (-1)^k φ(2k) (x/2)^(4k) / ((2k)!)^2
+/// where φ(n) = 1 + 1/2 + … + 1/n.
+fn ker_series(x: f64) -> f64 {
+  use std::f64::consts::PI;
+  let euler_gamma = 0.5772156649015329_f64;
+  let half = x * 0.5;
+  let half2 = half * half;
+  let mut total =
+    -(euler_gamma + (half).ln()) * ber_series(x) + (PI / 4.0) * bei_series(x);
+  // k = 1..∞: term_k = (-1)^k * φ(2k) * half^(4k) / ((2k)!)^2
+  let mut phi = 0.0_f64; // φ(0)
+  let mut fact_sq = 1.0_f64; // ((2*0)!)^2 = 1
+  let mut half_pow = 1.0_f64; // half^(4*0)
+  for k in 1..200usize {
+    // accumulate φ(2k-1), φ(2k)
+    let n2m1 = (2 * k - 1) as f64;
+    let n2 = (2 * k) as f64;
+    phi += 1.0 / n2m1 + 1.0 / n2;
+    fact_sq *= n2m1 * n2 * n2m1 * n2; // ((2k)!)^2 / ((2k-2)!)^2
+    half_pow *= half2 * half2;
+    let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+    let term = sign * phi * half_pow / fact_sq;
+    total += term;
+    if term.abs() < 1e-18 * total.abs().max(1.0) {
+      break;
+    }
+  }
+  total
+}
+
+/// Real-valued `kei(x)` via the standard power series (DLMF 10.65.7).
+///   kei(x) = -[γ + ln(x/2)] bei(x) - (π/4) ber(x)
+///          + Σ_{k=0..} (-1)^k φ(2k+1) (x/2)^(4k+2) / ((2k+1)!)^2
+fn kei_series(x: f64) -> f64 {
+  use std::f64::consts::PI;
+  let euler_gamma = 0.5772156649015329_f64;
+  let half = x * 0.5;
+  let half2 = half * half;
+  let mut total =
+    -(euler_gamma + (half).ln()) * bei_series(x) - (PI / 4.0) * ber_series(x);
+  // k = 0..∞: term_k = (-1)^k * φ(2k+1) * half^(4k+2) / ((2k+1)!)^2
+  let mut phi = 1.0_f64; // φ(1)
+  let mut fact_sq = 1.0_f64; // ((2*0+1)!)^2 = 1
+  let mut half_pow = half2; // half^(4*0+2)
+  total += phi * half_pow / fact_sq;
+  for k in 1..200usize {
+    let n2 = (2 * k) as f64;
+    let n2p1 = (2 * k + 1) as f64;
+    phi += 1.0 / n2 + 1.0 / n2p1;
+    fact_sq *= n2 * n2p1 * n2 * n2p1; // ((2k+1)!)^2 / ((2k-1)!)^2
+    half_pow *= half2 * half2;
+    let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+    let term = sign * phi * half_pow / fact_sq;
+    total += term;
+    if term.abs() < 1e-18 * total.abs().max(1.0) {
+      break;
+    }
+  }
+  total
+}
+
+/// Complex-valued `ker(z)` via the same series as the real version. The
+/// log term becomes complex via `Log[r] + I·θ`; the rest is straight
+/// complex arithmetic.
+fn ker_series_complex(re: f64, im: f64) -> (f64, f64) {
+  use std::f64::consts::PI;
+  let euler_gamma = 0.5772156649015329_f64;
+  let half_re = re * 0.5;
+  let half_im = im * 0.5;
+  // ln(z/2) = ln|z/2| + I*arg(z/2)
+  let ln_mag = 0.5 * (half_re * half_re + half_im * half_im).ln();
+  let ln_arg = half_im.atan2(half_re);
+  // half^2, half^4 (complex)
+  let half2_re = half_re * half_re - half_im * half_im;
+  let half2_im = 2.0 * half_re * half_im;
+  let half4_re = half2_re * half2_re - half2_im * half2_im;
+  let half4_im = 2.0 * half2_re * half2_im;
+
+  let (ber_re, ber_im) = ber_series_complex(re, im);
+  let (bei_re, bei_im) = bei_series_complex(re, im);
+  // -(γ + ln(z/2)) * ber(z) + (π/4) * bei(z)
+  let a_re = -(euler_gamma + ln_mag);
+  let a_im = -ln_arg;
+  let mut total_re = a_re * ber_re - a_im * ber_im + (PI / 4.0) * bei_re;
+  let mut total_im = a_re * ber_im + a_im * ber_re + (PI / 4.0) * bei_im;
+
+  // Σ_{k=1..} (-1)^k φ(2k) (z/2)^(4k) / ((2k)!)^2
+  let mut phi = 0.0_f64;
+  let mut fact_sq = 1.0_f64;
+  let mut half_pow_re = 1.0_f64; // (z/2)^0
+  let mut half_pow_im = 0.0_f64;
+  for k in 1..200usize {
+    let n2m1 = (2 * k - 1) as f64;
+    let n2 = (2 * k) as f64;
+    phi += 1.0 / n2m1 + 1.0 / n2;
+    fact_sq *= n2m1 * n2 * n2m1 * n2;
+    let new_re = half_pow_re * half4_re - half_pow_im * half4_im;
+    let new_im = half_pow_re * half4_im + half_pow_im * half4_re;
+    half_pow_re = new_re;
+    half_pow_im = new_im;
+    let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+    let factor = sign * phi / fact_sq;
+    let term_re = factor * half_pow_re;
+    let term_im = factor * half_pow_im;
+    total_re += term_re;
+    total_im += term_im;
+    let term_mag2 = term_re * term_re + term_im * term_im;
+    let total_mag2 = total_re * total_re + total_im * total_im;
+    if term_mag2 < 1e-36 * total_mag2.max(1.0) {
+      break;
+    }
+  }
+  (total_re, total_im)
+}
+
+/// Complex-valued `kei(z)` via the same series as the real version.
+fn kei_series_complex(re: f64, im: f64) -> (f64, f64) {
+  use std::f64::consts::PI;
+  let euler_gamma = 0.5772156649015329_f64;
+  let half_re = re * 0.5;
+  let half_im = im * 0.5;
+  let ln_mag = 0.5 * (half_re * half_re + half_im * half_im).ln();
+  let ln_arg = half_im.atan2(half_re);
+  let half2_re = half_re * half_re - half_im * half_im;
+  let half2_im = 2.0 * half_re * half_im;
+  let half4_re = half2_re * half2_re - half2_im * half2_im;
+  let half4_im = 2.0 * half2_re * half2_im;
+
+  let (ber_re, ber_im) = ber_series_complex(re, im);
+  let (bei_re, bei_im) = bei_series_complex(re, im);
+  // -(γ + ln(z/2)) * bei(z) - (π/4) * ber(z)
+  let a_re = -(euler_gamma + ln_mag);
+  let a_im = -ln_arg;
+  let mut total_re = a_re * bei_re - a_im * bei_im - (PI / 4.0) * ber_re;
+  let mut total_im = a_re * bei_im + a_im * bei_re - (PI / 4.0) * ber_im;
+
+  // Σ_{k=0..} (-1)^k φ(2k+1) (z/2)^(4k+2) / ((2k+1)!)^2
+  // k = 0 term = φ(1) * (z/2)^2 / 1 = half2
+  let mut phi = 1.0_f64;
+  let mut fact_sq = 1.0_f64;
+  let mut half_pow_re = half2_re;
+  let mut half_pow_im = half2_im;
+  total_re += phi * half_pow_re / fact_sq;
+  total_im += phi * half_pow_im / fact_sq;
+  for k in 1..200usize {
+    let n2 = (2 * k) as f64;
+    let n2p1 = (2 * k + 1) as f64;
+    phi += 1.0 / n2 + 1.0 / n2p1;
+    fact_sq *= n2 * n2p1 * n2 * n2p1;
+    let new_re = half_pow_re * half4_re - half_pow_im * half4_im;
+    let new_im = half_pow_re * half4_im + half_pow_im * half4_re;
+    half_pow_re = new_re;
+    half_pow_im = new_im;
+    let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+    let factor = sign * phi / fact_sq;
+    let term_re = factor * half_pow_re;
+    let term_im = factor * half_pow_im;
+    total_re += term_re;
+    total_im += term_im;
+    let term_mag2 = term_re * term_re + term_im * term_im;
+    let total_mag2 = total_re * total_re + total_im * total_im;
+    if term_mag2 < 1e-36 * total_mag2.max(1.0) {
+      break;
+    }
+  }
+  (total_re, total_im)
+}
+
+/// 2-arg `ker_ν(x)`/`kei_ν(x)` for non-integer ν > 0 via
+///   ker_ν + I·kei_ν = e^{-νπI/2} K_ν(x e^{πI/4})
+///                   = (π/(2 sin νπ)) [(ber_{-ν}+I·bei_{-ν}) - e^{-νπI}(ber_ν+I·bei_ν)]
+/// which reduces to
+///   ker_ν(x) = (π/(2 sin νπ)) (ber_{-ν}(x) - cos(νπ) ber_ν(x) - sin(νπ) bei_ν(x))
+///   kei_ν(x) = (π/(2 sin νπ)) (bei_{-ν}(x) - cos(νπ) bei_ν(x) + sin(νπ) ber_ν(x))
+fn ker_kei_nu_series(nu: f64, x: f64) -> Option<(f64, f64)> {
+  use std::f64::consts::PI;
+  // Handle integer ν via a separate path to avoid 1/sin(νπ) → ∞.
+  if (nu - nu.round()).abs() < 1e-12 {
+    return None;
+  }
+  let (ber_p, bei_p) = ber_bei_nu_series(nu, x);
+  let (ber_m, bei_m) = ber_bei_nu_series(-nu, x);
+  let s_nu_pi = (nu * PI).sin();
+  let c_nu_pi = (nu * PI).cos();
+  let c = PI / (2.0 * s_nu_pi);
+  let ker = c * (ber_m - c_nu_pi * ber_p - s_nu_pi * bei_p);
+  let kei = c * (bei_m - c_nu_pi * bei_p + s_nu_pi * ber_p);
+  Some((ker, kei))
+}
+
+/// KelvinKer[x] - real part of e^(-Pi·I/2)·BesselK[0, x·e^(Pi I/4)].
+pub fn kelvin_ker_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if !(args.len() == 1 || args.len() == 2) {
+    return Err(InterpreterError::EvaluationError(
+      "KelvinKer expects 1 or 2 arguments".into(),
+    ));
+  }
+  if args.len() == 2 {
+    let nu = match &args[0] {
+      Expr::Integer(n) => Some(*n as f64),
+      Expr::Real(f) => Some(*f),
+      _ => None,
+    };
+    let x = match &args[1] {
+      Expr::Integer(n) if *n > 0 => Some(*n as f64),
+      Expr::Real(f) if *f > 0.0 => Some(*f),
+      _ => None,
+    };
+    // Only numericize when an argument is inexact (a Real). With exact integer
+    // / symbolic arguments wolframscript keeps the symbolic two-argument form.
+    let any_real =
+      matches!(&args[0], Expr::Real(_)) || matches!(&args[1], Expr::Real(_));
+    if any_real
+      && let (Some(nu), Some(x)) = (nu, x)
+      && let Some((ker, _)) = ker_kei_nu_series(nu, x)
+    {
+      return Ok(Expr::Real(ker));
+    }
+    return Ok(unevaluated("KelvinKer", args));
+  }
+  if let Some(x) = match &args[0] {
+    Expr::Real(f) if *f > 0.0 => Some(*f),
+    _ => None,
+  } {
+    return Ok(Expr::Real(ker_series(x)));
+  }
+  if let Some((re, im)) = try_extract_complex_f64(&args[0])
+    && im != 0.0
+  {
+    let (rr, ri) = ker_series_complex(re, im);
+    return Ok(build_complex_float_expr(rr, ri));
+  }
+  // KelvinKer[z] = KelvinKer[0, z] for exact/symbolic z (matches wolframscript).
+  Ok(call("KelvinKer", vec![Expr::Integer(0), args[0].clone()]))
+}
+
+/// KelvinKei[x] - imaginary part of e^(-Pi·I/2)·BesselK[0, x·e^(Pi I/4)].
+pub fn kelvin_kei_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if !(args.len() == 1 || args.len() == 2) {
+    return Err(InterpreterError::EvaluationError(
+      "KelvinKei expects 1 or 2 arguments".into(),
+    ));
+  }
+  if args.len() == 2 {
+    let nu = match &args[0] {
+      Expr::Integer(n) => Some(*n as f64),
+      Expr::Real(f) => Some(*f),
+      _ => None,
+    };
+    let x = match &args[1] {
+      Expr::Integer(n) if *n > 0 => Some(*n as f64),
+      Expr::Real(f) if *f > 0.0 => Some(*f),
+      _ => None,
+    };
+    // Only numericize when an argument is inexact (a Real). With exact integer
+    // / symbolic arguments wolframscript keeps the symbolic two-argument form.
+    let any_real =
+      matches!(&args[0], Expr::Real(_)) || matches!(&args[1], Expr::Real(_));
+    if any_real
+      && let (Some(nu), Some(x)) = (nu, x)
+      && let Some((_, kei)) = ker_kei_nu_series(nu, x)
+    {
+      return Ok(Expr::Real(kei));
+    }
+    return Ok(unevaluated("KelvinKei", args));
+  }
+  if let Some(x) = match &args[0] {
+    Expr::Real(f) if *f > 0.0 => Some(*f),
+    _ => None,
+  } {
+    return Ok(Expr::Real(kei_series(x)));
+  }
+  if let Some((re, im)) = try_extract_complex_f64(&args[0])
+    && im != 0.0
+  {
+    let (rr, ri) = kei_series_complex(re, im);
+    return Ok(build_complex_float_expr(rr, ri));
+  }
+  // KelvinKei[z] = KelvinKei[0, z] for exact/symbolic z (matches wolframscript).
+  Ok(call("KelvinKei", vec![Expr::Integer(0), args[0].clone()]))
+}

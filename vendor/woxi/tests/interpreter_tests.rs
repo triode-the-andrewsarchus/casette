@@ -1,0 +1,5142 @@
+// Each test file wraps its tests in a module named after the file, which
+// keeps `cargo nextest run <name>` filters matching the file they live in.
+#![allow(clippy::module_inception)]
+
+use woxi::{
+  clear_state, interpret, interpret_with_stdout, split_into_statements,
+};
+
+mod interpreter_tests {
+  use super::*;
+
+  #[test]
+  fn test_split_single_expression() {
+    assert_eq!(split_into_statements("1 + 2"), vec!["1 + 2"]);
+  }
+
+  #[test]
+  fn test_split_multiple_lines() {
+    assert_eq!(
+      split_into_statements(
+        "Graphics[Circle[]]\n1 + 3\nGraphics[Rectangle[]]\n5 * 8"
+      ),
+      vec![
+        "Graphics[Circle[]]",
+        "1 + 3",
+        "Graphics[Rectangle[]]",
+        "5 * 8"
+      ]
+    );
+  }
+
+  #[test]
+  fn test_split_preserves_multiline_brackets() {
+    assert_eq!(
+      split_into_statements("Module[{a = 1},\n  a + 2\n]\n3 + 4"),
+      vec!["Module[{a = 1},\n  a + 2\n]", "3 + 4"]
+    );
+  }
+
+  #[test]
+  fn test_split_preserves_set_delayed_continuation() {
+    assert_eq!(
+      split_into_statements("f[x_] :=\n  x^2\nf[3]"),
+      vec!["f[x_] :=\n  x^2", "f[3]"]
+    );
+  }
+
+  #[test]
+  fn test_split_preserves_prefix_not_continuation() {
+    // `lychrelQ[n_] := !\n  palindromeQ[n]` — the `!` at end of line is
+    // a prefix Not awaiting its operand on the next line, not a postfix
+    // Factorial. Detected by the prev_code_char being an operator (`=`).
+    assert_eq!(
+      split_into_statements("f[n_] := !\n  g[n]\nf[5]"),
+      vec!["f[n_] := !\n  g[n]", "f[5]"]
+    );
+  }
+
+  #[test]
+  fn test_split_semicolon_lines() {
+    assert_eq!(
+      split_into_statements("a = 5;\nb = 10;\na + b"),
+      vec!["a = 5;", "b = 10;", "a + b"]
+    );
+  }
+
+  #[test]
+  fn test_split_blank_lines() {
+    assert_eq!(
+      split_into_statements("1 + 2\n\n3 + 4"),
+      vec!["1 + 2", "3 + 4"]
+    );
+  }
+
+  #[test]
+  fn test_split_trailing_comment_only() {
+    // A trailing comment-only line should not produce a separate statement
+    assert_eq!(
+      split_into_statements("Sin[123]\n(* comment *)"),
+      vec!["Sin[123]"]
+    );
+  }
+
+  #[test]
+  fn test_split_leading_comment_only() {
+    // A leading comment-only line should be merged with the next code line
+    assert_eq!(
+      split_into_statements("(* comment *)\nSin[123]"),
+      vec!["(* comment *)\nSin[123]"]
+    );
+  }
+
+  #[test]
+  fn test_split_comment_between_expressions() {
+    // A comment between two expressions should not produce an extra statement
+    assert_eq!(
+      split_into_statements("1 + 1\n(* comment *)\n2 + 2"),
+      vec!["1 + 1", "(* comment *)\n2 + 2"]
+    );
+  }
+
+  #[test]
+  fn test_split_multiple_comments_only() {
+    // Multiple comment-only lines should not produce statements
+    assert_eq!(split_into_statements("(* c1 *)\n(* c2 *)"), vec![""]);
+  }
+
+  #[test]
+  fn test_split_preserves_multiline_association() {
+    assert_eq!(
+      split_into_statements(
+        "a = <|\n  \"x\" -> 1,\n  \"y\" -> 2\n|>\nPrint[a]"
+      ),
+      vec!["a = <|\n  \"x\" -> 1,\n  \"y\" -> 2\n|>", "Print[a]"]
+    );
+  }
+
+  #[test]
+  fn test_split_preserves_nested_multiline_association() {
+    assert_eq!(
+      split_into_statements("a = <|\"x\" -> <|\n  \"n\" -> 42\n|>|>\nPrint[a]"),
+      vec!["a = <|\"x\" -> <|\n  \"n\" -> 42\n|>|>", "Print[a]"]
+    );
+  }
+
+  #[test]
+  fn test_split_backslash_line_continuation() {
+    assert_eq!(
+      split_into_statements(
+        "ImaginaryQ[u_] :=\\\n  Head[u]===Complex && Re[u]===0\nImaginaryQ[3 I]"
+      ),
+      vec![
+        "ImaginaryQ[u_] :=  Head[u]===Complex && Re[u]===0",
+        "ImaginaryQ[3 I]"
+      ]
+    );
+  }
+
+  #[test]
+  fn test_split_backslash_continuation_multi() {
+    assert_eq!(split_into_statements("1 +\\\n2 +\\\n3"), vec!["1 +2 +3"]);
+  }
+
+  #[test]
+  fn test_split_backslash_line_continuation_crlf() {
+    // Line continuation should work with CRLF line endings (issue #70)
+    assert_eq!(
+      split_into_statements(
+        "ImaginaryQ[u_] :=\\\r\n  Head[u]===Complex && Re[u]===0\r\nImaginaryQ[3 I]"
+      ),
+      vec![
+        "ImaginaryQ[u_] :=  Head[u]===Complex && Re[u]===0",
+        "ImaginaryQ[3 I]"
+      ]
+    );
+  }
+
+  #[test]
+  fn test_split_backslash_continuation_multi_crlf() {
+    // Multiple line continuations with CRLF (issue #70)
+    assert_eq!(
+      split_into_statements("1 +\\\r\n2 +\\\r\n3"),
+      vec!["1 +2 +3"]
+    );
+  }
+
+  #[test]
+  fn test_interpret_line_continuation_crlf() {
+    // Full interpret path with CRLF line endings (issue #70)
+    assert_eq!(interpret("f[x_] :=\\\r\n  x + 1\r\nf[5]").unwrap(), "6");
+  }
+
+  #[test]
+  fn test_guarded_rule_ordering_partitionsp() {
+    // Issue #118: a `/;`-guarded rule must be tried before an unguarded but
+    // otherwise-more-specific rule (`f[n_Integer, _] /; n<0` before
+    // `f[n_Integer, r_Integer]`). Without this, the recursion never hits the
+    // n<0 base case and either overflows or stays symbolic.
+    clear_state();
+    let program = "Unprotect[PartitionsP]\n\
+      PartitionsP[n_Integer, _] := 0 /; (n<0)\n\
+      PartitionsP[0, 0] := 1\n\
+      PartitionsP[_, 0] := 0\n\
+      PartitionsP[_, r_Integer] := 0 /; (r<0)\n\
+      PartitionsP[n_Integer, 1] := 1 /; (n>0)\n\
+      PartitionsP[n_Integer, 2] := Floor[n/2] /; (n>0)\n\
+      PartitionsP[n_Integer, r_Integer] := PartitionsP[n-r] /; (r >= n/2)\n\
+      PartitionsP[n_Integer, r_Integer] := \
+        PartitionsP[n, r] = PartitionsP[n-1, r-1] + PartitionsP[n-r, r]\n\
+      Table[PartitionsP[10, r], {r, 0, 10}]";
+    assert_eq!(
+      interpret(program).unwrap(),
+      "{0, 1, 5, 8, 9, 7, 5, 3, 2, 1, 1}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn test_guarded_rule_downvalue_order() {
+    // The guarded rule keeps its definition-order position ahead of a later
+    // unguarded, otherwise-more-specific rule (issue #118).
+    clear_state();
+    interpret("Unprotect[gg]").unwrap();
+    interpret("gg[n_Integer, _] := aa /; (n < 0)").unwrap();
+    interpret("gg[n_Integer, r_Integer] := bb").unwrap();
+    assert_eq!(
+      interpret("DownValues[gg]").unwrap(),
+      "{HoldPattern[gg[n_Integer, _]] :> aa /; n < 0, \
+       HoldPattern[gg[n_Integer, r_Integer]] :> bb}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn test_same_pattern_guarded_rule_not_overwritten() {
+    // Issue #119: redefining an unconditional rule with the SAME base pattern
+    // must NOT delete a previously-defined guarded rule. In Wolfram both are
+    // distinct DownValues, the guard rule keeps its (earlier) position, so a
+    // canonicalizing rule `f[a_,b_] := f[b,a] /; a>b` still fires before the
+    // later general `f[a_,b_] := …`.
+    clear_state();
+    interpret("PP[n1_Integer, n2_Integer] := PP[n2, n1] /; (n1 > n2)").unwrap();
+    interpret("PP[n1_Integer, n2_Integer] := gen[n1, n2]").unwrap();
+    assert_eq!(
+      interpret("DownValues[PP]").unwrap(),
+      "{HoldPattern[PP[n1_Integer, n2_Integer]] :> PP[n2, n1] /; n1 > n2, \
+       HoldPattern[PP[n1_Integer, n2_Integer]] :> gen[n1, n2]}"
+    );
+    // The canonicalizing rule fires first for a descending pair.
+    assert_eq!(interpret("PP[2, 5]").unwrap(), "gen[2, 5]");
+    assert_eq!(interpret("PP[5, 2]").unwrap(), "gen[2, 5]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_bipartite_partitions_canonicalizing_rule() {
+    // Issue #119: full bipartite-partition recursion relying on the
+    // canonicalizing rule to avoid `PP[n, 0]` divide-by-zero (the
+    // `PP[n1_Integer, 0]` base case is intentionally omitted). Matches
+    // wolframscript's `{2, 4, 7}`.
+    clear_state();
+    let program = "PP[n1_Integer, n2_Integer] := PP[n2, n1] /; (n1 > n2)\n\
+      PP[n1_Integer, _] := 0 /; (n1<0)\n\
+      PP[0, n2_Integer] := PartitionsP[n2]\n\
+      PP[n1_Integer, n2_Integer] := PP[n1, n2] = \
+        Sum[k PP[n1 - r j, n2 - r k], {j, 0, n1}, {k, n2}, {r, n2/k}]/n2\n\
+      { PP[1,1], PP[1,2], PP[1,3] }";
+    assert_eq!(interpret(program).unwrap(), "{2, 4, 7}");
+    clear_state();
+  }
+
+  #[test]
+  fn test_guarded_rule_three_arg_incomparable_order() {
+    // Issue #121: a `/;`-guarded rule and a structurally-more-specific
+    // unguarded rule are INCOMPARABLE and must fire in definition order, even
+    // when the unguarded rule has more head constraints. The guard rule was
+    // entered first, so it must win for the overlapping `(-1, 3, 2)` case.
+    clear_state();
+    interpret("g3[a_Integer, _, _] := neg /; (a < 0)").unwrap();
+    interpret("g3[a_Integer, b_Integer, c_Integer] := three").unwrap();
+    assert_eq!(interpret("g3[-1, 3, 2]").unwrap(), "neg");
+    assert_eq!(interpret("g3[1, 3, 2]").unwrap(), "three");
+    // Reversed definition order: the unguarded rule is entered first and wins,
+    // since the two rules are incomparable (entry order is preserved).
+    clear_state();
+    interpret("h3[a_Integer, b_Integer, c_Integer] := three").unwrap();
+    interpret("h3[a_Integer, _, _] := neg /; (a < 0)").unwrap();
+    assert_eq!(interpret("h3[-1, 3, 2]").unwrap(), "three");
+    assert_eq!(interpret("h3[1, 3, 2]").unwrap(), "three");
+    clear_state();
+  }
+
+  #[test]
+  fn test_nested_pattern_more_specific_than_blank_either_order() {
+    // A nested structural pattern (`f[g[x_]]`) is more specific than a bare
+    // blank (`f[x_]`) and must fire first regardless of definition order. The
+    // partial-order insertion falls back to the specificity score for
+    // structural patterns, so this keeps working in both orders.
+    clear_state();
+    interpret("f7[g[x_]] := ng[x]").unwrap();
+    interpret("f7[x_] := gen[x]").unwrap();
+    assert_eq!(interpret("f7[g[5]]").unwrap(), "ng[5]");
+    assert_eq!(interpret("f7[5]").unwrap(), "gen[5]");
+    clear_state();
+    // Reversed: the general rule is entered first, but the structural pattern
+    // still wins for `f8[g[5]]`.
+    interpret("f8[x_] := gen[x]").unwrap();
+    interpret("f8[g[x_]] := ng[x]").unwrap();
+    assert_eq!(interpret("f8[g[5]]").unwrap(), "ng[5]");
+    assert_eq!(interpret("f8[5]").unwrap(), "gen[5]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_exact_arity_more_specific_than_optional_arg() {
+    // `f[x_]` (exact arity 1) is more specific than `f[x_, y_:0]` (which can
+    // default `y`), so a single-arg call fires `f[x_]` regardless of definition
+    // order; a two-arg call still falls to the optional rule. Matches WL.
+    clear_state();
+    interpret("f1[x_, y_:0] := opt[x, y]").unwrap();
+    interpret("f1[x_] := one[x]").unwrap();
+    assert_eq!(interpret("f1[5]").unwrap(), "one[5]");
+    assert_eq!(interpret("f1[5, 6]").unwrap(), "opt[5, 6]");
+    clear_state();
+    // Reversed definition order yields the same dispatch.
+    interpret("f2[x_] := one[x]").unwrap();
+    interpret("f2[x_, y_:0] := opt[x, y]").unwrap();
+    assert_eq!(interpret("f2[5]").unwrap(), "one[5]");
+    assert_eq!(interpret("f2[5, 6]").unwrap(), "opt[5, 6]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_optional_arg_overload_kept_distinct() {
+    // `f[x_, y_]` and `f[x_, y_:0]` are distinct DownValues — defining the
+    // optional-arg rule must NOT delete the exact-arity rule. For a two-arg call
+    // the exact rule wins; for a one-arg call only the optional rule applies.
+    clear_state();
+    interpret("q1[x_, y_] := req2[x, y]").unwrap();
+    interpret("q1[x_, y_:0] := opt[x, y]").unwrap();
+    assert_eq!(interpret("q1[5]").unwrap(), "opt[5, 0]");
+    assert_eq!(interpret("q1[5, 6]").unwrap(), "req2[5, 6]");
+    clear_state();
+    // Redefining the SAME optional-arg pattern still replaces it.
+    interpret("q4[x_, y_:0] := a[x, y]").unwrap();
+    interpret("q4[x_, y_:0] := b[x, y]").unwrap();
+    assert_eq!(interpret("q4[3]").unwrap(), "b[3, 0]");
+    assert_eq!(interpret("q4[3, 4]").unwrap(), "b[3, 4]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_nested_pattern_inner_head_specificity() {
+    // Among nested structural patterns, a tighter inner pattern wins: `g[x_Integer]`
+    // is more specific than `g[x_]` and fires for an integer argument, while a
+    // non-integer falls to the looser rule. Matches wolframscript.
+    clear_state();
+    interpret("f12[g[x_]] := a[x]").unwrap();
+    interpret("f12[g[x_Integer]] := b[x]").unwrap();
+    assert_eq!(interpret("f12[g[5]]").unwrap(), "b[5]");
+    assert_eq!(interpret("f12[g[1.5]]").unwrap(), "a[1.5]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_bipartite_partitions_three_arg_recursion() {
+    // Issue #121: the three-index bipartite-partition recursion relies on the
+    // `BiPartitionsP[n1_Integer, _, _] := 0 /; n1<0` guard firing before the
+    // unguarded memoizing rule. A wrong order made `BiPartitionsP[-1, 3, 2]`
+    // evaluate to 1, inflating the total. Matches wolframscript exactly.
+    clear_state();
+    let program = "Unprotect[PartitionsP]\n\
+      PartitionsP[n_Integer, _] := 0 /; (n < 0)\n\
+      PartitionsP[0, 0] := 1\n\
+      PartitionsP[_, 0] := 0\n\
+      PartitionsP[_, r_Integer] := 0 /; (r < 0)\n\
+      PartitionsP[n_Integer, 1] := 1 /; (n > 0)\n\
+      PartitionsP[n_Integer, 2] := Floor[n/2] /; (n > 0)\n\
+      PartitionsP[n_Integer, r_Integer] := PartitionsP[n-r] /; (r >= n/2)\n\
+      PartitionsP[n_Integer, r_Integer] := \
+        PartitionsP[n, r] = PartitionsP[n-1, r-1] + PartitionsP[n-r, r]\n\
+      BiPartitionsP[n1_Integer, n2_Integer, r_Integer] := \
+        BiPartitionsP[n2, n1, r] /; (n1 > n2)\n\
+      BiPartitionsP[n1_Integer, _, _] := 0 /; (n1 < 0)\n\
+      BiPartitionsP[0, n2_Integer, r_Integer] := PartitionsP[n2, r]\n\
+      BiPartitionsP[0, 0, 0] := 1\n\
+      BiPartitionsP[_, _, 0] := 0\n\
+      BiPartitionsP[0, 0, _] := 0\n\
+      BiPartitionsP[_, _, 1] := 1\n\
+      BiPartitionsP[n1_Integer, n2_Integer, r_Integer] := \
+        0 /; ((r < 0) || (r > n1+n2))\n\
+      BiPartitionsP[n1_Integer, n2_Integer, r_Integer] := \
+        BiPartitionsP[n1, n2, r] = BiPartitionsP[n1-1, n2, r-1] + \
+        BiPartitionsP[n1-r, n2, r] + \
+        Sum[BiPartitionsP[n1-i, n2-j, i] PartitionsP[j, r-i], \
+          {i, Min[r-1, n1]}, {j, r-i, Min[n2, n1+n2-2i]}]\n\
+      { BiPartitionsP[-1, 3, 2], \
+        Table[BiPartitionsP[2, 3, r], {r, 0, 5}], \
+        Sum[BiPartitionsP[2, 3, r], {r, 0, 5}] }";
+    assert_eq!(interpret(program).unwrap(), "{0, {0, 1, 5, 6, 3, 1}, 16}");
+    clear_state();
+  }
+
+  #[test]
+  fn test_list_pattern_literal_element() {
+    // Issue #119: a literal element inside a list pattern must be matched
+    // exactly — `f[{0, n2_}]` must NOT match `f[{1, 5}]`.
+    clear_state();
+    interpret("f[{0, n2_Integer}] := matched0[n2]").unwrap();
+    interpret("f[{n1_Integer, n2_Integer}] := general[n1, n2]").unwrap();
+    assert_eq!(interpret("f[{0, 5}]").unwrap(), "matched0[5]");
+    assert_eq!(interpret("f[{1, 5}]").unwrap(), "general[1, 5]");
+    assert_eq!(interpret("f[{3, 5}]").unwrap(), "general[3, 5]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_bare_symbol_pattern_arg_matches_its_current_value() {
+    // A bare symbol with no `_` in a pattern-argument slot is not a pattern
+    // variable — WL requires an explicit `_` to introduce one — so it is
+    // evaluated to its current value and matched literally, the same as a
+    // numeric literal written directly. This is the idiom demonstrations
+    // commonly use inside a `Module`: `n = 5; f[x_, n] := ...` only matches
+    // when the second argument is `5`. Before the fix, the bare symbol
+    // became an unconstrained second wildcard, indistinguishable in
+    // specificity from a fully generic `f[x_, y_]` overload, so calls meant
+    // for the literal-argument rule fell through to the generic one instead
+    // (concretely, `Null` from an `If[cond, then]` with no `else` whose
+    // `cond` referenced the never-bound outer symbol).
+    clear_state();
+    interpret("n = 5;").unwrap();
+    interpret("f[x_, n] := matchedLiteral[x]").unwrap();
+    interpret("f[x_, y_] := general[x, y]").unwrap();
+    assert_eq!(interpret("f[1, 5]").unwrap(), "matchedLiteral[1]");
+    assert_eq!(interpret("f[1, 6]").unwrap(), "general[1, 6]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_bare_symbol_pattern_arg_both_positions() {
+    // Same idiom with the literal-valued symbol in the first slot instead,
+    // and a second overload using the symbol in the last slot — mirroring
+    // the `d[j_, Np]` / `d[Np, j_]` pair from the Frank-Kamenetskii
+    // Demonstration's collocation-matrix construction.
+    clear_state();
+    interpret("np = 3;").unwrap();
+    interpret("d[np, j_] := fromNp[j]").unwrap();
+    interpret("d[j_, np] := toNp[j]").unwrap();
+    interpret("d[j_, k_] := generic[j, k]").unwrap();
+    assert_eq!(interpret("d[3, 7]").unwrap(), "fromNp[7]");
+    assert_eq!(interpret("d[7, 3]").unwrap(), "toNp[7]");
+    assert_eq!(interpret("d[2, 7]").unwrap(), "generic[2, 7]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_list_pattern_head_constraint() {
+    // Issue #119: per-element head constraints inside a list pattern must be
+    // enforced — `g[{n1_Integer, n2_Integer}]` must NOT match a non-integer
+    // element.
+    clear_state();
+    interpret("g[{n1_Integer, n2_Integer}] := bothInt[n1, n2]").unwrap();
+    assert_eq!(interpret("g[{1, 2}]").unwrap(), "bothInt[1, 2]");
+    assert_eq!(interpret("g[{1, \"x\"}]").unwrap(), "g[{1, x}]");
+    assert_eq!(interpret("g[{1.5, 2}]").unwrap(), "g[{1.5, 2}]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_list_pattern_literal_more_specific_than_blank() {
+    // Issue #119: a list rule with a literal element (`{1, x_}`) must take
+    // priority over an all-blank list rule (`{n_, x_}`) regardless of which
+    // is defined first — matching Wolfram's specificity ordering.
+    clear_state();
+    interpret("s[{n_, x_}] := other[n, x]").unwrap();
+    interpret("s[{1, x_}] := one[x]").unwrap();
+    assert_eq!(interpret("s[{1, 9}]").unwrap(), "one[9]");
+    assert_eq!(interpret("s[{2, 9}]").unwrap(), "other[2, 9]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_list_pattern_head_more_specific_than_blank() {
+    // Issue #119: a head-constrained list element (`{n_Integer, x_}`) is more
+    // specific than a bare blank element (`{n_, x_}`), independent of order.
+    clear_state();
+    interpret("g[{n_, x_}] := gen[n, x]").unwrap();
+    interpret("g[{n_Integer, x_}] := hd[n, x]").unwrap();
+    assert_eq!(interpret("g[{1, 9}]").unwrap(), "hd[1, 9]");
+    assert_eq!(interpret("g[{1.5, 9}]").unwrap(), "gen[1.5, 9]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_nested_list_pattern_binding() {
+    // Issue #119 follow-up: nested list patterns bind their inner elements, so
+    // `p[{{a_, b_}, c_}]` binds a, b, c — matching wolframscript.
+    clear_state();
+    interpret("p[{{a_, b_}, c_}] := f[a, b, c]").unwrap();
+    assert_eq!(interpret("p[{{1, 2}, 3}]").unwrap(), "f[1, 2, 3]");
+    // Wrong shape must not match.
+    assert_eq!(interpret("p[{1, 2, 3}]").unwrap(), "p[{1, 2, 3}]");
+    clear_state();
+    interpret("q[{{a_, b_}, {c_, d_}}] := g[a, b, c, d]").unwrap();
+    assert_eq!(interpret("q[{{1, 2}, {3, 4}}]").unwrap(), "g[1, 2, 3, 4]");
+    clear_state();
+  }
+
+  #[test]
+  fn test_nested_list_pattern_binding_with_immediate_set() {
+    // A pattern nested inside a list argument must bind under immediate
+    // `Set` (`=`) exactly as it does under `SetDelayed` (`:=`) above —
+    // `f[z_, {{b1_, t1_}, {b2_, t2_}}] = …` previously stored the whole list
+    // argument as one unmatched synthetic parameter, so `b1`/`t1`/`b2`/`t2`
+    // never got substituted and the call returned the RHS with those names
+    // still bare (only `z` bound). Found while making Woxi Studio evaluate a
+    // Wolfram Demonstration whose `totalTax` piecewise function is defined
+    // this way.
+    clear_state();
+    interpret("f[z_, {{b1_, t1_}, {b2_, t2_}}] = b1*t1 + b2*t2 + z").unwrap();
+    assert_eq!(interpret("f[10, {{1, 2}, {3, 4}}]").unwrap(), "24");
+    clear_state();
+    // Single-argument nested list pattern.
+    interpret("g[{a_, b_}] = a + b").unwrap();
+    assert_eq!(interpret("g[{5, 6}]").unwrap(), "11");
+    clear_state();
+  }
+
+  #[test]
+  fn test_list_pattern_downvalues_reconstruction() {
+    // Issue #119 follow-up: DownValues/Definition reconstruct the surface
+    // `{…}` list pattern (with element names, body, and `/;` guard) rather than
+    // leaking the lowered `_lp0_List` / `Part[_lp0, i]` form.
+    clear_state();
+    interpret("g[{a_Integer, b_}] := h[a, b]").unwrap();
+    assert_eq!(
+      interpret("DownValues[g]").unwrap(),
+      "{HoldPattern[g[{a_Integer, b_}]] :> h[a, b]}"
+    );
+    clear_state();
+    interpret("ZZ[{n1_Integer, n2_Integer}] := ZZ[{n2, n1}] /; (n1 > n2)")
+      .unwrap();
+    interpret("ZZ[{n1_Integer, n2_Integer}] := gen[n1, n2]").unwrap();
+    assert_eq!(
+      interpret("DownValues[ZZ]").unwrap(),
+      "{HoldPattern[ZZ[{n1_Integer, n2_Integer}]] :> ZZ[{n2, n1}] /; n1 > n2, \
+       HoldPattern[ZZ[{n1_Integer, n2_Integer}]] :> gen[n1, n2]}"
+    );
+    clear_state();
+    interpret("p[{{a_, b_}, c_}] := f[a, b, c]").unwrap();
+    assert_eq!(
+      interpret("DownValues[p]").unwrap(),
+      "{HoldPattern[p[{{a_, b_}, c_}]] :> f[a, b, c]}"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn test_list_pattern_guard_over_elements() {
+    // Issue #119: a body-level `/;` guard that references destructured list
+    // elements must be checked against the bound element values, so the
+    // list-argument recursion produces the same result as the scalar form.
+    clear_state();
+    let program = "ZZ[{n1_Integer, n2_Integer}] := ZZ[{n2, n1}] /; (n1 > n2)\n\
+      ZZ[{n1_Integer, _}] := 0 /; (n1<0)\n\
+      ZZ[{0, n2_Integer}] := PartitionsP[n2]\n\
+      ZZ[{n1_Integer, n2_Integer}] := ZZ[{n1, n2}] = \
+        Sum[k ZZ[{n1 - r j, n2 - r k}], {j, 0, n1}, {k, n2}, {r, n2/k}]/n2\n\
+      { ZZ[{1,1}], ZZ[{1,2}], ZZ[{1,3}], ZZ[{2,2}], ZZ[{2,3}] }";
+    assert_eq!(interpret(program).unwrap(), "{2, 4, 7, 9, 16}");
+    clear_state();
+  }
+
+  #[test]
+  fn test_split_condition_continuation() {
+    // /; (Condition) at end of line means the expression continues
+    assert_eq!(
+      split_into_statements("Foo[x_] :=\n  -x /;\nx > 1\nFoo[2]"),
+      vec!["Foo[x_] :=\n  -x /;\nx > 1", "Foo[2]"]
+    );
+  }
+
+  #[test]
+  fn test_split_operator_continuation() {
+    // Lines ending with operators should continue to the next line
+    assert_eq!(split_into_statements("x = 1 +\n2"), vec!["x = 1 +\n2"]);
+  }
+
+  #[test]
+  fn test_comment_only_input() {
+    // A standalone comment should not cause an error
+    clear_state();
+    let result = interpret("(* comment *)");
+    assert!(result.is_err());
+    assert!(matches!(result, Err(woxi::InterpreterError::EmptyInput)));
+  }
+
+  #[test]
+  fn test_percent_history_in_visual_mode() {
+    // In visual mode (woxi-studio), `%` should resolve to the previous
+    // `interpret_with_stdout` call's top-level result so cells like
+    // `N[%]` work as expected. CLI mode keeps wolframscript's behaviour
+    // of returning `Out[0]` (no history), which is exercised elsewhere.
+    clear_state();
+    woxi::clear_last_output();
+    let r1 = interpret_with_stdout("2 + 3").unwrap();
+    assert_eq!(r1.result, "5");
+    let r2 = interpret_with_stdout("N[%]").unwrap();
+    assert_eq!(r2.result, "5.");
+  }
+
+  #[test]
+  fn test_percent_in_cli_mode_collapses_to_out_zero() {
+    // `interpret` (CLI / wolframscript-equivalent path) must not consume
+    // the visual-mode history. `%` collapses to `Out[0]` exactly as
+    // wolframscript does inside a single `-code` invocation.
+    clear_state();
+    woxi::clear_last_output();
+    let _ = interpret_with_stdout("123").unwrap(); // would populate history
+    // Bare `interpret` ignores history:
+    assert_eq!(interpret("%").unwrap(), "Out[0]");
+  }
+
+  #[test]
+  fn test_interpret_with_stdout_exposes_result_expr() {
+    // The structured result must be filled in even under plain
+    // command-line semantics, where `%` history (and therefore
+    // `get_last_output`) stays empty.
+    clear_state();
+    woxi::clear_last_output();
+    let r = interpret_with_stdout("1/3 + 1/6").unwrap();
+    assert_eq!(r.result, "1/2");
+    let expr = r.expr.expect("structured result");
+    assert_eq!(
+      woxi::functions::predicate_ast::expr_to_full_form(&expr),
+      "Rational[1, 2]"
+    );
+  }
+
+  #[test]
+  fn test_interpret_with_stdout_result_expr_not_stale() {
+    // A failed evaluation must not report the previous call's tree.
+    clear_state();
+    let _ = interpret_with_stdout("2 + 3").unwrap();
+    assert!(interpret_with_stdout("1 +").is_err());
+    let r = interpret_with_stdout("x = 1;").unwrap();
+    assert_eq!(r.result, "\0");
+    assert!(
+      r.expr.is_none()
+        || woxi::functions::predicate_ast::expr_to_full_form(
+          r.expr.as_ref().unwrap()
+        ) != "5"
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn test_interpret_expr_with_stdout_evaluates_a_tree() {
+    // Submitting an already-built expression must behave like the text
+    // path: same formatted result, same captured stdout, same tree.
+    use woxi::syntax::Expr;
+    clear_state();
+    let tree = Expr::FunctionCall {
+      name: "Integrate".to_string(),
+      args: vec![
+        Expr::FunctionCall {
+          name: "Power".to_string(),
+          args: vec![Expr::Identifier("x".to_string()), Expr::Integer(2)]
+            .into(),
+        },
+        Expr::Identifier("x".to_string()),
+      ]
+      .into(),
+    };
+    let r = woxi::interpret_expr_with_stdout(&tree).unwrap();
+    assert_eq!(r.result, "x^3/3");
+    assert_eq!(
+      r.result,
+      interpret_with_stdout("Integrate[x^2, x]").unwrap().result
+    );
+    assert!(r.expr.is_some());
+  }
+
+  #[test]
+  fn test_interpret_expr_with_stdout_captures_print() {
+    use woxi::syntax::Expr;
+    clear_state();
+    let tree = Expr::FunctionCall {
+      name: "Print".to_string(),
+      args: vec![Expr::String("hi".to_string())].into(),
+    };
+    let r = woxi::interpret_expr_with_stdout(&tree).unwrap();
+    assert_eq!(r.stdout, "hi\n");
+  }
+
+  #[test]
+  fn test_part_partw_mirrored_to_captured_stdout() {
+    // wolframscript prints Part::partw to stdout in script mode, so the
+    // library path (interpret_with_stdout — snapshot tests, playground,
+    // Jupyter) must capture it too. Regression test for the
+    // stem-and-leaf_plot.wls snapshot divergence.
+    clear_state();
+    let r = interpret_with_stdout("RealDigits[Quotient[x, 10]][[2]]").unwrap();
+    assert_eq!(
+      r.stdout,
+      "\nPart::partw: Part 2 of RealDigits[Quotient[x, 10]] does not \
+       exist.\n"
+    );
+  }
+
+  #[test]
+  fn test_accented_named_characters_decode() {
+    // Wolfram named characters for accented Latin letters must decode to
+    // their Unicode chars, so e.g. imported text ("Curaçao") compares
+    // equal to source written with escapes ("Cura\[CCedilla]ao").
+    clear_state();
+    assert_eq!(interpret("\"Cura\\[CCedilla]ao\"").unwrap(), "Curaçao");
+    assert_eq!(
+      interpret("\"Cura\\[CCedilla]ao\" == \"Curaçao\"").unwrap(),
+      "True"
+    );
+    // A lookup keyed by the escaped form must hit when queried with the
+    // decoded (imported) form — the exact pattern the FIFA notebook uses.
+    assert_eq!(
+      interpret("Lookup[<|\"Cura\\[CCedilla]ao\" -> 0.152|>, \"Curaçao\"]")
+        .unwrap(),
+      "0.152"
+    );
+    // Spot-check a few more across the Latin-1 range.
+    assert_eq!(interpret("\"\\[ODoubleDot]\"").unwrap(), "ö");
+    assert_eq!(interpret("\"\\[NTilde]\"").unwrap(), "ñ");
+    assert_eq!(interpret("\"\\[CapitalATilde]\\[Section]\"").unwrap(), "Ã§");
+    assert_eq!(interpret("\"\\[SZ]\"").unwrap(), "ß");
+  }
+
+  #[test]
+  fn test_arrow_named_characters_decode() {
+    // The vertical/double arrow family must decode to Unicode (the
+    // Demonstrations notebooks use \[DoubleDownArrow] as a "maps to"
+    // glyph between a transform's name and its rendered graphic).
+    clear_state();
+    assert_eq!(interpret("\"\\[UpDownArrow]\"").unwrap(), "\u{2195}");
+    assert_eq!(interpret("\"\\[DoubleUpArrow]\"").unwrap(), "\u{21D1}");
+    assert_eq!(interpret("\"\\[DoubleDownArrow]\"").unwrap(), "\u{21D3}");
+    assert_eq!(interpret("\"\\[DoubleUpDownArrow]\"").unwrap(), "\u{21D5}");
+    assert_eq!(
+      interpret("ToCharacterCode[\"\\[DoubleDownArrow]\"]").unwrap(),
+      "{8659}"
+    );
+  }
+
+  #[test]
+  fn test_formal_symbol_named_characters_parse_as_identifiers() {
+    // `\[FormalA]`..`\[FormalZ]` (and their Greek/capitalized variants) are
+    // Wolfram's private-use-area "formal symbol" glyphs, used as generic
+    // bound-variable names — e.g. a Demonstration's helper writes
+    // `Prepend[#, {\[FormalX], \[FormalY]}]` where a plain pattern would
+    // otherwise need a name. A notebook's box form stores these as the
+    // bare `\u{F817}`/`\u{F818}` characters, not the `\[FormalX]` escape,
+    // so both forms must lex as ordinary identifiers rather than failing
+    // to parse.
+    clear_state();
+    assert_eq!(interpret("Head[\\[FormalX]]").unwrap(), "Symbol");
+    // Formal symbols are `Protected` `System`` symbols, so assigning to one
+    // fails with `Set::wrsym` and the symbol stays symbolic.
+    assert_eq!(
+      interpret("\\[FormalX] = 3; \\[FormalX] + 1").unwrap(),
+      "1 + \u{F817}"
+    );
+    assert_eq!(
+      interpret("{Attributes[\\[FormalX]], Context[\\[FormalScriptA]]}")
+        .unwrap(),
+      "{{Protected}, System`}"
+    );
+    // Scoping constructs still bind them.
+    assert_eq!(
+      interpret("Block[{\\[FormalX] = 2}, \\[FormalX]]").unwrap(),
+      "2"
+    );
+    clear_state();
+    // The exact shape the notebook uses: a pure function prepending a
+    // generic-named pair ahead of `#`, with no pattern variable involved.
+    // The escape text names the same symbol as the bare glyph (see
+    // `test_formal_symbol_escaped_and_raw_glyph_spellings_are_the_same_symbol`),
+    // so it prints back as the glyph, not the literal escape spelling.
+    assert_eq!(
+      interpret("Prepend[#, {\\[FormalX], \\[FormalY]}] & [{1, 2}]").unwrap(),
+      "{{\u{F817}, \u{F818}}, 1, 2}"
+    );
+    clear_state();
+    // The bare glyph form (as a notebook's BoxData actually stores it).
+    assert_eq!(interpret("Head[\u{F817}]").unwrap(), "Symbol");
+    assert_eq!(
+      interpret("{\u{F817}, \u{F818}}").unwrap(),
+      "{\u{F817}, \u{F818}}"
+    );
+    clear_state();
+    // The extended "formal script" block a couple of the rarer variants
+    // (e.g. `\[FormalScriptCapitalA]`) live in.
+    assert_eq!(
+      interpret("Head[\\[FormalScriptCapitalA]]").unwrap(),
+      "Symbol"
+    );
+  }
+
+  #[test]
+  fn test_named_character_identifier_keeps_trailing_dollar_signs() {
+    // Wolfram's FrontEnd names a Manipulate-tracked variable built from a
+    // named character with a trailing `$$` (e.g. `\[Delta]$$`); the whole
+    // thing must parse as one Symbol, not split into the bare named
+    // character and a separate `$$` symbol joined by implicit
+    // multiplication. This is exactly the shape a Demonstration's
+    // `{{\[Delta]$$, 0.015}, 0.01, 0.025, 0.001}` Manipulate control spec
+    // takes once its `$CellContext`` prefix is stripped when Woxi Studio
+    // rebuilds a saved widget from a notebook with no Input-cell source.
+    clear_state();
+    assert_eq!(interpret("Head[\\[Delta]$$]").unwrap(), "Symbol");
+    assert_eq!(interpret("\\[Delta]$$ = 3; \\[Delta]$$ + 1").unwrap(), "4");
+    clear_state();
+    // The same holds for a function-call head, not just a bare symbol.
+    assert_eq!(
+      interpret("\\[Theta]$$[x_] := x^2; \\[Theta]$$[5]").unwrap(),
+      "25"
+    );
+  }
+
+  #[test]
+  fn test_formal_symbol_escaped_and_raw_glyph_spellings_are_the_same_symbol() {
+    // `\[FormalX]` (the escape text) and the bare private-use glyph it
+    // stands for (`\u{F817}`, as a notebook's BoxData actually stores it)
+    // must name the *same* symbol, exactly like any other named character.
+    // `is_symbol_letter` in src/syntax.rs (which decides whether the
+    // escape text's `\[Name]` resolves to the Unicode glyph or falls back
+    // to the literal name string) needs the same private-use ranges as the
+    // `PrivateUseLetter` parser rule, or the two spellings silently name
+    // different symbols.
+    let formal_x = '\u{F817}'; // \[FormalX]
+    clear_state();
+    assert_eq!(
+      interpret(&format!("{formal_x} === \\[FormalX]")).unwrap(),
+      "True"
+    );
+    // The glyph also works as a pattern variable's name, not just a bare
+    // reference (the `PatternName` grammar rule shares `PrivateUseLetter`).
+    clear_state();
+    assert_eq!(
+      interpret(&format!(
+        "f[{formal_x}_] := {{{formal_x}, {formal_x}}};\nf[1]"
+      ))
+      .unwrap(),
+      "{1, 1}"
+    );
+  }
+
+  #[test]
+  fn test_manipulate_bare_sibling_bound_stays_symbolic_in_echo() {
+    // A combinatorics-style Demonstration pattern (independently written,
+    // not copied from any specific one): a control's bound is a bare
+    // expression (no `Dynamic[…]` wrapper) counting some combination of
+    // another control's value — `Length[Subsets[Range[n], {2}]]` bounding
+    // `pick` by how many pairs `Range[n]` has. Manipulate's held-echo pass
+    // speculatively evaluates each bound to fold constants (`2 Pi` ->
+    // `6.28...`), but with `n` unbound that speculative evaluation doesn't
+    // fail — `Subsets` on the unevaluated `Range[n]` silently returns `{}`,
+    // so `Length` comes back `0` — and previously got baked into the
+    // echoed `Manipulate[…]` as a wrong literal `0` instead of being left
+    // symbolic for Woxi Studio's widget builder to resolve against `n`'s
+    // live value (see `process_manipulate_var_spec` in
+    // `src/functions/graphics.rs`). Like wolframscript, the echo wraps such
+    // a bound in `Dynamic[…]`.
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"Manipulate[pick, {{n, 4, "count"}, 3, 8, 1}, {{pick, 1, "pick"}, 1, Length[Subsets[Range[n], {2}]], 1}]"#
+      )
+      .unwrap(),
+      "Manipulate[pick, {{n, 4, count}, 3, 8, 1}, {{pick, 1, pick}, 1, \
+       Dynamic[Length[Subsets[Range[n], {2}]]], 1}]"
+    );
+    // Choice lists and option values naming a sibling are wrapped the
+    // same way; `Enabled` conditions are wrapped on their right-hand side.
+    clear_state();
+    assert_eq!(
+      interpret("Manipulate[x, {n, 1, 5}, {x, {1, 2, n}}]").unwrap(),
+      "Manipulate[x, {n, 1, 5}, {x, Dynamic[{1, 2, n}]}]"
+    );
+    assert_eq!(
+      interpret("Manipulate[x, {n, 1, 5}, {x, 0, 1, Enabled -> n > 2}]")
+        .unwrap(),
+      "Manipulate[x, {n, 1, 5}, {x, 0, 1, Enabled -> Dynamic[n > 2]}]"
+    );
+    assert_eq!(
+      interpret("Manipulate[x, {n, 1, 5}, {x, Dynamic[n], 10}]").unwrap(),
+      "Manipulate[x, {n, 1, 5}, {x, Dynamic[n], 10}]"
+    );
+  }
+
+  #[test]
+  fn test_manipulate_echo_normalizes_control_specs() {
+    // A bare control type echoes as the `ControlType -> …` option it stands
+    // for, and a spec giving nothing else gets that type's default values.
+    clear_state();
+    for (code, echo) in [
+      (
+        "Manipulate[x, {x, 0, 1, Slider}]",
+        "Manipulate[x, {x, 0, 1, ControlType -> Slider}]",
+      ),
+      (
+        "Manipulate[x, {x, Slider}]",
+        "Manipulate[x, {x, 0, 1, ControlType -> Slider}]",
+      ),
+      (
+        "Manipulate[p, {{p, {0, 0}}, Locator}]",
+        "Manipulate[p, {{p, {0, 0}}, Automatic, ControlType -> Locator}]",
+      ),
+      (
+        "Manipulate[x, {{x, 5}, None}]",
+        "Manipulate[x, {{x, 5}, 0, ControlType -> None}]",
+      ),
+      (
+        "Manipulate[x, {x, InputField}]",
+        "Manipulate[x, {x, ControlType -> InputField}]",
+      ),
+      (
+        "Manipulate[x, {{x, 1}, PopupMenu}]",
+        "Manipulate[x, {{x, 1}, {True, False, Automatic}, \
+         ControlType -> PopupMenu}]",
+      ),
+      (
+        "Manipulate[x, {x, Checkbox}]",
+        "Manipulate[x, {x, {True, False}, ControlType -> Checkbox}]",
+      ),
+      // `Automatic` is not a control type to spell out.
+      (
+        "Manipulate[x, {x, 0, 1, Automatic}]",
+        "Manipulate[x, {x, 0, 1, Automatic}]",
+      ),
+      // The initial value is evaluated; the label is not.
+      (
+        "Manipulate[x, {{x, 1 + 1, \"a\"}, 0, 5}]",
+        "Manipulate[x, {{x, 2, a}, 0, 5}]",
+      ),
+      (
+        "Manipulate[x, {{x, Red}, ColorSlider}]",
+        "Manipulate[x, {{x, RGBColor[1, 0, 0]}, Gray, \
+         ControlType -> ColorSlider}]",
+      ),
+      // Only a range naming a sibling control is wrapped in Dynamic.
+      ("Manipulate[x, {x, foo}]", "Manipulate[x, {x, foo}]"),
+    ] {
+      assert_eq!(interpret(code).unwrap(), echo, "{code}");
+    }
+  }
+
+  #[test]
+  fn test_control_is_held() {
+    clear_state();
+    assert_eq!(
+      interpret("Control[{x, 0, 2 Pi}]").unwrap(),
+      "Control[{x, 0, 2*Pi}]"
+    );
+    assert_eq!(
+      interpret("Control[{x, 0, 1, Slider}]").unwrap(),
+      "Control[{x, 0, 1, Slider}]"
+    );
+  }
+
+  #[test]
+  fn test_expression_then_comment() {
+    // Expression followed by comment should evaluate the expression
+    clear_state();
+    assert_eq!(interpret("Sin[123]\n(* comment *)").unwrap(), "Sin[123]");
+  }
+
+  #[test]
+  fn test_column_with_tableform_and_headings_full_example() {
+    // Regression test for the playground rendering of a Column that mixes
+    // text headings, a TableForm with column headings, and trailing text.
+    clear_state();
+    let r = interpret_with_stdout(
+      "names = {\"2\\[Euro]\", \"1\\[Euro]\", \"50c\", \"20c\"};\n\
+       weights = {8.50, 7.50, 7.80, 5.74};\n\
+       best = {10, 2, 0, 0};\n\
+       Column[{\n\
+         \"=== Fewest Euro coins to make exactly 100 g ===\",\n\
+         TableForm[\n\
+           Select[Transpose[{names, best, best * weights}], #[[2]] > 0 &],\n\
+           TableHeadings -> {None, {\"Coin\", \"Count\", \"Weight (g)\"}}\n\
+         ],\n\
+         \"Total coins\"\n\
+       }]",
+    )
+    .unwrap();
+    let svg = r.graphics.expect("expected graphics output");
+    assert!(svg.matches("<svg").count() >= 2);
+    assert!(!svg.contains("TableForm["));
+    assert!(svg.contains("Fewest Euro coins"));
+    assert!(svg.contains("Coin"));
+  }
+
+  /// The picture a cell shows is the one its value *is*, not the last one
+  /// drawn while getting there. A Manipulate body that builds several plots
+  /// and then picks one — the standard Demonstrations "which view?" control
+  /// — used to display whichever plot was assigned last.
+  #[test]
+  fn test_displayed_graphic_is_the_result_not_the_last_drawn() {
+    clear_state();
+    // `p1` is a plot 320 wide, `p2` one 480 wide; the body returns `p1`.
+    let r = interpret_with_stdout(
+      "Module[{p1, p2, which}, \
+       which = 1; \
+       p1 = Plot[Sin[x], {x, 0, 4}, ImageSize -> 320]; \
+       p2 = Plot[Cos[x], {x, 0, 4}, ImageSize -> 480]; \
+       Switch[which, 1, p1, 2, p2]]",
+    )
+    .unwrap();
+    let svg = r.graphics.expect("expected graphics output");
+    assert!(
+      svg.starts_with("<svg width=\"320\""),
+      "expected the picked plot (320 wide), got: {}",
+      &svg[..svg.len().min(80)]
+    );
+    // …and picking the other branch shows the other plot.
+    clear_state();
+    let r = interpret_with_stdout(
+      "Module[{p1, p2, which}, \
+       which = 2; \
+       p1 = Plot[Sin[x], {x, 0, 4}, ImageSize -> 320]; \
+       p2 = Plot[Cos[x], {x, 0, 4}, ImageSize -> 480]; \
+       Switch[which, 1, p1, 2, p2]]",
+    )
+    .unwrap();
+    let svg = r.graphics.expect("expected graphics output");
+    assert!(
+      svg.starts_with("<svg width=\"480\""),
+      "expected the picked plot (480 wide), got: {}",
+      &svg[..svg.len().min(80)]
+    );
+  }
+
+  /// `TabView[{"first" -> pane1, "second" -> pane2}]` has no single branch
+  /// the way `Switch` does — a real front end keeps every pane's expression
+  /// live and just *displays* the first one until the user clicks another
+  /// tab. Woxi still evaluates every pane eagerly, and a pane that draws a
+  /// picture calls `capture_graphics` as a side effect, so the same
+  /// last-drawn-wins bug applies: the second (last) pane used to win the
+  /// capture buffer no matter which tab a notebook actually opens on.
+  #[test]
+  fn test_tabview_shows_first_tab_not_last_evaluated() {
+    clear_state();
+    let r = interpret_with_stdout(
+      "TabView[{\"first\" -> Plot[Sin[x], {x, 0, 4}, ImageSize -> 320], \
+       \"second\" -> Plot[Cos[x], {x, 0, 4}, ImageSize -> 480]}]",
+    )
+    .unwrap();
+    let svg = r.graphics.expect("expected graphics output");
+    assert!(
+      svg.starts_with("<svg width=\"320\""),
+      "expected the first tab's plot (320 wide), got: {}",
+      &svg[..svg.len().min(80)]
+    );
+  }
+
+  /// The same holds across the statements of one cell: the value of the
+  /// last statement is what gets displayed.
+  #[test]
+  fn test_displayed_graphic_is_the_last_statements_value() {
+    clear_state();
+    let r = interpret_with_stdout(
+      "p1 = Plot[Sin[x], {x, 0, 4}, ImageSize -> 320];\n\
+       p2 = Plot[Cos[x], {x, 0, 4}, ImageSize -> 480];\n\
+       p1",
+    )
+    .unwrap();
+    let svg = r.graphics.expect("expected graphics output");
+    assert!(
+      svg.starts_with("<svg width=\"320\""),
+      "expected the referenced plot (320 wide), got: {}",
+      &svg[..svg.len().min(80)]
+    );
+  }
+
+  /// A Demonstration idiom draws flow-direction arrows along a curve with
+  /// `Plot[…, PlotStyle -> {..., Arrowheads[…]}] /. Line -> Arrow`. The
+  /// `ReplaceAll` forces the plot to re-render from its remembered
+  /// primitives instead of reusing the picture `Plot` already drew, and
+  /// that re-render used to lose the plot's own aspect ratio (`Plot`
+  /// derives it from `ImageSize` directly rather than storing an
+  /// `AspectRatio` option) and fit the generic `Graphics[...]` bounding box
+  /// of the primitives instead — which an `Arrow`'s head geometry can throw
+  /// wildly off. Independently written, not copied from any specific
+  /// Demonstration.
+  #[test]
+  fn test_line_to_arrow_replacement_keeps_plot_aspect_ratio() {
+    clear_state();
+    let baseline = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 10}, ImageSize -> 380], \"SVG\"]",
+    )
+    .unwrap();
+    let baseline_height = svg_root_height(&baseline);
+
+    let arrowed = interpret(
+      "ExportString[Plot[{Sin[x], Cos[x]}, {x, 0, 10}, \
+         PlotStyle -> {{Red, Arrowheads[ConstantArray[0.04, 5]]}, \
+                        {Blue, Arrowheads[ConstantArray[0.04, 5]]}}, \
+         ImageSize -> 380] /. Line -> Arrow, \"SVG\"]",
+    )
+    .unwrap();
+    let arrowed_height = svg_root_height(&arrowed);
+
+    assert!(
+      (arrowed_height - baseline_height).abs() < 1.0,
+      "Line -> Arrow replacement changed the plot's height: {arrowed_height} \
+       vs baseline {baseline_height}"
+    );
+  }
+
+  /// Extract the outermost `<svg width="…" height="…"` pair as an `f64`.
+  fn svg_root_height(svg: &str) -> f64 {
+    let after = svg.split("height=\"").nth(1).expect("no height attribute");
+    let digits: String = after.chars().take_while(|c| *c != '"').collect();
+    digits.parse().expect("height is not a number")
+  }
+
+  /// A Demonstration idiom wraps a Manipulate body's live picture in
+  /// `EventHandler[Style[Dynamic[graphic], opts], "MouseClicked" :> action]`
+  /// so clicking the picture toggles some state. Woxi's visual hosts don't
+  /// wire the click itself through to `MousePosition`, but the picture must
+  /// still render — before this fix, an unrecognized `EventHandler[…]` head
+  /// fell all the way through the display pipeline unresolved and the cell
+  /// showed its raw source text instead of the graphic. Independently
+  /// written, not copied from any specific Demonstration.
+  #[test]
+  fn test_event_handler_wrapped_dynamic_graphic_still_renders() {
+    clear_state();
+    let r = interpret_with_stdout(
+      "EventHandler[\
+         Style[Dynamic[Graphics[{Blue, Disk[]}]], \
+           DynamicEvaluationTimeout -> 20], \
+         \"MouseClicked\" :> Null\
+       ]",
+    )
+    .unwrap();
+    let svg = r.graphics.expect(
+      "expected the wrapped graphic to render instead of the raw \
+       EventHandler[...] source echo",
+    );
+    assert!(svg.contains("<svg"));
+  }
+
+  /// Script/CLI mode keeps EventHandler's canonical symbolic form, matching
+  /// wolframscript run without a front end — only Woxi's visual hosts
+  /// (Playground, Studio) release it to show the wrapped content.
+  #[test]
+  fn event_handler_stays_symbolic_in_script_mode() {
+    clear_state();
+    assert_eq!(
+      interpret("EventHandler[Graphics[{Circle[]}], \"MouseClicked\" :> 1]")
+        .unwrap(),
+      "EventHandler[-Graphics-, MouseClicked :> 1]"
+    );
+  }
+
+  #[test]
+  fn test_export_graphic_does_not_render_inline() {
+    // Exporting a graphic (e.g. BarChart) to a file writes the file and
+    // returns the filename; it must NOT also surface the chart as inline
+    // graphics in visual frontends (playground, woxi-studio). Evaluating the
+    // second argument populates the capture buffer, so Export has to drop that
+    // entry.
+    clear_state();
+    let path = temp_file("woxi_test_export_barchart.svg");
+    let code = format!("Export[\"{path}\", BarChart[{{5, 8, 3, 9, 6, 4, 7}}]]");
+    let r = interpret_with_stdout(&code).unwrap();
+    assert_eq!(r.result, path);
+    assert!(
+      r.graphics.is_none(),
+      "Export should not surface inline graphics, got:\n{:?}",
+      r.graphics
+    );
+    // The file itself must still contain the rendered chart.
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("<svg"), "exported file should be an SVG");
+    std::fs::remove_file(&path).ok();
+  }
+
+  #[test]
+  fn test_piechart_chartstyle_and_chartlabels() {
+    // Regression: PieChart must honor `ChartStyle` (per-slice fill colors,
+    // keyed by data index) and `ChartLabels` (text drawn on each wedge).
+    clear_state();
+    let svg = interpret_with_stdout(
+      "PieChart[{1, 2, 3, 4}, \
+       ChartStyle -> {Pink, LightBlue, LightGreen, LightOrange}, \
+       ChartLabels -> {\"one\", \"two\", \"three\", \"four\"}]",
+    )
+    .unwrap()
+    .graphics
+    .expect("PieChart should produce a graphics SVG");
+    // ChartStyle colors, one per data index (Pink, LightBlue, LightGreen,
+    // LightOrange). The default PLOT_COLORS palette must not appear.
+    for rgb in [
+      "rgb(255,128,128)", // Pink
+      "rgb(222,240,255)", // LightBlue
+      "rgb(224,255,224)", // LightGreen
+      "rgb(255,230,204)", // LightOrange
+    ] {
+      assert!(
+        svg.contains(rgb),
+        "PieChart SVG missing ChartStyle color {rgb}:\n{svg}"
+      );
+    }
+    // ChartLabels rendered as wedge text.
+    for label in ["one", "two", "three", "four"] {
+      assert!(
+        svg.contains(&format!(">{label}</text>")),
+        "PieChart SVG missing ChartLabels text `{label}`:\n{svg}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_piechart_input_order_and_black_border() {
+    // Regression: PieChart draws slices in the order given by the value
+    // array (no smallest-to-largest sorting) and every wedge has a black
+    // border by default, matching wolframscript (EdgeForm GrayLevel[0]).
+    clear_state();
+    let svg = interpret_with_stdout("PieChart[{30, 20, 10}]")
+      .unwrap()
+      .graphics
+      .expect("PieChart should produce a graphics SVG");
+    // Borders must be black, never white.
+    assert!(
+      !svg.contains("stroke=\"white\""),
+      "PieChart wedges must use a black border:\n{svg}"
+    );
+    assert!(
+      svg.contains("stroke=\"black\""),
+      "PieChart wedges must use a black border:\n{svg}"
+    );
+    // Slices appear in input order: the first `<title>` is 30, then 20, 10.
+    let order: Vec<&str> = svg
+      .match_indices("<title>")
+      .map(|(i, _)| {
+        let rest = &svg[i + "<title>".len()..];
+        &rest[..rest.find("</title>").unwrap()]
+      })
+      .collect();
+    assert_eq!(
+      order,
+      vec!["30", "20", "10"],
+      "PieChart slices must follow the input value order:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_piechart_plotlabel_string() {
+    // Regression: PieChart silently ignored PlotLabel (unlike Plot/BarChart).
+    clear_state();
+    let with_label =
+      interpret_with_stdout("PieChart[{1, 2, 3}, PlotLabel -> \"Split\"]")
+        .unwrap()
+        .graphics
+        .expect("PieChart should produce a graphics SVG");
+    assert!(
+      with_label.contains(">Split</text>"),
+      "PieChart SVG missing PlotLabel text:\n{with_label}"
+    );
+
+    // The frame grows taller to fit the label, while an unlabeled chart
+    // keeps its default square size.
+    clear_state();
+    let without_label = interpret_with_stdout("PieChart[{1, 2, 3}]")
+      .unwrap()
+      .graphics
+      .expect("PieChart should produce a graphics SVG");
+    let height_of = |svg: &str| -> u32 {
+      let start = svg.find("height=\"").unwrap() + "height=\"".len();
+      let rest = &svg[start..];
+      rest[..rest.find('"').unwrap()].parse().unwrap()
+    };
+    assert!(
+      height_of(&with_label) > height_of(&without_label),
+      "PieChart with a PlotLabel must reserve extra headroom:\nlabeled: {with_label}\nunlabeled: {without_label}"
+    );
+  }
+
+  #[test]
+  fn test_piechart_plotlabel_grid_stacks_lines() {
+    // Regression: a Grid/Column PlotLabel (as Demonstrations commonly build,
+    // e.g. a two-row table of names and computed values) stacks its rows as
+    // separate lines above the pie, matching Plot/BarChart.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "PieChart[{1, 2}, PlotLabel -> Grid[{{\"A\", \"B\"}, {1, 2}}]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("PieChart should produce a graphics SVG");
+    assert!(
+      svg.contains(">A B<"),
+      "PieChart SVG missing first PlotLabel line:\n{svg}"
+    );
+    assert!(
+      svg.contains("<tspan") && svg.contains(">1 2</tspan>"),
+      "PieChart SVG missing stacked second PlotLabel line:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_graphics_plotlabel_stringform_substitutes_placeholders() {
+    // Regression: `PlotLabel -> StringForm["…", args]` (the "Paths inside a
+    // Polygon" Demonstration's `PlotLabel -> StringForm["Path distance =
+    // ``", …]` idiom) leaked the literal `StringForm[…]` wrapper into the
+    // graphic instead of substituting its placeholders. `Print`/`ToString`
+    // are unaffected — wolframscript itself only substitutes `StringForm`
+    // when it is explicitly typeset (a front end, or `ToString`), and a
+    // graphic's label is exactly that.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "Graphics[{Circle[]}, PlotLabel -> StringForm[\"d = ``\", 3.14]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Graphics should produce an SVG");
+    assert!(
+      svg.contains(">d = 3.14<"),
+      "PlotLabel must substitute the StringForm placeholder:\n{svg}"
+    );
+    assert!(
+      !svg.contains("StringForm["),
+      "PlotLabel must not leak the literal StringForm wrapper:\n{svg}"
+    );
+
+    // A substituted argument still typesets through the label's own
+    // renderer — a NumberForm argument rounds/pads, and a symbolic power
+    // still becomes a superscript tspan — instead of dropping to FullForm
+    // text.
+    clear_state();
+    let svg_numberform = interpret_with_stdout(
+      "Graphics[{Circle[]}, PlotLabel -> \
+       StringForm[\"Path distance = ``\", NumberForm[3.14159, {9, 3}]]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Graphics should produce an SVG");
+    assert!(
+      svg_numberform.contains(">Path distance = 3.142<"),
+      "NumberForm argument must render its rounded form, not FullForm text:\n{svg_numberform}"
+    );
+
+    clear_state();
+    let svg_power = interpret_with_stdout(
+      "Graphics[{Circle[]}, PlotLabel -> StringForm[\"area = ``\", x^2]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Graphics should produce an SVG");
+    assert!(
+      svg_power.contains("area = x<tspan baseline-shift=\"super\""),
+      "Power argument must typeset as a superscript:\n{svg_power}"
+    );
+
+    // The template's own literal text still gets XML-escaped.
+    clear_state();
+    let svg_escaped = interpret_with_stdout(
+      "Graphics[{Circle[]}, PlotLabel -> StringForm[\"a < b: ``\", 5]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Graphics should produce an SVG");
+    assert!(
+      svg_escaped.contains("a &lt; b: 5"),
+      "PlotLabel template text must stay XML-escaped:\n{svg_escaped}"
+    );
+
+    // `Print`/`ToString` are unrelated call sites and must keep their
+    // existing (wolframscript-verified) behavior.
+    clear_state();
+    let printed = interpret_with_stdout("Print[StringForm[\"Value: ``\", 5]]")
+      .unwrap()
+      .stdout;
+    assert_eq!(
+      printed.trim(),
+      "StringForm[Value: ``, 5]",
+      "Print must keep showing the literal StringForm wrapper"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("ToString[StringForm[\"Value: ``\", 5]]").unwrap(),
+      "Value: 5"
+    );
+  }
+
+  #[test]
+  fn test_plot3d_framed_plotlabel_typesets_content() {
+    // Regression: Plot3D[…, PlotLabel -> Style[Framed[TraditionalForm[expr]],
+    // …]] (the pattern the "Complex Exponential and Logarithm Functions"
+    // Demonstration's Manipulate uses) printed the literal `Framed[…]`
+    // wrapper text instead of typesetting the boxed content. SVG text
+    // markup has no room to draw the frame's border, so the fix typesets
+    // the content plain rather than leaking the head.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "Plot3D[x + y, {x, -1, 1}, {y, -1, 1}, \
+       PlotLabel -> Style[Framed[TraditionalForm[Re[Exp[z]]]], Blue]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Plot3D should produce a graphics SVG");
+    assert!(
+      !svg.contains("Framed["),
+      "Framed PlotLabel must not leak its literal head:\n{svg}"
+    );
+    assert!(
+      svg.contains("Re(") || svg.contains("Re["),
+      "Framed PlotLabel should still typeset its content:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_show_merged_plot3d_keeps_per_surface_plotstyle() {
+    // Regression: a Manipulate body that stacks several flat `Plot3D`
+    // surfaces with an explicit per-surface `PlotStyle` list inside a
+    // `Show[{…}]` (the shape a "sheets stacked along an axis" Demonstration
+    // uses, e.g. one built from the Riemann surface of the logarithm) lost
+    // the requested colours: merging `Plot3D`'s symbolic structure into
+    // `Show` recoloured every surface with the automatic height-based
+    // rainbow instead of honoring `PlotStyle`.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "Show[{Plot3D[{-1, 0, 1}, {x, -2, 2}, {y, -2, 2}, \
+       PlotStyle -> {{LightBlue}, {Yellow}, {LightBlue}}], \
+       Graphics3D[{Thick, White, Line[{{0, 0, -1}, {2, 0, -1}}]}]}]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Show should produce a graphics SVG");
+    assert!(
+      svg.contains("rgb(188,203,216)"),
+      "the two LightBlue surfaces must keep their PlotStyle colour:\n{svg}"
+    );
+    assert!(
+      svg.contains("rgb(216,216,0)"),
+      "the Yellow surface must keep its PlotStyle colour:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_directive_with_single_list_argument_applies_its_styles() {
+    // Regression: `Directive[{a, b, …}]` (one List argument, as
+    // `ContourStyle -> Directive[{Thickness[...], RGBColor[...]}]` writes
+    // it) silently applied no style at all — only the flat spelling
+    // `Directive[a, b, …]` worked. `apply_directive` fell through its
+    // `Expr::List` argument to the `_ => false` arm instead of recursing
+    // into the list's items.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "Graphics[{Directive[{Thickness[.02], RGBColor[.25, .43, .82]}], \
+       Circle[{0, 0}, 1]}]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Graphics should produce a graphics SVG");
+    assert!(
+      svg.contains("rgb(64,110,209)"),
+      "Directive[{{…}}] must apply its RGBColor:\n{svg}"
+    );
+    assert!(
+      !svg.contains("rgb(0,0,0)"),
+      "Directive[{{…}}] must not leave the circle black:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_show_contour_plot_with_directive_list_contour_style() {
+    // Regression: `Show[ContourPlot[…], Graphics[…]]` where the
+    // ContourPlot's `ContourStyle` is a `Directive[{…}]` (single List
+    // argument) lost its color once merged — the contour lines rendered
+    // black instead of the requested color. `ContourPlot`'s symbolic
+    // `structure` embeds the ContourStyle directive verbatim, so the same
+    // `Directive[{…}]` parsing gap dropped it there too.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "Show[ContourPlot[x^2 + y^2, {x, -2, 2}, {y, -2, 2}, \
+       ContourStyle -> Directive[{Thickness[.01], RGBColor[.25, .43, .82]}], \
+       ContourShading -> None, Axes -> False, Frame -> False], \
+       Graphics[{Black, Circle[{0, 0}, .2]}]]",
+    )
+    .unwrap()
+    .graphics
+    .expect("Show should produce a graphics SVG");
+    assert!(
+      svg.contains("rgb(64,110,209)"),
+      "merged ContourPlot must keep its Directive[{{…}}] ContourStyle color:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_column_with_nested_tableform_renders_as_graphics() {
+    // In visual mode (playground / woxi-studio), a Column containing a
+    // TableForm must pre-render the table as a sub-SVG instead of falling
+    // back to the literal `TableForm[…]` text echo.
+    clear_state();
+    let r =
+      interpret_with_stdout("Column[{\"hello\", TableForm[{{1, 2}, {3, 4}}]}]")
+        .unwrap();
+    let svg = r.graphics.expect("Column should produce a graphics SVG");
+    // A nested <svg> child is the marker that the TableForm got embedded
+    // as a sub-SVG (vs. being stringified as plain text).
+    assert!(
+      svg.matches("<svg").count() >= 2,
+      "Column SVG should embed the TableForm as a nested <svg>:\n{svg}"
+    );
+    // The text item is still rendered as a <text> element.
+    assert!(
+      svg.contains(">hello<"),
+      "Column SVG missing text item:\n{svg}"
+    );
+    // The fall-back stringified table should NOT appear.
+    assert!(
+      !svg.contains("TableForm["),
+      "Column SVG should not contain raw TableForm[…] text:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_tableform_of_non_list_passes_through_to_wrapped_content() {
+    // `TableForm[expr]` for a non-list `expr` is a pass-through in Wolfram:
+    // expr displays exactly as it would on its own. A Manipulate body that
+    // keeps whichever "screen" is on display in one variable and always
+    // renders it `TableForm[display, …]` relies on this — most screens
+    // (a title card, a caption panel, …) are plain layout constructs, not
+    // tabular data, and only look right if TableForm just shows them
+    // untouched. Regression: `tableform_grid_args` returns `None` for
+    // non-list data (as designed — there's no grid to build), but the
+    // caller treated that the same as "nothing rendered" and fell back to
+    // the raw, unevaluated `TableForm[Framed[…], …]` source text instead of
+    // rendering the wrapped `Framed[…]` picture.
+    clear_state();
+    let r = interpret_with_stdout(
+      "TableForm[Framed[Pane[Text[Style[\"hi\", 24]]]], TableAlignments -> Center]",
+    )
+    .unwrap();
+    let svg = r
+      .graphics
+      .expect("TableForm of a non-list Framed picture should still render");
+    assert!(
+      svg.contains(">hi<"),
+      "the wrapped Framed/Pane/Text content must render:\n{svg}"
+    );
+    assert!(
+      !svg.contains("TableForm["),
+      "must not fall back to the raw TableForm[…] source text:\n{svg}"
+    );
+    assert!(
+      !svg.contains("Framed["),
+      "must not fall back to the raw Framed[…] source text either:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_bare_button_in_column_renders_as_plate_not_source_text() {
+    // A bare `Button[label, action]` drawn as a `Column`/`Row`/`Grid`/
+    // `TableForm` item (not wrapped in `Inset[…]`, which already drew it as
+    // a plate) fell back to printing its literal, unevaluated
+    // `Button[100, Set[x, 1]]`-style source text instead of a button. A
+    // Demonstration's clickable grid built with `Table[Button[…], …]`
+    // relies on each generated cell drawing as a real button plate.
+    clear_state();
+    let r =
+      interpret_with_stdout("Column[{Button[100, x = 1], Button[200, x = 2]}]")
+        .unwrap();
+    let svg = r.graphics.expect("Column of Buttons should render");
+    assert!(
+      !svg.contains("Button["),
+      "must not fall back to raw Button[…] source text:\n{svg}"
+    );
+    assert!(
+      svg.contains(">100<") && svg.contains(">200<"),
+      "each button's label must appear on its plate:\n{svg}"
+    );
+    // The plate itself: a rounded rectangle behind the label.
+    assert!(
+      svg.matches("<rect").count() >= 2,
+      "each button must draw as a plate (a <rect>), one per button:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_tableform_decimal_alignment_lines_up_dots() {
+    // `TableAlignments -> "."` must line up the numbers on their decimal
+    // point. Each cell is start-anchored in the SVG, so the dot's x-position
+    // is `x + (chars before the dot) * char_width` (char_width = 8.4). All
+    // cells must share the same dot x.
+    clear_state();
+    let svg = interpret(
+      "ExportString[TableForm[0.12345 * 10^Range[4], TableAlignments -> \".\"], \"SVG\"]",
+    )
+    .unwrap();
+
+    let char_width = 8.4_f64;
+    let mut dot_positions: Vec<f64> = Vec::new();
+    for chunk in svg.split("<text ").skip(1) {
+      // Parse the `x="…"` attribute.
+      let x_val = chunk
+        .split("x=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .and_then(|s| s.parse::<f64>().ok())
+        .expect("text element must have an x attribute");
+      // Parse the element's text content.
+      let content = chunk
+        .split('>')
+        .nth(1)
+        .and_then(|s| s.split('<').next())
+        .expect("text element must have content");
+      // Only numeric cells participate in decimal alignment.
+      let int_chars = match content.find('.') {
+        Some(pos) => content[..pos].chars().count(),
+        None => content.chars().count(),
+      };
+      dot_positions.push(x_val + int_chars as f64 * char_width);
+    }
+
+    assert_eq!(dot_positions.len(), 4, "expected 4 rows:\n{svg}");
+    let first = dot_positions[0];
+    for dp in &dot_positions {
+      assert!(
+        (dp - first).abs() < 1e-6,
+        "decimal points must line up; got {dot_positions:?}\n{svg}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_real_output_svg_has_no_precision_backtick() {
+    // Regression: the playground/Studio SVG for results containing machine
+    // Reals (e.g. `NMinimize[(x-1)^2, x]` → `{0., {x -> 1.}}`) must not show
+    // the box-form precision marker backtick (`0.``/`1.``). The typeset
+    // display suppresses it.
+    clear_state();
+    let r = interpret_with_stdout("NMinimize[(x - 1)^2, x]").unwrap();
+    let svg = r
+      .output_svg
+      .expect("expected output SVG for real-valued result");
+    assert!(
+      !svg.contains('`'),
+      "Real result SVG must not contain a precision-marker backtick:\n{svg}"
+    );
+    // The numeric values themselves are still present.
+    assert!(svg.contains("0.") && svg.contains("1."), "SVG: {svg}");
+  }
+
+  #[test]
+  fn test_traditional_form_integrate_differential_svg_uses_plain_d() {
+    // Regression: `TraditionalForm[HoldForm[Integrate[…]]]` typesets the
+    // closing differential as the literal box glyph `\[DifferentialD]`
+    // (U+2146, "ⅆ"). That Mathematical Alphanumeric Symbols codepoint has no
+    // glyph in most non-Mathematica fonts, so the Playground/Studio SVG
+    // viewer's font-fallback substitute renders at a different width than
+    // the plain-ASCII advance the layout computed, overlapping the following
+    // variable (`ⅆx` reads as if it were "ddx"). The SVG must instead emit
+    // plain "d" (italicized like any other math variable), which every font
+    // has, so the two glyphs never overlap.
+    clear_state();
+    let svg = interpret_with_stdout(
+      "TraditionalForm[HoldForm[Integrate[x^2, {x, -1, 1}]]]",
+    )
+    .unwrap()
+    .output_svg
+    .expect("expected output SVG for TraditionalForm[HoldForm[Integrate[…]]]");
+    assert!(
+      !svg.contains('\u{2146}'),
+      "Integrate differential SVG must not contain the raw U+2146 glyph:\n{svg}"
+    );
+    assert!(
+      svg.contains(">d<"),
+      "Integrate differential SVG must render the differential as plain \"d\":\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_manipulate_style_text_differential_svg_uses_plain_d() {
+    // Regression: a `Column[{Graphics[…], Style[Text[Row[{…}]], size]}]`
+    // body — the shape Woxi Studio's Manipulate widgets render for a
+    // Demonstration's "graphic beside its formula" layout (e.g. Wolfram
+    // Demonstrations Project's "A Geometric Limit Problem") — renders its
+    // `Style[Text[…]]` half through a different SVG writer
+    // (`boxes_to_svg`/`expr_to_svg_markup`) than the one the previous test
+    // covers (`layout_box`/`layout_to_svg`, used for a bare top-level
+    // result). That second writer had its own, unfixed copy of the same
+    // U+2146 DifferentialD bug: the raw glyph reached the SVG untouched,
+    // where common font fallback renders it as an unrelated glyph (an "L"
+    // shape) instead of "d". It must also come out as a plain, italicized
+    // "d".
+    clear_state();
+    let r = interpret_with_stdout(
+      "Column[{Graphics[{Circle[{0, 0}, 1]}], \
+       Style[Text[Row[{TraditionalForm[ \
+         HoldForm[Integrate[Sqrt[1 - x^2], {x, 0, 1}]]]}]], 18]}]",
+    )
+    .unwrap();
+    let svg = r
+      .graphics
+      .expect("expected combined Column graphics output");
+    assert!(
+      !svg.contains('\u{2146}'),
+      "Manipulate-style Column SVG must not contain the raw U+2146 glyph:\n{svg}"
+    );
+    assert!(
+      svg.contains("<tspan font-style=\"italic\">d</tspan>"),
+      "Manipulate-style Column SVG must render the differential as an \
+       italicized plain \"d\":\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_manipulate_style_text_exponential_e_and_imaginary_i_svg() {
+    // Same bug, other two Letterlike Symbols glyphs TraditionalForm
+    // typesets from this renderer: `Exp[x]` as `\[ExponentialE]^x` (ⅇ,
+    // U+2147) and `I` as `\[ImaginaryI]` (ⅈ, U+2148). Both must come out
+    // as plain, italicized ASCII letters through the same SVG writer as
+    // the DifferentialD case above.
+    clear_state();
+    let r = interpret_with_stdout(
+      "Column[{Graphics[{Circle[{0, 0}, 1]}], \
+       Style[Text[Row[{TraditionalForm[HoldForm[Exp[x]]], \" \", \
+         TraditionalForm[HoldForm[2 + 3 I]]}]], 18]}]",
+    )
+    .unwrap();
+    let svg = r
+      .graphics
+      .expect("expected combined Column graphics output");
+    assert!(
+      !svg.contains('\u{2147}') && !svg.contains('\u{2148}'),
+      "Manipulate-style Column SVG must not contain the raw U+2147/U+2148 \
+       glyphs:\n{svg}"
+    );
+    assert!(
+      svg.contains("<tspan font-style=\"italic\">e</tspan>"),
+      "Manipulate-style Column SVG must render Exp's base as an \
+       italicized plain \"e\":\n{svg}"
+    );
+    assert!(
+      svg.contains("<tspan font-style=\"italic\">i</tspan>"),
+      "Manipulate-style Column SVG must render the imaginary unit as an \
+       italicized plain \"i\":\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_manipulate_row_style_symbolic_divide_svg_renders_as_fraction() {
+    // Regression (Wolfram Demonstrations Project "Diagrammatic
+    // Representations of Scientific Formulas"): a `Manipulate`'s
+    // `PlotLabel -> Column[{..., Style[Row[{..., v/r, ...}], size]}]` idiom
+    // evaluates the division symbolically to `Times[v, Power[r, -1]]`
+    // (`FullForm` of `v/r`). The `Row`/`Style` SVG writer
+    // (`expr_to_svg_markup`, distinct from bare `Text[...]`'s writer) typeset
+    // a negative `Power` exponent as a literal superscripted `-1` — "R^-1 V"
+    // — instead of the fraction "V/R" every other engine and Woxi's own
+    // `Text[...]` renderer show.
+    clear_state();
+    let r = interpret_with_stdout(
+      "Graphics[{Circle[]}, PlotLabel -> Row[{Style[\"I\", Italic], \" = \", \
+       Style[\"V\", Italic]/Style[\"R\", Italic]}]]",
+    )
+    .unwrap();
+    let svg = r.graphics.expect("expected Graphics SVG output");
+    assert!(
+      !svg.contains("super"),
+      "PlotLabel SVG must not typeset the reciprocal as a superscripted \
+       negative exponent:\n{svg}"
+    );
+    assert!(
+      svg.contains(
+        "<tspan font-style=\"italic\">V</tspan>/<tspan font-style=\"italic\">R</tspan>"
+      ),
+      "PlotLabel SVG must render the symbolic division as the fraction \
+       \"V/R\":\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_manipulate_row_style_symbolic_reciprocal_product_svg() {
+    // Same renderer, a product of two reciprocals (`Times[a, Power[b, -1],
+    // Power[c, -1]]`, i.e. `a/(b c)`): every reciprocal factor must move
+    // into a single combined, parenthesized denominator — `a/(b c)`, not
+    // the ambiguous `a/b c` (misreadable as `(a/b) c`) or a superscripted
+    // negative exponent on each factor.
+    clear_state();
+    let r = interpret_with_stdout("Graphics[{Circle[]}, PlotLabel -> a/(b c)]")
+      .unwrap();
+    let svg = r.graphics.expect("expected Graphics SVG output");
+    assert!(
+      svg.contains(">a/(b c)<"),
+      "PlotLabel SVG must render a/(b c) as a single fraction with a \
+       parenthesized denominator:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_scientific_real_output_svg_uses_superscript() {
+    // Regression: a machine Real in scientific notation (`10.^10` → `1.*^10`)
+    // must be typeset as `1. × 10^10` in the Playground/Studio SVG — a `×`
+    // factor with the exponent as a smaller superscript — rather than the raw
+    // InputForm `*^` operator.
+    for code in ["10.^10", "1.5*^-8", "3.4*^10"] {
+      clear_state();
+      let svg = interpret_with_stdout(code)
+        .unwrap()
+        .output_svg
+        .unwrap_or_else(|| panic!("expected output SVG for {code}"));
+      assert!(
+        !svg.contains("*^"),
+        "scientific SVG for {code} must not contain the literal `*^`:\n{svg}"
+      );
+      assert!(
+        svg.contains('\u{00d7}'),
+        "scientific SVG for {code} must contain the × factor:\n{svg}"
+      );
+      // The exponent renders in the reduced superscript font size (14 * 0.7).
+      assert!(
+        svg.contains("font-size=\"9.8\""),
+        "scientific SVG for {code} must have a superscript exponent:\n{svg}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_overscript_and_underscript_accents_typeset() {
+    // Regression: `Overscript[expr, accent]` / `Underscript[expr, accent]`
+    // and their `OverBar`/`UnderBar` shorthands (a Demonstration's estimator
+    // notation — a hat or bar accent over a symbol, e.g. a sample mean) had
+    // no box-form conversion, so the typeset SVG fell back to literal
+    // `Overscript[x, "_"]`/`OverBar[x]` text instead of drawing an accent.
+    clear_state();
+    for code in [
+      "ExportString[Overscript[x, \"^\"], \"SVG\"]",
+      "ExportString[OverBar[x], \"SVG\"]",
+      "ExportString[Underscript[x, \"^\"], \"SVG\"]",
+      "ExportString[UnderBar[x], \"SVG\"]",
+      "ExportString[TraditionalForm[Overscript[x, \"^\"]], \"SVG\"]",
+      "ExportString[TraditionalForm[OverBar[x]], \"SVG\"]",
+    ] {
+      clear_state();
+      let svg = interpret(code).unwrap();
+      assert!(
+        !svg.contains("Overscript")
+          && !svg.contains("Underscript")
+          && !svg.contains("OverBar")
+          && !svg.contains("UnderBar"),
+        "accent SVG for {code} must not leak the head as literal text:\n{svg}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_overscript_accent_inside_grid_cell_typesets() {
+    // Regression: a Grid cell holding `Overscript[…]`/`OverBar[…]` (the
+    // shape of a Demonstration's summary-statistics table, e.g. a sample
+    // mean or an estimator symbol) rendered as literal `Overscript[x, "_"]`
+    // text — the grid-cell markup renderer had cases for Subscript/
+    // Superscript but none for the accent heads.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{OverBar[x], Overscript[y, \"^\"]}}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("OverBar") && !svg.contains("Overscript"),
+      "grid-cell accent SVG must not leak the head as literal text:\n{svg}"
+    );
+    assert!(
+      svg.contains("text-decoration=\"overline\""),
+      "OverBar[x] in a grid cell must draw as a real overline:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_grid_frame_and_unquoted_text_with_graphics_cell() {
+    // Regression: a Grid row mixing a plain string cell with a Graphics
+    // cell (a Demonstration's idiom for a labeled row of pictures, e.g.
+    // `Grid[{Join[{"encryption"}, pictures]}, Frame -> All]`) took a
+    // different, simpler renderer than a plain Grid of strings because
+    // `lays_out_a_graphic` was true — the cell-by-cell composition path
+    // used for `Grid`/`Column`/`Row` holding a picture ignored `Frame`
+    // entirely and printed a string cell as quoted InputForm text instead
+    // of the plain label a pure-text Grid already renders unquoted.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{\"row1\", Graphics[Circle[], ImageSize -> 20], \
+       Graphics[Disk[], ImageSize -> 20]}}, Frame -> All], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.contains(">row1<"),
+      "a plain string cell next to a picture must stay unquoted, matching a text-only grid:\n{svg}"
+    );
+    assert!(
+      !svg.contains("&quot;row1&quot;"),
+      "a plain string cell next to a picture must not print as quoted InputForm text:\n{svg}"
+    );
+    assert!(
+      svg.contains("<line"),
+      "Frame -> All must still draw gridlines when a row holds a picture:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_mouseover_graphics_in_grid_renders_picture() {
+    // Regression: a Grid cell wrapped in `Mouseover[graphic, appearance]` —
+    // the idiom a Demonstration uses to show a plot with a text tooltip on
+    // hover (e.g. Wolfram Demonstrations' "Square Matrix Permutations") —
+    // printed the literal `Mouseover[-Graphics-, appearance]` source instead
+    // of drawing the wrapped graphic. A static export shows the base
+    // appearance (there is no hover), so the picture is what `Mouseover`
+    // wraps.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{Mouseover[ArrayPlot[{{1, 2}, {3, 4}}], \"tip\"]}}], \
+       \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("Mouseover"),
+      "Mouseover must not leak into the rendered output as text:\n{svg}"
+    );
+    assert!(
+      svg.contains("<rect"),
+      "the wrapped ArrayPlot must be drawn as a picture:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_mouseover_graphics_in_column_renders_picture() {
+    // Same wrapper, but as a bare Column cell rather than a Grid cell —
+    // exercises the `lays_out_a_graphic`/`expr_to_svg` path directly instead
+    // of `grid_cell_graphic`'s fallback.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Column[{Mouseover[ArrayPlot[{{1, 2}, {3, 4}}], \"tip\"]}], \
+       \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("Mouseover"),
+      "Mouseover must not leak into the rendered output as text:\n{svg}"
+    );
+    assert!(
+      svg.contains("<rect"),
+      "the wrapped ArrayPlot must be drawn as a picture:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_mouseover_graphics_bare_renders_picture() {
+    // A bare top-level `Mouseover[graphic, appearance]` (not inside any
+    // layout) must also draw the wrapped graphic rather than printing the
+    // call as source.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Mouseover[ArrayPlot[{{1, 2}, {3, 4}}], \"tip\"], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("Mouseover"),
+      "Mouseover must not leak into the rendered output as text:\n{svg}"
+    );
+    assert!(
+      svg.contains("<rect"),
+      "the wrapped ArrayPlot must be drawn as a picture:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_column_item_styled_tableform_typesets() {
+    // Regression: a `Column` item holding `Item[Style[TableForm[…],
+    // size], opts…]` — the shape a Demonstration's Manipulate body uses to
+    // show a computed table below a caption line — printed as the literal
+    // `TableForm[{{…}}]` source instead of an actual grid. `lays_out_a_graphic`
+    // (which decides whether a Column/Item is composed as a picture or
+    // typeset as text) had no case for `TableForm`/`MatrixForm`, even
+    // though `expr_to_svg` already knew how to render one.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Column[{\"Header\", Item[Style[TableForm[{{1, 2}, \
+       {3, 4}}], 18], Alignment -> Center]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("TableForm"),
+      "a Column item's TableForm must not leak the head as literal text:\n{svg}"
+    );
+    assert!(
+      svg.contains(">1<")
+        && svg.contains(">2<")
+        && svg.contains(">3<")
+        && svg.contains(">4<"),
+      "the table's cells must render individually:\n{svg}"
+    );
+    assert!(
+      svg.contains("font-size=\"18\""),
+      "the Style[…, 18] wrapping the TableForm must still set its font size:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_grid_background_explicit_cell_rules_take_priority() {
+    // Regression: `Background -> {cols, rows, {{i, j} -> color, …}}` — the
+    // three-argument form a Demonstration uses to highlight specific
+    // cells of a table (e.g. a Punnett square marking which
+    // genotype/phenotype combinations share a category) — was silently
+    // ignored: only the two-argument `{cols, rows}` form was parsed, so a
+    // table like this rendered with no cell coloring at all.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{1, 2}, {3, 4}}, \
+       Background -> {{Yellow, Yellow}, {Yellow, Yellow}, \
+       {{1, 1} -> Red, {2, 2} -> Blue}}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.contains("<rect"),
+      "an explicit per-cell Background rule must paint a rect:\n{svg}"
+    );
+    assert!(
+      svg.contains("rgb(255,0,0)"),
+      "cell {{1,1}} must use its explicit Red override, not the column/row default:\n{svg}"
+    );
+    assert!(
+      svg.contains("rgb(0,0,255)"),
+      "cell {{2,2}} must use its explicit Blue override, not the column/row default:\n{svg}"
+    );
+  }
+
+  #[test]
+  fn test_large_number_output_svg_groups_digits() {
+    // The Wolfram notebook groups the integer part of large numbers into
+    // 3-digit blocks (`10^10` → `10 000 000 000`). In the Playground/Studio SVG
+    // each group renders as its own `<text>` atom, so the full ungrouped run
+    // never appears and the leading/interior groups do.
+    clear_state();
+    let svg = interpret_with_stdout("10^10").unwrap().output_svg.unwrap();
+    assert!(
+      !svg.contains(">10000000000<"),
+      "large integer digits must be grouped:\n{svg}"
+    );
+    assert!(
+      svg.contains(">10<") && svg.contains(">000<"),
+      "expected 3-digit groups:\n{svg}"
+    );
+
+    // Grouping starts at five integer digits: `10^3` (1000) stays ungrouped,
+    // `10^4` (10000) becomes `10 000`.
+    clear_state();
+    let four = interpret_with_stdout("10^3").unwrap().output_svg.unwrap();
+    assert!(
+      four.contains(">1000<"),
+      "4-digit number must not group:\n{four}"
+    );
+    clear_state();
+    let five = interpret_with_stdout("10^4").unwrap().output_svg.unwrap();
+    assert!(
+      five.contains(">10<") && five.contains(">000<"),
+      "5-digit number must group:\n{five}"
+    );
+
+    // A non-scientific real groups only its integer part (`10.^5` → `100 000.`).
+    clear_state();
+    let real = interpret_with_stdout("10.^5").unwrap().output_svg.unwrap();
+    assert!(
+      real.contains(">100<") && real.contains(">000.<"),
+      "real integer part must group, fractional dot kept:\n{real}"
+    );
+  }
+
+  #[test]
+  fn test_bare_literal_output_svg_groups_digits() {
+    // A bare number literal (which the interpreter serves from a fast path)
+    // still gets a typeset, digit-grouped SVG in visual hosts, like a computed
+    // result: `10000` → `10 000`, `100000.` → `100 000.`, and a list literal
+    // `{10000, 20000}` groups each element.
+    for (code, present, absent) in [
+      ("10000", ">10<", ">10000<"),
+      ("100000.", ">000.<", ">100000.<"),
+      ("{10000, 20000}", ">000<", ">10000<"),
+    ] {
+      clear_state();
+      let svg = interpret_with_stdout(code)
+        .unwrap()
+        .output_svg
+        .unwrap_or_else(|| {
+          panic!("bare literal {code} should have an output SVG")
+        });
+      assert!(
+        svg.contains(present),
+        "{code}: expected {present} in:\n{svg}"
+      );
+      assert!(
+        !svg.contains(absent),
+        "{code}: must not contain {absent}:\n{svg}"
+      );
+    }
+    // Below the 5-digit threshold a bare literal stays ungrouped.
+    clear_state();
+    let small = interpret_with_stdout("1000").unwrap().output_svg.unwrap();
+    assert!(
+      small.contains(">1000<"),
+      "1000 must stay ungrouped:\n{small}"
+    );
+  }
+
+  #[test]
+  fn test_play_synthesizes_audio_in_visual_mode() {
+    // In visual mode (playground / woxi-studio), Play[f, {t, …}] synthesizes a
+    // playable WAV exposed via the `sound` channel instead of the -Sound- echo.
+    clear_state();
+    let r = interpret_with_stdout("Play[Sin[440*2*Pi*t], {t, 0, 1}]").unwrap();
+    let audio = r.sound.expect("Play should produce synthesized audio");
+    assert_eq!(audio.mime, "audio/wav");
+    // Decoded bytes start with the RIFF/WAVE magic.
+    let bytes = base64::engine::Engine::decode(
+      &base64::engine::general_purpose::STANDARD,
+      &audio.base64,
+    )
+    .expect("sound should be valid base64");
+    assert_eq!(&bytes[0..4], b"RIFF", "WAV should start with RIFF magic");
+    assert_eq!(&bytes[8..12], b"WAVE", "WAV should declare WAVE format");
+    // 1 second at 8000 Hz, 16-bit mono => 44-byte header + 8000*2 data bytes.
+    assert_eq!(bytes.len(), 44 + 8000 * 2);
+  }
+
+  #[test]
+  fn test_sound_list_of_plays_synthesizes_audio_in_visual_mode() {
+    // Sound[{Play[…], Play[…]}] concatenates its segments into one WAV.
+    clear_state();
+    let r = interpret_with_stdout(
+      "Sound[{Play[Sin[1000*t], {t, 0, 0.2}], Play[Sin[500*t], {t, 0, 0.5}]}]",
+    )
+    .unwrap();
+    let audio = r.sound.expect("Sound should produce synthesized audio");
+    let bytes = base64::engine::Engine::decode(
+      &base64::engine::general_purpose::STANDARD,
+      &audio.base64,
+    )
+    .expect("sound should be valid base64");
+    // 0.2s + 0.5s = 0.7s at 8000 Hz, 16-bit mono.
+    assert_eq!(bytes.len(), 44 + (8000 * 7 / 10) * 2);
+  }
+
+  #[test]
+  fn test_list_play_synthesizes_audio_in_visual_mode() {
+    // In visual mode (playground / woxi-studio), ListPlay[{levels…}] is
+    // normalized, encoded as a WAV, and exposed via the `sound` channel so the
+    // hosts render a playable audio widget instead of the -Sound- echo.
+    clear_state();
+    let r = interpret_with_stdout("ListPlay[{0.1, 0.2, 0.3, -0.1}]").unwrap();
+    let audio = r.sound.expect("ListPlay should produce synthesized audio");
+    let bytes = base64::engine::Engine::decode(
+      &base64::engine::general_purpose::STANDARD,
+      &audio.base64,
+    )
+    .expect("sound should be valid base64");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    // Default ListPlay sample rate is 8000 Hz.
+    assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 8000);
+    // Four normalized samples, 16-bit mono, byte-verified against wolframscript.
+    assert_eq!(bytes.len(), 44 + 4 * 2);
+    assert_eq!(&bytes[44..52], &[0, 0, 0, 64, 255, 127, 0, 128]);
+  }
+
+  #[test]
+  fn test_list_play_target_waveform_in_visual_mode() {
+    // The motivating example: a 50 Hz sine sampled at 2000 Hz over 1 second
+    // (2001 samples) plays as a Sound in the visual hosts.
+    clear_state();
+    let r = interpret_with_stdout(
+      "ListPlay[Table[Sin[2 Pi 50 t], {t, 0, 1, 1./2000}]]",
+    )
+    .unwrap();
+    assert_eq!(r.result, "-Sound-");
+    let audio = r.sound.expect("ListPlay should produce synthesized audio");
+    let bytes = base64::engine::Engine::decode(
+      &base64::engine::general_purpose::STANDARD,
+      &audio.base64,
+    )
+    .expect("sound should be valid base64");
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 8000);
+    // 2001 samples, 16-bit mono.
+    assert_eq!(bytes.len(), 44 + 2001 * 2);
+  }
+
+  /// Decode the base64 WAV payload of a captured audio output.
+  fn decode_wav_bytes(audio: &woxi::AudioOutput) -> Vec<u8> {
+    assert_eq!(audio.mime, "audio/wav");
+    base64::engine::Engine::decode(
+      &base64::engine::general_purpose::STANDARD,
+      &audio.base64,
+    )
+    .expect("sound should be valid base64")
+  }
+
+  #[test]
+  fn test_audio_from_samples_renders_player_in_visual_mode() {
+    // In visual mode (playground / woxi-studio), Audio[{samples…}] is encoded
+    // as a WAV and exposed via the `sound` channel so the hosts render a
+    // graphical audio player. The CLI keeps the symbolic Audio[…] form.
+    clear_state();
+    let r = interpret_with_stdout("Audio[{0, 0.5, -0.5, 1}]").unwrap();
+    assert_eq!(r.result, "-Audio-");
+    let audio = r.sound.expect("Audio should produce playable audio");
+    assert_eq!(audio.label, None);
+    let bytes = decode_wav_bytes(&audio);
+    assert_eq!(&bytes[0..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WAVE");
+    // Default sample rate for sample-data Audio is 44100 Hz.
+    assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 44100);
+    // 4 samples, 16-bit mono.
+    assert_eq!(bytes.len(), 44 + 4 * 2);
+  }
+
+  #[test]
+  fn test_audio_sample_rate_option_sets_wav_rate() {
+    clear_state();
+    let r =
+      interpret_with_stdout("Audio[{0, 1, 0}, SampleRate -> 8000]").unwrap();
+    let audio = r.sound.expect("Audio should produce playable audio");
+    let bytes = decode_wav_bytes(&audio);
+    assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 8000);
+  }
+
+  #[test]
+  fn test_audio_multichannel_samples_encode_interleaved_wav() {
+    clear_state();
+    let r = interpret_with_stdout("Audio[{{0, 1, 0}, {1, 0, 1}}]").unwrap();
+    let audio = r.sound.expect("Audio should produce playable audio");
+    let bytes = decode_wav_bytes(&audio);
+    // Channel count lives in bytes 22..24 of the fmt chunk.
+    assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 2);
+    // 3 frames × 2 channels × 16-bit.
+    assert_eq!(bytes.len(), 44 + 3 * 2 * 2);
+  }
+
+  #[test]
+  fn test_audio_file_renders_player_in_visual_mode() {
+    // Audio[File["path"]] embeds the file's bytes so visual hosts render a
+    // graphical audio player that can actually play the file.
+    clear_state();
+    let wav = interpret_with_stdout("Audio[{0, 1, 0}]")
+      .unwrap()
+      .sound
+      .unwrap();
+    let bytes = decode_wav_bytes(&wav);
+    let path = temp_file("woxi_test_audio_file.wav");
+    std::fs::write(&path, &bytes).unwrap();
+
+    clear_state();
+    let r = interpret_with_stdout(&format!("Audio[File[\"{path}\"]]")).unwrap();
+    assert_eq!(r.result, "-Audio-");
+    let audio = r.sound.expect("file-backed Audio should produce audio");
+    assert_eq!(audio.mime, "audio/wav");
+    assert_eq!(audio.label.as_deref(), Some("woxi_test_audio_file.wav"));
+    // The player carries the file's bytes verbatim.
+    assert_eq!(decode_wav_bytes(&audio), bytes);
+    std::fs::remove_file(&path).ok();
+  }
+
+  #[test]
+  fn test_audio_file_path_string_renders_player_in_visual_mode() {
+    // A bare string with an audio extension works like File["path"].
+    clear_state();
+    let wav = interpret_with_stdout("Audio[{0, 1, 0}]")
+      .unwrap()
+      .sound
+      .unwrap();
+    let bytes = decode_wav_bytes(&wav);
+    let path = temp_file("woxi_test_audio_str.wav");
+    std::fs::write(&path, &bytes).unwrap();
+
+    clear_state();
+    let r = interpret_with_stdout(&format!("Audio[\"{path}\"]")).unwrap();
+    assert_eq!(r.result, "-Audio-");
+    let audio = r.sound.expect("file-backed Audio should produce audio");
+    assert_eq!(audio.label.as_deref(), Some("woxi_test_audio_str.wav"));
+    assert_eq!(decode_wav_bytes(&audio), bytes);
+    std::fs::remove_file(&path).ok();
+  }
+
+  #[test]
+  fn test_export_image_to_svg_embeds_png() {
+    // Exporting an Image to an .svg file must produce a valid SVG that wraps
+    // the raster pixels as a base64-encoded PNG <image> element, rather than
+    // erroring because the image crate has no SVG raster encoder.
+    clear_state();
+    let path = temp_file("woxi_test_export_image.svg");
+    let _ = std::fs::remove_file(&path);
+    let code = format!(
+      "Export[\"{path}\", Image[ConstantArray[{{0, 1, 0.5}}, {{4, 4}}]]]"
+    );
+    // Export returns the filename it wrote to.
+    assert_eq!(interpret(&code).unwrap(), path);
+
+    let svg = std::fs::read_to_string(&path).unwrap();
+    // Matches wolframscript, which opens the file with the XML declaration.
+    assert!(
+      svg.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg"),
+      "not an SVG document: {}",
+      &svg[..40.min(svg.len())]
+    );
+    assert!(
+      svg.contains("width='4'") && svg.contains("height='4'"),
+      "wrong dims"
+    );
+    assert!(
+      svg.contains("data:image/png;base64,"),
+      "raster not embedded as a base64 PNG"
+    );
+    std::fs::remove_file(&path).ok();
+  }
+
+  #[test]
+  fn test_export_string_image_svg_embeds_png() {
+    // ExportString[image, "SVG"] uses the same embedded-PNG rendering.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Image[ConstantArray[{0, 1, 0.5}, {2, 2}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg")
+    );
+    assert!(svg.contains("data:image/png;base64,"));
+  }
+
+  #[test]
+  fn test_export_string_svg_embeds_used_fonts() {
+    // A standalone exported SVG carries the fonts it uses so it renders the
+    // same on systems where they aren't installed. Any text pulls in the
+    // sans-serif face (Atkinson Hyperlegible Next) as an @font-face with the
+    // font bytes inlined as a base64 data URL.
+    clear_state();
+    let svg =
+      interpret("ExportString[Plot[Sin[x], {x, 0, 6}], \"SVG\"]").unwrap();
+    assert!(svg.contains("@font-face"), "no @font-face block");
+    assert!(
+      svg.contains("font-family: \"Atkinson Hyperlegible Next\""),
+      "sans-serif face not embedded"
+    );
+    assert!(
+      svg.contains("src: url(\"data:font/ttf;base64,"),
+      "font bytes not inlined as a data URL"
+    );
+    // The style block sits inside the SVG document, right after the root tag.
+    assert!(svg.contains("<defs><style"), "no <style> block");
+  }
+
+  #[test]
+  fn test_export_string_svg_embeds_monospace_only_when_used() {
+    // The Mono face is embedded only for documents that actually use
+    // monospace text (typeset expressions, datasets, …), not for every graphic.
+    clear_state();
+    let mono =
+      interpret("ExportString[Dataset[<|\"a\" -> 1|>], \"SVG\"]").unwrap();
+    assert!(
+      mono.contains("font-family: \"Atkinson Hyperlegible Mono\""),
+      "monospace face missing for a monospace-using export"
+    );
+
+    clear_state();
+    let sans =
+      interpret("ExportString[Plot[Sin[x], {x, 0, 6}], \"SVG\"]").unwrap();
+    assert!(
+      !sans.contains("Atkinson Hyperlegible Mono"),
+      "Mono face embedded into a graphic that uses no monospace text"
+    );
+
+    // A text label that merely *reads* "monospace" must not pull in the Mono
+    // face — only a `font-family` requesting one does. (The label itself is
+    // drawn with the default sans-serif family.)
+    clear_state();
+    let label = interpret(
+      "ExportString[Graphics[{Text[\"monospace\", {0, 0}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !label.contains("Atkinson Hyperlegible Mono"),
+      "Mono face embedded because of text content, not a font-family"
+    );
+  }
+
+  #[test]
+  fn test_export_string_svg_without_text_embeds_no_fonts() {
+    // A text-free graphic needs no fonts, so none are embedded.
+    clear_state();
+    let svg = interpret("ExportString[Graphics[{Disk[]}], \"SVG\"]").unwrap();
+    assert!(
+      !svg.contains("@font-face"),
+      "fonts embedded into a text-free graphic"
+    );
+  }
+
+  #[test]
+  fn test_vector_plot_epilog_draws_extra_primitives() {
+    // Regression: VectorPlot silently dropped its Epilog option entirely,
+    // so markers a Wolfram Demonstration draws over the field (e.g. the
+    // source charges in an electric-field trajectory plot) went missing
+    // from the render. Mirrors DensityPlot/ContourPlot, which already
+    // draw Epilog via plot_epilog::render_epilog_svg.
+    clear_state();
+    let svg = interpret(
+      "ExportString[VectorPlot[{y, -x}, {x, -2, 2}, {y, -2, 2}, \
+       Epilog -> {Red, Disk[{0, 0}, 0.3]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.contains("<ellipse") || svg.contains("<path"),
+      "Epilog Disk not drawn: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_plot_prolog_draws_under_background_not_behind_it() {
+    // Regression: `Plot`'s Prolog primitives were spliced in right after
+    // the opening `<svg …>` tag, landing *before* the plot's own opaque
+    // background rect (`root.fill(&bg_color)`, drawn by `plotters`) in
+    // document order. Since later SVG elements paint over earlier ones,
+    // that full-canvas rect ended up covering the Prolog entirely instead
+    // of the Prolog sitting on the blank canvas but under the axes/curve —
+    // e.g. a Demonstration's shaded Riemann-sum rectangles under a curve
+    // vanished completely.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Plot[x, {x, 0, 1}, Prolog -> {Red, Line[{{0, 0}, {1, 1}}]}], \"SVG\"]",
+    )
+    .unwrap();
+    let bg_pos = svg.find("<rect").expect("background rect not found");
+    let prolog_pos = svg.find("rgb(255,0,0)").expect("prolog line not drawn");
+    assert!(
+      prolog_pos > bg_pos,
+      "Prolog drawn before (and thus hidden under) the background rect: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_plot_prolog_nested_box_without_marker() {
+    // Regression: a box head nested inside an explicit `\*Head[...]` box
+    // without its own `\*` marker — valid Wolfram linear syntax, since a
+    // further box call stays in "box mode" once already inside one — was
+    // left as literal box-source text instead of being parsed recursively.
+    // A Wolfram Demonstration's axis label
+    // `\!\(\*SuperscriptBox[\(x\), FractionBox[\(p\), \(q\)]]\)` rendered
+    // its superscript as the raw text "FractionBox[p, q]" instead of the
+    // fraction p/q.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Plot[x, {x, 0, 1}, Prolog -> {Text[\"\\!\\(\\*SuperscriptBox[\\(x\\), FractionBox[\\(p\\), \\(q\\)]]\\)\", {0.5, 0.5}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("FractionBox"),
+      "raw box source leaked into SVG: {svg}"
+    );
+    assert!(
+      svg.contains("p/q"),
+      "expected the nested fraction to render as p/q: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_graphics_text_renders_inline_box_notation() {
+    // A notebook `Text[…]` label can carry its typeset content as inline
+    // `\!\(\*…\)` box notation — the front end's linear-syntax form for a
+    // sub/superscript, e.g. `Text["\!\(\*SubscriptBox[\(X\), \(3\)]\)",
+    // pos]` for "X₃". Regression: this used to draw the private-use box
+    // markers and box source literally instead of the Unicode glyph.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Graphics[Text[\"\\!\\(\\*SubscriptBox[\\(X\\), \\(3\\)]\\)\", {0, 0}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.contains(">X₃<"), "expected X₃ in SVG, got: {svg}");
+    assert!(
+      !svg.contains("SubscriptBox"),
+      "raw box source leaked into SVG: {svg}"
+    );
+
+    clear_state();
+    let svg_super = interpret(
+      "ExportString[Graphics[Text[\"\\!\\(\\*SuperscriptBox[\\(x\\), \\(2\\)]\\)\", {0, 0}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg_super.contains(">x²<"),
+      "expected x² in SVG, got: {svg_super}"
+    );
+
+    // The same escape nested inside a `Row` label (how a Demonstration
+    // typically mixes plain text with a typeset sub-expression).
+    clear_state();
+    let svg_row = interpret(
+      "ExportString[Graphics[Text[Row[{\"d\", \"\\!\\(\\*SubscriptBox[\\(X\\), \\(6\\)]\\)\"}], {0, 0}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg_row.contains(">dX₆<"),
+      "expected dX₆ in SVG, got: {svg_row}"
+    );
+  }
+
+  #[test]
+  fn test_greater_less_slant_equal_operators() {
+    // `\[GreaterSlantEqual]` (⩾, U+2A7E) and `\[LessSlantEqual]` (⩽,
+    // U+2A7D) are glyph variants of GreaterEqual/LessEqual that a
+    // Demonstration's box notation resolves to literal Unicode characters
+    // once extracted from a notebook cell. Regression: the parser only
+    // recognized the plain ≥/≤ (U+2265/U+2264) forms as comparison
+    // operators, so `q⩾q1` failed to parse at all.
+    clear_state();
+    assert_eq!(interpret("3\u{2A7E}2").unwrap(), "True");
+    assert_eq!(interpret("2\u{2A7E}3").unwrap(), "False");
+    assert_eq!(interpret("2\u{2A7E}2").unwrap(), "True");
+    clear_state();
+    assert_eq!(interpret("2\u{2A7D}3").unwrap(), "True");
+    assert_eq!(interpret("3\u{2A7D}2").unwrap(), "False");
+    assert_eq!(interpret("2\u{2A7D}2").unwrap(), "True");
+    // The chained/mixed form parses as a Comparison, same as `<=`/`>=`.
+    clear_state();
+    assert_eq!(interpret("1\u{2A7D}2\u{2A7D}3").unwrap(), "True");
+    clear_state();
+    assert_eq!(interpret("If[3\u{2A7E}2, \"yes\", \"no\"]").unwrap(), "yes");
+  }
+
+  #[test]
+  fn test_inset_and_text_embed_rasterized_image() {
+    // `Inset[img, pos]` and `Text[img, pos]` with `img` an already-rasterized
+    // `Image[…]` (e.g. from `Rasterize[Graphics[…]]`) must draw the picture
+    // itself, the way a Demonstration composites a small rendered icon into
+    // a larger scene. Regression: both fell through to the plain-text path
+    // and printed the object's `-Image-` short form as literal text instead.
+    clear_state();
+    let inset_svg = interpret(
+      "h = Rasterize[Graphics[Disk[]]]; ExportString[Graphics[{Inset[h, {0, 0}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      inset_svg.contains("data:image/png;base64,"),
+      "Inset of a rasterized image did not embed a PNG: {inset_svg}"
+    );
+    assert!(
+      !inset_svg.contains("-Image-"),
+      "Inset fell back to the -Image- text placeholder: {inset_svg}"
+    );
+
+    clear_state();
+    let text_svg = interpret(
+      "h = Rasterize[Graphics[Disk[]]]; ExportString[Graphics[{Text[h, {0, 0}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      text_svg.contains("data:image/png;base64,"),
+      "Text of a rasterized image did not embed a PNG: {text_svg}"
+    );
+    assert!(
+      !text_svg.contains("-Image-"),
+      "Text fell back to the -Image- text placeholder: {text_svg}"
+    );
+
+    // A `Style[…]`-wrapped image (as a Demonstration writes to scale an
+    // icon down with `Magnification`) still embeds instead of falling
+    // through just because it is styled.
+    clear_state();
+    let styled_svg = interpret(
+      "h = Rasterize[Graphics[Disk[]]]; ExportString[Graphics[{Inset[Style[h, Magnification -> .5], {0, 0}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      styled_svg.contains("data:image/png;base64,"),
+      "Style-wrapped Inset did not embed a PNG: {styled_svg}"
+    );
+
+    // Plain text content is unaffected — still drawn as a label, not
+    // mistaken for a picture.
+    clear_state();
+    let plain_svg =
+      interpret("ExportString[Graphics[{Text[\"hello\", {0, 0}]}], \"SVG\"]")
+        .unwrap();
+    assert!(
+      plain_svg.contains("hello"),
+      "plain text label lost: {plain_svg}"
+    );
+    assert!(!plain_svg.contains("data:image/png;base64,"));
+  }
+
+  #[test]
+  fn test_same_q_extreme_magnitude_reals_does_not_overflow() {
+    // `SameQ`'s one-ULP tolerance on machine reals maps each double's bits
+    // to a monotonic i64 key and compares the key distance. Two reals near
+    // opposite ends of the double range (e.g. the largest positive and
+    // largest negative finite doubles) produce keys near opposite ends of
+    // the i64 range, whose difference overflows a plain i64 subtraction.
+    // A Demonstration's `Manipulate` comparing a fit result against a
+    // sentinel value hit this and crashed Woxi Studio outright.
+    clear_state();
+    assert_eq!(
+      interpret("SameQ[1.7976931348623157*^308, -1.7976931348623157*^308]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("1.7976931348623157*^308 === -1.7976931348623157*^308")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("SameQ[-0.0, 0.0]").unwrap(), "True");
+  }
+
+  #[test]
+  fn test_bare_sum_and_product_glyphs_parse_as_symbols() {
+    // `∑` (U+2211) and `∏` (U+220F) are Unicode "Math Symbol" characters,
+    // not letters, so the identifier grammar didn't accept them as bare
+    // symbol names — only their escaped forms (`\[Sum]`, `\[Product]`)
+    // matched. A Demonstration that uses the literal glyph purely for
+    // display (e.g. `Subscript[∑, i = 1]` inside a `HoldForm`, never
+    // calling the real `Sum` function) hit this: one unrecognized
+    // character deep inside several nested heads made the PEG parser
+    // backtrack exponentially instead of failing fast, hitting the
+    // call-limit guard meant for pathological unclosed brackets and
+    // crashing Woxi Studio's attempt to instantiate the widget.
+    clear_state();
+    assert_eq!(interpret("Head[Hold[∑]]").unwrap(), "Hold");
+    assert_eq!(interpret("Head[Hold[∏]]").unwrap(), "Hold");
+    assert_eq!(
+      interpret("Hold[Subscript[∑, i = 1]]").unwrap(),
+      "Hold[Subscript[∑, i = 1]]"
+    );
+    // The real `Sum`/`Product` functions (ASCII names) are unaffected.
+    assert_eq!(interpret("Sum[i, {i, 1, 4}]").unwrap(), "10");
+    assert_eq!(interpret("Product[i, {i, 1, 4}]").unwrap(), "24");
+  }
+
+  #[test]
+  fn test_sum_of_kth_powers_beyond_the_hand_derived_degrees() {
+    // `Sum[k^s, {k, 1, n}]` used to hand-derive one closed form per degree
+    // (s = 2..5) and leave every higher power unevaluated — a Demonstration
+    // sampled from the Wolfram Demonstrations Project ("Summation by
+    // Parts") drives a slider up to degree 17, so a numeric answer was
+    // needed for every degree in between too, not just the five that had
+    // been transcribed by hand. Faulhaber's formula (Bernoulli numbers)
+    // closes any degree; each result is checked against a brute-force sum
+    // for several `n`, and s = 2..5 must still print exactly as before.
+    clear_state();
+    assert_eq!(
+      interpret("Sum[k^2, {k, 1, n}]").unwrap(),
+      "(n*(1 + n)*(1 + 2*n))/6"
+    );
+    assert_eq!(
+      interpret("Sum[k^3, {k, 1, n}]").unwrap(),
+      "(n^2*(1 + n)^2)/4"
+    );
+    assert_eq!(
+      interpret("Sum[k^5, {k, 1, n}]").unwrap(),
+      "(n^2*(1 + n)^2*(-1 + 2*n + 2*n^2))/12"
+    );
+    for s in [1, 6, 7, 9, 17] {
+      let closed_form = interpret(&format!("Sum[k^{s}, {{k, 1, n}}]")).unwrap();
+      assert!(
+        !closed_form.contains("Sum["),
+        "degree {s} stayed unevaluated: {closed_form}"
+      );
+      for n in [1, 2, 5, 12] {
+        let via_formula: i64 =
+          interpret(&format!("Sum[k^{s}, {{k, 1, n}}] /. n -> {n}"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let brute_force: i64 = interpret(&format!("Sum[k^{s}, {{k, 1, {n}}}]"))
+          .unwrap()
+          .parse()
+          .unwrap();
+        assert_eq!(
+          via_formula, brute_force,
+          "degree {s}, n = {n}: {closed_form}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_sum_of_power_times_harmonic_number() {
+    // The same "Summation by Parts" Demonstration's whole point is a
+    // closed form for `Sum[k^s HarmonicNumber[k], {k, 1, n}]` — discrete
+    // summation by parts (Abel summation), independently re-derived here
+    // rather than read off the notebook. Checked against a brute-force sum
+    // (with `HarmonicNumber` expanded numerically) for several `n`.
+    // wolframscript/Woxi print a machine real past a certain magnitude in
+    // `1.234*^6`-style scientific notation, which Rust's `f64` parser
+    // rejects outright (it wants `1.234e6`).
+    fn parse_wolfram_real(s: &str) -> f64 {
+      s.replace("*^", "e").parse().unwrap()
+    }
+
+    clear_state();
+    for s in [1, 2, 4, 8] {
+      let closed_form =
+        interpret(&format!("Sum[k^{s}*HarmonicNumber[k], {{k, 1, n}}]"))
+          .unwrap();
+      assert!(
+        !closed_form.contains("Sum["),
+        "degree {s} stayed unevaluated: {closed_form}"
+      );
+      for n in [1, 2, 5, 9] {
+        let via_formula = parse_wolfram_real(
+          &interpret(&format!(
+            "N[Sum[k^{s}*HarmonicNumber[k], {{k, 1, n}}] /. n -> {n}]"
+          ))
+          .unwrap(),
+        );
+        let brute_force = parse_wolfram_real(
+          &interpret(&format!(
+            "N[Sum[k^{s}*HarmonicNumber[k], {{k, 1, {n}}}]]"
+          ))
+          .unwrap(),
+        );
+        assert!(
+          (via_formula - brute_force).abs() < 1e-6 * brute_force.abs().max(1.0),
+          "degree {s}, n = {n}: formula {via_formula} vs brute force \
+           {brute_force} ({closed_form})"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_indefinite_sum_drops_a_nonfinite_boundary_term() {
+    // `Sum[f[i], i]` (indefinite) closes as `f(0) + Sum[f[k], {k, 1, i-1}]`.
+    // For a summand with a genuine pole at 0 (`1/k`, `PolyGamma[k]`) that
+    // boundary term evaluates to `ComplexInfinity`/`Indeterminate` and used
+    // to poison the whole result through `Plus`, even though the
+    // antidifference itself is perfectly well defined there — wolframscript's
+    // `Sum[1/i, i]` is `PolyGamma[0, i]`, exactly the telescoping part alone
+    // (up to the additive constant an antidifference is free to pick; see
+    // `harmonic_antidifference_as_polygamma`). A non-finite boundary term is
+    // now dropped instead of added in. `Log[0]` evaluates to a plain
+    // (unary-negated) `Infinity` rather than
+    // `ComplexInfinity`/`Indeterminate` — a different spelling of
+    // "non-finite" that must be caught too, or it still poisons the sum
+    // through `Plus` the same way.
+    clear_state();
+    assert_eq!(interpret("Sum[1/k, k]").unwrap(), "PolyGamma[0, k]");
+    for code in ["Sum[PolyGamma[k], k]", "Sum[k*PolyGamma[k], k]"] {
+      let result = interpret(code).unwrap();
+      assert!(
+        !result.contains("Indeterminate"),
+        "{code}: a pole at the boundary must not poison the whole sum, got {result}"
+      );
+      // The antidifference has no closed form either (no `Sum` handling for
+      // `PolyGamma`), so the rewrite must hand back the original call
+      // unevaluated rather than a partial rewrite still holding the
+      // internal `$sum_indef_k_$` dummy — which would otherwise leak either
+      // as a bare occurrence, or (worse) get blindly substituted back to
+      // `k` and shadow the free `k` inside the held `Sum`'s own iterator
+      // spec (`Sum[PolyGamma[k], {k, 1, -1 + k}]`, ill-formed).
+      assert_eq!(result, code, "{code}: must stay unevaluated verbatim");
+    }
+    assert!(
+      !interpret("Sum[Log[i], i]").unwrap().contains("Infinity"),
+      "a plain (non-ComplexInfinity) infinite boundary term must not poison \
+       the whole sum either"
+    );
+    // A regular (non-singular) summand is unaffected: the boundary term is
+    // still added in as before, and an unresolved antidifference (no Sum
+    // pattern for `Sin`/a bare symbolic function) still must not leak the
+    // dummy variable either.
+    assert_eq!(interpret("Sum[1, i]").unwrap(), "i");
+    assert_eq!(interpret("Sum[i, i]").unwrap(), "((-1 + i)*i)/2");
+    for code in ["Sum[Sin[k], k]", "Sum[f[k], k]"] {
+      assert_eq!(
+        interpret(code).unwrap(),
+        code,
+        "{code}: an unclosed antidifference must stay unevaluated verbatim, \
+         not leak the internal dummy variable or produce an ill-formed \
+         iterator that shadows its own free variable"
+      );
+    }
+  }
+
+  /// An antidifference is only fixed up to an additive constant, and
+  /// wolframscript reports the one *without* the `Zeta[s]` offset that the
+  /// harmonic-number form carries: `Sum[1/k^s, k]` comes back as a plain
+  /// multiple of `PolyGamma[s - 1, k]` rather than `HarmonicNumber[k-1, s]`
+  /// (which differs from it by `Zeta[s]`, or `EulerGamma` when `s == 1`).
+  #[test]
+  fn test_indefinite_reciprocal_power_sum_is_a_polygamma() {
+    clear_state();
+    for (order, expected) in [
+      (1, "PolyGamma[0, k]"),
+      (2, "-PolyGamma[1, k]"),
+      (3, "PolyGamma[2, k]/2"),
+      (4, "-1/6*PolyGamma[3, k]"),
+      (5, "PolyGamma[4, k]/24"),
+    ] {
+      assert_eq!(
+        interpret(&format!("Sum[1/k^{order}, k]")).unwrap(),
+        expected,
+        "order {order}"
+      );
+    }
+    // A constant factor rides along on the rewritten term.
+    assert_eq!(interpret("Sum[3/k, k]").unwrap(), "3*PolyGamma[0, k]");
+    // The definite sum keeps the harmonic-number form — there the additive
+    // constant is pinned by the lower limit, so the two spellings are not
+    // interchangeable.
+    assert_eq!(
+      interpret("Sum[1/k, {k, 1, n}]").unwrap(),
+      "HarmonicNumber[n]"
+    );
+    assert_eq!(
+      interpret("Sum[1/k^2, {k, 1, n}]").unwrap(),
+      "HarmonicNumber[n, 2]"
+    );
+  }
+
+  #[test]
+  fn test_distinct_images_are_not_same_q_or_equal() {
+    // `expr_to_string` reports every `Image[…]` as the same `-Image-`
+    // display placeholder. `SameQ`/`Equal` and the structural-equality
+    // helper they share must compare actual pixel data instead of that
+    // placeholder, or any two distinct images collapse into "the same
+    // value" — e.g. a Demonstration that builds a `Graph` whose vertices
+    // are image tiles (`GraphPlot[Thread[imgA -> imgB], …]`) would then
+    // see every tile dedup into a single vertex.
+    clear_state();
+    assert_eq!(
+      interpret("Image[{{1, 2}, {3, 4}}] === Image[{{5, 6}, {7, 8}}]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("SameQ[Image[{{1, 2}, {3, 4}}], Image[{{5, 6}, {7, 8}}]]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("Image[{{1, 2}, {3, 4}}] == Image[{{5, 6}, {7, 8}}]").unwrap(),
+      "False"
+    );
+    // Two images with identical pixel data are still SameQ/Equal.
+    assert_eq!(
+      interpret("Image[{{1, 2}, {3, 4}}] === Image[{{1, 2}, {3, 4}}]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("Image[{{1, 2}, {3, 4}}] == Image[{{1, 2}, {3, 4}}]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn test_graph_plot_dedups_image_vertices_by_content() {
+    // `GraphPlot[Thread[imgA -> imgB], …]` — the pattern a Demonstration
+    // uses to plot a nearest-neighbor graph over image tiles — must build
+    // one graph vertex per distinct image, not collapse every image into
+    // one vertex because they all stringify to `-Image-`.
+    clear_state();
+    let svg = interpret(
+      "imgs = Table[Image[ConstantArray[N[i / 5], {2, 2, 3}]], {i, 1, 5}]; \
+       edges = Flatten[Table[Thread[imgs[[i]] -> {imgs[[Mod[i, 5] + 1]]}], {i, 5}]]; \
+       ExportString[GraphPlot[edges, VertexRenderingFunction -> (Inset[#2, #, Center, .5] &)], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(
+      svg.matches("<image").count(),
+      5,
+      "expected one <image> per distinct vertex, got: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_treeplot_rejects_non_position_second_argument() {
+    // `TreePlot[rules, pos, …]`'s second positional argument must be one of
+    // Top/Bottom/Left/Right/Center, a vertex of the graph (the older
+    // root-vertex calling convention), or a number. Anything else raises
+    // `TreePlot::rp` and leaves the call unevaluated.
+    clear_state();
+    let result = interpret("TreePlot[{1 -> 2, 2 -> 3}, x]").unwrap();
+    assert_eq!(result, "TreePlot[{1 -> 2, 2 -> 3}, x]");
+    let messages = woxi::get_captured_messages_raw();
+    assert!(
+      messages.iter().any(|m| m
+        == "TreePlot::rp: The second argument x of TreePlot must be one of Top, Bottom, Left, Right or Center."),
+      "expected TreePlot::rp message, got: {messages:?}"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("TreePlot[{a -> b}, f[a]]").unwrap(),
+      "TreePlot[{a -> b}, f[a]]"
+    );
+  }
+
+  #[test]
+  fn test_treeplot_accepts_root_vertex_second_argument() {
+    // The pre-Graph-object `TreePlot[rules, v]` form (still used by older
+    // Demonstrations such as "Combinatorics of Love from A Midsummer
+    // Night's Dream") names the root vertex in the position slot.
+    for code in [
+      "TreePlot[{1 -> 2, 2 -> 3}, 1]",
+      "TreePlot[{1 -> 2, 2 -> 3}, 3]",
+      "TreePlot[{a -> b}, a]",
+      "TreePlot[{\"a\" -> \"b\"}, \"a\"]",
+      "TreePlot[{1 -> 2, 2 -> 3}, 7]",
+      "TreePlot[{1 -> 2, 2 -> 3}, Center]",
+      "TreePlot[{1 -> 2, 2 -> 3}, Top, 3]",
+    ] {
+      clear_state();
+      assert_eq!(interpret(code).unwrap(), "-Graphics-", "{code}");
+      let messages = woxi::get_captured_messages_raw();
+      assert!(
+        messages.is_empty(),
+        "{code}: unexpected messages: {messages:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_treeplot_root_vertex_hangs_the_tree_from_it() {
+    // Rooted at the chain's far end, vertex 3 sits on top and 1 at the
+    // bottom — the edges are followed against their direction too.
+    let vertex_ys = |root: i32| -> Vec<f64> {
+      clear_state();
+      let svg = interpret(&format!(
+        "ExportString[TreePlot[{{1 -> 2, 2 -> 3}}, {root}], \"SVG\"]"
+      ))
+      .unwrap();
+      svg
+        .split("<ellipse")
+        .skip(1)
+        .map(|e| {
+          let cy = e.split("cy=\"").nth(1).unwrap();
+          cy[..cy.find('"').unwrap()].parse().unwrap()
+        })
+        .collect()
+    };
+    // SVG y grows downwards: a smaller cy is higher up.
+    let from_3 = vertex_ys(3);
+    assert!(from_3[2] < from_3[1] && from_3[1] < from_3[0], "{from_3:?}");
+    let from_1 = vertex_ys(1);
+    assert!(from_1[0] < from_1[1] && from_1[1] < from_1[2], "{from_1:?}");
+  }
+
+  #[test]
+  fn test_treeplot_accepts_valid_position_argument() {
+    clear_state();
+    assert_eq!(
+      interpret("TreePlot[{1 -> 2, 2 -> 3}, Top]").unwrap(),
+      "-Graphics-"
+    );
+    let messages = woxi::get_captured_messages_raw();
+    assert!(messages.is_empty(), "unexpected messages: {messages:?}");
+  }
+
+  #[test]
+  fn test_treeplot_without_position_argument_still_plots() {
+    clear_state();
+    assert_eq!(
+      interpret("TreePlot[{1 -> 2, 2 -> 3}]").unwrap(),
+      "-Graphics-"
+    );
+    let messages = woxi::get_captured_messages_raw();
+    assert!(messages.is_empty(), "unexpected messages: {messages:?}");
+  }
+
+  #[test]
+  fn test_text_offset_follows_rotated_direction() {
+    // `Text[expr, coords, offset, direction]` measures `offset` along the
+    // label's own (rotated) baseline, not along the fixed screen axes:
+    // Wolfram's docs describe the offset as relative to that rotated
+    // baseline, and demonstrations that fan labels out radially (e.g.
+    // `Table[Text[…, {Cos[a], Sin[a]}], {a, 0, 2 Pi, …}]`) rely on this to
+    // push each label outward along its own direction rather than by a
+    // fixed amount in x. Regression: the offset used to be applied purely
+    // along the unrotated x/y screen axes, so every label in such a table
+    // landed at the exact same on-screen position regardless of direction.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Graphics[{Text[\"Q\", {0, 0}, {-1, 0}, {1, 0}], Text[\"Q\", {0, 0}, {-1, 0}, {0, 1}]}, ImageSize -> {100, 100}, PlotRange -> {{-1, 1}, {-1, 1}}], \"SVG\"]",
+    )
+    .unwrap();
+    // Direction {1, 0} (pointing right, unrotated baseline): offset -1
+    // shifts the label along x only, landing right of the anchor.
+    assert!(
+      svg.contains("<text x=\"54.20\" y=\"50.00\""),
+      "unrotated offset in the wrong place: {svg}"
+    );
+    // Direction {0, 1} (baseline rotated 90 degrees to point up): the same
+    // offset -1 now shifts the label along the rotated baseline, i.e.
+    // vertically, landing above the anchor instead of to its right.
+    assert!(
+      svg.contains(
+        "<text x=\"50.00\" y=\"45.80\" fill=\"rgb(0,0,0)\" font-size=\"14\" font-weight=\"normal\" font-style=\"normal\" text-anchor=\"middle\" dominant-baseline=\"central\" transform=\"rotate(-90.000 50.00 45.80)\""
+      ),
+      "offset was not rotated along with direction: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_plot_range_dynamic_wrapper_is_unwrapped() {
+    // `PlotRange -> Dynamic[{{xmin, xmax}, {ymin, ymax}}]` is how a
+    // `Manipulate` body built from a Demonstration's saved definition
+    // spells an option value that depends on a control variable — outside
+    // an interactive front end, `Dynamic[expr]` just means expr's current
+    // value. Regression: `Dynamic[…]` options were left as an unrecognized
+    // expression by the option parser (which only handles a bare
+    // `{{...},{...}}` list), so the range silently fell back to Automatic
+    // instead of the asymmetric range actually requested.
+    clear_state();
+    let plain = interpret(
+      "ExportString[Graphics[{Red, Disk[{0, 0}, 10]}, PlotRange -> {{-5, 5}, {-2, 8}}], \"SVG\"]",
+    )
+    .unwrap();
+    let dynamic = interpret(
+      "ExportString[Graphics[{Red, Disk[{0, 0}, 10]}, PlotRange -> Dynamic[{{-5, 5}, {-2, 8}}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(
+      dynamic, plain,
+      "Dynamic-wrapped PlotRange should render identically to the bare range"
+    );
+    // Sanity: the shared range is genuinely asymmetric (off-center), so this
+    // is not vacuously true because both sides fell back to Automatic.
+    assert!(
+      plain.contains("cy=\"288.00\""),
+      "expected the asymmetric range to shift the circle's center: {plain}"
+    );
+  }
+
+  #[test]
+  fn test_invisible_text_label_paints_nothing() {
+    // `Text[Invisible[Style["e", …]], pos]` — a Demonstration hides one
+    // item's label (e.g. an edge whose name shouldn't show) by wrapping it
+    // in `Invisible[…]` rather than special-casing it out of a shared
+    // `Table[Text[label[[i]], …], {i, …}]` loop. Regression: `Invisible[…]`
+    // was not recognized by the label parser shared across 2D and 3D
+    // `Text[…]`/chart labels, so it fell through to the catch-all branch
+    // and typeset the wrapper's own textual form, `Invisible[e]`, as a
+    // literal on-screen label instead of painting nothing.
+    clear_state();
+    let svg2d = interpret(
+      "ExportString[Graphics[{Text[\"A\", {0, 0}], Text[Invisible[Style[\"e\", 16]], {1, 1}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg2d.contains(">A<"), "visible label lost: {svg2d}");
+    assert!(
+      !svg2d.contains("Invisible"),
+      "Invisible[…] label leaked as literal text: {svg2d}"
+    );
+    assert!(!svg2d.contains(">e<"), "hidden label was painted: {svg2d}");
+
+    clear_state();
+    let svg3d = interpret(
+      "ExportString[Graphics3D[{Text[\"A\", {0, 0, 0}], Text[Invisible[Style[\"e\", 16]], {1, 1, 1}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg3d.contains(">A<"), "visible label lost: {svg3d}");
+    assert!(
+      !svg3d.contains("Invisible"),
+      "Invisible[…] label leaked as literal text: {svg3d}"
+    );
+    assert!(!svg3d.contains(">e<"), "hidden label was painted: {svg3d}");
+  }
+
+  #[test]
+  fn test_inset_labeled_graphic_embeds_picture() {
+    // `Inset[Labeled[Graphics[…], caption], pos, opos, size]` — a
+    // Demonstration's usual way to caption a small diagram composited into
+    // a larger picture (e.g. a pie chart inset with a "distribution of
+    // wealth" label). Regression: `Labeled[…]` was not one of the wrappers
+    // `Inset` peels to find its picture, so the whole `Labeled[…]` call
+    // printed as literal text (`Labeled[-Graphics-, distribution of
+    // wealth]`) instead of drawing the nested circle.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Graphics[{Inset[Labeled[Graphics[{Circle[]}], \
+       Style[\"caption\", {Black, \"Text\"}]], ImageScaled[{0.6, 0.5}], \
+       ImageScaled[{0, 0}], 0.5]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.contains("ellipse"),
+      "Inset[Labeled[…]] did not draw the nested circle: {svg}"
+    );
+    assert!(
+      !svg.contains("Labeled["),
+      "Inset[Labeled[…]] fell back to printing the call as text: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_graphics3d_inset_text_draws_label() {
+    // `Inset[obj, {x, y, z}]` in `Graphics3D` — the Demonstrations gallery's
+    // usual way to place a label, almost always as
+    // `Inset[Text[Style[…]], pos]`. Regression: `Graphics3D`'s primitive
+    // collector only recognized a bare `Text[…, pos]` call, so `Inset[…]`
+    // was silently dropped and no label was drawn at all.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Graphics3D[{Arrow[{{0, 0, 0}, {1, 1, 1}}], \
+       Inset[Text[Style[\"O\", 15]], {0, 0, 0}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.contains(">O<"),
+      "Inset[Text[…]] label was not drawn in Graphics3D: {svg}"
+    );
+
+    // The label's wrapper content (here a plain string) still typesets the
+    // same way when passed to Inset directly, without the Text[…] wrapper.
+    clear_state();
+    let svg2 = interpret(
+      "ExportString[Graphics3D[{Inset[\"AB\", {0, 0, 0}]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg2.contains(">AB<"),
+      "Inset[…] with a bare string label was not drawn in Graphics3D: {svg2}"
+    );
+  }
+
+  #[test]
+  fn test_plot_aspect_ratio_sizes_frame_not_canvas() {
+    // AspectRatio sets the height/width ratio of the plotting *area* (the data
+    // frame), not the whole image. A short ratio must therefore NOT squash the
+    // plot: the total image is the frame plus the label/tick margins, so its
+    // height exceeds `width * ratio`. Regression for a bug where AspectRatio
+    // sized the entire canvas, collapsing ticks/data into a thin band.
+    let dims = |svg: &str| -> (f64, f64) {
+      let grab = |attr: &str| -> f64 {
+        let key = format!("{attr}=\"");
+        let start = svg.find(&key).expect("attr present") + key.len();
+        let end = svg[start..].find('"').unwrap() + start;
+        svg[start..end].parse().unwrap()
+      };
+      (grab("width"), grab("height"))
+    };
+
+    clear_state();
+    let short = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 4 Pi}, AspectRatio -> 1/3], \"SVG\"]",
+    )
+    .unwrap();
+    let (w, h) = dims(&short);
+    // Frame height alone would be w/3; the real image must be taller because
+    // axis ticks and labels live outside the frame.
+    assert!(
+      h > w / 3.0 + 30.0,
+      "AspectRatio 1/3 collapsed the frame: {w}x{h} (expected height > w/3 + margins)"
+    );
+
+    // A taller ratio yields a taller image, and the height grows linearly with
+    // the ratio (frame = w' * ratio, margins constant) — never proportional to
+    // the whole canvas.
+    clear_state();
+    let tall = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 4 Pi}, AspectRatio -> 2/3], \"SVG\"]",
+    )
+    .unwrap();
+    let (_, h2) = dims(&tall);
+    assert!(
+      h2 > h,
+      "doubling AspectRatio did not increase image height: {h} -> {h2}"
+    );
+
+    // ListPlot / ListLinePlot honor AspectRatio the same way (previously they
+    // ignored it and stayed at the default height).
+    for head in ["ListPlot", "ListLinePlot"] {
+      clear_state();
+      let with_ar = interpret(&format!(
+        "ExportString[{head}[Table[Sin[t], {{t, 0, 10, 0.2}}], AspectRatio -> 1/3], \"SVG\"]"
+      ))
+      .unwrap();
+      let (lw, lh) = dims(&with_ar);
+      assert!(
+        lh < lw && (lh - lw / 3.0).abs() < lw / 3.0,
+        "{head} ignored AspectRatio 1/3: {lw}x{lh}"
+      );
+    }
+  }
+
+  #[test]
+  fn test_plot_small_image_size_keeps_positive_plot_area() {
+    // Regression: a small explicit `ImageSize` (an 80x80 panel in a
+    // Manipulate's GraphicsGrid, a common real-world case in a Wolfram
+    // Demonstration) used to leave the fixed-pixel frame/tick-label margins
+    // summing to more than the whole canvas, collapsing the plot area to
+    // zero width. Every data point then mapped to the same pixel, so the
+    // curve drew as a single vertical line and the tick labels stacked on
+    // top of each other instead of spreading down the frame.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Plot[Sin[x], {x, -Pi, Pi}, Frame -> True, ImageSize -> {80, 80}], \"SVG\"]",
+    )
+    .unwrap();
+    let mut min_x = f64::MAX;
+    let mut max_x = f64::MIN;
+    for points in svg.split("points=\"").skip(1) {
+      let Some(points) = points.split('"').next() else {
+        continue;
+      };
+      for pair in points.split_whitespace() {
+        if let Some(x) =
+          pair.split(',').next().and_then(|s| s.parse::<f64>().ok())
+        {
+          min_x = min_x.min(x);
+          max_x = max_x.max(x);
+        }
+      }
+    }
+    assert!(
+      max_x - min_x > 100.0,
+      "the plot collapsed to a single x position: {min_x}..{max_x}"
+    );
+  }
+
+  #[test]
+  fn test_graphics_grid_uses_golden_ratio_default_for_bare_graphics_cell() {
+    // Regression: `g1 = Graphics[...]` with an elongated bounding box (a
+    // vertical stack of shapes, say) rendered standalone at whatever tall,
+    // thin aspect its own data implied. Once dropped into a `GraphicsGrid`
+    // next to normally-proportioned panels, `GraphicsGrid` re-rendered it at
+    // the shared per-cell width but kept that same data-driven aspect
+    // instead of the classic 1/GoldenRatio a bare `Graphics[...]` panel
+    // defaults to — the resulting composite's height blew out to many times
+    // its width. A Wolfram Demonstration commonly builds one such panel as
+    // a variable and reuses it exactly this way.
+    clear_state();
+    let svg = interpret(
+      "g1 = Graphics[{Yellow, Table[Disk[{0, n}, 0.4], {n, 0, 3, 1}]}]; \
+       ExportString[GraphicsGrid[{{g1, g1}}, ImageSize -> {400, 200}], \"SVG\"]",
+    )
+    .unwrap();
+    let grab = |attr: &str| -> f64 {
+      let key = format!("{attr}=\"");
+      let start = svg.find(&key).expect("attr present") + key.len();
+      let end = svg[start..].find('"').unwrap() + start;
+      svg[start..end].parse().unwrap()
+    };
+    let (w, h) = (grab("width"), grab("height"));
+    assert!(
+      h < w,
+      "a bare Graphics cell kept its own elongated data aspect inside GraphicsGrid: {w}x{h}"
+    );
+  }
+
+  #[test]
+  fn test_graphics_grid_span_from_above_draws_nothing() {
+    // Regression: `SpanFromAbove` in a `GraphicsGrid` cell (the same
+    // spanning marker `Grid` accepts, used by a Demonstration to lay a
+    // small plot beside a picture that spans two rows) fell through to the
+    // text renderer and printed the literal word "SpanFromAbove" in that
+    // cell instead of drawing nothing.
+    clear_state();
+    let svg = interpret(
+      "p1 = Graphics[{Red, Disk[]}]; g1 = Graphics[{Blue, Rectangle[]}]; \
+       p2 = Graphics[{Green, Disk[]}]; \
+       ExportString[GraphicsGrid[{{p1, g1}, {p2, SpanFromAbove}}, ImageSize -> 400], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("SpanFromAbove"),
+      "SpanFromAbove leaked into the rendered SVG as literal text: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_list_line_plot_accepts_whole_series_tooltip_wrapper() {
+    // `ListLinePlot[Tooltip[data, label], ...]` wraps the *entire* data
+    // series in a Tooltip (as opposed to `Tooltip` wrapping individual
+    // points) so hovering the line shows `label`. This must plot exactly
+    // like the bare series, not report `ListLinePlot::lpn` and stay
+    // unevaluated: the data-argument validity check only unwrapped
+    // `Tooltip` around single points, not around the whole list.
+    clear_state();
+    let bare = interpret_with_stdout("ListLinePlot[{1, 4, 9, 16}]").unwrap();
+    clear_state();
+    let wrapped = interpret_with_stdout(
+      "ListLinePlot[Tooltip[{1, 4, 9, 16}, \"squares\"]]",
+    )
+    .unwrap();
+    assert!(
+      wrapped.warnings.is_empty(),
+      "a whole-series Tooltip wrapper must not raise ListLinePlot::lpn: {:?}",
+      wrapped.warnings
+    );
+    assert_eq!(
+      wrapped.result, bare.result,
+      "a Tooltip-wrapped series should render identically to the bare series"
+    );
+  }
+
+  #[test]
+  fn test_list_line_plot_accepts_tooltip_wrapped_time_series() {
+    // Same whole-argument-wrapper bug as
+    // `test_list_line_plot_accepts_whole_series_tooltip_wrapper`, but for the
+    // non-List `TimeSeries` data source: the `ListLinePlot::lpn` guard must
+    // strip the `Tooltip` before checking for temporal data too, not just
+    // before the List/Association check.
+    clear_state();
+    let bare =
+      interpret_with_stdout("ListLinePlot[TimeSeries[{{1, 2}, {2, 4}}]]")
+        .unwrap();
+    clear_state();
+    let wrapped = interpret_with_stdout(
+      "ListLinePlot[Tooltip[TimeSeries[{{1, 2}, {2, 4}}], \"series\"]]",
+    )
+    .unwrap();
+    assert!(
+      wrapped.warnings.is_empty(),
+      "a Tooltip-wrapped TimeSeries must not raise ListLinePlot::lpn: {:?}",
+      wrapped.warnings
+    );
+    assert_eq!(
+      wrapped.result, bare.result,
+      "a Tooltip-wrapped TimeSeries should render identically to the bare one"
+    );
+  }
+
+  #[test]
+  fn test_plot_label_style_sets_frame_label_size_and_color() {
+    // LabelStyle -> {size, color} must restyle the FrameLabel/AxesLabel/
+    // PlotLabel text; it used to be accepted and silently dropped, so a
+    // Demonstration asking for large, high-contrast labels rendered them at
+    // the default small gray size instead.
+    clear_state();
+    let plain = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, \
+         FrameLabel -> {\"t\", \"y\"}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !plain.contains("fill=\"rgb(255,0,0)\""),
+      "an unstyled frame label must not already be red"
+    );
+
+    clear_state();
+    let styled = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, \
+         FrameLabel -> {\"t\", \"y\"}, LabelStyle -> {20, Red}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      styled.contains("font-size=\"200\""),
+      "LabelStyle size 20 must scale to font-size 200 at the default 10x \
+       render scale: {styled}"
+    );
+    assert!(
+      styled.contains("fill=\"rgb(255,0,0)\""),
+      "LabelStyle color Red must reach the frame label: {styled}"
+    );
+
+    // The same option reaches a Plot wrapped in Show, the way a
+    // Demonstration typically applies it to a Which-selected sub-plot.
+    clear_state();
+    let via_show = interpret(
+      "ExportString[Show[Plot[Sin[x], {x, 0, 2 Pi}, \
+         FrameLabel -> {\"t\", \"y\"}], LabelStyle -> {20, Red}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      via_show.contains("font-size=\"200\"")
+        && via_show.contains("fill=\"rgb(255,0,0)\""),
+      "LabelStyle applied via Show must still restyle the frame label: {via_show}"
+    );
+  }
+
+  #[test]
+  fn test_frame_label_grid_renders_as_embedded_table() {
+    // `FrameLabel -> Grid[…]` (a Demonstration frame-labeling a plot with a
+    // summary table, as the Wolfram Demonstrations Project's authoring
+    // template shows) used to vanish entirely: `expr_to_label` treats `Grid`
+    // as a known builtin application and returns `None` for it, so the
+    // label silently dropped instead of showing the table. It must now
+    // embed the table as a picture below the frame.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, Frame -> True, \
+         FrameLabel -> Grid[{{\"a\", \"b\"}, {1, 2}}, Frame -> All]], \
+         \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.matches("<svg").count() > 1,
+      "a Grid FrameLabel must embed a nested <svg> table, not just the \
+       outer plot: {svg}"
+    );
+    assert!(
+      svg.contains(">a<") && svg.contains(">b<"),
+      "the embedded table must carry the Grid's own cell text: {svg}"
+    );
+
+    // A bare (non-Grid) FrameLabel keeps rendering as plain text, unchanged.
+    clear_state();
+    let text_svg = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, Frame -> True, \
+         FrameLabel -> \"t\"], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(
+      text_svg.matches("<svg").count(),
+      1,
+      "a plain-text FrameLabel must not embed any nested <svg>: {text_svg}"
+    );
+    assert!(
+      text_svg.contains(">t<"),
+      "the plain-text FrameLabel must still render as text: {text_svg}"
+    );
+  }
+
+  #[test]
+  fn test_frame_label_power_renders_as_unicode_superscript() {
+    // A `FrameLabel`/`AxesLabel` entry built from `base^exp` (a Demonstration
+    // typesets `e^(iΩ)` as `Style["e", Italic]^Row[{Style["i", Italic],
+    // "Ω"}]`) used to vanish entirely: `expr_to_label` had no arm for
+    // `Expr::BinaryOp { op: Power, .. }`, so a bare Power entry returned
+    // `None` outright, and a Power nested inside a `Row[…]` was silently
+    // skipped by the row's `filter_map` while the rest of the row's text
+    // stayed — e.g. `"H(", base^exp, ")"` rendered as `"H()"`.
+    clear_state();
+
+    // A bare Power FrameLabel entry.
+    let svg = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, Frame -> True, \
+         FrameLabel -> {\"t\", x^2}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg.contains("x²"),
+      "a bare Power FrameLabel entry must render as a Unicode superscript, \
+       not vanish: {svg}"
+    );
+
+    // A Power nested inside a Row alongside other text, the way a
+    // Demonstration typesets a styled base raised to a styled exponent.
+    clear_state();
+    let svg2 = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, Frame -> True, \
+         FrameLabel -> Row[{\"H(\", Style[\"e\", Italic]^Row[{\
+         Style[\"i\", Italic], \"t\"}], \")\"}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      svg2.contains("H(eit)"),
+      "a Power nested in a Row must render alongside the row's other text, \
+       not leave a gap: {svg2}"
+    );
+  }
+
+  #[test]
+  fn test_axes_label_none_suppresses_that_axis_label() {
+    // `AxesLabel -> {label, None}` (or `{None, label}`) must omit the axis
+    // whose entry is the bare symbol `None`, not print the literal text
+    // "None" — it used to leak through because `expr_to_label` returned
+    // `Some("None".to_string())` for any identifier, including `None`.
+    clear_state();
+    let y_none = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, \
+         AxesLabel -> {\"t\", None}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !y_none.contains(">None<"),
+      "AxesLabel -> {{\"t\", None}} must not render the text None: {y_none}"
+    );
+    assert!(
+      y_none.contains(">t<"),
+      "AxesLabel -> {{\"t\", None}} must still render the x label: {y_none}"
+    );
+
+    clear_state();
+    let x_none = interpret(
+      "ExportString[Plot[Sin[x], {x, 0, 2 Pi}, \
+         AxesLabel -> {None, \"y\"}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !x_none.contains(">None<"),
+      "AxesLabel -> {{None, \"y\"}} must not render the text None: {x_none}"
+    );
+    assert!(
+      x_none.contains(">y<"),
+      "AxesLabel -> {{None, \"y\"}} must still render the y label: {x_none}"
+    );
+
+    // The same option reaches a Plot wrapped in Show, as in the widget's
+    // `AxesLabel -> {Style["t", Italic], None}` from the source Demonstration.
+    clear_state();
+    let via_show = interpret(
+      "ExportString[Show[Plot[Sin[x], {x, 0, 2 Pi}], \
+         AxesLabel -> {Style[\"t\", Italic], None}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(
+      !via_show.contains(">None<"),
+      "AxesLabel -> {{.., None}} applied via Show must not render None: {via_show}"
+    );
+  }
+
+  #[test]
+  fn test_x_axis_touching_zero_leaves_room_for_tick_labels() {
+    // A y range that only *touches* zero (`PlotRange -> {0, ...}`, common
+    // for a histogram or a PDF plot) draws the x axis flush with the
+    // bottom edge of the picture rather than through its middle. That axis
+    // used to be classified as "interior" (spans zero) and given only a 6px
+    // gutter — too little for its 14px tick-label text, which then drew
+    // below the SVG's own height and was clipped off entirely by any
+    // conforming renderer.
+    clear_state();
+    let svg = interpret(
+      "ExportString[Graphics[{Blue, Rectangle[{0, 0}, {1, 3}]}, \
+         Axes -> True, PlotRange -> {{-0.5, 2}, {0, 4}}, \
+         ImageSize -> {300, 200}], \"SVG\"]",
+    )
+    .unwrap();
+    let height: f64 = svg
+      .split("height=\"")
+      .nth(1)
+      .and_then(|s| s.split('"').next())
+      .and_then(|s| s.parse().ok())
+      .expect("svg must declare a height");
+    let mut found_x_tick = false;
+    for line in svg.lines() {
+      if !line.contains("dominant-baseline=\"hanging\"") {
+        continue;
+      }
+      let y: f64 = line
+        .split("y=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .and_then(|s| s.parse().ok())
+        .expect("tick text must declare y");
+      found_x_tick = true;
+      assert!(
+        y + 14.0 <= height,
+        "x-axis tick label at y={y} (font-size 14) must fit within the \
+         svg's own height={height}, not be clipped off the bottom: {svg}"
+      );
+    }
+    assert!(
+      found_x_tick,
+      "Axes -> True must draw x-axis tick labels: {svg}"
+    );
+  }
+
+  #[test]
+  fn test_audio_missing_file_still_renders_player_chrome() {
+    // A file-backed Audio whose file cannot be read (missing here; any local
+    // path in the browser playground) still renders the player chrome: the
+    // audio output is captured with an empty payload and the file's name.
+    clear_state();
+    let r =
+      interpret_with_stdout("Audio[File[\"/nonexistent/jazz_no1.flac\"]]")
+        .unwrap();
+    assert_eq!(r.result, "-Audio-");
+    let audio = r.sound.expect("file-backed Audio should produce audio");
+    assert_eq!(audio.base64, "");
+    assert_eq!(audio.mime, "audio/flac");
+    assert_eq!(audio.label.as_deref(), Some("jazz_no1.flac"));
+  }
+
+  #[test]
+  fn test_audio_symbolic_data_keeps_text_echo_in_visual_mode() {
+    // Audio with non-numeric data cannot become a player and keeps its
+    // symbolic echo even in visual mode.
+    clear_state();
+    let r = interpret_with_stdout("Audio[{a, b}]").unwrap();
+    assert_eq!(r.result, "Audio[{a, b}]");
+    assert!(r.sound.is_none());
+  }
+
+  #[test]
+  fn test_comment_then_expression() {
+    // Comment followed by expression should evaluate the expression
+    clear_state();
+    assert_eq!(interpret("(* comment *)\nSin[123]").unwrap(), "Sin[123]");
+  }
+
+  #[test]
+  fn test_inline_comment() {
+    // Inline comment should not affect the result
+    clear_state();
+    assert_eq!(interpret("5 + (* inline *) 3").unwrap(), "8");
+  }
+
+  #[test]
+  fn test_comment_after_condition_operator() {
+    // A comment after /; should not cause an infinite loop
+    clear_state();
+    assert_eq!(interpret("x /; (* foo *) True").unwrap(), "x /; True");
+  }
+
+  #[test]
+  fn test_modifier_circumflex_as_power() {
+    // Regression: the modifier-letter circumflex `ˆ` (U+02C6, emitted by the
+    // macOS `^` dead key) must act as the Power operator, identical to `^`.
+    clear_state();
+    assert_eq!(interpret("2ˆ10").unwrap(), interpret("2^10").unwrap());
+    assert_eq!(interpret("2ˆ10").unwrap(), "1024");
+    clear_state();
+    assert_eq!(interpret("xˆ2 /. x->3").unwrap(), "9");
+    clear_state();
+    assert_eq!(
+      interpret("r=(1.+2. I)ˆI; {r, Abs[r], Im[r]}").unwrap(),
+      "{0.2291401859804338 + 0.23817011512167555*I, \
+       0.3304999675767306, 0.23817011512167555}"
+    );
+    // The circumflex must stay literal inside string content.
+    clear_state();
+    assert_eq!(interpret("\"aˆb\"").unwrap(), "aˆb");
+  }
+
+  #[test]
+  fn test_set_delayed_compound_expression_rhs_keeps_parens_in_input_form() {
+    // Regression: printing `lhs := (a; b; c)` back to InputForm must keep
+    // the parentheses around the `;`-sequence body. CompoundExpression has
+    // the lowest precedence of any operator, so dropping them would
+    // re-parse as `(lhs := a); b; c` — silently losing every statement
+    // after the first. Same for `=`, `^:=`, and `^=`.
+    clear_state();
+    assert_eq!(
+      interpret("ToString[Hold[f[x_] := (a = x; a + 1)], InputForm]").unwrap(),
+      "Hold[f[x_] := (a = x; a + 1)]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("ToString[Hold[f[x_] = (a = x; a + 1)], InputForm]").unwrap(),
+      "Hold[f[x_] = (a = x; a + 1)]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("ToString[Hold[f[x_] ^:= (a = x; a + 1)], InputForm]").unwrap(),
+      "Hold[f[x_] ^:= (a = x; a + 1)]"
+    );
+    clear_state();
+    assert_eq!(
+      interpret("ToString[Hold[f[x_] ^= (a = x; a + 1)], InputForm]").unwrap(),
+      "Hold[f[x_] ^= (a = x; a + 1)]"
+    );
+  }
+
+  #[test]
+  fn test_negative_product_exponent_keeps_parens_in_input_form() {
+    // Regression: `Power[base, -(k*rest)]` printed via a division (moving
+    // the negative-exponent factor to the denominator) must parenthesize
+    // the positive exponent it reconstructs. `denominator_form` strips a
+    // `UnaryOp::Minus` exponent down to its `BinaryOp::Times` operand, and
+    // the exponent-parenthesization check only recognized a `Times`
+    // spelled as `Expr::FunctionCall` — a `BinaryOp::Times` exponent (the
+    // shape juxtaposed factors like `-k ((-1+x))^(2)` parse to, e.g. from
+    // a Wolfram Demonstrations notebook's reconstructed box source)
+    // printed without parens, so `E^(k*(-1+x)^2)` came back as
+    // `E^k*(-1+x)^2`: precedence silently pulls `(-1+x)^2` out of the
+    // exponent, changing the value.
+    clear_state();
+    assert_eq!(
+      interpret("ToString[Hold[(x-1)(E)^(-k((-1+x))^(2))], InputForm]")
+        .unwrap(),
+      "Hold[(x - 1)/E^(k*(-1 + x)^2)]"
+    );
+  }
+
+  #[test]
+  fn test_definition_of_compound_expression_body_keeps_parens() {
+    // Same regression, surfaced through Definition[] (which formats
+    // DownValues by hand rather than through expr_to_input_form): a
+    // Demonstrations-style multi-statement delayed body must print with
+    // its grouping parentheses so Definition[f]'s own text remains valid
+    // input.
+    clear_state();
+    interpret("f[x_] := (a = x; b = a + 1; b)").unwrap();
+    assert_eq!(
+      interpret("Definition[f]").unwrap(),
+      "f[x_] := (a = x; b = a + 1; b)"
+    );
+  }
+
+  #[test]
+  fn test_definition_of_compound_expression_body_round_trips() {
+    // The real-world failure mode: re-parsing a printed Definition must
+    // reproduce the exact same function, not one that only runs its first
+    // statement. This is the mechanism Woxi Studio's Manipulate rendering
+    // relies on: a Demonstration's body is parsed to an AST and printed
+    // back to source before evaluation, so any statement dropped here
+    // silently breaks the Manipulate at render time.
+    clear_state();
+    interpret("f[x_] := (a = x; b = a + 1; b)").unwrap();
+    let def_text = interpret("ToString[Definition[f], InputForm]").unwrap();
+    clear_state();
+    interpret(&def_text).unwrap();
+    assert_eq!(interpret("f[5]").unwrap(), "6");
+  }
+
+  #[test]
+  fn test_while_with_parenthesized_compound_body_survives_reprint() {
+    // The exact shape that broke a real Wolfram Demonstration in Woxi
+    // Studio: a recursive downvalue whose base case is set from inside a
+    // `While` loop, with the whole delayed body parenthesized as a
+    // `;`-sequence. Printing the parsed body back to source (as the
+    // Manipulate renderer does) and re-running it must still terminate
+    // with the right answer instead of raising
+    // "While: test must evaluate to True or False" from a statement that
+    // silently escaped the delayed definition.
+    clear_state();
+    interpret("step[n_] := step[n - 1] + 1;").unwrap();
+    interpret(
+      "run[start_] := (step[0] = start; \
+         k = 1; \
+         While[k <= 3, k++]; \
+         step[3]);",
+    )
+    .unwrap();
+    let printed = interpret("ToString[Definition[run], InputForm]").unwrap();
+    assert!(
+      printed.starts_with("run[start_] := ("),
+      "lost the grouping parens: {printed}"
+    );
+    // Re-define `run` from nothing but its own printed definition (`step`'s
+    // definition is untouched) and confirm it still runs as one delayed
+    // multi-statement body instead of leaking its later statements out as
+    // immediate top-level code.
+    interpret(&printed).unwrap();
+    assert_eq!(interpret("run[10]").unwrap(), "13");
+  }
+
+  #[test]
+  fn test_protect_takes_strings_and_lists_of_symbols() {
+    // `Protect`/`Unprotect` address a symbol, a string naming one, a string
+    // name pattern, or a list of any of those. Only the bare symbol worked,
+    // so `Unprotect["Style"]` silently left the symbol Protected (#603).
+    clear_state();
+    assert_eq!(
+      interpret("Unprotect[{Style, MetaInformation}]").unwrap(),
+      "{Style, MetaInformation}"
+    );
+    assert_eq!(
+      interpret("Style = 5; MetaInformation = 6; Style").unwrap(),
+      "5"
+    );
+
+    clear_state();
+    assert_eq!(interpret("Unprotect[\"Style\"]").unwrap(), "{Style}");
+    assert_eq!(interpret("Style = 5; Style").unwrap(), "5");
+
+    // A pattern selects every matching name, and `Protect` puts it back.
+    clear_state();
+    interpret("aa = 1; ab = 2; ba = 3").unwrap();
+    assert_eq!(interpret("Protect[\"Global`a*\"]").unwrap(), "{aa, ab}");
+    assert_eq!(interpret("Unprotect[\"Global`a*\"]").unwrap(), "{aa, ab}");
+    clear_state();
+    assert_eq!(interpret("Attributes[CellFrame]").unwrap(), "{Protected}");
+    assert_eq!(
+      interpret("Unprotect[\"System`CellFra*\"]; Attributes[CellFrame]")
+        .unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("Protect[\"System`CellFra*\"]; Attributes[CellFrame]").unwrap(),
+      "{Protected}"
+    );
+    // A pattern that matches nothing changes nothing.
+    assert_eq!(interpret("Unprotect[\"NoSuchSymbol*\"]").unwrap(), "{}");
+    clear_state();
+  }
+
+  #[test]
+  fn test_while_stops_on_a_non_boolean_test() {
+    // `While` runs its body only while the test is literally `True`; every
+    // other result ends the loop quietly. Raising an error instead aborted
+    // the whole `Get` of `wljs-snippets/src/Library.wl` (issue #603).
+    clear_state();
+    assert_eq!(interpret("i = 0; While[i, i = i + 1]; i").unwrap(), "0");
+    assert_eq!(interpret("Clear[q]; While[q, 1]; done").unwrap(), "done");
+    assert_eq!(interpret("k = 0; While[5, k = 1]; k").unwrap(), "0");
+    assert_eq!(interpret("j = 0; While[\"yes\", j = 1]; j").unwrap(), "0");
+  }
+
+  #[test]
+  fn test_file_name_join_collapses_separators_inside_components() {
+    // A component may carry its own separators; the join must not leave a
+    // run of them behind, or `StringTake[…, -3]` on the result diverges.
+    // The separator is the host's unless one is named, so every case below
+    // names `"Unix"` — otherwise the expectations only hold off Windows.
+    clear_state();
+    let unix = |components: &str| {
+      interpret(&format!(
+        "FileNameJoin[{components}, OperatingSystem -> \"Unix\"]"
+      ))
+      .unwrap()
+    };
+    assert_eq!(unix("{\"/a\", \"b/\", \"c.wlx\"}"), "/a/b/c.wlx");
+    assert_eq!(unix("{\"a//b\", \"c\"}"), "a/b/c");
+    assert_eq!(unix("{\"/a\", \"/b\"}"), "/a/b");
+    assert_eq!(unix("{\"//a\", \"b\"}"), "/a/b");
+    assert_eq!(unix("{\"/\"}"), "/");
+    assert_eq!(unix("{\"/\", \"a\"}"), "/a");
+    assert_eq!(unix("{\"/a/b/\"}"), "/a/b");
+    assert_eq!(unix("{}"), "");
+    assert_eq!(
+      interpret(
+        "FileNameJoin[{\"a/\", \"b\"}, OperatingSystem -> \"Windows\"]"
+      )
+      .unwrap(),
+      "a\\b"
+    );
+    // A non-string component leaves the call unevaluated.
+    assert_eq!(
+      interpret("FileNameJoin[{\"/a\", 5}]").unwrap(),
+      "FileNameJoin[{/a, 5}]"
+    );
+  }
+
+  #[test]
+  fn test_comment_after_condition_in_set_delayed() {
+    // SetDelayed with Condition and inline comment should work
+    clear_state();
+    assert_eq!(
+      interpret("f[x_] := x^2 /; (* positive *) True; f[3]").unwrap(),
+      "9"
+    );
+  }
+
+  #[test]
+  fn test_condition_in_module_as_guard() {
+    // Condition inside Module should act as a guard for the function definition.
+    // If test is True, return the value. If not, the overload doesn't match.
+    clear_state();
+    interpret("Foo[u_,x_Symbol] := Module[{}, 3 /; u == 1]").unwrap();
+    // x != 1, so Foo[x, x] should remain unevaluated
+    assert_eq!(interpret("Foo[x, x]").unwrap(), "Foo[x, x]");
+    // 1 == 1 is True, so Foo[1, x] should return 3
+    assert_eq!(interpret("Foo[1, x]").unwrap(), "3");
+  }
+
+  #[test]
+  fn test_condition_in_block_as_guard() {
+    // Same behavior with Block instead of Module
+    clear_state();
+    interpret("Bar[n_] := Block[{}, n^2 /; n > 0]").unwrap();
+    assert_eq!(interpret("Bar[3]").unwrap(), "9");
+    assert_eq!(interpret("Bar[-1]").unwrap(), "Bar[-1]");
+  }
+
+  #[test]
+  fn test_evaluate_escapes_hold_in_block_var_spec() {
+    // `Evaluate[…]` escapes any surrounding Hold attribute, including the
+    // held local-variable-specification argument of Block/Module/With.
+    // `Block[Evaluate[{f, g}], …]` — a Wolfram Demonstrations idiom for
+    // localizing whichever built-in a control variable currently holds —
+    // must see the already-substituted list `{Sin, ArcSin}`, not the
+    // literal, un-evaluated `Evaluate[{f, g}]` expression.
+    clear_state();
+    interpret("f = Sin; g = ArcSin;").unwrap();
+    // Localizing Sin/ArcSin themselves strips their evaluation rules, so
+    // the application inside stays literal — this is what lets a
+    // Demonstration's caption show the un-simplified function call. The
+    // coefficients keep `g[…]`'s argument from directly nesting inside
+    // `f[…]`, which is the shape this idiom is actually used for.
+    assert_eq!(
+      interpret("Block[Evaluate[{f, g}], HoldForm @@ {f[3 g[2 x]]}]").unwrap(),
+      "HoldForm[Sin[3*ArcSin[2*x]]]"
+    );
+    // Outside the Block, Sin/ArcSin evaluate normally again (no special
+    // rule fires here, so the application just stays put either way — the
+    // point is that no error or stray substitution leaks out of the Block).
+    assert_eq!(
+      interpret("Sin[3 ArcSin[2 x]]").unwrap(),
+      "Sin[3*ArcSin[2*x]]"
+    );
+  }
+
+  #[test]
+  fn test_evaluate_escapes_hold_in_module_and_with_var_spec() {
+    // Same Evaluate-escapes-Hold rule for Module and With: the spec list
+    // is computed from other bindings before Module/With's own local-var
+    // parsing runs, rather than being handed the literal `Evaluate[…]`
+    // wrapper and rejected as "not a List".
+    clear_state();
+    // A variable holding the *name* of the symbol to localize (a bare
+    // symbol spec, which only Module and Block allow).
+    interpret("localName = counter;").unwrap();
+    assert_eq!(
+      interpret("Module[Evaluate[{localName}], counter = 10; counter]")
+        .unwrap(),
+      "10"
+    );
+    clear_state();
+    // Same for `With`, seen through its validation: a variable holding a
+    // `symbol -> value` *rule* is not a binding (`With` wants `pivot = 9`;
+    // see `a_rule_is_not_a_local_assignment`), and the rejection quotes the
+    // resolved specification `{pivot -> 9}` rather than the literal
+    // `Evaluate[{binding}]` — which is exactly what shows that the
+    // `Evaluate` was released before the local-var parsing ran.
+    interpret("binding = pivot -> 9;").unwrap();
+    assert_eq!(
+      interpret("With[Evaluate[{binding}], pivot + 1]").unwrap(),
+      "With[{pivot -> 9}, pivot + 1]"
+    );
+  }
+
+  #[test]
+  fn test_condition_in_module_with_expression() {
+    // Condition guard with non-trivial expression in Module
+    clear_state();
+    interpret("Sqr[n_] := Module[{}, n^2 /; n > 0]").unwrap();
+    assert_eq!(interpret("Sqr[3]").unwrap(), "9");
+    assert_eq!(interpret("Sqr[-1]").unwrap(), "Sqr[-1]");
+  }
+
+  #[test]
+  fn test_replace_repeated_with_conditional_rule_stored_in_variable() {
+    // Bubble-sort-style rule with a Condition guard, stored in an OwnValue
+    // and applied via //.. Regression for two bugs:
+    //   1. Set was stringifying RuleDelayed, dropping the parens around
+    //      `(p /; c)` and re-parsing as `Condition[p, RuleDelayed[c, body]]`.
+    //   2. Pattern matching with `/;` didn't backtrack through sequence
+    //      splits, so the first split `b=1, c=2` failed the condition and
+    //      the rule never fired even though `b=2, c=1` satisfies `b > c`.
+    clear_state();
+    interpret("sort = ({a___, b_, c_, d___} /; b > c) :> {a, c, b, d}")
+      .unwrap();
+    assert_eq!(interpret("{1, 2, 1} //. sort").unwrap(), "{1, 1, 2}");
+    assert_eq!(
+      interpret("{3, 1, 2, 5, 4} //. sort").unwrap(),
+      "{1, 2, 3, 4, 5}"
+    );
+  }
+
+  #[test]
+  fn test_replace_all_descends_into_rule_and_association() {
+    // Regression: a blank pattern (x_Real, x_Integer, ...) must descend into
+    // the pattern/replacement of a Rule subexpression and into Association
+    // keys/values, matching wolframscript. Previously the AST pattern path
+    // handled only List/FunctionCall/BinaryOp and fell through to a
+    // string-based fallback that never reached inside a Rule.
+    clear_state();
+    // Into a bare Rule's replacement.
+    assert_eq!(
+      interpret("({0} -> {1.5, 2.5}) /. x_Real :> Round[x]").unwrap(),
+      "{0} -> {2, 2}",
+    );
+    // Into a Rule nested in a list.
+    assert_eq!(interpret("{a -> 1.5} /. x_Real :> 9").unwrap(), "{a -> 9}");
+    assert_eq!(interpret("(a -> 5) /. x_Integer :> 9").unwrap(), "a -> 9");
+    // Into an Association value.
+    assert_eq!(
+      interpret("<|k -> 1.5|> /. x_Real :> 9").unwrap(),
+      "<|k -> 9|>",
+    );
+    // A symbol blank descends into the Rule parts (a, b) AND its `Rule` head,
+    // matching wolframscript — rather than the buggy string fallback binding
+    // the whole `a -> b` as a Symbol. See test_replace_all_rewrites_head_symbol.
+    assert_eq!(
+      interpret("(a -> b) /. x_Symbol :> foo[x]").unwrap(),
+      "foo[Rule][foo[a], foo[b]]",
+    );
+  }
+
+  #[test]
+  fn test_replace_all_accepts_association_as_rules() {
+    // Regression: an Association used directly as the rules argument of
+    // ReplaceAll / ReplaceRepeated / Replace must behave as if it were the
+    // list of its key -> value pairs, matching wolframscript. Woxi used to
+    // reject it with ReplaceAll::reps ("neither a list of replacement rules
+    // nor a valid dispatch table").
+    clear_state();
+    assert_eq!(
+      interpret(r#"{"a", "b", "c"} /. <|"a" -> 1, "b" -> 2|>"#).unwrap(),
+      "{1, 2, c}",
+    );
+    assert_eq!(
+      interpret("{a, a, b} /. AssociationThread[{a, b}, {1, 2}]").unwrap(),
+      "{1, 1, 2}",
+    );
+    // ReplaceRepeated delegates to the same rule-shape validation.
+    assert_eq!(interpret("a //. <|a -> b, b -> c|>").unwrap(), "c",);
+    // Replace (top-level only) accepts an Association too.
+    assert_eq!(
+      interpret(r#"Replace["a", <|"a" -> 1, "b" -> 2|>]"#).unwrap(),
+      "1",
+    );
+    // An empty Association still counts as a valid (no-op) rule set rather
+    // than triggering the reps error.
+    assert_eq!(interpret("{a, b} /. <||>").unwrap(), "{a, b}");
+  }
+
+  #[test]
+  fn test_replace_all_rewrites_head_symbol() {
+    // ReplaceAll treats a compound's head as an ordinary subexpression, so a
+    // symbol-blank rule rewrites the head too, producing `f[h][...]` (a
+    // CurriedCall) exactly like wolframscript. Regression for woxi previously
+    // leaving heads untouched under `x_Symbol :> ...`.
+    clear_state();
+    assert_eq!(
+      interpret("h[a, b] /. x_Symbol :> f[x]").unwrap(),
+      "f[h][f[a], f[b]]",
+    );
+    // List / Rule heads are subexpressions too.
+    assert_eq!(
+      interpret("{a, b} /. x_Symbol :> f[x]").unwrap(),
+      "f[List][f[a], f[b]]",
+    );
+    assert_eq!(
+      interpret("(a -> b) /. x_Symbol :> f[x]").unwrap(),
+      "f[Rule][f[a], f[b]]",
+    );
+    // Non-symbol heads (integers) are left alone; the head still rewrites.
+    assert_eq!(
+      interpret("h[1, 2] /. x_Symbol :> f[x]").unwrap(),
+      "f[h][1, 2]"
+    );
+    // Curried calls rewrite every layer's head. Previously `h[a][b]` matched
+    // `x_Symbol` at the top level because get_expr_head returned "Symbol".
+    assert_eq!(
+      interpret("h[a][b] /. x_Symbol :> f[x]").unwrap(),
+      "f[h][f[a]][f[b]]",
+    );
+    assert_eq!(interpret("h[a][b] /. x_h :> 99").unwrap(), "99[b]");
+    // The multi-rule path (list of rules) behaves identically.
+    assert_eq!(
+      interpret("h[a, b] /. {x_Symbol :> f[x]}").unwrap(),
+      "f[h][f[a], f[b]]",
+    );
+    // A literal head rule still rewrites only the matching head.
+    assert_eq!(interpret("x[a] /. x -> 3").unwrap(), "3[a]");
+  }
+
+  #[test]
+  fn test_curried_call_over_infix_operator_head_keeps_parens() {
+    // A CurriedCall's head (`(head)[args]`) that is itself an infix
+    // operator expression must print with parens, or the reconstructed
+    // text re-parses with `[args]` attached to the wrong operand.
+    // Regression: a Wolfram Demonstration's Manipulate body used
+    // `(r /. sol[[1, 1]])["Domain"]`; Woxi Studio reconstructs a
+    // Manipulate body's InputForm text from the held (unevaluated) AST to
+    // re-evaluate it with slider bindings, and previously printed this as
+    // `r /. sol[[1, 1]]["Domain"]`, which reparses as `r /. (sol[[1,
+    // 1]]["Domain"])` instead — a different computation entirely.
+    // `:>` holds its RHS unevaluated, so printing the constructed Rule
+    // exercises the same InputForm printer without needing a widget.
+    clear_state();
+    assert_eq!(
+      interpret("x :> (a /. b -> c)[d]").unwrap(),
+      "x :> (a /. b -> c)[d]",
+    );
+    assert_eq!(
+      interpret("x :> (a //. b -> c)[d]").unwrap(),
+      "x :> (a //. b -> c)[d]",
+    );
+    assert_eq!(interpret("x :> (a /@ b)[d]").unwrap(), "x :> (a /@ b)[d]",);
+    assert_eq!(interpret("x :> (a @@ b)[d]").unwrap(), "x :> (a @@ b)[d]",);
+    assert_eq!(interpret("x :> (a @@@ b)[d]").unwrap(), "x :> (a @@@ b)[d]",);
+    assert_eq!(interpret("x :> (a; b)[d]").unwrap(), "x :> (a; b)[d]",);
+  }
+
+  #[test]
+  fn test_replace_all_head_prefilter_keeps_every_match() {
+    // ReplaceAll skips a rule list outright at nodes whose head no rule
+    // names. The shapes it must still reach:
+    clear_state();
+    // A call whose head one rule out of many does name.
+    assert_eq!(
+      interpret("g[1, 2] /. {f[a_, b_] :> \"f\", g[a_, b_] :> \"g\"}").unwrap(),
+      "g",
+    );
+    // Nested deep inside arguments no rule can match at their own level.
+    assert_eq!(
+      interpret("h[{1, {2, g[3, 4]}}, 5] /. {g[a_, b_] :> a + b}").unwrap(),
+      "h[{1, {2, 7}}, 5]",
+    );
+    // A head the rules never name is left alone, arguments included.
+    assert_eq!(
+      interpret("zz[1, 2] /. {f[a_, b_] :> \"f\", g[a_, b_] :> \"g\"}")
+        .unwrap(),
+      "zz[1, 2]",
+    );
+    // `{…}`, `a -> b` and `a + b` stand in for `List[…]`, `Rule[…]` and
+    // `Plus[…]` calls, so a rule naming those heads still reaches them.
+    assert_eq!(interpret("{1, 2} /. List[a_, b_] :> a + b").unwrap(), "3");
+    assert_eq!(interpret("(a -> b) /. Rule[p_, q_] :> q").unwrap(), "b");
+    assert_eq!(
+      interpret("1 + c /. Plus[a_, b_] :> \"hit\"").unwrap(),
+      "hit"
+    );
+    // An optional argument lets a pattern match an expression that is no
+    // call at all — `a` matches `Plus[x_, y_.]` as `Plus[a, 0]` — so such a
+    // pattern's head rules nothing out.
+    assert_eq!(interpret("a /. Plus[x_, y_.] :> \"hit\"").unwrap(), "hit");
+    assert_eq!(interpret("5 /. Plus[x_, y_.] :> \"hit\"").unwrap(), "hit");
+    // Rules that are not head-anchored at all keep matching everywhere.
+    assert_eq!(
+      interpret("h[1, {2}] /. x_Integer :> x + 10").unwrap(),
+      "h[11, {12}]",
+    );
+    assert_eq!(
+      interpret("h[a, b] /. {x_Symbol :> f[x]}").unwrap(),
+      "f[h][f[a], f[b]]",
+    );
+  }
+
+  #[test]
+  fn test_table_localizes_its_iterator_like_block() {
+    // Table gives its iterator a value for the duration of one iteration
+    // (Block-style dynamic scoping); it does not textually replace the symbol
+    // throughout the body. The two agree wherever the body is evaluated to
+    // the end, and part ways in every held position — which is where a
+    // `Table[lhs :> rhs, …]` rule list keeps the loop counter symbolic.
+    clear_state();
+    assert_eq!(
+      interpret("Table[Hold[i^2], {i, 2}]").unwrap(),
+      "{Hold[i^2], Hold[i^2]}"
+    );
+    assert_eq!(
+      interpret("Table[tile[i, 0] :> i^2, {i, 2}]").unwrap(),
+      "{tile[1, 0] :> i^2, tile[2, 0] :> i^2}"
+    );
+    // The immediate rule is the one that captures the value.
+    assert_eq!(
+      interpret("Table[tile[i, 0] -> i^2, {i, 2}]").unwrap(),
+      "{tile[1, 0] -> 1, tile[2, 0] -> 4}"
+    );
+    assert_eq!(
+      interpret("Table[Function[x, i + x], {i, 2}]").unwrap(),
+      "{Function[x, i + x], Function[x, i + x]}"
+    );
+    assert_eq!(
+      interpret("Table[HoldForm[i], {i, 2}]").unwrap(),
+      "{HoldForm[i], HoldForm[i]}"
+    );
+    // A held position stays symbolic whatever the iterator ranges over:
+    // a list of values, a min/max/step range, or a nested iterator.
+    assert_eq!(
+      interpret("Table[Hold[i], {i, {a, b}}]").unwrap(),
+      "{Hold[i], Hold[i]}"
+    );
+    assert_eq!(
+      interpret("Table[Hold[i], {i, 1, 5, 2}]").unwrap(),
+      "{Hold[i], Hold[i], Hold[i]}"
+    );
+    assert_eq!(
+      interpret("Table[Table[Hold[i + j], {j, 2}], {i, 2}]").unwrap(),
+      "{{Hold[i + j], Hold[i + j]}, {Hold[i + j], Hold[i + j]}}"
+    );
+    // An inner binder still wins: With substitutes its own local, so the
+    // iterator's value reaches the held expression through `k`.
+    assert_eq!(
+      interpret("Table[With[{k = i}, Hold[k]], {i, 2}]").unwrap(),
+      "{Hold[1], Hold[2]}"
+    );
+    // Evaluated positions are unaffected — the ordinary use of Table.
+    assert_eq!(interpret("Table[i^2, {i, 4}]").unwrap(), "{1, 4, 9, 16}");
+    assert_eq!(
+      interpret("Table[i + j, {i, 2}, {j, 2}]").unwrap(),
+      "{{2, 3}, {3, 4}}"
+    );
+    // The iterator is local: an outer value survives the loop, and an
+    // unbound symbol stays unbound.
+    clear_state();
+    interpret("i = 42;").unwrap();
+    assert_eq!(interpret("Table[i, {i, 2}]").unwrap(), "{1, 2}");
+    assert_eq!(interpret("i").unwrap(), "42");
+    clear_state();
+    assert_eq!(interpret("Table[i, {i, 2}]").unwrap(), "{1, 2}");
+    assert_eq!(interpret("i").unwrap(), "i");
+  }
+
+  #[test]
+  fn test_table_nested_iterator_bound_through_part() {
+    // Regression: a later iterator's bound can depend on an earlier
+    // iterator's variable through any syntactic wrapper, not just a bare
+    // identifier (`Table[{i, j}, {i, 1, 3}, {j, 1, i}]` already worked).
+    // `nl[[dn1]]` is a `Part` node, and the validity check that decides
+    // whether a bound "resolves" (used to reject the whole Table with
+    // `Table::iterb` and leave it unevaluated) failed to look inside `Part`,
+    // `f@x`, `f/@list`, etc., so it saw only the untouched symbol `dn1` and
+    // declared the bound unresolved — even though `dn1` is perfectly well
+    // bound by the time that iterator runs. Found via a real Wolfram
+    // Demonstration whose Manipulate draws `Table[Point[...], {dn1, ...},
+    // {dn2, ...}, {x, 0, nl[[dn1]] - 1}, {y, 0, ml[[dn2]] - 1}]`.
+    clear_state();
+    interpret("nl = {2, 1, 4};").unwrap();
+    assert_eq!(
+      interpret("Table[x, {dn1, 1, Length[nl]}, {x, 0, nl[[dn1]] - 1}]")
+        .unwrap(),
+      "{{0, 1}, {0}, {0, 1, 2, 3}}"
+    );
+    // Same shape through `@` (PrefixApply) instead of a bare identifier.
+    clear_state();
+    interpret("nl = {2, 1, 4};").unwrap();
+    assert_eq!(
+      interpret(
+        "Table[x, {dn1, 1, Length[nl]}, {x, 0, First@Take[nl, {dn1}] - 1}]"
+      )
+      .unwrap(),
+      "{{0, 1}, {0}, {0, 1, 2, 3}}"
+    );
+    // Four-level nesting where two later iterators each depend on a
+    // different earlier one, matching the Demonstration's shape.
+    clear_state();
+    interpret("nl = {2, 1}; ml = {1, 2};").unwrap();
+    assert_eq!(
+      interpret(
+        "Table[{x, y}, {dn1, 1, Length[nl]}, {dn2, 1, Length[ml]}, \
+         {x, 0, nl[[dn1]] - 1}, {y, 0, ml[[dn2]] - 1}]"
+      )
+      .unwrap(),
+      "{{{{{0, 0}}, {{1, 0}}}, {{{0, 0}, {0, 1}}, {{1, 0}, {1, 1}}}}, \
+       {{{{0, 0}}}, {{{0, 0}, {0, 1}}}}}"
+    );
+  }
+
+  #[test]
+  fn test_replace_all_scales_to_a_demonstrations_sized_rule_list() {
+    // Wolfram Demonstrations build one rewrite rule per lattice site and
+    // hand the whole list to `/.` — thousands of `f[x_Integer, y_Integer]
+    // :> …` rules, applied to an expression with hundreds of nodes. Every
+    // node used to be offered every rule, which put a single frame of such
+    // a notebook minutes away; a node whose head no rule names now skips
+    // the list. The rewrite itself must stay exact.
+    clear_state();
+    // `->` and not `:>`: Table localizes `i` the way Block does, so a delayed
+    // rule would keep the literal `i^2` on its right-hand side (see
+    // `test_table_localizes_its_iterator_like_block`).
+    interpret("rules = Table[tile[i, 0] -> i^2, {i, 8000}];").unwrap();
+    interpret("data = Join[Range[3000], {tile[7, 0]}];").unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(interpret("Last[data /. rules]").unwrap(), "49");
+    let elapsed = start.elapsed();
+    assert!(
+      elapsed < std::time::Duration::from_secs(4),
+      "8000 rules over 3001 nodes took {elapsed:?} — the rule list is being \
+       re-scanned at nodes no rule can match"
+    );
+  }
+
+  #[test]
+  fn test_replace_all_on_unmatched_rendered_graphic_no_op() {
+    // Regression: PieChart (and the other chart functions) render straight
+    // to SVG with no symbolic primitive list, so `PieChart[…][[1]]` stays
+    // an unevaluated `Part[…]` wrapping the opaque graphic. Applying a rule
+    // that matches nothing (no `Disk[…]` anywhere) fell through to the
+    // string-based ReplaceAll fallback, which serializes the graphic to its
+    // output-only `-Graphics-` placeholder and then failed to parse it back
+    // — crashing instead of leaving the expression unchanged, exactly like
+    // wolframscript does when a rule finds nothing to rewrite.
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Head[PieChart[{0.3, 0.7}][[1]] /. Disk[c_, r_, a_] :> Disk[c, r*2, a]]"
+      )
+      .unwrap(),
+      "Part",
+    );
+  }
+
+  #[test]
+  fn test_match_q_with_condition_backtracks_through_sequence_splits() {
+    // MatchQ must enumerate sequence splits when the LHS has a Condition,
+    // returning True if any split satisfies the guard.
+    clear_state();
+    assert_eq!(
+      interpret("MatchQ[{1, 2, 1}, {a___, b_, c_, d___} /; b > c]").unwrap(),
+      "True",
+    );
+    assert_eq!(
+      interpret("MatchQ[{1, 2, 3}, {a___, b_, c_, d___} /; b > c]").unwrap(),
+      "False",
+    );
+  }
+
+  #[test]
+  fn test_condition_guard_calling_curried_function_does_not_recurse() {
+    // A `/;` guard that calls a curried function (`f[p][x, y]`, i.e. two
+    // chained applications) used to blow $RecursionLimit: evaluating the
+    // guard's own nested pattern match for `f`'s curried DownValue was
+    // still seeing the *outer* Condition's LHS-guard stack entry (pushed
+    // for backtracking through sequence splits), so it kept re-applying
+    // the outer guard to the inner match's unrelated bindings forever.
+    // Found via a real Wolfram Demonstration notebook while testing Woxi
+    // Studio's notebook support.
+    clear_state();
+    interpret("cond[p_][a_, b_] := a < b").unwrap();
+    assert_eq!(
+      interpret("Cases[{{1, 2}, {3, 1}, {2, 3}}, {x_, y_} /; cond[0][x, y]]")
+        .unwrap(),
+      "{{1, 2}, {2, 3}}",
+    );
+    assert_eq!(
+      interpret(
+        "Select[{{1, 2}, {3, 1}, {2, 3}}, MatchQ[#, {x_, y_} /; cond[0][x, y]] &]"
+      )
+      .unwrap(),
+      "{{1, 2}, {2, 3}}",
+    );
+    clear_state();
+    interpret("cond2[p_][a_, b_] := a < b").unwrap();
+    assert_eq!(
+      interpret("{{1, 2}, {3, 1}} /. {x_, y_} /; cond2[0][x, y] :> f[x, y]")
+        .unwrap(),
+      "{f[1, 2], {3, 1}}",
+    );
+    clear_state();
+  }
+
+  #[test]
+  fn test_long_plus_times_chains_do_not_exceed_recursion_limit() {
+    // `w1*w2*...*wN` (e.g. a word-list literal like
+    // `besedeA = ability*abraham*...*zurich` from a real Wolfram
+    // Demonstration notebook) parses as an O(N)-deep nested `BinaryOp`
+    // chain. Evaluating it used to recurse once per term through
+    // `evaluate_expr_to_expr` (descending into the nested left/right
+    // operands), burning one `$RecursionLimit` slot per term and
+    // terminating the whole evaluation past ~1024 terms with
+    // `TerminatedEvaluation[RecursionLimit]` — even though `Times`/`Plus`
+    // are `Flat` and Wolfram evaluates a chain of any length without
+    // spending recursion budget on it. The same bug hit `Plus`/`Minus` and
+    // `Times`/`Divide` chains alike. Found via a real Wolfram
+    // Demonstration notebook while testing Woxi Studio's notebook support.
+    clear_state();
+    let n: i64 = 1500;
+
+    let times_chain = vec!["2"; n as usize].join("*");
+    assert_eq!(
+      interpret(&times_chain).unwrap(),
+      interpret(&format!("2^{n}")).unwrap(),
+    );
+
+    let plus_chain =
+      (1..=n).map(|i| i.to_string()).collect::<Vec<_>>().join("+");
+    assert_eq!(
+      interpret(&plus_chain).unwrap(),
+      (n * (n + 1) / 2).to_string()
+    );
+
+    // Alternating `+`/`-` of 1..n: simulate the same left-to-right fold in
+    // Rust to get the expected value, rather than a hand-derived formula.
+    let mut mixed = String::from("0");
+    let mut expected: i64 = 0;
+    for i in 1..=n {
+      if i % 2 == 1 {
+        mixed.push('+');
+        expected += i;
+      } else {
+        mixed.push('-');
+        expected -= i;
+      }
+      mixed.push_str(&i.to_string());
+    }
+    assert_eq!(interpret(&mixed).unwrap(), expected.to_string());
+
+    // A long `Divide` chain: `2/2/2/.../2` (n terms) == `2^(2-n)`.
+    let divide_chain = vec!["2"; n as usize].join("/");
+    assert_eq!(
+      interpret(&divide_chain).unwrap(),
+      interpret(&format!("2^(2-{n})")).unwrap(),
+    );
+
+    clear_state();
+  }
+
+  #[test]
+  fn condition_binds_tighter_than_rule() {
+    // Wolfram gives Condition precedence 130 and Rule/RuleDelayed 120, so a
+    // guard written left of the arrow belongs to the *pattern*:
+    // `lhs /; test :> rhs` is RuleDelayed[Condition[lhs, test], rhs].
+    // Woxi used to parse it the other way round, which made the whole
+    // expression an invalid rule (ReplaceAll::reps).
+    clear_state();
+    assert_eq!(interpret("Head[x_ /; y :> z]").unwrap(), "RuleDelayed");
+    assert_eq!(interpret("Head[x_ /; y -> z]").unwrap(), "Rule");
+    assert_eq!(
+      interpret("Head[Hold[x_ /; y :> z][[1, 1]]]").unwrap(),
+      "Condition"
+    );
+    assert_eq!(
+      interpret("{5, 20} /. x_Integer /; x < 10 :> aa").unwrap(),
+      "{aa, 20}"
+    );
+    assert_eq!(
+      interpret("{5, 20} /. x_Integer /; x < 10 -> aa").unwrap(),
+      "{aa, 20}"
+    );
+  }
+
+  #[test]
+  fn condition_stays_looser_than_its_neighbours() {
+    // The precedence move must not disturb the operators on either side:
+    // a guard still absorbs a whole comparison / boolean test on its right,
+    // and a definition's RHS still absorbs the guard.
+    clear_state();
+    assert_eq!(
+      interpret("{1, 5} /. x_ /; x > 2 && x < 9 :> big").unwrap(),
+      "{1, big}"
+    );
+    assert_eq!(
+      interpret("f[x_] := 1 /; x > 0; {f[2], f[-2]}").unwrap(),
+      "{1, f[-2]}"
+    );
+  }
+
+  #[test]
+  fn complex_pattern_matches_under_a_guard() {
+    // `Complex[re_, im_]` is the structural pattern for a complex atom.
+    // Woxi stores complex numbers as `a + b I`, so the subject has to be
+    // canonicalized before matching — otherwise the guarded form
+    // (used to strip round-off imaginary parts from numeric solves) fails
+    // while the bare form succeeds.
+    clear_state();
+    assert_eq!(
+      interpret("MatchQ[0.5 + 2. I, Complex[a_, b_] /; True]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "{0.5 + 3.8*^-8 I} /. Complex[a_, b_] /; Abs[b] < 10^(-4) :> a"
+      )
+      .unwrap(),
+      "{0.5}"
+    );
+    assert_eq!(
+      interpret("{2 + 3 I} /. Complex[a_, b_] :> {a, b}").unwrap(),
+      "{{2, 3}}"
+    );
+    assert_eq!(
+      interpret("Cases[{1, 2 + I, 3.}, Complex[a_, b_] /; b > 0 :> a]")
+        .unwrap(),
+      "{2}"
+    );
+    // A real number has no imaginary part and must not match.
+    assert_eq!(interpret("MatchQ[2.5, Complex[a_, b_]]").unwrap(), "False");
+    assert_eq!(interpret("MatchQ[3, Complex[a_, b_]]").unwrap(), "False");
+  }
+
+  #[test]
+  fn returned_unevaluated_sequence_splices_into_the_caller() {
+    // Wolfram keeps an `Unevaluated[…]` wrapper only when it is written
+    // literally in an argument list; as soon as it comes *back out* of a
+    // function the wrapper is stripped and its content evaluated. That makes
+    // `If[test, Unevaluated[Sequence[…]], {}]` the idiomatic way to splice a
+    // variable number of items into a list.
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Module[{a, c}, c = True; If[c, a = 5]; \
+         {0, If[c, Unevaluated[Sequence[1, a, a + 1]], {}], 9}]"
+      )
+      .unwrap(),
+      "{0, 1, 5, 6, 9}"
+    );
+    assert_eq!(
+      interpret("{0, If[True, Unevaluated[Sequence[]], {}], 9}").unwrap(),
+      "{0, 9}"
+    );
+    assert_eq!(
+      interpret("g[x_] := Unevaluated[Sequence[1, x + 1]]; {0, g[5], 9}")
+        .unwrap(),
+      "{0, 1, 6, 9}"
+    );
+    assert_eq!(
+      interpret("f[0, If[True, Unevaluated[Sequence[1, 2 + 3]]], 9]").unwrap(),
+      "f[0, 1, 5, 9]"
+    );
+    assert_eq!(
+      interpret("{0, Which[True, Unevaluated[Sequence[1, 2 + 3]]], 9}")
+        .unwrap(),
+      "{0, 1, 5, 9}"
+    );
+    assert_eq!(
+      interpret("{0, Module[{q = 4}, Unevaluated[Sequence[1, q + 1]]], 9}")
+        .unwrap(),
+      "{0, 1, 5, 9}"
+    );
+    assert_eq!(
+      interpret("h[x_] := Unevaluated[x + 1]; {0, h[5], 9}").unwrap(),
+      "{0, 6, 9}"
+    );
+  }
+
+  #[test]
+  fn literal_unevaluated_argument_keeps_its_wrapper() {
+    // The counterpart to the rule above: written literally, the wrapper
+    // survives and the Sequence does *not* splice — Length stays 3.
+    clear_state();
+    assert_eq!(
+      interpret("{0, Unevaluated[1 + 1], 9}").unwrap(),
+      "{0, Unevaluated[1 + 1], 9}"
+    );
+    assert_eq!(
+      interpret("{0, Unevaluated[Sequence[1, 2 + 3]], 9}").unwrap(),
+      "{0, Unevaluated[Sequence[1, 2 + 3]], 9}"
+    );
+    assert_eq!(
+      interpret("Length[{0, Unevaluated[Sequence[1, 2, 3]], 9}]").unwrap(),
+      "3"
+    );
+    // InputForm shows the wrapper too — only a *direct* argument loses it,
+    // and that happens in the evaluator, not the renderer.
+    assert_eq!(
+      interpret("ToString[{0, Unevaluated[1 + 1], 9}, InputForm]").unwrap(),
+      "{0, Unevaluated[1 + 1], 9}"
+    );
+    assert_eq!(
+      interpret("ToString[Unevaluated[1 + 1], InputForm]").unwrap(),
+      "1 + 1"
+    );
+  }
+
+  #[test]
+  fn test_nested_comment() {
+    clear_state();
+    assert_eq!(
+      interpret("1 + (* outer (* inner *) outer *) 2").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn test_nested_comment_only() {
+    clear_state();
+    assert!(interpret("(* outer (* inner *) *)").is_err());
+  }
+
+  #[test]
+  fn test_deeply_nested_comment() {
+    clear_state();
+    assert_eq!(
+      interpret("10 + (* a (* b (* c *) b *) a *) 5").unwrap(),
+      "15"
+    );
+  }
+
+  #[test]
+  fn test_nested_comment_multiline() {
+    clear_state();
+    assert_eq!(
+      interpret("1 + (* outer\n(* inner *)\nouter *) 2").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn test_split_nested_comment() {
+    assert_eq!(
+      split_into_statements("1 + 1\n(* outer (* inner *) *)\n2 + 2"),
+      vec!["1 + 1", "(* outer (* inner *) *)\n2 + 2"]
+    );
+  }
+
+  #[test]
+  fn test_multi_statement_results() {
+    // When a cell has multiple expressions, each should produce output
+    clear_state();
+    let statements = split_into_statements("a = 1 + 2\n2^a");
+    assert_eq!(statements, vec!["a = 1 + 2", "2^a"]);
+
+    let mut results = Vec::new();
+    for stmt in &statements {
+      if let Ok(result) = interpret_with_stdout(stmt)
+        && result.result != "\0"
+      {
+        results.push(result.result);
+      }
+    }
+    assert_eq!(results, vec!["3", "8"]);
+  }
+
+  #[test]
+  fn test_unary_plus() {
+    clear_state();
+    assert_eq!(interpret("(+q)").unwrap(), "q");
+    assert_eq!(interpret("+5").unwrap(), "5");
+    assert_eq!(interpret("+x").unwrap(), "x");
+    assert_eq!(interpret("1 + +2").unwrap(), "3");
+    assert_eq!(interpret("+x^2").unwrap(), "x^2");
+  }
+
+  #[test]
+  fn test_circle_minus() {
+    clear_state();
+    // CircleMinus is a symbolic operator displayed with the ⊖ glyph
+    assert_eq!(interpret("CircleMinus[a, b]").unwrap(), "a \u{2296} b");
+    assert_eq!(
+      interpret("CircleMinus[a, b, c]").unwrap(),
+      "a \u{2296} b \u{2296} c"
+    );
+    // Single argument stays in CircleMinus[...] form, matching wolframscript
+    assert_eq!(interpret("CircleMinus[5]").unwrap(), "CircleMinus[5]");
+  }
+
+  #[test]
+  fn test_insphere_simplex() {
+    clear_state();
+    // A 2-simplex is a triangle; Insphere[Simplex[...]] must match the
+    // Triangle[...] wrapper form. 3-4-5 right triangle → incircle of radius 1
+    // centred at {1, 1}; 6-8-10 right triangle → radius 2 centred at {2, 2}.
+    assert_eq!(
+      interpret("Insphere[Simplex[{{0, 0}, {4, 0}, {0, 3}}]]").unwrap(),
+      "Sphere[{1, 1}, 1]"
+    );
+    assert_eq!(
+      interpret("Insphere[Simplex[{{0, 0}, {6, 0}, {0, 8}}]]").unwrap(),
+      "Sphere[{2, 2}, 2]"
+    );
+    // A 3-simplex is a tetrahedron; Simplex and Tetrahedron wrappers must
+    // agree on the inscribed sphere for the same vertices.
+    let verts = "{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}}";
+    assert_eq!(
+      interpret(&format!("Insphere[Simplex[{verts}]]")).unwrap(),
+      interpret(&format!("Insphere[Tetrahedron[{verts}]]")).unwrap()
+    );
+  }
+
+  #[test]
+  fn test_resource_function_bare_name_stays_symbolic() {
+    clear_state();
+    // ResourceFunction["Name"] fetches the named resource from the Wolfram
+    // Function Repository over the network on first use (see
+    // functions::resource_function_ast — its own hermetic unit tests cover
+    // the pure identifier-rewriting and cell-extraction logic). Actually
+    // fetching isn't something an offline unit test can assert a specific
+    // result for, so this only checks the one part of the contract that is
+    // deterministic regardless of network access: a bare resource name,
+    // never wrapped in ResourceFunction, is not a kernel builtin and must
+    // stay symbolic.
+    assert_eq!(
+      interpret("BarycentricCoordinates[{{0, 0}, {1, 0}, {0, 1}}, {0, 0}]")
+        .unwrap(),
+      "BarycentricCoordinates[{{0, 0}, {1, 0}, {0, 1}}, {0, 0}]"
+    );
+  }
+
+  #[test]
+  fn test_mixed_radix_quantity_stays_symbolic() {
+    clear_state();
+    // MixedRadixQuantity[digits, radixList] is an inert container: wolframscript
+    // leaves it symbolic (arguments evaluate, the head stays) and emits no
+    // message. It must NOT produce a "not yet implemented" warning.
+    let r =
+      interpret_with_stdout("MixedRadixQuantity[{1, 2, 3}, {60, 60}]").unwrap();
+    assert_eq!(r.result, "MixedRadixQuantity[{1, 2, 3}, {60, 60}]");
+    assert!(
+      !r.warnings.iter().any(|w| w.contains("not yet implemented")),
+      "unexpected warning: {:?}",
+      r.warnings
+    );
+    // N threads into the arguments while the head is preserved.
+    assert_eq!(
+      interpret("N[MixedRadixQuantity[{1, 2, 3}, {60, 60}]]").unwrap(),
+      "MixedRadixQuantity[{1., 2., 3.}, {60., 60.}]"
+    );
+    assert_eq!(
+      interpret("Head[MixedRadixQuantity[{1, 2, 3}, {60, 60}]]").unwrap(),
+      "MixedRadixQuantity"
+    );
+  }
+
+  #[test]
+  fn n_of_exact_zero_stays_exact() {
+    clear_state();
+    // N[0, p] on an exact zero stays the exact integer 0 (Head Integer,
+    // Precision Infinity) — wolframscript never fabricates a
+    // precision-tagged BigFloat zero. Non-zero exacts still pick up the tag.
+    assert_eq!(interpret("N[0, 20]").unwrap(), "0");
+    assert_eq!(interpret("N[0, 30]").unwrap(), "0");
+    assert_eq!(interpret("Head[N[0, 20]]").unwrap(), "Integer");
+    assert_eq!(interpret("Precision[N[0, 20]]").unwrap(), "Infinity");
+    // Exact zeros arising from evaluation collapse too.
+    assert_eq!(interpret("N[Sin[0], 20]").unwrap(), "0");
+    assert_eq!(interpret("N[2 - 2, 25]").unwrap(), "0");
+    assert_eq!(interpret("N[Cos[Pi/2], 40]").unwrap(), "0");
+    // A machine Real 0. is left unchanged, and non-zero exacts keep the tag.
+    assert_eq!(interpret("N[0., 20]").unwrap(), "0.");
+    assert_eq!(interpret("N[2, 20]").unwrap(), "2.`20.");
+    // Lists collapse the zero elements element-wise while others keep the tag.
+    assert_eq!(
+      interpret("N[{1, 0, 2}, 20]").unwrap(),
+      "{1.`20., 0, 2.`20.}"
+    );
+    // RealDigits sees the exact 0, not a padded BigFloat zero.
+    assert_eq!(interpret("RealDigits[N[0, 20]]").unwrap(), "{{0}, 1}");
+  }
+
+  #[test]
+  fn arbitrary_precision_constant_through_variable() {
+    // Regression: a variable bound to Pi/E/Degree must reach the
+    // arbitrary-precision path the same way the literal constant does.
+    // Assignment substitutes the constant in as `Identifier`, not the
+    // `Constant` node a literal `Pi` token parses to, and `N[_, digits]`
+    // and `RealDigits` only recognized the latter — so `c = Pi; N[c, 30]`
+    // silently returned `c` unevaluated instead of computing digits.
+    assert_eq!(
+      interpret("c = Pi; N[c, 30]").unwrap(),
+      interpret("N[Pi, 30]").unwrap()
+    );
+    assert_eq!(
+      interpret("c = E; N[c, 30]").unwrap(),
+      interpret("N[E, 30]").unwrap()
+    );
+    assert_eq!(
+      interpret("c = Degree; N[c, 30]").unwrap(),
+      interpret("N[Degree, 30]").unwrap()
+    );
+    assert_eq!(
+      interpret("c = Pi; RealDigits[c, 10, 10]").unwrap(),
+      "{{3, 1, 4, 1, 5, 9, 2, 6, 5, 3}, 1}"
+    );
+    assert_eq!(
+      interpret("c = E; RealDigits[c, 10, 10]").unwrap(),
+      "{{2, 7, 1, 8, 2, 8, 1, 8, 2, 8}, 1}"
+    );
+    // GoldenRatio already worked through a variable; keep it covered
+    // alongside Pi/E/Degree so a future regression here is caught too.
+    assert_eq!(
+      interpret("c = GoldenRatio; RealDigits[c, 10, 10]").unwrap(),
+      "{{1, 6, 1, 8, 0, 3, 3, 9, 8, 8}, 1}"
+    );
+  }
+
+  #[test]
+  fn notation_wrappers_stay_symbolic_without_warning() {
+    // Notation/display wrapper heads stay unevaluated as their canonical form
+    // in wolframscript and must NOT emit a spurious "not yet implemented"
+    // warning (like Subscript/Superscript/Framed already behave).
+    let cases = [
+      ("Overscript[x, 2]", "Overscript[x, 2]"),
+      ("Underscript[x, 2]", "Underscript[x, 2]"),
+      ("Underoverscript[x, 1, 2]", "Underoverscript[x, 1, 2]"),
+      ("Underlined[\"x\"]", "Underlined[x]"),
+      // Highlighted is intentionally omitted here: like Framed it renders to
+      // an SVG box (`-Graphics-`) in visual mode rather than staying symbolic.
+      ("Mouseover[a, b]", "Mouseover[a, b]"),
+      ("Magnify[x, 2]", "Magnify[x, 2]"),
+      ("Ket[0]", "Ket[0]"),
+      ("Bra[0]", "Bra[0]"),
+    ];
+    for (input, expected) in cases {
+      let r = interpret_with_stdout(input).unwrap();
+      assert_eq!(r.result, expected, "result mismatch for {input}");
+      assert!(
+        !r.warnings.iter().any(|w| w.contains("not yet implemented")),
+        "unexpected 'not yet implemented' warning for {input}: {:?}",
+        r.warnings
+      );
+    }
+  }
+
+  #[test]
+  fn control_wrappers_stay_symbolic_without_warning() {
+    // Interactive control / display / annotation wrapper heads stay
+    // unevaluated as their canonical form in wolframscript's script mode and
+    // must NOT emit a spurious "not yet implemented" warning.
+    let cases = [
+      ("Button[a, b]", "Button[a, b]"),
+      ("ActionMenu[a, b]", "ActionMenu[a, b]"),
+      ("Tooltip[a, b]", "Tooltip[a, b]"),
+      ("Interpretation[a, b]", "Interpretation[a, b]"),
+      ("Invisible[x]", "Invisible[x]"),
+      ("Subsuperscript[x, 1, 2]", "Subsuperscript[x, 1, 2]"),
+      // Deploy only makes its content non-selectable, so a front end shows
+      // the content itself — as visual mode does here. The script-mode echo
+      // `Deploy[x]` is covered by deploy_stays_symbolic_in_text_mode.
+      ("Deploy[x]", "x"),
+      ("MouseAppearance[a, b]", "MouseAppearance[a, b]"),
+      ("Editable[x]", "Editable[x]"),
+      ("Selectable[x]", "Selectable[x]"),
+      ("DynamicWrapper[a, b]", "DynamicWrapper[a, b]"),
+      // Dynamic displays the current value of its content in visual mode
+      // (interpret_with_stdout), like a notebook front end — for an
+      // undefined symbol that value is the symbol itself. The script-mode
+      // echo `Dynamic[x]` is covered by dynamic_stays_symbolic_in_text_mode.
+      ("Dynamic[x]", "x"),
+      // EventHandler displays its content in visual mode the same way —
+      // the front end wires the event rules to live input, which a
+      // notebook host still shows the content without. Script mode keeps
+      // the symbolic echo, covered by
+      // event_handler_stays_symbolic_in_script_mode below.
+      ("EventHandler[a, b]", "a"),
+      ("Setter[a, b]", "Setter[a, b]"),
+      ("Slider[0.5]", "Slider[0.5]"),
+      ("Toggler[a, b]", "Toggler[a, b]"),
+      ("Manipulator[x]", "Manipulator[x]"),
+      ("ColorSlider[x]", "ColorSlider[x]"),
+      ("Opener[x]", "Opener[x]"),
+      ("TabView[x]", "TabView[x]"),
+      ("MenuView[x]", "MenuView[x]"),
+      ("SlideView[x]", "SlideView[x]"),
+      ("FlipView[x]", "FlipView[x]"),
+      // Interactive manipulation heads from the InteractiveManipulation
+      // guide. In script mode these stay unevaluated as their canonical form
+      // (they only become interactive objects inside a notebook), so they
+      // must not emit a spurious "not yet implemented" warning.
+      ("Animate[x, {x, 0, 1}]", "Animate[x, {x, 0, 1}]"),
+      ("Animator[0]", "Animator[0]"),
+      ("ListAnimate[{1, 2, 3}]", "ListAnimate[{1, 2, 3}]"),
+      (
+        "ControllerManipulate[x, {x, 0, 1}]",
+        "ControllerManipulate[x, {x, 0, 1}]",
+      ),
+      ("Trigger[Dynamic[x]]", "Trigger[Dynamic[x]]"),
+      ("SetterBar[1, {1, 2, 3}]", "SetterBar[1, {1, 2, 3}]"),
+      ("CheckboxBar[{1}, {1, 2}]", "CheckboxBar[{1}, {1, 2}]"),
+      ("TogglerBar[{1}, {1, 2}]", "TogglerBar[{1}, {1, 2}]"),
+      ("RadioButton[1]", "RadioButton[1]"),
+      ("ProgressIndicator[0.5]", "ProgressIndicator[0.5]"),
+      ("PaneSelector[{1 -> a}, 1]", "PaneSelector[{1 -> a}, 1]"),
+      ("PopupView[{a, b}]", "PopupView[{a, b}]"),
+      ("IntervalSlider[{2, 4}]", "IntervalSlider[{2, 4}]"),
+      ("Slider2D[{0, 0}]", "Slider2D[{0, 0}]"),
+      // Manipulate option symbols used on their own stay symbolic too.
+      ("Bookmarks", "Bookmarks"),
+      ("ContinuousAction", "ContinuousAction"),
+      ("AppearanceElements", "AppearanceElements"),
+    ];
+    for (input, expected) in cases {
+      let r = interpret_with_stdout(input).unwrap();
+      assert_eq!(r.result, expected, "result mismatch for {input}");
+      assert!(
+        !r.warnings.iter().any(|w| w.contains("not yet implemented")),
+        "unexpected 'not yet implemented' warning for {input}: {:?}",
+        r.warnings
+      );
+    }
+  }
+
+  #[test]
+  fn control_active_returns_inactive_form_in_script_mode() {
+    // ControlActive[activeform, normalform] displays as `activeform` only
+    // while it sits inside a control that is being actively manipulated. In
+    // script mode nothing is ever actively manipulated, so it evaluates to
+    // its inactive form `normalform` (with the argument fully evaluated).
+    let cases = [
+      ("ControlActive[1, 2]", "2"),
+      ("ControlActive[1 + 1, 2 + 2]", "4"),
+      ("ControlActive[\"fast\", \"slow\"]", "slow"),
+      // ControlActive[] with no arguments queries whether a control is being
+      // actively manipulated; outside a notebook nothing is, so it is False.
+      ("ControlActive[]", "False"),
+      // Other non-two-argument forms have no active/normal split, so they stay
+      // symbolic (and must not warn about being unimplemented).
+      ("ControlActive[5]", "ControlActive[5]"),
+    ];
+    for (input, expected) in cases {
+      let r = interpret_with_stdout(input).unwrap();
+      assert_eq!(r.result, expected, "result mismatch for {input}");
+      assert!(
+        !r.warnings.iter().any(|w| w.contains("not yet implemented")),
+        "unexpected 'not yet implemented' warning for {input}: {:?}",
+        r.warnings
+      );
+    }
+  }
+
+  #[test]
+  fn polar_curves_stay_symbolic_in_script_mode() {
+    // PolarCurve / FilledPolarCurve are lightweight graphics primitives that
+    // the playground and Woxi Studio render as graphics. In the plain CLI
+    // (script mode) they stay unevaluated as their canonical form — rather
+    // than being lowered to a ParametricRegion the way wolframscript does —
+    // so the visual hosts can draw them.
+    let cases = [
+      (
+        "PolarCurve[1 + Cos[t], {t, 0, 2 Pi}]",
+        "PolarCurve[1 + Cos[t], {t, 0, 2*Pi}]",
+      ),
+      (
+        "FilledPolarCurve[PolarCurve[Sin[2 t], {t, 0, 2 Pi}]]",
+        "FilledPolarCurve[PolarCurve[Sin[2*t], {t, 0, 2*Pi}]]",
+      ),
+      (
+        "FilledPolarCurve[1 - Cos[t], t]",
+        "FilledPolarCurve[1 - Cos[t], t]",
+      ),
+      // Wrapped in Graphics the head is Graphics (they render as a curve /
+      // filled region in visual hosts).
+      (
+        "Head[Graphics[PolarCurve[1 + Cos[t], {t, 0, 2 Pi}]]]",
+        "Graphics",
+      ),
+      (
+        "Head[Graphics[FilledPolarCurve[PolarCurve[Sin[2 t], {t, 0, 2 Pi}]]]]",
+        "Graphics",
+      ),
+      (
+        "Head[Graphics[FilledPolarCurve[1 - Cos[t], t]]]",
+        "Graphics",
+      ),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(
+        interpret(input).unwrap(),
+        expected,
+        "result mismatch for {input}"
+      );
+    }
+  }
+
+  #[test]
+  fn held_graphics_argument_summarizes_as_graphics_placeholder() {
+    // A Graphics[...] argument held inside a symbolic wrapper (LocatorPane,
+    // ClickPane) still summarizes to the -Graphics- placeholder in OutputForm,
+    // matching wolframscript — the full Graphics expression is only shown by
+    // InputForm / FullForm. (A visual host renders the pane itself; this is
+    // the script-mode text form.)
+    let cases = [
+      (
+        "LocatorPane[Dynamic[p], Graphics[Point[p]]]",
+        "LocatorPane[Dynamic[p], -Graphics-]",
+      ),
+      ("ClickPane[Graphics[{}], f]", "ClickPane[-Graphics-, f]"),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(
+        interpret(input).unwrap(),
+        expected,
+        "result mismatch for {input}"
+      );
+    }
+  }
+
+  #[test]
+  fn sequence_apply_splices_into_show_and_graphics_row() {
+    // `Show`/`GraphicsRow` aren't `HoldAll` in Wolfram Language, so a
+    // `Sequence @@ list` argument must reduce to `Sequence[…]` and splice
+    // before dispatch, exactly as a literal `Sequence[…]` argument already
+    // does. These held-for-rendering-purposes functions used to see the
+    // whole `Sequence @@ list` as a single unevaluated `Apply` argument
+    // instead, so a demonstration combining several precomputed panels via
+    // `Show[Sequence @@ panels]` silently dropped every panel but the first.
+    let cases = [
+      (
+        "Head[Show[Sequence @@ {Graphics[{}], Graphics[{}]}]]",
+        "Graphics",
+      ),
+      (
+        "Head[GraphicsRow[Sequence @@ {{Graphics[{}], Graphics[{}]}}]]",
+        "Graphics",
+      ),
+      // A literal `Sequence[…]` argument keeps working alongside the
+      // Apply-shorthand form.
+      (
+        "Head[Show[Sequence[Graphics[{}], Graphics[{}]]]]",
+        "Graphics",
+      ),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(
+        interpret(input).unwrap(),
+        expected,
+        "result mismatch for {input}"
+      );
+    }
+    // The spliced call must produce the same result as writing the same
+    // arguments out directly.
+    assert_eq!(
+      interpret(
+        "Show[Sequence @@ {Graphics[{Circle[]}], Graphics[{Circle[{1, 1}]}]}]"
+      )
+      .unwrap(),
+      interpret("Show[Graphics[{Circle[]}], Graphics[{Circle[{1, 1}]}]]")
+        .unwrap()
+    );
+  }
+
+  #[test]
+  fn drop_shadowing_canonicalizes_with_defaults() {
+    // DropShadowing arguments are matched positionally in the order
+    // offset (2-element numeric list), radius (number), color (color
+    // directive or None), each slot optional, and the missing slots are
+    // filled with the defaults {-3, -3}, 2 and
+    // Opacity[1/3, ThemeColor[Foreground]] — matching wolframscript.
+    let cases = [
+      (
+        "DropShadowing[]",
+        "DropShadowing[{-3, -3}, 2, Opacity[1/3, ThemeColor[Foreground]]]",
+      ),
+      (
+        "DropShadowing[{1, 2}]",
+        "DropShadowing[{1, 2}, 2, Opacity[1/3, ThemeColor[Foreground]]]",
+      ),
+      (
+        "DropShadowing[5]",
+        "DropShadowing[{-3, -3}, 5, Opacity[1/3, ThemeColor[Foreground]]]",
+      ),
+      (
+        "DropShadowing[2.5]",
+        "DropShadowing[{-3, -3}, 2.5, Opacity[1/3, ThemeColor[Foreground]]]",
+      ),
+      (
+        "DropShadowing[Red]",
+        "DropShadowing[{-3, -3}, 2, RGBColor[1, 0, 0]]",
+      ),
+      (
+        "DropShadowing[Opacity[0.5]]",
+        "DropShadowing[{-3, -3}, 2, Opacity[0.5]]",
+      ),
+      ("DropShadowing[None]", "DropShadowing[{-3, -3}, 2, None]"),
+      (
+        "DropShadowing[{1, 2}, 5]",
+        "DropShadowing[{1, 2}, 5, Opacity[1/3, ThemeColor[Foreground]]]",
+      ),
+      (
+        "DropShadowing[{1, 2}, Red]",
+        "DropShadowing[{1, 2}, 2, RGBColor[1, 0, 0]]",
+      ),
+      (
+        "DropShadowing[5, Red]",
+        "DropShadowing[{-3, -3}, 5, RGBColor[1, 0, 0]]",
+      ),
+      (
+        "DropShadowing[{1, 2}, 5, Red]",
+        "DropShadowing[{1, 2}, 5, RGBColor[1, 0, 0]]",
+      ),
+      // The canonical form is a fixed point of evaluation.
+      (
+        "DropShadowing[{-3, -3}, 2, Opacity[1/3, ThemeColor[Foreground]]]",
+        "DropShadowing[{-3, -3}, 2, Opacity[1/3, ThemeColor[Foreground]]]",
+      ),
+    ];
+    for (input, expected) in cases {
+      let r = interpret_with_stdout(input).unwrap();
+      assert_eq!(r.result, expected, "result mismatch for {input}");
+      assert!(
+        !r.warnings.iter().any(|w| w.contains("not yet implemented")),
+        "unexpected 'not yet implemented' warning for {input}: {:?}",
+        r.warnings
+      );
+    }
+  }
+
+  #[test]
+  fn drop_shadowing_invalid_specs_stay_unevaluated() {
+    // Argument lists that don't fit the offset/radius/color pattern
+    // (wrong types, wrong slot order, too many arguments) are left
+    // unevaluated with evaluated arguments, and must NOT emit a spurious
+    // "not yet implemented" warning (like Glow/EdgeForm/Opacity).
+    let cases = [
+      ("DropShadowing[True]", "DropShadowing[True]"),
+      ("DropShadowing[False]", "DropShadowing[False]"),
+      ("DropShadowing[x]", "DropShadowing[x]"),
+      ("DropShadowing[{a, b}]", "DropShadowing[{a, b}]"),
+      ("DropShadowing[{1, 2, 3}]", "DropShadowing[{1, 2, 3}]"),
+      // Color before offset is out of order.
+      (
+        "DropShadowing[Red, {1, 2}]",
+        "DropShadowing[RGBColor[1, 0, 0], {1, 2}]",
+      ),
+      (
+        "DropShadowing[{1, 2}, 5, Red, 7]",
+        "DropShadowing[{1, 2}, 5, RGBColor[1, 0, 0], 7]",
+      ),
+    ];
+    for (input, expected) in cases {
+      let r = interpret_with_stdout(input).unwrap();
+      assert_eq!(r.result, expected, "result mismatch for {input}");
+      assert!(
+        !r.warnings.iter().any(|w| w.contains("not yet implemented")),
+        "unexpected 'not yet implemented' warning for {input}: {:?}",
+        r.warnings
+      );
+    }
+  }
+
+  // On Windows, if a path has components starting with
+  // n, r, t, the backslashes look like escape sequences,
+  // and the path doesn't work when passed to interpret.
+  // Patching paths in the test cases is whack-a-mole, so
+  // just use a Unix-style path syntax always.
+  // C:/tmp/foo/bar.txt works fine on Windows.
+  fn unixify(path: &str) -> String {
+    path.replace('\\', "/")
+  }
+
+  fn temp_dir() -> String {
+    let mut tmp = std::env::temp_dir().display().to_string();
+    if tmp.ends_with(std::path::MAIN_SEPARATOR) {
+      tmp.pop();
+    }
+    unixify(&tmp)
+  }
+
+  /// A scratch path inside the platform temp directory. Never hardcode
+  /// `/tmp/...` in a test — it does not exist on Windows, where the
+  /// nightly CI runs the full unit suite.
+  fn temp_file(file: &str) -> String {
+    let tmp = std::env::temp_dir().join(file);
+    unixify(&tmp.display().to_string())
+  }
+
+  fn manifest_file(file: &str) -> String {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    unixify(&format!("{manifest}/{file}"))
+  }
+
+  mod case_helpers;
+
+  mod algebra;
+  mod arg_count;
+  mod arithmetic;
+  mod assessment;
+  mod association;
+  mod astronomy;
+  mod attributes;
+  mod audio;
+  mod batch_wrappers;
+  mod calculus;
+  mod cellular_automaton;
+  mod code_parser;
+  mod column;
+  mod contexts;
+  mod control_flow;
+  mod dataset;
+  mod datetime;
+  mod distributions;
+  mod element_data;
+  mod entity;
+  mod example_data;
+  mod function_application;
+  mod function_definitions;
+  mod functions;
+  mod geometry;
+  mod graph_theory;
+  mod graphics;
+  mod image;
+  mod interpret_to_expr_api;
+  mod interval;
+  mod io;
+  mod isotope_data;
+  mod knot_data;
+  mod large_number_and_memoization;
+  mod linear_algebra;
+  mod list;
+  mod machine_specific;
+  mod math;
+  mod molecule;
+  mod music;
+  mod patterns;
+  mod polyhedron_data;
+  mod polyhedron_operations;
+  mod property;
+  mod quantity;
+  mod rosetta_script_fixes;
+  mod row;
+  mod sockets;
+  mod special_functions;
+  mod statistics;
+  mod string;
+  mod styling;
+  mod syntax;
+  mod tabular;
+  mod timeseries;
+  mod turing_machine;
+  mod wavelets;
+  mod wxf;
+}

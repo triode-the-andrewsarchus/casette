@@ -1,0 +1,689 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use wasm_bindgen::prelude::*;
+
+use crate::syntax::Expr;
+use crate::{clear_state, interpret, interpret_with_stdout};
+
+thread_local! {
+  // Host-registered in-memory files. The browser has no local filesystem,
+  // so `Import["name"]` resolves against this store instead (see
+  // `import_virtual` in evaluator/dispatch/image_functions.rs).
+  static VIRTUAL_FILES: RefCell<HashMap<String, Vec<u8>>> =
+    RefCell::new(HashMap::new());
+
+  // Files produced by `Export["name", …]` during evaluation. The browser has
+  // no filesystem to write to, so exports are collected here for the host to
+  // offer as downloads (see `record_exported_file` / `take_exported_files`).
+  // Insertion order is preserved; re-exporting the same name overwrites in
+  // place so the store mirrors the final on-"disk" state.
+  //
+  // Each entry is (name, bytes, rasterize). `rasterize` is `Some("png")` etc.
+  // when `bytes` is actually SVG that the host must rasterize to that format
+  // in the browser (via a canvas) — the SVG rasterizer is native-only, so
+  // graphics→raster export is delegated to the host instead of bundled here.
+  static EXPORTED_FILES: RefCell<Vec<(String, Vec<u8>, Option<String>)>> =
+    RefCell::new(Vec::new());
+}
+
+/// Register (or replace) an in-memory file so `Import["name"]` can read it
+/// in the browser.
+#[wasm_bindgen]
+pub fn set_virtual_file(name: &str, data: &[u8]) {
+  VIRTUAL_FILES.with(|files| {
+    files.borrow_mut().insert(name.to_string(), data.to_vec());
+  });
+}
+
+/// Remove all host-registered in-memory files.
+#[wasm_bindgen]
+pub fn clear_virtual_files() {
+  VIRTUAL_FILES.with(|files| files.borrow_mut().clear());
+}
+
+/// Look up a host-registered file by exact name, falling back to the
+/// basename so `Import["/tmp/data.csv"]` still finds a file registered
+/// as "data.csv".
+pub fn virtual_file(path: &str) -> Option<Vec<u8>> {
+  VIRTUAL_FILES.with(|files| {
+    let files = files.borrow();
+    if let Some(data) = files.get(path) {
+      return Some(data.clone());
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    files.get(base).cloned()
+  })
+}
+
+/// Record (or replace) a file produced by `Export`, so the host can offer it
+/// for download after evaluation. Called from the WASM `Export` handler in
+/// `evaluator/dispatch/io_functions.rs` in place of writing to disk.
+///
+/// `rasterize` is `Some("png")`/`Some("jpg")` when `data` is SVG the host must
+/// convert to that raster format in the browser; `None` for ready-to-save bytes.
+pub fn record_exported_file(name: &str, data: &[u8], rasterize: Option<&str>) {
+  EXPORTED_FILES.with(|files| {
+    let mut files = files.borrow_mut();
+    let raster = rasterize.map(|s| s.to_string());
+    if let Some(entry) = files.iter_mut().find(|(n, _, _)| n == name) {
+      entry.1 = data.to_vec();
+      entry.2 = raster;
+    } else {
+      files.push((name.to_string(), data.to_vec(), raster));
+    }
+  });
+}
+
+/// Return every file produced by `Export` since the last call as a JSON array
+/// of `{"name":…, "data":<base64>[, "rasterize":"png"]}`, then clear the store.
+/// The host decodes each base64 payload into a Blob and renders a download
+/// link; entries carrying `rasterize` hold SVG the host converts to that raster
+/// format first. Draining on read keeps each evaluation's exports separate.
+#[wasm_bindgen]
+pub fn take_exported_files() -> String {
+  EXPORTED_FILES.with(|files| {
+    let mut files = files.borrow_mut();
+    let parts: Vec<String> = files
+      .iter()
+      .map(|(name, data, rasterize)| {
+        let b64 = base64::Engine::encode(
+          &base64::engine::general_purpose::STANDARD,
+          data,
+        );
+        match rasterize {
+          Some(fmt) => format!(
+            r#"{{"name":"{}","data":"{}","rasterize":"{}"}}"#,
+            json_escape(name),
+            b64,
+            json_escape(fmt)
+          ),
+          None => {
+            format!(r#"{{"name":"{}","data":"{}"}}"#, json_escape(name), b64)
+          }
+        }
+      })
+      .collect();
+    files.clear();
+    format!("[{}]", parts.join(","))
+  })
+}
+
+/// Discard any pending exported files without returning them. Called when the
+/// host clears interpreter state so stale exports don't leak into a later run.
+pub fn clear_exported_files() {
+  EXPORTED_FILES.with(|files| files.borrow_mut().clear());
+}
+
+// Import a JS-provided function that fetches a URL and returns its content
+// as a base64-encoded string.  The host (worker.js / kernel) must supply this.
+#[wasm_bindgen]
+extern "C" {
+  #[wasm_bindgen(js_name = "__woxi_fetch_url", catch)]
+  fn woxi_fetch_url(url: &str) -> Result<String, JsValue>;
+
+  // Host-provided panic reporter. The panic hook calls this *before* the
+  // resulting `unreachable` trap fires, so the host can capture a meaningful
+  // message and auto-restart the instance. `catch` makes the call a no-op
+  // when the host hasn't installed `globalThis.__woxi_report_panic`.
+  #[wasm_bindgen(js_name = "__woxi_report_panic", catch)]
+  fn report_panic(msg: &str) -> Result<(), JsValue>;
+}
+
+/// Fetch a URL via the host-provided hook and base64-decode the response.
+fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, crate::InterpreterError> {
+  let b64 = woxi_fetch_url(url).map_err(|e| {
+    crate::InterpreterError::EvaluationError(format!(
+      "Import: failed to fetch \"{}\": {:?}",
+      url, e
+    ))
+  })?;
+  if b64.is_empty() {
+    return Err(crate::InterpreterError::EvaluationError(format!(
+      "Import: empty response from \"{}\"",
+      url
+    )));
+  }
+  base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64)
+    .map_err(|e| {
+      crate::InterpreterError::EvaluationError(format!(
+        "Import: failed to decode fetched data: {}",
+        e
+      ))
+    })
+}
+
+/// Download a URL and decode the image bytes (WASM).
+/// Returns the image as an Expr::Image.
+pub fn import_image_from_url_wasm(
+  url: &str,
+) -> Result<Expr, crate::InterpreterError> {
+  let bytes = fetch_url_bytes(url)?;
+  crate::functions::image_ast::import_image_from_bytes(&bytes)
+}
+
+/// Download a CSV file from a URL and parse it (WASM).
+pub fn csv_import_from_url_wasm(
+  url: &str,
+  element: Option<&str>,
+) -> Result<Expr, crate::InterpreterError> {
+  let bytes = fetch_url_bytes(url)?;
+  let content = String::from_utf8(bytes).map_err(|e| {
+    crate::InterpreterError::EvaluationError(format!(
+      "Import: downloaded CSV is not valid UTF-8: {}",
+      e
+    ))
+  })?;
+  let rows = crate::functions::csv_ast::parse_csv(&content);
+  Ok(crate::functions::csv_ast::csv_import_element(
+    &rows, element,
+  ))
+}
+
+#[wasm_bindgen(start)]
+pub fn init() {
+  // Install a panic hook that both logs the full panic (with a JS stack) to
+  // the developer console and forwards the message to the host. A Rust panic
+  // in WASM compiles to the `unreachable` trap: it aborts the current call
+  // and leaves the module's mutable globals (notably the shadow-stack
+  // pointer) in a half-updated state, so every subsequent call into the same
+  // instance re-traps with a bare "unreachable". The host uses the forwarded
+  // message to show a real error and reinstantiate a fresh instance.
+  std::panic::set_hook(Box::new(|info| {
+    console_error_panic_hook::hook(info);
+    let _ = report_panic(&info.to_string());
+  }));
+}
+
+/// Synchronously block the current (worker) thread for `secs` seconds.
+/// Implemented as a busy-wait against `Date.now()` because
+/// `std::thread::sleep` is unavailable on `wasm32-unknown-unknown`.
+/// Burns one core for the duration but does not block the UI thread
+/// when called from a Web Worker.
+pub fn sleep_seconds(secs: f64) {
+  if secs <= 0.0 {
+    return;
+  }
+  let end = js_sys::Date::now() + secs * 1000.0;
+  while js_sys::Date::now() < end {
+    // busy-wait
+  }
+}
+
+/// Evaluate a Wolfram Language expression and return the result.
+/// If the expression produces Print output, it is prepended to the result.
+#[wasm_bindgen]
+pub fn evaluate(input: &str) -> String {
+  match interpret_with_stdout(input) {
+    Ok(result) => {
+      let mut output = result.stdout;
+      if result.result != "\0" {
+        output.push_str(&result.result);
+      }
+      output
+    }
+    Err(e) => format!("Error: {e}"),
+  }
+}
+
+/// Return the captured SVG graphics from the last `evaluate()` call, if any.
+/// Returns an empty string when there is no graphics output.
+#[wasm_bindgen]
+pub fn get_graphics() -> String {
+  crate::get_captured_graphics().unwrap_or_default()
+}
+
+/// Return the playable audio (base64-encoded) from the last `evaluate()`
+/// call, if any. Returns an empty string when there is no sound.
+#[wasm_bindgen]
+pub fn get_sound() -> String {
+  crate::get_captured_sound()
+    .map(|audio| audio.base64)
+    .unwrap_or_default()
+}
+
+/// Return warnings from the last `evaluate()` call as newline-separated text.
+/// Returns an empty string when there are no warnings.
+#[wasm_bindgen]
+pub fn get_warnings() -> String {
+  crate::get_captured_warnings().join("\n")
+}
+
+/// Clear all interpreter state (variables and function definitions).
+#[wasm_bindgen]
+pub fn clear() {
+  clear_state();
+  clear_exported_files();
+}
+
+/// Enable or disable dark mode for SVG output colors.
+#[wasm_bindgen]
+pub fn set_dark_mode(enabled: bool) {
+  crate::set_dark_mode(enabled);
+}
+
+/// Evaluate all top-level statements and return a JSON array of output items.
+/// Each item has a "type" field ("text", "graphics", "print", "warning", "error",
+/// "manipulate") and corresponding content fields.
+#[wasm_bindgen]
+pub fn evaluate_all(input: &str) -> String {
+  let statements = crate::split_into_statements(input);
+  let mut items = Vec::new();
+  for stmt in &statements {
+    items.extend(evaluate_statement_items(stmt));
+  }
+  format!("[{}]", items.join(","))
+}
+
+/// Split `input` into top-level statements and return a JSON array of strings.
+/// Lets the front-end loop one statement at a time so output (and side
+/// effects like `Pause[n]`) appear progressively rather than batched.
+#[wasm_bindgen]
+pub fn split_statements(input: &str) -> String {
+  let statements = crate::split_into_statements(input);
+  let parts: Vec<String> = statements
+    .iter()
+    .map(|s| format!("\"{}\"", json_escape(s)))
+    .collect();
+  format!("[{}]", parts.join(","))
+}
+
+/// Evaluate a single statement and return a JSON array of output items
+/// (same shape as `evaluate_all`'s elements). Use together with
+/// `split_statements` for progressive output.
+#[wasm_bindgen]
+pub fn evaluate_statement(stmt: &str) -> String {
+  let items = evaluate_statement_items(stmt);
+  format!("[{}]", items.join(","))
+}
+
+/// Residual text of a graphics-carrying result once the graphics
+/// placeholders are stripped. A result that is one `Legended[-Graphics-, …]`
+/// wrapper (e.g. `PeriodicTablePlot["Phase"]`) displays entirely as its SVG
+/// — the legend is baked into the rendered graphic — so it leaves no
+/// residual text.
+fn residual_text(result: &str) -> String {
+  if result.starts_with("Legended[-Graphics") && result.ends_with(']') {
+    return String::new();
+  }
+  result
+    .replace("-Graphics-", "")
+    .replace("-Graphics3D-", "")
+    .replace("-Image-", "")
+    .trim()
+    .to_string()
+}
+
+/// Build the JSON output items produced by a single statement.
+fn evaluate_statement_items(stmt: &str) -> Vec<String> {
+  let mut items = Vec::new();
+  match interpret_with_stdout(stmt) {
+    Ok(result) => {
+      // Print output
+      let trimmed_stdout = result.stdout.trim_end();
+      if !trimmed_stdout.is_empty() {
+        items.push(json_output_item("print", trimmed_stdout, None));
+      }
+
+      // Warnings
+      for w in &result.warnings {
+        items.push(json_output_item("warning", w, None));
+      }
+
+      // If the statement is a top-level Manipulate[…] or a standalone
+      // Control[…] call, emit a dedicated "manipulate" item so the frontend
+      // can render interactive controls instead of the plain text echo. We
+      // re-parse the source so we can inspect the held expression shape.
+      if result.result != "\0"
+        && let Some(item) = try_build_manipulate_item(stmt)
+      {
+        items.push(item);
+        return items;
+      }
+
+      // Playable audio (Play[…] / Sound[…] / Audio[…]) — emit a dedicated
+      // "sound" item carrying the base64 data so the frontend can render a
+      // graphical audio player. The textual echo is suppressed in favor of it.
+      if let Some(ref audio) = result.sound
+        && result.result != "\0"
+      {
+        items.push(json_sound_item(audio));
+        return items;
+      }
+
+      // Main result
+      if let Some(ref svg) = result.graphics {
+        // Only display graphics if output wasn't suppressed by trailing semicolon
+        if result.result != "\0" {
+          items.push(json_output_item("graphics", svg, None));
+          // Check for non-graphics text mixed in
+          let cleaned = residual_text(&result.result);
+          if !cleaned.is_empty() && cleaned != "\0" {
+            items.push(json_output_item("text", &cleaned, None));
+          }
+        }
+      } else if result.result != "\0" {
+        items.push(json_output_item(
+          "text",
+          &result.result,
+          result.output_svg.as_deref(),
+        ));
+      }
+    }
+    Err(crate::InterpreterError::EmptyInput) => {
+      // Function definitions etc. produce no output
+    }
+    Err(e) => {
+      items.push(json_output_item("error", &format!("{e}"), None));
+    }
+  }
+  items
+}
+
+/// Try to detect whether `stmt` is a top-level `Manipulate[…]` call and
+/// build a JSON "manipulate" output item (spec + initial rendering).
+/// Returns `None` if the statement isn't a well-formed Manipulate.
+fn try_build_manipulate_item(stmt: &str) -> Option<String> {
+  // Re-interpret the statement so we get the evaluated (but held)
+  // Manipulate FunctionCall back as an Expr we can inspect. Manipulate
+  // is HoldAll-ish (see functions::graphics::manipulate_ast), so its body
+  // and variable symbols remain intact.
+  let expr = crate::interpret_to_expr(stmt).ok()?;
+  // A top-level Manipulate[…]/Animate[…], a standalone Control[…]/Animator[…],
+  // a ListAnimate[{…}], or a LocatorPane/ClickPane all render as an interactive
+  // control widget backed by a ManipulateSpec (Animate/Animator/ListAnimate
+  // additionally auto-play).
+  use crate::functions::graphics as g;
+  let spec = g::extract_manipulate_spec(&expr)
+    .or_else(|| g::extract_control_spec(&expr))
+    .or_else(|| g::extract_list_animate_spec(&expr))
+    .or_else(|| g::extract_animator_spec(&expr))
+    .or_else(|| g::extract_locator_pane_spec(&expr))
+    .or_else(|| g::extract_click_pane_spec(&expr))?;
+
+  // Produce an initial rendering by substituting initial values via Block.
+  let bindings = crate::functions::graphics::manipulate_initial_bindings(&spec);
+  let block_code = crate::functions::graphics::manipulate_block_code(
+    &spec.body_code,
+    &bindings,
+  );
+
+  let initial = match crate::interpret_with_stdout(&block_code) {
+    Ok(r) => r,
+    Err(_) => crate::InterpretResult {
+      stdout: String::new(),
+      result: String::new(),
+      expr: None,
+      graphics: None,
+      output_svg: None,
+      sound: None,
+      warnings: vec![],
+    },
+  };
+
+  let spec_json = crate::functions::graphics::manipulate_spec_to_json(&spec);
+
+  // Build initial-rendering JSON.
+  let mut initial_parts: Vec<String> = Vec::new();
+  if let Some(ref svg) = initial.graphics {
+    initial_parts.push(format!(r#""svg":"{}""#, json_escape(svg)));
+  }
+  let cleaned_text = residual_text(&initial.result);
+  if !cleaned_text.is_empty() && initial.graphics.is_none() {
+    initial_parts.push(format!(r#""text":"{}""#, json_escape(&cleaned_text)));
+    if let Some(ref output_svg) = initial.output_svg {
+      initial_parts.push(format!(r#""textSvg":"{}""#, json_escape(output_svg)));
+    }
+  }
+  // Render any extra display elements (e.g. a Checkbox grid) against the
+  // initial bindings so the widget is fully populated on first paint.
+  // Install the bindings as globals once so a large `data` matrix is parsed a
+  // single time rather than once per display.
+  if !spec.displays.is_empty() {
+    let trees: Vec<String> = crate::with_scoped_globals(&bindings, || {
+      spec
+        .displays
+        .iter()
+        .map(|d| crate::functions::graphics::render_manipulate_display(d, &[]))
+        .collect()
+    });
+    initial_parts.push(format!(r#""displayTrees":[{}]"#, trees.join(",")));
+  }
+  let initial_json = format!("{{{}}}", initial_parts.join(","));
+
+  Some(format!(
+    r#"{{"type":"manipulate",{},"initial":{}}}"#,
+    spec_json, initial_json
+  ))
+}
+
+/// Evaluate a Manipulate body with a specific set of variable bindings
+/// and return a single JSON output item representing the result.
+///
+/// `body` must be the body expression in InputForm (as produced by
+/// `evaluate_all`'s manipulate item). `bindings_json` must be a JSON
+/// object mapping variable names to InputForm-serialized values, e.g.
+/// `{"a": "1.5", "b": "\"foo\""}`.
+///
+/// The result is a JSON object of the same shape as `initial` from
+/// the evaluate_all manipulate item: `{"svg": "...", "text": "..."}`.
+#[wasm_bindgen]
+pub fn evaluate_manipulate(body: &str, bindings_json: &str) -> String {
+  let bindings =
+    crate::functions::graphics::parse_manipulate_bindings(bindings_json);
+  let code = crate::functions::graphics::manipulate_block_code(body, &bindings);
+
+  let result = match crate::interpret_with_stdout(&code) {
+    Ok(r) => r,
+    Err(e) => {
+      return format!(r#"{{"error":"{}"}}"#, json_escape(&format!("{e}")));
+    }
+  };
+
+  let mut parts: Vec<String> = Vec::new();
+  if let Some(ref svg) = result.graphics {
+    parts.push(format!(r#""svg":"{}""#, json_escape(svg)));
+  }
+  let cleaned_text = residual_text(&result.result);
+  if !cleaned_text.is_empty() && result.graphics.is_none() {
+    parts.push(format!(r#""text":"{}""#, json_escape(&cleaned_text)));
+    if let Some(ref output_svg) = result.output_svg {
+      parts.push(format!(r#""textSvg":"{}""#, json_escape(output_svg)));
+    }
+  }
+  format!("{{{}}}", parts.join(","))
+}
+
+/// Evaluate each Manipulate control's `Enabled` condition against a binding
+/// set and return a JSON array of booleans (one per control, in order).
+///
+/// `conditions_json` is a JSON string array aligned with the control list;
+/// an empty string marks a control with no condition (always enabled).
+/// `bindings_json` is the same JSON object of variable bindings used by
+/// `evaluate_manipulate`. Used by the Playground to grey out controls that a
+/// `Enabled -> Dynamic[…]` option has switched off for the current state.
+#[wasm_bindgen]
+pub fn evaluate_manipulate_enabled(
+  conditions_json: &str,
+  bindings_json: &str,
+) -> String {
+  use crate::functions::graphics as g;
+  let bindings = g::parse_manipulate_bindings(bindings_json);
+  let conditions: Vec<Option<String>> =
+    g::parse_json_string_array(conditions_json)
+      .into_iter()
+      .map(|c| if c.is_empty() { None } else { Some(c) })
+      .collect();
+  let states = g::manipulate_enabled_states(&conditions, &bindings);
+  let parts: Vec<String> = states.iter().map(|b| b.to_string()).collect();
+  format!("[{}]", parts.join(","))
+}
+
+/// Render a Manipulate body, its extra display elements, and any pending
+/// interactive write-backs in one call. Used by widgets that have display
+/// elements (e.g. a `Checkbox` grid) that both read and rewrite shared
+/// state.
+///
+/// `displays_json` and `mutations_json` are JSON string arrays. Each
+/// mutation is an assignment (e.g. `data[[3, 5]] = 1`) applied before the
+/// re-render; the updated value of every mutated variable is returned under
+/// `state` so the frontend can keep its binding set in sync.
+///
+/// The result is `{"output":{svg|text|textSvg}, "displays":[<tree>…],
+/// "state":{name:value,…}}`.
+#[wasm_bindgen]
+pub fn evaluate_manipulate_full(
+  body: &str,
+  displays_json: &str,
+  bindings_json: &str,
+  mutations_json: &str,
+) -> String {
+  use crate::functions::graphics as g;
+  let bindings = g::parse_manipulate_bindings(bindings_json);
+  let displays = g::parse_json_string_array(displays_json);
+  let mutations = g::parse_json_string_array(mutations_json);
+  let mutated_vars = g::mutation_target_symbols(&mutations);
+
+  // Install the bindings as globals once — parsing a large `data` matrix a
+  // single time — then evaluate the write-backs, body, and displays against
+  // them without re-embedding (and re-parsing) that matrix every call.
+  let (output, trees, updated) = crate::with_scoped_globals(&bindings, || {
+    // Apply interactive write-backs to the installed globals.
+    for m in &mutations {
+      let _ = crate::interpret(m);
+    }
+    // Read back the mutated variables so the frontend can track them.
+    let read_back = |v: &String| {
+      crate::interpret_to_expr(v)
+        .ok()
+        .map(|e| (v.clone(), crate::syntax::expr_to_input_form(&e)))
+    };
+    let mut updated: Vec<(String, String)> =
+      mutated_vars.iter().filter_map(read_back).collect();
+    // A mutation need not be a plain assignment — a caption `Button[…]`
+    // sends its whole held action (e.g. `If[n == 1, n = 6, n--]`), whose
+    // target no assignment-shaped scan can name. Anything the action
+    // actually changed is caught here by comparing each binding against
+    // the value it was installed with.
+    for (name, before) in &bindings {
+      if updated.iter().any(|(n, _)| n == name) {
+        continue;
+      }
+      if let Some((_, after)) = read_back(name)
+        && after != *before
+      {
+        updated.push((name.clone(), after));
+      }
+    }
+
+    // Body output — the globals are in scope, so the body string carries no
+    // matrix literal.
+    let output = match crate::interpret_with_stdout(body) {
+      Ok(result) => {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ref svg) = result.graphics {
+          parts.push(format!(r#""svg":"{}""#, json_escape(svg)));
+        }
+        let cleaned_text = residual_text(&result.result);
+        if !cleaned_text.is_empty() && result.graphics.is_none() {
+          parts.push(format!(r#""text":"{}""#, json_escape(&cleaned_text)));
+          if let Some(ref output_svg) = result.output_svg {
+            parts.push(format!(r#""textSvg":"{}""#, json_escape(output_svg)));
+          }
+        }
+        format!("{{{}}}", parts.join(","))
+      }
+      Err(e) => format!(r#"{{"error":"{}"}}"#, json_escape(&format!("{e}"))),
+    };
+
+    // Displays render against the installed globals (empty local bindings).
+    let trees: Vec<String> = displays
+      .iter()
+      .map(|d| g::render_manipulate_display(d, &[]))
+      .collect();
+
+    (output, trees, updated)
+  });
+
+  // Report the updated state values so the frontend can track them.
+  let state_parts: Vec<String> = updated
+    .iter()
+    .map(|(name, value)| {
+      format!(r#""{}":"{}""#, json_escape(name), json_escape(value))
+    })
+    .collect();
+
+  format!(
+    r#"{{"output":{},"displays":[{}],"state":{{{}}}}}"#,
+    output,
+    trees.join(","),
+    state_parts.join(","),
+  )
+}
+
+/// Build a single JSON object string for an output item.
+fn json_output_item(kind: &str, content: &str, svg: Option<&str>) -> String {
+  let escaped_content = json_escape(content);
+  if let Some(svg_str) = svg {
+    let escaped_svg = json_escape(svg_str);
+    format!(
+      r#"{{"type":"{}","text":"{}","svg":"{}"}}"#,
+      kind, escaped_content, escaped_svg
+    )
+  } else if kind == "graphics" {
+    format!(r#"{{"type":"graphics","svg":"{}"}}"#, escaped_content)
+  } else {
+    format!(r#"{{"type":"{}","text":"{}"}}"#, kind, escaped_content)
+  }
+}
+
+/// Build a "sound" output item carrying base64-encoded audio data. The
+/// frontend turns the `audio` + `mime` fields into an `<audio controls>`
+/// data URI; `label` (the source file name, when present) is shown next to
+/// the player. An empty `audio` field means the data is unavailable (e.g. a
+/// local file the browser cannot read) — the player chrome is still shown.
+fn json_sound_item(audio: &crate::AudioOutput) -> String {
+  let mut fields = vec![
+    r#""type":"sound""#.to_string(),
+    format!(r#""audio":"{}""#, json_escape(&audio.base64)),
+    format!(r#""mime":"{}""#, json_escape(&audio.mime)),
+  ];
+  if let Some(ref label) = audio.label {
+    fields.push(format!(r#""label":"{}""#, json_escape(label)));
+  }
+  format!("{{{}}}", fields.join(","))
+}
+
+/// Escape a string for safe inclusion in JSON.
+fn json_escape(s: &str) -> String {
+  let mut out = String::with_capacity(s.len() + 16);
+  for ch in s.chars() {
+    match ch {
+      '"' => out.push_str(r#"\""#),
+      '\\' => out.push_str(r"\\"),
+      '\n' => out.push_str(r"\n"),
+      '\r' => out.push_str(r"\r"),
+      '\t' => out.push_str(r"\t"),
+      c if (c as u32) < 0x20 => {
+        out.push_str(&format!(r"\u{:04x}", c as u32));
+      }
+      c => out.push(c),
+    }
+  }
+  out
+}
+
+/// Evaluate, returning only the final expression result (no Print output).
+#[wasm_bindgen]
+pub fn evaluate_expr(input: &str) -> String {
+  match interpret(input) {
+    Ok(result) => {
+      if result == "\0" {
+        String::new()
+      } else {
+        result
+      }
+    }
+    Err(e) => format!("Error: {e}"),
+  }
+}

@@ -1,0 +1,7738 @@
+use super::*;
+
+mod connected_components {
+  use super::*;
+
+  #[test]
+  fn undirected_two_components() {
+    let result =
+      interpret("ConnectedComponents[Graph[{1  2, 2  3, 4  5}]]").unwrap();
+    assert_eq!(result, "{{1, 2, 3}, {4, 5}}");
+  }
+
+  #[test]
+  fn undirected_single_component() {
+    let result =
+      interpret("ConnectedComponents[Graph[{a  b, c  d, b  c}]]").unwrap();
+    assert_eq!(result, "{{a, b, c, d}}");
+  }
+
+  #[test]
+  fn directed_no_cycles() {
+    // Each vertex is its own SCC when there are no cycles
+    let result =
+      interpret("ConnectedComponents[Graph[{1 -> 2, 2 -> 3, 4 -> 5}]]")
+        .unwrap();
+    // Should have 5 singleton components
+    assert!(result.contains("{1}"));
+    assert!(result.contains("{2}"));
+    assert!(result.contains("{3}"));
+    assert!(result.contains("{4}"));
+    assert!(result.contains("{5}"));
+  }
+
+  #[test]
+  fn directed_cycle() {
+    let result =
+      interpret("ConnectedComponents[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]")
+        .unwrap();
+    // All three vertices form one SCC
+    assert!(
+      result.contains('1') && result.contains('2') && result.contains('3')
+    );
+    // Should be a single component
+    assert_eq!(result.matches('{').count(), 2); // outer { + one inner {
+  }
+
+  #[test]
+  fn directed_mixed() {
+    let result = interpret(
+      "ConnectedComponents[Graph[{1 -> 2, 2 -> 1, 3 -> 4, 4 -> 3, 1 -> 3}]]",
+    )
+    .unwrap();
+    // {1,2} and {3,4} are separate SCCs (1->3 doesn't create a cycle between them)
+    assert!(result.contains('1') && result.contains('2'));
+    assert!(result.contains('3') && result.contains('4'));
+  }
+
+  #[test]
+  fn complete_graph() {
+    let result = interpret("ConnectedComponents[CompleteGraph[4]]").unwrap();
+    assert_eq!(result, "{{1, 2, 3, 4}}");
+  }
+
+  #[test]
+  fn unevaluated_non_graph() {
+    assert_eq!(
+      interpret("ConnectedComponents[foo]").unwrap(),
+      "ConnectedComponents[foo]"
+    );
+  }
+
+  // wolframscript lists strongly connected components in reverse topological
+  // order (a sink component first), not sorted by size.
+  #[test]
+  fn scc_reverse_topological_order() {
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "{{3}, {2}, {1}}"
+    );
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1 -> 2, 3 -> 4}]]").unwrap(),
+      "{{2}, {1}, {4}, {3}}"
+    );
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1 -> 2, 3 -> 2, 4 -> 5}]]")
+        .unwrap(),
+      "{{2}, {1}, {3}, {5}, {4}}"
+    );
+    // A cyclic component keeps its natural vertex order and comes before the
+    // upstream singleton.
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 2}]]")
+        .unwrap(),
+      "{{2, 3, 4}, {1}}"
+    );
+  }
+
+  // Rule-form edges (a -> b) are directed even when the Graph is given with an
+  // explicit vertex list; the SCC of a 2-cycle must still be detected.
+  #[test]
+  fn explicit_vertices_rule_edges_are_directed() {
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1, 2, 3}, {1 -> 2, 2 -> 1}]]")
+        .unwrap(),
+      "{{1, 2}, {3}}"
+    );
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1, 2, 3}, {1 -> 2}]]").unwrap(),
+      "{{2}, {1}, {3}}"
+    );
+  }
+}
+
+mod connected_graph_q {
+  use super::*;
+
+  // A directed path is not strongly connected.
+  #[test]
+  fn directed_path_not_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "False"
+    );
+  }
+
+  // A directed cycle is strongly connected.
+  #[test]
+  fn directed_cycle_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn directed_bidirectional_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1 -> 2, 2 -> 1}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn undirected_path_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1 <-> 2, 2 <-> 3}]]").unwrap(),
+      "True"
+    );
+  }
+
+  // Two disconnected undirected components.
+  #[test]
+  fn undirected_two_components_not_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}]]").unwrap(),
+      "False"
+    );
+  }
+
+  // An isolated vertex makes the graph disconnected.
+  #[test]
+  fn isolated_vertex_not_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1, 2, 3}, {UndirectedEdge[1, 2]}]]")
+        .unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn complete_graph_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[CompleteGraph[4]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn single_vertex_connected() {
+    assert_eq!(
+      interpret("ConnectedGraphQ[Graph[{1}, {}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn empty_graph_connected() {
+    assert_eq!(interpret("ConnectedGraphQ[Graph[{}, {}]]").unwrap(), "True");
+  }
+
+  // Non-graph arguments yield False (not unevaluated).
+  #[test]
+  fn non_graph_is_false() {
+    assert_eq!(interpret("ConnectedGraphQ[5]").unwrap(), "False");
+    assert_eq!(interpret(r#"ConnectedGraphQ["hello"]"#).unwrap(), "False");
+  }
+}
+
+// WeaklyConnectedGraphQ ignores edge direction: True iff the underlying
+// undirected graph is connected.
+mod weakly_connected_graph_q {
+  use super::*;
+
+  // A directed path is weakly connected (undirected version is a path).
+  #[test]
+  fn directed_path_weakly_connected() {
+    assert_eq!(
+      interpret("WeaklyConnectedGraphQ[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "True"
+    );
+  }
+
+  // Two separate directed edges are not weakly connected.
+  #[test]
+  fn two_components_not_weakly_connected() {
+    assert_eq!(
+      interpret("WeaklyConnectedGraphQ[Graph[{1 -> 2, 3 -> 4}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("WeaklyConnectedGraphQ[Graph[{1 -> 2, 2 -> 3, 4 -> 5}]]")
+        .unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn directed_bidirectional_weakly_connected() {
+    assert_eq!(
+      interpret("WeaklyConnectedGraphQ[Graph[{1 -> 2, 2 -> 1}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn undirected_and_complete_weakly_connected() {
+    assert_eq!(
+      interpret("WeaklyConnectedGraphQ[Graph[{1 <-> 2, 2 <-> 3}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("WeaklyConnectedGraphQ[CompleteGraph[3]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn non_graph_is_false() {
+    assert_eq!(interpret("WeaklyConnectedGraphQ[5]").unwrap(), "False");
+  }
+}
+
+mod complete_graph {
+  use super::*;
+
+  #[test]
+  fn vertices() {
+    assert_eq!(
+      interpret("VertexList[CompleteGraph[4]]").unwrap(),
+      "{1, 2, 3, 4}"
+    );
+  }
+
+  #[test]
+  fn edge_count_3() {
+    assert_eq!(
+      interpret("Length[EdgeList[CompleteGraph[3]]]").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn edge_count_4() {
+    assert_eq!(
+      interpret("Length[EdgeList[CompleteGraph[4]]]").unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn adjacency_matrix() {
+    assert_eq!(
+      interpret("AdjacencyMatrix[CompleteGraph[3]]").unwrap(),
+      "{{0, 1, 1}, {1, 0, 1}, {1, 1, 0}}"
+    );
+  }
+
+  // CompleteGraph[{n1, ..., nk}] is the complete k-partite graph: edges only
+  // between vertices in different groups.
+  #[test]
+  fn multipartite_bipartite() {
+    assert_eq!(
+      interpret("EdgeList[CompleteGraph[{2, 3}]]").unwrap(),
+      "{1 \u{f3d4} 3, 1 \u{f3d4} 4, 1 \u{f3d4} 5, 2 \u{f3d4} 3, 2 \u{f3d4} 4, 2 \u{f3d4} 5}"
+    );
+    assert_eq!(
+      interpret("VertexCount[CompleteGraph[{2, 3}]]").unwrap(),
+      "5"
+    );
+    // K_{2,3} is bipartite by construction.
+    assert_eq!(
+      interpret("BipartiteGraphQ[CompleteGraph[{2, 3}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn multipartite_three_parts() {
+    assert_eq!(
+      interpret("EdgeList[CompleteGraph[{2, 2, 1}]]").unwrap(),
+      "{1 \u{f3d4} 3, 1 \u{f3d4} 4, 1 \u{f3d4} 5, 2 \u{f3d4} 3, 2 \u{f3d4} 4, \
+       2 \u{f3d4} 5, 3 \u{f3d4} 5, 4 \u{f3d4} 5}"
+    );
+  }
+
+  // A single-element list {n} is the ordinary complete graph K_n.
+  #[test]
+  fn single_part_is_complete_graph() {
+    assert_eq!(
+      interpret("EdgeList[CompleteGraph[{3}]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 3}"
+    );
+    assert_eq!(interpret("EdgeList[CompleteGraph[{1}]]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn with_vertex_size_option() {
+    // CompleteGraph now accepts trailing Rule options.
+    assert_eq!(
+      interpret("Head[CompleteGraph[4, VertexSize -> Small]]").unwrap(),
+      "Graph"
+    );
+    assert_eq!(
+      interpret("Length[VertexList[CompleteGraph[4, VertexSize -> Small]]]")
+        .unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret("Length[EdgeList[CompleteGraph[4, VertexSize -> Small]]]")
+        .unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn cycle_graph_with_options() {
+    assert_eq!(
+      interpret("Head[CycleGraph[5, VertexSize -> {1 -> Medium}]]").unwrap(),
+      "Graph"
+    );
+    assert_eq!(
+      interpret("Length[EdgeList[CycleGraph[5, VertexSize -> {1 -> Medium}]]]")
+        .unwrap(),
+      "5"
+    );
+  }
+}
+
+mod adjacency_matrix {
+  use super::*;
+
+  #[test]
+  fn directed_cycle() {
+    assert_eq!(
+      interpret("AdjacencyMatrix[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "{{0, 1, 0}, {0, 0, 1}, {1, 0, 0}}"
+    );
+  }
+
+  #[test]
+  fn directed_chain() {
+    assert_eq!(
+      interpret("AdjacencyMatrix[Graph[{a -> b, b -> c}]]").unwrap(),
+      "{{0, 1, 0}, {0, 0, 1}, {0, 0, 0}}"
+    );
+  }
+
+  #[test]
+  fn single_edge() {
+    assert_eq!(
+      interpret("AdjacencyMatrix[Graph[{1 -> 2}]]").unwrap(),
+      "{{0, 1}, {0, 0}}"
+    );
+  }
+
+  #[test]
+  fn self_loop() {
+    assert_eq!(
+      interpret("AdjacencyMatrix[Graph[{1 -> 1, 1 -> 2}]]").unwrap(),
+      "{{1, 1}, {0, 0}}"
+    );
+  }
+}
+
+mod incidence_matrix {
+  use super::*;
+
+  #[test]
+  fn undirected_complete() {
+    // Rows = vertices, columns = edges; both endpoints get +1.
+    assert_eq!(
+      interpret("IncidenceMatrix[CompleteGraph[3]]").unwrap(),
+      "{{1, 1, 0}, {1, 0, 1}, {0, 1, 1}}"
+    );
+  }
+
+  #[test]
+  fn undirected_path() {
+    assert_eq!(
+      // Normal[...] makes the comparison representation-agnostic: Woxi already
+      // returns a dense matrix, and wolframscript's SparseArray collapses to
+      // the same dense list, so the conformance check holds for both.
+      interpret("Normal[IncidenceMatrix[PathGraph[{1, 2, 3, 4}]]]").unwrap(),
+      "{{1, 0, 0}, {1, 1, 0}, {0, 1, 1}, {0, 0, 1}}"
+    );
+  }
+
+  #[test]
+  fn directed_cycle() {
+    // Directed edge: source -1, target +1.
+    assert_eq!(
+      interpret(
+        "Normal[IncidenceMatrix[Graph[{1, 2, 3}, {1 -> 2, 2 -> 3, 3 -> 1}]]]"
+      )
+      .unwrap(),
+      "{{-1, 0, 1}, {1, -1, 0}, {0, 1, -1}}"
+    );
+  }
+
+  #[test]
+  fn single_directed_edge() {
+    assert_eq!(
+      interpret("Normal[IncidenceMatrix[Graph[{1, 2, 3}, {1 -> 2}]]]").unwrap(),
+      "{{-1}, {1}, {0}}"
+    );
+  }
+
+  #[test]
+  fn directed_self_loop() {
+    // A directed self-loop yields -2 (Wolfram convention).
+    assert_eq!(
+      interpret("Normal[IncidenceMatrix[Graph[{1, 2}, {1 -> 1, 1 -> 2}]]]")
+        .unwrap(),
+      "{{-2, -1}, {0, 1}}"
+    );
+  }
+
+  #[test]
+  fn undirected_self_loop() {
+    // An undirected self-loop yields 2.
+    assert_eq!(
+      interpret("Normal[IncidenceMatrix[Graph[{1, 2}, {1 <-> 1, 1 <-> 2}]]]")
+        .unwrap(),
+      "{{2, 1}, {0, 1}}"
+    );
+  }
+}
+
+mod kirchhoff_matrix {
+  use super::*;
+
+  #[test]
+  fn complete_graph() {
+    // L = D - A; the complete graph K_n has diagonal n-1 and -1 off-diagonal.
+    assert_eq!(
+      interpret("KirchhoffMatrix[CompleteGraph[3]]").unwrap(),
+      "{{2, -1, -1}, {-1, 2, -1}, {-1, -1, 2}}"
+    );
+    assert_eq!(
+      interpret("KirchhoffMatrix[CompleteGraph[4]]").unwrap(),
+      "{{3, -1, -1, -1}, {-1, 3, -1, -1}, \
+       {-1, -1, 3, -1}, {-1, -1, -1, 3}}"
+    );
+  }
+
+  #[test]
+  fn undirected_path() {
+    assert_eq!(
+      // Normal[...] reconciles Woxi's dense matrix with wolframscript's
+      // SparseArray result without changing the values.
+      interpret(
+        "Normal[KirchhoffMatrix[Graph[{1, 2, 3, 4}, {1 <-> 2, 2 <-> 3, 3 <-> 4}]]]"
+      )
+      .unwrap(),
+      "{{1, -1, 0, 0}, {-1, 2, -1, 0}, {0, -1, 2, -1}, {0, 0, -1, 1}}"
+    );
+  }
+
+  #[test]
+  fn directed_chain() {
+    // Directed edges count toward both the source's out-degree and the
+    // target's in-degree on the diagonal, with -A on the off-diagonal.
+    assert_eq!(
+      interpret("Normal[KirchhoffMatrix[Graph[{1, 2, 3}, {1 -> 2, 2 -> 3}]]]")
+        .unwrap(),
+      "{{1, -1, 0}, {0, 2, -1}, {0, 0, 1}}"
+    );
+  }
+
+  #[test]
+  fn isolated_vertices() {
+    assert_eq!(
+      interpret("Normal[KirchhoffMatrix[Graph[{1, 2, 3, 4}, {1 <-> 2}]]]")
+        .unwrap(),
+      "{{1, -1, 0, 0}, {-1, 1, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}}"
+    );
+  }
+
+  #[test]
+  fn directed_self_loop_ignored() {
+    // Self-loops contribute nothing to the Kirchhoff matrix.
+    assert_eq!(
+      interpret("Normal[KirchhoffMatrix[Graph[{1, 2}, {1 -> 1, 1 -> 2}]]]")
+        .unwrap(),
+      "{{1, -1}, {0, 1}}"
+    );
+  }
+
+  #[test]
+  fn undirected_self_loop_ignored() {
+    assert_eq!(
+      interpret("Normal[KirchhoffMatrix[Graph[{1, 2}, {1 <-> 1, 1 <-> 2}]]]")
+        .unwrap(),
+      "{{1, -1}, {-1, 1}}"
+    );
+  }
+
+  #[test]
+  fn parallel_edges_collapsed() {
+    // Parallel edges collapse to a simple graph for the Kirchhoff matrix.
+    assert_eq!(
+      interpret(
+        "Normal[KirchhoffMatrix[Graph[{1, 2, 3}, {1 <-> 2, 1 <-> 2, 2 <-> 3}]]]"
+      )
+      .unwrap(),
+      "{{1, -1, 0}, {-1, 2, -1}, {0, -1, 1}}"
+    );
+  }
+
+  #[test]
+  fn non_graph_stays_symbolic() {
+    assert_eq!(
+      interpret("KirchhoffMatrix[5]").unwrap(),
+      "KirchhoffMatrix[5]"
+    );
+  }
+}
+
+mod adjacency_graph_from_matrix {
+  use super::*;
+
+  #[test]
+  fn undirected_symmetric() {
+    assert_eq!(
+      interpret("EdgeList[AdjacencyGraph[{{0, 1, 1}, {1, 0, 0}, {1, 0, 0}}]]")
+        .unwrap(),
+      "{1  2, 1  3}"
+    );
+    assert_eq!(
+      interpret(
+        "VertexList[AdjacencyGraph[{{0, 1, 1}, {1, 0, 0}, {1, 0, 0}}]]"
+      )
+      .unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn directed_asymmetric() {
+    assert_eq!(
+      interpret("EdgeList[AdjacencyGraph[{{0, 1, 0}, {0, 0, 1}, {1, 0, 0}}]]")
+        .unwrap(),
+      "{1  2, 2  3, 3  1}"
+    );
+    assert_eq!(
+      interpret(
+        "VertexList[AdjacencyGraph[{{0, 1, 0}, {0, 0, 1}, {1, 0, 0}}]]"
+      )
+      .unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn with_named_vertices() {
+    let result = interpret(
+      "EdgeList[AdjacencyGraph[{\"a\", \"b\", \"c\"}, {{0, 1, 0}, {1, 0, 1}, {0, 1, 0}}]]",
+    )
+    .unwrap();
+    assert!(result.contains("a  b"));
+    assert!(result.contains("b  c"));
+  }
+}
+
+/// Regression: `GraphPlot[m]` takes a bare adjacency matrix directly
+/// (documented for GraphPlot, unlike plain `Graph[m]` which needs
+/// `AdjacencyGraph[m]`). It used to stay unevaluated because the matrix
+/// was forwarded straight to `Graph[m]`, which only understands an edge
+/// list or an already-split `{vertices}, {edges}` pair.
+mod graph_plot_from_matrix {
+  use super::*;
+
+  #[test]
+  fn renders_graphics() {
+    assert_eq!(
+      interpret("Head[GraphPlot[{{0, 1, 1}, {1, 0, 0}, {1, 0, 0}}]]").unwrap(),
+      "Graphics"
+    );
+  }
+
+  #[test]
+  fn undirected_symmetric_vertex_and_edge_count() {
+    let svg = interpret(
+      "ExportString[GraphPlot[{{0, 1, 1}, {1, 0, 0}, {1, 0, 0}}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("<ellipse").count(), 3, "SVG: {svg}");
+    assert_eq!(svg.matches("<polyline").count(), 2, "SVG: {svg}");
+  }
+
+  #[test]
+  fn directed_asymmetric_vertex_and_edge_count() {
+    let svg = interpret(
+      "ExportString[GraphPlot[{{0, 1, 0}, {0, 0, 1}, {1, 0, 0}}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("<ellipse").count(), 3, "SVG: {svg}");
+    assert_eq!(svg.matches("<polyline").count(), 3, "SVG: {svg}");
+  }
+
+  /// GraphPlot's own options (e.g. SelfLoopStyle, VertexLabeling,
+  /// DirectedEdges) still apply when the argument is a matrix rather than
+  /// an edge list.
+  #[test]
+  fn accepts_graphplot_options() {
+    assert_eq!(
+      interpret(
+        "Head[GraphPlot[{{0, 1, 0}, {1, 0, 1}, {0, 1, 0}}, SelfLoopStyle -> True, VertexLabeling -> True, DirectedEdges -> True]]"
+      )
+      .unwrap(),
+      "Graphics"
+    );
+  }
+
+  /// AdjacencyGraph itself must keep working after the shared matrix
+  /// conversion was factored out for reuse by GraphPlot.
+  #[test]
+  fn adjacency_graph_still_works() {
+    assert_eq!(
+      interpret("EdgeList[AdjacencyGraph[{{0, 1, 0}, {0, 0, 1}, {1, 0, 0}}]]")
+        .unwrap(),
+      "{1  2, 2  3, 3  1}"
+    );
+  }
+}
+
+mod path_graph {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret("VertexList[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{1, 2, 3, 4}"
+    );
+    assert_eq!(
+      interpret("EdgeList[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{1  2, 2  3, 3  4}"
+    );
+  }
+
+  #[test]
+  fn with_symbols() {
+    assert_eq!(
+      interpret("VertexList[PathGraph[{a, b, c}]]").unwrap(),
+      "{a, b, c}"
+    );
+    assert_eq!(
+      interpret("EdgeList[PathGraph[{a, b, c}]]").unwrap(),
+      "{a  b, b  c}"
+    );
+  }
+}
+
+mod vertex_count {
+  use super::*;
+
+  #[test]
+  fn complete_graph() {
+    assert_eq!(interpret("VertexCount[CompleteGraph[5]]").unwrap(), "5");
+  }
+
+  #[test]
+  fn path_graph() {
+    assert_eq!(interpret("VertexCount[PathGraph[{1, 2, 3}]]").unwrap(), "3");
+  }
+
+  // VertexCount[graph, patt] counts the vertices matching the pattern.
+  #[test]
+  fn pattern_form() {
+    assert_eq!(interpret("VertexCount[CompleteGraph[5], _]").unwrap(), "5");
+    assert_eq!(
+      interpret("VertexCount[CompleteGraph[5], _?EvenQ]").unwrap(),
+      "2"
+    );
+  }
+}
+
+// VertexList[graph, patt] / EdgeList[graph, patt] keep the matching elements.
+mod vertex_edge_list_pattern {
+  use super::*;
+
+  #[test]
+  fn vertex_list_pattern() {
+    assert_eq!(
+      interpret("VertexList[CompleteGraph[5], _?OddQ]").unwrap(),
+      "{1, 3, 5}"
+    );
+    // An integer is a literal-value pattern, not a count.
+    assert_eq!(
+      interpret("VertexList[Graph[{1 -> 2, 2 -> 3, 1 <-> 3}], 2]").unwrap(),
+      "{2}"
+    );
+  }
+
+  #[test]
+  fn edge_list_pattern() {
+    let g = "Graph[{1 -> 2, 2 -> 3, 1 <-> 3}]";
+    assert_eq!(
+      interpret(&format!("Length[EdgeList[{g}, _DirectedEdge]]")).unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret(&format!("Length[EdgeList[{g}, _UndirectedEdge]]")).unwrap(),
+      "1"
+    );
+  }
+}
+
+mod edge_count {
+  use super::*;
+
+  #[test]
+  fn complete_graph() {
+    assert_eq!(interpret("EdgeCount[CompleteGraph[5]]").unwrap(), "10");
+  }
+
+  #[test]
+  fn path_graph() {
+    assert_eq!(
+      interpret("EdgeCount[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "3"
+    );
+  }
+
+  // EdgeCount[graph, patt] counts the edges matching the pattern. A blank
+  // matches every edge; a bare head (UndirectedEdge) matches none.
+  #[test]
+  fn pattern_blank_and_bare_head() {
+    assert_eq!(interpret("EdgeCount[CompleteGraph[5], _]").unwrap(), "10");
+    assert_eq!(
+      interpret("EdgeCount[CompleteGraph[5], UndirectedEdge]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("EdgeCount[CompleteGraph[5], _UndirectedEdge]").unwrap(),
+      "10"
+    );
+  }
+
+  // A mixed graph distinguishes directed and undirected edges by pattern.
+  #[test]
+  fn pattern_mixed_graph() {
+    let g = "Graph[{1 -> 2, 2 -> 3, 1 <-> 3}]";
+    assert_eq!(interpret(&format!("EdgeCount[{g}, _]")).unwrap(), "3");
+    assert_eq!(
+      interpret(&format!("EdgeCount[{g}, _DirectedEdge]")).unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret(&format!("EdgeCount[{g}, _UndirectedEdge]")).unwrap(),
+      "1"
+    );
+  }
+}
+
+mod vertex_degree {
+  use super::*;
+
+  #[test]
+  fn all_degrees() {
+    assert_eq!(
+      interpret("VertexDegree[CompleteGraph[4]]").unwrap(),
+      "{3, 3, 3, 3}"
+    );
+  }
+
+  #[test]
+  fn single_vertex() {
+    assert_eq!(interpret("VertexDegree[CompleteGraph[5], 1]").unwrap(), "4");
+  }
+
+  #[test]
+  fn path_graph_degrees() {
+    assert_eq!(
+      interpret("VertexDegree[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{1, 2, 2, 1}"
+    );
+  }
+}
+
+mod graph_embedding {
+  use super::*;
+
+  #[test]
+  fn complete_graph_3() {
+    assert_eq!(
+      interpret("GraphEmbedding[CompleteGraph[3]]").unwrap(),
+      "{{-0.8660254037844388, -0.5}, {0.8660254037844384, -0.5}, {0., 1.}}"
+    );
+  }
+
+  #[test]
+  fn complete_graph_4() {
+    assert_eq!(
+      interpret("GraphEmbedding[CompleteGraph[4]]").unwrap(),
+      "{{-1., 0.}, {0., -1.}, {1., 0.}, {0., 1.}}"
+    );
+  }
+
+  #[test]
+  fn directed_graph() {
+    assert_eq!(
+      interpret("GraphEmbedding[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "{{-0.8660254037844388, -0.5}, {0.8660254037844384, -0.5}, {0., 1.}}"
+    );
+  }
+
+  #[test]
+  fn single_edge() {
+    assert_eq!(
+      interpret("GraphEmbedding[Graph[{1 -> 2}]]").unwrap(),
+      "{{0., -1.}, {0., 1.}}"
+    );
+  }
+
+  #[test]
+  fn path_graph() {
+    assert_eq!(
+      interpret("GraphEmbedding[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{{-1., 0.}, {0., -1.}, {1., 0.}, {0., 1.}}"
+    );
+  }
+
+  #[test]
+  fn non_graph_unevaluated() {
+    assert_eq!(
+      interpret("GraphEmbedding[42]").unwrap(),
+      "GraphEmbedding[42]"
+    );
+  }
+
+  #[test]
+  fn with_method_argument() {
+    // With explicit "CircularEmbedding" method, same result
+    assert_eq!(
+      interpret("GraphEmbedding[CompleteGraph[3], \"CircularEmbedding\"]")
+        .unwrap(),
+      "{{-0.8660254037844388, -0.5}, {0.8660254037844384, -0.5}, {0., 1.}}"
+    );
+  }
+
+  #[test]
+  fn length_matches_vertex_count() {
+    assert_eq!(
+      interpret("Length[GraphEmbedding[CompleteGraph[5]]]").unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn each_coordinate_is_pair() {
+    assert_eq!(
+      interpret("Length[GraphEmbedding[CompleteGraph[3]][[1]]]").unwrap(),
+      "2"
+    );
+  }
+}
+
+mod net_graph {
+  use super::*;
+
+  #[test]
+  fn unevaluated() {
+    assert_eq!(
+      interpret("NetGraph[{1, 2}, {1 -> 2}]").unwrap(),
+      "NetGraph[{1, 2}, {1 -> 2}]"
+    );
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(
+      interpret("Head[NetGraph[{1, 2}, {1 -> 2}]]").unwrap(),
+      "NetGraph"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[NetGraph]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+}
+
+mod find_maximum_flow {
+  use super::*;
+
+  #[test]
+  fn simple_two_paths() {
+    assert_eq!(
+      interpret("FindMaximumFlow[Graph[{1 -> 2, 2 -> 3, 1 -> 3}], 1, 3]")
+        .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn linear_graph() {
+    assert_eq!(
+      interpret("FindMaximumFlow[Graph[{1 -> 2, 2 -> 3}], 1, 3]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn symbolic_vertices() {
+    assert_eq!(
+      interpret("FindMaximumFlow[Graph[{a -> b, b -> c, a -> c}], a, c]")
+        .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn no_path() {
+    assert_eq!(
+      interpret("FindMaximumFlow[Graph[{1 -> 2, 3 -> 4}], 1, 4]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn bottleneck() {
+    // 1->2, 1->3, 2->4, 3->4: two paths, each capacity 1, max flow = 2
+    assert_eq!(
+      interpret(
+        "FindMaximumFlow[Graph[{1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4}], 1, 4]"
+      )
+      .unwrap(),
+      "2"
+    );
+  }
+}
+
+mod voronoi_mesh {
+  use super::*;
+
+  #[test]
+  fn unevaluated_non_list() {
+    assert_eq!(interpret("VoronoiMesh[x]").unwrap(), "VoronoiMesh[x]");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[VoronoiMesh]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn single_point_returns_empty_region() {
+    assert_eq!(
+      interpret("VoronoiMesh[{{0, 0}}]").unwrap(),
+      "EmptyRegion[2]"
+    );
+  }
+
+  #[test]
+  fn zero_points_returns_unevaluated() {
+    assert_eq!(interpret("VoronoiMesh[{}]").unwrap(), "VoronoiMesh[{}]");
+  }
+
+  #[test]
+  fn two_points_produces_mesh_region() {
+    let result = interpret("VoronoiMesh[{{0, 0}, {1, 0}}]").unwrap();
+    assert_eq!(result, "-Graphics-", "Got: {result}");
+  }
+
+  #[test]
+  fn three_points_produces_mesh_region() {
+    let result = interpret("VoronoiMesh[{{0, 0}, {1, 0}, {0, 1}}]").unwrap();
+    assert_eq!(result, "-Graphics-", "Got: {result}");
+  }
+
+  #[test]
+  fn five_points_produces_mesh_region() {
+    let result =
+      interpret("VoronoiMesh[{{0, 0}, {1, 0}, {0, 1}, {1, 1}, {0.5, 0.5}}]")
+        .unwrap();
+    assert_eq!(result, "-Graphics-", "Got: {result}");
+  }
+
+  #[test]
+  fn collinear_points_produces_mesh_region() {
+    let result = interpret("VoronoiMesh[{{0, 0}, {1, 0}, {2, 0}}]").unwrap();
+    assert_eq!(result, "-Graphics-", "Got: {result}");
+  }
+
+  #[test]
+  fn result_is_mesh_region() {
+    assert_eq!(
+      interpret("Head[VoronoiMesh[{{0, 0}, {1, 0}, {0, 1}}]]").unwrap(),
+      "MeshRegion"
+    );
+  }
+
+  #[test]
+  fn non_numeric_returns_empty_region() {
+    assert_eq!(
+      interpret("VoronoiMesh[{{a, b}, {c, d}}]").unwrap(),
+      "EmptyRegion[2]"
+    );
+  }
+
+  #[test]
+  fn svg_export() {
+    let result = interpret(
+      "ExportString[VoronoiMesh[{{0, 0}, {1, 0}, {0, 1}, {1, 1}, {0.5, 0.5}}], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains("<svg"));
+    assert!(result.contains("<polygon"));
+  }
+
+  #[test]
+  fn symmetric_square() {
+    // 4 corners of unit square should produce 4 cells in a MeshRegion
+    let result =
+      interpret("VoronoiMesh[{{0, 0}, {1, 0}, {0, 1}, {1, 1}}]").unwrap();
+    assert_eq!(result, "-Graphics-", "Got: {result}");
+  }
+
+  #[test]
+  fn show_overlay_with_points() {
+    // Show[VoronoiMesh[pts], Graphics[{Point[pts]}]] should render both
+    let result = interpret(
+      "ExportString[Show[VoronoiMesh[{{0,0},{1,0},{0,1},{1,1}}], Graphics[{Point[{{0,0},{1,0},{0,1},{1,1}}]}]], \"SVG\"]"
+    ).unwrap();
+    assert!(
+      result.contains("<polygon"),
+      "Should contain Voronoi polygons"
+    );
+    assert!(result.contains("<circle"), "Should contain overlay points");
+  }
+}
+
+mod expression_graph {
+  use super::*;
+
+  #[test]
+  fn single_atom() {
+    assert_eq!(interpret("VertexList[ExpressionGraph[x]]").unwrap(), "{1}");
+    assert_eq!(interpret("EdgeList[ExpressionGraph[x]]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn simple_function() {
+    assert_eq!(
+      interpret("EdgeList[ExpressionGraph[f[x, y]]]").unwrap(),
+      "{1  2, 1  3}"
+    );
+  }
+
+  #[test]
+  fn nested_function() {
+    assert_eq!(
+      interpret("EdgeList[ExpressionGraph[f[x, g[y, z]]]]").unwrap(),
+      "{1  2, 1  3, 3  4, 3  5}"
+    );
+  }
+
+  #[test]
+  fn plus_times() {
+    assert_eq!(
+      interpret("VertexList[ExpressionGraph[a + b*c]]").unwrap(),
+      "{1, 2, 3, 4, 5}"
+    );
+    assert_eq!(
+      interpret("EdgeList[ExpressionGraph[a + b*c]]").unwrap(),
+      "{1  2, 1  3, 3  4, 3  5}"
+    );
+  }
+
+  #[test]
+  fn list_expression() {
+    assert_eq!(
+      interpret("EdgeList[ExpressionGraph[{a, b, c}]]").unwrap(),
+      "{1  2, 1  3, 1  4}"
+    );
+  }
+
+  #[test]
+  fn vertex_count() {
+    assert_eq!(
+      interpret("VertexCount[ExpressionGraph[a + b^2 + c^3 + d]]").unwrap(),
+      "9"
+    );
+  }
+}
+
+mod graph_rendering {
+  use super::*;
+
+  #[test]
+  fn undirected_graph_renders() {
+    // Graph summarises as `<vertex_count>, <edge_count>`.
+    assert_eq!(
+      interpret("Graph[{1  2, 2  3, 3  1}]").unwrap(),
+      "Graph[<3>, <3>]"
+    );
+  }
+
+  #[test]
+  fn directed_graph_renders() {
+    assert_eq!(
+      interpret("Graph[{1  2, 2  3, 3  1}]").unwrap(),
+      "Graph[<3>, <3>]"
+    );
+  }
+
+  #[test]
+  fn graph_with_vertex_style() {
+    let result = interpret(
+      "ExportString[Graph[{1  2, 2  3, 3  1}, VertexStyle -> Orange], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains("rgb(255,128,0)"));
+  }
+
+  #[test]
+  fn graph_with_edge_style() {
+    let result = interpret(
+      "ExportString[Graph[{1  2, 2  3}, EdgeStyle -> Red], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(result.contains("rgb(255,0,0)"));
+  }
+
+  #[test]
+  fn graph_with_vertex_labels() {
+    let result = interpret(
+      "ExportString[Graph[{1  2, 2  3}, VertexLabels -> \"Name\"], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(result.contains(">1</text>"));
+    assert!(result.contains(">2</text>"));
+    assert!(result.contains(">3</text>"));
+  }
+
+  #[test]
+  fn graph_with_labeled_edge() {
+    let result = interpret(
+      "ExportString[Graph[{1  2, Labeled[2  3, \"hello\"]}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(result.contains(">hello</text>"));
+  }
+
+  #[test]
+  fn graph_labeled_edge_label_is_black() {
+    // Regression: edge labels previously inherited the edge's grey stroke
+    // color instead of being rendered in black.
+    let result = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, Labeled[3 <-> 1, \"hello\"]}, VertexLabels -> \"Name\"], \"SVG\"]"
+    ).unwrap();
+    let hello_tag = result
+      .lines()
+      .find(|l| l.contains(">hello</text>"))
+      .expect("edge label should be rendered");
+    assert!(
+      hello_tag.contains("fill=\"rgb(0,0,0)\""),
+      "edge label should be black, got: {hello_tag}"
+    );
+  }
+
+  #[test]
+  fn graph_with_diamond_shape() {
+    let result = interpret(
+      "ExportString[Graph[{1  2}, VertexShapeFunction -> \"Diamond\"], \"SVG\"]"
+    ).unwrap();
+    // Diamond is rendered as polygon with 4 points
+    assert!(result.contains("<polygon"));
+  }
+
+  #[test]
+  fn graph_with_directive_vertex_style() {
+    let result = interpret(
+      "ExportString[Graph[{1  2}, VertexStyle -> Directive[Orange, EdgeForm[Orange]]], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains("rgb(255,128,0)"));
+  }
+
+  #[test]
+  fn graph_internal_edge_encoding_undirected_side() {
+    // A `Graph` restored via `Uncompress[Compress[…]]` (a Demonstration
+    // embedding a pre-built graph) encodes its edges as
+    // `{directedPairs, undirectedPairs}` — 1-based index pairs into the
+    // vertex list, `Null` for whichever side is empty — rather than the
+    // public `UndirectedEdge`/`DirectedEdge` list a typed `Graph[…]` call
+    // uses. This must normalize to real edges instead of rendering three
+    // disconnected vertices.
+    let result = interpret(
+      "ExportString[Graph[{1, 2, 3}, {Null, {{1, 2}, {2, 3}}}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(result.matches("<ellipse").count(), 3);
+    assert_eq!(result.matches("<polyline").count(), 2);
+    // Undirected: no arrowhead polygons.
+    assert_eq!(result.matches("<polygon").count(), 0);
+  }
+
+  #[test]
+  fn graph_internal_edge_encoding_directed_side() {
+    let result = interpret(
+      "ExportString[Graph[{1, 2, 3}, {{{1, 2}, {2, 3}}, Null}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(result.matches("<ellipse").count(), 3);
+    // Directed: one arrowhead polygon per edge.
+    assert_eq!(result.matches("<polygon").count(), 2);
+  }
+
+  // `EdgeList` (and other functions that inspect a Graph's raw arguments
+  // directly, rather than going through `graph_ast`'s rendering path) must
+  // normalize the internal index-pair encoding too — not just Graph[…]'s
+  // own SVG export. Before this, `EdgeList` on such a Graph returned the
+  // `{directedPairs, undirectedPairs}` literal itself instead of edges.
+  #[test]
+  fn edge_list_normalizes_internal_index_pair_encoding() {
+    assert_eq!(
+      interpret("EdgeList[Graph[{1, 2, 3}, {Null, {{1, 2}, {2, 3}}}]]")
+        .unwrap(),
+      "{1 \u{f3d4} 2, 2 \u{f3d4} 3}"
+    );
+  }
+
+  // A `NetworkGraphics` box (cached, e.g., when a Demonstration pastes
+  // `GraphData[…]`'s output literally instead of calling it live) stores a
+  // graph's edges as a `SparseArray` adjacency matrix in compressed-row
+  // form, not as an index-pair list or a plain edge list. `EdgeList` must
+  // decode that shape too, deduplicating the symmetric undirected matrix
+  // to one edge per pair.
+  #[test]
+  fn edge_list_normalizes_sparse_array_adjacency_undirected() {
+    // Vertices 1-4 with a triangle on {1, 2, 3} and 4 left isolated:
+    // row 1 -> cols {2, 3}, row 2 -> cols {1, 3}, row 3 -> cols {1, 2},
+    // row 4 -> none.
+    let result = interpret(
+      "EdgeList[Graph[{1, 2, 3, 4}, {Null, \
+       SparseArray[Automatic, {4, 4}, 0, \
+       {1, {{0, 2, 4, 6, 6}, {{2}, {3}, {1}, {3}, {1}, {2}}}, Pattern}]}]]",
+    )
+    .unwrap();
+    assert_eq!(result, "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 3}");
+  }
+
+  #[test]
+  fn edge_list_normalizes_sparse_array_adjacency_directed() {
+    // A directed path 1 -> 2 -> 3: row 1 -> col {2}, row 2 -> col {3},
+    // row 3 -> none.
+    let result = interpret(
+      "EdgeList[Graph[{1, 2, 3}, \
+       {SparseArray[Automatic, {3, 3}, 0, \
+       {1, {{0, 1, 2, 2}, {{2}, {3}}}, Pattern}], Null}]]",
+    )
+    .unwrap();
+    assert_eq!(result, "{1 \u{f3d5} 2, 2 \u{f3d5} 3}");
+  }
+
+  // Reconstructing a plain Graph from such a cached literal's `EdgeList`
+  // (as a Demonstration's Manipulate body does — `Graph[EdgeList[g], …]` —
+  // to re-style it before display) must produce a graph the rest of the
+  // graph functions treat normally, not one still carrying the internal
+  // encoding.
+  #[test]
+  fn rebuilt_graph_from_sparse_array_edge_list_is_a_normal_graph() {
+    let result = interpret(
+      "g = Graph[{1, 2, 3, 4}, {Null, \
+       SparseArray[Automatic, {4, 4}, 0, \
+       {1, {{0, 2, 4, 6, 6}, {{2}, {3}, {1}, {3}, {1}, {2}}}, Pattern}]}]; \
+       EdgeCount[Graph[EdgeList[g]]]",
+    )
+    .unwrap();
+    assert_eq!(result, "3");
+  }
+
+  #[test]
+  fn graph_vertex_coordinates_normalizes_arbitrary_scale() {
+    // `VertexCoordinates` restored from a Demonstration's stored data can
+    // use any unit (sequence positions 1..118, say) — it must be rescaled
+    // to the layout heuristics' usual ~2-unit-wide extent rather than
+    // shrinking every vertex to an invisible dot at that scale.
+    let result = interpret(
+      "ExportString[Graph[{1, 2, 3}, {1 <-> 2, 2 <-> 3}, VertexCoordinates -> {{0, 0}, {50, 0}, {100, 0}}], \"SVG\"]"
+    ).unwrap();
+    let cx_values: Vec<f64> = result
+      .split("cx=\"")
+      .skip(1)
+      .filter_map(|s| s.split('"').next())
+      .filter_map(|s| s.parse().ok())
+      .collect();
+    assert_eq!(cx_values.len(), 3);
+    let spread = cx_values.iter().copied().fold(f64::MIN, f64::max)
+      - cx_values.iter().copied().fold(f64::MAX, f64::min);
+    assert!(
+      spread > 100.0,
+      "expected vertices spread across the canvas, got cx values: {cx_values:?}"
+    );
+  }
+
+  #[test]
+  fn graph_linear_embedding_draws_arcs_not_straight_lines() {
+    // `GraphLayout -> "LinearEmbedding"` places vertices on a line and
+    // draws every edge as a semicircular arc above it (Mathematica's
+    // standard way to lay out, e.g., an RNA sequence's base-pairing graph)
+    // rather than a straight chord.
+    let result = interpret(
+      "ExportString[Graph[{1, 2}, {1 <-> 2}, GraphLayout -> \"LinearEmbedding\"], \"SVG\"]"
+    ).unwrap();
+    let points_attr = result
+      .split("points=\"")
+      .nth(1)
+      .and_then(|s| s.split('"').next())
+      .expect("edge should render as a polyline");
+    let point_count = points_attr.split_whitespace().count();
+    assert!(
+      point_count > 2,
+      "LinearEmbedding edge should render as a curved arc (many points), got {point_count} points: {points_attr}"
+    );
+  }
+
+  #[test]
+  fn graph_linear_embedding_dense_vertices_do_not_overlap() {
+    // A dense `LinearEmbedding` (many vertices sharing a line, as an RNA
+    // sequence's positions do) must not let the vertex radius exceed half
+    // the spacing between neighbors — otherwise adjacent dots coalesce
+    // into a solid bar instead of staying individually visible.
+    let result = interpret(
+      "ExportString[Graph[Range[20], Table[i <-> (i + 1), {i, 19}], GraphLayout -> \"LinearEmbedding\"], \"SVG\"]"
+    ).unwrap();
+    let cx_values: Vec<f64> = result
+      .split("cx=\"")
+      .skip(1)
+      .filter_map(|s| s.split('"').next())
+      .filter_map(|s| s.parse().ok())
+      .collect();
+    assert_eq!(cx_values.len(), 20);
+    let rx: f64 = result
+      .split("rx=\"")
+      .nth(1)
+      .and_then(|s| s.split('"').next())
+      .unwrap()
+      .parse()
+      .unwrap();
+    let mut sorted = cx_values.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let min_gap = sorted
+      .windows(2)
+      .map(|w| w[1] - w[0])
+      .fold(f64::INFINITY, f64::min);
+    assert!(
+      rx * 2.0 < min_gap,
+      "vertices should not overlap: rx={rx}, min_gap={min_gap}"
+    );
+  }
+
+  #[test]
+  fn graph_vertex_shape_insets_nested_graph() {
+    // `VertexShape -> {v -> graphic, …}` replaces a vertex's default disk
+    // with a rendered picture — e.g. a Demonstration nesting one small
+    // `Graph[…]` inside each node of a larger one.
+    let result = interpret(
+      "ExportString[Graph[{1, 2}, {1 <-> 2}, VertexShape -> {1 -> Graph[{10, 20}, {10 <-> 20}]}], \"SVG\"]"
+    ).unwrap();
+    // Vertex 1 draws the nested graph's own two vertices instead of a
+    // single default disk; vertex 2 keeps its default disk.
+    assert_eq!(
+      result.matches("<ellipse").count(),
+      3,
+      "expected vertex 1's nested graph (2 vertices) plus vertex 2's default disk: {result}"
+    );
+  }
+
+  #[test]
+  fn graph_with_per_vertex_style_color() {
+    // Style[3, Red] inside the vertex list should color that vertex red
+    // without losing the edges that reference `3`.
+    let result = interpret(
+      "ExportString[Graph[{1, 2, Style[3, Red]}, {1 <-> 2, 2 <-> 3, 3 <-> 1}], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains("fill=\"rgb(255,0,0)\""));
+    // All three edges must still be drawn.
+    assert_eq!(result.matches("<polyline").count(), 3);
+  }
+
+  #[test]
+  fn graph_with_per_edge_style_color() {
+    // Style[3 <-> 1, Green] should color that single edge green.
+    let result = interpret(
+      "ExportString[Graph[{1, 2, 3}, {1 <-> 2, 2 <-> 3, Style[3 <-> 1, Green]}], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains("stroke=\"rgb(0,255,0)\""));
+    // All three edges must still be drawn.
+    assert_eq!(result.matches("<polyline").count(), 3);
+  }
+
+  #[test]
+  fn graph_with_mixed_style_wrappers() {
+    // Combined per-vertex and per-edge Style wrappers should coexist.
+    let result = interpret(
+      "ExportString[Graph[{1, 2, Style[3, Red]}, {1 <-> 2, 2 <-> 3, Style[3 <-> 1, Green]}], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains("fill=\"rgb(255,0,0)\""));
+    assert!(result.contains("stroke=\"rgb(0,255,0)\""));
+    assert_eq!(result.matches("<polyline").count(), 3);
+  }
+
+  #[test]
+  fn graph_with_styled_vertex_and_label() {
+    // Label of a styled vertex should strip the Style wrapper.
+    let result = interpret(
+      "ExportString[Graph[{1, 2, Style[3, Red]}, {1 <-> 2, 2 <-> 3, 3 <-> 1}, VertexLabels -> \"Name\"], \"SVG\"]"
+    ).unwrap();
+    assert!(result.contains(">3</text>"));
+    assert!(!result.contains("Style"));
+  }
+
+  #[test]
+  fn complete_graph_renders() {
+    assert_eq!(interpret("CompleteGraph[4]").unwrap(), "Graph[<4>, <6>]");
+  }
+
+  #[test]
+  fn star_graph_renders() {
+    assert_eq!(interpret("StarGraph[5]").unwrap(), "Graph[<5>, <4>]");
+  }
+
+  #[test]
+  fn grid_graph_vertex_count() {
+    assert_eq!(
+      interpret("VertexCount[GridGraph[{10, 10}]]").unwrap(),
+      "100"
+    );
+    assert_eq!(interpret("VertexCount[GridGraph[{2, 3}]]").unwrap(), "6");
+    assert_eq!(interpret("VertexCount[GridGraph[{3, 2}]]").unwrap(), "6");
+    assert_eq!(interpret("VertexCount[GridGraph[{1, 1}]]").unwrap(), "1");
+  }
+
+  #[test]
+  fn grid_graph_edge_count() {
+    // {m, n}: horizontal edges = (m-1)*n, vertical edges = m*(n-1)
+    assert_eq!(interpret("EdgeCount[GridGraph[{2, 3}]]").unwrap(), "7");
+    assert_eq!(interpret("EdgeCount[GridGraph[{3, 2}]]").unwrap(), "7");
+    assert_eq!(interpret("EdgeCount[GridGraph[{10, 10}]]").unwrap(), "180");
+    assert_eq!(interpret("EdgeCount[GridGraph[{1, 1}]]").unwrap(), "0");
+  }
+
+  #[test]
+  fn grid_graph_edge_list_2x3() {
+    // GridGraph[{m, n}]: m columns, n rows, row-major numbering.
+    // For each v: if not in last column emit v—(v+1); if not in last row emit v—(v+m).
+    assert_eq!(
+      interpret("EdgeList[GridGraph[{2, 3}]]").unwrap(),
+      format!(
+        "{{1 {ue} 2, 1 {ue} 3, 2 {ue} 4, 3 {ue} 4, 3 {ue} 5, 4 {ue} 6, 5 {ue} 6}}",
+        ue = "\u{f3d4}"
+      )
+    );
+  }
+
+  #[test]
+  fn grid_graph_edge_list_3x2() {
+    assert_eq!(
+      interpret("EdgeList[GridGraph[{3, 2}]]").unwrap(),
+      format!(
+        "{{1 {ue} 2, 1 {ue} 4, 2 {ue} 3, 2 {ue} 5, 3 {ue} 6, 4 {ue} 5, 5 {ue} 6}}",
+        ue = "\u{f3d4}"
+      )
+    );
+  }
+
+  #[test]
+  fn grid_graph_renders() {
+    assert_eq!(interpret("GridGraph[{3, 3}]").unwrap(), "Graph[<9>, <12>]");
+  }
+
+  // TorusGraph[{n1, …, nk}] is the Cartesian product of cycles: ∏ ni vertices,
+  // each of degree 2k, so k·(∏ ni) edges.
+  #[test]
+  fn torus_graph_counts() {
+    assert_eq!(interpret("VertexCount[TorusGraph[{3, 3}]]").unwrap(), "9");
+    assert_eq!(interpret("EdgeCount[TorusGraph[{3, 3}]]").unwrap(), "18");
+    assert_eq!(
+      interpret("VertexCount[TorusGraph[{2, 2, 2}]]").unwrap(),
+      "8"
+    );
+    assert_eq!(interpret("EdgeCount[TorusGraph[{2, 2, 2}]]").unwrap(), "24");
+    // Every vertex of a k-torus has degree 2k.
+    assert_eq!(
+      interpret("Union[VertexDegree[TorusGraph[{3, 3}]]]").unwrap(),
+      "{4}"
+    );
+  }
+
+  // Each vertex emits a forward edge per dimension, in vertex-then-dimension
+  // order (the first dimension is outermost).
+  #[test]
+  fn torus_graph_edge_list_2x3() {
+    assert_eq!(
+      interpret("EdgeList[TorusGraph[{2, 3}]]").unwrap(),
+      format!(
+        "{{1 {ue} 4, 1 {ue} 2, 2 {ue} 5, 2 {ue} 3, 3 {ue} 6, 3 {ue} 1, \
+          4 {ue} 1, 4 {ue} 5, 5 {ue} 2, 5 {ue} 6, 6 {ue} 3, 6 {ue} 4}}",
+        ue = "\u{f3d4}"
+      )
+    );
+  }
+
+  // A one-dimensional torus is just a cycle.
+  #[test]
+  fn torus_graph_one_dimensional_is_cycle() {
+    assert_eq!(
+      interpret("EdgeList[TorusGraph[{4}]]").unwrap(),
+      format!(
+        "{{1 {ue} 2, 2 {ue} 3, 3 {ue} 4, 4 {ue} 1}}",
+        ue = "\u{f3d4}"
+      )
+    );
+  }
+
+  #[test]
+  fn graph_export_string_svg() {
+    let result =
+      interpret("ExportString[Graph[{1  2, 2  3, 3  1}], \"SVG\"]").unwrap();
+    assert!(result.starts_with("<svg"));
+    assert!(result.contains("</svg>"));
+  }
+
+  #[test]
+  fn directed_graph_has_arrows() {
+    let result =
+      interpret("ExportString[Graph[{1  2, 2  3}], \"SVG\"]").unwrap();
+    // Arrows produce polygon arrowheads
+    assert!(result.contains("<polygon"));
+  }
+
+  #[test]
+  fn graph_with_vertex_size_medium() {
+    // Should render without error with Medium vertex size
+    assert_eq!(
+      interpret("Graph[{1  2}, VertexSize -> Medium]").unwrap(),
+      "Graph[<2>, <1>]"
+    );
+  }
+
+  /// Regression: vertex radii for named sizes must increase monotonically,
+  /// and the spread between Tiny and Large must be visibly large (roughly
+  /// matches wolframscript's ratios for a 3-vertex circular graph).
+  #[test]
+  fn graph_vertex_size_named_sizes_have_wide_spread() {
+    let extract_radius = |code: &str| -> f64 {
+      let svg = interpret(code).unwrap();
+      let marker = "rx=\"";
+      let start = svg.find(marker).expect("no rx attribute") + marker.len();
+      let end = svg[start..].find('"').unwrap() + start;
+      svg[start..end].parse::<f64>().unwrap()
+    };
+    let tiny = extract_radius(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, VertexSize -> Tiny], \"SVG\"]",
+    );
+    let small = extract_radius(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, VertexSize -> Small], \"SVG\"]",
+    );
+    let medium = extract_radius(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, VertexSize -> Medium], \"SVG\"]",
+    );
+    let large = extract_radius(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, VertexSize -> Large], \"SVG\"]",
+    );
+    assert!(
+      tiny < small,
+      "Tiny ({tiny}) should be smaller than Small ({small})"
+    );
+    assert!(
+      small < medium,
+      "Small ({small}) should be smaller than Medium ({medium})"
+    );
+    assert!(
+      medium < large,
+      "Medium ({medium}) should be smaller than Large ({large})"
+    );
+    // Large should be noticeably bigger than Tiny (>4x) so Table[... {Tiny,
+    // Small, Medium, Large}] produces visibly different graphs.
+    assert!(
+      large / tiny > 4.0,
+      "Large/Tiny ratio should exceed 4 (got {:.2})",
+      large / tiny
+    );
+  }
+
+  /// Regression: PlotLabel option on a Graph must render the title as
+  /// SVG <text>. Previously the option was silently ignored.
+  #[test]
+  fn graph_plot_label_string() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, PlotLabel -> \"My Triangle\"], \"SVG\"]"
+    )
+    .unwrap();
+    assert!(svg.contains(">My Triangle</text>"), "SVG: {svg}");
+  }
+
+  /// PlotLabel accepts an Identifier (e.g. `PlotLabel -> Tiny` where the
+  /// label is a symbolic name, as used in Table[Graph[..., PlotLabel -> s],
+  /// {s, {Tiny, Small, Medium, Large}}]).
+  #[test]
+  fn graph_plot_label_identifier() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, PlotLabel -> Tiny], \"SVG\"]"
+    )
+    .unwrap();
+    assert!(svg.contains(">Tiny</text>"), "SVG: {svg}");
+  }
+
+  /// Style directives inside PlotLabel (color, font size, Bold, Italic)
+  /// must flow through to the rendered <text> element, overriding defaults.
+  #[test]
+  fn graph_plot_label_styled() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2}, PlotLabel -> Style[\"Red Title\", Red, 20, Italic]], \"SVG\"]"
+    )
+    .unwrap();
+    assert!(svg.contains(">Red Title</text>"), "SVG: {svg}");
+    assert!(
+      svg.contains("fill=\"rgb(255,0,0)\""),
+      "expected red fill; SVG: {svg}"
+    );
+    assert!(
+      svg.contains("font-size=\"20\""),
+      "expected font-size 20; SVG: {svg}"
+    );
+    assert!(
+      svg.contains("font-style=\"italic\""),
+      "expected italic; SVG: {svg}"
+    );
+  }
+
+  /// PlotLabel -> None must suppress the label entirely (no <text> added
+  /// beyond whatever other options may add).
+  #[test]
+  fn graph_plot_label_none_renders_no_label() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}, PlotLabel -> None], \"SVG\"]"
+    )
+    .unwrap();
+    assert!(
+      !svg.contains("<text"),
+      "SVG should have no <text> element: {svg}"
+    );
+  }
+
+  #[test]
+  fn graph_preserves_vertex_list() {
+    assert_eq!(
+      interpret("VertexList[Graph[{1  2, 2  3}]]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn graph_preserves_edge_list() {
+    assert_eq!(
+      interpret("EdgeList[Graph[{1  2, 2  3}]]").unwrap(),
+      "{1  2, 2  3}"
+    );
+  }
+
+  #[test]
+  fn graph_with_square_shape() {
+    let result = interpret(
+      "ExportString[Graph[{1  2}, VertexShapeFunction -> \"Square\"], \"SVG\"]"
+    ).unwrap();
+    assert!(result.starts_with("<svg"));
+  }
+
+  #[test]
+  fn directed_self_loop() {
+    let result = interpret(
+      "ExportString[Graph[{1, 2, 3}, {1  2, 2  3, 2  2}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(result.starts_with("<svg"));
+    // Self-loop produces an arrowhead polygon
+    assert!(result.contains("<polygon"));
+  }
+
+  #[test]
+  fn undirected_self_loop() {
+    let result =
+      interpret("ExportString[Graph[{1, 2}, {1  2, 1  1}], \"SVG\"]")
+        .unwrap();
+    assert!(result.starts_with("<svg"));
+    // Should have 2 polylines: one regular edge + one self-loop
+    assert_eq!(result.matches("<polyline").count(), 2);
+  }
+}
+
+mod group_orbits {
+  use super::*;
+
+  #[test]
+  fn unevaluated() {
+    assert_eq!(interpret("GroupOrbits[x, y]").unwrap(), "GroupOrbits[x, y]");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[GroupOrbits]").unwrap(), "Symbol");
+  }
+}
+
+mod two_way_rule {
+  use super::*;
+
+  #[test]
+  fn operator_parses_as_two_way_rule() {
+    // Matches Wolfram: a <-> b has Head TwoWayRule (not UndirectedEdge).
+    assert_eq!(interpret("FullForm[a <-> b]").unwrap(), "FullForm[a <-> b]");
+    assert_eq!(interpret("Head[a <-> b]").unwrap(), "TwoWayRule");
+  }
+
+  #[test]
+  fn roundtrip_display() {
+    assert_eq!(interpret("a <-> b").unwrap(), "a <-> b");
+    assert_eq!(interpret("TwoWayRule[a, b]").unwrap(), "a <-> b");
+  }
+
+  #[test]
+  fn precedence_tighter_than_rule() {
+    // `<->` binds tighter than `->`: a <-> b -> c == Rule[TwoWayRule[a, b], c]
+    assert_eq!(
+      interpret("FullForm[a <-> b -> c]").unwrap(),
+      "FullForm[a <-> b -> c]"
+    );
+  }
+
+  #[test]
+  fn precedence_looser_than_arithmetic() {
+    // `<->` binds looser than `+`: a + b <-> c + d == TwoWayRule[a+b, c+d]
+    assert_eq!(
+      interpret("FullForm[a + b <-> c + d]").unwrap(),
+      "FullForm[a + b <-> c + d]"
+    );
+  }
+
+  #[test]
+  fn inside_list() {
+    // List elements containing `<->` must not be mis-parsed as ReplacementRule.
+    assert_eq!(
+      interpret("{a <-> b, c <-> d}").unwrap(),
+      "{a <-> b, c <-> d}"
+    );
+  }
+
+  #[test]
+  fn inside_function_args() {
+    assert_eq!(interpret("f[a <-> b]").unwrap(), "f[a <-> b]");
+    // Mixed with a real rule argument — both should parse distinctly.
+    assert_eq!(
+      interpret("f[a <-> b, x -> y]").unwrap(),
+      "f[a <-> b, x -> y]"
+    );
+  }
+
+  #[test]
+  fn graph_accepts_two_way_rule_edges() {
+    // Graph[] should treat TwoWayRule edges as undirected edges.
+    assert_eq!(
+      interpret("VertexCount[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}]]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("EdgeCount[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}]]").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn graph_two_way_rule_connected_components() {
+    assert_eq!(
+      interpret("ConnectedComponents[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}]]")
+        .unwrap(),
+      "{{1, 2, 3}, {4, 5}}"
+    );
+  }
+
+  #[test]
+  fn graph_two_way_rule_with_self_loop() {
+    // Regression for the user's `Graph[{"A" <-> "B", "B" <-> "B"}]` example
+    // — parser must accept self-loops with `<->` without failing.
+    assert_eq!(
+      interpret("VertexCount[Graph[{\"A\" <-> \"B\", \"B\" <-> \"B\"}]]")
+        .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn graph_mixed_directed_and_two_way_rule() {
+    // Regression: mixing `->` (Rule → DirectedEdge) with `<->` in the
+    // same edge list must work. Wolfram accepts this.
+    assert_eq!(
+      interpret("VertexList[Graph[{a -> b, b -> a, b <-> b}]]").unwrap(),
+      "{a, b}"
+    );
+    assert_eq!(
+      interpret("VertexCount[Graph[{a -> b, b -> a, b <-> b}]]").unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("EdgeCount[Graph[{a -> b, b -> a, b <-> b}]]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("EdgeList[Graph[{a -> b, b -> a, b <-> b}]]").unwrap(),
+      "{a  b, b  a, b  b}"
+    );
+  }
+
+  #[test]
+  fn graph_mixed_rule_and_undirected_edge() {
+    // Same mixed case but with an explicit UndirectedEdge[..] alongside a Rule.
+    assert_eq!(
+      interpret("EdgeList[Graph[{1 -> 2, 2  3}]]").unwrap(),
+      "{1  2, 2  3}"
+    );
+  }
+
+  #[test]
+  fn antiparallel_edges_render_as_distinct_curves() {
+    // Regression: Graph[{a -> b, b -> a}] must render two visually
+    // distinct arrow curves, not two arrows overlapping on a single
+    // straight line between the vertices.
+    let result =
+      interpret("ExportString[Graph[{a -> b, b -> a}], \"SVG\"]").unwrap();
+    // Two polylines for the two edges…
+    assert_eq!(result.matches("<polyline").count(), 2);
+    // …and two arrowhead polygons (one per directed edge).
+    assert_eq!(result.matches("<polygon").count(), 2);
+    // The two polylines must not be identical (that was the bug —
+    // both edges were drawn as the same horizontal segment).
+    let polylines: Vec<&str> = result
+      .match_indices("<polyline")
+      .map(|(i, _)| {
+        let end = result[i..].find("/>").unwrap_or(0) + i;
+        &result[i..end]
+      })
+      .collect();
+    assert_ne!(polylines[0], polylines[1]);
+  }
+
+  #[test]
+  fn mixed_antiparallel_plus_self_loop_renders_three_edges() {
+    // The original report: Graph[{a -> b, b -> a, b <-> b}] must have
+    // two separate edges between a and b (curved) plus a self-loop on b.
+    // Expect 3 polylines total (2 curves + 1 loop) and 2 arrowheads
+    // (one per directed antiparallel edge; the self-loop is undirected).
+    let result =
+      interpret("ExportString[Graph[{a -> b, b -> a, b <-> b}], \"SVG\"]")
+        .unwrap();
+    assert_eq!(result.matches("<polyline").count(), 3);
+    assert_eq!(result.matches("<polygon").count(), 2);
+  }
+
+  #[test]
+  fn labeled_two_way_rule_edge() {
+    // Labeled wrapper around `<->` should still be recognized as an edge.
+    assert_eq!(
+      interpret("EdgeCount[Graph[{Labeled[a <-> b, \"e1\"]}]]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn short_arrow_edges_get_proportionally_smaller_arrowheads() {
+    // Regression: multi-component cluster graphs pack many short edges
+    // into small cells. The arrowhead must scale down with the edge so
+    // it doesn't swallow the whole line. For each directed edge we
+    // verify that the arrowhead's triangle is no larger than ~half the
+    // edge's polyline length in pixel space.
+    let svg = interpret(
+      "ExportString[Graph[Table[i -> Mod[i^2, 74], {i, 100}]], \"SVG\"]",
+    )
+    .unwrap();
+
+    // Extract (polyline points, polygon points) pairs — in graph
+    // rendering each directed edge produces one polyline followed
+    // immediately by one arrowhead polygon.
+    let polyline_re = "<polyline points=\"";
+    let polygon_re = "<polygon points=\"";
+
+    let mut idx = 0;
+    let mut pairs_checked = 0;
+    while let Some(p_off) = svg[idx..].find(polyline_re) {
+      let p_start = idx + p_off + polyline_re.len();
+      let p_end = svg[p_start..].find('"').map(|e| p_start + e).unwrap();
+      let polyline_pts_str = &svg[p_start..p_end];
+
+      // Find the next polygon after this polyline.
+      let after = p_end;
+      let Some(g_off) = svg[after..].find(polygon_re) else {
+        break;
+      };
+      let g_start = after + g_off + polygon_re.len();
+      let g_end = svg[g_start..].find('"').map(|e| g_start + e).unwrap();
+      let polygon_pts_str = &svg[g_start..g_end];
+
+      idx = g_end;
+
+      // Parse points like "x,y x,y ..." into Vec<(f64,f64)>.
+      let parse = |s: &str| -> Vec<(f64, f64)> {
+        s.split_whitespace()
+          .filter_map(|tok| {
+            let (a, b) = tok.split_once(',')?;
+            Some((a.parse().ok()?, b.parse().ok()?))
+          })
+          .collect()
+      };
+      let pl = parse(polyline_pts_str);
+      let pg = parse(polygon_pts_str);
+      if pl.len() < 2 || pg.len() != 3 {
+        continue;
+      }
+
+      // Polyline length in pixels, and bounding-box diagonal.
+      let mut line_len = 0.0_f64;
+      let (mut minx, mut maxx) = (f64::INFINITY, f64::NEG_INFINITY);
+      let (mut miny, mut maxy) = (f64::INFINITY, f64::NEG_INFINITY);
+      for &(x, y) in &pl {
+        if x < minx {
+          minx = x;
+        }
+        if x > maxx {
+          maxx = x;
+        }
+        if y < miny {
+          miny = y;
+        }
+        if y > maxy {
+          maxy = y;
+        }
+      }
+      for w in pl.windows(2) {
+        line_len +=
+          ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+      }
+      let bbox_diag = ((maxx - minx).powi(2) + (maxy - miny).powi(2)).sqrt();
+
+      // Arrowhead length = distance from tip to midpoint of the base.
+      // The tip is vertex 0 of the polygon (emitted first in graphics.rs).
+      let tip = pg[0];
+      let base_mid = (
+        f64::midpoint(pg[1].0, pg[2].0),
+        f64::midpoint(pg[1].1, pg[2].1),
+      );
+      let head_len =
+        ((tip.0 - base_mid.0).powi(2) + (tip.1 - base_mid.1).powi(2)).sqrt();
+
+      // Skip pathologically collapsed edges (e.g. FR layouts sometimes
+      // put two nodes on top of each other, producing a line of length
+      // < 1 px). The arrow is invisible anyway.
+      if line_len < 2.0 {
+        continue;
+      }
+
+      // Head must be small compared to both the path length and the
+      // shape's bbox diagonal (the latter catches tight self-loops).
+      let shape_size = line_len.min(bbox_diag).max(1.0);
+      assert!(
+        head_len <= shape_size * 0.6 + 0.5,
+        "arrowhead too large: head_len={head_len:.2} shape_size={shape_size:.2}"
+      );
+      pairs_checked += 1;
+    }
+    assert!(
+      pairs_checked >= 50,
+      "expected to find many arrow edges, got {pairs_checked}"
+    );
+  }
+
+  #[test]
+  fn multi_component_graph_renders_separated_clusters() {
+    // Regression: Graph[Table[i -> Mod[i^2, 74], {i, 100}]] has 8
+    // weakly-connected components (sizes 34, 32, 12, 10, 5, 5, 2, 1).
+    // A plain circular layout would place all 101 vertices on a single
+    // circle and hide the cluster structure, so we lay out each
+    // component separately and pack them into a grid. Verify that the
+    // SVG contains all 101 vertices and that their centers are not all
+    // on a common circle (which would indicate the old circular layout
+    // is still being used for multi-component graphs).
+    let svg = interpret(
+      "ExportString[Graph[Table[i -> Mod[i^2, 74], {i, 100}]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+
+    // Collect vertex centers from the rendered <ellipse cx="..." cy="..." ...> tags.
+    let centers: Vec<(f64, f64)> = svg
+      .match_indices("<ellipse")
+      .filter_map(|(i, _)| {
+        let rest = &svg[i..];
+        let cx_idx = rest.find("cx=\"")? + 4;
+        let cx_end = rest[cx_idx..].find('"')? + cx_idx;
+        let cy_idx = rest.find("cy=\"")? + 4;
+        let cy_end = rest[cy_idx..].find('"')? + cy_idx;
+        let cx: f64 = rest[cx_idx..cx_end].parse().ok()?;
+        let cy: f64 = rest[cy_idx..cy_end].parse().ok()?;
+        Some((cx, cy))
+      })
+      .collect();
+    assert_eq!(
+      centers.len(),
+      101,
+      "expected 101 rendered vertices, got {}",
+      centers.len()
+    );
+
+    // If every vertex were on a common circle its distance to the bbox
+    // centroid would be nearly constant. Check that the stddev of those
+    // distances is substantially larger than 5% of the mean — i.e. the
+    // layout is clearly not a single circle.
+    let cx0: f64 =
+      centers.iter().map(|p| p.0).sum::<f64>() / centers.len() as f64;
+    let cy0: f64 =
+      centers.iter().map(|p| p.1).sum::<f64>() / centers.len() as f64;
+    let dists: Vec<f64> = centers
+      .iter()
+      .map(|&(x, y)| ((x - cx0).powi(2) + (y - cy0).powi(2)).sqrt())
+      .collect();
+    let mean = dists.iter().sum::<f64>() / dists.len() as f64;
+    let var = dists.iter().map(|d| (d - mean).powi(2)).sum::<f64>()
+      / dists.len() as f64;
+    let stddev = var.sqrt();
+    assert!(
+      stddev / mean > 0.15,
+      "vertices look like a single circle (stddev/mean = {:.3})",
+      stddev / mean
+    );
+  }
+}
+
+mod random_graph {
+  use super::*;
+
+  #[test]
+  fn correct_vertex_count() {
+    assert_eq!(
+      interpret("Length[VertexList[RandomGraph[{5, 6}]]]").unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn correct_edge_count() {
+    assert_eq!(
+      interpret("Length[EdgeList[RandomGraph[{5, 6}]]]").unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn head_is_graph() {
+    assert_eq!(interpret("Head[RandomGraph[{5, 6}]]").unwrap(), "Graph");
+  }
+
+  #[test]
+  fn edges_are_unique() {
+    assert_eq!(
+      interpret("Length[DeleteDuplicates[EdgeList[RandomGraph[{8, 12}]]]]")
+        .unwrap(),
+      "12"
+    );
+  }
+
+  #[test]
+  fn complete_graph_when_m_equals_max() {
+    // K_4 has 6 edges; RandomGraph[{4, 6}] should yield exactly that set.
+    assert_eq!(
+      interpret("Length[EdgeList[RandomGraph[{4, 6}]]]").unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn too_many_edges_returns_unevaluated() {
+    // K_4 has 6 edges, asking for 100 is impossible.
+    assert_eq!(
+      interpret("RandomGraph[{4, 100}]").unwrap(),
+      "RandomGraph[{4, 100}]"
+    );
+  }
+
+  #[test]
+  fn k_variant_returns_list() {
+    assert_eq!(interpret("Length[RandomGraph[{5, 4}, 3]]").unwrap(), "3");
+    assert_eq!(
+      interpret("Head /@ RandomGraph[{5, 4}, 3]").unwrap(),
+      "{Graph, Graph, Graph}"
+    );
+  }
+
+  #[test]
+  fn with_options() {
+    // Audit case: trailing Rule options pass through as Graph options.
+    assert_eq!(
+      interpret(
+        "Head[RandomGraph[{10, 20}, VertexLabels -> Placed[Automatic, Center], \
+         VertexSize -> 0.75]]"
+      )
+      .unwrap(),
+      "Graph"
+    );
+    assert_eq!(
+      interpret(
+        "Length[VertexList[RandomGraph[{10, 20}, \
+         VertexLabels -> Placed[Automatic, Center], VertexSize -> 0.75]]]"
+      )
+      .unwrap(),
+      "10"
+    );
+    assert_eq!(
+      interpret(
+        "Length[EdgeList[RandomGraph[{10, 20}, \
+         VertexLabels -> Placed[Automatic, Center], VertexSize -> 0.75]]]"
+      )
+      .unwrap(),
+      "20"
+    );
+  }
+
+  #[test]
+  fn bernoulli_graph_distribution_returns_graph() {
+    // RandomGraph[BernoulliGraphDistribution[n, p]] is an Erdős–Rényi
+    // G(n, p) sample: each of the n·(n−1)/2 possible edges is included
+    // independently with probability p. The result is a `Graph` with
+    // exactly n vertices.
+    assert_eq!(
+      interpret("Head[RandomGraph[BernoulliGraphDistribution[6, 0.4]]]")
+        .unwrap(),
+      "Graph"
+    );
+    assert_eq!(
+      interpret(
+        "Length[VertexList[RandomGraph[BernoulliGraphDistribution[6, 0.4]]]]"
+      )
+      .unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn bernoulli_graph_distribution_edge_count_in_range() {
+    // p=1 forces all edges; p=0 forbids them.
+    assert_eq!(
+      interpret(
+        "Length[EdgeList[RandomGraph[BernoulliGraphDistribution[5, 1]]]]"
+      )
+      .unwrap(),
+      "10"
+    );
+    assert_eq!(
+      interpret(
+        "Length[EdgeList[RandomGraph[BernoulliGraphDistribution[5, 0]]]]"
+      )
+      .unwrap(),
+      "0"
+    );
+  }
+}
+
+mod graph_q {
+  use super::*;
+
+  #[test]
+  fn true_for_edge_list_graph() {
+    assert_eq!(interpret("GraphQ[Graph[{1->2, 2->3}]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn true_for_complete_graph() {
+    assert_eq!(interpret("GraphQ[CompleteGraph[4]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn true_for_path_graph() {
+    assert_eq!(interpret("GraphQ[PathGraph[{1, 2, 3}]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn true_for_vertices_and_rule_edges() {
+    assert_eq!(
+      interpret("GraphQ[Graph[{1, 2, 3}, {1 -> 2}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn true_for_empty_edge_list() {
+    assert_eq!(interpret("GraphQ[Graph[{1, 2}, {}]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn false_for_number() {
+    assert_eq!(interpret("GraphQ[5]").unwrap(), "False");
+  }
+
+  #[test]
+  fn false_for_string() {
+    assert_eq!(interpret(r#"GraphQ["abc"]"#).unwrap(), "False");
+  }
+
+  #[test]
+  fn false_for_bare_edge_list() {
+    assert_eq!(interpret("GraphQ[{1 -> 2}]").unwrap(), "False");
+  }
+
+  #[test]
+  fn false_for_invalid_edge() {
+    assert_eq!(
+      interpret(r#"GraphQ[Graph[{1, 2, 3}, {1 -> 2, "x"}]]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn false_for_non_edge_in_edge_list() {
+    assert_eq!(
+      interpret("GraphQ[Graph[{1, 2, 3}, {1, 2}]]").unwrap(),
+      "False"
+    );
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn directed_edge() {
+    assert_case(r#"DirectedEdge[x, y, z]"#, r#"DirectedEdge[x, y, z]"#);
+  }
+  #[test]
+  fn expr() {
+    assert_case(r#"DirectedEdge[x, y, z]; a \[DirectedEdge] b"#, r#"a  b"#);
+  }
+  #[test]
+  fn undirected_edge() {
+    assert_case(r#"UndirectedEdge[x, y, z]"#, r#"UndirectedEdge[x, y, z]"#);
+  }
+  #[test]
+  fn less() {
+    assert_case(r#"UndirectedEdge[x, y, z]; a <-> b"#, r#"a <-> b"#);
+  }
+}
+
+mod vertex_in_degree {
+  use super::*;
+
+  #[test]
+  fn directed_edge_list() {
+    assert_eq!(
+      interpret("VertexInDegree[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 3}]").unwrap(),
+      "{1, 1, 2}"
+    );
+  }
+
+  #[test]
+  fn vertex_order_follows_first_appearance() {
+    assert_eq!(
+      interpret("VertexInDegree[{3 -> 2, 1 -> 3, 2 -> 1}]").unwrap(),
+      "{1, 1, 1}"
+    );
+  }
+
+  #[test]
+  fn graph_with_explicit_vertices() {
+    assert_eq!(
+      interpret(
+        "VertexInDegree[Graph[{a, b, c, d}, \
+         {a -> b, b -> c, c -> a, a -> c, d -> a}]]"
+      )
+      .unwrap(),
+      "{2, 1, 2, 0}"
+    );
+  }
+
+  #[test]
+  fn directed_self_loop_counts_once() {
+    assert_eq!(
+      interpret("VertexInDegree[{1 -> 1, 1 -> 2, 2 -> 1}]").unwrap(),
+      "{2, 1}"
+    );
+  }
+
+  #[test]
+  fn pure_undirected_counts_both_endpoints() {
+    assert_eq!(
+      interpret("VertexInDegree[{1 <-> 2, 2 <-> 3, 3 <-> 1}]").unwrap(),
+      "{2, 2, 2}"
+    );
+  }
+
+  #[test]
+  fn undirected_self_loop_counts_twice() {
+    assert_eq!(
+      interpret("VertexInDegree[{1 <-> 1, 1 <-> 2}]").unwrap(),
+      "{3, 1}"
+    );
+  }
+
+  #[test]
+  fn mixed_graph_ignores_undirected_edges() {
+    // A graph with any directed edge is a mixed graph: undirected edges
+    // contribute nothing to in-degree.
+    assert_eq!(
+      interpret("VertexInDegree[{1 -> 2, 2 <-> 3, 3 -> 1}]").unwrap(),
+      "{1, 1, 0}"
+    );
+    assert_eq!(
+      interpret("VertexInDegree[{1 <-> 2, 2 <-> 3, 3 <-> 1, 1 -> 2}]").unwrap(),
+      "{0, 1, 0}"
+    );
+  }
+
+  #[test]
+  fn directed_and_undirected_edge_heads() {
+    assert_eq!(
+      interpret(
+        "VertexInDegree[{DirectedEdge[a, b], \
+         UndirectedEdge[b, c], DirectedEdge[c, a]}]"
+      )
+      .unwrap(),
+      "{1, 1, 0}"
+    );
+  }
+
+  #[test]
+  fn single_vertex_query() {
+    assert_eq!(
+      interpret("VertexInDegree[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 3}, 1]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret(
+        "VertexInDegree[Graph[{a, b, c}, {a -> b, b -> c, c -> a, a -> c}], c]"
+      )
+      .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn no_edges() {
+    assert_eq!(
+      interpret("VertexInDegree[Graph[{1, 2, 3}, {}]]").unwrap(),
+      "{0, 0, 0}"
+    );
+  }
+
+  #[test]
+  fn unknown_vertex_stays_unevaluated() {
+    assert_eq!(
+      interpret("VertexInDegree[{1 -> 2, 2 -> 3}, 5]").unwrap(),
+      "VertexInDegree[{1 -> 2, 2 -> 3}, 5]"
+    );
+  }
+}
+
+mod vertex_out_degree {
+  use super::*;
+
+  #[test]
+  fn directed_edge_list() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 3}]").unwrap(),
+      "{2, 1, 1}"
+    );
+  }
+
+  #[test]
+  fn graph_with_explicit_vertices() {
+    assert_eq!(
+      interpret("VertexOutDegree[Graph[{1, 2, 3}, {1 -> 2, 2 -> 3}]]").unwrap(),
+      "{1, 1, 0}"
+    );
+  }
+
+  #[test]
+  fn directed_self_loop_counts_once() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 -> 1, 1 -> 2, 2 -> 1}]").unwrap(),
+      "{2, 1}"
+    );
+  }
+
+  #[test]
+  fn pure_undirected_counts_both_endpoints() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 <-> 2, 2 <-> 3, 3 <-> 1}]").unwrap(),
+      "{2, 2, 2}"
+    );
+  }
+
+  #[test]
+  fn undirected_self_loop_counts_twice() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 <-> 1, 1 <-> 2}]").unwrap(),
+      "{3, 1}"
+    );
+  }
+
+  #[test]
+  fn mixed_graph_ignores_undirected_edges() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 -> 2, 2 <-> 3, 3 -> 1}]").unwrap(),
+      "{1, 0, 1}"
+    );
+  }
+
+  #[test]
+  fn single_vertex_query() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 3}, 1]")
+        .unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn unknown_vertex_stays_unevaluated() {
+    assert_eq!(
+      interpret("VertexOutDegree[{1 -> 2, 2 -> 3}, 5]").unwrap(),
+      "VertexOutDegree[{1 -> 2, 2 -> 3}, 5]"
+    );
+  }
+}
+
+mod weighted_adjacency_matrix {
+  use super::*;
+
+  #[test]
+  fn directed_with_weights() {
+    assert_eq!(
+      // Normal[...] collapses wolframscript's SparseArray to the dense matrix
+      // Woxi already returns, keeping the conformance comparison meaningful.
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2, 3}, {1 -> 2, 2 -> 3}, EdgeWeight -> {5, 10}]]]"
+      )
+      .unwrap(),
+      "{{0, 5, 0}, {0, 0, 10}, {0, 0, 0}}"
+    );
+  }
+
+  #[test]
+  fn undirected_with_weights() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2, 3}, {1 <-> 2, 2 <-> 3, 1 <-> 3}, \
+         EdgeWeight -> {5, 10, 2}]]]"
+      )
+      .unwrap(),
+      "{{0, 5, 2}, {5, 0, 10}, {2, 10, 0}}"
+    );
+  }
+
+  #[test]
+  fn implicit_vertices() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1 <-> 2, 2 <-> 3}, EdgeWeight -> {5, 10}]]]"
+      )
+      .unwrap(),
+      "{{0, 5, 0}, {5, 0, 10}, {0, 10, 0}}"
+    );
+  }
+
+  #[test]
+  fn default_weight_is_one() {
+    assert_eq!(
+      interpret("Normal[WeightedAdjacencyMatrix[Graph[{1 -> 2, 2 -> 3}]]]")
+        .unwrap(),
+      "{{0, 1, 0}, {0, 0, 1}, {0, 0, 0}}"
+    );
+  }
+
+  #[test]
+  fn directed_self_loop() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2}, {1 -> 1, 1 -> 2}, EdgeWeight -> {7, 3}]]]"
+      )
+      .unwrap(),
+      "{{7, 3}, {0, 0}}"
+    );
+  }
+
+  #[test]
+  fn undirected_self_loop_counts_once() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2}, {1 <-> 1, 1 <-> 2}, EdgeWeight -> {7, 3}]]]"
+      )
+      .unwrap(),
+      "{{7, 3}, {3, 0}}"
+    );
+  }
+
+  #[test]
+  fn parallel_edges_sum_weights() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2, 3}, {1 -> 2, 1 -> 2, 2 -> 3}, \
+         EdgeWeight -> {5, 4, 10}]]]"
+      )
+      .unwrap(),
+      "{{0, 9, 0}, {0, 0, 10}, {0, 0, 0}}"
+    );
+  }
+
+  #[test]
+  fn symbolic_weight() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2}, {1 <-> 2}, EdgeWeight -> {x}]]]"
+      )
+      .unwrap(),
+      "{{0, x}, {x, 0}}"
+    );
+  }
+
+  #[test]
+  fn real_weight() {
+    assert_eq!(
+      interpret(
+        "Normal[WeightedAdjacencyMatrix[\
+         Graph[{1, 2}, {1 <-> 2}, EdgeWeight -> {2.5}]]]"
+      )
+      .unwrap(),
+      "{{0, 2.5}, {2.5, 0}}"
+    );
+  }
+}
+
+mod find_shortest_path {
+  use super::*;
+
+  #[test]
+  fn weighted_directed_dijkstra() {
+    // Shortest weighted path a -> e in the RosettaCode Dijkstra example.
+    assert_eq!(
+      interpret(
+        "FindShortestPath[Graph[{\"a\" \\[DirectedEdge] \"b\", \
+         \"a\" \\[DirectedEdge] \"c\", \"b\" \\[DirectedEdge] \"c\", \
+         \"b\" \\[DirectedEdge] \"d\", \"c\" \\[DirectedEdge] \"d\", \
+         \"d\" \\[DirectedEdge] \"e\", \"a\" \\[DirectedEdge] \"f\", \
+         \"c\" \\[DirectedEdge] \"f\", \"e\" \\[DirectedEdge] \"f\"}, \
+         EdgeWeight -> {7, 9, 10, 15, 11, 6, 14, 2, 9}], \"a\", \"e\"]"
+      )
+      .unwrap(),
+      "{a, c, d, e}"
+    );
+  }
+
+  #[test]
+  fn unreachable_returns_empty() {
+    assert_eq!(
+      interpret(
+        "FindShortestPath[Graph[{\"a\" \\[DirectedEdge] \"b\"}], \"b\", \"a\"]"
+      )
+      .unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn ties_favour_lower_numbered_vertices() {
+    // Two equal-length paths exist around the cycle; wolframscript returns
+    // the lexicographically smallest one (favouring lower vertices).
+    assert_eq!(
+      interpret("FindShortestPath[CycleGraph[6], 1, 4]").unwrap(),
+      "{1, 2, 3, 4}"
+    );
+    assert_eq!(
+      interpret("FindShortestPath[CycleGraph[8], 1, 5]").unwrap(),
+      "{1, 2, 3, 4, 5}"
+    );
+    // From 2 the smallest neighbour is 1, so the path wraps the low side.
+    assert_eq!(
+      interpret("FindShortestPath[CycleGraph[6], 2, 5]").unwrap(),
+      "{2, 1, 6, 5}"
+    );
+    // Grid graph: the lexicographically smallest geodesic from corner 1.
+    assert_eq!(
+      interpret("FindShortestPath[GridGraph[{3, 3}], 1, 9]").unwrap(),
+      "{1, 2, 3, 6, 9}"
+    );
+  }
+
+  #[test]
+  fn weight_beats_vertex_order() {
+    // The cheaper two-hop route wins even though the direct edge has a
+    // lower-numbered next vertex.
+    assert_eq!(
+      interpret(
+        "FindShortestPath[Graph[{1 -> 2, 2 -> 3, 1 -> 3}, \
+         EdgeWeight -> {1, 1, 5}], 1, 3]"
+      )
+      .unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+}
+
+mod transitive_closure_graph {
+  use super::*;
+
+  #[test]
+  fn directed_closures() {
+    assert_eq!(
+      interpret("TransitiveClosureGraph[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "Graph[<3>, <3>]"
+    );
+    assert_eq!(
+      interpret("EdgeList[TransitiveClosureGraph[Graph[{1 -> 2, 2 -> 3}]]]")
+        .unwrap(),
+      "{1 \u{f3d5} 2, 1 \u{f3d5} 3, 2 \u{f3d5} 3}"
+    );
+    // A cycle closes into the complete digraph without self-loops
+    assert_eq!(
+      interpret(
+        "EdgeList[TransitiveClosureGraph[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 1 \u{f3d5} 3, 2 \u{f3d5} 1, 2 \u{f3d5} 3, 3 \u{f3d5} 1, 3 \u{f3d5} 2}"
+    );
+    // Components stay separate; diamond DAG closes with the long edge
+    assert_eq!(
+      interpret("EdgeList[TransitiveClosureGraph[Graph[{1 -> 2, 3 -> 4}]]]")
+        .unwrap(),
+      "{1 \u{f3d5} 2, 3 \u{f3d5} 4}"
+    );
+    assert_eq!(
+      interpret("EdgeList[TransitiveClosureGraph[Graph[{a -> b, b -> c}]]]")
+        .unwrap(),
+      "{a \u{f3d5} b, a \u{f3d5} c, b \u{f3d5} c}"
+    );
+  }
+
+  #[test]
+  fn undirected_closures_connect_components() {
+    assert_eq!(
+      interpret("EdgeList[TransitiveClosureGraph[Graph[{1 <-> 2, 2 <-> 3}]]]")
+        .unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 3}"
+    );
+  }
+
+  #[test]
+  fn edge_lists_and_invalid_input() {
+    // Raw edge lists wrap into a Graph first
+    assert_eq!(
+      interpret("TransitiveClosureGraph[{1 -> 2}]").unwrap(),
+      "Graph[<2>, <1>]"
+    );
+    assert_eq!(
+      interpret("TransitiveClosureGraph[x]").unwrap(),
+      "TransitiveClosureGraph[x]"
+    );
+  }
+}
+
+mod transitive_reduction_graph {
+  use super::*;
+
+  #[test]
+  fn directed_acyclic_reductions() {
+    // The redundant long edge 1->3 is dropped (reachable via 1->2->3).
+    assert_eq!(
+      interpret(
+        "EdgeList[TransitiveReductionGraph[Graph[{1 -> 2, 2 -> 3, 1 -> 3}]]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 2 \u{f3d5} 3}"
+    );
+    // A longer chain drops both shortcut edges 1->3 and 1->4.
+    assert_eq!(
+      interpret(
+        "EdgeList[TransitiveReductionGraph[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 1 -> 4, 1 -> 3}]]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 2 \u{f3d5} 3, 3 \u{f3d5} 4}"
+    );
+    // Symbolic vertices behave identically.
+    assert_eq!(
+      interpret(
+        "EdgeList[TransitiveReductionGraph[Graph[{a -> b, b -> c, a -> c}]]]"
+      )
+      .unwrap(),
+      "{a \u{f3d5} b, b \u{f3d5} c}"
+    );
+  }
+
+  #[test]
+  fn output_is_sorted_by_vertex_order() {
+    // Edges given out of order still come back sorted by (source, target).
+    assert_eq!(
+      interpret(
+        "EdgeList[TransitiveReductionGraph[Graph[{1 -> 3, 2 -> 3, 1 -> 2}]]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 2 \u{f3d5} 3}"
+    );
+  }
+
+  #[test]
+  fn disconnected_components() {
+    assert_eq!(
+      interpret(
+        "EdgeList[TransitiveReductionGraph[Graph[{1 -> 2, 3 -> 4, 3 -> 5, 4 -> 5}]]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 3 \u{f3d5} 4, 4 \u{f3d5} 5}"
+    );
+  }
+
+  #[test]
+  fn graph_form_and_raw_edge_lists() {
+    assert_eq!(
+      interpret("TransitiveReductionGraph[Graph[{1 -> 2, 2 -> 3, 1 -> 3}]]")
+        .unwrap(),
+      "Graph[<3>, <2>]"
+    );
+    // Raw edge lists wrap into a Graph first, like TransitiveClosureGraph.
+    assert_eq!(
+      interpret("TransitiveReductionGraph[{1 -> 2, 2 -> 3, 1 -> 3}]").unwrap(),
+      "Graph[<3>, <2>]"
+    );
+  }
+
+  #[test]
+  fn invalid_input_unevaluated() {
+    assert_eq!(
+      interpret("TransitiveReductionGraph[x]").unwrap(),
+      "TransitiveReductionGraph[x]"
+    );
+  }
+}
+
+mod find_independent_vertex_set {
+  use super::*;
+
+  #[test]
+  fn maximum_sets() {
+    assert_eq!(
+      interpret(
+        "FindIndependentVertexSet[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 4, 4 <-> 1}]]"
+      )
+      .unwrap(),
+      "{{1, 3}}"
+    );
+    assert_eq!(
+      interpret("FindIndependentVertexSet[Graph[{1 <-> 2, 1 <-> 3, 1 <-> 4}]]")
+        .unwrap(),
+      "{{2, 3, 4}}"
+    );
+    assert_eq!(
+      interpret(
+        "FindIndependentVertexSet[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 4, 4 <-> 5}]]"
+      )
+      .unwrap(),
+      "{{1, 3, 5}}"
+    );
+    assert_eq!(
+      interpret(
+        "FindIndependentVertexSet[Graph[{1 <-> 2, 1 <-> 3, 2 <-> 3, 4 <-> 5}]]"
+      )
+      .unwrap(),
+      "{{1, 4}}"
+    );
+    assert_eq!(
+      interpret("FindIndependentVertexSet[Graph[{a <-> b, b <-> c}]]").unwrap(),
+      "{{a, c}}"
+    );
+  }
+
+  #[test]
+  fn tie_break_uses_vertex_list_order() {
+    // Vertex 2 appears first in the vertex list, so it wins the tie
+    assert_eq!(
+      interpret("FindIndependentVertexSet[Graph[{2 <-> 1}]]").unwrap(),
+      "{{2}}"
+    );
+    assert_eq!(
+      interpret(
+        "FindIndependentVertexSet[Graph[{5 <-> 3, 3 <-> 1, 1 <-> 4, 4 <-> 2}]]"
+      )
+      .unwrap(),
+      "{{5, 1, 2}}"
+    );
+  }
+
+  #[test]
+  fn directed_and_invalid_input() {
+    // Directed graphs use the underlying undirected graph
+    assert_eq!(
+      interpret("FindIndependentVertexSet[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "{{1, 3}}"
+    );
+    assert_eq!(
+      interpret("FindIndependentVertexSet[x]").unwrap(),
+      "FindIndependentVertexSet[x]"
+    );
+  }
+}
+
+mod vertex_component {
+  use super::*;
+
+  #[test]
+  fn undirected_components() {
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}], 1]")
+        .unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}], {4}]")
+        .unwrap(),
+      "{4, 5}"
+    );
+    // BFS order from the seed, not vertex-list order
+    assert_eq!(
+      interpret("VertexComponent[Graph[{5 <-> 3, 3 <-> 1, 8 <-> 9}], 1]")
+        .unwrap(),
+      "{1, 3, 5}"
+    );
+    assert_eq!(
+      interpret(
+        "VertexComponent[Graph[{9 <-> 7, 7 <-> 5, 5 <-> 3, 2 <-> 4}], 5]"
+      )
+      .unwrap(),
+      "{5, 7, 3, 9}"
+    );
+    assert_eq!(
+      interpret("VertexComponent[Graph[{a <-> b, c <-> d}], b]").unwrap(),
+      "{b, a}"
+    );
+  }
+
+  #[test]
+  fn directed_in_components() {
+    // Directed graphs return the vertices that can REACH the seed
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 -> 2, 3 -> 2}], 1]").unwrap(),
+      "{1}"
+    );
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 -> 2, 3 -> 2}], 2]").unwrap(),
+      "{2, 1, 3}"
+    );
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 -> 2, 2 -> 1, 2 -> 3}], 1]").unwrap(),
+      "{1, 2}"
+    );
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 -> 2, 2 -> 3, 4 -> 3, 5 -> 4}], 3]")
+        .unwrap(),
+      "{3, 2, 4, 1, 5}"
+    );
+  }
+
+  #[test]
+  fn multiple_seeds_and_invalid_vertices() {
+    // Seeds expand sequentially with shared visited state
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}], {1, 4}]")
+        .unwrap(),
+      "{1, 2, 3, 4, 5}"
+    );
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 -> 2}], {2, 1}]").unwrap(),
+      "{2, 1}"
+    );
+    // Unknown vertex emits VertexComponent::inv and stays unevaluated
+    assert_eq!(
+      interpret("VertexComponent[Graph[{1 <-> 2}], 7]").unwrap(),
+      "VertexComponent[Graph[<2>, <1>], 7]"
+    );
+  }
+}
+
+mod vertex_in_out_component {
+  use super::*;
+
+  #[test]
+  fn out_component_follows_directed_edges() {
+    // Only vertices reachable from the seed along directed edges.
+    assert_eq!(
+      interpret(
+        "VertexOutComponent[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 2}], 2]"
+      )
+      .unwrap(),
+      "{2, 3, 4}"
+    );
+    // Length-bounded: at most one step out.
+    assert_eq!(
+      interpret(
+        "VertexOutComponent[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 2}], 2, 1]"
+      )
+      .unwrap(),
+      "{2, 3}"
+    );
+    // A plain directed chain: out-component of the middle is downstream only.
+    assert_eq!(
+      interpret("VertexOutComponent[Graph[{1 -> 2, 2 -> 3, 3 -> 4}], 3]")
+        .unwrap(),
+      "{3, 4}"
+    );
+    assert_eq!(
+      interpret("VertexOutComponent[Graph[{a -> b, b -> c}], a]").unwrap(),
+      "{a, b, c}"
+    );
+  }
+
+  #[test]
+  fn in_component_follows_edges_backwards() {
+    assert_eq!(
+      interpret(
+        "VertexInComponent[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 2}], 3]"
+      )
+      .unwrap(),
+      "{3, 2, 1, 4}"
+    );
+    assert_eq!(
+      interpret(
+        "VertexInComponent[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 2}], 3, 1]"
+      )
+      .unwrap(),
+      "{3, 2}"
+    );
+    // Multiple seeds expand sequentially with shared visited state.
+    assert_eq!(
+      interpret(
+        "VertexInComponent[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 2}], {1, 4}]"
+      )
+      .unwrap(),
+      "{1, 4, 3, 2}"
+    );
+  }
+
+  #[test]
+  fn undirected_edges_are_bidirectional() {
+    assert_eq!(
+      interpret("VertexOutComponent[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}], 1]")
+        .unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("VertexInComponent[Graph[{1 <-> 2, 2 <-> 3, 4 <-> 5}], 1]")
+        .unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+}
+
+mod weighted_adjacency_graph {
+  use super::*;
+
+  #[test]
+  fn symmetric_matrices_give_undirected_graphs() {
+    assert_eq!(
+      interpret("WeightedAdjacencyGraph[{{Infinity, 2, Infinity}, {2, Infinity, 5}, {Infinity, 5, Infinity}}]").unwrap(),
+      "Graph[<3>, <2>]"
+    );
+    assert_eq!(
+      interpret("EdgeList[WeightedAdjacencyGraph[{{Infinity, 2, Infinity}, {2, Infinity, 5}, {Infinity, 5, Infinity}}]]").unwrap(),
+      "{1 \u{f3d4} 2, 2 \u{f3d4} 3}"
+    );
+    // Custom vertex names
+    assert_eq!(
+      interpret("VertexList[WeightedAdjacencyGraph[{a, b, c}, {{Infinity, 2, Infinity}, {2, Infinity, 5}, {Infinity, 5, Infinity}}]]").unwrap(),
+      "{a, b, c}"
+    );
+    // Diagonal entries are self-loops; zero is a real weight, only
+    // Infinity marks absence
+    assert_eq!(
+      interpret("EdgeList[WeightedAdjacencyGraph[{{1, 2}, {2, Infinity}}]]")
+        .unwrap(),
+      "{1 \u{f3d4} 1, 1 \u{f3d4} 2}"
+    );
+  }
+
+  #[test]
+  fn asymmetric_matrices_give_directed_graphs() {
+    assert_eq!(
+      interpret(
+        "EdgeList[WeightedAdjacencyGraph[{{Infinity, 2}, {3, Infinity}}]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 2 \u{f3d5} 1}"
+    );
+  }
+
+  #[test]
+  fn weights_survive_round_trips() {
+    assert_eq!(
+      interpret("Normal[WeightedAdjacencyMatrix[WeightedAdjacencyGraph[{{Infinity, 2, Infinity}, {2, Infinity, 5}, {Infinity, 5, Infinity}}]]]").unwrap(),
+      "{{0, 2, 0}, {2, 0, 5}, {0, 5, 0}}"
+    );
+  }
+
+  #[test]
+  fn invalid_input() {
+    assert_eq!(
+      interpret("WeightedAdjacencyGraph[x]").unwrap(),
+      "WeightedAdjacencyGraph[x]"
+    );
+  }
+}
+
+mod graph_distance_weighted {
+  use super::*;
+
+  #[test]
+  fn uses_edge_weights_and_returns_reals() {
+    // Regression: EdgeWeight was ignored (returned hop count 2)
+    assert_eq!(
+      interpret("GraphDistance[WeightedAdjacencyGraph[{{Infinity, 2, Infinity}, {2, Infinity, 5}, {Infinity, 5, Infinity}}], 1, 3]").unwrap(),
+      "7."
+    );
+    assert_eq!(
+      interpret("GraphDistance[WeightedAdjacencyGraph[{{Infinity, 2}, {3, Infinity}}], 2, 1]").unwrap(),
+      "3."
+    );
+    // Dijkstra takes the cheap two-hop path over the expensive direct
+    // edge
+    assert_eq!(
+      interpret("GraphDistance[WeightedAdjacencyGraph[{{Infinity, 1, 10}, {1, Infinity, 1}, {10, 1, Infinity}}], 1, 3]").unwrap(),
+      "2."
+    );
+    // Unreachable stays Infinity; unweighted graphs keep integer hops
+    assert_eq!(
+      interpret("GraphDistance[WeightedAdjacencyGraph[{{Infinity, 2}, {Infinity, Infinity}}], 2, 1]").unwrap(),
+      "Infinity"
+    );
+    assert_eq!(
+      interpret("GraphDistance[Graph[{1 <-> 2, 2 <-> 3}], 1, 3]").unwrap(),
+      "2"
+    );
+  }
+}
+
+mod find_minimum_cost_flow {
+  use super::*;
+
+  #[test]
+  fn unit_capacity_min_cost_max_flow() {
+    // Flow 2: the direct edge (4) plus the two-hop path (2 + 1)
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 2, 4}, {0, 0, 1}, {0, 0, 0}}, 1, 3]")
+        .unwrap(),
+      "7"
+    );
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 1}, {0, 0}}, 1, 2]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 5, 2, 0}, {0, 0, 0, 3}, {0, 0, 0, 4}, {0, 0, 0, 0}}, 1, 4]").unwrap(),
+      "14"
+    );
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 1, 1, 0}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 0}}, 1, 4]").unwrap(),
+      "4"
+    );
+    // Reverse-direction entries are separate arcs
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 3}, {2, 0}}, 1, 2]").unwrap(),
+      "3"
+    );
+    // Residual rerouting: diamond with a cross edge
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 1, 2, 0}, {0, 0, 1, 2}, {0, 0, 0, 1}, {0, 0, 0, 0}}, 1, 4]").unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 9, 1, 0, 0}, {0, 0, 0, 1, 0}, {0, 0, 0, 9, 1}, {0, 0, 0, 0, 1}, {0, 0, 0, 0, 0}}, 1, 5]").unwrap(),
+      "13"
+    );
+  }
+
+  #[test]
+  fn real_costs_give_reals() {
+    assert_eq!(
+      interpret(
+        "FindMinimumCostFlow[{{0, 1.5, 0}, {0, 0, 2.5}, {0, 0, 0}}, 1, 3]"
+      )
+      .unwrap(),
+      "4."
+    );
+  }
+
+  #[test]
+  fn no_flow_stays_unevaluated() {
+    assert_eq!(
+      interpret("FindMinimumCostFlow[{{0, 0}, {0, 0}}, 1, 2]").unwrap(),
+      "FindMinimumCostFlow[{{0, 0}, {0, 0}}, 1, 2]"
+    );
+    assert_eq!(
+      interpret("FindMinimumCostFlow[x, 1, 2]").unwrap(),
+      "FindMinimumCostFlow[x, 1, 2]"
+    );
+  }
+}
+
+mod nearest_neighbor_graph {
+  use super::*;
+
+  #[test]
+  fn nearest_neighbor_edges() {
+    assert_eq!(
+      interpret("NearestNeighborGraph[{{0, 0}, {1, 0}, {5, 5}, {6, 5}}]")
+        .unwrap(),
+      "Graph[<4>, <2>]"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[NearestNeighborGraph[{{0, 0}, {1, 0}, {5, 5}, {6, 5}}]]"
+      )
+      .unwrap(),
+      "{{0, 0} \u{f3d4} {1, 0}, {5, 5} \u{f3d4} {6, 5}}"
+    );
+    // Mutual nearest neighbors collapse into single undirected edges
+    assert_eq!(
+      interpret("EdgeList[NearestNeighborGraph[{1, 2, 4, 8}]]").unwrap(),
+      "{1 \u{f3d4} 2, 2 \u{f3d4} 4, 4 \u{f3d4} 8}"
+    );
+    // Vertices keep input order even when scrambled
+    assert_eq!(
+      interpret("EdgeList[NearestNeighborGraph[{10, 3, 7}]]").unwrap(),
+      "{10 \u{f3d4} 7, 3 \u{f3d4} 7}"
+    );
+    assert_eq!(
+      interpret("VertexList[NearestNeighborGraph[{1, 2, 4, 8}]]").unwrap(),
+      "{1, 2, 4, 8}"
+    );
+  }
+
+  #[test]
+  fn ties_include_all_equidistant_points() {
+    assert_eq!(
+      interpret("EdgeList[NearestNeighborGraph[{0, 1, 2, 3}]]").unwrap(),
+      "{0 \u{f3d4} 1, 1 \u{f3d4} 2, 2 \u{f3d4} 3}"
+    );
+    assert_eq!(
+      interpret("EdgeList[NearestNeighborGraph[{0, 2, 4}]]").unwrap(),
+      "{0 \u{f3d4} 2, 2 \u{f3d4} 4}"
+    );
+  }
+
+  #[test]
+  fn k_nearest_and_real_coordinates() {
+    assert_eq!(
+      interpret("EdgeList[NearestNeighborGraph[{1, 2, 4, 8}, 2]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 4, 2 \u{f3d4} 4, 2 \u{f3d4} 8, 4 \u{f3d4} 8}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[NearestNeighborGraph[{{0, 0}, {2, 0}, {4, 1}, {1, 3}}, 2]]"
+      )
+      .unwrap(),
+      "{{0, 0} \u{f3d4} {2, 0}, {0, 0} \u{f3d4} {1, 3}, {2, 0} \u{f3d4} {4, 1}, {2, 0} \u{f3d4} {1, 3}, {4, 1} \u{f3d4} {1, 3}}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[NearestNeighborGraph[{{0., 0.}, {1.5, 0.}, {1.5, 1.}}]]"
+      )
+      .unwrap(),
+      "{{0., 0.} \u{f3d4} {1.5, 0.}, {1.5, 0.} \u{f3d4} {1.5, 1.}}"
+    );
+  }
+
+  #[test]
+  fn invalid_input() {
+    // NearestNeighborGraph::list message
+    assert_eq!(
+      interpret("NearestNeighborGraph[x]").unwrap(),
+      "NearestNeighborGraph[x]"
+    );
+  }
+}
+
+mod harary_graph {
+  use super::*;
+
+  #[test]
+  fn displays_as_graph_summary() {
+    assert_eq!(interpret("HararyGraph[2, 8]").unwrap(), "Graph[<8>, <8>]");
+    assert_eq!(interpret("HararyGraph[4, 9]").unwrap(), "Graph[<9>, <18>]");
+  }
+
+  #[test]
+  fn even_k_is_circulant() {
+    // H_{2,n} is the cycle; H_{2r,n} connects each vertex to its r
+    // nearest neighbors on each side
+    assert_eq!(
+      interpret("EdgeList[HararyGraph[2, 8]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 8, 2 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 5, 5 \u{f3d4} 6, 6 \u{f3d4} 7, 7 \u{f3d4} 8}"
+    );
+    assert_eq!(interpret("EdgeCount[HararyGraph[4, 8]]").unwrap(), "16");
+  }
+
+  #[test]
+  fn odd_k_even_n_adds_diameters() {
+    // H_{3,8}: cycle plus the four diameters
+    assert_eq!(
+      interpret("EdgeList[HararyGraph[3, 8]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 5, 1 \u{f3d4} 8, 2 \u{f3d4} 3, 2 \u{f3d4} 6, 3 \u{f3d4} 4, 3 \u{f3d4} 7, 4 \u{f3d4} 5, 4 \u{f3d4} 8, 5 \u{f3d4} 6, 6 \u{f3d4} 7, 7 \u{f3d4} 8}"
+    );
+  }
+
+  #[test]
+  fn odd_k_odd_n_adds_half_diagonals() {
+    // H_{3,7}: cycle, the (1, 1+(n-1)/2) edge, and (i, i+(n+1)/2)
+    assert_eq!(
+      interpret("EdgeList[HararyGraph[3, 7]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 4, 1 \u{f3d4} 5, 1 \u{f3d4} 7, 2 \u{f3d4} 3, 2 \u{f3d4} 6, 3 \u{f3d4} 4, 3 \u{f3d4} 7, 4 \u{f3d4} 5, 5 \u{f3d4} 6, 6 \u{f3d4} 7}"
+    );
+  }
+
+  #[test]
+  fn k_equals_n_minus_one_is_complete() {
+    assert_eq!(interpret("EdgeCount[HararyGraph[7, 8]]").unwrap(), "28");
+    assert_eq!(
+      interpret("EdgeList[HararyGraph[2, 3]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 3}"
+    );
+  }
+
+  #[test]
+  fn edge_count_is_ceil_kn_over_2() {
+    assert_eq!(interpret("EdgeCount[HararyGraph[3, 11]]").unwrap(), "17");
+    assert_eq!(interpret("VertexCount[HararyGraph[4, 9]]").unwrap(), "9");
+    assert_eq!(
+      interpret("VertexList[HararyGraph[3, 11]]").unwrap(),
+      "{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}"
+    );
+  }
+
+  #[test]
+  fn options_are_accepted_and_ignored() {
+    assert_eq!(
+      interpret("HararyGraph[3, 7, PlotLabel -> x]").unwrap(),
+      "Graph[<7>, <11>]"
+    );
+  }
+
+  #[test]
+  fn k_must_be_at_least_two() {
+    assert_eq!(interpret("HararyGraph[1, 5]").unwrap(), "HararyGraph[1, 5]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "HararyGraph::intg: Integer greater than 1 expected at position 1 in HararyGraph[1, 5]."
+      )),
+      "expected intg message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn n_must_exceed_k() {
+    assert_eq!(interpret("HararyGraph[8, 8]").unwrap(), "HararyGraph[8, 8]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "HararyGraph::intg: Integer greater than 8 expected at position 2 in HararyGraph[8, 8]."
+      )),
+      "expected intg message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn non_positive_and_real_arguments_warn_intpm() {
+    assert_eq!(interpret("HararyGraph[0, 5]").unwrap(), "HararyGraph[0, 5]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "HararyGraph::intpm: Positive machine-sized integer expected at position 1 in HararyGraph[0, 5]."
+      )),
+      "expected intpm message, got {msgs:?}"
+    );
+    assert_eq!(
+      interpret("HararyGraph[3, 7.5]").unwrap(),
+      "HararyGraph[3, 7.5]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "HararyGraph::intpm: Positive machine-sized integer expected at position 2 in HararyGraph[3, 7.5]."
+      )),
+      "expected intpm message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn symbolic_arguments_stay_unevaluated_silently() {
+    assert_eq!(interpret("HararyGraph[2, n]").unwrap(), "HararyGraph[2, n]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(msgs.is_empty(), "expected no messages, got {msgs:?}");
+  }
+
+  #[test]
+  fn non_option_extra_argument_warns_nonopt() {
+    assert_eq!(
+      interpret("HararyGraph[3, 7, 1]").unwrap(),
+      "HararyGraph[3, 7, 1]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "HararyGraph::nonopt: Options expected (instead of 1) beyond position 2 in HararyGraph[3, 7, 1]."
+      )),
+      "expected nonopt message, got {msgs:?}"
+    );
+  }
+}
+
+mod connectivity {
+  use super::*;
+
+  #[test]
+  fn edge_connectivity_basic() {
+    assert_eq!(
+      interpret("EdgeConnectivity[CompleteGraph[5]]").unwrap(),
+      "4"
+    );
+    assert_eq!(interpret("EdgeConnectivity[CycleGraph[6]]").unwrap(), "2");
+    assert_eq!(interpret("EdgeConnectivity[StarGraph[6]]").unwrap(), "1");
+    assert_eq!(
+      interpret("EdgeConnectivity[PathGraph[Range[5]]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("EdgeConnectivity[PetersenGraph[5, 2]]").unwrap(),
+      "3"
+    );
+  }
+
+  // Directed edge connectivity is the smallest s-t edge cut over all ordered
+  // vertex pairs (0 when the graph is not strongly connected).
+  #[test]
+  fn edge_connectivity_directed() {
+    assert_eq!(
+      interpret("EdgeConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "1"
+    );
+    // The complete digraph on three vertices has two arc-disjoint s-t paths.
+    assert_eq!(
+      interpret(
+        "EdgeConnectivity[Graph[{1 -> 2, 2 -> 1, 1 -> 3, 2 -> 3, 3 -> 1, \
+         3 -> 2}]]"
+      )
+      .unwrap(),
+      "2"
+    );
+    // A directed path is not strongly connected.
+    assert_eq!(
+      interpret("EdgeConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn vertex_connectivity_basic() {
+    assert_eq!(
+      interpret("VertexConnectivity[CompleteGraph[5]]").unwrap(),
+      "4"
+    );
+    assert_eq!(interpret("VertexConnectivity[CycleGraph[6]]").unwrap(), "2");
+    assert_eq!(interpret("VertexConnectivity[StarGraph[6]]").unwrap(), "1");
+    assert_eq!(
+      interpret("VertexConnectivity[PetersenGraph[5, 2]]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[GridGraph[{3, 3}]]").unwrap(),
+      "2"
+    );
+  }
+
+  // Directed vertex connectivity is the smallest s-t vertex cut over ordered
+  // non-adjacent pairs (n-1 for the complete digraph, 0 when not strongly
+  // connected).
+  #[test]
+  fn vertex_connectivity_directed() {
+    assert_eq!(
+      interpret("VertexConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret(
+        "VertexConnectivity[Graph[{1 -> 2, 2 -> 1, 1 -> 3, 2 -> 3, 3 -> 1, \
+         3 -> 2}]]"
+      )
+      .unwrap(),
+      "2"
+    );
+    // A directed path is not strongly connected.
+    assert_eq!(
+      interpret("VertexConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]").unwrap(),
+      "0"
+    );
+    // Vertex 2 is a cut vertex of this strongly connected digraph.
+    assert_eq!(
+      interpret("VertexConnectivity[Graph[{1 -> 2, 2 -> 1, 2 -> 3, 3 -> 2}]]")
+        .unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn harary_graphs_are_exactly_k_connected() {
+    // H_{k,n} is the minimal k-connected graph — cross-validates both
+    // HararyGraph and the connectivity algorithms
+    assert_eq!(
+      interpret(
+        "Table[{VertexConnectivity[HararyGraph[k, 9]], EdgeConnectivity[HararyGraph[k, 9]]}, {k, 2, 8}]"
+      )
+      .unwrap(),
+      "{{2, 2}, {3, 3}, {4, 4}, {5, 5}, {6, 6}, {7, 7}, {8, 8}}"
+    );
+  }
+
+  #[test]
+  fn disconnected_graphs_have_zero_connectivity() {
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4}, {1 <-> 2, 3 <-> 4}]; {EdgeConnectivity[g], VertexConnectivity[g]}"
+      )
+      .unwrap(),
+      "{0, 0}"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[Graph[{1, 2, 3}, {}]]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn s_t_connectivity() {
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4, 5, 6}, {1 <-> 2, 2 <-> 3, 3 <-> 4, 1 <-> 5, 5 <-> 6, 6 <-> 4, 2 <-> 5, 3 <-> 6}]; {EdgeConnectivity[g, 2, 6], VertexConnectivity[g, 2, 6]}"
+      )
+      .unwrap(),
+      "{2, 2}"
+    );
+    // Non-adjacent pair on a cycle
+    assert_eq!(
+      interpret("VertexConnectivity[CycleGraph[5], 1, 3]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn adjacent_vertices_have_vertex_connectivity_zero() {
+    // wolframscript convention: no vertex cut separates adjacent vertices
+    assert_eq!(
+      interpret("VertexConnectivity[CycleGraph[5], 1, 2]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[CompleteGraph[5], 1, 2]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn same_vertex_artifacts() {
+    // wolframscript: s == t gives the degree (edge) or edge count (vertex)
+    assert_eq!(
+      interpret("EdgeConnectivity[StarGraph[6], 1, 1]").unwrap(),
+      "5"
+    );
+    assert_eq!(
+      interpret("EdgeConnectivity[StarGraph[6], 3, 3]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[CompleteGraph[5], 1, 1]").unwrap(),
+      "10"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[CycleGraph[5], 1, 1]").unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn single_vertex_graph() {
+    // wolframscript: EdgeConnectivity stays unevaluated, VertexConnectivity
+    // gives 0
+    assert_eq!(
+      interpret("EdgeConnectivity[Graph[{1}, {}]]").unwrap(),
+      "EdgeConnectivity[Graph[<1>, <0>]]"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[Graph[{1}, {}]]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn invalid_vertex_emits_inv_message() {
+    assert_eq!(
+      interpret("EdgeConnectivity[CycleGraph[5], 1, 7]").unwrap(),
+      "EdgeConnectivity[Graph[<5>, <5>], 1, 7]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "EdgeConnectivity::inv: The argument 3 in EdgeConnectivity[Graph[<5>, <5>], 1, 7] is not a valid vertex."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+    assert_eq!(
+      interpret("VertexConnectivity[CycleGraph[5], 9, 2]").unwrap(),
+      "VertexConnectivity[Graph[<5>, <5>], 9, 2]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "VertexConnectivity::inv: The argument 2 in VertexConnectivity[Graph[<5>, <5>], 9, 2] is not a valid vertex."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn non_graph_argument_stays_unevaluated() {
+    assert_eq!(
+      interpret("EdgeConnectivity[x]").unwrap(),
+      "EdgeConnectivity[x]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(msgs.is_empty(), "expected no messages, got {msgs:?}");
+  }
+}
+
+mod k_core_components {
+  use super::*;
+
+  #[test]
+  fn finds_k_core_components() {
+    // Two 3-cores joined by a path through vertex 5
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4, 5, 6, 7, 8, 9}, {1 <-> 2, 1 <-> 3, 1 <-> 4, 2 <-> 3, 2 <-> 4, 3 <-> 4, 4 <-> 5, 5 <-> 6, 6 <-> 7, 6 <-> 8, 6 <-> 9, 7 <-> 8, 7 <-> 9, 8 <-> 9}]; KCoreComponents[g, 3]"
+      )
+      .unwrap(),
+      "{{6, 7, 8, 9}, {1, 2, 3, 4}}"
+    );
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5], 2]").unwrap(),
+      "{{1, 2, 3, 4, 5}}"
+    );
+    assert_eq!(
+      interpret("KCoreComponents[PetersenGraph[5, 2], 3]").unwrap(),
+      "{{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}}"
+    );
+  }
+
+  #[test]
+  fn component_ordering() {
+    // Size descending, ties broken by descending position of the first
+    // member in the vertex list
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 4 <-> 5, 4 <-> 6, 4 <-> 7, 5 <-> 6, 5 <-> 7, 6 <-> 7, 9 <-> 10, 9 <-> 11, 10 <-> 11}]; KCoreComponents[g, 2]"
+      )
+      .unwrap(),
+      "{{4, 5, 6, 7}, {9, 10, 11}, {1, 2, 3}}"
+    );
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 10}, {1 <-> 10, 2 <-> 3}]; KCoreComponents[g, 1]"
+      )
+      .unwrap(),
+      "{{2, 3}, {1, 10}}"
+    );
+    // Members appear in VertexList order, not sorted by value
+    assert_eq!(
+      interpret(
+        "g = Graph[{5, 4, 3, 2, 1}, {5 <-> 4, 2 <-> 1}]; KCoreComponents[g, 1]"
+      )
+      .unwrap(),
+      "{{2, 1}, {5, 4}}"
+    );
+  }
+
+  #[test]
+  fn k_larger_than_max_degree_gives_empty() {
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5], 7]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn degree_one_core_keeps_leaves() {
+    assert_eq!(
+      interpret("KCoreComponents[StarGraph[6], 1]").unwrap(),
+      "{{1, 2, 3, 4, 5, 6}}"
+    );
+    assert_eq!(
+      interpret("KCoreComponents[CompleteGraph[6], 5]").unwrap(),
+      "{{1, 2, 3, 4, 5, 6}}"
+    );
+    assert_eq!(
+      interpret("KCoreComponents[WheelGraph[7], 3]").unwrap(),
+      "{{1, 2, 3, 4, 5, 6, 7}}"
+    );
+  }
+
+  #[test]
+  fn in_out_parameter_accepted() {
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5], 2, \"In\"]").unwrap(),
+      "{{1, 2, 3, 4, 5}}"
+    );
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5], 2, \"Out\"]").unwrap(),
+      "{{1, 2, 3, 4, 5}}"
+    );
+  }
+
+  #[test]
+  fn invalid_parameter_emits_inv() {
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5], 2, \"Bogus\"]").unwrap(),
+      "KCoreComponents[Graph[<5>, <5>], 2, Bogus]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "KCoreComponents::inv: The argument Bogus in KCoreComponents[Graph[<5>, <5>], 2, Bogus] is not a valid parameter."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn non_integer_k_emits_int() {
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5], 1.5]").unwrap(),
+      "KCoreComponents[Graph[<5>, <5>], 1.5]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "KCoreComponents::int: Integer expected at position 2 in KCoreComponents[Graph[<5>, <5>], 1.5]."
+      )),
+      "expected int message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn wrong_arg_count_emits_argtu() {
+    assert_eq!(
+      interpret("KCoreComponents[CycleGraph[5]]").unwrap(),
+      "KCoreComponents[Graph[<5>, <5>]]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "KCoreComponents::argtu: KCoreComponents called with 1 argument; 2 or 3 arguments are expected."
+      )),
+      "expected argtu message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn non_graph_stays_unevaluated() {
+    assert_eq!(
+      interpret("KCoreComponents[x, 2]").unwrap(),
+      "KCoreComponents[x, 2]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(msgs.is_empty(), "expected no messages, got {msgs:?}");
+  }
+}
+
+mod find_clique {
+  use super::*;
+
+  #[test]
+  fn finds_largest_clique() {
+    assert_eq!(
+      interpret("FindClique[CompleteGraph[4]]").unwrap(),
+      "{{1, 2, 3, 4}}"
+    );
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4, 5}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4, 4 <-> 5}]; FindClique[g]"
+      )
+      .unwrap(),
+      "{{1, 2, 3}}"
+    );
+    assert_eq!(interpret("FindClique[CycleGraph[6]]").unwrap(), "{{1, 2}}");
+  }
+
+  #[test]
+  fn largest_means_largest_not_first() {
+    // The lexicographically first maximal clique {1, 2} is smaller than
+    // the triangle — the triangle must win
+    assert_eq!(
+      interpret(
+        "g4 = Graph[{1, 2, 3, 4, 5}, {1 <-> 2, 3 <-> 4, 3 <-> 5, 4 <-> 5}]; FindClique[g4]"
+      )
+      .unwrap(),
+      "{{3, 4, 5}}"
+    );
+    // Ties go to the ascending-lexicographic first
+    assert_eq!(
+      interpret(
+        "g2 = Graph[{1, 2, 3, 4, 5, 6}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 4 <-> 5, 4 <-> 6, 5 <-> 6}]; FindClique[g2]"
+      )
+      .unwrap(),
+      "{{1, 2, 3}}"
+    );
+  }
+
+  #[test]
+  fn only_maximal_cliques_count() {
+    // Every edge of a triangle is inside the triangle, so no maximal
+    // clique has size <= 2
+    assert_eq!(
+      interpret(
+        "g2 = Graph[{1, 2, 3, 4, 5, 6}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 4 <-> 5, 4 <-> 6, 5 <-> 6}]; FindClique[g2, 2, All]"
+      )
+      .unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn all_results_sorted_size_then_reverse_lex() {
+    assert_eq!(
+      interpret("FindClique[CycleGraph[6], 2, All]").unwrap(),
+      "{{5, 6}, {4, 5}, {3, 4}, {2, 3}, {1, 6}, {1, 2}}"
+    );
+    assert_eq!(
+      interpret(
+        "g3 = Graph[{1, 2, 3, 4, 5, 6, 7}, {1 <-> 2, 2 <-> 3, 3 <-> 1, 3 <-> 4, 4 <-> 5, 5 <-> 6, 6 <-> 4, 6 <-> 7}]; FindClique[g3, 3, All]"
+      )
+      .unwrap(),
+      "{{4, 5, 6}, {1, 2, 3}, {6, 7}, {3, 4}}"
+    );
+  }
+
+  #[test]
+  fn count_takes_ascending_enumeration_prefix() {
+    // count k >= 2: first k maximal cliques in ascending order, then
+    // sorted by size descending / lex descending
+    assert_eq!(
+      interpret(
+        "g3 = Graph[{1, 2, 3, 4, 5, 6, 7}, {1 <-> 2, 2 <-> 3, 3 <-> 1, 3 <-> 4, 4 <-> 5, 5 <-> 6, 6 <-> 4, 6 <-> 7}]; FindClique[g3, 3, 2]"
+      )
+      .unwrap(),
+      "{{1, 2, 3}, {3, 4}}"
+    );
+    assert_eq!(
+      interpret(
+        "g3 = Graph[{1, 2, 3, 4, 5, 6, 7}, {1 <-> 2, 2 <-> 3, 3 <-> 1, 3 <-> 4, 4 <-> 5, 5 <-> 6, 6 <-> 4, 6 <-> 7}]; FindClique[g3, 3, 3]"
+      )
+      .unwrap(),
+      "{{4, 5, 6}, {1, 2, 3}, {3, 4}}"
+    );
+  }
+
+  #[test]
+  fn size_specifications() {
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4, 5}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4, 4 <-> 5}]; {FindClique[g, 2], FindClique[g, {2}], FindClique[g, {1, 2}]}"
+      )
+      .unwrap(),
+      "{{{3, 4}}, {{3, 4}}, {{3, 4}}}"
+    );
+    assert_eq!(
+      interpret("FindClique[CompleteGraph[5], {3}, All]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("FindClique[CycleGraph[5], Infinity, All]").unwrap(),
+      "{{4, 5}, {3, 4}, {2, 3}, {1, 5}, {1, 2}}"
+    );
+  }
+
+  #[test]
+  fn isolated_vertices_are_one_cliques() {
+    assert_eq!(interpret("FindClique[Graph[{1, 2}, {}]]").unwrap(), "{{1}}");
+    assert_eq!(interpret("FindClique[Graph[{}, {}]]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn invalid_spec_emits_inv() {
+    assert_eq!(
+      interpret("FindClique[CycleGraph[5], 0]").unwrap(),
+      "FindClique[Graph[<5>, <5>], 0]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "FindClique::inv: The argument 0 in FindClique[Graph[<5>, <5>], 0] is not a valid parameter."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+    assert_eq!(
+      interpret("FindClique[CycleGraph[5], {1, 2, 3}]").unwrap(),
+      "FindClique[Graph[<5>, <5>], {1, 2, 3}]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "FindClique::inv: The argument {1, 2, 3} in FindClique[Graph[<5>, <5>], {1, 2, 3}] is not a valid parameter."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+  }
+
+  #[test]
+  fn non_graph_stays_unevaluated() {
+    assert_eq!(interpret("FindClique[x]").unwrap(), "FindClique[x]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(msgs.is_empty(), "expected no messages, got {msgs:?}");
+  }
+}
+
+mod petersen_graph_labeling {
+  use super::*;
+
+  #[test]
+  fn matches_wolfram_vertex_convention() {
+    // Regression: wolframscript labels the k-jump ring 1..n and the plain
+    // cycle n+1..2n (Woxi previously had them swapped), with edges sorted
+    assert_eq!(
+      interpret("EdgeList[PetersenGraph[5, 2]]").unwrap(),
+      "{1 \u{f3d4} 3, 1 \u{f3d4} 4, 1 \u{f3d4} 6, 2 \u{f3d4} 4, 2 \u{f3d4} 5, 2 \u{f3d4} 7, 3 \u{f3d4} 5, 3 \u{f3d4} 8, 4 \u{f3d4} 9, 5 \u{f3d4} 10, 6 \u{f3d4} 7, 6 \u{f3d4} 10, 7 \u{f3d4} 8, 8 \u{f3d4} 9, 9 \u{f3d4} 10}"
+    );
+    assert_eq!(
+      interpret("FindClique[PetersenGraph[5, 2]]").unwrap(),
+      "{{1, 3}}"
+    );
+  }
+}
+
+mod subgraph {
+  use super::*;
+
+  #[test]
+  fn induced_subgraph() {
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4, 5}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4, 4 <-> 5}]; EdgeList[Subgraph[g, {1, 2, 3}]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 3}"
+    );
+    assert_eq!(
+      interpret("EdgeList[Subgraph[CompleteGraph[5], {2, 3, 5}]]").unwrap(),
+      "{2 \u{f3d4} 3, 2 \u{f3d4} 5, 3 \u{f3d4} 5}"
+    );
+    assert_eq!(
+      interpret("EdgeList[Subgraph[PetersenGraph[5, 2], {1, 3, 5, 6}]]")
+        .unwrap(),
+      "{1 \u{f3d4} 3, 3 \u{f3d4} 5, 1 \u{f3d4} 6}"
+    );
+  }
+
+  #[test]
+  fn keeps_given_vertex_order() {
+    assert_eq!(
+      interpret(
+        "g = CycleGraph[6]; {VertexList[Subgraph[g, {5, 2, 1}]], EdgeList[Subgraph[g, {5, 2, 1}]]}"
+      )
+      .unwrap(),
+      "{{5, 2, 1}, {2 \u{f3d4} 1}}"
+    );
+    assert_eq!(
+      interpret("EdgeList[Subgraph[CycleGraph[6], {4, 3, 2}]]").unwrap(),
+      "{4 \u{f3d4} 3, 3 \u{f3d4} 2}"
+    );
+  }
+
+  #[test]
+  fn unknown_vertices_ignored() {
+    assert_eq!(
+      interpret("Subgraph[CycleGraph[5], {1, 9}]").unwrap(),
+      "Graph[<1>, <0>]"
+    );
+    assert_eq!(
+      interpret("Subgraph[CycleGraph[5], {}]").unwrap(),
+      "Graph[<0>, <0>]"
+    );
+  }
+
+  #[test]
+  fn single_vertex_spec_and_non_graph() {
+    assert_eq!(
+      interpret("Subgraph[CycleGraph[5], 3]").unwrap(),
+      "Graph[<1>, <0>]"
+    );
+    assert_eq!(interpret("Subgraph[x, {1}]").unwrap(), "Subgraph[x, {1}]");
+  }
+}
+
+mod highlight_graph {
+  use super::*;
+
+  const G: &str = "Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}]";
+
+  #[test]
+  fn returns_a_graph_with_the_same_parts() {
+    // Highlighting styles the picture; it must not change the graph.
+    assert_eq!(
+      interpret(&format!("HighlightGraph[{G}, {{1}}]")).unwrap(),
+      "Graph[<3>, <3>]"
+    );
+    assert_eq!(
+      interpret(&format!("VertexList[HighlightGraph[{G}, {{1, 2}}]]")).unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "ToString[EdgeList[HighlightGraph[{G}, {{1 <-> 2}}]], InputForm]"
+      ))
+      .unwrap(),
+      "{UndirectedEdge[1, 2], UndirectedEdge[2, 3], UndirectedEdge[3, 1]}"
+    );
+  }
+
+  // The highlighted parts are recorded on the graph, so they can be read
+  // back with AnnotationValue — with their Style wrappers dropped.
+  #[test]
+  fn records_the_highlighted_parts_as_an_annotation() {
+    assert_eq!(
+      interpret(&format!(
+        "AnnotationValue[HighlightGraph[{G}, {{2}}], GraphHighlight]"
+      ))
+      .unwrap(),
+      "{2}"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "AnnotationValue[HighlightGraph[{G}, \
+         {{Style[1, Green], Style[3, Blue]}}], GraphHighlight]"
+      ))
+      .unwrap(),
+      "{1, 3}"
+    );
+    // A part that is not in the graph is not highlighted, so not recorded.
+    assert_eq!(
+      interpret(&format!(
+        "AnnotationValue[HighlightGraph[{G}, {{9}}], GraphHighlight]"
+      ))
+      .unwrap(),
+      "{}"
+    );
+    // An edge counts too.
+    assert_eq!(
+      interpret(&format!(
+        "Length[AnnotationValue[HighlightGraph[{G}, 1 <-> 2], GraphHighlight]]"
+      ))
+      .unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn highlights_vertices_in_red_by_default() {
+    let svg = interpret(&format!(
+      "ExportString[HighlightGraph[{G}, {{1}}], \"SVG\"]"
+    ))
+    .unwrap();
+    assert_eq!(svg.matches("fill=\"rgb(255,0,0)\"").count(), 1);
+    // The other two vertices keep the default blue.
+    assert_eq!(svg.matches("fill=\"rgb(66,116,183)\"").count(), 2);
+  }
+
+  #[test]
+  fn highlights_edges_in_red_by_default() {
+    let svg = interpret(&format!(
+      "ExportString[HighlightGraph[{G}, {{1 <-> 2}}], \"SVG\"]"
+    ))
+    .unwrap();
+    assert_eq!(svg.matches("stroke=\"rgb(255,0,0)\"").count(), 1);
+    assert_eq!(svg.matches("stroke=\"rgb(153,153,153)\"").count(), 2);
+  }
+
+  #[test]
+  fn a_bare_part_needs_no_list() {
+    let svg =
+      interpret(&format!("ExportString[HighlightGraph[{G}, 2], \"SVG\"]"))
+        .unwrap();
+    assert_eq!(svg.matches("fill=\"rgb(255,0,0)\"").count(), 1);
+  }
+
+  #[test]
+  fn style_wrapper_picks_the_highlight_color() {
+    let svg = interpret(&format!(
+      "ExportString[HighlightGraph[{G}, {{Style[1, Green], Style[2, Blue]}}], \
+       \"SVG\"]"
+    ))
+    .unwrap();
+    assert!(svg.contains("fill=\"rgb(0,255,0)\""));
+    assert!(svg.contains("fill=\"rgb(0,0,255)\""));
+  }
+
+  #[test]
+  fn a_color_function_may_supply_the_style() {
+    // The idiom used by Wolfram demonstrations: one Style per vertex, its
+    // color read out of a named gradient.
+    let svg = interpret(
+      "g = Graph[{1 <-> 2, 2 <-> 3}]; \
+       ExportString[HighlightGraph[g, \
+       Table[Style[VertexList[g][[i]], ColorData[\"DarkRainbow\"][i/3]], \
+       {i, VertexCount[g]}]], \"SVG\"]",
+    )
+    .unwrap();
+    // Every vertex gets its own color, so the default blue is gone.
+    assert!(!svg.contains("fill=\"rgb(66,116,183)\""));
+  }
+
+  #[test]
+  fn a_subgraph_highlights_all_of_its_parts() {
+    let svg = interpret(&format!(
+      "ExportString[HighlightGraph[{G}, Subgraph[{G}, {{1, 2}}]], \"SVG\"]"
+    ))
+    .unwrap();
+    // Vertices 1 and 2 plus the edge between them.
+    assert_eq!(svg.matches("fill=\"rgb(255,0,0)\"").count(), 2);
+    assert_eq!(svg.matches("stroke=\"rgb(255,0,0)\"").count(), 1);
+  }
+
+  #[test]
+  fn parts_not_in_the_graph_are_ignored() {
+    let svg = interpret(&format!(
+      "ExportString[HighlightGraph[{G}, {{99, 1}}], \"SVG\"]"
+    ))
+    .unwrap();
+    assert_eq!(svg.matches("fill=\"rgb(255,0,0)\"").count(), 1);
+  }
+
+  #[test]
+  fn trailing_options_reach_the_graph() {
+    let svg = interpret(&format!(
+      "ExportString[HighlightGraph[{G}, {{1}}, VertexLabels -> \"Name\"], \
+       \"SVG\"]"
+    ))
+    .unwrap();
+    assert!(svg.contains(">1</text>"));
+  }
+
+  #[test]
+  fn the_highlight_wins_over_the_graphs_own_style() {
+    let svg = interpret(
+      "ExportString[HighlightGraph[Graph[{1 <-> 2, 2 <-> 3}, \
+       VertexStyle -> Orange], {2}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("fill=\"rgb(255,0,0)\"").count(), 1);
+    // The un-highlighted vertices keep the graph's own orange.
+    assert_eq!(svg.matches("fill=\"rgb(255,128,0)\"").count(), 2);
+  }
+
+  #[test]
+  fn non_graph_first_argument_stays_unevaluated() {
+    assert_eq!(
+      interpret("HighlightGraph[x, {1}]").unwrap(),
+      "HighlightGraph[x, {1}]"
+    );
+  }
+}
+
+mod graph_style_rules {
+  use super::*;
+
+  #[test]
+  fn vertex_style_accepts_per_vertex_rules() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3}, \
+       VertexStyle -> {1 -> Red, 3 -> Green}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.contains("fill=\"rgb(255,0,0)\""));
+    assert!(svg.contains("fill=\"rgb(0,255,0)\""));
+    // Vertex 2 is not named by a rule and keeps the default blue.
+    assert_eq!(svg.matches("fill=\"rgb(66,116,183)\"").count(), 1);
+  }
+
+  #[test]
+  fn vertex_style_rules_override_a_default_directive() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3}, \
+       VertexStyle -> {Yellow, 1 -> Red}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("fill=\"rgb(255,0,0)\"").count(), 1);
+    assert_eq!(svg.matches("fill=\"rgb(255,255,0)\"").count(), 2);
+  }
+
+  #[test]
+  fn edge_style_accepts_per_edge_rules() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3}, \
+       EdgeStyle -> {1 <-> 2 -> Red}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("stroke=\"rgb(255,0,0)\"").count(), 1);
+    assert_eq!(svg.matches("stroke=\"rgb(153,153,153)\"").count(), 1);
+  }
+
+  #[test]
+  fn an_undirected_style_rule_matches_either_orientation() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3}, \
+       EdgeStyle -> {2 <-> 1 -> Red}], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("stroke=\"rgb(255,0,0)\"").count(), 1);
+  }
+
+  #[test]
+  fn a_plain_directive_still_styles_every_part() {
+    let svg = interpret(
+      "ExportString[Graph[{1 <-> 2, 2 <-> 3}, VertexStyle -> Green], \"SVG\"]",
+    )
+    .unwrap();
+    assert_eq!(svg.matches("fill=\"rgb(0,255,0)\"").count(), 3);
+  }
+}
+
+mod line_graph {
+  use super::*;
+
+  #[test]
+  fn line_graph_of_generators() {
+    // Vertices index the edges in EdgeList order
+    assert_eq!(
+      interpret(
+        "{VertexList[LineGraph[CycleGraph[4]]], EdgeList[LineGraph[CycleGraph[4]]]}"
+      )
+      .unwrap(),
+      "{{1, 2, 3, 4}, {1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 4, 3 \u{f3d4} 4}}"
+    );
+    assert_eq!(
+      interpret("EdgeList[LineGraph[CycleGraph[5]]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 5, 3 \u{f3d4} 4, 4 \u{f3d4} 5}"
+    );
+    // The line graph of a star is a complete graph
+    assert_eq!(
+      interpret("EdgeList[LineGraph[StarGraph[5]]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 1 \u{f3d4} 4, 2 \u{f3d4} 3, 2 \u{f3d4} 4, 3 \u{f3d4} 4}"
+    );
+  }
+
+  #[test]
+  fn line_graph_of_complete_graph() {
+    assert_eq!(
+      interpret("LineGraph[CompleteGraph[4]]").unwrap(),
+      "Graph[<6>, <12>]"
+    );
+  }
+
+  #[test]
+  fn edgeless_and_non_graph() {
+    assert_eq!(
+      interpret("LineGraph[Graph[{1, 2}, {}]]").unwrap(),
+      "Graph[<0>, <0>]"
+    );
+    assert_eq!(interpret("LineGraph[x]").unwrap(), "LineGraph[x]");
+  }
+}
+
+mod cycle_graph_edge_order {
+  use super::*;
+
+  #[test]
+  fn edges_are_sorted() {
+    // Regression: the wrap-around edge previously appeared last as n <-> 1
+    assert_eq!(
+      interpret("EdgeList[CycleGraph[4]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 4, 2 \u{f3d4} 3, 3 \u{f3d4} 4}"
+    );
+    assert_eq!(
+      interpret("EdgeList[CycleGraph[6]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 6, 2 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 5, 5 \u{f3d4} 6}"
+    );
+  }
+
+  #[test]
+  fn degenerate_cycles_are_literal() {
+    // wolframscript: CycleGraph[1] has a self-loop, CycleGraph[2] a
+    // doubled edge
+    assert_eq!(
+      interpret("EdgeList[CycleGraph[1]]").unwrap(),
+      "{1 \u{f3d4} 1}"
+    );
+    assert_eq!(
+      interpret("EdgeList[CycleGraph[2]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 2}"
+    );
+  }
+}
+
+mod neighborhood_graph {
+  use super::*;
+
+  #[test]
+  fn center_and_neighbors() {
+    assert_eq!(
+      interpret(
+        "{VertexList[NeighborhoodGraph[CycleGraph[6], 1]], EdgeList[NeighborhoodGraph[CycleGraph[6], 1]]}"
+      )
+      .unwrap(),
+      "{{1, 2, 6}, {1 \u{f3d4} 2, 1 \u{f3d4} 6}}"
+    );
+    assert_eq!(
+      interpret(
+        "{VertexList[NeighborhoodGraph[PetersenGraph[5, 2], 1]], EdgeList[NeighborhoodGraph[PetersenGraph[5, 2], 1]]}"
+      )
+      .unwrap(),
+      "{{1, 3, 4, 6}, {1 \u{f3d4} 3, 1 \u{f3d4} 4, 1 \u{f3d4} 6}}"
+    );
+  }
+
+  #[test]
+  fn center_incident_edges_come_first() {
+    // Center 3 of K4: incident edges first with the center endpoint
+    // first, then the remaining edges in canonical order
+    assert_eq!(
+      interpret("EdgeList[NeighborhoodGraph[CompleteGraph[4], 3]]").unwrap(),
+      "{3 \u{f3d4} 1, 3 \u{f3d4} 2, 3 \u{f3d4} 4, 1 \u{f3d4} 2, 1 \u{f3d4} 4, 2 \u{f3d4} 4}"
+    );
+    assert_eq!(
+      interpret("EdgeList[NeighborhoodGraph[WheelGraph[6], 1]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 1 \u{f3d4} 4, 1 \u{f3d4} 5, 1 \u{f3d4} 6, 2 \u{f3d4} 3, 2 \u{f3d4} 6, 3 \u{f3d4} 4, 4 \u{f3d4} 5, 5 \u{f3d4} 6}"
+    );
+  }
+
+  #[test]
+  fn multiple_centers() {
+    assert_eq!(
+      interpret(
+        "g = CycleGraph[8]; {VertexList[NeighborhoodGraph[g, {1, 4}]], EdgeList[NeighborhoodGraph[g, {1, 4}]]}"
+      )
+      .unwrap(),
+      "{{1, 4, 2, 8, 3, 5}, {1 \u{f3d4} 2, 1 \u{f3d4} 8, 4 \u{f3d4} 3, 4 \u{f3d4} 5, 2 \u{f3d4} 3}}"
+    );
+  }
+
+  #[test]
+  fn radius_parameter() {
+    assert_eq!(
+      interpret(
+        "{VertexList[NeighborhoodGraph[CycleGraph[8], 1, 2]], EdgeList[NeighborhoodGraph[CycleGraph[8], 1, 2]]}"
+      )
+      .unwrap(),
+      "{{1, 2, 3, 7, 8}, {1 \u{f3d4} 2, 1 \u{f3d4} 8, 2 \u{f3d4} 3, 7 \u{f3d4} 8}}"
+    );
+    // Radius 0 keeps only the center
+    assert_eq!(
+      interpret("VertexList[NeighborhoodGraph[CycleGraph[5], 2, 0]]").unwrap(),
+      "{2}"
+    );
+  }
+
+  #[test]
+  fn unknown_center_and_non_graph() {
+    assert_eq!(
+      interpret("NeighborhoodGraph[CycleGraph[5], 9]").unwrap(),
+      "Graph[<0>, <0>]"
+    );
+    assert_eq!(
+      interpret("NeighborhoodGraph[x, 1]").unwrap(),
+      "NeighborhoodGraph[x, 1]"
+    );
+  }
+}
+
+mod graph_predicates {
+  use super::*;
+
+  #[test]
+  fn hamiltonian_graph_q() {
+    assert_eq!(
+      interpret("HamiltonianGraphQ[CycleGraph[5]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[CompleteGraph[4]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[PathGraph[Range[4]]]").unwrap(),
+      "False"
+    );
+    // The Petersen graph is famously non-Hamiltonian
+    assert_eq!(
+      interpret("HamiltonianGraphQ[PetersenGraph[5, 2]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[StarGraph[4]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[WheelGraph[7]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[GridGraph[{3, 3}]]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn hamiltonian_degenerate_cases() {
+    // wolframscript: K1 and the doubled-edge 2-cycle are Hamiltonian,
+    // the null graph and a simple K2 are not
+    assert_eq!(
+      interpret("HamiltonianGraphQ[Graph[{1}, {}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[CycleGraph[1]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[CycleGraph[2]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[Graph[{}, {}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("HamiltonianGraphQ[Graph[{1, 2}, {1 <-> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("HamiltonianGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn find_hamiltonian_cycle() {
+    // The single-argument form returns a length-1 list holding one Hamiltonian
+    // cycle, chosen by a lexicographic greedy DFS from the first vertex.
+    // wolframscript: FindHamiltonianCycle[CompleteGraph[4]]
+    //   -> {{1 <-> 2, 2 <-> 3, 3 <-> 4, 4 <-> 1}}
+    assert_eq!(
+      interpret("FindHamiltonianCycle[CompleteGraph[4]]").unwrap(),
+      "{{1 \u{f3d4} 2, 2 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 1}}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianCycle[CycleGraph[5]]").unwrap(),
+      "{{1 \u{f3d4} 2, 2 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 5, 5 \u{f3d4} 1}}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianCycle[WheelGraph[5]]").unwrap(),
+      "{{1 \u{f3d4} 2, 2 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 5, 5 \u{f3d4} 1}}"
+    );
+    // Edges are reported in traversal order (note the 6 <-> 5, 5 <-> 3 chain).
+    assert_eq!(
+      interpret("FindHamiltonianCycle[GridGraph[{2, 3}]]").unwrap(),
+      "{{1 \u{f3d4} 2, 2 \u{f3d4} 4, 4 \u{f3d4} 6, 6 \u{f3d4} 5, \
+       5 \u{f3d4} 3, 3 \u{f3d4} 1}}"
+    );
+  }
+
+  #[test]
+  fn find_hamiltonian_cycle_none() {
+    // A path graph has no Hamiltonian cycle: wolframscript returns {}.
+    assert_eq!(
+      interpret("FindHamiltonianCycle[Graph[{1 <-> 2, 2 <-> 3}]]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianCycle[PathGraph[Range[4]]]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianCycle[PetersenGraph[5, 2]]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn find_hamiltonian_cycle_directed() {
+    // A directed cycle reports DirectedEdge (\u{f3d5}) edges.
+    assert_eq!(
+      interpret("FindHamiltonianCycle[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]")
+        .unwrap(),
+      "{{1 \u{f3d5} 2, 2 \u{f3d5} 3, 3 \u{f3d5} 1}}"
+    );
+  }
+
+  // FindEulerianCycle: Hierholzer from the first vertex, taking the
+  // highest-ranked available neighbour (reproduces wolframscript's cycle).
+  #[test]
+  fn find_eulerian_cycle() {
+    assert_eq!(
+      interpret("FindEulerianCycle[CycleGraph[4]]").unwrap(),
+      "{{1 \u{f3d4} 4, 4 \u{f3d4} 3, 3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+    assert_eq!(
+      interpret("FindEulerianCycle[CompleteGraph[3]]").unwrap(),
+      "{{1 \u{f3d4} 3, 3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+    // Every vertex of K5 has even degree, so it is Eulerian; the walk revisits
+    // vertices and is spliced by Hierholzer's algorithm.
+    assert_eq!(
+      interpret("FindEulerianCycle[CompleteGraph[5]]").unwrap(),
+      "{{1 \u{f3d4} 5, 5 \u{f3d4} 4, 4 \u{f3d4} 3, 3 \u{f3d4} 5, \
+       5 \u{f3d4} 2, 2 \u{f3d4} 4, 4 \u{f3d4} 1, 1 \u{f3d4} 3, \
+       3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+    // Two triangles sharing a vertex: the walk stitches the two loops.
+    assert_eq!(
+      interpret(
+        "FindEulerianCycle[Graph[{1 <-> 2, 2 <-> 3, 1 <-> 3, \
+         1 <-> 4, 4 <-> 5, 1 <-> 5}]]"
+      )
+      .unwrap(),
+      "{{1 \u{f3d4} 5, 5 \u{f3d4} 4, 4 \u{f3d4} 1, 1 \u{f3d4} 3, \
+       3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+  }
+
+  #[test]
+  fn find_eulerian_cycle_none() {
+    // Odd-degree endpoints → no Eulerian cycle.
+    assert_eq!(
+      interpret("FindEulerianCycle[PathGraph[{1, 2, 3}]]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("FindEulerianCycle[Graph[{1 <-> 2, 2 <-> 3}]]").unwrap(),
+      "{}"
+    );
+  }
+
+  // FindPostmanTour: an Eulerian graph's tour is exactly its Eulerian cycle.
+  #[test]
+  fn find_postman_tour_eulerian() {
+    assert_eq!(
+      interpret("FindPostmanTour[CycleGraph[4]]").unwrap(),
+      "{{1 \u{f3d4} 4, 4 \u{f3d4} 3, 3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+    assert_eq!(
+      interpret("FindPostmanTour[CompleteGraph[5]]").unwrap(),
+      "{{1 \u{f3d4} 5, 5 \u{f3d4} 4, 4 \u{f3d4} 3, 3 \u{f3d4} 5, \
+       5 \u{f3d4} 2, 2 \u{f3d4} 4, 4 \u{f3d4} 1, 1 \u{f3d4} 3, \
+       3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+  }
+
+  // A non-Eulerian graph duplicates a minimum-weight pairing of the
+  // odd-degree vertices, then traces the tour over the augmented multigraph.
+  #[test]
+  fn find_postman_tour_non_eulerian() {
+    // Two odd endpoints: the whole path is retraced.
+    assert_eq!(
+      interpret("FindPostmanTour[PathGraph[{1, 2, 3}]]").unwrap(),
+      "{{1 \u{f3d4} 2, 2 \u{f3d4} 3, 3 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+    // Four odd vertices in K4: the pairing {1,2},{3,4} duplicates edges 1-2
+    // and 3-4.
+    assert_eq!(
+      interpret("FindPostmanTour[CompleteGraph[4]]").unwrap(),
+      "{{1 \u{f3d4} 4, 4 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 2, \
+       2 \u{f3d4} 3, 3 \u{f3d4} 1, 1 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+    assert_eq!(
+      interpret("FindPostmanTour[GridGraph[{2, 2}]]").unwrap(),
+      "{{1 \u{f3d4} 3, 3 \u{f3d4} 4, 4 \u{f3d4} 2, 2 \u{f3d4} 1}}"
+    );
+  }
+
+  #[test]
+  fn bipartite_graph_q() {
+    assert_eq!(interpret("BipartiteGraphQ[CycleGraph[4]]").unwrap(), "True");
+    assert_eq!(
+      interpret("BipartiteGraphQ[CycleGraph[5]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("BipartiteGraphQ[StarGraph[5]]").unwrap(), "True");
+    assert_eq!(
+      interpret("BipartiteGraphQ[PetersenGraph[5, 2]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("BipartiteGraphQ[GridGraph[{3, 3}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("BipartiteGraphQ[Graph[{}, {}]]").unwrap(), "True");
+    assert_eq!(interpret("BipartiteGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn complete_graph_q() {
+    assert_eq!(
+      interpret("CompleteGraphQ[CompleteGraph[4]]").unwrap(),
+      "True"
+    );
+    // K3 is a triangle
+    assert_eq!(interpret("CompleteGraphQ[CycleGraph[3]]").unwrap(), "True");
+    assert_eq!(interpret("CompleteGraphQ[CycleGraph[4]]").unwrap(), "False");
+    assert_eq!(interpret("CompleteGraphQ[Graph[{1}, {}]]").unwrap(), "True");
+    assert_eq!(interpret("CompleteGraphQ[Graph[{}, {}]]").unwrap(), "True");
+    // A doubled edge disqualifies completeness
+    assert_eq!(
+      interpret("CompleteGraphQ[Graph[{1, 2}, {1 <-> 2, 1 <-> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("CompleteGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn loop_free_and_simple_q() {
+    assert_eq!(interpret("LoopFreeGraphQ[CycleGraph[5]]").unwrap(), "True");
+    assert_eq!(
+      interpret("LoopFreeGraphQ[Graph[{1, 2}, {1 <-> 1, 1 <-> 2}]]").unwrap(),
+      "False"
+    );
+    // Multi-edges are loop-free but not simple
+    assert_eq!(interpret("LoopFreeGraphQ[CycleGraph[2]]").unwrap(), "True");
+    assert_eq!(interpret("SimpleGraphQ[CycleGraph[2]]").unwrap(), "False");
+    assert_eq!(interpret("SimpleGraphQ[CycleGraph[1]]").unwrap(), "False");
+    assert_eq!(interpret("SimpleGraphQ[CycleGraph[5]]").unwrap(), "True");
+    assert_eq!(
+      interpret("SimpleGraphQ[Graph[{1, 2}, {1 <-> 2, 1 <-> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("LoopFreeGraphQ[x]").unwrap(), "False");
+    assert_eq!(interpret("SimpleGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn path_graph_q() {
+    assert_eq!(
+      interpret("PathGraphQ[PathGraph[Range[4]]]").unwrap(),
+      "True"
+    );
+    // wolframscript counts cycles as path graphs (all degrees <= 2)
+    assert_eq!(interpret("PathGraphQ[CycleGraph[4]]").unwrap(), "True");
+    assert_eq!(interpret("PathGraphQ[Graph[{1}, {}]]").unwrap(), "True");
+    assert_eq!(
+      interpret("PathGraphQ[Graph[{1, 2, 3}, {1 <-> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("PathGraphQ[StarGraph[4]]").unwrap(), "False");
+    assert_eq!(interpret("PathGraphQ[Graph[{}, {}]]").unwrap(), "False");
+    // Multi-edges disqualify
+    assert_eq!(interpret("PathGraphQ[CycleGraph[2]]").unwrap(), "False");
+    assert_eq!(
+      interpret("PathGraphQ[Graph[{3, 1, 2}, {3 <-> 1, 1 <-> 2}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("PathGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn empty_graph_q() {
+    assert_eq!(interpret("EmptyGraphQ[Graph[{1, 2}, {}]]").unwrap(), "True");
+    assert_eq!(interpret("EmptyGraphQ[Graph[{}, {}]]").unwrap(), "True");
+    assert_eq!(interpret("EmptyGraphQ[CycleGraph[3]]").unwrap(), "False");
+    assert_eq!(interpret("EmptyGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn mixed_graph_q() {
+    // Both a directed and an undirected edge → mixed.
+    assert_eq!(
+      interpret("MixedGraphQ[Graph[{1 -> 2, 2 <-> 3}]]").unwrap(),
+      "True"
+    );
+    // All-directed or all-undirected graphs are not mixed.
+    assert_eq!(
+      interpret("MixedGraphQ[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("MixedGraphQ[CycleGraph[4]]").unwrap(), "False");
+    assert_eq!(interpret("MixedGraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn multigraph_q() {
+    // Parallel directed edges.
+    assert_eq!(
+      interpret("MultigraphQ[Graph[{1 -> 2, 1 -> 2}]]").unwrap(),
+      "True"
+    );
+    // Parallel undirected edges (CycleGraph[2] is a doubled edge).
+    assert_eq!(
+      interpret("MultigraphQ[Graph[{1, 2}, {1 <-> 2, 1 <-> 2}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("MultigraphQ[CycleGraph[2]]").unwrap(), "True");
+    // Repeated self-loops count as parallel edges.
+    assert_eq!(
+      interpret("MultigraphQ[Graph[{1 -> 1, 1 -> 1}]]").unwrap(),
+      "True"
+    );
+    // A single self-loop is not a multigraph.
+    assert_eq!(interpret("MultigraphQ[Graph[{1 -> 1}]]").unwrap(), "False");
+    // Opposite directed edges are distinct, not parallel.
+    assert_eq!(
+      interpret("MultigraphQ[Graph[{1 -> 2, 2 -> 1}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("MultigraphQ[CycleGraph[5]]").unwrap(), "False");
+    assert_eq!(interpret("MultigraphQ[x]").unwrap(), "False");
+  }
+
+  #[test]
+  fn weighted_graph_q() {
+    // Explicit edge weights make a graph weighted.
+    assert_eq!(
+      interpret(
+        "WeightedGraphQ[Graph[{1 -> 2, 2 -> 3}, EdgeWeight -> {5, 3}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    // Vertex weights count too.
+    assert_eq!(
+      interpret("WeightedGraphQ[Graph[{1 -> 2}, VertexWeight -> {3, 4}]]")
+        .unwrap(),
+      "True"
+    );
+    // WeightedAdjacencyGraph carries weights.
+    assert_eq!(
+      interpret("WeightedGraphQ[WeightedAdjacencyGraph[{{0, 2}, {2, 0}}]]")
+        .unwrap(),
+      "True"
+    );
+    // No weights, or EdgeWeight -> Automatic, is unweighted.
+    assert_eq!(
+      interpret("WeightedGraphQ[Graph[{1 -> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("WeightedGraphQ[Graph[{1 -> 2}, EdgeWeight -> Automatic]]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("WeightedGraphQ[CycleGraph[4]]").unwrap(), "False");
+    assert_eq!(interpret("WeightedGraphQ[x]").unwrap(), "False");
+  }
+}
+
+mod planar_graph_q {
+  use super::*;
+
+  #[test]
+  fn classic_planar_and_nonplanar() {
+    assert_eq!(interpret("PlanarGraphQ[CompleteGraph[4]]").unwrap(), "True");
+    assert_eq!(
+      interpret("PlanarGraphQ[CompleteGraph[5]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PlanarGraphQ[CompleteGraph[6]]").unwrap(),
+      "False"
+    );
+    // K3,3
+    assert_eq!(
+      interpret(
+        "PlanarGraphQ[Graph[{1, 2, 3, 4, 5, 6}, {1 <-> 4, 1 <-> 5, 1 <-> 6, 2 <-> 4, 2 <-> 5, 2 <-> 6, 3 <-> 4, 3 <-> 5, 3 <-> 6}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PlanarGraphQ[PetersenGraph[5, 2]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PlanarGraphQ[GridGraph[{4, 4}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("PlanarGraphQ[WheelGraph[8]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn boundary_cases() {
+    // K5 minus one edge is planar
+    assert_eq!(
+      interpret(
+        "PlanarGraphQ[Graph[Range[5], {1 <-> 2, 1 <-> 3, 1 <-> 4, 1 <-> 5, 2 <-> 3, 2 <-> 4, 2 <-> 5, 3 <-> 4, 3 <-> 5}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    // The cube graph is planar; adding a crossing chord breaks it
+    assert_eq!(
+      interpret(
+        "PlanarGraphQ[Graph[Range[8], {1 <-> 2, 2 <-> 3, 3 <-> 4, 4 <-> 1, 5 <-> 6, 6 <-> 7, 7 <-> 8, 8 <-> 5, 1 <-> 5, 2 <-> 6, 3 <-> 7, 4 <-> 8}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "PlanarGraphQ[Graph[Range[8], {1 <-> 2, 2 <-> 3, 3 <-> 4, 4 <-> 1, 5 <-> 6, 6 <-> 7, 7 <-> 8, 8 <-> 5, 1 <-> 5, 2 <-> 6, 3 <-> 7, 4 <-> 8, 1 <-> 7}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    // Harary graphs: H(4, n) is planar for some n, not others
+    assert_eq!(
+      interpret("PlanarGraphQ[HararyGraph[4, 7]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PlanarGraphQ[HararyGraph[4, 8]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PlanarGraphQ[HararyGraph[2, 9]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn decomposition_handles_components() {
+    // A disconnected graph containing K3,3 plus a path
+    assert_eq!(
+      interpret(
+        "PlanarGraphQ[Graph[Range[9], {1 <-> 4, 1 <-> 5, 1 <-> 6, 2 <-> 4, 2 <-> 5, 2 <-> 6, 3 <-> 4, 3 <-> 5, 3 <-> 6, 7 <-> 8, 8 <-> 9}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PlanarGraphQ[Graph[{1, 2, 3, 4}, {1 <-> 2, 3 <-> 4}]]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn degenerate_graphs_are_planar() {
+    assert_eq!(interpret("PlanarGraphQ[Graph[{}, {}]]").unwrap(), "True");
+    assert_eq!(interpret("PlanarGraphQ[Graph[{1}, {}]]").unwrap(), "True");
+    // Self-loops and doubled edges never affect planarity
+    assert_eq!(interpret("PlanarGraphQ[CycleGraph[1]]").unwrap(), "True");
+    assert_eq!(interpret("PlanarGraphQ[CycleGraph[2]]").unwrap(), "True");
+    assert_eq!(interpret("PlanarGraphQ[x]").unwrap(), "False");
+  }
+}
+
+mod graph_metrics {
+  use super::*;
+
+  #[test]
+  fn global_clustering_coefficient() {
+    // Triangle with a pendant: 3 triangles-counted / 5 connected triples
+    assert_eq!(
+      interpret(
+        "GlobalClusteringCoefficient[Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "3/5"
+    );
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[CompleteGraph[5]]").unwrap(),
+      "1"
+    );
+    // Triangle-free graphs give 0
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[CycleGraph[5]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[PetersenGraph[5, 2]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[WheelGraph[6]]").unwrap(),
+      "3/5"
+    );
+    // No connected triples at all also gives 0
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[Graph[{1}, {}]]").unwrap(),
+      "0"
+    );
+  }
+
+  // Directed graphs use the directed transitivity trace(A^3) / sum A^2: a
+  // length-2 path i->j->k is closed by an edge k->i (a directed 3-cycle).
+  #[test]
+  fn global_clustering_coefficient_directed() {
+    // Every triple of a directed 3-cycle is closed.
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]")
+        .unwrap(),
+      "1"
+    );
+    // A transitive triangle has no directed 3-cycle.
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[Graph[{1 -> 2, 1 -> 3, 2 -> 3}]]")
+        .unwrap(),
+      "0"
+    );
+    // A directed path has no closed triple.
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]")
+        .unwrap(),
+      "0"
+    );
+    // A mutual pair has no length-2 path with distinct endpoints.
+    assert_eq!(
+      interpret("GlobalClusteringCoefficient[Graph[{1 -> 2, 2 -> 1}]]")
+        .unwrap(),
+      "0"
+    );
+  }
+
+  // MeanDegreeConnectivity[g] gives, for each degree k = 0, 1, 2, ..., the mean
+  // average neighbour degree over vertices of degree k.
+  #[test]
+  fn mean_degree_connectivity_undirected() {
+    // Star: leaves (degree 1) see the degree-3 centre; the centre sees leaves.
+    assert_eq!(
+      interpret("MeanDegreeConnectivity[StarGraph[4]]").unwrap(),
+      "{0, 3, 0, 1}"
+    );
+    assert_eq!(
+      interpret("MeanDegreeConnectivity[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{0, 2, 3/2}"
+    );
+  }
+
+  // Directed graphs use total (in+out) degree; every edge makes its endpoints
+  // neighbours regardless of direction.
+  #[test]
+  fn mean_degree_connectivity_directed() {
+    assert_eq!(
+      interpret("MeanDegreeConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]")
+        .unwrap(),
+      "{0, 0, 2}"
+    );
+    assert_eq!(
+      interpret("MeanDegreeConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]")
+        .unwrap(),
+      "{0, 2, 3/2}"
+    );
+    assert_eq!(
+      interpret(
+        "MeanDegreeConnectivity[Graph[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 3}]]"
+      )
+      .unwrap(),
+      "{0, 0, 3, 8/3}"
+    );
+    // The complete digraph on three vertices: every vertex has degree 4.
+    assert_eq!(
+      interpret(
+        "MeanDegreeConnectivity[Graph[{1 -> 2, 2 -> 1, 1 -> 3, 2 -> 3, \
+         3 -> 1, 3 -> 2}]]"
+      )
+      .unwrap(),
+      "{0, 0, 0, 0, 4}"
+    );
+  }
+
+  #[test]
+  fn mean_clustering_coefficient() {
+    // (1 + 1 + 1/3 + 0)/4
+    assert_eq!(
+      interpret(
+        "MeanClusteringCoefficient[Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "7/12"
+    );
+    assert_eq!(
+      interpret("MeanClusteringCoefficient[CompleteGraph[5]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("MeanClusteringCoefficient[WheelGraph[6]]").unwrap(),
+      "23/36"
+    );
+    assert_eq!(
+      interpret("MeanClusteringCoefficient[Graph[{1}, {}]]").unwrap(),
+      "0"
+    );
+  }
+
+  // Directed clustering: a length-2 path in -> v -> out is closed by a back
+  // arc out -> in (a directed 3-cycle through v).
+  #[test]
+  fn clustering_coefficients_directed() {
+    // Every vertex of a directed 3-cycle has local clustering 1.
+    assert_eq!(
+      interpret("LocalClusteringCoefficient[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]")
+        .unwrap(),
+      "{1, 1, 1}"
+    );
+    // A transitive triangle has no directed 3-cycle.
+    assert_eq!(
+      interpret("LocalClusteringCoefficient[Graph[{1 -> 2, 1 -> 3, 2 -> 3}]]")
+        .unwrap(),
+      "{0, 0, 0}"
+    );
+    // Mixed local values.
+    assert_eq!(
+      interpret(
+        "LocalClusteringCoefficient[Graph[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 4, \
+         4 -> 2}]]"
+      )
+      .unwrap(),
+      "{1/2, 1/2, 1, 0}"
+    );
+    // MeanClusteringCoefficient is the mean of the local coefficients.
+    assert_eq!(
+      interpret(
+        "MeanClusteringCoefficient[Graph[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 4, \
+         4 -> 2}]]"
+      )
+      .unwrap(),
+      "1/2"
+    );
+    assert_eq!(
+      interpret("MeanClusteringCoefficient[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]")
+        .unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn graph_density() {
+    assert_eq!(
+      interpret(
+        "GraphDensity[Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "2/3"
+    );
+    assert_eq!(interpret("GraphDensity[CompleteGraph[5]]").unwrap(), "1");
+    assert_eq!(interpret("GraphDensity[CycleGraph[5]]").unwrap(), "1/2");
+    assert_eq!(interpret("GraphDensity[StarGraph[7]]").unwrap(), "2/7");
+    assert_eq!(interpret("GraphDensity[Graph[{1, 2}, {}]]").unwrap(), "0");
+    // Doubled edges count once
+    assert_eq!(interpret("GraphDensity[CycleGraph[2]]").unwrap(), "1");
+    // The single-vertex formula degenerates: stays unevaluated
+    assert_eq!(
+      interpret("GraphDensity[Graph[{1}, {}]]").unwrap(),
+      "GraphDensity[Graph[<1>, <0>]]"
+    );
+    assert_eq!(interpret("GraphDensity[x]").unwrap(), "GraphDensity[x]");
+  }
+
+  // Directed graphs use n(n-1) possible ordered edges (self-loops excluded).
+  #[test]
+  fn graph_density_directed() {
+    assert_eq!(
+      interpret("GraphDensity[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]").unwrap(),
+      "1/4"
+    );
+    // The complete digraph on three vertices has density 1.
+    assert_eq!(
+      interpret(
+        "GraphDensity[Graph[{1 -> 2, 2 -> 1, 1 -> 3, 2 -> 3, 3 -> 1, 3 -> 2}]]"
+      )
+      .unwrap(),
+      "1"
+    );
+    // A directed cycle.
+    assert_eq!(
+      interpret("GraphDensity[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 1}]]")
+        .unwrap(),
+      "1/3"
+    );
+    // Self-loops do not count.
+    assert_eq!(
+      interpret("GraphDensity[Graph[{1 -> 1, 1 -> 2}]]").unwrap(),
+      "1/2"
+    );
+  }
+
+  #[test]
+  fn mean_graph_distance() {
+    assert_eq!(
+      interpret(
+        "MeanGraphDistance[Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "4/3"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[CompleteGraph[5]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[CycleGraph[5]]").unwrap(),
+      "3/2"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[PetersenGraph[5, 2]]").unwrap(),
+      "5/3"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[GridGraph[{3, 3}]]").unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[PathGraph[Range[6]]]").unwrap(),
+      "7/3"
+    );
+    // Disconnected graphs give Infinity
+    assert_eq!(
+      interpret("MeanGraphDistance[Graph[{1, 2, 3, 4}, {1 <-> 2, 3 <-> 4}]]")
+        .unwrap(),
+      "Infinity"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[Graph[{1}, {}]]").unwrap(),
+      "MeanGraphDistance[Graph[<1>, <0>]]"
+    );
+  }
+
+  // Directed graphs use directed distances over ordered pairs; a non-strongly
+  // connected digraph has some unreachable pair and gives Infinity.
+  #[test]
+  fn mean_graph_distance_directed() {
+    assert_eq!(
+      interpret("MeanGraphDistance[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "3/2"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[Graph[{1 -> 2, 2 -> 3, 3 -> 4, 4 -> 1}]]")
+        .unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret("MeanGraphDistance[Graph[{1 -> 2, 2 -> 1, 2 -> 3, 3 -> 2}]]")
+        .unwrap(),
+      "4/3"
+    );
+    // A directed path is not strongly connected.
+    assert_eq!(
+      interpret("MeanGraphDistance[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]").unwrap(),
+      "Infinity"
+    );
+  }
+
+  // MeanNeighborDegree[g] gives, per vertex, the mean degree of its neighbours.
+  #[test]
+  fn mean_neighbor_degree() {
+    // Every C5 vertex has two degree-2 neighbours.
+    assert_eq!(
+      interpret("MeanNeighborDegree[CycleGraph[5]]").unwrap(),
+      "{2, 2, 2, 2, 2}"
+    );
+    // Star: the centre sees degree-1 leaves; each leaf sees the degree-3 centre.
+    assert_eq!(
+      interpret("MeanNeighborDegree[StarGraph[4]]").unwrap(),
+      "{1, 3, 3, 3}"
+    );
+    assert_eq!(
+      interpret("MeanNeighborDegree[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{2, 3/2, 3/2, 2}"
+    );
+    // Triangle with a pendant vertex.
+    assert_eq!(
+      interpret(
+        "MeanNeighborDegree[Graph[{1 <-> 2, 2 <-> 3, 1 <-> 3, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "{5/2, 5/2, 5/3, 3}"
+    );
+    // An isolated vertex has mean neighbour degree 0.
+    assert_eq!(
+      interpret("MeanNeighborDegree[Graph[{1, 2, 3}, {1 <-> 2}]]").unwrap(),
+      "{1, 1, 0}"
+    );
+  }
+}
+
+mod graph_accessors {
+  use super::*;
+
+  #[test]
+  fn adjacency_list() {
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]; AdjacencyList[g, 3]"
+      )
+      .unwrap(),
+      "{1, 2, 4}"
+    );
+    // One-argument form: all neighbor lists
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]; AdjacencyList[g]"
+      )
+      .unwrap(),
+      "{{2, 3}, {1, 3}, {1, 2, 4}, {3}}"
+    );
+    // Neighbors follow the vertex-list order, not value order
+    assert_eq!(
+      interpret("AdjacencyList[Graph[{3, 1, 2}, {3 <-> 1, 1 <-> 2}], 1]")
+        .unwrap(),
+      "{3, 2}"
+    );
+    assert_eq!(
+      interpret("AdjacencyList[PetersenGraph[5, 2], 1]").unwrap(),
+      "{3, 4, 6}"
+    );
+    assert_eq!(
+      interpret("AdjacencyList[StarGraph[5], 1]").unwrap(),
+      "{2, 3, 4, 5}"
+    );
+  }
+
+  #[test]
+  fn incidence_list() {
+    // Incident edges in EdgeList order with stored orientation
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]; IncidenceList[g, 3]"
+      )
+      .unwrap(),
+      "{1 \u{f3d4} 3, 2 \u{f3d4} 3, 3 \u{f3d4} 4}"
+    );
+    assert_eq!(
+      interpret("IncidenceList[CycleGraph[5], 1]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 5}"
+    );
+  }
+
+  #[test]
+  fn edge_index() {
+    // TwoWayRule and UndirectedEdge specs, either endpoint order
+    assert_eq!(
+      interpret(
+        "g = Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]; {EdgeIndex[g, 2 <-> 3], EdgeIndex[g, 3 <-> 2]}"
+      )
+      .unwrap(),
+      "{3, 3}"
+    );
+    assert_eq!(
+      interpret("EdgeIndex[CycleGraph[5], UndirectedEdge[1, 2]]").unwrap(),
+      "1"
+    );
+    assert_eq!(interpret("EdgeIndex[CycleGraph[5], 1 <-> 5]").unwrap(), "2");
+  }
+
+  #[test]
+  fn invalid_arguments() {
+    assert_eq!(
+      interpret("AdjacencyList[CycleGraph[5], 9]").unwrap(),
+      "AdjacencyList[Graph[<5>, <5>], 9]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "AdjacencyList::inv: The argument 9 in AdjacencyList[Graph[<5>, <5>], 9] is not a valid vertex."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+    assert_eq!(
+      interpret("EdgeIndex[CycleGraph[5], 1 <-> 3]").unwrap(),
+      "EdgeIndex[Graph[<5>, <5>], 1 <-> 3]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "EdgeIndex::inv: The argument 1 <-> 3 in EdgeIndex[Graph[<5>, <5>], 1 <-> 3] is not a valid edge."
+      )),
+      "expected inv message, got {msgs:?}"
+    );
+    // Non-graphs stay silently unevaluated
+    assert_eq!(
+      interpret("AdjacencyList[x, 1]").unwrap(),
+      "AdjacencyList[x, 1]"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(msgs.is_empty(), "expected no messages, got {msgs:?}");
+  }
+}
+
+mod graph_assortativity {
+  use super::*;
+
+  #[test]
+  fn newman_coefficient_exact() {
+    // Triangle with a pendant, computed by hand: -5/7
+    assert_eq!(
+      interpret(
+        "GraphAssortativity[Graph[{1, 2, 3, 4}, {1 <-> 2, 1 <-> 3, 2 <-> 3, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "-5/7"
+    );
+    // Stars are maximally disassortative
+    assert_eq!(interpret("GraphAssortativity[StarGraph[5]]").unwrap(), "-1");
+    assert_eq!(interpret("GraphAssortativity[StarGraph[7]]").unwrap(), "-1");
+    assert_eq!(
+      interpret("GraphAssortativity[GridGraph[{2, 3}]]").unwrap(),
+      "-1/6"
+    );
+    assert_eq!(
+      interpret("GraphAssortativity[GridGraph[{3, 3}]]").unwrap(),
+      "-1/17"
+    );
+    assert_eq!(
+      interpret("GraphAssortativity[PathGraph[Range[5]]]").unwrap(),
+      "-1/3"
+    );
+    assert_eq!(
+      interpret("GraphAssortativity[WheelGraph[6]]").unwrap(),
+      "-1/3"
+    );
+  }
+
+  #[test]
+  fn regular_graphs_give_zero() {
+    assert_eq!(interpret("GraphAssortativity[CycleGraph[5]]").unwrap(), "0");
+    assert_eq!(
+      interpret("GraphAssortativity[PetersenGraph[5, 2]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("GraphAssortativity[Graph[{1, 2}, {1 <-> 2}]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("GraphAssortativity[HararyGraph[3, 8]]").unwrap(),
+      "0"
+    );
+    // Edgeless graphs too
+    assert_eq!(
+      interpret("GraphAssortativity[Graph[{1}, {}]]").unwrap(),
+      "0"
+    );
+  }
+
+  #[test]
+  fn non_graph_stays_unevaluated() {
+    assert_eq!(
+      interpret("GraphAssortativity[x]").unwrap(),
+      "GraphAssortativity[x]"
+    );
+  }
+}
+
+mod vertex_contract {
+  use super::*;
+
+  // VertexContract merges the listed vertices into the first one, redirecting
+  // edges and dropping the resulting self-loops and duplicate edges.
+  #[test]
+  fn complete_graph_pair() {
+    assert_eq!(
+      interpret("VertexList[VertexContract[CompleteGraph[4], {1, 2}]]")
+        .unwrap(),
+      "{1, 3, 4}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[VertexContract[CompleteGraph[4], {1, 2}]] === \
+         {UndirectedEdge[1, 3], UndirectedEdge[1, 4], UndirectedEdge[3, 4]}"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("VertexCount[VertexContract[CompleteGraph[4], {1, 2}]]")
+        .unwrap(),
+      "3"
+    );
+  }
+
+  // The survivor is the first vertex of the list (here 2); the rest are merged.
+  #[test]
+  fn merges_multiple_into_first() {
+    assert_eq!(
+      interpret("VertexList[VertexContract[CompleteGraph[5], {2, 3, 4}]]")
+        .unwrap(),
+      "{1, 2, 5}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[VertexContract[CompleteGraph[5], {2, 3, 4}]] === \
+         {UndirectedEdge[1, 2], UndirectedEdge[1, 5], UndirectedEdge[2, 5]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // The contracted edges are re-canonicalized: 1-3 sorts before 1-5 even though
+  // CycleGraph lists the 1-5 wrap-around edge before the 2-3 edge.
+  #[test]
+  fn re_sorts_edges() {
+    assert_eq!(
+      interpret(
+        "EdgeList[VertexContract[CycleGraph[5], {1, 2}]] === \
+         {UndirectedEdge[1, 3], UndirectedEdge[1, 5], \
+          UndirectedEdge[3, 4], UndirectedEdge[4, 5]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // Directed edges keep their direction; only exact-duplicate arcs and
+  // self-loops are removed.
+  #[test]
+  fn directed_preserves_direction() {
+    assert_eq!(
+      interpret(
+        "EdgeList[VertexContract[Graph[{1 -> 2, 2 -> 3, 3 -> 1}], {1, 2}]] \
+         === {DirectedEdge[1, 3], DirectedEdge[3, 1]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // Contracting all vertices yields a single isolated vertex.
+  #[test]
+  fn contract_all() {
+    assert_eq!(
+      interpret("VertexCount[VertexContract[CompleteGraph[4], {1, 2, 3, 4}]]")
+        .unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("EdgeCount[VertexContract[CompleteGraph[4], {1, 2, 3, 4}]]")
+        .unwrap(),
+      "0"
+    );
+  }
+
+  // A vertex not present leaves the graph unchanged; a non-graph stays symbolic.
+  #[test]
+  fn invalid_and_non_graph() {
+    assert_eq!(
+      interpret("EdgeCount[VertexContract[CompleteGraph[4], {1, 9}]]").unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("VertexContract[x, {1, 2}]").unwrap(),
+      "VertexContract[x, {1, 2}]"
+    );
+  }
+}
+
+mod edge_contract {
+  use super::*;
+
+  // EdgeContract[g, u <-> v] contracts an existing edge, equivalent to
+  // VertexContract[g, {u, v}] with the first endpoint as survivor.
+  #[test]
+  fn undirected_edge() {
+    assert_eq!(
+      interpret("VertexList[EdgeContract[CompleteGraph[4], 1 <-> 2]]").unwrap(),
+      "{1, 3, 4}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[EdgeContract[CompleteGraph[4], 1 <-> 2]] === \
+         {UndirectedEdge[1, 3], UndirectedEdge[1, 4], UndirectedEdge[3, 4]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // The first endpoint survives; here the 3 merges into 2.
+  #[test]
+  fn survivor_is_first_endpoint() {
+    assert_eq!(
+      interpret("VertexList[EdgeContract[CycleGraph[5], 2 <-> 3]]").unwrap(),
+      "{1, 2, 4, 5}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[EdgeContract[CycleGraph[5], 2 <-> 3]] === \
+         {UndirectedEdge[1, 2], UndirectedEdge[1, 5], \
+          UndirectedEdge[2, 4], UndirectedEdge[4, 5]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // An explicit UndirectedEdge head is accepted just like the <-> form.
+  #[test]
+  fn explicit_undirected_edge_head() {
+    assert_eq!(
+      interpret(
+        "EdgeList[EdgeContract[CompleteGraph[4], UndirectedEdge[1, 2]]] === \
+         {UndirectedEdge[1, 3], UndirectedEdge[1, 4], UndirectedEdge[3, 4]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // Directed edges keep their direction.
+  #[test]
+  fn directed_edge() {
+    assert_eq!(
+      interpret(
+        "EdgeList[EdgeContract[Graph[{1 -> 2, 2 -> 3, 3 -> 1}], 1 -> 2]] === \
+         {DirectedEdge[1, 3], DirectedEdge[3, 1]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // Contracting a non-existent edge leaves the graph unchanged.
+  #[test]
+  fn non_existent_edge_unchanged() {
+    assert_eq!(
+      interpret("EdgeCount[EdgeContract[PathGraph[{1, 2, 3, 4}], 1 <-> 4]]")
+        .unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("EdgeCount[EdgeContract[CompleteGraph[4], 5 <-> 6]]").unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn non_graph_stays_unevaluated() {
+    assert_eq!(
+      interpret("EdgeContract[x, 1 <-> 2]").unwrap(),
+      "EdgeContract[x, 1 <-> 2]"
+    );
+  }
+}
+
+mod isomorphic_graph_q {
+  use super::*;
+
+  // IsomorphicGraphQ is True exactly when a structure-preserving vertex
+  // bijection exists, regardless of vertex labels.
+  #[test]
+  fn isomorphic_true() {
+    assert_eq!(
+      interpret("IsomorphicGraphQ[CycleGraph[4], CycleGraph[4]]").unwrap(),
+      "True"
+    );
+    // A triangle is a triangle whether built as K3 or C3.
+    assert_eq!(
+      interpret("IsomorphicGraphQ[CompleteGraph[3], CycleGraph[3]]").unwrap(),
+      "True"
+    );
+    // Different vertex labels, same structure.
+    assert_eq!(
+      interpret("IsomorphicGraphQ[PathGraph[{1, 2, 3}], PathGraph[{4, 5, 6}]]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn non_isomorphic_false() {
+    // Same vertex/edge counts but different structure.
+    assert_eq!(
+      interpret("IsomorphicGraphQ[CycleGraph[4], PathGraph[{1, 2, 3, 4}]]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("IsomorphicGraphQ[CompleteGraph[4], CycleGraph[4]]").unwrap(),
+      "False"
+    );
+    // Different vertex counts.
+    assert_eq!(
+      interpret("IsomorphicGraphQ[CycleGraph[3], CycleGraph[4]]").unwrap(),
+      "False"
+    );
+  }
+
+  // Directedness is respected.
+  #[test]
+  fn directed_graphs() {
+    assert_eq!(
+      interpret(
+        "IsomorphicGraphQ[Graph[{1 -> 2, 2 -> 3}], Graph[{4 -> 5, 5 -> 6}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "IsomorphicGraphQ[Graph[{1 -> 2, 2 -> 3}], Graph[{1 -> 2, 3 -> 2}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+  }
+
+  // A non-graph argument makes the predicate False (not unevaluated).
+  #[test]
+  fn non_graph_is_false() {
+    assert_eq!(
+      interpret("IsomorphicGraphQ[x, CycleGraph[3]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("IsomorphicGraphQ[x, y]").unwrap(), "False");
+  }
+}
+
+mod graph_disjoint_union {
+  use super::*;
+
+  // GraphDisjointUnion relabels all vertices to consecutive integers 1..N, the
+  // second graph shifted past the first, with edges relabeled to match.
+  #[test]
+  fn two_graphs() {
+    assert_eq!(
+      interpret(
+        "VertexList[GraphDisjointUnion[CycleGraph[3], PathGraph[{1, 2}]]]"
+      )
+      .unwrap(),
+      "{1, 2, 3, 4, 5}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[GraphDisjointUnion[CycleGraph[3], PathGraph[{1, 2}]]] === \
+         {UndirectedEdge[1, 2], UndirectedEdge[1, 3], \
+          UndirectedEdge[2, 3], UndirectedEdge[4, 5]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // Relabeling is positional, independent of the original vertex names.
+  #[test]
+  fn relabels_positionally() {
+    assert_eq!(
+      interpret(
+        "EdgeList[GraphDisjointUnion[PathGraph[{5, 6, 7}], PathGraph[{8, 9}]]] \
+         === {UndirectedEdge[1, 2], UndirectedEdge[2, 3], UndirectedEdge[4, 5]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // More than two graphs accumulate offsets.
+  #[test]
+  fn three_graphs() {
+    assert_eq!(
+      interpret(
+        "VertexList[GraphDisjointUnion[CycleGraph[3], CycleGraph[3], \
+          PathGraph[{1, 2}]]]"
+      )
+      .unwrap(),
+      "{1, 2, 3, 4, 5, 6, 7, 8}"
+    );
+    assert_eq!(
+      interpret("EdgeCount[GraphDisjointUnion[CycleGraph[3], CycleGraph[3]]]")
+        .unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret(
+        "VertexCount[GraphDisjointUnion[CycleGraph[3], CycleGraph[3]]]"
+      )
+      .unwrap(),
+      "6"
+    );
+  }
+
+  // Directed edges keep their direction after relabeling.
+  #[test]
+  fn directed_graphs() {
+    assert_eq!(
+      interpret(
+        "EdgeList[GraphDisjointUnion[Graph[{1 -> 2, 2 -> 3}], Graph[{1 -> 2}]]] \
+         === {DirectedEdge[1, 2], DirectedEdge[2, 3], DirectedEdge[4, 5]}"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // A single graph is relabeled to 1..n; a non-graph argument stays symbolic.
+  #[test]
+  fn single_and_non_graph() {
+    assert_eq!(
+      interpret("VertexCount[GraphDisjointUnion[CycleGraph[3]]]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("GraphDisjointUnion[x, CycleGraph[3]] // Head").unwrap(),
+      "GraphDisjointUnion"
+    );
+  }
+
+  // A trailing option configures the result's rendering and must not be
+  // mistaken for a missing graph operand, nor lost from the output.
+  #[test]
+  fn trailing_layout_option_is_kept_and_does_not_block_evaluation() {
+    assert_eq!(
+      interpret(
+        "VertexCount[GraphDisjointUnion[CycleGraph[3], PathGraph[{1, 2}], \
+         GraphLayout -> \"CircularEmbedding\"]]"
+      )
+      .unwrap(),
+      "5"
+    );
+    assert_eq!(
+      interpret(
+        "GraphDisjointUnion[CycleGraph[3], GraphLayout -> \"CircularEmbedding\"] \
+         // Head"
+      )
+      .unwrap(),
+      "Graph"
+    );
+  }
+}
+
+mod graph_reciprocity {
+  use super::*;
+
+  // GraphReciprocity is the fraction of directed edges that are reciprocated
+  // (the reverse edge is also present); self-loops count as reciprocated.
+  #[test]
+  fn directed_fractions() {
+    assert_eq!(
+      interpret("GraphReciprocity[Graph[{1 -> 2, 2 -> 1}]]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("GraphReciprocity[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "0"
+    );
+    assert_eq!(
+      interpret("GraphReciprocity[Graph[{1 -> 2, 2 -> 1, 2 -> 3}]]").unwrap(),
+      "2/3"
+    );
+    assert_eq!(
+      interpret("GraphReciprocity[Graph[{1 -> 2, 2 -> 1, 3 -> 4, 4 -> 5}]]")
+        .unwrap(),
+      "1/2"
+    );
+  }
+
+  // A self-loop is reciprocated with itself.
+  #[test]
+  fn self_loop_reciprocated() {
+    assert_eq!(
+      interpret("GraphReciprocity[Graph[{1 -> 1, 1 -> 2, 2 -> 1}]]").unwrap(),
+      "1"
+    );
+  }
+
+  // An undirected graph with at least one edge has reciprocity 1.
+  #[test]
+  fn undirected_is_one() {
+    assert_eq!(interpret("GraphReciprocity[CycleGraph[4]]").unwrap(), "1");
+    assert_eq!(
+      interpret("GraphReciprocity[PathGraph[{1, 2, 3}]]").unwrap(),
+      "1"
+    );
+  }
+
+  // Edgeless, mixed, and non-graph inputs stay unevaluated (no result value).
+  #[test]
+  fn unsupported_stays_unevaluated() {
+    assert_eq!(
+      interpret("Head[GraphReciprocity[Graph[{1, 2, 3}, {}]]]").unwrap(),
+      "GraphReciprocity"
+    );
+    assert_eq!(
+      interpret("Head[GraphReciprocity[Graph[{1 <-> 2, 2 -> 3}]]]").unwrap(),
+      "GraphReciprocity"
+    );
+    assert_eq!(
+      interpret("GraphReciprocity[x]").unwrap(),
+      "GraphReciprocity[x]"
+    );
+  }
+}
+
+mod eigenvector_centrality {
+  use super::*;
+
+  // EigenvectorCentrality is the principal eigenvector of the adjacency matrix,
+  // normalized so the entries sum to 1.
+  #[test]
+  fn regular_graphs_uniform() {
+    // A regular graph has a uniform principal eigenvector.
+    assert_eq!(
+      interpret("Round[EigenvectorCentrality[CycleGraph[4]], 10^-6]").unwrap(),
+      "{1/4, 1/4, 1/4, 1/4}"
+    );
+    assert_eq!(
+      interpret("Round[EigenvectorCentrality[CompleteGraph[4]], 10^-6]")
+        .unwrap(),
+      "{1/4, 1/4, 1/4, 1/4}"
+    );
+  }
+
+  // Path: eigenvector proportional to {1, Sqrt[2], 1}, normalized to sum 1.
+  #[test]
+  fn path_graph() {
+    assert_eq!(
+      interpret("Round[EigenvectorCentrality[PathGraph[{1, 2, 3}]], 10^-6]")
+        .unwrap(),
+      "{292893/1000000, 207107/500000, 292893/1000000}"
+    );
+  }
+
+  // Star: the center is the most central vertex.
+  #[test]
+  fn star_graph() {
+    assert_eq!(
+      interpret("Round[EigenvectorCentrality[StarGraph[4]], 10^-6]").unwrap(),
+      "{14641/40000, 8453/40000, 8453/40000, 8453/40000}"
+    );
+  }
+
+  // The centralities always sum to 1.
+  #[test]
+  fn sums_to_one() {
+    assert_eq!(
+      interpret(
+        "Round[Total[EigenvectorCentrality[PathGraph[{1, 2, 3, 4, 5}]]], 10^-6]"
+      )
+      .unwrap(),
+      "1"
+    );
+  }
+
+  // Directed graphs use the in-adjacency and are supported only on the
+  // dominant strongly-connected component; everything else (and all of an
+  // acyclic graph) is zero.
+  #[test]
+  fn directed_supported_on_dominant_scc() {
+    // An acyclic directed graph has no cyclic component.
+    assert_eq!(
+      interpret("EigenvectorCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]")
+        .unwrap(),
+      "{0., 0., 0., 0.}"
+    );
+    // The 2-cycle {1,2} is the dominant SCC; the downstream sink 3 is zero.
+    assert_eq!(
+      interpret("EigenvectorCentrality[Graph[{1 -> 2, 2 -> 1, 2 -> 3}]]")
+        .unwrap(),
+      "{0.5, 0.5, 0.}"
+    );
+    // Here the upstream source 1 is outside the SCC {2,3} and is zero.
+    assert_eq!(
+      interpret("EigenvectorCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 2}]]")
+        .unwrap(),
+      "{0., 0.5, 0.5}"
+    );
+  }
+
+  #[test]
+  fn directed_strongly_connected() {
+    // A directed cycle is uniform.
+    assert_eq!(
+      interpret(
+        "Round[EigenvectorCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]], 10^-6]"
+      )
+      .unwrap(),
+      "{333333/1000000, 333333/1000000, 333333/1000000}"
+    );
+    // An asymmetric strongly-connected digraph: the vertex most pointed to is
+    // most central (in-adjacency).
+    assert_eq!(
+      interpret(
+        "Round[EigenvectorCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 1, 1 -> 3}]], \
+         10^-6]"
+      )
+      .unwrap(),
+      "{162359/500000, 122561/500000, 5377/12500}"
+    );
+  }
+}
+
+mod katz_centrality {
+  use super::*;
+
+  // KatzCentrality[g, alpha] solves (I - alpha A) x = 1 (beta defaults to 1).
+  // For a d-regular graph every entry is 1/(1 - alpha d).
+  #[test]
+  fn regular_graphs() {
+    // CycleGraph[4] and CompleteGraph[3] are both 2-regular: 1/(1-0.2) = 1.25.
+    assert_eq!(
+      interpret("Round[KatzCentrality[CycleGraph[4], 0.1], 10^-6]").unwrap(),
+      "{5/4, 5/4, 5/4, 5/4}"
+    );
+    assert_eq!(
+      interpret("Round[KatzCentrality[CompleteGraph[3], 0.1], 10^-6]").unwrap(),
+      "{5/4, 5/4, 5/4}"
+    );
+    // Exact rational alpha gives the same machine-real result.
+    assert_eq!(
+      interpret("Round[KatzCentrality[CycleGraph[4], 1/10], 10^-6]").unwrap(),
+      "{5/4, 5/4, 5/4, 5/4}"
+    );
+  }
+
+  #[test]
+  fn path_and_star() {
+    assert_eq!(
+      interpret("Round[KatzCentrality[PathGraph[{1, 2, 3}], 0.1], 10^-6]")
+        .unwrap(),
+      "{1122449/1000000, 122449/100000, 1122449/1000000}"
+    );
+    // The star center is more central than the leaves.
+    assert_eq!(
+      interpret("Round[KatzCentrality[StarGraph[4], 0.1], 10^-6]").unwrap(),
+      "{670103/500000, 1134021/1000000, 1134021/1000000, 1134021/1000000}"
+    );
+  }
+
+  // The optional third argument scales the whole result by beta.
+  #[test]
+  fn beta_scales_result() {
+    assert_eq!(
+      interpret("Round[KatzCentrality[CycleGraph[4], 0.1, 0.5], 10^-6]")
+        .unwrap(),
+      "{5/8, 5/8, 5/8, 5/8}"
+    );
+  }
+
+  // A length-n third argument is a per-vertex bias vector: it solves
+  // (I - alpha A^T) x = beta rather than scaling a constant.
+  #[test]
+  fn beta_vector_is_per_vertex_bias() {
+    assert_eq!(
+      interpret(
+        "Round[KatzCentrality[PathGraph[{1, 2, 3}], 0.5, {1, 2, 3}], 10^-6]"
+      )
+      .unwrap(),
+      "{5, 8, 7}"
+    );
+    assert_eq!(
+      interpret("Round[KatzCentrality[CycleGraph[3], 0.1, {1, 2, 3}], 10^-6]")
+        .unwrap(),
+      "{1590909/1000000, 5/2, 3409091/1000000}"
+    );
+  }
+
+  // Katz gains centrality from in-neighbours, so directed edges matter: on a
+  // directed path each vertex accumulates alpha^k from k steps upstream.
+  #[test]
+  fn directed_uses_in_edges() {
+    assert_eq!(
+      interpret(
+        "Round[KatzCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 4}], 0.1], 10^-6]"
+      )
+      .unwrap(),
+      "{1, 11/10, 111/100, 1111/1000}"
+    );
+    // A shared target gains from both its in-neighbours.
+    assert_eq!(
+      interpret(
+        "Round[KatzCentrality[Graph[{1 -> 3, 2 -> 3, 3 -> 4}], 0.2], 10^-6]"
+      )
+      .unwrap(),
+      "{1, 7/5, 1, 32/25}"
+    );
+  }
+}
+
+mod pagerank_centrality {
+  use super::*;
+
+  // PageRankCentrality solves (I - alpha P^T) p = (1-alpha)/n 1 with
+  // P = D^-1 A; the result sums to 1. Regular graphs are uniform.
+  #[test]
+  fn regular_graphs_uniform() {
+    assert_eq!(
+      interpret("Round[PageRankCentrality[CycleGraph[4], 0.85], 10^-6]")
+        .unwrap(),
+      "{1/4, 1/4, 1/4, 1/4}"
+    );
+    // 1/3 is not exactly representable, so it rounds to 333333/1000000.
+    assert_eq!(
+      interpret("Round[PageRankCentrality[CompleteGraph[3], 0.85], 10^-6]")
+        .unwrap(),
+      "{333333/1000000, 333333/1000000, 333333/1000000}"
+    );
+  }
+
+  #[test]
+  fn path_and_star() {
+    assert_eq!(
+      interpret("Round[PageRankCentrality[PathGraph[{1, 2, 3}], 0.85], 10^-6]")
+        .unwrap(),
+      "{256757/1000000, 243243/500000, 256757/1000000}"
+    );
+    // The star center is the most central vertex.
+    assert_eq!(
+      interpret("Round[PageRankCentrality[StarGraph[4], 0.85], 10^-6]")
+        .unwrap(),
+      "{47973/100000, 173423/1000000, 173423/1000000, 173423/1000000}"
+    );
+  }
+
+  // The damping factor defaults to 0.85.
+  #[test]
+  fn default_damping() {
+    let with_default =
+      interpret("Round[PageRankCentrality[PathGraph[{1, 2, 3}]], 10^-6]")
+        .unwrap();
+    let explicit =
+      interpret("Round[PageRankCentrality[PathGraph[{1, 2, 3}], 0.85], 10^-6]")
+        .unwrap();
+    assert_eq!(with_default, explicit);
+  }
+
+  // The centralities always sum to 1.
+  #[test]
+  fn sums_to_one() {
+    assert_eq!(
+      interpret("Round[Total[PageRankCentrality[StarGraph[5], 0.85]], 10^-6]")
+        .unwrap(),
+      "1"
+    );
+  }
+
+  // Directed edges let rank flow one way: on a directed path the sink
+  // accumulates the most rank (the sink is a dangling node that teleports).
+  #[test]
+  fn directed_chain_flows_downstream() {
+    assert_eq!(
+      interpret(
+        "Round[PageRankCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]], 10^-6]"
+      )
+      .unwrap(),
+      "{29039/250000, 26861/125000, 298811/1000000, 74029/200000}"
+    );
+    // A strongly connected directed cycle is uniform.
+    assert_eq!(
+      interpret(
+        "Round[PageRankCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]], 10^-6]"
+      )
+      .unwrap(),
+      "{333333/1000000, 333333/1000000, 333333/1000000}"
+    );
+  }
+}
+
+mod edge_betweenness_centrality {
+  use super::*;
+
+  // EdgeBetweennessCentrality gives, for each edge (in EdgeList order), the
+  // number of shortest paths over all vertex pairs that traverse it.
+  #[test]
+  fn path_graph() {
+    assert_eq!(
+      interpret("EdgeBetweennessCentrality[PathGraph[{1, 2, 3}]]").unwrap(),
+      "{4., 4.}"
+    );
+    // The middle edge of a longer path carries more paths.
+    assert_eq!(
+      interpret("EdgeBetweennessCentrality[PathGraph[{1, 2, 3, 4}]]").unwrap(),
+      "{6., 8., 6.}"
+    );
+  }
+
+  #[test]
+  fn symmetric_graphs() {
+    assert_eq!(
+      interpret("EdgeBetweennessCentrality[CycleGraph[4]]").unwrap(),
+      "{4., 4., 4., 4.}"
+    );
+    assert_eq!(
+      interpret("EdgeBetweennessCentrality[CycleGraph[5]]").unwrap(),
+      "{6., 6., 6., 6., 6.}"
+    );
+    assert_eq!(
+      interpret("EdgeBetweennessCentrality[CompleteGraph[3]]").unwrap(),
+      "{2., 2., 2.}"
+    );
+  }
+
+  #[test]
+  fn star_graph() {
+    assert_eq!(
+      interpret("EdgeBetweennessCentrality[StarGraph[4]]").unwrap(),
+      "{6., 6., 6.}"
+    );
+  }
+
+  // A graph with multiple shortest paths splits the credit by path count.
+  #[test]
+  fn multiple_shortest_paths() {
+    assert_eq!(
+      interpret(
+        "EdgeBetweennessCentrality[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 4, 4 <-> 1, 1 <-> 3}]]"
+      )
+      .unwrap(),
+      "{3., 3., 3., 3., 2.}"
+    );
+  }
+}
+
+mod radiality_centrality {
+  use super::*;
+
+  // radiality(v) = (sum over reachable w of (D + 1 - d(v, w))) / ((n-1) * D),
+  // D = graph diameter. Rounded to sidestep machine-float noise.
+  #[test]
+  fn path_and_star() {
+    // Center of a 3-path is maximally radial.
+    assert_eq!(
+      interpret("Round[RadialityCentrality[PathGraph[{1, 2, 3}]], 10^-6]")
+        .unwrap(),
+      "{3/4, 1, 3/4}"
+    );
+    // Star center is maximally radial; leaves share a lower value.
+    assert_eq!(
+      interpret("Round[RadialityCentrality[StarGraph[4]], 10^-6]").unwrap(),
+      "{1, 666667/1000000, 666667/1000000, 666667/1000000}"
+    );
+  }
+
+  // Directed distances: on a directed path the sink has radiality 0 and the
+  // source is most radial (D is the largest finite directed distance).
+  #[test]
+  fn directed_chain() {
+    assert_eq!(
+      interpret(
+        "Round[RadialityCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]], 10^-6]"
+      )
+      .unwrap(),
+      "{666667/1000000, 138889/250000, 333333/1000000, 0}"
+    );
+  }
+
+  #[test]
+  fn regular_graph_uniform() {
+    // Every vertex of a cycle has the same radiality.
+    assert_eq!(
+      interpret("Round[RadialityCentrality[CycleGraph[4]], 10^-6]").unwrap(),
+      "{833333/1000000, 833333/1000000, 833333/1000000, 833333/1000000}"
+    );
+    // A complete graph gives radiality 1 at every vertex.
+    assert_eq!(
+      interpret("RadialityCentrality[CompleteGraph[3]]").unwrap(),
+      "{1., 1., 1.}"
+    );
+  }
+
+  #[test]
+  fn longer_path() {
+    assert_eq!(
+      interpret("Round[RadialityCentrality[PathGraph[{1, 2, 3, 4}]], 10^-6]")
+        .unwrap(),
+      "{666667/1000000, 888889/1000000, 888889/1000000, 666667/1000000}"
+    );
+  }
+
+  #[test]
+  fn disconnected_and_edgeless() {
+    // Diameter is the largest within-component distance.
+    assert_eq!(
+      interpret("RadialityCentrality[Graph[{1 <-> 2, 3 <-> 4}]]").unwrap(),
+      "{0.3333333333333333, 0.3333333333333333, 0.3333333333333333, \
+       0.3333333333333333}"
+    );
+    // With no edges the diameter is zero and every radiality is zero.
+    assert_eq!(
+      interpret("RadialityCentrality[Graph[{1, 2, 3}, {}]]").unwrap(),
+      "{0., 0., 0.}"
+    );
+  }
+}
+
+mod vertex_q_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn vertex_membership() {
+    assert_eq!(
+      interpret("VertexQ[Graph[{1 -> 2, 2 -> 3}], 2]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("VertexQ[Graph[{1 -> 2, 2 -> 3}], 5]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(r#"VertexQ[Graph[{"a" -> "b"}], "a"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"VertexQ[Graph[{1 -> 2}], "a"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  // A non-graph first argument gives False without any message.
+  #[test]
+  fn non_graph_is_false() {
+    assert_eq!(interpret("VertexQ[{1, 2}, 1]").unwrap(), "False");
+  }
+}
+
+mod reverse_graph_tests {
+  use woxi::interpret;
+
+  // Directed edges flip; the edge list comes out stably sorted by the
+  // vertex-list positions of the new endpoints (wolframscript's readout
+  // order from the reversed adjacency structure).
+  #[test]
+  fn reverses_directed_edges() {
+    assert_eq!(
+      interpret("EdgeList[ReverseGraph[Graph[{1 -> 2, 2 -> 3, 1 -> 3}]]]")
+        .unwrap(),
+      "{2 \u{f3d5} 1, 3 \u{f3d5} 1, 3 \u{f3d5} 2}"
+    );
+    assert_eq!(
+      interpret("EdgeList[ReverseGraph[Graph[{3 -> 1, 2 -> 1, 1 -> 2}]]]")
+        .unwrap(),
+      "{1 \u{f3d5} 3, 1 \u{f3d5} 2, 2 \u{f3d5} 1}"
+    );
+    assert_eq!(
+      interpret("EdgeList[ReverseGraph[Graph[{1 -> 3, 1 -> 2}]]]").unwrap(),
+      "{3 \u{f3d5} 1, 2 \u{f3d5} 1}"
+    );
+    assert_eq!(
+      interpret(r#"EdgeList[ReverseGraph[Graph[{"b" -> "a", "a" -> "c"}]]]"#)
+        .unwrap(),
+      "{a \u{f3d5} b, c \u{f3d5} a}"
+    );
+    // Self-loops stay in place.
+    assert_eq!(
+      interpret("EdgeList[ReverseGraph[Graph[{2 -> 2, 1 -> 2}]]]").unwrap(),
+      "{2 \u{f3d5} 2, 2 \u{f3d5} 1}"
+    );
+  }
+
+  // The vertex list (and its order) is preserved, including isolated
+  // vertices from the explicit Graph[vertices, edges] form.
+  #[test]
+  fn preserves_vertex_order() {
+    assert_eq!(
+      interpret("VertexList[ReverseGraph[Graph[{1 -> 2, 2 -> 3, 1 -> 3}]]]")
+        .unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[ReverseGraph[Graph[{4, 3, 2, 1}, {1 -> 2, 3 -> 2}]]]"
+      )
+      .unwrap(),
+      "{2 \u{f3d5} 3, 2 \u{f3d5} 1}"
+    );
+    assert_eq!(
+      interpret(
+        "VertexList[ReverseGraph[Graph[{4, 3, 2, 1}, {1 -> 2, 3 -> 2}]]]"
+      )
+      .unwrap(),
+      "{4, 3, 2, 1}"
+    );
+    assert_eq!(
+      interpret(r#"VertexList[ReverseGraph[Graph[{"x", "y"}, {"x" -> "y"}]]]"#)
+        .unwrap(),
+      "{x, y}"
+    );
+  }
+
+  #[test]
+  fn undirected_edges_unchanged() {
+    assert_eq!(
+      interpret(
+        "EdgeList[ReverseGraph[Graph[{UndirectedEdge[2, 3], UndirectedEdge[1, 2]}]]]"
+      )
+      .unwrap(),
+      "{2 \u{f3d4} 3, 1 \u{f3d4} 2}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[ReverseGraph[Graph[{UndirectedEdge[1, 2], 2 -> 3}]]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d4} 2, 3 \u{f3d5} 2}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[ReverseGraph[Graph[{UndirectedEdge[3, 1], 2 -> 1}]]]"
+      )
+      .unwrap(),
+      "{3 \u{f3d4} 1, 1 \u{f3d5} 2}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[ReverseGraph[Graph[{3 -> 2, UndirectedEdge[1, 2], 2 -> 1}]]]"
+      )
+      .unwrap(),
+      "{2 \u{f3d5} 3, 1 \u{f3d4} 2, 1 \u{f3d5} 2}"
+    );
+    assert_eq!(
+      interpret("EdgeList[ReverseGraph[Graph[{}, {}]]]").unwrap(),
+      "{}"
+    );
+  }
+
+  // A non-graph argument echoes with the ::graph message.
+  #[test]
+  fn non_graph_stays_unevaluated() {
+    assert_eq!(
+      interpret("ReverseGraph[{1, 2}]").unwrap(),
+      "ReverseGraph[{1, 2}]"
+    );
+  }
+}
+
+// DirectedGraph[g] converts g to a directed graph: each undirected edge becomes
+// a pair of opposite directed edges (a self-loop stays a single directed loop),
+// while already-directed edges are kept as-is. Edges come out sorted by the
+// vertex-list positions of their endpoints. Verified against wolframscript;
+// the `/. DirectedEdge -> List` rewrite renders the arrow edges as plain lists.
+mod directed_graph_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn undirected_edges_become_both_orientations() {
+    assert_eq!(
+      interpret(
+        "EdgeList[DirectedGraph[PathGraph[{1, 2, 3}]]] /. DirectedEdge -> List"
+      )
+      .unwrap(),
+      "{{1, 2}, {2, 1}, {2, 3}, {3, 2}}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[DirectedGraph[CycleGraph[4]]] /. DirectedEdge -> List"
+      )
+      .unwrap(),
+      "{{1, 2}, {1, 4}, {2, 1}, {2, 3}, {3, 2}, {3, 4}, {4, 1}, {4, 3}}"
+    );
+  }
+
+  #[test]
+  fn directed_edges_kept_and_mixed() {
+    // Already-directed edges are kept single.
+    assert_eq!(
+      interpret(
+        "EdgeList[DirectedGraph[Graph[{1 -> 2, 2 -> 3}]]] /. DirectedEdge -> List"
+      )
+      .unwrap(),
+      "{{1, 2}, {2, 3}}"
+    );
+    // An undirected edge doubles; a directed edge stays single.
+    assert_eq!(
+      interpret(
+        "EdgeList[DirectedGraph[Graph[{1 <-> 2, 2 -> 3}]]] /. DirectedEdge -> List"
+      )
+      .unwrap(),
+      "{{1, 2}, {2, 1}, {2, 3}}"
+    );
+  }
+
+  #[test]
+  fn self_loop_stays_single() {
+    assert_eq!(
+      interpret(
+        "EdgeList[DirectedGraph[Graph[{1 <-> 1, 1 <-> 2}]]] /. DirectedEdge -> List"
+      )
+      .unwrap(),
+      "{{1, 1}, {1, 2}, {2, 1}}"
+    );
+  }
+
+  #[test]
+  fn result_is_directed_and_preserves_vertices() {
+    assert_eq!(
+      interpret("DirectedGraphQ[DirectedGraph[CycleGraph[3]]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("VertexList[DirectedGraph[PathGraph[{1, 2, 3}]]]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn non_graph_stays_unevaluated() {
+    assert_eq!(interpret("DirectedGraph[5]").unwrap(), "DirectedGraph[5]");
+  }
+}
+
+mod incidence_graph_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn undirected_from_ones() {
+    assert_eq!(
+      interpret("EdgeList[IncidenceGraph[{{1, 1, 0}, {1, 0, 1}, {0, 1, 1}}]]")
+        .unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 2 \u{f3d4} 3}"
+    );
+    // Non-loop edges keep their column order (no sorting).
+    assert_eq!(
+      interpret("EdgeList[IncidenceGraph[{{0, 1}, {1, 1}, {1, 0}}]]").unwrap(),
+      "{2 \u{f3d4} 3, 1 \u{f3d4} 2}"
+    );
+  }
+
+  // A -1/+1 column is a directed edge from the -1 row to the +1 row;
+  // zero rows are isolated vertices.
+  #[test]
+  fn directed_from_signed_pairs() {
+    assert_eq!(
+      interpret("EdgeList[IncidenceGraph[{{-1, 1}, {1, -1}, {0, 0}}]]")
+        .unwrap(),
+      "{1 \u{f3d5} 2, 2 \u{f3d5} 1}"
+    );
+    assert_eq!(
+      interpret("VertexList[IncidenceGraph[{{-1, 1}, {1, -1}, {0, 0}}]]")
+        .unwrap(),
+      "{1, 2, 3}"
+    );
+    // In mixed graphs the directed edges come first.
+    assert_eq!(
+      interpret("Head /@ EdgeList[IncidenceGraph[{{1, -1}, {1, 1}}]]").unwrap(),
+      "{DirectedEdge, UndirectedEdge}"
+    );
+  }
+
+  // A single 2 is an undirected self-loop, emitted after the other edges;
+  // a single -2 is a directed self-loop (kept with the directed group).
+  #[test]
+  fn self_loops() {
+    assert_eq!(
+      interpret("EdgeList[IncidenceGraph[{{2, 1}, {0, 1}}]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 1}"
+    );
+    assert_eq!(
+      interpret("EdgeList[IncidenceGraph[{{2, 1, 0}, {0, 1, 2}}]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 1, 2 \u{f3d4} 2}"
+    );
+    assert_eq!(
+      interpret("Head /@ EdgeList[IncidenceGraph[{{-1, 2}, {1, 0}}]]").unwrap(),
+      "{DirectedEdge, UndirectedEdge}"
+    );
+    assert_eq!(
+      interpret("Head /@ EdgeList[IncidenceGraph[{{-2, 0}, {0, -2}}]]")
+        .unwrap(),
+      "{DirectedEdge, DirectedEdge}"
+    );
+  }
+
+  #[test]
+  fn named_vertices() {
+    assert_eq!(
+      interpret(
+        r#"VertexList[IncidenceGraph[{"a", "b", "c"}, {{1, 1, 0}, {1, 0, 1}, {0, 1, 1}}]]"#
+      )
+      .unwrap(),
+      "{a, b, c}"
+    );
+    assert_eq!(
+      interpret(
+        r#"EdgeList[IncidenceGraph[{"a", "b", "c"}, {{1, 1, 0}, {1, 0, 1}, {0, 1, 1}}]]"#
+      )
+      .unwrap(),
+      "{a \u{f3d4} b, a \u{f3d4} c, b \u{f3d4} c}"
+    );
+    // A name list whose length doesn't match the rows stays silently
+    // unevaluated.
+    assert_eq!(
+      interpret(r#"IncidenceGraph[{"a", "b"}, {{1, 1}, {1, 0}, {0, 1}}]"#)
+        .unwrap(),
+      "IncidenceGraph[{a, b}, {{1, 1}, {1, 0}, {0, 1}}]"
+    );
+  }
+
+  #[test]
+  fn round_trips_with_incidence_matrix() {
+    assert_eq!(
+      interpret(
+        "Normal[IncidenceMatrix[IncidenceGraph[{{1, 1, 0}, {1, 0, 1}, {0, 1, 1}}]]]"
+      )
+      .unwrap(),
+      "{{1, 1, 0}, {1, 0, 1}, {0, 1, 1}}"
+    );
+  }
+
+  // Invalid columns (bad entries, zero columns, three 1s) give ::inv;
+  // non-matrices give ::matrix — both leave the call unevaluated.
+  #[test]
+  fn invalid_inputs() {
+    assert_eq!(
+      interpret("IncidenceGraph[{{1, 2}, {3, 4}}]").unwrap(),
+      "IncidenceGraph[{{1, 2}, {3, 4}}]"
+    );
+    assert_eq!(
+      interpret("IncidenceGraph[{{1}, {1}, {1}}]").unwrap(),
+      "IncidenceGraph[{{1}, {1}, {1}}]"
+    );
+    assert_eq!(
+      interpret("IncidenceGraph[{{1, 0}, {1, 0}}]").unwrap(),
+      "IncidenceGraph[{{1, 0}, {1, 0}}]"
+    );
+    assert_eq!(
+      interpret("IncidenceGraph[{{0.5, 1}, {1, 1}}]").unwrap(),
+      "IncidenceGraph[{{0.5, 1}, {1, 1}}]"
+    );
+    assert_eq!(
+      interpret(r#"IncidenceGraph["foo"]"#).unwrap(),
+      "IncidenceGraph[foo]"
+    );
+  }
+}
+
+mod edge_rules_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn edges_as_rules() {
+    assert_eq!(
+      interpret("EdgeRules[Graph[{1 -> 2, 2 -> 3, UndirectedEdge[3, 4]}]]")
+        .unwrap(),
+      "{1 -> 2, 2 -> 3, 3 -> 4}"
+    );
+    // Undirected edges become rules too.
+    assert_eq!(
+      interpret(r#"EdgeRules[Graph[{"x" <-> "y"}]]"#).unwrap(),
+      "{x -> y}"
+    );
+    assert_eq!(interpret("EdgeRules[Graph[{1, 2}, {}]]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn non_graph_emits_message() {
+    assert_eq!(interpret("EdgeRules[{1, 2}]").unwrap(), "EdgeRules[{1, 2}]");
+  }
+}
+
+mod kirchhoff_graph_tests {
+  use woxi::interpret;
+
+  // A symmetric Laplacian gives undirected edges from the upper triangle.
+  #[test]
+  fn symmetric_matrices() {
+    assert_eq!(
+      interpret(
+        "EdgeList[KirchhoffGraph[{{2, -1, -1}, {-1, 1, 0}, {-1, 0, 1}}]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3}"
+    );
+    assert_eq!(
+      interpret(
+        "EdgeList[KirchhoffGraph[{{3, -1, -1, -1}, {-1, 1, 0, 0}, {-1, 0, 1, 0}, {-1, 0, 0, 1}}]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 3, 1 \u{f3d4} 4}"
+    );
+    // -k means k parallel edges; the diagonal is not validated.
+    assert_eq!(
+      interpret("EdgeList[KirchhoffGraph[{{2, -2}, {-2, 2}}]]").unwrap(),
+      "{1 \u{f3d4} 2, 1 \u{f3d4} 2}"
+    );
+    assert_eq!(
+      interpret("EdgeList[KirchhoffGraph[{{1, -1}, {-1, 2}}]]").unwrap(),
+      "{1 \u{f3d4} 2}"
+    );
+    assert_eq!(
+      interpret("VertexList[KirchhoffGraph[{{0, 0}, {0, 0}}]]").unwrap(),
+      "{1, 2}"
+    );
+  }
+
+  // Non-symmetric matrices give directed edges, read row by row.
+  #[test]
+  fn directed_matrices() {
+    assert_eq!(
+      interpret(
+        "EdgeList[KirchhoffGraph[{{1, -1, 0}, {0, 1, -1}, {-1, 0, 1}}]]"
+      )
+      .unwrap(),
+      "{1 \u{f3d5} 2, 2 \u{f3d5} 3, 3 \u{f3d5} 1}"
+    );
+    assert_eq!(
+      interpret("EdgeList[KirchhoffGraph[{{1, 0}, {-1, 1}}]]").unwrap(),
+      "{2 \u{f3d5} 1}"
+    );
+  }
+
+  #[test]
+  fn named_vertices_and_options() {
+    assert_eq!(
+      interpret(
+        r#"VertexList[KirchhoffGraph[{"a", "b"}, {{1, -1}, {-1, 1}}]]"#
+      )
+      .unwrap(),
+      "{a, b}"
+    );
+    // Trailing Graph options pass through.
+    assert_eq!(
+      interpret(
+        r#"EdgeList[KirchhoffGraph[{{1, -1}, {-1, 1}}, VertexLabels -> "Name"]]"#
+      )
+      .unwrap(),
+      "{1 \u{f3d4} 2}"
+    );
+  }
+
+  #[test]
+  fn round_trips_with_kirchhoff_matrix() {
+    assert_eq!(
+      interpret(
+        "Normal[KirchhoffMatrix[KirchhoffGraph[{{2, -1, -1}, {-1, 1, 0}, {-1, 0, 1}}]]]"
+      )
+      .unwrap(),
+      "{{2, -1, -1}, {-1, 1, 0}, {-1, 0, 1}}"
+    );
+  }
+
+  // Positive off-diagonal or real entries emit ::inv; non-square input
+  // emits ::matsq — both echo the call.
+  #[test]
+  fn invalid_inputs() {
+    assert_eq!(
+      interpret("KirchhoffGraph[{{1, 1}, {-1, 1}}]").unwrap(),
+      "KirchhoffGraph[{{1, 1}, {-1, 1}}]"
+    );
+    assert_eq!(
+      interpret("KirchhoffGraph[{{1.5, -1.5}, {-1.5, 1.5}}]").unwrap(),
+      "KirchhoffGraph[{{1.5, -1.5}, {-1.5, 1.5}}]"
+    );
+    assert_eq!(
+      interpret("KirchhoffGraph[{{1, -1}, {-1, 1}, {0, 0}}]").unwrap(),
+      "KirchhoffGraph[{{1, -1}, {-1, 1}, {0, 0}}]"
+    );
+    assert_eq!(
+      interpret(r#"KirchhoffGraph["foo"]"#).unwrap(),
+      "KirchhoffGraph[foo]"
+    );
+  }
+}
+
+mod find_fundamental_cycles_tests {
+  use woxi::interpret;
+
+  // One cycle per non-tree edge of the BFS spanning forest, in reverse
+  // EdgeList order, closed by the non-tree edge in input orientation.
+  // All values verified against wolframscript.
+  #[test]
+  fn fundamental_cycles() {
+    assert_eq!(
+      interpret("FindFundamentalCycles[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1}]]")
+        .unwrap(),
+      "{{3  1, 1  2, 2  3}}"
+    );
+    assert_eq!(
+      interpret("FindFundamentalCycles[CompleteGraph[4]]").unwrap(),
+      "{{4  1, 1  3, 3  4}, {4  1, 1  2, 2  4}, {3  1, 1  2, 2  3}}"
+    );
+    assert_eq!(
+      interpret("FindFundamentalCycles[CycleGraph[5]]").unwrap(),
+      "{{4  5, 5  1, 1  2, 2  3, 3  4}}"
+    );
+    // Non-root LCA.
+    assert_eq!(
+      interpret(
+        "FindFundamentalCycles[Graph[{1 <-> 2, 2 <-> 3, 2 <-> 4, 3 <-> 4}]]"
+      )
+      .unwrap(),
+      "{{4  2, 2  3, 3  4}}"
+    );
+    // Vertex order comes from first appearance, not sorting.
+    assert_eq!(
+      interpret("FindFundamentalCycles[Graph[{2 <-> 1, 1 <-> 3, 3 <-> 2}]]")
+        .unwrap(),
+      "{{3  2, 2  1, 1  3}}"
+    );
+    // Disconnected: global reverse edge order across components.
+    assert_eq!(
+      interpret(
+        "FindFundamentalCycles[Graph[{1 <-> 2, 2 <-> 3, 3 <-> 1, 4 <-> 5, 5 <-> 6, 6 <-> 4}]]"
+      )
+      .unwrap(),
+      "{{6  4, 4  5, 5  6}, {3  1, 1  2, 2  3}}"
+    );
+    // Bare edge lists, multi-edges, and self-loops.
+    assert_eq!(
+      interpret("FindFundamentalCycles[{1 <-> 2, 2 <-> 3, 3 <-> 1}]").unwrap(),
+      "{{3  1, 1  2, 2  3}}"
+    );
+    assert_eq!(
+      interpret("FindFundamentalCycles[Graph[{1 <-> 2, 1 <-> 2}]]").unwrap(),
+      "{{2  1, 1  2}}"
+    );
+    assert_eq!(
+      interpret("FindFundamentalCycles[Graph[{1 <-> 2, 1 <-> 1}]]").unwrap(),
+      "{{1  1}}"
+    );
+    // Acyclic graphs give an empty list; options are accepted.
+    assert_eq!(
+      interpret("FindFundamentalCycles[Graph[{1 <-> 2, 2 <-> 3}]]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret(
+        "FindFundamentalCycles[CycleGraph[3], VertexLabels -> \"Name\"]"
+      )
+      .unwrap(),
+      "{{3  1, 1  2, 2  3}}"
+    );
+  }
+
+  // Directed graphs emit `ngen`, non-graphs `graph`, non-option extras
+  // `nonopt`, and zero arguments `argx` — all unevaluated.
+  #[test]
+  fn message_cases() {
+    let r = woxi::interpret_with_stdout(
+      "FindFundamentalCycles[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]",
+    )
+    .unwrap();
+    assert_eq!(r.result, "FindFundamentalCycles[Graph[<3>, <3>]]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "FindFundamentalCycles::ngen: The generalized FindFundamentalCycles[Graph[<3>, <3>]] is not implemented."
+    )));
+
+    let r = woxi::interpret_with_stdout("FindFundamentalCycles[5]").unwrap();
+    assert_eq!(r.result, "FindFundamentalCycles[5]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "FindFundamentalCycles::graph: A graph object is expected at position 1 in FindFundamentalCycles[5]."
+    )));
+
+    let r =
+      woxi::interpret_with_stdout("FindFundamentalCycles[CycleGraph[3], 1]")
+        .unwrap();
+    assert_eq!(r.result, "FindFundamentalCycles[Graph[<3>, <3>], 1]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "FindFundamentalCycles::nonopt: Options expected (instead of 1) beyond position 1 in FindFundamentalCycles[Graph[<3>, <3>], 1]. An option must be a rule or a list of rules."
+    )));
+
+    let r = woxi::interpret_with_stdout("FindFundamentalCycles[]").unwrap();
+    assert_eq!(r.result, "FindFundamentalCycles[]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "FindFundamentalCycles::argx: FindFundamentalCycles called with 0 arguments; 1 argument is expected."
+    )));
+  }
+}
+
+// GraphLinkEfficiency = 1 - MeanGraphDistance/EdgeCount (decoded from
+// wolframscript's exact rationals). All outputs verified against
+// wolframscript.
+mod graph_link_efficiency {
+  use super::*;
+
+  #[test]
+  fn connected_graphs() {
+    assert_eq!(
+      interpret("GraphLinkEfficiency[CycleGraph[3]]").unwrap(),
+      "2/3"
+    );
+    assert_eq!(
+      interpret("GraphLinkEfficiency[CycleGraph[5]]").unwrap(),
+      "7/10"
+    );
+    assert_eq!(
+      interpret("GraphLinkEfficiency[CompleteGraph[4]]").unwrap(),
+      "5/6"
+    );
+    assert_eq!(
+      interpret("GraphLinkEfficiency[PathGraph[Range[4]]]").unwrap(),
+      "4/9"
+    );
+    assert_eq!(
+      interpret("GraphLinkEfficiency[StarGraph[4]]").unwrap(),
+      "1/2"
+    );
+  }
+
+  #[test]
+  fn disconnected_and_invalid() {
+    // An infinite mean distance makes the efficiency -Infinity — also
+    // for directed graphs that are not strongly connected.
+    assert_eq!(
+      interpret("GraphLinkEfficiency[Graph[{1 <-> 2, 3 <-> 4}]]").unwrap(),
+      "-Infinity"
+    );
+    assert_eq!(
+      interpret("GraphLinkEfficiency[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "-Infinity"
+    );
+    assert_eq!(
+      interpret("GraphLinkEfficiency[x]").unwrap(),
+      "GraphLinkEfficiency[x]"
+    );
+  }
+}
+
+mod directed_predicates_undirected_graph_and_hamiltonian_path {
+  use super::*;
+
+  // The graph predicates read directed edges too; a directed edge and its
+  // reverse are two different edges, so neither makes the graph a multigraph.
+  #[test]
+  fn simple_graph_q_reads_directed_edges() {
+    assert_eq!(
+      interpret("SimpleGraphQ[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("SimpleGraphQ[Graph[{1 -> 2, 2 -> 1}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("SimpleGraphQ[Graph[{1 -> 2, 1 -> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret("SimpleGraphQ[Graph[{1 -> 1}]]").unwrap(), "False");
+    // A mixed graph: the undirected edge and the arc are different edges.
+    assert_eq!(
+      interpret("SimpleGraphQ[Graph[{1 <-> 2, 1 -> 2}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn loop_free_and_planar_read_directed_edges() {
+    assert_eq!(
+      interpret("LoopFreeGraphQ[Graph[{1 -> 2}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("PlanarGraphQ[Graph[{1 -> 2}]]").unwrap(), "True");
+  }
+
+  // A digraph is a path when every vertex has at most one arc in and one out;
+  // a directed cycle counts, as it does in the undirected case.
+  #[test]
+  fn path_graph_q_on_a_digraph() {
+    assert_eq!(
+      interpret("PathGraphQ[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("PathGraphQ[Graph[{2 -> 1, 2 -> 3}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("PathGraphQ[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap(),
+      "True"
+    );
+  }
+
+  // A complete digraph needs both arcs of every pair.
+  #[test]
+  fn complete_graph_q_on_a_digraph() {
+    assert_eq!(
+      interpret("CompleteGraphQ[Graph[{1 -> 2, 2 -> 1}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("CompleteGraphQ[Graph[{1 -> 2}]]").unwrap(),
+      "False"
+    );
+  }
+
+  // UndirectedGraph drops the directions and the duplicates they leave.
+  #[test]
+  fn undirected_graph() {
+    assert_eq!(
+      interpret(
+        "ToString[InputForm[EdgeList[UndirectedGraph[Graph[{1 -> 2, 2 -> 1}]]]]]"
+      )
+      .unwrap(),
+      "{UndirectedEdge[1, 2]}"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[InputForm[EdgeList[UndirectedGraph[Graph[{1 -> 2, 2 -> 3}]]]]]"
+      )
+      .unwrap(),
+      "{UndirectedEdge[1, 2], UndirectedEdge[2, 3]}"
+    );
+    assert_eq!(
+      interpret("VertexList[UndirectedGraph[Graph[{1 -> 2}]]]").unwrap(),
+      "{1, 2}"
+    );
+    assert_eq!(
+      interpret("UndirectedGraphQ[UndirectedGraph[Graph[{1 -> 2}]]]").unwrap(),
+      "True"
+    );
+  }
+
+  // FindHamiltonianPath reports the vertices of one path, or {} when the
+  // graph has none.
+  #[test]
+  fn find_hamiltonian_path() {
+    assert_eq!(
+      interpret("FindHamiltonianPath[CycleGraph[4]]").unwrap(),
+      "{1, 2, 3, 4}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianPath[PathGraph[{1, 2, 3}]]").unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianPath[CompleteGraph[4]]").unwrap(),
+      "{1, 2, 3, 4}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianPath[Graph[{1 <-> 2, 3 <-> 4}]]").unwrap(),
+      "{}"
+    );
+    // Directed edges are followed in their own direction only.
+    assert_eq!(
+      interpret("FindHamiltonianPath[Graph[{1 -> 2, 2 -> 3}]]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn find_hamiltonian_path_between_two_vertices() {
+    assert_eq!(
+      interpret("FindHamiltonianPath[Graph[{1 <-> 2, 2 <-> 3}], 1, 3]")
+        .unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("FindHamiltonianPath[Graph[{1 <-> 2, 2 <-> 3}], 3, 1]")
+        .unwrap(),
+      "{3, 2, 1}"
+    );
+    // No Hamiltonian path starts at the middle vertex.
+    assert_eq!(
+      interpret("FindHamiltonianPath[Graph[{1 <-> 2, 2 <-> 3}], 2, 3]")
+        .unwrap(),
+      "{}"
+    );
+  }
+}
+
+/// The annotations a `Graph[vertices, edges, opts…]` carries: reading them
+/// back, setting them, and the predicates over them.
+mod graph_annotations {
+  use super::*;
+
+  #[test]
+  fn vertices_can_be_renamed() {
+    clear_state();
+    for (code, expected) in [
+      (
+        "ToString[VertexList[VertexReplace[Graph[{1 <-> 2}], 1 -> 5]], InputForm]",
+        "{5, 2}",
+      ),
+      (
+        "ToString[EdgeList[VertexReplace[Graph[{1 <-> 2}], 1 -> 5]], InputForm]",
+        "{UndirectedEdge[5, 2]}",
+      ),
+      (
+        "ToString[VertexList[VertexReplace[Graph[{1 <-> 2, 2 <-> 3}], \
+         {1 -> a, 3 -> c}]], InputForm]",
+        "{a, 2, c}",
+      ),
+      (
+        "ToString[EdgeList[VertexReplace[Graph[{1 -> 2}], 2 -> y]], InputForm]",
+        "{DirectedEdge[1, y]}",
+      ),
+      // Renaming onto a vertex that is already there merges the two.
+      (
+        "ToString[VertexList[VertexReplace[Graph[{1 <-> 2, 2 <-> 3}], \
+         {1 -> 3}]], InputForm]",
+        "{3, 2}",
+      ),
+    ] {
+      assert_eq!(
+        interpret(&code.replace("         ", "")).unwrap(),
+        expected,
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn the_weight_predicates_see_what_the_graph_carries() {
+    clear_state();
+    for (code, expected) in [
+      (
+        "EdgeWeightedGraphQ[Graph[{1 <-> 2}, EdgeWeight -> {5}]]",
+        "True",
+      ),
+      ("EdgeWeightedGraphQ[Graph[{1 <-> 2}]]", "False"),
+      (
+        "VertexWeightedGraphQ[Graph[{1 <-> 2}, VertexWeight -> {1, 2}]]",
+        "True",
+      ),
+      (
+        "VertexWeightedGraphQ[Graph[{1 <-> 2}, EdgeWeight -> {5}]]",
+        "False",
+      ),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn annotations_are_read_by_graph_or_by_item() {
+    clear_state();
+    const G: &str = "Graph[{1 <-> 2, 2 <-> 3}, EdgeWeight -> {5, 7}]";
+    for (code, expected) in [
+      (
+        format!("ToString[Options[{G}], InputForm]"),
+        "{EdgeWeight -> {5, 7}}",
+      ),
+      (
+        format!("ToString[Options[{G}, EdgeWeight], InputForm]"),
+        "{EdgeWeight -> {5, 7}}",
+      ),
+      (
+        "ToString[Options[Graph[{1 <-> 2}]], InputForm]".to_string(),
+        "{}",
+      ),
+      (
+        format!("ToString[AnnotationValue[{G}, EdgeWeight], InputForm]"),
+        "{5, 7}",
+      ),
+      // An item names one of the values.
+      (
+        format!("AnnotationValue[{{{G}, 2 <-> 3}}, EdgeWeight]"),
+        "7",
+      ),
+      (format!("PropertyValue[{{{G}, 2 <-> 3}}, EdgeWeight]"), "7"),
+      (format!("PropertyValue[{{{G}, 1 <-> 2}}, EdgeWeight]"), "5"),
+      (
+        "PropertyValue[{Graph[{1 <-> 2}, VertexWeight -> {3, 4}], 1}, \
+         VertexWeight]"
+          .to_string(),
+        "3",
+      ),
+      // A property the graph does not carry, or an item it does not hold.
+      (
+        format!("AnnotationValue[{{{G}, 1}}, VertexWeight]"),
+        "$Failed",
+      ),
+      (
+        format!("PropertyValue[{{{G}, 5 <-> 6}}, EdgeWeight]"),
+        "$Failed",
+      ),
+    ] {
+      assert_eq!(
+        interpret(&code.replace("         ", "")).unwrap(),
+        expected,
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_property_can_be_set_on_an_edge() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "EdgeWeightedGraphQ[SetProperty[{Graph[{1 <-> 2}], 1 <-> 2}, \
+         EdgeWeight -> 7]]"
+          .replace("         ", "")
+          .as_str()
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[Options[SetProperty[{Graph[{1 <-> 2}], 1 <-> 2}, \
+         EdgeWeight -> 7]], InputForm]"
+          .replace("         ", "")
+          .as_str()
+      )
+      .unwrap(),
+      "{EdgeWeight -> {7}}"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[EdgeList[SetProperty[{Graph[{1 <-> 2}], 1 <-> 2}, \
+         EdgeWeight -> 7]], InputForm]"
+          .replace("         ", "")
+          .as_str()
+      )
+      .unwrap(),
+      "{UndirectedEdge[1, 2]}"
+    );
+  }
+
+  #[test]
+  fn the_property_list_grows_with_what_the_graph_carries() {
+    clear_state();
+    assert_eq!(
+      interpret("ToString[PropertyList[Graph[{1 <-> 2}]], InputForm]").unwrap(),
+      "{GraphHighlight, GraphHighlightStyle, GraphLayout, GraphStyle, \
+       EdgeShapeFunction, EdgeStyle, VertexCoordinates, VertexShapeFunction, \
+       VertexShape, VertexSize, VertexStyle}"
+        .replace("       ", "")
+    );
+    // A graph carrying one of its own lists the whole set alphabetically.
+    assert_eq!(
+      interpret(
+        "ToString[PropertyList[Graph[{1 <-> 2}, EdgeWeight -> {5}]], InputForm]"
+      )
+      .unwrap(),
+      "{EdgeShapeFunction, EdgeStyle, EdgeWeight, GraphHighlight, \
+       GraphHighlightStyle, GraphLayout, GraphStyle, VertexCoordinates, \
+       VertexShape, VertexShapeFunction, VertexSize, VertexStyle}"
+        .replace("       ", "")
+    );
+  }
+
+  /// The graph the annotation tests below read from: two of its three
+  /// vertices are labelled, one vertex is styled and one of its two edges is.
+  const ANNOTATED: &str = "Graph[{1 -> 2, 2 -> 3}, \
+     VertexLabels -> {1 -> \"a\", 2 -> \"b\"}, \
+     EdgeStyle -> {DirectedEdge[1, 2] -> Red}, VertexStyle -> {1 -> Blue}]";
+
+  /// The same graph with a single label, so that every annotation it carries
+  /// names exactly one item.
+  const LABELLED: &str = "Graph[{1 -> 2, 2 -> 3}, \
+     VertexLabels -> {1 -> \"a\"}, \
+     EdgeStyle -> {DirectedEdge[1, 2] -> Red}]";
+
+  #[test]
+  fn an_item_annotation_reads_back_as_its_bare_value() {
+    clear_state();
+    for (code, expected) in [
+      // The item named by a rule takes the value the rule gives it, not the
+      // rule itself.
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 1}}, VertexLabels]"),
+        "\"a\"",
+      ),
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 2}}, VertexLabels]"),
+        "\"b\"",
+      ),
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 1}}, VertexStyle]"),
+        "RGBColor[0, 0, 1]",
+      ),
+      (
+        format!(
+          "AnnotationValue[{{{ANNOTATED}, DirectedEdge[1, 2]}}, EdgeStyle]"
+        ),
+        "RGBColor[1, 0, 0]",
+      ),
+      // A list of items reads a value for each of them.
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, {{1, 2}}}}, VertexLabels]"),
+        "{\"a\", \"b\"}",
+      ),
+      // An annotation every item of that kind offers falls back to its own
+      // default; one only some items carry has nothing to fall back on.
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 3}}, VertexStyle]"),
+        "Automatic",
+      ),
+      (
+        format!(
+          "AnnotationValue[{{{ANNOTATED}, DirectedEdge[2, 3]}}, EdgeStyle]"
+        ),
+        "Automatic",
+      ),
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 3}}, VertexLabels]"),
+        "$Failed",
+      ),
+      (
+        format!(
+          "AnnotationValue[{{{ANNOTATED}, DirectedEdge[2, 3]}}, EdgeLabels]"
+        ),
+        "$Failed",
+      ),
+      // An annotation of the wrong kind, or an item the graph does not hold.
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 1}}, EdgeStyle]"),
+        "$Failed",
+      ),
+      (
+        format!("AnnotationValue[{{{ANNOTATED}, 99}}, VertexStyle]"),
+        "$Failed",
+      ),
+      // Whole-graph reads give the option's default when it is unset.
+      (
+        format!("AnnotationValue[{ANNOTATED}, GraphLayout]"),
+        "Automatic",
+      ),
+      (
+        format!("AnnotationValue[{ANNOTATED}, VertexWeight]"),
+        "Automatic",
+      ),
+      (format!("AnnotationValue[{ANNOTATED}, EdgeLabels]"), "None"),
+      (
+        format!("AnnotationValue[{ANNOTATED}, GraphHighlight]"),
+        "{}",
+      ),
+    ] {
+      let code = format!("ToString[{code}, InputForm]");
+      assert_eq!(interpret(&code).unwrap(), expected, "{code}");
+    }
+  }
+
+  #[test]
+  fn annotation_keys_list_what_the_graph_or_one_item_offers() {
+    clear_state();
+    const BASE_VERTEX: &str = "{VertexCoordinates, VertexShapeFunction, \
+       VertexShape, VertexSize, VertexStyle}";
+    const SORTED_VERTEX: &str = "{VertexCoordinates, VertexShape, \
+       VertexShapeFunction, VertexSize, VertexStyle}";
+    for (code, expected) in [
+      // A whole-graph read lists the same annotations PropertyList does.
+      (
+        format!("AnnotationKeys[{ANNOTATED}]"),
+        "{GraphHighlight, GraphHighlightStyle, GraphLayout, GraphStyle, \
+         EdgeShapeFunction, EdgeStyle, VertexCoordinates, \
+         VertexShapeFunction, VertexShape, VertexSize, VertexStyle}"
+          .to_string(),
+      ),
+      // An annotation the graph sets for an item joins that item's list.
+      (
+        format!("AnnotationKeys[{{{ANNOTATED}, 1}}]"),
+        "{VertexCoordinates, VertexLabels, VertexShape, VertexShapeFunction, \
+         VertexSize, VertexStyle}"
+          .to_string(),
+      ),
+      // One it sets for other items only does not.
+      (
+        format!("AnnotationKeys[{{{ANNOTATED}, 3}}]"),
+        SORTED_VERTEX.to_string(),
+      ),
+      (
+        format!("AnnotationKeys[{{{ANNOTATED}, DirectedEdge[1, 2]}}]"),
+        "{EdgeShapeFunction, EdgeStyle}".to_string(),
+      ),
+      // A graph that carries nothing about its items keeps wolframscript's
+      // own order; one that carries anything lists them alphabetically.
+      (
+        "AnnotationKeys[{Graph[{1 -> 2, 2 -> 3}], 1}]".to_string(),
+        BASE_VERTEX.to_string(),
+      ),
+      (
+        "AnnotationKeys[{Graph[{1 -> 2, 2 -> 3}, EdgeWeight -> {5, 7}], 1}]"
+          .to_string(),
+        SORTED_VERTEX.to_string(),
+      ),
+      (
+        "AnnotationKeys[{Graph[{1 -> 2, 2 -> 3}], DirectedEdge[1, 2]}]"
+          .to_string(),
+        "{EdgeShapeFunction, EdgeStyle}".to_string(),
+      ),
+      // A list of items gives a list of key lists.
+      (
+        "AnnotationKeys[{Graph[{1 -> 2, 2 -> 3}], {1, 2}}]".to_string(),
+        format!("{{{BASE_VERTEX}, {BASE_VERTEX}}}").replace("       ", ""),
+      ),
+      // Only a weight extends the whole-graph list — a label does not.
+      (
+        "AnnotationKeys[Graph[{1 -> 2}, VertexLabels -> {1 -> \"a\"}]]"
+          .to_string(),
+        "{GraphHighlight, GraphHighlightStyle, GraphLayout, GraphStyle, \
+         EdgeShapeFunction, EdgeStyle, VertexCoordinates, \
+         VertexShapeFunction, VertexShape, VertexSize, VertexStyle}"
+          .to_string(),
+      ),
+    ] {
+      let code = format!("ToString[{code}, InputForm]");
+      assert_eq!(
+        interpret(&code).unwrap(),
+        expected.replace("         ", "").replace("       ", ""),
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn annotation_delete_drops_a_whole_key_or_one_items_share_of_it() {
+    clear_state();
+    for (code, expected) in [
+      // Without a key every annotation goes.
+      (format!("Options[AnnotationDelete[{LABELLED}]]"), "{}"),
+      // With one only that key does; the rest keep their values.
+      (
+        format!("Options[AnnotationDelete[{LABELLED}, VertexLabels]]"),
+        "{EdgeStyle -> {DirectedEdge[1, 2] -> RGBColor[1, 0, 0]}}",
+      ),
+      (
+        format!(
+          "Options[AnnotationDelete[{LABELLED}, {{VertexLabels, EdgeStyle}}]]"
+        ),
+        "{}",
+      ),
+      // A key the graph does not carry leaves it alone.
+      (
+        "Options[AnnotationDelete[Graph[{1 -> 2}], VertexStyle]]".to_string(),
+        "{}",
+      ),
+      // Naming an item takes only that item's share, and drops the key once
+      // nothing is left of it.
+      (
+        format!("Options[AnnotationDelete[{{{ANNOTATED}, 1}}, VertexLabels]]"),
+        "{EdgeStyle -> {DirectedEdge[1, 2] -> RGBColor[1, 0, 0]}, \
+         VertexLabels -> {2 -> \"b\"}, VertexStyle -> {1 -> RGBColor[0, 0, 1]}}",
+      ),
+      (
+        format!("Options[AnnotationDelete[{{{ANNOTATED}, 1}}]]"),
+        "{EdgeStyle -> {DirectedEdge[1, 2] -> RGBColor[1, 0, 0]}, \
+         VertexLabels -> {2 -> \"b\"}}",
+      ),
+      (
+        format!(
+          "Options[AnnotationDelete[{{{LABELLED}, DirectedEdge[1, 2]}}, \
+           EdgeStyle]]"
+        ),
+        "{VertexLabels -> {1 -> \"a\"}}",
+      ),
+      // An annotation that spells out a value per item resets that item's
+      // slot to the default weight rather than losing the key.
+      (
+        "Options[AnnotationDelete[{Graph[{1 <-> 2, 2 <-> 3}, \
+         EdgeWeight -> {5, 7}], 1 <-> 2}, EdgeWeight]]"
+          .to_string(),
+        "{EdgeWeight -> {1, 7}}",
+      ),
+      // The graph itself is untouched.
+      (
+        format!("VertexList[AnnotationDelete[{ANNOTATED}]]"),
+        "{1, 2, 3}",
+      ),
+      (format!("Head[AnnotationDelete[{ANNOTATED}]]"), "Graph"),
+    ] {
+      let code =
+        format!("ToString[{}, InputForm]", code.replace("           ", ""));
+      assert_eq!(
+        interpret(&code).unwrap(),
+        expected.replace("         ", ""),
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn graph_options_are_named_in_alphabetical_order() {
+    clear_state();
+    assert_eq!(
+      interpret(&format!("ToString[Options[{LABELLED}], InputForm]")).unwrap(),
+      "{EdgeStyle -> {DirectedEdge[1, 2] -> RGBColor[1, 0, 0]}, \
+       VertexLabels -> {1 -> \"a\"}}"
+        .replace("       ", "")
+    );
+  }
+
+  #[test]
+  fn every_edge_of_a_tagged_graph_carries_a_tag() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ToString[EdgeList[EdgeTaggedGraph[{1 <-> 2, 2 <-> 3}]], InputForm]"
+      )
+      .unwrap(),
+      "{UndirectedEdge[1, 2, 1], UndirectedEdge[2, 3, 1]}"
+    );
+    // An edge written with a tag keeps it.
+    assert_eq!(
+      interpret(
+        "ToString[EdgeTags[EdgeTaggedGraph[{UndirectedEdge[1, 2, \"a\"], \
+         2 <-> 3}]], InputForm]"
+          .replace("         ", "")
+          .as_str()
+      )
+      .unwrap(),
+      "{\"a\", 1}"
+    );
+    assert_eq!(
+      interpret("ToString[EdgeTags[Graph[{1 <-> 2}]], InputForm]").unwrap(),
+      "{}"
+    );
+    assert_eq!(
+      interpret("EdgeTaggedGraphQ[EdgeTaggedGraph[{1 <-> 2}]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("EdgeTaggedGraphQ[Graph[{1 <-> 2}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[VertexList[EdgeTaggedGraph[{1 <-> 2, 2 <-> 3}]], \
+       InputForm]"
+          .replace("       ", "")
+          .as_str()
+      )
+      .unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+}
+
+// Wolfram's own documentation states that every graph query/analysis
+// function below accepts either a `Graph[...]` object or a bare list of
+// edges for its first argument ("g can be a graph or a list of edges").
+// Woxi already normalized `Graph[{a -> b, ...}]` (a single-argument Graph
+// constructor) into the canonical `Graph[vertices, edges]` form; these
+// functions just weren't reusing that normalization when the `Graph[...]`
+// wrapper was missing entirely, so a bare edge list fell through to
+// "unevaluated" instead.
+mod bare_edge_list_argument {
+  use super::*;
+
+  #[test]
+  fn vertex_and_edge_list_accept_bare_edges() {
+    assert_eq!(
+      interpret("VertexList[{1 -> 2, 2 -> 3, 3 -> 1}]").unwrap(),
+      "{1, 2, 3}"
+    );
+    assert_eq!(
+      interpret("VertexCount[{1 -> 2, 2 -> 3, 3 -> 1}]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("EdgeCount[{1 -> 2, 2 -> 3, 3 -> 1}]").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn centrality_measures_accept_bare_edges() {
+    // Matches the Graph[...]-wrapped result exactly (this is a shorthand
+    // for the same graph, not a different computation).
+    let wrapped =
+      interpret("ClosenessCentrality[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]")
+        .unwrap();
+    let bare =
+      interpret("ClosenessCentrality[{1 -> 2, 2 -> 3, 3 -> 1}]").unwrap();
+    assert_eq!(bare, wrapped);
+    assert_eq!(
+      interpret("Round[ClosenessCentrality[{1 -> 2, 2 -> 3, 3 -> 1}], 10^-6]")
+        .unwrap(),
+      "{666667/1000000, 666667/1000000, 666667/1000000}"
+    );
+
+    assert_eq!(
+      interpret("Round[PageRankCentrality[{1 -> 2, 2 -> 3, 3 -> 1}], 10^-6]")
+        .unwrap(),
+      "{333333/1000000, 333333/1000000, 333333/1000000}"
+    );
+    assert_eq!(
+      interpret("DegreeCentrality[{1 -> 2, 2 -> 3, 3 -> 1}]").unwrap(),
+      "{2, 2, 2}"
+    );
+  }
+
+  #[test]
+  fn undirected_bare_edges_also_normalize() {
+    assert_eq!(
+      interpret("VertexList[{1 <-> 2, 2 <-> 3}]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn non_edge_bare_list_still_falls_through_unevaluated() {
+    // {1, 2, 3} isn't a list of edges, so it must not be silently coerced
+    // into a graph on 3 vertices with no edges.
+    assert_eq!(
+      interpret("VertexCount[{1, 2, 3}]").unwrap(),
+      "VertexCount[{1, 2, 3}]"
+    );
+  }
+}
+
+mod topological_sort {
+  use super::*;
+
+  #[test]
+  fn linear_chain() {
+    let result =
+      interpret("TopologicalSort[Graph[{1 -> 2, 2 -> 3, 3 -> 4}]]").unwrap();
+    assert_eq!(result, "{1, 2, 3, 4}");
+  }
+
+  #[test]
+  fn diamond_shape() {
+    // Every directed edge u -> v must have u appear before v.
+    let result =
+      interpret("TopologicalSort[Graph[{1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4}]]")
+        .unwrap();
+    assert_eq!(result, "{1, 2, 3, 4}");
+  }
+
+  #[test]
+  fn independent_vertices_break_ties_lexicographically() {
+    // 1 and 2 both have no incoming edges; Woxi always picks the lower
+    // index first (Kahn's algorithm), giving the lexicographically
+    // smallest valid order.
+    let result = interpret("TopologicalSort[Graph[{1 -> 3, 2 -> 3}]]").unwrap();
+    assert_eq!(result, "{1, 2, 3}");
+  }
+
+  #[test]
+  fn isolated_vertex_included() {
+    let result =
+      interpret("TopologicalSort[Graph[{1, 2, 3}, {1 -> 3}]]").unwrap();
+    assert_eq!(result, "{1, 2, 3}");
+  }
+
+  #[test]
+  fn cyclic_graph_stays_unevaluated() {
+    // A cycle has no topological order, matching WL's failure behavior.
+    let result =
+      interpret("TopologicalSort[Graph[{1 -> 2, 2 -> 3, 3 -> 1}]]").unwrap();
+    assert_eq!(result, "TopologicalSort[Graph[<3>, <3>]]");
+  }
+
+  #[test]
+  fn self_loop_stays_unevaluated() {
+    let result = interpret("TopologicalSort[Graph[{1 -> 1, 1 -> 2}]]").unwrap();
+    assert!(result.starts_with("TopologicalSort["));
+  }
+
+  #[test]
+  fn accepts_bare_edge_list() {
+    assert_eq!(
+      interpret("TopologicalSort[{1 -> 2, 2 -> 3}]").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn undirected_graph_stays_unevaluated() {
+    // TopologicalSort is only defined for a DAG; an undirected edge can't
+    // be oriented, so it must not be silently dropped and treated as no
+    // constraint at all.
+    let result =
+      interpret("TopologicalSort[Graph[{1 <-> 2, 2 <-> 3}]]").unwrap();
+    assert!(result.starts_with("TopologicalSort["));
+  }
+
+  #[test]
+  fn mixed_directed_and_undirected_stays_unevaluated() {
+    let result =
+      interpret("TopologicalSort[Graph[{1 -> 2, 2 <-> 3}]]").unwrap();
+    assert!(result.starts_with("TopologicalSort["));
+  }
+}
+
+// GraphData backs itself with a self-contained slice of the Wolfram
+// Knowledgebase graph atlas (see src/functions/graph_data.rs) rather than the
+// full ~12500-entry enumeration. Everything it does carry uses Wolfram's own
+// names, vertex labelling and edge order, so the two agree entry for entry.
+mod graph_data {
+  use super::*;
+
+  #[test]
+  fn no_args_lists_known_names() {
+    assert_eq!(
+      interpret("MemberQ[GraphData[], \"PetersenGraph\"]").unwrap(),
+      "True"
+    );
+    // Woxi used to invent `"CompleteGraphK4"`, `"CycleGraphC6"` and friends
+    // for the parametrized families. Wolfram has no such names — they are
+    // spelled `{"Complete", 4}` and `{"Cycle", 6}` — so listing them made
+    // `MemberQ[GraphData[], …]` answer True where wolframscript answers
+    // False.
+    assert_eq!(
+      interpret("MemberQ[GraphData[], \"CompleteGraphK4\"]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("MemberQ[GraphData[], \"CycleGraphC6\"]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("MemberQ[GraphData[], \"UtilityGraph\"]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn no_args_has_no_duplicate_names() {
+    assert_eq!(
+      interpret("Length[GraphData[]] == Length[Union[GraphData[]]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn named_graph_returns_graph_object() {
+    assert_eq!(
+      interpret("Head[GraphData[\"PetersenGraph\"]]").unwrap(),
+      "Graph"
+    );
+    assert_eq!(
+      interpret("Head[GraphData[{\"Complete\", 5}]]").unwrap(),
+      "Graph"
+    );
+  }
+
+  #[test]
+  fn vertex_and_edge_count_properties() {
+    assert_eq!(
+      interpret("GraphData[\"PetersenGraph\", \"VertexCount\"]").unwrap(),
+      "10"
+    );
+    assert_eq!(
+      interpret("GraphData[\"PetersenGraph\", \"EdgeCount\"]").unwrap(),
+      "15"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Complete\", 4}, \"VertexCount\"]").unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Complete\", 4}, \"EdgeCount\"]").unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Cycle\", 6}, \"VertexCount\"]").unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Cycle\", 6}, \"EdgeCount\"]").unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn edge_count_matches_vertex_count_and_edge_rules_for_every_graph() {
+    // Every carried graph's VertexCount/EdgeCount/EdgeRules stay consistent
+    // with the underlying Graph[...] object.
+    let result = interpret(
+      "AllTrue[GraphData[], (GraphData[#, \"EdgeCount\"] == \
+       Length[GraphData[#, \"EdgeRules\"]] && \
+       VertexCount[GraphData[#]] == GraphData[#, \"VertexCount\"] && \
+       EdgeCount[GraphData[#]] == GraphData[#, \"EdgeCount\"]) &]",
+    )
+    .unwrap();
+    assert_eq!(result, "True");
+  }
+
+  // Vertex labelling follows Wolfram's, so the edge rules match rule for
+  // rule — including the ones that are *not* the obvious labelling: the
+  // Petersen graph's outer cycle is not 1-2-3-4-5, a star's hub is its
+  // *last* vertex, and a cycle's wrap-around edge sorts second.
+  #[test]
+  fn edge_rules_follow_wolframs_vertex_labelling() {
+    assert_eq!(
+      interpret("GraphData[{\"Complete\", 4}, \"EdgeRules\"]").unwrap(),
+      "{1 -> 2, 1 -> 3, 1 -> 4, 2 -> 3, 2 -> 4, 3 -> 4}"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Cycle\", 6}, \"EdgeRules\"]").unwrap(),
+      "{1 -> 2, 1 -> 6, 2 -> 3, 3 -> 4, 4 -> 5, 5 -> 6}"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Star\", 5}, \"EdgeRules\"]").unwrap(),
+      "{1 -> 5, 2 -> 5, 3 -> 5, 4 -> 5}"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Wheel\", 5}, \"EdgeRules\"]").unwrap(),
+      "{1 -> 2, 1 -> 4, 1 -> 5, 2 -> 3, 2 -> 5, 3 -> 4, 3 -> 5, 4 -> 5}"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"CompleteBipartite\", {2, 4}}, \"EdgeRules\"]")
+        .unwrap(),
+      "{1 -> 3, 1 -> 4, 1 -> 5, 1 -> 6, 2 -> 3, 2 -> 4, 2 -> 5, 2 -> 6}"
+    );
+    assert_eq!(
+      interpret("GraphData[\"PetersenGraph\", \"EdgeRules\"]").unwrap(),
+      "{1 -> 3, 1 -> 4, 1 -> 6, 2 -> 4, 2 -> 5, 2 -> 7, 3 -> 5, 3 -> 8, \
+       4 -> 9, 5 -> 10, 6 -> 7, 6 -> 10, 7 -> 8, 8 -> 9, 9 -> 10}"
+    );
+  }
+
+  // A named entity that *is* a family member is the very same graph, so the
+  // two spellings can never drift apart.
+  #[test]
+  fn named_aliases_agree_with_their_parametrized_spelling() {
+    assert_eq!(
+      interpret(
+        "GraphData[\"TetrahedralGraph\", \"EdgeRules\"] == \
+         GraphData[{\"Complete\", 4}, \"EdgeRules\"]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "GraphData[\"UtilityGraph\", \"EdgeRules\"] == \
+         GraphData[{\"CompleteBipartite\", {3, 3}}, \"EdgeRules\"]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("GraphData[\"SquareGraph\", \"EdgeRules\"]").unwrap(),
+      "{1 -> 2, 1 -> 4, 2 -> 3, 3 -> 4}"
+    );
+  }
+
+  // "Name" is the human-readable description (with Wolfram's U+2010 hyphen
+  // in the size prefix), "StandardName" the canonical entity — which for a
+  // spec Wolfram has no name for is the spec itself.
+  #[test]
+  fn name_and_standard_name() {
+    assert_eq!(
+      interpret("GraphData[\"PetersenGraph\", \"Name\"]").unwrap(),
+      "Petersen graph"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Complete\", 4}, \"StandardName\"]").unwrap(),
+      "TetrahedralGraph"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[GraphData[{\"Cycle\", 6}, \"StandardName\"], InputForm]"
+      )
+      .unwrap(),
+      "{\"Cycle\", 6}"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Cycle\", 6}, \"Name\"]").unwrap(),
+      "6\u{2010}cycle graph"
+    );
+    // Wolfram collapses a spec onto its canonical spelling before naming it:
+    // K(1,3) is the claw graph, which is the 4-star.
+    assert_eq!(
+      interpret("GraphData[{\"CompleteBipartite\", {1, 3}}, \"StandardName\"]")
+        .unwrap(),
+      "ClawGraph"
+    );
+    assert_eq!(
+      interpret("GraphData[{\"Wheel\", 4}, \"StandardName\"]").unwrap(),
+      "TetrahedralGraph"
+    );
+  }
+
+  // wolframscript emits `GraphData::notent` and leaves the call unevaluated
+  // rather than answering `Missing["NotAvailable"]`.
+  #[test]
+  fn unknown_name_stays_unevaluated() {
+    assert_eq!(
+      interpret("GraphData[\"NotARealGraphName\"]").unwrap(),
+      "GraphData[NotARealGraphName]"
+    );
+    assert_eq!(
+      interpret("GraphData[\"NotARealGraphName\", \"VertexCount\"]").unwrap(),
+      "GraphData[NotARealGraphName, VertexCount]"
+    );
+    assert_eq!(
+      interpret("GraphData[\"CompleteGraphK4\", \"VertexCount\"]").unwrap(),
+      "GraphData[CompleteGraphK4, VertexCount]"
+    );
+  }
+
+  // Likewise `GraphData::notprop` for an unknown property — and a bare
+  // symbol is *not* a shorthand for the string, it is simply not a property.
+  #[test]
+  fn unknown_property_stays_unevaluated() {
+    assert_eq!(
+      interpret("GraphData[\"PetersenGraph\", \"NotAProperty\"]").unwrap(),
+      "GraphData[PetersenGraph, NotAProperty]"
+    );
+    assert_eq!(
+      interpret("Head[GraphData[\"PetersenGraph\", Image]]").unwrap(),
+      "GraphData"
+    );
+  }
+
+  #[test]
+  fn properties_lists_the_answerable_properties() {
+    assert_eq!(
+      interpret("MemberQ[GraphData[\"Properties\"], \"EdgeCount\"]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn select_by_edge_count_matches_direct_filtering() {
+    // Mirrors the `Select[GraphData[], Inequality[4, LessEqual, ..., Less,
+    // 20] &]` pattern used to pick small graphs for a substitution system.
+    let result = interpret(
+      "Length[Select[GraphData[], \
+       4 <= GraphData[#, \"EdgeCount\"] < 20 &]] > 0",
+    )
+    .unwrap();
+    assert_eq!(result, "True");
+  }
+}

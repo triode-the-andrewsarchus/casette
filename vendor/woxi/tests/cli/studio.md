@@ -1,0 +1,269 @@
+---
+icon: lucide/book-text
+---
+
+# Woxi Studio
+
+**Woxi Studio** is a native notebook editor for Wolfram Language
+`.nb` files, built with the [Iced] GUI framework.
+It offers a Mathematica-like cell-based editing experience,
+runs expressions through the Woxi interpreter,
+and renders graphics inline as SVG.
+
+[Iced]: https://iced.rs
+
+
+## Running
+
+From a checkout of the repository:
+
+```sh
+cargo run -p woxi-studio
+```
+
+Or download a prebuilt binary for Linux, macOS, or Windows from
+[the latest release](https://github.com/ad-si/Woxi/releases).
+
+The last opened or saved notebook is remembered in
+`~/.config/woxi-studio/last_file` and re-opened automatically on the
+next launch, so the editor comes up where you left off.
+Opening a notebook via `File → Open` spawns a new Studio window
+instead of replacing the current one, so multiple notebooks can be
+edited side by side.
+
+
+## Verifying a download
+
+Every release archive is built by a public
+[GitHub Actions run](https://github.com/ad-si/Woxi/actions)
+and carries a signed build provenance attestation.
+[GitHub's CLI](https://cli.github.com) checks a download against it:
+
+```sh
+gh attestation verify woxi-studio-v0.3.0-x86_64-pc-windows-msvc.zip \
+  --repo ad-si/Woxi
+```
+
+This confirms that the exact file came out of this repository's release
+workflow, and names the commit it was built from.
+It is a stronger guarantee than the `SHA256SUMS.txt` published alongside
+the archives, since whoever managed to swap a binary could regenerate
+those checksums as well.
+
+
+## Antivirus false positives
+
+The Windows binaries are not yet code-signed, so Microsoft Defender's
+machine-learning heuristics occasionally flag a fresh release with a
+generic verdict such as `Trojan:Win32/Wacatac.B!ml`.
+The `!ml` suffix means that no malware signature actually matched —
+the classifier guessed, based on the fact that it is looking at a large,
+unsigned executable it has never seen before.
+That describes every new release of an independent Rust project,
+so the verdict reflects the file's lack of reputation rather than
+anything about its contents.
+
+If you run into it:
+
+1. Verify the download with the attestation command above.
+   If that check fails, the file did not come from this project and
+   should be discarded rather than reported.
+2. [Report the file to Microsoft as a false positive](https://www.microsoft.com/en-us/wdsi/filesubmission).
+   Submissions from affected users are what gets the verdict corrected
+   for everyone else.
+3. [Open an issue](https://github.com/ad-si/Woxi/issues) so the
+   submission can be made from this side too.
+
+Building from source avoids the prebuilt binary — and the heuristic —
+entirely.
+
+
+## Cell types
+
+Each cell has its own text editor and a cell-type selector (with a
+[Lucide] icon) in the gutter.  The following styles are supported:
+
+- **Heading cells**: `Title`, `Subtitle`, `Section`, `Subsection`,
+  `Subsubsection`, `Chapter`, `Subchapter`
+- **Text cells**: `Text`, `Item`, `Subitem`
+- **Code cells**: `Input`, `Code`
+- **Output cells**: `Output`, `Print` output
+
+`Title` and `Subtitle` cells are rendered in bold with a colored
+accent, and the dropdown menu flips upward when it would otherwise
+be clipped by the bottom of the window.
+Changing a cell's style clears any stale output it had.
+
+`Chapter` and `Subchapter` cells get a collapse chevron in a
+reserved slot left of the type picker.  Clicking it hides every
+cell that follows up to the next same-or-higher-level heading.
+The collapsed state is serialized as
+`Cell["...", "Chapter", CellOpen -> False]` so it is restored when
+the notebook is reopened.
+
+[Lucide]: https://lucide.dev
+
+
+## Evaluation
+
+- **`Shift+Enter`** evaluates the focused cell.  If there is another
+  cell below, the cursor moves to it; otherwise a new input cell is
+  appended and scrolled into view.
+- The green ▶ play button on the right side of a cell evaluates just
+  that cell.
+- The circle-play button at the left of the toolbar (**Eval All**)
+  evaluates every input/code cell from top to bottom.
+- Evaluating a single cell re-runs all preceding input cells first,
+  so variable assignments and function definitions from earlier
+  cells are always in scope.
+- Each statement inside a cell is evaluated separately (matching the
+  Playground and Jupyter behavior), so every result is shown — not
+  just the final one.
+- When an input cell is modified after evaluation, its output is
+  grayed out to signal that it is stale.
+- Warnings and error messages surface inline in the cell instead of
+  being printed to the terminal.
+- The `Null` symbol, trailing semicolons, and void operations
+  (function definitions, `Clear`, …) produce no visible output.
+
+
+## Graphics & interactive output
+
+`Graphics`, `Graphics3D`, and `Plot[…]` expressions are rendered
+inline as SVG and pre-rasterized to a bitmap at the display scale
+factor, so scrolling stays smooth even for complex plots.
+Double-clicking a graphic opens a fullscreen modal for closer
+inspection; `Escape`, clicking the backdrop, or the Close button
+dismiss it without losing the scroll position.
+
+`Manipulate[expr, {u, umin, umax}, …]` is rendered as an interactive
+widget with sliders and pick lists.  Option values such as
+`Initialization :> …` are preserved and prepended to every
+re-evaluation.  Discrete pick lists may be given as an expression that
+evaluates to a list (e.g. `{g, PolyhedronData[All]}`).  A `Locator`
+control binds its variable to a draggable point (or list of points),
+rendered as one X/Y slider pair per point; `LocatorAutoCreate -> True`
+additionally offers adding and removing points.  Discrete choices whose
+rule label is a graphic (`"+" -> myIcon[2]`) show the rendered icon in
+the SetterBar.  Controls may be grouped in a `Row[…]`, `Column[…]`, or
+`Grid[…]` argument, and a `ControlType -> …` given to the `Manipulate`
+itself types every control that does not pick one (a list value,
+`ControlType -> {Slider, PopupMenu}`, assigns one type per control in
+spec order).  `ControlType -> Slider` over a choice list draws a slider
+that steps through the choices rather than a dropdown.  A choice list
+built from another control's variable (`Range[1, If[flat, 3, 6], 1]`)
+is rebuilt whenever that control moves, and a selected value the
+narrowed list no longer offers falls back to the last one it does.  A
+`ControlType -> None` variable has no slider but stays live, mutable
+state: extra display arguments such as a trailing
+`Dynamic[Panel[Grid[… Checkbox …]]]` are rendered as interactive
+widgets, and toggling a checkbox writes back into that state and
+re-renders both the display and the body.
+A control keeps the typesetting its label was written with:
+`Style["t", Italic]` stays italic, `Subscript[Style["k", Italic], 1]`
+reads `k₁`, and a derivative such as `Style["y", Italic]'` reads `y′`.
+
+Output text is rendered in a read-only text editor, so it can be
+selected and copied with the mouse.
+
+
+## Table of contents
+
+A TOC sidebar on the left lists every heading cell from `Title`
+through `Subsubsection`, indented by level.  Clicking an entry
+scrolls the notebook to the corresponding cell using the widget's
+actual bounds for precise positioning.  The sidebar is auto-shown
+for notebooks that contain any headings, and its width adapts to
+both the longest entry and the current window width.
+
+
+## Editing
+
+The input/code cells use a Wolfram Language syntax highlighter that
+colors comments, strings, numbers, function names, keywords,
+operators, and patterns.
+
+**Text manipulation**
+
+- **`Tab` / `Shift+Tab`** — indent / unindent
+- **`Cmd+/`** (or `Ctrl+/`) — toggle comments.  With no selection
+  it comments the current line; within a single line it wraps only
+  the selected text; across multiple lines it comments every line
+  that is touched, using `(* … *)` syntax.
+- Selecting text and typing `{`, `[`, `(`, `"`, or `'` wraps the
+  selection in the matching pair instead of replacing it.
+- **`Cmd+Z` / `Cmd+Shift+Z`** — per-cell undo / redo.
+- **`Cmd+C` / `Cmd+V` / `Cmd+X` / `Cmd+A`** — clipboard and
+  select-all work as expected.
+- **`Ctrl+A` / `Ctrl+E`** — Emacs-style jump to line start / end
+  (works on Linux, macOS, and Windows).
+- **`Ctrl+D`** — forward-delete the character under the cursor.
+- **`Ctrl+W`** — delete the previous word.
+
+**Navigation**
+
+- **`Up` / `Down`** arrow keys move the cursor between lines within
+  a cell and jump to the neighboring cell (or the `+` divider
+  between cells) when already at the first/last line.
+- Pressing `Enter` on a focused divider inserts a new cell there.
+- Dividers are visually highlighted when focused.
+
+
+## Reordering cells
+
+Hovering over the gutter (left of a cell, below the type selector)
+reveals a grip handle.  Press and drag it to move the cell up or
+down; a blue indicator line shows the drop target.
+
+
+## Export
+
+Notebooks can be exported from the toolbar's **Export as** dropdown
+to the following formats:
+
+- **Mathematica Notebook** (`.nb`)
+- **Jupyter Notebook** (`.ipynb`)
+- **Markdown** (`.md`)
+- **LaTeX** (`.tex`)
+- **Typst** (`.typ`)
+- **PDF** (`.pdf`) — rendered via the SVG→PDF pipeline powered by
+  [`svg2pdf`](https://crates.io/crates/svg2pdf), with headings, text,
+  code blocks, output text, and graphics embedded as vector content.
+
+The save dialog pre-fills the current notebook path with the
+appropriate extension and does not change the file currently being
+edited.
+
+
+## File management
+
+- **`Cmd+N` / `Ctrl+N`** — new notebook (in a new window)
+- **`Cmd+O` / `Ctrl+O`** — open `.nb` file
+- **`Cmd+S` / `Ctrl+S`** — save
+- Closing a notebook with unsaved changes prompts with a
+  **Save / Don't Save / Cancel** dialog.
+- The window title shows the current file name, e.g.
+  `Woxi Studio | showcase.nb`.
+
+
+## Appearance
+
+- **Theme**: `Auto` (default, follows the OS light/dark preference),
+  `Light`, or `Dark`.  Fonts are embedded Atkinson Hyperlegible Next
+  (sans) and Atkinson Hyperlegible Mono so output looks identical
+  across platforms.
+- **Preview mode** (eye icon, top right) hides the gutter,
+  dividers, play buttons, and editor borders for distraction-free
+  reading.
+- Notebook content is limited to 800 px and centered; input and
+  output are grouped inside a single rounded container separated by
+  a thin rule.
+
+
+!!! tip
+
+    Woxi Studio is the native counterpart to the in-browser
+    [Playground](/) and
+    [JupyterLite](/jupyterlite/lab/index.html?path=showcase.ipynb) environments — the same
+    interpreter powers all three, so expressions that work in one
+    work in the others.

@@ -1,0 +1,4486 @@
+use super::*;
+
+mod absolute_time {
+  use super::*;
+
+  #[test]
+  fn absolute_time_year() {
+    assert_eq!(interpret("AbsoluteTime[{2000}]").unwrap(), "3155673600");
+  }
+
+  #[test]
+  fn absolute_time_date_string() {
+    assert_eq!(
+      interpret("AbsoluteTime[\"6 June 1991\"]").unwrap(),
+      "2885155200"
+    );
+  }
+
+  #[test]
+  fn absolute_time_format_spec() {
+    // String format spec returns Real (Wolfram behavior)
+    assert_eq!(
+      interpret(
+        "AbsoluteTime[{\"01/02/03\", {\"Day\", \"Month\", \"YearShort\"}}]"
+      )
+      .unwrap(),
+      "3.2530464*^9"
+    );
+  }
+
+  #[test]
+  fn absolute_time_format_spec_dashes() {
+    // String format spec returns Real (Wolfram behavior)
+    assert_eq!(
+      interpret(
+        "AbsoluteTime[{\"6-6-91\", {\"Day\", \"Month\", \"YearShort\"}}]"
+      )
+      .unwrap(),
+      "2.8851552*^9"
+    );
+  }
+
+  #[test]
+  fn absolute_time_full_date() {
+    assert_eq!(
+      interpret("AbsoluteTime[{1991, 6, 6, 12, 0, 0}]").unwrap(),
+      "2885198400"
+    );
+  }
+
+  // An empty date list has no components to read, so every field takes its
+  // default and the result is the current time — like `AbsoluteTime[]`.
+  // It used to index past the end of the component vector and panic.
+  //   wolframscript -code 'Head[AbsoluteTime[{}]]'
+  #[test]
+  fn absolute_time_empty_list_is_now() {
+    assert_eq!(
+      interpret(
+        "With[{t = AbsoluteTime[{}]}, Head[t] === Real && t > 3155673600]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // AbsoluteTime accepts a DateObject, at any granularity.
+  //   wolframscript -code 'AbsoluteTime[DateObject[{2020, 3, 5}]]'
+  #[test]
+  fn absolute_time_date_object() {
+    assert_eq!(
+      interpret("AbsoluteTime[DateObject[{2020, 3, 5}]]").unwrap(),
+      "3792355200"
+    );
+    assert_eq!(
+      interpret("AbsoluteTime[DateObject[{2020, 3, 5, 6, 7, 8}]]").unwrap(),
+      "3792377228"
+    );
+    // Coarser granularities fall back to the start of the period.
+    assert_eq!(
+      interpret("AbsoluteTime[DateObject[{2020, 3}]]").unwrap(),
+      "3792009600"
+    );
+    assert_eq!(
+      interpret("AbsoluteTime[DateObject[{2020}]]").unwrap(),
+      "3786825600"
+    );
+  }
+
+  // Months outside 1..12 roll the year over in both directions. Month 0 used
+  // to clamp to January, and months past 13 counted 30-day filler months.
+  //   wolframscript -code 'DateList[AbsoluteTime[{2020, 0, 1}]]'
+  #[test]
+  fn absolute_time_month_rollover() {
+    // Month 0 is the previous December.
+    assert_eq!(
+      interpret("DateList[AbsoluteTime[{2020, 0, 1}]]").unwrap(),
+      "{2019, 12, 1, 0, 0, 0.}"
+    );
+    assert_eq!(
+      interpret("DateList[AbsoluteTime[{2020, -1, 1}]]").unwrap(),
+      "{2019, 11, 1, 0, 0, 0.}"
+    );
+    // A full year back.
+    assert_eq!(
+      interpret("DateList[AbsoluteTime[{2020, -12, 1}]]").unwrap(),
+      "{2018, 12, 1, 0, 0, 0.}"
+    );
+    // More than one year forward.
+    assert_eq!(
+      interpret("DateList[AbsoluteTime[{2020, 25, 1}]]").unwrap(),
+      "{2022, 1, 1, 0, 0, 0.}"
+    );
+    assert_eq!(
+      interpret("DateList[AbsoluteTime[{2020, 37, 15}]]").unwrap(),
+      "{2023, 1, 15, 0, 0, 0.}"
+    );
+    // Month and day underflow compose.
+    assert_eq!(
+      interpret("DateList[AbsoluteTime[{2020, 0, 0}]]").unwrap(),
+      "{2019, 11, 30, 0, 0, 0.}"
+    );
+  }
+}
+
+mod date_list {
+  use super::*;
+
+  #[test]
+  fn date_list_epoch() {
+    assert_eq!(interpret("DateList[0]").unwrap(), "{1900, 1, 1, 0, 0, 0.}");
+  }
+
+  // An ISO date string with a time part is parsed (date-only still works).
+  #[test]
+  fn date_list_iso_datetime_string() {
+    assert_eq!(
+      interpret("DateList[\"2022-11-23 14:30:00\"]").unwrap(),
+      "{2022, 11, 23, 14, 30, 0.}"
+    );
+    assert_eq!(
+      interpret("DateList[\"2022-11-23T14:30:00\"]").unwrap(),
+      "{2022, 11, 23, 14, 30, 0.}"
+    );
+    assert_eq!(
+      interpret("DateList[\"2024-02-29 09:15:45\"]").unwrap(),
+      "{2024, 2, 29, 9, 15, 45.}"
+    );
+    assert_eq!(
+      interpret("DateList[\"2022-11-23 14:30\"]").unwrap(),
+      "{2022, 11, 23, 14, 30, 0.}"
+    );
+    // Date-only string is unchanged.
+    assert_eq!(
+      interpret("DateList[\"2022-11-23\"]").unwrap(),
+      "{2022, 11, 23, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_year_2000() {
+    assert_eq!(
+      interpret("DateList[3155673600]").unwrap(),
+      "{2000, 1, 1, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_date_object() {
+    assert_eq!(
+      interpret("DateList[DateObject[{2026, 3, 15}]]").unwrap(),
+      "{2026, 3, 15, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_date_object_with_time() {
+    assert_eq!(
+      interpret("DateList[DateObject[{2026, 3, 15, 10, 30, 45}]]").unwrap(),
+      "{2026, 3, 15, 10, 30, 45.}"
+    );
+  }
+
+  #[test]
+  fn date_list_date_object_partial() {
+    assert_eq!(
+      interpret("DateList[DateObject[{2026, 3}]]").unwrap(),
+      "{2026, 3, 1, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_overflow_days() {
+    assert_eq!(
+      interpret("DateList[{2012, 1, 300., 10}]").unwrap(),
+      "{2012, 10, 26, 10, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_date_string() {
+    assert_eq!(
+      interpret("DateList[\"31/10/1991\"]").unwrap(),
+      "{1991, 10, 31, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_format_spec() {
+    assert_eq!(
+      interpret(
+        "DateList[{\"31/10/91\", {\"Day\", \"Month\", \"YearShort\"}}]"
+      )
+      .unwrap(),
+      "{1991, 10, 31, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn date_list_format_with_separators() {
+    assert_eq!(
+      interpret("DateList[{\"31 10/91\", {\"Day\", \" \", \"Month\", \"/\", \"YearShort\"}}]")
+        .unwrap(),
+      "{1991, 10, 31, 0, 0, 0.}"
+    );
+  }
+}
+
+mod date_bounds {
+  use super::*;
+
+  // DateBounds gives the earliest and latest of a list of dates.
+  #[test]
+  fn earliest_and_latest() {
+    assert_eq!(
+      interpret("DateBounds[{{2024, 6, 1}, {2024, 1, 1}, {2024, 3, 15}}]")
+        .unwrap(),
+      "{{2024, 1, 1}, {2024, 6, 1}}"
+    );
+    // Crossing year boundaries.
+    assert_eq!(
+      interpret("DateBounds[{{2024, 1, 1}, {2023, 12, 31}, {2024, 12, 31}}]")
+        .unwrap(),
+      "{{2023, 12, 31}, {2024, 12, 31}}"
+    );
+  }
+
+  // A single date gives equal bounds.
+  #[test]
+  fn single_date() {
+    assert_eq!(
+      interpret("DateBounds[{{2024, 1, 1}}]").unwrap(),
+      "{{2024, 1, 1}, {2024, 1, 1}}"
+    );
+  }
+
+  // Time components participate in the ordering.
+  #[test]
+  fn time_components() {
+    assert_eq!(
+      interpret("DateBounds[{{2024, 1, 1, 12, 0, 0}, {2024, 1, 1, 6, 0, 0}}]")
+        .unwrap(),
+      "{{2024, 1, 1, 6, 0, 0}, {2024, 1, 1, 12, 0, 0}}"
+    );
+  }
+
+  // Each bound keeps its original representation.
+  #[test]
+  fn preserves_date_object_form() {
+    assert_eq!(
+      interpret(
+        "DateBounds[{DateObject[{2024, 1, 1}], DateObject[{2024, 5, 1}]}]"
+      )
+      .unwrap(),
+      "{DateObject[{2024, 1, 1}, Day], DateObject[{2024, 5, 1}, Day]}"
+    );
+  }
+
+  // A non-list or non-date argument stays unevaluated.
+  #[test]
+  fn non_date_unevaluated() {
+    assert_eq!(interpret("DateBounds[5]").unwrap(), "DateBounds[5]");
+  }
+}
+
+mod max_min_date {
+  use super::*;
+
+  // MaxDate / MinDate pick the latest / earliest date from a list.
+  #[test]
+  fn latest_and_earliest() {
+    assert_eq!(
+      interpret(
+        "MaxDate[{DateObject[{2022, 4, 8}], DateObject[{2022, 4, 9}], \
+         DateObject[{2022, 4, 7}]}]"
+      )
+      .unwrap(),
+      "DateObject[{2022, 4, 9}, Day]"
+    );
+    assert_eq!(
+      interpret(
+        "MinDate[{DateObject[{2022, 4, 8}], DateObject[{2022, 4, 9}], \
+         DateObject[{2022, 4, 7}]}]"
+      )
+      .unwrap(),
+      "DateObject[{2022, 4, 7}, Day]"
+    );
+  }
+
+  // Each element keeps its original form (here bare date lists).
+  #[test]
+  fn preserves_element_form() {
+    assert_eq!(
+      interpret("MaxDate[{{2024, 6, 1}, {2024, 1, 1}, {2024, 3, 15}}]")
+        .unwrap(),
+      "{2024, 6, 1}"
+    );
+    assert_eq!(
+      interpret("MinDate[{{2024, 6, 1}, {2024, 1, 1}, {2024, 3, 15}}]")
+        .unwrap(),
+      "{2024, 1, 1}"
+    );
+  }
+
+  // Finer granularity wins the comparison and is returned as-is.
+  #[test]
+  fn mixed_granularity() {
+    assert_eq!(
+      interpret("MaxDate[{DateObject[{2020, 3}], DateObject[{2020, 3, 15}]}]")
+        .unwrap(),
+      "DateObject[{2020, 3, 15}, Day]"
+    );
+    assert_eq!(
+      interpret(
+        "MaxDate[{DateObject[{2020, 5, 3}], \
+         DateObject[{2020, 5, 3, 10, 0, 0}]}]"
+      )
+      .unwrap(),
+      "DateObject[{2020, 5, 3, 10, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // A single-element list returns that element.
+  #[test]
+  fn single_element() {
+    assert_eq!(
+      interpret("MaxDate[{DateObject[{2022, 4, 8}]}]").unwrap(),
+      "DateObject[{2022, 4, 8}, Day]"
+    );
+  }
+
+  // A DateInterval yields its end / start point at the interval granularity.
+  #[test]
+  fn date_interval_endpoints() {
+    assert_eq!(
+      interpret("MaxDate[DateInterval[{{2020, 1, 1}, {2021, 1, 1}}]]").unwrap(),
+      "DateObject[{2021, 1, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("MinDate[DateInterval[{{2020, 1, 1}, {2021, 1, 1}}]]").unwrap(),
+      "DateObject[{2020, 1, 1}, Day]"
+    );
+  }
+
+  // A non-date argument stays unevaluated.
+  #[test]
+  fn non_date_unevaluated() {
+    assert_eq!(interpret("MaxDate[5]").unwrap(), "MaxDate[5]");
+    assert_eq!(interpret("MinDate[5]").unwrap(), "MinDate[5]");
+  }
+}
+
+mod date_plus {
+  use super::*;
+
+  #[test]
+  fn date_plus_days() {
+    assert_eq!(
+      interpret("DatePlus[{2010, 2, 5}, 73]").unwrap(),
+      "{2010, 4, 19}"
+    );
+  }
+
+  #[test]
+  fn date_plus_date_object_returns_date_object() {
+    assert_eq!(
+      interpret("FullForm[DatePlus[DateObject[{2026, 4, 1}, \"Day\"], 7]]")
+        .unwrap(),
+      "FullForm[DateObject[{2026, 4, 8}, \"Day\"]]"
+    );
+  }
+
+  #[test]
+  fn date_plus_multi_unit() {
+    assert_eq!(
+      interpret("DatePlus[{2010, 2, 5}, {{8, \"Week\"}, {1, \"Day\"}}]")
+        .unwrap(),
+      "{2010, 4, 3}"
+    );
+  }
+  #[test]
+  fn date_plus_multi_unit_applies_every_increment() {
+    // Regression: a multi-increment spec must apply ALL pairs in order, not
+    // just the first. {+1 Month, -1 Day} from the 1st is the month's last day.
+    assert_eq!(
+      interpret("DatePlus[{2013, 8}, {{1, \"Month\"}, {-1, \"Day\"}}]")
+        .unwrap(),
+      "{2013, 8, 31}"
+    );
+    assert_eq!(
+      interpret("DatePlus[{2013, 2}, {{1, \"Month\"}, {-1, \"Day\"}}]")
+        .unwrap(),
+      "{2013, 2, 28}"
+    );
+  }
+  #[test]
+  fn date_plus_single_month_pair() {
+    // Regression: a single {n, "unit"} pair (not wrapped in a list) must be
+    // applied; Jan 31 + 1 month clamps to Feb 29 in a leap year.
+    assert_eq!(
+      interpret("DatePlus[{2020, 1, 31}, {1, \"Month\"}]").unwrap(),
+      "{2020, 2, 29}"
+    );
+    assert_eq!(
+      interpret("DatePlus[{2013, 12, 15}, {1, \"Year\"}]").unwrap(),
+      "{2014, 12, 15}"
+    );
+  }
+  #[test]
+  fn date_plus_plural_units() {
+    // A {n, unit} pair accepts the plural unit spelling, like Quantity does.
+    assert_eq!(
+      interpret("DatePlus[{2024, 1, 1}, {2, \"Months\"}]").unwrap(),
+      "{2024, 3, 1}"
+    );
+    assert_eq!(
+      interpret("DatePlus[{2024, 1, 15}, {3, \"Days\"}]").unwrap(),
+      "{2024, 1, 18}"
+    );
+    // Month overflow rolls into the next year.
+    assert_eq!(
+      interpret("DatePlus[{2024, 11, 1}, {3, \"Months\"}]").unwrap(),
+      "{2025, 2, 1}"
+    );
+    assert_eq!(
+      interpret("DatePlus[{2024, 1, 1}, {1, \"Years\"}]").unwrap(),
+      "{2025, 1, 1}"
+    );
+    assert_eq!(
+      interpret("DatePlus[{2024, 1, 1}, {2, \"Weeks\"}]").unwrap(),
+      "{2024, 1, 15}"
+    );
+  }
+  #[test]
+  fn date_plus_quantity_days() {
+    assert_eq!(
+      interpret("FullForm[DatePlus[DateObject[{2026, 4, 1}, \"Day\"], Quantity[7, \"Days\"]]]")
+        .unwrap(),
+      "FullForm[DateObject[{2026, 4, 8}, \"Day\"]]"
+    );
+  }
+
+  #[test]
+  fn date_plus_quantity_weeks() {
+    assert_eq!(
+      interpret("FullForm[DatePlus[DateObject[{2026, 4, 1}, \"Day\"], Quantity[4, \"Weeks\"]]]")
+        .unwrap(),
+      "FullForm[DateObject[{2026, 4, 29}, \"Day\"]]"
+    );
+  }
+
+  #[test]
+  fn date_plus_quantity_months() {
+    assert_eq!(
+      interpret("FullForm[DatePlus[DateObject[{2026, 4, 1}, \"Day\"], Quantity[5, \"Months\"]]]")
+        .unwrap(),
+      "FullForm[DateObject[{2026, 9, 1}, \"Day\"]]"
+    );
+  }
+
+  #[test]
+  fn date_plus_quantity_months_with_day_clamping() {
+    assert_eq!(
+      interpret("DatePlus[{2026, 1, 31}, Quantity[1, \"Months\"]]").unwrap(),
+      "{2026, 2, 28}"
+    );
+  }
+
+  #[test]
+  fn date_plus_quantity_years() {
+    assert_eq!(
+      interpret("DatePlus[{2026, 4, 1}, Quantity[2, \"Years\"]]").unwrap(),
+      "{2028, 4, 1}"
+    );
+  }
+
+  #[test]
+  fn day_name_date_plus_quantity() {
+    assert_eq!(
+      interpret("DayName[DatePlus[DateObject[{2026, 4, 1}, \"Day\"], Quantity[5, \"Months\"]]]")
+        .unwrap(),
+      "Tuesday"
+    );
+  }
+
+  // A Quantity whose unit is not a calendar/time increment (e.g. Meters or
+  // Kilograms) is not a valid DatePlus specification. It must stay unevaluated
+  // (DatePlus::inc) rather than silently treating the magnitude as days.
+  // (wolframscript parity)
+  #[test]
+  fn incompatible_unit_stays_unevaluated_list() {
+    assert_eq!(
+      interpret("DatePlus[{2024, 7, 4}, Quantity[5, \"Meters\"]]").unwrap(),
+      "DatePlus[{2024, 7, 4}, Quantity[5, Meters]]"
+    );
+  }
+
+  #[test]
+  fn incompatible_unit_stays_unevaluated_date_object() {
+    assert_eq!(
+      interpret(
+        "DatePlus[DateObject[{2024, 7, 4}], Quantity[3, \"Kilograms\"]]"
+      )
+      .unwrap(),
+      "DatePlus[DateObject[{2024, 7, 4}, Day], Quantity[3, Kilograms]]"
+    );
+  }
+}
+
+// Adding (or subtracting) a calendar-unit Quantity to a DateObject with `+`
+// shifts the date, the same as DatePlus. Previously the sum stayed
+// unevaluated. All expected values were verified against wolframscript.
+mod date_object_plus_quantity {
+  use super::*;
+
+  #[test]
+  fn add_days() {
+    assert_eq!(
+      interpret("DateObject[{2024, 7, 4}] + Quantity[1, \"Day\"]").unwrap(),
+      "DateObject[{2024, 7, 5}, Day]"
+    );
+  }
+
+  #[test]
+  fn commutes_with_quantity_on_the_left() {
+    assert_eq!(
+      interpret("Quantity[1, \"Day\"] + DateObject[{2024, 7, 4}]").unwrap(),
+      "DateObject[{2024, 7, 5}, Day]"
+    );
+  }
+
+  #[test]
+  fn add_months() {
+    assert_eq!(
+      interpret("DateObject[{2024, 7, 4}] + Quantity[2, \"Months\"]").unwrap(),
+      "DateObject[{2024, 9, 4}, Day]"
+    );
+  }
+
+  #[test]
+  fn subtract_days() {
+    assert_eq!(
+      interpret("DateObject[{2024, 7, 4}] - Quantity[3, \"Days\"]").unwrap(),
+      "DateObject[{2024, 7, 1}, Day]"
+    );
+  }
+
+  #[test]
+  fn month_addition_clamps_to_leap_february() {
+    assert_eq!(
+      interpret("DateObject[{2024, 1, 31}] + Quantity[1, \"Months\"]").unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+  }
+
+  #[test]
+  fn adds_multiple_quantities() {
+    assert_eq!(
+      interpret(
+        "DateObject[{2024, 7, 4}] + Quantity[1, \"Days\"] + Quantity[1, \"Days\"]"
+      )
+      .unwrap(),
+      "DateObject[{2024, 7, 6}, Day]"
+    );
+  }
+
+  #[test]
+  fn incompatible_unit_stays_unevaluated() {
+    // A non-time quantity cannot shift a date: the sum is left for ordinary
+    // Plus handling rather than being treated as days.
+    assert_eq!(
+      interpret("DateObject[{2024, 7, 4}] + Quantity[5, \"Meters\"]").unwrap(),
+      "DateObject[{2024, 7, 4}, Day] + Quantity[5, Meters]"
+    );
+  }
+}
+
+mod date_difference {
+  use super::*;
+
+  #[test]
+  fn date_difference_days() {
+    assert_eq!(
+      interpret("DateDifference[{2042, 1, 4}, {2057, 1, 1}]").unwrap(),
+      "Quantity[5476, Days]"
+    );
+  }
+
+  #[test]
+  fn date_difference_year() {
+    assert_eq!(
+      interpret("DateDifference[{1936, 8, 14}, {2000, 12, 1}, \"Year\"]")
+        .unwrap(),
+      "Quantity[64.2986301369863, Years]"
+    );
+  }
+
+  #[test]
+  fn date_difference_hour() {
+    assert_eq!(
+      interpret("DateDifference[{2010, 6, 1}, {2015, 1, 1}, \"Hour\"]")
+        .unwrap(),
+      "Quantity[40200, Hours]"
+    );
+  }
+
+  // A sub-day unit of an exact (integer-second) difference is an exact
+  // rational, not a machine real (2h30m in hours is 5/2).
+  #[test]
+  fn date_difference_subday_exact_rational() {
+    assert_eq!(
+      interpret(
+        "DateDifference[{2024,1,1,10,0,0}, {2024,1,1,12,30,0}, \"Hour\"]"
+      )
+      .unwrap(),
+      "Quantity[5/2, Hours]"
+    );
+    assert_eq!(
+      interpret(
+        "DateDifference[{2024,1,1,0,0,0}, {2024,1,1,0,0,10}, \"Hour\"]"
+      )
+      .unwrap(),
+      "Quantity[1/360, Hours]"
+    );
+    assert_eq!(
+      interpret(
+        "DateDifference[{2024,1,1,0,0,0}, {2024,1,1,0,0,10}, \"Minute\"]"
+      )
+      .unwrap(),
+      "Quantity[1/6, Minutes]"
+    );
+    assert_eq!(
+      interpret(
+        "DateDifference[{2024,1,1,0,0,0}, {2024,1,1,0,0,45}, \"Second\"]"
+      )
+      .unwrap(),
+      "Quantity[45, Seconds]"
+    );
+  }
+
+  // Week (and larger) units keep the machine-real form, matching wolframscript.
+  #[test]
+  fn date_difference_week_is_real() {
+    assert_eq!(
+      interpret("DateDifference[{2024, 1, 1}, {2024, 3, 1}, \"Week\"]")
+        .unwrap(),
+      "Quantity[8.571428571428571, Weeks]"
+    );
+  }
+
+  #[test]
+  fn date_object_subtraction() {
+    assert_eq!(
+      interpret("DateObject[{2026, 3, 30}] - DateObject[{2016, 7, 23}]")
+        .unwrap(),
+      "Quantity[3537, Days]"
+    );
+  }
+
+  #[test]
+  fn date_difference_with_date_objects() {
+    assert_eq!(
+      interpret(
+        "DateDifference[DateObject[{2020, 1, 1}], DateObject[{2020, 1, 11}]]"
+      )
+      .unwrap(),
+      "Quantity[10, Days]"
+    );
+  }
+
+  #[test]
+  fn date_object_normalizes_granularity() {
+    assert_eq!(
+      interpret("DateObject[{2016, 7, 23}]").unwrap(),
+      "DateObject[{2016, 7, 23}, Day]"
+    );
+  }
+
+  // An ISO date/time string is parsed into a component list with the implied
+  // granularity (Y-M-D → Day, Y-M → Month, Y → Year, with a time → Instant).
+  #[test]
+  fn date_object_parses_iso_string() {
+    assert_eq!(
+      interpret("DateObject[\"2024-03-15\"]").unwrap(),
+      "DateObject[{2024, 3, 15}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[\"2024-3-15\"]").unwrap(),
+      "DateObject[{2024, 3, 15}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[\"2024-03\"]").unwrap(),
+      "DateObject[{2024, 3}, Month]"
+    );
+    assert_eq!(
+      interpret("DateObject[\"2024\"]").unwrap(),
+      "DateObject[{2024}, Year]"
+    );
+  }
+
+  #[test]
+  fn date_object_parses_iso_datetime() {
+    assert_eq!(
+      interpret("DateObject[\"2024-03-15 14:30:00\"]").unwrap(),
+      "DateObject[{2024, 3, 15, 14, 30, 0}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("DateObject[\"2024-03-15T14:30:00\"]").unwrap(),
+      "DateObject[{2024, 3, 15, 14, 30, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // A string that is not an ISO date stays unparsed.
+  #[test]
+  fn date_object_non_iso_string_unparsed() {
+    assert_eq!(
+      interpret("DateObject[\"hello\"]").unwrap(),
+      "DateObject[hello]"
+    );
+  }
+}
+
+mod date_string {
+  use super::*;
+
+  #[test]
+  fn date_string_custom_format() {
+    assert_eq!(
+      interpret(
+        "DateString[{1991, 10, 31, 0, 0}, {\"Day\", \" \", \"MonthName\", \" \", \"Year\"}]"
+      )
+      .unwrap(),
+      "31 October 1991"
+    );
+  }
+
+  #[test]
+  fn date_string_default_format() {
+    assert_eq!(
+      interpret("DateString[{2007, 4, 15, 0}]").unwrap(),
+      "Sun 15 Apr 2007 00:00:00"
+    );
+  }
+
+  // A numeric argument is an absolute time (seconds since 1900-01-01).
+  #[test]
+  fn date_string_absolute_time_number() {
+    assert_eq!(
+      interpret("DateString[0]").unwrap(),
+      "Mon 1 Jan 1900 00:00:00"
+    );
+    assert_eq!(
+      interpret("DateString[3155673600]").unwrap(),
+      "Sat 1 Jan 2000 00:00:00"
+    );
+    assert_eq!(
+      interpret("DateString[1.5*^9]").unwrap(),
+      "Tue 15 Jul 1947 02:40:00"
+    );
+  }
+
+  #[test]
+  fn date_string_absolute_time_with_format() {
+    assert_eq!(
+      interpret("DateString[3155673600, \"ISODate\"]").unwrap(),
+      "2000-01-01"
+    );
+  }
+
+  #[test]
+  fn date_string_day_name_format() {
+    assert_eq!(
+      interpret(
+        "DateString[{1979, 3, 14}, {\"DayName\", \"  \", \"Month\", \"-\", \"YearShort\"}]"
+      )
+      .unwrap(),
+      "Wednesday  03-79"
+    );
+  }
+
+  // 12-hour clock, AM/PM, Quarter and the leading-zero-free Short variants.
+  #[test]
+  fn date_string_twelve_hour_and_short() {
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 3, 15, 9, 5, 0}, {\"Hour12\", \":\", \"Minute\", \" \", \"AMPM\"}]"
+      )
+      .unwrap(),
+      "09:05 AM"
+    );
+    // Afternoon hours wrap; midnight maps to 12.
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 3, 15, 21, 0, 0}, {\"Hour12\", \" \", \"AMPM\"}]"
+      )
+      .unwrap(),
+      "09 PM"
+    );
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 3, 15, 0, 5, 0}, {\"Hour12\", \" \", \"AMPMLowerCase\"}]"
+      )
+      .unwrap(),
+      "12 am"
+    );
+    // Quarter of the year.
+    assert_eq!(
+      interpret("DateString[{2024, 8, 15}, {\"Quarter\"}]").unwrap(),
+      "3"
+    );
+    // Short variants drop the leading zero.
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 3, 5}, {\"DayShort\", \"/\", \"MonthShort\", \"/\", \"Year\"}]"
+      )
+      .unwrap(),
+      "5/3/2024"
+    );
+  }
+
+  // "Hour24" is the explicit 2-digit 24-hour clock; "Hour24Short" drops the
+  // leading zero; "ISOWeekDay" is Monday=1 .. Sunday=7.
+  #[test]
+  fn date_string_hour24_and_isoweekday() {
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 3, 7, 14, 5}, {\"Hour24\", \":\", \"Minute\"}]"
+      )
+      .unwrap(),
+      "14:05"
+    );
+    // Zero-padded for single-digit hours, including midnight.
+    assert_eq!(
+      interpret("DateString[{2024, 3, 7, 3, 5}, {\"Hour24\"}]").unwrap(),
+      "03"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 3, 7, 0, 5}, {\"Hour24\"}]").unwrap(),
+      "00"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 3, 7, 3, 5}, {\"Hour24Short\"}]").unwrap(),
+      "3"
+    );
+    // A bare-string element formats the same way.
+    assert_eq!(
+      interpret("DateString[{2024, 3, 7, 14, 5}, \"Hour24\"]").unwrap(),
+      "14"
+    );
+    // ISO weekday: 2024-03-07 is a Thursday (4), the 3rd a Sunday (7), the
+    // 4th a Monday (1).
+    assert_eq!(
+      interpret("DateString[{2024, 3, 7}, {\"ISOWeekDay\"}]").unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 3, 3}, {\"ISOWeekDay\"}]").unwrap(),
+      "7"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 3, 4}, {\"ISOWeekDay\"}]").unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn date_string_fractional_day() {
+    assert_eq!(
+      interpret("DateString[{1991, 6, 6.5}]").unwrap(),
+      "Thu 6 Jun 1991 12:00:00"
+    );
+  }
+
+  #[test]
+  fn date_string_iso_datetime() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27, 19, 54, 40}, \"ISODateTime\"]")
+        .unwrap(),
+      "2026-02-27T19:54:40"
+    );
+  }
+
+  #[test]
+  fn date_string_iso_date() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27, 19, 54, 40}, \"ISODate\"]").unwrap(),
+      "2026-02-27"
+    );
+  }
+
+  #[test]
+  fn date_string_datetime() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27, 20, 5, 43}, \"DateTime\"]").unwrap(),
+      "Friday 27 February 2026 20:05:43"
+    );
+  }
+
+  #[test]
+  fn date_string_datetime_short() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27, 20, 5, 43}, \"DateTimeShort\"]")
+        .unwrap(),
+      "Fri 27 Feb 2026 20:05:43"
+    );
+  }
+
+  #[test]
+  fn date_string_date() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27}, \"Date\"]").unwrap(),
+      "Friday 27 February 2026"
+    );
+  }
+
+  #[test]
+  fn date_string_date_short() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27}, \"DateShort\"]").unwrap(),
+      "Fri 27 Feb 2026"
+    );
+  }
+
+  #[test]
+  fn date_string_time() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27, 14, 30, 15}, \"Time\"]").unwrap(),
+      "14:30:15"
+    );
+  }
+
+  #[test]
+  fn date_string_single_element_year() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27}, \"Year\"]").unwrap(),
+      "2026"
+    );
+  }
+
+  #[test]
+  fn date_string_single_element_month_name() {
+    assert_eq!(
+      interpret("DateString[{2026, 2, 27}, \"MonthName\"]").unwrap(),
+      "February"
+    );
+  }
+
+  #[test]
+  fn date_string_with_date_object() {
+    assert_eq!(
+      interpret("DateString[DateObject[{2026, 2, 27, 19, 54, 40}, \"Instant\", \"Gregorian\", 0.], \"ISODateTime\"]").unwrap(),
+      "2026-02-27T19:54:40"
+    );
+  }
+
+  #[test]
+  fn date_string_now_iso_datetime() {
+    let result = interpret("DateString[Now, \"ISODateTime\"]").unwrap();
+    // Should match YYYY-MM-DDTHH:MM:SS pattern
+    assert!(
+      result.len() == 19
+        && result.contains('T')
+        && result.contains('-')
+        && result.contains(':'),
+      "DateString[Now, \"ISODateTime\"] should return ISO format, got: {result}"
+    );
+  }
+
+  #[test]
+  fn date_string_from_string_date() {
+    assert_eq!(
+      interpret("DateString[\"2025-09-24\", {\"Year\", \"-\", \"Month\"}]")
+        .unwrap(),
+      "2025-09"
+    );
+  }
+
+  #[test]
+  fn date_string_from_string_date_returns_as_is() {
+    // DateString["string"] with no format spec returns the string unchanged
+    assert_eq!(
+      interpret("DateString[\"2025-09-24\"]").unwrap(),
+      "2025-09-24"
+    );
+    assert_eq!(
+      interpret("DateString[\"6 June 1991\"]").unwrap(),
+      "6 June 1991"
+    );
+    assert_eq!(
+      interpret("DateString[\"March 5, 2025\"]").unwrap(),
+      "March 5, 2025"
+    );
+  }
+
+  // DateString[fmt] with a recognized format name formats the CURRENT date,
+  // i.e. DateString[fmt] == DateString[Now, fmt]. Tested structurally (the
+  // actual date is non-deterministic) plus a consistency check.
+  #[test]
+  fn date_string_single_format_uses_current_date() {
+    assert_eq!(
+      interpret("StringLength[DateString[\"ISODate\"]]").unwrap(),
+      "10"
+    );
+    assert_eq!(
+      interpret("StringLength[DateString[\"ISODateTime\"]]").unwrap(),
+      "19"
+    );
+    assert_eq!(
+      interpret(
+        "StringMatchQ[DateString[\"ISODate\"], RegularExpression[\"\\\\d{4}-\\\\d{2}-\\\\d{2}\"]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    // Consistent with the explicit current-date form.
+    assert_eq!(
+      interpret(
+        "DateString[\"ISODate\"] == DateString[DateList[], \"ISODate\"]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("DateString[\"Year\"] == DateString[DateList[], \"Year\"]")
+        .unwrap(),
+      "True"
+    );
+    // A non-format string is still returned unchanged.
+    assert_eq!(interpret("DateString[\"hello\"]").unwrap(), "hello");
+  }
+
+  #[test]
+  fn date_string_date_object_day_granularity_omits_time() {
+    // DateObject with "Day" granularity should omit time in default format
+    assert_eq!(
+      interpret("DateString[DateObject[{2024, 1, 15}, \"Day\"]]").unwrap(),
+      "Mon 15 Jan 2024"
+    );
+  }
+
+  #[test]
+  fn date_string_date_object_implicit_day_granularity() {
+    // DateObject[{y,m,d}] creates Day granularity
+    assert_eq!(
+      interpret("DateString[DateObject[{2024, 1, 15}]]").unwrap(),
+      "Mon 15 Jan 2024"
+    );
+  }
+
+  #[test]
+  fn date_string_plain_list_includes_time() {
+    // Plain list always includes time (even when zero)
+    assert_eq!(
+      interpret("DateString[{2024, 6, 15}]").unwrap(),
+      "Sat 15 Jun 2024 00:00:00"
+    );
+  }
+
+  #[test]
+  fn date_string_date_object_with_time_includes_time() {
+    // DateObject with time components should include time
+    assert_eq!(
+      interpret("DateString[DateObject[{2024, 1, 15, 10, 30, 0}]]").unwrap(),
+      "Mon 15 Jan 2024 10:30:00"
+    );
+  }
+
+  #[test]
+  fn date_string_from_string_date_iso() {
+    assert_eq!(
+      interpret("DateString[\"2025-09-24\", \"ISODate\"]").unwrap(),
+      "2025-09-24"
+    );
+  }
+
+  #[test]
+  fn date_string_from_natural_language_date() {
+    // "Day" gives zero-padded day; "Day2" is not a Wolfram element (treated as literal)
+    assert_eq!(
+      interpret("DateString[\"6 June 1991\", {\"Year\", \"-\", \"Month\", \"-\", \"Day\"}]")
+        .unwrap(),
+      "1991-06-06"
+    );
+  }
+
+  #[test]
+  fn date_string_day2_is_literal() {
+    // "Day2" is not a recognized format element — treated as literal text
+    assert_eq!(
+      interpret("DateString[\"6 June 1991\", {\"Year\", \"-\", \"Month\", \"-\", \"Day2\"}]")
+        .unwrap(),
+      "1991-06-Day2"
+    );
+  }
+}
+
+/// Helper: extract {y, m, d} from "DateObject[{y, m, d}, \"Day\"]"
+fn parse_date_object_ymd(s: &str) -> Vec<i32> {
+  let list_start = s.find('{').unwrap();
+  let list_end = s.find('}').unwrap();
+  let inner = &s[list_start + 1..list_end];
+  inner.split(", ").map(|p| p.parse().unwrap()).collect()
+}
+
+mod today {
+  use super::*;
+
+  #[test]
+  fn today_returns_date_object_with_day_granularity() {
+    let result = interpret("Today").unwrap();
+    assert!(
+      result.starts_with("DateObject[{"),
+      "Today should return a DateObject, got: {result}"
+    );
+    assert!(
+      result.contains("}, Day]"),
+      "Today should include Day granularity, got: {result}"
+    );
+  }
+
+  #[test]
+  fn today_has_three_date_components() {
+    let result = interpret("Today").unwrap();
+    let parts = parse_date_object_ymd(&result);
+    assert_eq!(
+      parts.len(),
+      3,
+      "Today should have 3 date components (y, m, d), got: {parts:?}"
+    );
+  }
+
+  #[test]
+  fn today_returns_valid_date() {
+    let result = interpret("Today").unwrap();
+    let parts = parse_date_object_ymd(&result);
+    assert!(
+      parts[0] >= 2020 && parts[0] <= 2100,
+      "Year should be reasonable"
+    );
+    assert!(parts[1] >= 1 && parts[1] <= 12, "Month should be 1-12");
+    assert!(parts[2] >= 1 && parts[2] <= 31, "Day should be 1-31");
+  }
+}
+
+mod tomorrow {
+  use super::*;
+
+  #[test]
+  fn tomorrow_returns_date_object_with_day_granularity() {
+    let result = interpret("Tomorrow").unwrap();
+    assert!(
+      result.starts_with("DateObject[{"),
+      "Tomorrow should return a DateObject, got: {result}"
+    );
+    assert!(
+      result.contains("}, Day]"),
+      "Tomorrow should include Day granularity, got: {result}"
+    );
+  }
+
+  #[test]
+  fn tomorrow_has_three_date_components() {
+    let result = interpret("Tomorrow").unwrap();
+    let parts = parse_date_object_ymd(&result);
+    assert_eq!(
+      parts.len(),
+      3,
+      "Tomorrow should have 3 date components (y, m, d), got: {parts:?}"
+    );
+  }
+
+  #[test]
+  fn tomorrow_is_after_today() {
+    let today_parts = parse_date_object_ymd(&interpret("Today").unwrap());
+    let tomorrow_parts = parse_date_object_ymd(&interpret("Tomorrow").unwrap());
+
+    let today_days =
+      today_parts[0] * 366 + today_parts[1] * 31 + today_parts[2];
+    let tomorrow_days =
+      tomorrow_parts[0] * 366 + tomorrow_parts[1] * 31 + tomorrow_parts[2];
+    assert!(tomorrow_days > today_days, "Tomorrow should be after Today");
+  }
+}
+
+mod yesterday {
+  use super::*;
+
+  #[test]
+  fn yesterday_returns_date_object_with_day_granularity() {
+    let result = interpret("Yesterday").unwrap();
+    assert!(
+      result.starts_with("DateObject[{"),
+      "Yesterday should return a DateObject, got: {result}"
+    );
+    assert!(
+      result.contains("}, Day]"),
+      "Yesterday should include Day granularity, got: {result}"
+    );
+  }
+
+  #[test]
+  fn yesterday_has_three_date_components() {
+    let result = interpret("Yesterday").unwrap();
+    let parts = parse_date_object_ymd(&result);
+    assert_eq!(
+      parts.len(),
+      3,
+      "Yesterday should have 3 date components (y, m, d), got: {parts:?}"
+    );
+  }
+
+  #[test]
+  fn yesterday_is_before_today() {
+    let today_parts = parse_date_object_ymd(&interpret("Today").unwrap());
+    let yesterday_parts =
+      parse_date_object_ymd(&interpret("Yesterday").unwrap());
+
+    let today_days =
+      today_parts[0] * 366 + today_parts[1] * 31 + today_parts[2];
+    let yesterday_days =
+      yesterday_parts[0] * 366 + yesterday_parts[1] * 31 + yesterday_parts[2];
+    assert!(
+      yesterday_days < today_days,
+      "Yesterday should be before Today"
+    );
+  }
+}
+
+mod day_name {
+  use super::*;
+
+  #[test]
+  fn monday() {
+    assert_eq!(interpret("DayName[{2024, 1, 1}]").unwrap(), "Monday");
+  }
+
+  #[test]
+  fn thursday() {
+    assert_eq!(interpret("DayName[{2026, 3, 19}]").unwrap(), "Thursday");
+  }
+
+  #[test]
+  fn saturday() {
+    assert_eq!(interpret("DayName[{2000, 1, 1}]").unwrap(), "Saturday");
+  }
+
+  #[test]
+  fn unix_epoch() {
+    assert_eq!(interpret("DayName[{1970, 1, 1}]").unwrap(), "Thursday");
+  }
+
+  #[test]
+  fn with_date_object() {
+    assert_eq!(
+      interpret("DayName[DateObject[{2024, 6, 15}]]").unwrap(),
+      "Saturday"
+    );
+  }
+
+  #[test]
+  fn sunday() {
+    assert_eq!(interpret("DayName[{2024, 3, 3}]").unwrap(), "Sunday");
+  }
+
+  #[test]
+  fn partial_date_lists_default_to_the_first_of_the_period() {
+    // {2024, 2} is Feb 1st 2024, {2024} is Jan 1st 2024.
+    assert_eq!(interpret("DayName[{2024, 2}]").unwrap(), "Thursday");
+    assert_eq!(interpret("DayName[{2024}]").unwrap(), "Monday");
+  }
+
+  #[test]
+  fn bare_numbers_are_absolute_times_not_years() {
+    // A number is seconds since 1900-01-01, so `2024` is not the year 2024
+    // but half an hour into Monday 1 Jan 1900.
+    assert_eq!(interpret("DayName[0]").unwrap(), "Monday");
+    assert_eq!(interpret("DayName[2024]").unwrap(), "Monday");
+    assert_eq!(interpret("DayName[2024.5]").unwrap(), "Monday");
+    assert_eq!(interpret("DayName[3155673600]").unwrap(), "Saturday");
+  }
+
+  #[test]
+  fn date_strings() {
+    assert_eq!(interpret(r#"DayName["Feb 1 2024"]"#).unwrap(), "Thursday");
+    assert_eq!(interpret(r#"DayName["1 Feb 2024"]"#).unwrap(), "Thursday");
+    assert_eq!(
+      interpret(r#"DayName["February 1 2024"]"#).unwrap(),
+      "Thursday"
+    );
+    assert_eq!(interpret(r#"DayName["2024-02-01"]"#).unwrap(), "Thursday");
+  }
+
+  #[test]
+  fn no_argument_and_empty_list_mean_today() {
+    assert_eq!(interpret("DayName[] === DayName[Today]").unwrap(), "True");
+    assert_eq!(interpret("DayName[{}] === DayName[Today]").unwrap(), "True");
+    // `DateList[{}]` is the "now" that backs it — not the 1900 epoch.
+    assert_eq!(
+      interpret("Take[DateList[{}], 3] === Take[DateList[Today], 3]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn relative_day_symbols() {
+    assert_eq!(
+      interpret("DayName[Yesterday] === DayName[DatePlus[Today, -1]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn calendar_options_are_accepted() {
+    assert_eq!(
+      interpret(r#"DayName[{2024, 2, 1}, CalendarType -> "Gregorian"]"#)
+        .unwrap(),
+      "Thursday"
+    );
+  }
+
+  #[test]
+  fn uninterpretable_specs_emit_date() {
+    for (input, shown, expected) in [
+      (r#"DayName["Wednesday"]"#, "Wednesday", "DayName[Wednesday]"),
+      (
+        r#"DayName["not a date"]"#,
+        "not a date",
+        "DayName[not a date]",
+      ),
+      ("DayName[{2024, \"a\"}]", "{2024, a}", "DayName[{2024, a}]"),
+      ("DayName[x]", "x", "DayName[x]"),
+    ] {
+      assert_eq!(interpret(input).unwrap(), expected);
+      let msgs = woxi::get_captured_messages_raw();
+      assert!(
+        msgs.iter().any(|m| m.contains(&format!(
+          "DayName::date: Expression {shown} cannot be interpreted as a date specification."
+        ))),
+        "expected date message for {input}, got {msgs:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn non_option_second_argument_emits_nonopt() {
+    assert_eq!(interpret("DayName[1, 2]").unwrap(), "DayName[1, 2]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "DayName::nonopt: Options expected (instead of 2) beyond position 1 in DayName[1, 2]. An option must be a rule or a list of rules."
+      )),
+      "expected nonopt message, got {msgs:?}"
+    );
+  }
+}
+
+mod day_plus {
+  use super::*;
+
+  #[test]
+  fn add_days() {
+    assert_eq!(
+      interpret("DayPlus[{2024, 1, 15}, 10]").unwrap(),
+      "DateObject[{2024, 1, 25}, Day]"
+    );
+  }
+
+  #[test]
+  fn subtract_days() {
+    assert_eq!(
+      interpret("DayPlus[{2024, 1, 15}, -5]").unwrap(),
+      "DateObject[{2024, 1, 10}, Day]"
+    );
+  }
+
+  #[test]
+  fn leap_year() {
+    assert_eq!(
+      interpret("DayPlus[{2024, 2, 28}, 1]").unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+  }
+
+  #[test]
+  fn cross_month() {
+    assert_eq!(
+      interpret("DayPlus[{2024, 1, 31}, 1]").unwrap(),
+      "DateObject[{2024, 2, 1}, Day]"
+    );
+  }
+
+  #[test]
+  fn business_days() {
+    assert_eq!(
+      interpret(r#"DayPlus[{2024, 1, 15}, 10, "BusinessDay"]"#).unwrap(),
+      "DateObject[{2024, 1, 29}, Day]"
+    );
+  }
+}
+
+mod dated {
+  use super::*;
+
+  #[test]
+  fn dated_basic() {
+    assert_eq!(
+      interpret("Dated[100, {2015, 3, 1}]").unwrap(),
+      "Dated[100, {2015, 3, 1}]"
+    );
+  }
+
+  #[test]
+  fn dated_head() {
+    assert_eq!(
+      interpret("Head[Dated[100, {2015, 3, 1}]]").unwrap(),
+      "Dated"
+    );
+  }
+
+  #[test]
+  fn dated_part_extraction() {
+    assert_eq!(interpret("Dated[100, {2015, 3, 1}][[1]]").unwrap(), "100");
+    assert_eq!(
+      interpret("Dated[100, {2015, 3, 1}][[2]]").unwrap(),
+      "{2015, 3, 1}"
+    );
+  }
+
+  #[test]
+  fn dated_string_value() {
+    assert_eq!(
+      interpret("Dated[\"hello\", {2020}]").unwrap(),
+      "Dated[hello, {2020}]"
+    );
+  }
+}
+
+mod leap_year_q {
+  use woxi::interpret;
+
+  #[test]
+  fn leap_year_bare_integer() {
+    // Wolfram's LeapYearQ does not accept bare integers, returns False
+    assert_eq!(interpret("LeapYearQ[2024]").unwrap(), "False");
+    assert_eq!(interpret("LeapYearQ[2023]").unwrap(), "False");
+    assert_eq!(interpret("LeapYearQ[2000]").unwrap(), "False");
+    assert_eq!(interpret("LeapYearQ[1900]").unwrap(), "False");
+  }
+
+  #[test]
+  fn leap_year_list_format() {
+    assert_eq!(interpret("LeapYearQ[{2024}]").unwrap(), "True");
+    assert_eq!(interpret("LeapYearQ[{2023}]").unwrap(), "False");
+  }
+
+  #[test]
+  fn leap_year_century_rules() {
+    // Divisible by 400 -> leap
+    assert_eq!(interpret("LeapYearQ[{2000}]").unwrap(), "True");
+    // Divisible by 100 but not 400 -> not leap
+    assert_eq!(interpret("LeapYearQ[{1900}]").unwrap(), "False");
+    // Divisible by 4 but not 100 -> leap
+    assert_eq!(interpret("LeapYearQ[{2004}]").unwrap(), "True");
+  }
+
+  #[test]
+  fn leap_year_string_format() {
+    // Wolfram parses a string date spec and tests its year.
+    // Year-only strings:
+    assert_eq!(interpret(r#"LeapYearQ["2024"]"#).unwrap(), "True");
+    assert_eq!(interpret(r#"LeapYearQ["2023"]"#).unwrap(), "False");
+    assert_eq!(interpret(r#"LeapYearQ["1996"]"#).unwrap(), "True");
+    // Century rules also apply to string years:
+    assert_eq!(interpret(r#"LeapYearQ["2000"]"#).unwrap(), "True");
+    assert_eq!(interpret(r#"LeapYearQ["1900"]"#).unwrap(), "False");
+    // ISO date string -> uses its year:
+    assert_eq!(interpret(r#"LeapYearQ["2024-03-01"]"#).unwrap(), "True");
+  }
+
+  #[test]
+  fn leap_year_symbolic_is_unevaluated() {
+    // A bare symbol or arbitrary call cannot be interpreted as a date:
+    // Wolfram emits LeapYearQ::date and leaves the call unevaluated.
+    let r = woxi::interpret_with_stdout("LeapYearQ[x]").unwrap();
+    assert_eq!(r.result, "LeapYearQ[x]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "LeapYearQ::date: Expression x cannot be interpreted as a date specification."
+    )));
+
+    let r = woxi::interpret_with_stdout("LeapYearQ[foo[1]]").unwrap();
+    assert_eq!(r.result, "LeapYearQ[foo[1]]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "LeapYearQ::date: Expression foo[1] cannot be interpreted as a date specification."
+    )));
+  }
+
+  #[test]
+  fn day_count_symbolic_is_unevaluated() {
+    // DayCount with an un-interpretable date argument must report under its own
+    // head (not leak the internal DateDifference conversion).
+    let r = woxi::interpret_with_stdout("DayCount[{2024, 1, 1}, x]").unwrap();
+    assert_eq!(r.result, "DayCount[{2024, 1, 1}, x]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "DayCount::date: Expression x cannot be interpreted as a date specification."
+    )));
+
+    let r = woxi::interpret_with_stdout("DayCount[x, {2024, 1, 1}]").unwrap();
+    assert_eq!(r.result, "DayCount[x, {2024, 1, 1}]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "DayCount::date: Expression x cannot be interpreted as a date specification."
+    )));
+
+    // A valid pair still computes the day count.
+    assert_eq!(
+      interpret("DayCount[{2024, 1, 1}, {2024, 2, 1}]").unwrap(),
+      "31"
+    );
+  }
+
+  #[test]
+  fn date_difference_symbolic_is_unevaluated() {
+    let r =
+      woxi::interpret_with_stdout("DateDifference[{2024, 1, 1}, x]").unwrap();
+    assert_eq!(r.result, "DateDifference[{2024, 1, 1}, x]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "DateDifference::date: Expression x cannot be interpreted as a date specification."
+    )));
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn with() {
+    // The mathics original (`>> AbsoluteTime[] = ...`) accepts any
+    // output — wolframscript returns seconds since 1900-01-01, which
+    // changes every second. Verify the documented contract: a Real
+    // greater than the year-2000 epoch second count (3155673600).
+    assert_case(
+      r#"With[{t = AbsoluteTime[]}, Head[t] === Real && t > 3155673600]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn absolute_time_1() {
+    assert_case(r#"AbsoluteTime[]; AbsoluteTime[{2000}]"#, r#"3155673600"#);
+  }
+  #[test]
+  fn absolute_time_2() {
+    assert_case(
+      r#"AbsoluteTime[]; AbsoluteTime[{2000}]; AbsoluteTime[{"01/02/03", {"Day", "Month", "YearShort"}}]"#,
+      r#"3.2530464*^9"#,
+    );
+  }
+  #[test]
+  fn absolute_time_3() {
+    assert_case(
+      r#"AbsoluteTime[]; AbsoluteTime[{2000}]; AbsoluteTime[{"01/02/03", {"Day", "Month", "YearShort"}}]; AbsoluteTime["6 June 1991"]"#,
+      r#"2885155200"#,
+    );
+  }
+  #[test]
+  fn absolute_time_4() {
+    assert_case(
+      r#"AbsoluteTime[]; AbsoluteTime[{2000}]; AbsoluteTime[{"01/02/03", {"Day", "Month", "YearShort"}}]; AbsoluteTime["6 June 1991"]; AbsoluteTime[{"6-6-91", {"Day", "Month", "YearShort"}}]"#,
+      r#"2.8851552*^9"#,
+    );
+  }
+  #[test]
+  fn date_difference_1() {
+    assert_case(
+      r#"DateDifference[{2042, 1, 4}, {2057, 1, 1}]"#,
+      r#"Quantity[5476, "Days"]"#,
+    );
+  }
+  #[test]
+  fn date_difference_2() {
+    assert_case(
+      r#"DateDifference[{2042, 1, 4}, {2057, 1, 1}]; DateDifference[{1936, 8, 14}, {2000, 12, 1}, "Year"]"#,
+      r#"Quantity[64.2986301369863, "Years"]"#,
+    );
+  }
+  #[test]
+  fn date_difference_3() {
+    assert_case(
+      r#"DateDifference[{2042, 1, 4}, {2057, 1, 1}]; DateDifference[{1936, 8, 14}, {2000, 12, 1}, "Year"]; DateDifference[{2010, 6, 1}, {2015, 1, 1}, "Hour"]"#,
+      r#"Quantity[40200, "Hours"]"#,
+    );
+  }
+  #[test]
+  fn date_difference_4() {
+    assert_case(
+      r#"DateDifference[{2042, 1, 4}, {2057, 1, 1}]; DateDifference[{1936, 8, 14}, {2000, 12, 1}, "Year"]; DateDifference[{2010, 6, 1}, {2015, 1, 1}, "Hour"]; DateDifference[{2003, 8, 11}, {2003, 10, 19}, {"Week", "Day"}]"#,
+      r#"Quantity[MixedMagnitude[{9, 6}], MixedUnit[{"Weeks", "Days"}]]"#,
+    );
+  }
+  #[test]
+  fn date_object() {
+    assert_case(
+      r#"DateObject[{2020, 4, 15}]"#,
+      r#"DateObject[{2020, 4, 15}, "Day"]"#,
+    );
+  }
+  #[test]
+  fn date_plus_1() {
+    assert_case(r#"DatePlus[{2010, 2, 5}, 73]"#, r#"{2010, 4, 19}"#);
+  }
+  #[test]
+  fn date_plus_2() {
+    assert_case(
+      r#"DatePlus[{2010, 2, 5}, 73]; DatePlus[{2010, 2, 5}, {{8, "Week"}, {1, "Day"}}]"#,
+      r#"{2010, 4, 3}"#,
+    );
+  }
+  #[test]
+  fn date_list_1() {
+    assert_case(r#"DateList[0]"#, r#"{1900, 1, 1, 0, 0, 0.}"#);
+  }
+  #[test]
+  fn date_list_2() {
+    assert_case(
+      r#"DateList[0]; DateList[3155673600]"#,
+      r#"{2000, 1, 1, 0, 0, 0.}"#,
+    );
+  }
+  #[test]
+  fn date_list_3() {
+    assert_case(
+      r#"DateList[0]; DateList[3155673600]; DateList[{2003, 5, 0.5, 0.1, 0.767}]"#,
+      r#"{2003, 4, 30, 12, 6, 46.019999980926514}"#,
+    );
+  }
+  #[test]
+  fn date_list_4() {
+    assert_case(
+      r#"DateList[0]; DateList[3155673600]; DateList[{2003, 5, 0.5, 0.1, 0.767}]; DateList[{2012, 1, 300., 10}]"#,
+      r#"{2012, 10, 26, 10, 0, 0.}"#,
+    );
+  }
+  #[test]
+  fn date_list_5() {
+    assert_case(
+      r#"DateList[0]; DateList[3155673600]; DateList[{2003, 5, 0.5, 0.1, 0.767}]; DateList[{2012, 1, 300., 10}]; DateList["31/10/1991"]"#,
+      r#"{1991, 10, 31, 0, 0, 0.}"#,
+    );
+  }
+  #[test]
+  fn date_string_1() {
+    assert_case(
+      r#"DateString[]; DateString[{1991, 10, 31, 0, 0}, {"Day", " ", "MonthName", " ", "Year"}]"#,
+      r#""31 October 1991""#,
+    );
+  }
+  #[test]
+  fn date_string_2() {
+    assert_case(
+      r#"DateString[]; DateString[{1991, 10, 31, 0, 0}, {"Day", " ", "MonthName", " ", "Year"}]; DateString[{2007, 4, 15, 0}]"#,
+      r#""Sun 15 Apr 2007 00:00:00""#,
+    );
+  }
+  #[test]
+  fn date_string_3() {
+    assert_case(
+      r#"DateString[]; DateString[{1991, 10, 31, 0, 0}, {"Day", " ", "MonthName", " ", "Year"}]; DateString[{2007, 4, 15, 0}]; DateString[{1979, 3, 14}, {"DayName", "  ", "Month", "-", "YearShort"}]"#,
+      r#""Wednesday  03-79""#,
+    );
+  }
+  #[test]
+  fn date_string_4() {
+    assert_case(
+      r#"DateString[]; DateString[{1991, 10, 31, 0, 0}, {"Day", " ", "MonthName", " ", "Year"}]; DateString[{2007, 4, 15, 0}]; DateString[{1979, 3, 14}, {"DayName", "  ", "Month", "-", "YearShort"}]; DateString[{1991, 6, 6.5}]"#,
+      r#""Thu 6 Jun 1991 12:00:00""#,
+    );
+  }
+  #[test]
+  fn easter_sunday_1() {
+    assert_case(r#"EasterSunday[2000]"#, r#"EasterSunday[2000]"#);
+  }
+  #[test]
+  fn easter_sunday_2() {
+    assert_case(
+      r#"EasterSunday[2000]; EasterSunday[2030]"#,
+      r#"EasterSunday[2030]"#,
+    );
+  }
+  #[test]
+  fn absolute_time_5() {
+    assert_case(r#"AbsoluteTime[1000]"#, r#"1000"#);
+  }
+
+  #[test]
+  fn day_range_basic() {
+    assert_case(
+      r#"DayRange[{2020, 1, 1}, {2020, 1, 5}]"#,
+      r#"{DateObject[{2020, 1, 1}, Day], DateObject[{2020, 1, 2}, Day], DateObject[{2020, 1, 3}, Day], DateObject[{2020, 1, 4}, Day], DateObject[{2020, 1, 5}, Day]}"#,
+    );
+  }
+
+  #[test]
+  fn day_range_single() {
+    assert_case(
+      r#"DayRange[{2020, 1, 1}, {2020, 1, 1}]"#,
+      r#"{DateObject[{2020, 1, 1}, Day]}"#,
+    );
+  }
+
+  #[test]
+  fn day_range_weekday_filter() {
+    // 3-argument form keeps only the given weekday; `{2013, 1}` defaults the
+    // day to 1.
+    assert_case(
+      r#"DayRange[{2013, 1}, {2013, 1, 31}, Sunday]"#,
+      r#"{DateObject[{2013, 1, 6}, Day], DateObject[{2013, 1, 13}, Day], DateObject[{2013, 1, 20}, Day], DateObject[{2013, 1, 27}, Day]}"#,
+    );
+  }
+
+  #[test]
+  fn day_range_month_boundary() {
+    assert_case(
+      r#"DayRange[{2020, 1, 30}, {2020, 2, 2}]"#,
+      r#"{DateObject[{2020, 1, 30}, Day], DateObject[{2020, 1, 31}, Day], DateObject[{2020, 2, 1}, Day], DateObject[{2020, 2, 2}, Day]}"#,
+    );
+  }
+
+  #[test]
+  fn day_range_year_boundary() {
+    assert_case(
+      r#"DayRange[{2019, 12, 30}, {2020, 1, 2}]"#,
+      r#"{DateObject[{2019, 12, 30}, Day], DateObject[{2019, 12, 31}, Day], DateObject[{2020, 1, 1}, Day], DateObject[{2020, 1, 2}, Day]}"#,
+    );
+  }
+
+  // Reversed range is normalized to ascending order (matches wolframscript).
+  #[test]
+  fn day_range_reversed() {
+    assert_case(
+      r#"DayRange[{2020, 1, 3}, {2020, 1, 1}]"#,
+      r#"{DateObject[{2020, 1, 1}, Day], DateObject[{2020, 1, 2}, Day], DateObject[{2020, 1, 3}, Day]}"#,
+    );
+  }
+
+  #[test]
+  fn day_range_date_object_inputs() {
+    assert_case(
+      r#"DayRange[DateObject[{2020, 1, 1}], DateObject[{2020, 1, 3}]]"#,
+      r#"{DateObject[{2020, 1, 1}, Day], DateObject[{2020, 1, 2}, Day], DateObject[{2020, 1, 3}, Day]}"#,
+    );
+  }
+}
+
+mod date_range {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn date_range_basic_daily() {
+    // Default increment is one day; each element is a six-field date list with
+    // a Real seconds component.
+    assert_case(
+      r#"DateRange[{2024, 1, 1}, {2024, 1, 3}]"#,
+      r#"{{2024, 1, 1, 0, 0, 0.}, {2024, 1, 2, 0, 0, 0.}, {2024, 1, 3, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_single_element() {
+    assert_case(
+      r#"DateRange[{2024, 1, 1}, {2024, 1, 1}]"#,
+      r#"{{2024, 1, 1, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_integer_increment_is_days() {
+    assert_case(
+      r#"DateRange[{2024, 1, 1}, {2024, 1, 10}, 2]"#,
+      r#"{{2024, 1, 1, 0, 0, 0.}, {2024, 1, 3, 0, 0, 0.}, {2024, 1, 5, 0, 0, 0.}, {2024, 1, 7, 0, 0, 0.}, {2024, 1, 9, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_quantity_days() {
+    assert_case(
+      r#"DateRange[{2024, 1, 1}, {2024, 1, 10}, Quantity[3, "Days"]]"#,
+      r#"{{2024, 1, 1, 0, 0, 0.}, {2024, 1, 4, 0, 0, 0.}, {2024, 1, 7, 0, 0, 0.}, {2024, 1, 10, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_quantity_weeks() {
+    assert_case(
+      r#"DateRange[{2024, 1, 1}, {2024, 1, 15}, Quantity[1, "Weeks"]]"#,
+      r#"{{2024, 1, 1, 0, 0, 0.}, {2024, 1, 8, 0, 0, 0.}, {2024, 1, 15, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_quantity_hours_preserves_time() {
+    assert_case(
+      r#"DateRange[{2024, 1, 1, 12, 0, 0}, {2024, 1, 1, 15, 0, 0}, Quantity[1, "Hours"]]"#,
+      r#"{{2024, 1, 1, 12, 0, 0.}, {2024, 1, 1, 13, 0, 0.}, {2024, 1, 1, 14, 0, 0.}, {2024, 1, 1, 15, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_calendar_months() {
+    assert_case(
+      r#"DateRange[{2024, 1, 15}, {2024, 4, 15}, Quantity[1, "Months"]]"#,
+      r#"{{2024, 1, 15, 0, 0, 0.}, {2024, 2, 15, 0, 0, 0.}, {2024, 3, 15, 0, 0, 0.}, {2024, 4, 15, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_calendar_years() {
+    assert_case(
+      r#"DateRange[{2020, 6, 1}, {2023, 6, 1}, Quantity[1, "Years"]]"#,
+      r#"{{2020, 6, 1, 0, 0, 0.}, {2021, 6, 1, 0, 0, 0.}, {2022, 6, 1, 0, 0, 0.}, {2023, 6, 1, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_string_unit() {
+    assert_case(
+      r#"DateRange[{2024, 1, 1}, {2024, 3, 1}, "Month"]"#,
+      r#"{{2024, 1, 1, 0, 0, 0.}, {2024, 2, 1, 0, 0, 0.}, {2024, 3, 1, 0, 0, 0.}}"#,
+    );
+  }
+
+  #[test]
+  fn date_range_reversed_is_empty() {
+    // Unlike DayRange, DateRange does not normalize a descending range.
+    assert_case(r#"DateRange[{2024, 1, 5}, {2024, 1, 1}]"#, r#"{}"#);
+  }
+}
+
+mod time_object {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn time_object_minute_granularity() {
+    assert_case(r#"TimeObject[{14, 30}]"#, r#"TimeObject[{14, 30}, Minute]"#);
+  }
+
+  #[test]
+  fn time_object_hour_granularity() {
+    assert_case(r#"TimeObject[{14}]"#, r#"TimeObject[{14}, Hour]"#);
+  }
+
+  #[test]
+  fn time_object_instant_granularity() {
+    assert_case(
+      r#"TimeObject[{14, 30, 15}]"#,
+      r#"TimeObject[{14, 30, 15}, Instant]"#,
+    );
+  }
+
+  // TimeObject + Quantity[duration] shifts the time of day (wrapping around a
+  // 24h day); the result carries a 0. time-zone field.
+  #[test]
+  fn time_object_plus_quantity() {
+    assert_case(
+      r#"TimeObject[{14, 30, 0}] + Quantity[90, "Minutes"]"#,
+      r#"TimeObject[{16, 0, 0}, Instant, 0.]"#,
+    );
+    // Wraps past midnight.
+    assert_case(
+      r#"TimeObject[{23, 30, 0}] + Quantity[60, "Minutes"]"#,
+      r#"TimeObject[{0, 30, 0}, Instant, 0.]"#,
+    );
+    // Subtraction and commutativity.
+    assert_case(
+      r#"TimeObject[{10, 0, 0}] - Quantity[2, "Hours"]"#,
+      r#"TimeObject[{8, 0, 0}, Instant, 0.]"#,
+    );
+    assert_case(
+      r#"Quantity[15, "Minutes"] + TimeObject[{9, 0, 0}]"#,
+      r#"TimeObject[{9, 15, 0}, Instant, 0.]"#,
+    );
+    // Minute granularity is preserved.
+    assert_case(
+      r#"TimeObject[{14, 30}] + Quantity[1, "Hours"]"#,
+      r#"TimeObject[{15, 30}, Minute, 0.]"#,
+    );
+  }
+
+  #[test]
+  fn time_object_keeps_fractional_seconds() {
+    assert_case(
+      r#"TimeObject[{14, 30, 15.5}]"#,
+      r#"TimeObject[{14, 30, 15.5}, Instant]"#,
+    );
+  }
+
+  #[test]
+  fn time_object_hours_wrap_modulo_day() {
+    assert_case(r#"TimeObject[{25, 30}]"#, r#"TimeObject[{1, 30}, Minute]"#);
+  }
+
+  #[test]
+  fn time_object_minutes_carry() {
+    assert_case(r#"TimeObject[{14, 75}]"#, r#"TimeObject[{15, 15}, Minute]"#);
+  }
+
+  #[test]
+  fn time_object_seconds_carry() {
+    assert_case(
+      r#"TimeObject[{14, 30, 75}]"#,
+      r#"TimeObject[{14, 31, 15}, Instant]"#,
+    );
+  }
+
+  #[test]
+  fn time_object_negative_wraps() {
+    assert_case(r#"TimeObject[{-1, 30}]"#, r#"TimeObject[{23, 30}, Minute]"#);
+  }
+
+  #[test]
+  fn time_object_fractional_hours_carry() {
+    assert_case(
+      r#"TimeObject[{14.5, 30}]"#,
+      r#"TimeObject[{15, 0}, Minute]"#,
+    );
+  }
+
+  #[test]
+  fn time_object_full_day_wraps_to_zero() {
+    assert_case(
+      r#"TimeObject[{23, 59, 60}]"#,
+      r#"TimeObject[{0, 0, 0}, Instant]"#,
+    );
+  }
+
+  #[test]
+  fn time_object_fractional_hour_floored_at_hour_granularity() {
+    assert_case(r#"TimeObject[{14.5}]"#, r#"TimeObject[{14}, Hour]"#);
+  }
+}
+
+mod julian_date {
+  use super::*;
+
+  #[test]
+  fn epoch_and_common_dates() {
+    // J2000.0
+    assert_eq!(
+      interpret("JulianDate[{2000, 1, 1, 12, 0, 0}]").unwrap(),
+      "2.451545*^6"
+    );
+    // Midnight gives the half-day boundary
+    assert_eq!(
+      interpret("JulianDate[{2026, 6, 11}]").unwrap(),
+      "2.4612025*^6"
+    );
+    // Short date lists default to January 1st, 00:00
+    assert_eq!(interpret("JulianDate[{2000}]").unwrap(), "2.4515445*^6");
+    assert_eq!(
+      interpret("JulianDate[{2000, 1, 1, 12}]").unwrap(),
+      "2.451545*^6"
+    );
+    // Second overflow rolls over (leap-second style input)
+    assert_eq!(
+      interpret("JulianDate[{1999, 12, 31, 23, 59, 60}]").unwrap(),
+      "2.4515445*^6"
+    );
+    // Gregorian calendar adoption date
+    assert_eq!(
+      interpret("JulianDate[{1582, 10, 15}]").unwrap(),
+      "2.2991605*^6"
+    );
+    // Fractional seconds stay at machine precision
+    assert_eq!(
+      interpret("JulianDate[{2000, 1, 1, 12, 30, 45.5}]").unwrap(),
+      "2.4515450213599536*^6"
+    );
+  }
+
+  #[test]
+  fn no_input_year_zero() {
+    // Wolfram treats both 0 and -1 as 1 BC (astronomical year 0)
+    assert_eq!(interpret("JulianDate[{0, 1, 1}]").unwrap(), "1.7210595*^6");
+    assert_eq!(interpret("JulianDate[{-1, 1, 1}]").unwrap(), "1.7210595*^6");
+    assert_eq!(interpret("JulianDate[{1, 1, 1}]").unwrap(), "1.7214255*^6");
+    assert_eq!(
+      interpret("JulianDate[{-100, 1, 1}]").unwrap(),
+      "1.6849005*^6"
+    );
+    // JD 0 sits in input year -4713 (proleptic Gregorian)
+    assert_eq!(interpret("JulianDate[{-4713, 1, 1}]").unwrap(), "37.5");
+    assert_eq!(
+      interpret("JulianDate[{-4712, 1, 1, 12, 0, 0}]").unwrap(),
+      "404."
+    );
+  }
+
+  #[test]
+  fn non_date_input_stays_unevaluated() {
+    assert_eq!(interpret("JulianDate[x]").unwrap(), "JulianDate[x]");
+  }
+}
+
+mod from_unix_time {
+  use super::*;
+
+  #[test]
+  fn epoch_and_known_instants() {
+    // The Unix epoch itself.
+    assert_eq!(
+      interpret("FromUnixTime[0, TimeZone -> 0]").unwrap(),
+      "DateObject[{1970, 1, 1, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    // 2020-01-01T00:00:00Z.
+    assert_eq!(
+      interpret("FromUnixTime[1577836800, TimeZone -> 0]").unwrap(),
+      "DateObject[{2020, 1, 1, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    // A billion seconds after the epoch.
+    assert_eq!(
+      interpret("FromUnixTime[1000000000, TimeZone -> 0]").unwrap(),
+      "DateObject[{2001, 9, 9, 1, 46, 40}, Instant, Gregorian, 0.]"
+    );
+    // Sub-minute precision survives.
+    assert_eq!(
+      interpret("FromUnixTime[1577836845, TimeZone -> 0]").unwrap(),
+      "DateObject[{2020, 1, 1, 0, 0, 45}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  #[test]
+  fn time_zone_offsets_shift_the_displayed_time() {
+    assert_eq!(
+      interpret("FromUnixTime[0, TimeZone -> 1]").unwrap(),
+      "DateObject[{1970, 1, 1, 1, 0, 0}, Instant, Gregorian, 1.]"
+    );
+    assert_eq!(
+      interpret("FromUnixTime[0, TimeZone -> -5]").unwrap(),
+      "DateObject[{1969, 12, 31, 19, 0, 0}, Instant, Gregorian, -5.]"
+    );
+    // Fractional offsets are supported.
+    assert_eq!(
+      interpret("FromUnixTime[0, TimeZone -> 5.5]").unwrap(),
+      "DateObject[{1970, 1, 1, 5, 30, 0}, Instant, Gregorian, 5.5]"
+    );
+  }
+
+  #[test]
+  fn head_is_date_object() {
+    assert_eq!(
+      interpret("Head[FromUnixTime[0, TimeZone -> 0]]").unwrap(),
+      "DateObject"
+    );
+  }
+}
+
+mod from_absolute_time {
+  use super::*;
+
+  #[test]
+  fn epoch_and_known_instants() {
+    // The Wolfram epoch itself (1900-01-01), with a zero time-zone offset.
+    assert_eq!(
+      interpret("FromAbsoluteTime[0]").unwrap(),
+      "DateObject[{1900, 1, 1, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    // One day later.
+    assert_eq!(
+      interpret("FromAbsoluteTime[86400]").unwrap(),
+      "DateObject[{1900, 1, 2, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    // The Unix epoch is 2208988800 seconds after the Wolfram epoch.
+    assert_eq!(
+      interpret("FromAbsoluteTime[2208988800]").unwrap(),
+      "DateObject[{1970, 1, 1, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    // 2000-01-01.
+    assert_eq!(
+      interpret("FromAbsoluteTime[3155673600]").unwrap(),
+      "DateObject[{2000, 1, 1, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // FromAbsoluteTime inverts AbsoluteTime.
+  #[test]
+  fn round_trips_with_absolute_time() {
+    assert_eq!(
+      interpret("FromAbsoluteTime[AbsoluteTime[{2024, 6, 14}]]").unwrap(),
+      "DateObject[{2024, 6, 14, 0, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  #[test]
+  fn head_is_date_object() {
+    assert_eq!(
+      interpret("Head[FromAbsoluteTime[0]]").unwrap(),
+      "DateObject"
+    );
+  }
+}
+
+mod unix_time {
+  use super::*;
+
+  #[test]
+  fn from_date_list() {
+    // A full date list, interpreted as UTC.
+    assert_eq!(
+      interpret("UnixTime[{2020, 1, 1, 0, 0, 0}]").unwrap(),
+      "1577836800"
+    );
+    // Short date lists default the missing components.
+    assert_eq!(interpret("UnixTime[{2020, 1, 1}]").unwrap(), "1577836800");
+  }
+
+  #[test]
+  fn round_trips_with_from_unix_time() {
+    // UnixTime undoes FromUnixTime regardless of the display time zone.
+    assert_eq!(
+      interpret("UnixTime[FromUnixTime[1577836800, TimeZone -> 0]]").unwrap(),
+      "1577836800"
+    );
+    assert_eq!(
+      interpret("UnixTime[FromUnixTime[1577836800, TimeZone -> -5]]").unwrap(),
+      "1577836800"
+    );
+    assert_eq!(
+      interpret("UnixTime[FromUnixTime[1000000000, TimeZone -> 5.5]]").unwrap(),
+      "1000000000"
+    );
+  }
+}
+
+mod date_object_property {
+  use super::*;
+
+  #[test]
+  fn property_access_via_subscript() {
+    // DateObject[...]["property"] extracts a component, delegating to
+    // DateValue. Verified against wolframscript.
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4, 15, 30, 45}]["Day"]"#).unwrap(),
+      "4"
+    );
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4, 15, 30, 45}]["Year"]"#).unwrap(),
+      "2024"
+    );
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4, 15, 30, 45}]["Hour"]"#).unwrap(),
+      "15"
+    );
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4, 15, 30, 45}]["DayName"]"#).unwrap(),
+      "Thursday"
+    );
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4}]["Week"]"#).unwrap(),
+      "27"
+    );
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4}]["Quarter"]"#).unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn unknown_property_stays_unevaluated() {
+    assert_eq!(
+      interpret(r#"DateObject[{2024, 7, 4}]["Nonsense"]"#).unwrap(),
+      "DateObject[{2024, 7, 4}, Day][Nonsense]"
+    );
+  }
+}
+
+mod date_value {
+  use super::*;
+
+  #[test]
+  fn calendar_components() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "Year"]"#).unwrap(),
+      "2024"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "Month"]"#).unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "Day"]"#).unwrap(),
+      "15"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15, 10, 30, 0}, "Hour"]"#).unwrap(),
+      "10"
+    );
+  }
+
+  #[test]
+  fn named_components() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "DayName"]"#).unwrap(),
+      "Saturday"
+    );
+    // DayName is a Symbol (no quotes in InputForm), matching wolframscript;
+    // MonthName below is a String.
+    assert_eq!(
+      interpret(r#"ToString[DateValue[{2024, 6, 15}, "DayName"], InputForm]"#)
+        .unwrap(),
+      "Saturday"
+    );
+    assert_eq!(
+      interpret(
+        r#"ToString[DateValue[{2024, 6, 15}, "MonthName"], InputForm]"#
+      )
+      .unwrap(),
+      "\"June\""
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "MonthName"]"#).unwrap(),
+      "June"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "Quarter"]"#).unwrap(),
+      "2"
+    );
+  }
+
+  // "DayNameShort" returns the short weekday name as a string.
+  #[test]
+  fn day_name_short() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "DayNameShort"]"#).unwrap(),
+      "Fri"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 12, 25}, "DayNameShort"]"#).unwrap(),
+      "Wed"
+    );
+  }
+
+  // "MonthNameShort" returns the abbreviated month name.
+  #[test]
+  fn month_name_short() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "MonthNameShort"]"#).unwrap(),
+      "Mar"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 1, 1}, "MonthNameShort"]"#).unwrap(),
+      "Jan"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 12, 25}, "MonthNameShort"]"#).unwrap(),
+      "Dec"
+    );
+    // Works in a property list alongside other short names.
+    assert_eq!(
+      interpret(
+        r#"DateValue[{2024, 3, 15}, {"MonthNameShort", "DayNameShort"}]"#
+      )
+      .unwrap(),
+      "{Mar, Fri}"
+    );
+  }
+
+  // "Hour12" is the 12-hour-clock hour: 0 and 12 both map to 12, 13..23 to
+  // 1..11. "AMPM" is the meridiem string.
+  #[test]
+  fn hour12_and_ampm() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 14, 30, 0}, "Hour12"]"#).unwrap(),
+      "2"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 0, 0, 0}, "Hour12"]"#).unwrap(),
+      "12"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 12, 0, 0}, "Hour12"]"#).unwrap(),
+      "12"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 14, 0, 0}, "AMPM"]"#).unwrap(),
+      "PM"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 0, 0, 0}, "AMPM"]"#).unwrap(),
+      "AM"
+    );
+  }
+
+  // "…Short" component forms return the plain integer field, except
+  // "YearShort" which is the year modulo 100.
+  #[test]
+  fn short_component_forms() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "YearShort"]"#).unwrap(),
+      "24"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2005, 3, 15}, "YearShort"]"#).unwrap(),
+      "5"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "MonthShort"]"#).unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "DayShort"]"#).unwrap(),
+      "15"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 14, 30, 45}, "HourShort"]"#)
+        .unwrap(),
+      "14"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15, 14, 30, 45}, "SecondShort"]"#)
+        .unwrap(),
+      "45"
+    );
+  }
+
+  // ISO-8601 week date: "ISOWeek" and "ISOWeekYear", which differ from the
+  // calendar values near year boundaries. Verified against wolframscript.
+  #[test]
+  fn iso_week_and_year() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "ISOWeek"]"#).unwrap(),
+      "11"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "ISOWeekYear"]"#).unwrap(),
+      "2024"
+    );
+  }
+
+  #[test]
+  fn iso_week_year_boundaries() {
+    // 2023-01-01 is a Sunday → ISO week 52 of 2022.
+    assert_eq!(
+      interpret(r#"DateValue[{2023, 1, 1}, "ISOWeek"]"#).unwrap(),
+      "52"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2023, 1, 1}, "ISOWeekYear"]"#).unwrap(),
+      "2022"
+    );
+    // 2021-01-01 is a Friday → ISO week 53 of 2020.
+    assert_eq!(
+      interpret(r#"DateValue[{2021, 1, 1}, "ISOWeekYear"]"#).unwrap(),
+      "2020"
+    );
+    // 2025-12-29 is a Monday → ISO week 1 of 2026.
+    assert_eq!(
+      interpret(r#"DateValue[{2025, 12, 29}, "ISOWeekYear"]"#).unwrap(),
+      "2026"
+    );
+  }
+
+  #[test]
+  fn day_of_year_and_iso_weekday() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "DayOfYear"]"#).unwrap(),
+      "167"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 2, 29}, "DayOfYear"]"#).unwrap(),
+      "60"
+    );
+    // Saturday is ISO weekday 6 (Monday = 1).
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "ISOWeekDay"]"#).unwrap(),
+      "6"
+    );
+  }
+
+  // "ISOYearDay" is the ISO 8601 ordinal date: the calendar day of the year,
+  // the same value as "DayOfYear".
+  #[test]
+  fn iso_year_day() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 3, 15}, "ISOYearDay"]"#).unwrap(),
+      "75"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 12, 31}, "ISOYearDay"]"#).unwrap(),
+      "366"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2023, 12, 31}, "ISOYearDay"]"#).unwrap(),
+      "365"
+    );
+  }
+
+  // ISO-8601 week number, including the year-boundary edge cases.
+  #[test]
+  fn iso_week_number() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "Week"]"#).unwrap(),
+      "24"
+    );
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 1, 1}, "Week"]"#).unwrap(),
+      "1"
+    );
+    // 2021-01-01 belongs to ISO week 53 of 2020.
+    assert_eq!(
+      interpret(r#"DateValue[{2021, 1, 1}, "Week"]"#).unwrap(),
+      "53"
+    );
+    // 2024-12-30 belongs to ISO week 1 of 2025.
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 12, 30}, "Week"]"#).unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn list_of_properties() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, {"Year", "Month", "Day"}]"#)
+        .unwrap(),
+      "{2024, 6, 15}"
+    );
+  }
+
+  // DateObject and date-string inputs are accepted too.
+  #[test]
+  fn accepts_date_object_and_string() {
+    assert_eq!(
+      interpret(r#"DateValue[DateObject[{2024, 6, 15}], "DayName"]"#).unwrap(),
+      "Saturday"
+    );
+    assert_eq!(
+      interpret(r#"DateValue["2024-06-15", "MonthName"]"#).unwrap(),
+      "June"
+    );
+  }
+
+  // Unrecognized element specs stay unevaluated.
+  #[test]
+  fn unknown_property_unevaluated() {
+    assert_eq!(
+      interpret(r#"DateValue[{2024, 6, 15}, "DayOfWeek"]"#).unwrap(),
+      "DateValue[{2024, 6, 15}, DayOfWeek]"
+    );
+  }
+}
+
+mod day_match_q {
+  use super::*;
+
+  // 2024-06-15 is a Saturday; 2024-06-17 a Monday.
+  #[test]
+  fn weekday_name_symbol() {
+    assert_eq!(
+      interpret("DayMatchQ[{2024, 6, 15}, Saturday]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("DayMatchQ[{2024, 6, 15}, Sunday]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("DayMatchQ[{2024, 6, 17}, Monday]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn weekday_name_string() {
+    assert_eq!(
+      interpret(r#"DayMatchQ[{2024, 6, 15}, "Saturday"]"#).unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn weekend_and_weekday_categories() {
+    assert_eq!(
+      interpret(r#"DayMatchQ[{2024, 6, 15}, "Weekend"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"DayMatchQ[{2024, 6, 17}, "Weekend"]"#).unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(r#"DayMatchQ[{2024, 6, 17}, "Weekday"]"#).unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(r#"DayMatchQ[{2024, 6, 15}, "Weekday"]"#).unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn accepts_date_object() {
+    assert_eq!(
+      interpret("DayMatchQ[DateObject[{2024, 6, 15}], Saturday]").unwrap(),
+      "True"
+    );
+  }
+
+  // A bare category symbol (not a string) stays unevaluated, like Wolfram.
+  #[test]
+  fn bare_category_symbol_unevaluated() {
+    assert_eq!(
+      interpret("DayMatchQ[{2024, 6, 15}, Weekend]").unwrap(),
+      "DayMatchQ[{2024, 6, 15}, Weekend]"
+    );
+  }
+}
+
+mod day_round {
+  use super::*;
+
+  // 2024-06-15 is a Saturday. DayRound advances to the next occurrence of the
+  // weekday (the default next-day convention), staying put when it matches.
+  #[test]
+  fn rounds_forward_to_next_weekday() {
+    assert_eq!(
+      interpret("DayRound[{2024, 6, 15}, Saturday]").unwrap(),
+      "DateObject[{2024, 6, 15}, Day]"
+    );
+    assert_eq!(
+      interpret("DayRound[{2024, 6, 15}, Monday]").unwrap(),
+      "DateObject[{2024, 6, 17}, Day]"
+    );
+    assert_eq!(
+      interpret("DayRound[{2024, 6, 15}, Sunday]").unwrap(),
+      "DateObject[{2024, 6, 16}, Day]"
+    );
+    // Friday is the previous day, but rounding still goes forward a week.
+    assert_eq!(
+      interpret("DayRound[{2024, 6, 15}, Friday]").unwrap(),
+      "DateObject[{2024, 6, 21}, Day]"
+    );
+  }
+
+  #[test]
+  fn crosses_month_and_year_boundaries() {
+    assert_eq!(
+      interpret("DayRound[{2024, 6, 30}, Monday]").unwrap(),
+      "DateObject[{2024, 7, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("DayRound[{2024, 12, 31}, Sunday]").unwrap(),
+      "DateObject[{2025, 1, 5}, Day]"
+    );
+  }
+
+  #[test]
+  fn accepts_string_name_and_date_object() {
+    assert_eq!(
+      interpret(r#"DayRound[{2024, 6, 15}, "Monday"]"#).unwrap(),
+      "DateObject[{2024, 6, 17}, Day]"
+    );
+    assert_eq!(
+      interpret("DayRound[DateObject[{2024, 6, 15}], Monday]").unwrap(),
+      "DateObject[{2024, 6, 17}, Day]"
+    );
+  }
+
+  // DayRound[date] (no daytype) floors the date to its containing day.
+  #[test]
+  fn single_arg_floors_to_day() {
+    assert_eq!(
+      interpret("DayRound[{2024, 3, 15}]").unwrap(),
+      "DateObject[{2024, 3, 15}, Day]"
+    );
+  }
+
+  #[test]
+  fn single_arg_drops_time_components() {
+    // Any time of day truncates to the containing day (no half-up rounding).
+    assert_eq!(
+      interpret("DayRound[{2024, 3, 15, 8, 30, 0}]").unwrap(),
+      "DateObject[{2024, 3, 15}, Day]"
+    );
+    assert_eq!(
+      interpret("DayRound[{2024, 3, 15, 23, 59, 0}]").unwrap(),
+      "DateObject[{2024, 3, 15}, Day]"
+    );
+  }
+
+  #[test]
+  fn single_arg_completes_partial_dates() {
+    assert_eq!(
+      interpret("DayRound[{2024}]").unwrap(),
+      "DateObject[{2024, 1, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("DayRound[{2024, 2}]").unwrap(),
+      "DateObject[{2024, 2, 1}, Day]"
+    );
+  }
+
+  #[test]
+  fn single_arg_accepts_date_object() {
+    assert_eq!(
+      interpret("DayRound[DateObject[{2024, 3, 15}]]").unwrap(),
+      "DateObject[{2024, 3, 15}, Day]"
+    );
+    // A date-time DateObject carries a time zone that DayRound retains.
+    assert_eq!(
+      interpret("DayRound[DateObject[{2024, 7, 8, 14, 30}]]").unwrap(),
+      "DateObject[{2024, 7, 8}, Day, Gregorian, 0.]"
+    );
+  }
+
+  // The "Day" day-type class floors to the containing day (every day counts),
+  // matching the single-argument form regardless of the time of day.
+  #[test]
+  fn day_class_floors_to_containing_day() {
+    // A DateObject built from a date-time list carries a time zone; DayRound
+    // retains the calendar and time zone in the rounded result.
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 8, 14, 30}], "Day"]"#)
+        .unwrap(),
+      "DateObject[{2024, 7, 8}, Day, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(r#"DayRound[{2024, 7, 8, 1, 0}, "Day"]"#).unwrap(),
+      "DateObject[{2024, 7, 8}, Day]"
+    );
+  }
+
+  // "Weekday" advances to the next Monday–Friday on or after the date.
+  // 2024-07-06 is a Saturday, 2024-07-07 a Sunday, 2024-07-08 a Monday,
+  // 2024-07-12 a Friday.
+  #[test]
+  fn weekday_class_rounds_to_next_business_weekday() {
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 6}], "Weekday"]"#).unwrap(),
+      "DateObject[{2024, 7, 8}, Day]"
+    );
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 7}], "Weekday"]"#).unwrap(),
+      "DateObject[{2024, 7, 8}, Day]"
+    );
+    // A weekday stays put.
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 12}], "Weekday"]"#).unwrap(),
+      "DateObject[{2024, 7, 12}, Day]"
+    );
+  }
+
+  // "Weekend" advances to the next Saturday or Sunday on or after the date.
+  #[test]
+  fn weekend_class_rounds_to_next_weekend_day() {
+    // Monday 2024-07-08 → next Saturday 2024-07-13.
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 8}], "Weekend"]"#).unwrap(),
+      "DateObject[{2024, 7, 13}, Day]"
+    );
+    // Sunday stays put.
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 7}], "Weekend"]"#).unwrap(),
+      "DateObject[{2024, 7, 7}, Day]"
+    );
+    // Friday 2024-07-12 → next Saturday 2024-07-13.
+    assert_eq!(
+      interpret(r#"DayRound[DateObject[{2024, 7, 12}], "Weekend"]"#).unwrap(),
+      "DateObject[{2024, 7, 13}, Day]"
+    );
+  }
+}
+
+// NextDate[date, weekday] gives the next occurrence of that weekday strictly
+// after the date.
+mod next_date {
+  use super::*;
+
+  #[test]
+  fn next_weekday_strictly_after() {
+    // 2024-06-22 is a Saturday.
+    assert_eq!(
+      interpret("NextDate[{2024, 6, 22}, Sunday]").unwrap(),
+      "DateObject[{2024, 6, 23}, Day]"
+    );
+    assert_eq!(
+      interpret("NextDate[{2024, 6, 22}, Monday]").unwrap(),
+      "DateObject[{2024, 6, 24}, Day]"
+    );
+  }
+
+  #[test]
+  fn same_weekday_jumps_a_full_week() {
+    // 2024-06-23 is a Sunday; NextDate is strict, so it advances seven days.
+    assert_eq!(
+      interpret("NextDate[{2024, 6, 23}, Sunday]").unwrap(),
+      "DateObject[{2024, 6, 30}, Day]"
+    );
+    assert_eq!(
+      interpret("NextDate[{2024, 6, 22}, Saturday]").unwrap(),
+      "DateObject[{2024, 6, 29}, Day]"
+    );
+  }
+
+  #[test]
+  fn crosses_month_year_and_leap_day() {
+    assert_eq!(
+      interpret("NextDate[{2024, 12, 31}, Friday]").unwrap(),
+      "DateObject[{2025, 1, 3}, Day]"
+    );
+    // 2024-02-28 → the next Thursday is the leap day, Feb 29.
+    assert_eq!(
+      interpret("NextDate[{2024, 2, 28}, Thursday]").unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+    assert_eq!(
+      interpret("NextDate[{2023, 12, 28}, Monday]").unwrap(),
+      "DateObject[{2024, 1, 1}, Day]"
+    );
+  }
+
+  #[test]
+  fn accepts_string_name_and_date_object() {
+    assert_eq!(
+      interpret(r#"NextDate[{2024, 6, 22}, "Sunday"]"#).unwrap(),
+      "DateObject[{2024, 6, 23}, Day]"
+    );
+    assert_eq!(
+      interpret("NextDate[DateObject[{2024, 6, 22}], Sunday]").unwrap(),
+      "DateObject[{2024, 6, 23}, Day]"
+    );
+  }
+
+  // NextDate[date, granularity] gives the next calendar unit of that
+  // granularity, returned at that granularity.
+  #[test]
+  fn next_day_granularity() {
+    // Crosses the leap day and the year boundary.
+    assert_eq!(
+      interpret(r#"NextDate[DateObject[{2024, 2, 28}], "Day"]"#).unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+    assert_eq!(
+      interpret(r#"NextDate[DateObject[{2024, 12, 31}], "Day"]"#).unwrap(),
+      "DateObject[{2025, 1, 1}, Day]"
+    );
+  }
+
+  #[test]
+  fn next_month_granularity() {
+    assert_eq!(
+      interpret(r#"NextDate[DateObject[{2024, 2, 28}], "Month"]"#).unwrap(),
+      "DateObject[{2024, 3}, Month]"
+    );
+    // December rolls over into the next January.
+    assert_eq!(
+      interpret(r#"NextDate[DateObject[{2024, 12}], "Month"]"#).unwrap(),
+      "DateObject[{2025, 1}, Month]"
+    );
+  }
+
+  #[test]
+  fn next_year_granularity() {
+    assert_eq!(
+      interpret(r#"NextDate[DateObject[{2024, 2, 28}], "Year"]"#).unwrap(),
+      "DateObject[{2025}, Year]"
+    );
+  }
+}
+
+// PreviousDate[date, weekday] gives the previous occurrence of that weekday
+// strictly before the date (the mirror of NextDate).
+mod previous_date {
+  use super::*;
+
+  #[test]
+  fn previous_weekday_strictly_before() {
+    // 2024-06-22 is a Saturday.
+    assert_eq!(
+      interpret("PreviousDate[{2024, 6, 22}, Sunday]").unwrap(),
+      "DateObject[{2024, 6, 16}, Day]"
+    );
+    assert_eq!(
+      interpret("PreviousDate[{2024, 6, 22}, Monday]").unwrap(),
+      "DateObject[{2024, 6, 17}, Day]"
+    );
+  }
+
+  #[test]
+  fn same_weekday_jumps_a_full_week_back() {
+    // 2024-06-23 is a Sunday; PreviousDate is strict, so it steps back a week.
+    assert_eq!(
+      interpret("PreviousDate[{2024, 6, 23}, Sunday]").unwrap(),
+      "DateObject[{2024, 6, 16}, Day]"
+    );
+    assert_eq!(
+      interpret("PreviousDate[{2024, 6, 22}, Saturday]").unwrap(),
+      "DateObject[{2024, 6, 15}, Day]"
+    );
+  }
+
+  #[test]
+  fn crosses_year_and_leap_day() {
+    assert_eq!(
+      interpret("PreviousDate[{2024, 1, 1}, Friday]").unwrap(),
+      "DateObject[{2023, 12, 29}, Day]"
+    );
+    // 2024-03-01 → the previous Thursday is the leap day, Feb 29.
+    assert_eq!(
+      interpret("PreviousDate[{2024, 3, 1}, Thursday]").unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+  }
+
+  #[test]
+  fn accepts_string_name_and_date_object() {
+    assert_eq!(
+      interpret(r#"PreviousDate[{2024, 6, 22}, "Sunday"]"#).unwrap(),
+      "DateObject[{2024, 6, 16}, Day]"
+    );
+    assert_eq!(
+      interpret("PreviousDate[DateObject[{2024, 6, 22}], Sunday]").unwrap(),
+      "DateObject[{2024, 6, 16}, Day]"
+    );
+  }
+
+  // PreviousDate[date, granularity] gives the previous calendar unit of that
+  // granularity, returned at that granularity.
+  #[test]
+  fn previous_day_granularity() {
+    // Steps back onto the leap day.
+    assert_eq!(
+      interpret(r#"PreviousDate[DateObject[{2024, 3, 1}], "Day"]"#).unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+  }
+
+  #[test]
+  fn previous_month_granularity() {
+    // January steps back into the prior December.
+    assert_eq!(
+      interpret(r#"PreviousDate[DateObject[{2024, 1, 1}], "Month"]"#).unwrap(),
+      "DateObject[{2023, 12}, Month]"
+    );
+  }
+
+  #[test]
+  fn previous_year_granularity() {
+    assert_eq!(
+      interpret(r#"PreviousDate[DateObject[{2024, 2, 28}], "Year"]"#).unwrap(),
+      "DateObject[{2023}, Year]"
+    );
+  }
+}
+
+mod mid_date {
+  use super::*;
+
+  // The midpoint of a single granular date is the middle instant of the
+  // interval it covers (September has 30 days, so its middle is the 16th
+  // at midnight). Reference: MidDate docs, basic example 1.
+  #[test]
+  fn middle_of_a_month() {
+    assert_eq!(
+      interpret("MidDate[DateObject[{2024, 9}]]").unwrap(),
+      "DateObject[{2024, 9, 16, 0, 0, 0.}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // The middle day of a (leap) year. Reference: docs basic example 2.
+  #[test]
+  fn middle_of_a_year_as_day() {
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2024}], "Day"]"#).unwrap(),
+      "DateObject[{2024, 7, 2}, Day]"
+    );
+    // Non-leap year: 365 days, midpoint falls at noon of day 183 (Jul 2).
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2023}], "Day"]"#).unwrap(),
+      "DateObject[{2023, 7, 2}, Day]"
+    );
+  }
+
+  // The date a fraction of the way through an interval; a Week-granular
+  // date covers the week starting on its Monday. Reference: docs basic
+  // example 3 (2/3 through the week of Mon Sep 30 is Fri Oct 4, 4 pm).
+  #[test]
+  fn fraction_of_a_week_as_hour() {
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2024, 9, 30}, "Week"], "Hour", 2/3]"#)
+        .unwrap(),
+      "DateObject[{2024, 10, 4, 16}, Hour, Gregorian, 0.]"
+    );
+  }
+
+  // A list of instants gives their plain mean. Reference: docs basic
+  // example 4.
+  #[test]
+  fn mean_of_instants() {
+    assert_eq!(
+      interpret(
+        "MidDate[{DateObject[{2024, 12, 30, 18, 1, 56.77401781082153}], \
+         DateObject[{2024, 4, 8, 12, 54, 47.175180435180664}], \
+         DateObject[{2024, 8, 13, 22, 45, 35.52135992050171}]}]"
+      )
+      .unwrap(),
+      "DateObject[{2024, 8, 17, 17, 54, 6.4901862144470215}, Instant, \
+       Gregorian, 0.]"
+    );
+  }
+
+  // For a list of dates each date's implicit interval is used: the
+  // midpoints of Oct 1 and Oct 3 (both at noon) average to noon of Oct 2.
+  // Reference: docs scope example 1.
+  #[test]
+  fn mean_of_days() {
+    assert_eq!(
+      interpret(
+        r#"MidDate[{DateObject[{2024, 10, 1}], DateObject[{2024, 10, 3}]}, "Day"]"#
+      )
+      .unwrap(),
+      "DateObject[{2024, 10, 2}, Day]"
+    );
+  }
+
+  // Truncation to a coarser granularity. Reference: docs scope example.
+  #[test]
+  fn mean_of_days_as_month() {
+    assert_eq!(
+      interpret(
+        "MidDate[{DateObject[{2024, 10, 3}], DateObject[{2024, 10, 5}], \
+         DateObject[{2024, 10, 5}]}, \"Month\"]"
+      )
+      .unwrap(),
+      "DateObject[{2024, 10}, Month]"
+    );
+  }
+
+  // The default "GranularMean" method weighs each midpoint by the nominal
+  // length of its granularity: a Week counts 7 times as much as a Day, so
+  // {Oct 1 (Day), week of Oct 7} lands at Oct 9, 9:00. Reference: docs
+  // scope example ("dates of different granularity").
+  #[test]
+  fn granular_mean_weighs_by_nominal_length() {
+    assert_eq!(
+      interpret(
+        r#"MidDate[{DateObject[{2024, 10, 1}], DateObject[{2024, 10, 7}, "Week"]}]"#
+      )
+      .unwrap(),
+      "DateObject[{2024, 10, 9, 9, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    // The same midpoint from the eight days the two intervals cover.
+    assert_eq!(
+      interpret(
+        "MidDate[{DateObject[{2024, 10, 1}], DateObject[{2024, 10, 7}], \
+         DateObject[{2024, 10, 8}], DateObject[{2024, 10, 9}], \
+         DateObject[{2024, 10, 10}], DateObject[{2024, 10, 11}], \
+         DateObject[{2024, 10, 12}], DateObject[{2024, 10, 13}]}]"
+      )
+      .unwrap(),
+      "DateObject[{2024, 10, 9, 9, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // Months all get the same nominal weight (the mean Gregorian month),
+  // so February (29 days) and April (30 days) average to Mar 16 — not the
+  // Mar 17 a duration-weighted mean would give. Reference: docs scope
+  // example (Method -> "GranularMean" vs "WeightedMean").
+  #[test]
+  fn months_weigh_equally() {
+    assert_eq!(
+      interpret(
+        r#"MidDate[{DateObject[{2024, 2}], DateObject[{2024, 4}]}, "Day"]"#
+      )
+      .unwrap(),
+      "DateObject[{2024, 3, 16}, Day]"
+    );
+    // Mixed granularities: a Month outweighs a Day 30.436875 : 1.
+    assert_eq!(
+      interpret(
+        r#"MidDate[{DateObject[{2024, 2}], DateObject[{2024, 10, 4}]}, "Day"]"#
+      )
+      .unwrap(),
+      "DateObject[{2024, 2, 22}, Day]"
+    );
+  }
+
+  // A DateInterval covers everything from the start of its first day to
+  // the end of its last day (20 days here), so the midpoint is Jan 11.
+  #[test]
+  fn middle_of_a_date_interval() {
+    assert_eq!(
+      interpret(
+        r#"MidDate[DateInterval[{{2019, 1, 1}, {2019, 1, 20}}], "Day"]"#
+      )
+      .unwrap(),
+      "DateObject[{2019, 1, 11}, Day]"
+    );
+    assert_eq!(
+      interpret("MidDate[DateInterval[{{2019, 1, 1}, {2019, 1, 20}}]]")
+        .unwrap(),
+      "DateObject[{2019, 1, 11, 0, 0, 0.}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // Date lists and date strings are accepted like DateObjects.
+  #[test]
+  fn accepts_date_lists_and_strings() {
+    assert_eq!(
+      interpret(r#"MidDate[{{2024, 1, 1}, {2024, 1, 3}}, "Day"]"#).unwrap(),
+      "DateObject[{2024, 1, 2}, Day]"
+    );
+    assert_eq!(
+      interpret(r#"MidDate[{"1 January 2019", "31 December 2019"}, "Day"]"#)
+        .unwrap(),
+      "DateObject[{2019, 7, 2}, Day]"
+    );
+  }
+
+  // The values of an association are treated as the list of dates.
+  #[test]
+  fn accepts_associations() {
+    assert_eq!(
+      interpret(
+        "MidDate[<|\"date1\" -> DateObject[{2024, 9, 22}], \
+         \"date2\" -> DateObject[{2024, 4, 24}], \
+         \"date3\" -> DateObject[{2024, 10, 28}]|>]"
+      )
+      .unwrap(),
+      "DateObject[{2024, 8, 15, 4, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // Truncation to the remaining output granularities.
+  #[test]
+  fn output_granularities() {
+    assert_eq!(
+      interpret(r#"MidDate[{DateObject[{2023}], DateObject[{2025}]}, "Year"]"#)
+        .unwrap(),
+      "DateObject[{2024}, Year]"
+    );
+    // Mid-October noon falls in the week starting Mon Oct 14.
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2024, 10}], "Week"]"#).unwrap(),
+      "DateObject[{2024, 10, 14}, Week]"
+    );
+  }
+
+  // Fractions 0 and 1 give the interval bounds.
+  #[test]
+  fn fraction_bounds() {
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2024}], "Day", 0]"#).unwrap(),
+      "DateObject[{2024, 1, 1}, Day]"
+    );
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2024}], "Day", 1]"#).unwrap(),
+      "DateObject[{2025, 1, 1}, Day]"
+    );
+  }
+
+  // Uninterpretable arguments leave the expression unevaluated.
+  #[test]
+  fn unevaluated_for_bad_input() {
+    assert_eq!(interpret("MidDate[x]").unwrap(), "MidDate[x]");
+    assert_eq!(interpret("MidDate[{}]").unwrap(), "MidDate[{}]");
+    assert_eq!(
+      interpret(r#"MidDate[DateObject[{2024}], "Fortnight"]"#).unwrap(),
+      "MidDate[DateObject[{2024}, Year], Fortnight]"
+    );
+  }
+}
+
+// DateObject results display as a framed date panel in visual hosts
+// (playground, studio — anything driven by interpret_with_stdout), like
+// Wolfram notebooks. The CLI keeps the symbolic echo.
+mod date_object_panel {
+  use super::*;
+
+  #[test]
+  fn date_object_renders_panel_in_visual_mode() {
+    let result =
+      woxi::interpret_with_stdout("DateObject[{2026, 7, 2}]").unwrap();
+    assert_eq!(result.result, "-Graphics-");
+    let svg = result.graphics.expect("no captured graphics");
+    assert!(svg.starts_with("<svg"), "Got: {svg}");
+    assert!(svg.contains("Thu 2 Jul 2026"), "Got: {svg}");
+  }
+
+  #[test]
+  fn instant_panel_shows_time_and_zone() {
+    let result = woxi::interpret_with_stdout(
+      "DateObject[{2026, 7, 2, 16, 37, 38.83}, Instant, Gregorian, 0.]",
+    )
+    .unwrap();
+    assert_eq!(result.result, "-Graphics-");
+    let svg = result.graphics.expect("no captured graphics");
+    assert!(svg.contains("Thu 2 Jul 2026 16:37:38"), "Got: {svg}");
+    // The zone label must flow after the date glyphs (tspan), not sit at an
+    // absolutely-positioned x, or it overlaps the seconds when the host's
+    // monospace font is wider than the width estimate.
+    assert!(
+      svg.contains("<tspan dx=\"5\" font-size=\"11\""),
+      "Got: {svg}"
+    );
+    assert!(svg.contains("GMT+0</tspan>"), "Got: {svg}");
+  }
+
+  #[test]
+  fn random_date_renders_panel_in_visual_mode() {
+    let result = woxi::interpret_with_stdout("RandomDate[]").unwrap();
+    assert_eq!(result.result, "-Graphics-");
+    let svg = result.graphics.expect("no captured graphics");
+    assert!(svg.starts_with("<svg"), "Got: {svg}");
+  }
+
+  // ExportString renders the panel, not the typeset symbolic text.
+  #[test]
+  fn export_string_svg() {
+    let svg =
+      interpret("ExportString[DateObject[{2026, 7, 2}], \"SVG\"]").unwrap();
+    assert!(svg.starts_with("<svg"), "Got: {svg}");
+    assert!(svg.contains("Thu 2 Jul 2026"), "Got: {svg}");
+  }
+
+  // The CLI (plain interpret) keeps the symbolic form, matching
+  // wolframscript.
+  #[test]
+  fn stays_symbolic_in_cli_mode() {
+    assert_eq!(
+      interpret("DateObject[{2026, 7, 2}]").unwrap(),
+      "DateObject[{2026, 7, 2}, Day]"
+    );
+  }
+
+  // Symbolic components cannot be formatted — keep the textual echo
+  // even in visual mode.
+  #[test]
+  fn symbolic_date_stays_text_in_visual_mode() {
+    let result = woxi::interpret_with_stdout("DateObject[{y, 7, 2}]").unwrap();
+    assert_eq!(result.result, "DateObject[{y, 7, 2}, Day]");
+    assert!(result.graphics.is_none());
+  }
+}
+
+// DateDifference with the "Month" and "Year" units uses calendar arithmetic:
+// whole months/years counted with end-of-month day clamping, then a
+// fractional part that divides the leftover days by the actual length of the
+// partial month/year. Previously Woxi used fixed 30.436875-day and 365-day
+// approximations, giving fractional results where Wolfram returns exact
+// integers and diverging on leap-year spans. All expected values were
+// verified against wolframscript.
+mod date_difference_calendar_units {
+  use super::*;
+
+  #[test]
+  fn whole_months_are_exact() {
+    assert_eq!(
+      interpret("DateDifference[{2023, 1, 1}, {2023, 3, 1}, \"Month\"]")
+        .unwrap(),
+      "Quantity[2, Months]"
+    );
+  }
+
+  #[test]
+  fn month_end_clamping_counts_as_whole_month() {
+    // Jan 31 + 1 month clamps to Feb 28, so the span is exactly one month.
+    assert_eq!(
+      interpret("DateDifference[{2023, 1, 31}, {2023, 2, 28}, \"Month\"]")
+        .unwrap(),
+      "Quantity[1, Months]"
+    );
+  }
+
+  #[test]
+  fn fractional_month_divides_by_partial_month_length() {
+    // 2 whole months (to Mar 1) plus 14 days into March (31-day month).
+    assert_eq!(
+      interpret("DateDifference[{2023, 1, 1}, {2023, 3, 15}, \"Month\"]")
+        .unwrap(),
+      "Quantity[2.4516129032258065, Months]"
+    );
+  }
+
+  #[test]
+  fn fractional_month_partial_starts_in_february() {
+    // 1 whole month (to Feb 15) plus 14 days, divided by February's 28 days.
+    assert_eq!(
+      interpret("DateDifference[{2023, 1, 15}, {2023, 3, 1}, \"Month\"]")
+        .unwrap(),
+      "Quantity[1.5, Months]"
+    );
+  }
+
+  #[test]
+  fn month_difference_is_negative_when_reversed() {
+    assert_eq!(
+      interpret("DateDifference[{2023, 3, 1}, {2023, 1, 1}, \"Month\"]")
+        .unwrap(),
+      "Quantity[-2, Months]"
+    );
+  }
+
+  #[test]
+  fn whole_years_are_exact_across_a_leap_year() {
+    assert_eq!(
+      interpret("DateDifference[{2020, 1, 1}, {2023, 1, 1}, \"Year\"]")
+        .unwrap(),
+      "Quantity[3, Years]"
+    );
+  }
+
+  #[test]
+  fn fractional_year_uses_366_day_period_in_a_leap_year() {
+    // Jan 1 -> Jul 1 in 2020 is 182 days over a 366-day year period.
+    assert_eq!(
+      interpret("DateDifference[{2020, 1, 1}, {2020, 7, 1}, \"Year\"]")
+        .unwrap(),
+      "Quantity[0.4972677595628415, Years]"
+    );
+  }
+
+  #[test]
+  fn fractional_year_general_case() {
+    assert_eq!(
+      interpret("DateDifference[{2023, 6, 15}, {2025, 9, 20}, \"Year\"]")
+        .unwrap(),
+      "Quantity[2.265753424657534, Years]"
+    );
+  }
+}
+
+mod date_object_q_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn date_objects_are_true() {
+    assert_eq!(interpret("DateObjectQ[Today]").unwrap(), "True");
+    assert_eq!(interpret("DateObjectQ[Now]").unwrap(), "True");
+    assert_eq!(
+      interpret("DateObjectQ[DateObject[{2026, 7, 4}]]").unwrap(),
+      "True"
+    );
+    // Out-of-range components normalize into a valid date, so still True.
+    assert_eq!(
+      interpret("DateObjectQ[DateObject[{2026, 13, 45}]]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn non_date_objects_are_false() {
+    assert_eq!(
+      interpret("DateObjectQ[TimeObject[{12, 30}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(interpret(r#"DateObjectQ["2026-07-04"]"#).unwrap(), "False");
+    assert_eq!(interpret("DateObjectQ[42]").unwrap(), "False");
+    assert_eq!(interpret("DateObjectQ[x]").unwrap(), "False");
+    // Failed constructions (echoed unevaluated) are not date objects.
+    assert_eq!(
+      interpret(r#"DateObjectQ[DateObject["not a date"]]"#).unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("DateObjectQ[DateObject[{1, 2, 3, 4, 5, 6, 7}]]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("DateObjectQ[DateObject[{2026, x, 4}]]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn wrong_arg_counts_stay_unevaluated() {
+    assert_eq!(interpret("DateObjectQ[]").unwrap(), "DateObjectQ[]");
+    assert_eq!(interpret("DateObjectQ[1, 2]").unwrap(), "DateObjectQ[1, 2]");
+  }
+}
+
+// DateObject rolls out-of-range components into the next-larger unit,
+// exactly like wolframscript (regression tests for the normalization fix).
+mod date_object_normalization_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn month_overflow_and_underflow() {
+    assert_eq!(
+      interpret("DateObject[{2026, 13, 45}]").unwrap(),
+      "DateObject[{2027, 2, 14}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 0, 5}]").unwrap(),
+      "DateObject[{2025, 12, 5}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, -1, 5}]").unwrap(),
+      "DateObject[{2025, 11, 5}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 13}, \"Month\"]").unwrap(),
+      "DateObject[{2027, 1}, Month]"
+    );
+  }
+
+  #[test]
+  fn day_overflow_and_underflow() {
+    assert_eq!(
+      interpret("DateObject[{2026, 1, 0}]").unwrap(),
+      "DateObject[{2025, 12, 31}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 1, -1}]").unwrap(),
+      "DateObject[{2025, 12, 30}, Day]"
+    );
+    // February length respects leap years.
+    assert_eq!(
+      interpret("DateObject[{2026, 2, 30}]").unwrap(),
+      "DateObject[{2026, 3, 2}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 30}]").unwrap(),
+      "DateObject[{2024, 3, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 12, 32}]").unwrap(),
+      "DateObject[{2027, 1, 1}, Day]"
+    );
+    // Explicit granularity normalizes too.
+    assert_eq!(
+      interpret("DateObject[{2026, 13, 45}, \"Day\"]").unwrap(),
+      "DateObject[{2027, 2, 14}, Day]"
+    );
+  }
+
+  #[test]
+  fn time_component_carry() {
+    assert_eq!(
+      interpret("DateObject[{2026, 7, 4, 25, 0, 0}]").unwrap(),
+      "DateObject[{2026, 7, 5, 1, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 7, 4, 23, 61, 0}]").unwrap(),
+      "DateObject[{2026, 7, 5, 0, 1, 0}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 7, 4, 12, 30, 75.5}]").unwrap(),
+      "DateObject[{2026, 7, 4, 12, 31, 15.5}, Instant, Gregorian, 0.]"
+    );
+  }
+}
+
+mod date_within_q_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn containment_by_granularity() {
+    assert_eq!(
+      interpret("DateWithinQ[DateObject[{2026}], DateObject[{2026, 7, 4}]]")
+        .unwrap(),
+      "True"
+    );
+    // The coarser date is not within the finer one.
+    assert_eq!(
+      interpret("DateWithinQ[DateObject[{2026, 7, 4}], DateObject[{2026}]]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 7}], DateObject[{2026, 7, 31}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 12}], DateObject[{2026, 12, 31}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 7, 4}], DateObject[{2026, 7, 4}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 7, 4}], DateObject[{2026, 7, 4, 12, 30, 0}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("DateWithinQ[DateObject[{2026}], DateObject[{2027, 1, 1}]]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("DateWithinQ[DateObject[{2026, 7}], DateObject[{2027, 1, 1}]]")
+        .unwrap(),
+      "False"
+    );
+  }
+
+  // Spans are half-open: a day's opening midnight is within it, its
+  // closing midnight is not.
+  #[test]
+  fn half_open_boundaries() {
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 7, 4}], DateObject[{2026, 7, 4, 0, 0, 0}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 7, 4}], DateObject[{2026, 7, 5, 0, 0, 0}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+  }
+
+  // Non-date arguments emit ::arg and echo; TimeObjects and instant
+  // containers stay silently unevaluated, matching wolframscript.
+  #[test]
+  fn unresolvable_forms() {
+    assert_eq!(
+      interpret(r#"DateWithinQ[DateObject[{2026, 7, 4}], "2026-07-04"]"#)
+        .unwrap(),
+      "DateWithinQ[DateObject[{2026, 7, 4}, Day], 2026-07-04]"
+    );
+    assert_eq!(
+      interpret("DateWithinQ[DateObject[{2026}], x]").unwrap(),
+      "DateWithinQ[DateObject[{2026}, Year], x]"
+    );
+    assert_eq!(
+      interpret("DateWithinQ[TimeObject[{12, 0}], DateObject[{2026}]]")
+        .unwrap(),
+      "DateWithinQ[TimeObject[{12, 0}, Minute], DateObject[{2026}, Year]]"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2026, 7, 4, 12, 0, 0}], DateObject[{2026, 7, 4, 12, 0, 0}]]"
+      )
+      .unwrap(),
+      "DateWithinQ[DateObject[{2026, 7, 4, 12, 0, 0}, Instant, Gregorian, 0.], DateObject[{2026, 7, 4, 12, 0, 0}, Instant, Gregorian, 0.]]"
+    );
+  }
+
+  // A DateInterval container spans its whole calendar range; a DateObject or
+  // DateInterval is within it when its span is contained. Verified against
+  // wolframscript.
+  #[test]
+  fn date_interval_container() {
+    let iv = "DateInterval[{{2024, 1, 1}, {2024, 12, 31}}]";
+    assert_eq!(
+      interpret(&format!("DateWithinQ[{iv}, DateObject[{{2024, 6, 15}}]]"))
+        .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(&format!("DateWithinQ[{iv}, DateObject[{{2025, 6, 15}}]]"))
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "DateWithinQ[{iv}, DateInterval[{{{{2024, 3, 1}}, {{2024, 4, 1}}}}]]"
+      ))
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(&format!(
+        "DateWithinQ[{iv}, DateInterval[{{{{2023, 3, 1}}, {{2024, 4, 1}}}}]]"
+      ))
+      .unwrap(),
+      "False"
+    );
+  }
+}
+
+mod date_overlaps_q_tests {
+  use super::*;
+
+  #[test]
+  fn same_day_overlaps() {
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateObject[{2020, 1, 1}], DateObject[{2020, 1, 1}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn adjacent_units_do_not_overlap() {
+    // Consecutive days share only their boundary instant → no overlap.
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateObject[{2020, 1, 1}], DateObject[{2020, 1, 2}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    // Consecutive months likewise.
+    assert_eq!(
+      interpret("DateOverlapsQ[DateObject[{2020, 1}], DateObject[{2020, 2}]]")
+        .unwrap(),
+      "False"
+    );
+    // A year and the following month do not overlap.
+    assert_eq!(
+      interpret("DateOverlapsQ[DateObject[{2020}], DateObject[{2021, 1}]]")
+        .unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn coarser_span_contains_finer() {
+    // A day inside a year overlaps that year.
+    assert_eq!(
+      interpret("DateOverlapsQ[DateObject[{2020}], DateObject[{2020, 6, 1}]]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn intervals_overlap() {
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateInterval[{{2020, 1, 1}, {2020, 6, 1}}], \
+         DateInterval[{{2020, 3, 1}, {2020, 9, 1}}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    // Disjoint intervals do not overlap.
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateInterval[{{2020, 1, 1}, {2020, 6, 1}}], \
+         DateInterval[{{2020, 7, 1}, {2020, 9, 1}}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    // Intervals sharing an interior day (jun1) overlap.
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateInterval[{{2020, 1, 1}, {2020, 6, 1}}], \
+         DateInterval[{{2020, 6, 1}, {2020, 9, 1}}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn mixed_object_and_interval() {
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateObject[{2020, 3, 15}], \
+         DateInterval[{{2020, 1, 1}, {2020, 6, 1}}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn non_date_argument_unevaluated() {
+    assert_eq!(
+      interpret("DateOverlapsQ[5, DateObject[{2020}]]").unwrap(),
+      "DateOverlapsQ[5, DateObject[{2020}, Year]]"
+    );
+  }
+}
+
+mod time_zone_offset_tests {
+  use woxi::interpret;
+
+  // TimeZoneOffset[tz] is the zone's UTC offset (numeric zones pass
+  // through); the 2- and 3-argument forms give tz1 - tz2 (the date
+  // argument only matters for named zones).
+  #[test]
+  fn numeric_zones() {
+    assert_eq!(interpret("TimeZoneOffset[]").unwrap(), "0.");
+    assert_eq!(interpret("$TimeZone").unwrap(), "0.");
+    assert_eq!(interpret("TimeZoneOffset[5]").unwrap(), "5");
+    assert_eq!(interpret("TimeZoneOffset[2.5]").unwrap(), "2.5");
+    assert_eq!(interpret("TimeZoneOffset[5, 2]").unwrap(), "3");
+    assert_eq!(interpret("TimeZoneOffset[-3, 5/2]").unwrap(), "-11/2");
+    assert_eq!(interpret("TimeZoneOffset[1, 2, 3]").unwrap(), "-1");
+  }
+
+  // Invalid zone specs emit ::zone; named IANA zones resolve through
+  // chrono-tz at the reference date (the 1-argument form uses the current
+  // instant, so tests pin the date to stay DST-independent).
+  #[test]
+  fn invalid_zones() {
+    assert_eq!(interpret("TimeZoneOffset[x]").unwrap(), "TimeZoneOffset[x]");
+  }
+
+  #[test]
+  #[cfg(not(target_arch = "wasm32"))]
+  fn named_zones() {
+    assert_eq!(
+      interpret(
+        r#"TimeZoneOffset["America/Chicago", 0, DateObject[{2020, 1, 1}]]"#
+      )
+      .unwrap(),
+      "-6."
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneOffset["America/Chicago", 0, DateObject[{2020, 7, 1}]]"#
+      )
+      .unwrap(),
+      "-5."
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneOffset["Asia/Kathmandu", 0, DateObject[{2020, 1, 1}]]"#
+      )
+      .unwrap(),
+      "5.75"
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneOffset["Europe/Berlin", "America/Chicago", DateObject[{2020, 7, 1}]]"#
+      )
+      .unwrap(),
+      "7."
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneOffset["America/Chicago", 2, DateObject[{2020, 7, 1}]]"#
+      )
+      .unwrap(),
+      "-7."
+    );
+  }
+}
+
+mod from_julian_date_tests {
+  use woxi::interpret;
+
+  // Julian dates are noon-based; wolframscript uses historical year
+  // numbering (no year zero), so JD 0 lands on -4714-11-24 12:00.
+  #[test]
+  fn calendar_conversion() {
+    assert_eq!(
+      interpret("FromJulianDate[2460000]").unwrap(),
+      "DateObject[{2023, 2, 24, 12, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("FromJulianDate[0]").unwrap(),
+      "DateObject[{-4714, 11, 24, 12, 0, 0}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("FromJulianDate[1721425.5]").unwrap(),
+      "DateObject[{1, 1, 1, 0, 0, 0.}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("FromJulianDate[1721059.5]").unwrap(),
+      "DateObject[{-1, 1, 1, 0, 0, 0.}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // Exact input gives exact time components; Real input keeps a Real
+  // seconds slot even when it is zero.
+  #[test]
+  fn seconds_typing() {
+    assert_eq!(
+      interpret("FromJulianDate[2460000.5]").unwrap(),
+      "DateObject[{2023, 2, 25, 0, 0, 0.}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("FromJulianDate[2460000.]").unwrap(),
+      "DateObject[{2023, 2, 24, 12, 0, 0.}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("FromJulianDate[2460000 + 1/4]").unwrap(),
+      "DateObject[{2023, 2, 24, 18, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  #[test]
+  fn invalid_input() {
+    assert_eq!(interpret("FromJulianDate[x]").unwrap(), "FromJulianDate[x]");
+  }
+}
+
+// Regression: JulianDate accepts DateObject input (previously only
+// component lists worked).
+mod julian_date_date_object_tests {
+  use woxi::interpret;
+
+  #[test]
+  fn date_object_input() {
+    assert_eq!(
+      interpret("JulianDate[DateObject[{2023, 2, 24, 12, 0, 0}]]").unwrap(),
+      "2.46*^6"
+    );
+    assert_eq!(
+      interpret("JulianDate[DateObject[{2023, 2, 24}]]").unwrap(),
+      "2.4599995*^6"
+    );
+    // Round-trips with FromJulianDate to the same instant.
+    assert_eq!(
+      interpret(
+        "FromJulianDate[JulianDate[DateObject[{2023, 2, 24, 6, 30, 15}]]]"
+      )
+      .unwrap(),
+      "DateObject[{2023, 2, 24, 6, 30, 15.000012516975403}, Instant, Gregorian, 0.]"
+    );
+  }
+}
+
+mod time_zone_convert_tests {
+  use woxi::interpret;
+
+  // DST-aware conversion between named IANA zones and numeric offsets.
+  // All values verified against wolframscript.
+  #[test]
+  #[cfg(not(target_arch = "wasm32"))]
+  fn conversions() {
+    assert_eq!(
+      interpret(
+        r#"TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 0}, TimeZone -> "America/New_York"], "Europe/Berlin"]"#
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 1, 18, 0, 0}, Instant, Gregorian, Europe/Berlin]"
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneConvert[DateObject[{2020, 7, 1, 12, 0, 0}, TimeZone -> "America/New_York"], "Europe/Berlin"]"#
+      )
+      .unwrap(),
+      "DateObject[{2020, 7, 1, 18, 0, 0}, Instant, Gregorian, Europe/Berlin]"
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 0}, TimeZone -> "America/New_York"], 1]"#
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 1, 18, 0, 0}, Instant, Gregorian, 1.]"
+    );
+    assert_eq!(
+      interpret(
+        "TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 0}, TimeZone -> 3], -2]"
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 1, 7, 0, 0}, Instant, Gregorian, -2.]"
+    );
+    // Day rollover across the zone shift.
+    assert_eq!(
+      interpret(
+        "TimeZoneConvert[DateObject[{2020, 1, 1, 23, 30, 0}, TimeZone -> 0], 2]"
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 2, 1, 30, 0}, Instant, Gregorian, 2.]"
+    );
+    // Real seconds keep their type; day-granularity dates only relabel.
+    assert_eq!(
+      interpret(
+        "TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 30.5}, TimeZone -> 0], 1]"
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 1, 13, 0, 30.5}, Instant, Gregorian, 1.]"
+    );
+    assert_eq!(
+      interpret(
+        r#"TimeZoneConvert[DateObject[{2020, 1, 1}], "Europe/Berlin"]"#
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 1}, Day, Gregorian, Europe/Berlin]"
+    );
+    // One-argument form converts to $TimeZone (0.).
+    assert_eq!(
+      interpret(
+        "TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 0}, TimeZone -> 0]]"
+      )
+      .unwrap(),
+      "DateObject[{2020, 1, 1, 12, 0, 0}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  // Non-DateObject arguments emit `nodobj`, unknown zone names emit
+  // `DateObject::zone`, and zero arguments emit `argt`.
+  #[test]
+  #[cfg(not(target_arch = "wasm32"))]
+  fn message_cases() {
+    let r =
+      woxi::interpret_with_stdout(r#"TimeZoneConvert[5, "Europe/Berlin"]"#)
+        .unwrap();
+    assert_eq!(r.result, "TimeZoneConvert[5, Europe/Berlin]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "TimeZoneConvert::nodobj: First argument 5 in TimeZoneConvert is not a DateObject."
+    )));
+
+    let r = woxi::interpret_with_stdout(
+      r#"TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 0}, TimeZone -> 0], "Nowhere/Nothing"]"#,
+    )
+    .unwrap();
+    assert_eq!(
+      r.result,
+      "TimeZoneConvert[DateObject[{2020, 1, 1, 12, 0, 0}, TimeZone -> 0], Nowhere/Nothing]"
+    );
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "DateObject::zone: Time zone specification Nowhere/Nothing should be a real number, integer or time zone string."
+    )));
+
+    let r = woxi::interpret_with_stdout("TimeZoneConvert[]").unwrap();
+    assert_eq!(r.result, "TimeZoneConvert[]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "TimeZoneConvert::argt: TimeZoneConvert called with 0 arguments; 1 or 2 arguments are expected."
+    )));
+  }
+}
+
+mod date_select_tests {
+  use super::*;
+
+  #[test]
+  fn list_form_filters_by_criterion() {
+    assert_eq!(
+      interpret(
+        "DateSelect[{DateObject[{2020, 1, 1}], DateObject[{2020, 6, 15}], \
+         DateObject[{2021, 3, 1}]}, DateValue[#, \"Year\"] == 2020 &]"
+      )
+      .unwrap(),
+      "{DateObject[{2020, 1, 1}, Day], DateObject[{2020, 6, 15}, Day]}"
+    );
+    // Weekday criterion: 2020-01-01 was a Wednesday.
+    assert_eq!(
+      interpret(
+        "DateSelect[{DateObject[{2020, 1, 1}], DateObject[{2020, 1, 2}], \
+         DateObject[{2020, 1, 3}]}, #[\"DayName\"] == Wednesday &]"
+      )
+      .unwrap(),
+      "{DateObject[{2020, 1, 1}, Day]}"
+    );
+  }
+
+  #[test]
+  fn interval_form_enumerates_days() {
+    assert_eq!(
+      interpret(
+        "DateSelect[DateInterval[{{2020, 1, 1}, {2020, 1, 5}}], \
+         DateValue[#, \"Day\"] < 3 &]"
+      )
+      .unwrap(),
+      "{DateObject[{2020, 1, 1}, Day], DateObject[{2020, 1, 2}, Day]}"
+    );
+    // Mondays in the first ten days of March 2020: the 2nd and the 9th.
+    assert_eq!(
+      interpret(
+        "DateSelect[DateInterval[{{2020, 3, 1}, {2020, 3, 10}}], \
+         #[\"DayName\"] == Monday &]"
+      )
+      .unwrap(),
+      "{DateObject[{2020, 3, 2}, Day], DateObject[{2020, 3, 9}, Day]}"
+    );
+  }
+
+  #[test]
+  fn behaves_like_select_on_plain_lists() {
+    // With a plain list DateSelect is exactly Select.
+    assert_eq!(
+      interpret("DateSelect[{1, 2, 3}, # > 1 &]").unwrap(),
+      "{2, 3}"
+    );
+    // A criterion matching nothing returns the empty list.
+    assert_eq!(
+      interpret(
+        "DateSelect[{DateObject[{2020, 1, 1}]}, DateValue[#, \"Year\"] == 2099 &]"
+      )
+      .unwrap(),
+      "{}"
+    );
+  }
+}
+
+mod calendar_convert {
+  use super::*;
+
+  // Gregorian → Julian: the Julian calendar runs 13 days behind Gregorian in
+  // the 1900–2099 window (12/13-day offset in earlier centuries).
+  #[test]
+  fn gregorian_to_julian_modern() {
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{2024, 3, 14}], \"Julian\"]")
+        .unwrap(),
+      "DateObject[{2024, 3, 1}, Day, Julian]"
+    );
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{2000, 1, 1}], \"Julian\"]")
+        .unwrap(),
+      "DateObject[{1999, 12, 19}, Day, Julian]"
+    );
+  }
+
+  // The offset differs across century boundaries because Julian has no
+  // century leap-year exception.
+  #[test]
+  fn gregorian_to_julian_across_centuries() {
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{1900, 3, 1}], \"Julian\"]")
+        .unwrap(),
+      "DateObject[{1900, 2, 17}, Day, Julian]"
+    );
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{2100, 3, 1}], \"Julian\"]")
+        .unwrap(),
+      "DateObject[{2100, 2, 16}, Day, Julian]"
+    );
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{1, 1, 1}], \"Julian\"]").unwrap(),
+      "DateObject[{1, 1, 3}, Day, Julian]"
+    );
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{1582, 10, 15}], \"Julian\"]")
+        .unwrap(),
+      "DateObject[{1582, 10, 5}, Day, Julian]"
+    );
+  }
+
+  // Converting to Gregorian from a (default) Gregorian source is the identity,
+  // dropping any calendar tag and reporting Day granularity.
+  #[test]
+  fn gregorian_identity() {
+    assert_eq!(
+      interpret("CalendarConvert[DateObject[{2024, 3, 14}], \"Gregorian\"]")
+        .unwrap(),
+      "DateObject[{2024, 3, 14}, Day]"
+    );
+  }
+
+  // A source already tagged with a non-Gregorian calendar is left
+  // unevaluated, matching wolframscript.
+  #[test]
+  fn non_gregorian_source_unevaluated() {
+    assert_eq!(
+      interpret(
+        "CalendarConvert[DateObject[{2024, 3, 14}, \"Julian\"], \"Gregorian\"]"
+      )
+      .unwrap(),
+      "CalendarConvert[DateObject[{2024, 3, 14}, Julian], Gregorian]"
+    );
+  }
+}
+
+mod from_date_string {
+  use super::*;
+
+  #[test]
+  fn iso_date() {
+    assert_eq!(
+      interpret(r#"FromDateString["2026-07-15"]"#).unwrap(),
+      "DateObject[{2026, 7, 15}, Day]"
+    );
+  }
+
+  #[test]
+  fn month_name_forms() {
+    assert_eq!(
+      interpret(r#"FromDateString["July 4, 1776"]"#).unwrap(),
+      "DateObject[{1776, 7, 4}, Day]"
+    );
+    assert_eq!(
+      interpret(r#"FromDateString["Jan 1 2000"]"#).unwrap(),
+      "DateObject[{2000, 1, 1}, Day]"
+    );
+    // Day-first ordering and ordinal day suffixes.
+    assert_eq!(
+      interpret(r#"FromDateString["4th July 1776"]"#).unwrap(),
+      "DateObject[{1776, 7, 4}, Day]"
+    );
+    assert_eq!(
+      interpret(r#"FromDateString["Jan 8th, 2022"]"#).unwrap(),
+      "DateObject[{2022, 1, 8}, Day]"
+    );
+  }
+
+  #[test]
+  fn datetime_and_year_granularity() {
+    assert_eq!(
+      interpret(r#"FromDateString["2026-07-15 14:30:00"]"#).unwrap(),
+      "DateObject[{2026, 7, 15, 14, 30, 0}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(r#"FromDateString["2026"]"#).unwrap(),
+      "DateObject[{2026}, Year]"
+    );
+  }
+
+  // DateObject now parses natural-language month-name strings too.
+  #[test]
+  fn date_object_parses_month_name() {
+    assert_eq!(
+      interpret(r#"DateObject["July 4, 1776"]"#).unwrap(),
+      "DateObject[{1776, 7, 4}, Day]"
+    );
+  }
+}
+
+mod date_time_ordering {
+  use woxi::interpret;
+
+  // DateObject / TimeObject support the ordering comparisons (< > <= >=) by
+  // comparing absolute time / time-of-day.
+  #[test]
+  fn date_object_ordering() {
+    assert_eq!(
+      interpret("DateObject[{2026, 1, 1}] < DateObject[{2026, 6, 1}]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 6, 1}] > DateObject[{2026, 1, 1}]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 6, 1}] < DateObject[{2026, 1, 1}]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("DateObject[{2026, 1, 1}] <= DateObject[{2026, 1, 1}]")
+        .unwrap(),
+      "True"
+    );
+    // Sub-day resolution via time components.
+    assert_eq!(
+      interpret(
+        "DateObject[{2026, 1, 1, 10, 30, 0}] < DateObject[{2026, 1, 1, 14, 0, 0}]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn time_object_ordering() {
+    assert_eq!(
+      interpret("TimeObject[{10, 0, 0}] < TimeObject[{14, 0, 0}]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("TimeObject[{14, 0, 0}] <= TimeObject[{10, 0, 0}]").unwrap(),
+      "False"
+    );
+  }
+}
+
+// Week-based, quarter-name and initial-letter date elements. An element name
+// Woxi does not know is emitted literally, so a missing one silently produced
+// its own name instead of a date component.
+mod week_and_name_date_elements {
+  use super::*;
+
+  #[test]
+  fn iso_week_date() {
+    // The last days of a year can belong to week 1 of the next ISO year.
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"ISOWeekDate\"]").unwrap(),
+      "2025-W01-2"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 1, 5}, \"ISOWeekDate\"]").unwrap(),
+      "2024-W01-5"
+    );
+    // …and the first days of a year to the last week of the previous one.
+    assert_eq!(
+      interpret("DateString[{2023, 1, 1}, \"ISOWeekDate\"]").unwrap(),
+      "2022-W52-7"
+    );
+    assert_eq!(
+      interpret("DateString[{2021, 1, 3}, \"ISOWeekDate\"]").unwrap(),
+      "2020-W53-7"
+    );
+    assert_eq!(
+      interpret("DateString[{2019, 12, 30}, \"ISOWeekDate\"]").unwrap(),
+      "2020-W01-1"
+    );
+  }
+
+  #[test]
+  fn week_numbers_and_iso_year() {
+    // Both week forms are the zero-padded ISO week number.
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"Week\"]").unwrap(),
+      "01"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"WeekShort\"]").unwrap(),
+      "01"
+    );
+    assert_eq!(
+      interpret("DateString[{2020, 12, 31}, \"Week\"]").unwrap(),
+      "53"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 6, 15}, \"Week\"]").unwrap(),
+      "24"
+    );
+    // "ISOYear" is the calendar year, not the ISO week-numbering one.
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"ISOYear\"]").unwrap(),
+      "2024"
+    );
+    assert_eq!(
+      interpret("DateString[{2023, 1, 1}, \"ISOYear\"]").unwrap(),
+      "2023"
+    );
+  }
+
+  #[test]
+  fn quarter_names_and_initials() {
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"QuarterName\"]").unwrap(),
+      "Quarter 4"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 1, 5}, \"QuarterNameShort\"]").unwrap(),
+      "Q1"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"MonthNameInitial\"]").unwrap(),
+      "D"
+    );
+    // 2024-12-31 was a Tuesday, 2024-01-05 a Friday.
+    assert_eq!(
+      interpret("DateString[{2024, 12, 31}, \"DayNameInitial\"]").unwrap(),
+      "T"
+    );
+    assert_eq!(
+      interpret("DateString[{2024, 1, 5}, \"DayNameInitial\"]").unwrap(),
+      "F"
+    );
+  }
+
+  #[test]
+  fn the_elements_compose_in_a_list_spec() {
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 12, 31}, \
+         {\"ISOWeekDate\", \" \", \"QuarterNameShort\"}]"
+      )
+      .unwrap(),
+      "2025-W01-2 Q4"
+    );
+    assert_eq!(
+      interpret(
+        "DateString[{2024, 1, 5}, {\"MonthNameInitial\", \"DayNameInitial\"}]"
+      )
+      .unwrap(),
+      "JF"
+    );
+  }
+
+  // DateValue returns typed components: an unpadded integer week, strings for
+  // the names.
+  #[test]
+  fn date_value_components() {
+    assert_eq!(
+      interpret("DateValue[{2024, 12, 31}, \"WeekShort\"]").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret("DateValue[{2023, 1, 1}, \"WeekShort\"]").unwrap(),
+      "52"
+    );
+    assert_eq!(
+      interpret("DateValue[{2024, 12, 31}, \"QuarterName\"]").unwrap(),
+      "Quarter 4"
+    );
+    assert_eq!(
+      interpret("DateValue[{2024, 12, 31}, \"QuarterNameShort\"]").unwrap(),
+      "Q4"
+    );
+    assert_eq!(
+      interpret("DateValue[{2024, 12, 31}, \"MonthNameInitial\"]").unwrap(),
+      "D"
+    );
+    assert_eq!(
+      interpret("DateValue[{2019, 12, 30}, \"DayNameInitial\"]").unwrap(),
+      "M"
+    );
+  }
+}
+
+// A DateObject's granularity says which components it keeps: a "Month" object
+// is the whole month, so it holds only a year and a month.
+mod date_object_granularity {
+  use super::*;
+
+  #[test]
+  fn the_component_list_is_truncated() {
+    // Regression: the full list was kept, so a coarse DateObject still
+    // pointed at one instant.
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13, 5, 7}, \"Year\"]").unwrap(),
+      "DateObject[{2024}, Year]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13, 5, 7}, \"Month\"]").unwrap(),
+      "DateObject[{2024, 2}, Month]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13, 5, 7}, \"Day\"]").unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+    // The sub-day granularities also carry the calendar and UTC offset.
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13, 5, 7}, \"Hour\"]").unwrap(),
+      "DateObject[{2024, 2, 29, 13}, Hour, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13, 5, 7}, \"Minute\"]").unwrap(),
+      "DateObject[{2024, 2, 29, 13, 5}, Minute, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13, 5, 7}, \"Instant\"]").unwrap(),
+      "DateObject[{2024, 2, 29, 13, 5, 7}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  #[test]
+  fn a_short_list_is_padded() {
+    // Days and months count from 1, the clock parts from 0.
+    assert_eq!(
+      interpret("DateObject[{2024}, \"Day\"]").unwrap(),
+      "DateObject[{2024, 1, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2}, \"Day\"]").unwrap(),
+      "DateObject[{2024, 2, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29}, \"Hour\"]").unwrap(),
+      "DateObject[{2024, 2, 29, 0}, Hour, Gregorian, 0.]"
+    );
+    // The list form is unchanged.
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29}]").unwrap(),
+      "DateObject[{2024, 2, 29}, Day]"
+    );
+    // …and so is the date the object stands for.
+    assert_eq!(
+      interpret("DateList[DateObject[{2024, 2, 29}, \"Month\"]]").unwrap(),
+      "{2024, 2, 1, 0, 0, 0.}"
+    );
+  }
+
+  #[test]
+  fn the_granularity_can_be_read_back() {
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29}][\"Granularity\"]").unwrap(),
+      "Day"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29}, \"Month\"][\"Granularity\"]")
+        .unwrap(),
+      "Month"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29, 13}][\"Granularity\"]").unwrap(),
+      "Hour"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024}][\"Granularity\"]").unwrap(),
+      "Year"
+    );
+    // The other properties still resolve.
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29}][\"DayName\"]").unwrap(),
+      "Thursday"
+    );
+    assert_eq!(
+      interpret("DateObject[{2024, 2, 29}][\"Year\"]").unwrap(),
+      "2024"
+    );
+  }
+
+  #[test]
+  fn time_objects_report_their_components() {
+    assert_eq!(interpret("TimeObject[{13, 5, 0}][\"Hour\"]").unwrap(), "13");
+    assert_eq!(
+      interpret("TimeObject[{13, 5, 0}][\"Minute\"]").unwrap(),
+      "5"
+    );
+    assert_eq!(
+      interpret("TimeObject[{13, 5, 7}][\"Second\"]").unwrap(),
+      "7"
+    );
+    assert_eq!(
+      interpret("TimeObject[{13, 5, 0}][\"Granularity\"]").unwrap(),
+      "Instant"
+    );
+  }
+
+  // Containment follows from the granularity: a date is within the year, month
+  // or day its object covers.
+  #[test]
+  fn containment_uses_the_covered_period() {
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2024, 1, 1}, \"Year\"], \
+         DateObject[{2024, 5, 1}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2024, 1, 1}, \"Year\"], \
+         DateObject[{2025, 5, 1}]]"
+      )
+      .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret(
+        "DateWithinQ[DateObject[{2024, 1, 1}, \"Month\"], \
+         DateObject[{2024, 1, 15}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateObject[{2024, 1, 1}, \"Month\"], \
+         DateObject[{2024, 1, 15}]]"
+      )
+      .unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret(
+        "DateOverlapsQ[DateObject[{2024, 1, 1}, \"Year\"], \
+         DateObject[{2024, 6, 1}, \"Month\"]]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  // DateBounds of one object is the period it covers, ending where the next
+  // one starts.
+  #[test]
+  fn bounds_of_a_single_object() {
+    assert_eq!(
+      interpret("DateBounds[DateObject[{2024, 1, 1}, \"Year\"]]").unwrap(),
+      "{DateObject[{2024, 1, 1, 0, 0, 0.}, Instant, Gregorian, None], \
+       DateObject[{2025, 1, 1, 0, 0, 0.}, Instant, Gregorian, None]}"
+    );
+    assert_eq!(
+      interpret("DateBounds[DateObject[{2024, 12}, \"Month\"]]").unwrap(),
+      "{DateObject[{2024, 12, 1, 0, 0, 0.}, Instant, Gregorian, None], \
+       DateObject[{2025, 1, 1, 0, 0, 0.}, Instant, Gregorian, None]}"
+    );
+    assert_eq!(
+      interpret("DateBounds[DateObject[{2024, 2, 29, 13}, \"Hour\"]]").unwrap(),
+      "{DateObject[{2024, 2, 29, 13, 0, 0.}, Instant, Gregorian, 0.], \
+       DateObject[{2024, 2, 29, 14, 0, 0.}, Instant, Gregorian, 0.]}"
+    );
+    // The list form still reports the earliest and latest date.
+    assert_eq!(
+      interpret("DateBounds[{{2024, 1, 1}, {2024, 3, 1}}]").unwrap(),
+      "{{2024, 1, 1}, {2024, 3, 1}}"
+    );
+  }
+}
+
+/// A `DateObject` is itself a date specification, so `DateObject[date,
+/// granularity]` re-tags one: `DateObject[Now, "Hour"]` is the hour `Now`
+/// falls in — the key a package memoising once an hour caches on. The
+/// calendar and offset travel with the date; a date that carries neither
+/// only grows them when the new granularity is fine enough to need them.
+/// Verified against wolframscript.
+mod retagging_an_existing_date {
+  use super::*;
+
+  const INSTANT: &str = "DateObject[{2026, 9, 8, 10, 14, 50.5}]";
+
+  #[test]
+  fn a_coarser_granularity_truncates_the_components() {
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Hour\"]")).unwrap(),
+      "DateObject[{2026, 9, 8, 10}, Hour, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Minute\"]")).unwrap(),
+      "DateObject[{2026, 9, 8, 10, 14}, Minute, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Day\"]")).unwrap(),
+      "DateObject[{2026, 9, 8}, Day, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Month\"]")).unwrap(),
+      "DateObject[{2026, 9}, Month, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Year\"]")).unwrap(),
+      "DateObject[{2026}, Year, Gregorian, 0.]"
+    );
+  }
+
+  /// `"Second"` drops the fraction that `"Instant"` keeps.
+  #[test]
+  fn second_and_instant_differ_in_the_fraction() {
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Second\"]")).unwrap(),
+      "DateObject[{2026, 9, 8, 10, 14, 50}, Second, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}, \"Instant\"]")).unwrap(),
+      "DateObject[{2026, 9, 8, 10, 14, 50.5}, Instant, Gregorian, 0.]"
+    );
+  }
+
+  /// A month has no calendar or offset of its own; refining it to an hour
+  /// pads the components and gives the offset as `None`.
+  #[test]
+  fn refining_a_coarse_date_pads_it() {
+    assert_eq!(
+      interpret("DateObject[DateObject[{2026, 9}], \"Day\"]").unwrap(),
+      "DateObject[{2026, 9, 1}, Day]"
+    );
+    assert_eq!(
+      interpret("DateObject[DateObject[{2026, 9}], \"Hour\"]").unwrap(),
+      "DateObject[{2026, 9, 1, 0}, Hour, Gregorian, None]"
+    );
+  }
+
+  #[test]
+  fn a_date_alone_is_returned_unchanged() {
+    assert_eq!(
+      interpret(&format!("DateObject[{INSTANT}]")).unwrap(),
+      "DateObject[{2026, 9, 8, 10, 14, 50.5}, Instant, Gregorian, 0.]"
+    );
+    assert_eq!(
+      interpret(&format!("DateObjectQ[DateObject[{INSTANT}, \"Hour\"]]"))
+        .unwrap(),
+      "True"
+    );
+  }
+
+  /// Two dates re-tagged to the same hour are the same date — this is what
+  /// makes the memoisation idiom `cache[expr, DateObject[Now, "Hour"]]`
+  /// find its entry on the second call instead of recomputing.
+  #[test]
+  fn the_same_hour_compares_equal() {
+    assert_eq!(
+      interpret("DateObject[Now, \"Hour\"] == DateObject[Now, \"Hour\"]")
+        .unwrap(),
+      "True"
+    );
+  }
+}

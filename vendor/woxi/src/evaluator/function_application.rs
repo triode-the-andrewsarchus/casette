@@ -1,0 +1,3044 @@
+#[allow(unused_imports)]
+use super::*;
+
+/// MapAll[f, expr] - apply f to every subexpression in expr (bottom-up)
+pub fn map_all_ast(f: &Expr, expr: &Expr) -> Result<Expr, InterpreterError> {
+  // First, recursively apply to subexpressions
+  let mapped = match expr {
+    Expr::FunctionCall { name, args } => {
+      // Map over the arguments
+      let new_args: Vec<Expr> = args
+        .iter()
+        .map(|a| map_all_ast(f, a))
+        .collect::<Result<Vec<_>, _>>()?;
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args.into(),
+      }
+    }
+    Expr::List(items) => {
+      let new_items: Vec<Expr> = items
+        .iter()
+        .map(|a| map_all_ast(f, a))
+        .collect::<Result<Vec<_>, _>>()?;
+      Expr::List(new_items.into())
+    }
+    // Atoms: just return as-is (will be wrapped by f below)
+    _ => expr.clone(),
+  };
+
+  // Then apply f to the result
+  apply_function_to_arg(f, &mapped)
+}
+
+/// AST-based Distribute implementation
+/// Distribute[f[x1, x2, ...]] distributes f over Plus in the xi
+/// Distribute[expr, g] distributes over g instead of Plus
+/// Distribute[expr, g, f] only distributes if outer head is f
+pub fn distribute_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let expr = &args[0];
+
+  // Determine the inner head to distribute over (default: Plus/addition)
+  let distribute_over = if args.len() >= 2 {
+    match &args[1] {
+      Expr::Identifier(name) => name.clone(),
+      _ => "Plus".to_string(),
+    }
+  } else {
+    "Plus".to_string()
+  };
+
+  // Get the outer function call (or List)
+  let (outer_name, outer_args) = match expr {
+    Expr::FunctionCall { name, args } => (name.clone(), args.clone()),
+    Expr::List(items) => ("List".to_string(), items.clone()),
+    _ => {
+      // Not a function call - return as-is
+      return Ok(expr.clone());
+    }
+  };
+
+  // If 3 args provided, check that outer head matches
+  if args.len() == 3 {
+    let required_head = match &args[2] {
+      Expr::Identifier(name) => name.clone(),
+      _ => {
+        return Ok(unevaluated("Distribute", args));
+      }
+    };
+    if outer_name != required_head {
+      return Ok(expr.clone());
+    }
+  }
+
+  // Split each argument into its parts based on distribute_over head
+  let mut arg_lists: Vec<Vec<Expr>> = Vec::new();
+  for arg in &outer_args {
+    let parts = split_by_head(arg, &distribute_over);
+    arg_lists.push(parts);
+  }
+
+  // Compute cartesian product
+  let mut combinations: Vec<Vec<Expr>> = vec![vec![]];
+  for parts in &arg_lists {
+    let mut new_combinations = Vec::new();
+    for combo in &combinations {
+      for part in parts {
+        let mut new_combo = combo.clone();
+        new_combo.push(part.clone());
+        new_combinations.push(new_combo);
+      }
+    }
+    combinations = new_combinations;
+  }
+
+  // Build result: wrap each combination in outer_name, then combine with distribute_over
+  let terms: Vec<Expr> = combinations
+    .into_iter()
+    .map(|combo| {
+      if outer_name == "List" {
+        Expr::List(combo.into())
+      } else {
+        Expr::FunctionCall {
+          name: outer_name.clone(),
+          args: combo.into(),
+        }
+      }
+    })
+    .collect();
+
+  let result = if distribute_over == "List" {
+    Expr::List(terms.into())
+  } else {
+    Expr::FunctionCall {
+      name: distribute_over,
+      args: terms.into(),
+    }
+  };
+
+  evaluate_expr_to_expr(&result)
+}
+
+/// Largest slot index `n` referenced by `#n`/`##n` in `expr`. Returns 0 when
+/// the body uses no slots. SlotSequence `##` (== `##1`) counts as slot 1.
+/// The name of one `Compile` argument spec and whether its declared element
+/// type is `_Real`. A bare name (`x`) defaults to `_Real`, matching the
+/// Wolfram Language — unless `body` uses it as a repetition count
+/// (`NestList[…, x]`, a bare `{x}` iterator), in which case real Compile's
+/// usage-based type inference settles on `_Integer` instead, the same as an
+/// explicit `{s, _Integer, 0}` spec.
+fn compile_arg_spec(spec: &Expr, body: &Expr) -> Option<(String, bool)> {
+  match spec {
+    Expr::Identifier(name) => {
+      let real = !compile_param_used_as_integer_count(name, body);
+      Some((name.clone(), real))
+    }
+    Expr::List(items) if !items.is_empty() => {
+      let Expr::Identifier(name) = &items[0] else {
+        return None;
+      };
+      let real = match items.get(1) {
+        Some(Expr::Pattern { head, .. }) => head.as_deref() != Some("Integer"),
+        // No declared type — infer from usage, defaulting to `_Real`.
+        _ => !compile_param_used_as_integer_count(name, body),
+      };
+      Some((name.clone(), real))
+    }
+    _ => None,
+  }
+}
+
+/// The declared array rank of a `Compile` argument spec: 0 for a scalar
+/// position (a bare name, or `{name}`/`{name, _Type}`), or the explicit
+/// rank in `{name, _Type, rank}`.
+fn compile_spec_rank(spec: &Expr) -> usize {
+  match spec {
+    Expr::List(items) if items.len() >= 3 => match &items[2] {
+      Expr::Integer(n) if *n >= 0 => *n as usize,
+      _ => 0,
+    },
+    _ => 0,
+  }
+}
+
+/// The nesting depth of a rectangular list expression: 0 for a non-list
+/// value, otherwise 1 + the depth of its first element. `Compile`'s
+/// arguments are always rectangular arrays in practice, so checking just
+/// the first element (rather than every element) is enough.
+fn expr_array_depth(expr: &Expr) -> usize {
+  match expr {
+    Expr::List(items) => 1 + items.first().map_or(0, expr_array_depth),
+    _ => 0,
+  }
+}
+
+/// Whether `body` uses the bare parameter `name` in a fixed count
+/// *position* — the 3rd argument of `Nest`/`NestList`/`FixedPointList`, the
+/// 2nd of `Array`, or a bare `{name}` iterator spec in one of `Do`'s/
+/// `Table`'s/`Sum`'s/`Product`'s own iterator arguments (`Do[…, {name}]`).
+/// Compile infers such a parameter as `_Integer` even without an explicit
+/// type declaration, matching real Mathematica's usage-based inference.
+fn compile_param_used_as_integer_count(name: &str, expr: &Expr) -> bool {
+  match expr {
+    Expr::FunctionCall { name: fname, args } => {
+      // Each of these has a fixed count *position*, not just a trailing
+      // one: `FixedPointList[f, expr]` (2-arg) ends in `expr`, not a count,
+      // and `Array[f, n, r, …]`'s count `n` is always the 2nd argument,
+      // never the last once an index origin/head follows it. `NestWhile`/
+      // `NestWhileList` have no count argument at all in their base form
+      // (they iterate until `test` fails), so they are excluded entirely.
+      let is_count_position = match fname.as_str() {
+        // Nest[f, expr, n] / NestList[f, expr, n] — always exactly 3
+        // args, with the count last.
+        "Nest" | "NestList" if args.len() == 3 => {
+          matches!(args.last(), Some(Expr::Identifier(n)) if n == name)
+        }
+        // FixedPointList[f, expr, max] — only the 3-arg form has a count,
+        // and it is last.
+        "FixedPointList" if args.len() == 3 => {
+          matches!(args.last(), Some(Expr::Identifier(n)) if n == name)
+        }
+        // Array[f, n, …] — the count is always the 2nd argument.
+        "Array" if args.len() >= 2 => {
+          matches!(args.get(1), Some(Expr::Identifier(n)) if n == name)
+        }
+        // Do/Table/Sum/Product's iterator arguments (everything after the
+        // body/summand) may each be a bare `{name}` repetition-count spec
+        // — but only there: `name` appearing in a `{name}` list anywhere
+        // else (e.g. `Total[{x}]`, data rather than an iterator) is not a
+        // count.
+        "Do" | "Table" | "Sum" | "Product" if args.len() >= 2 => {
+          args[1..].iter().any(|it| {
+            matches!(it, Expr::List(items) if items.len() == 1
+              && matches!(items.first(), Some(Expr::Identifier(n)) if n == name))
+          })
+        }
+        _ => false,
+      };
+      if is_count_position {
+        return true;
+      }
+      args
+        .iter()
+        .any(|a| compile_param_used_as_integer_count(name, a))
+    }
+    Expr::List(items) => items
+      .iter()
+      .any(|it| compile_param_used_as_integer_count(name, it)),
+    Expr::BinaryOp { left, right, .. } => {
+      compile_param_used_as_integer_count(name, left)
+        || compile_param_used_as_integer_count(name, right)
+    }
+    Expr::UnaryOp { operand, .. } => {
+      compile_param_used_as_integer_count(name, operand)
+    }
+    Expr::CompoundExpr(items)
+    | Expr::Comparison {
+      operands: items, ..
+    } => items
+      .iter()
+      .any(|it| compile_param_used_as_integer_count(name, it)),
+    Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => {
+      compile_param_used_as_integer_count(name, pattern)
+        || compile_param_used_as_integer_count(name, replacement)
+    }
+    Expr::Part { expr, index } => {
+      compile_param_used_as_integer_count(name, expr)
+        || compile_param_used_as_integer_count(name, index)
+    }
+    Expr::Function { body } => compile_param_used_as_integer_count(name, body),
+    Expr::NamedFunction { body, .. } => {
+      compile_param_used_as_integer_count(name, body)
+    }
+    _ => false,
+  }
+}
+
+/// Convert exact numbers to machine reals, descending into lists so a
+/// rank-n `_Real` argument arrives numeric throughout — the sample grid a
+/// compiled Mandelbrot iteration is handed is full of exact rationals.
+fn coerce_to_real(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Integer(n) => Expr::Real(*n as f64),
+    Expr::BigInteger(n) => {
+      use std::str::FromStr;
+      Expr::Real(f64::from_str(&n.to_string()).unwrap_or(f64::NAN))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+        Expr::Real(*n as f64 / *d as f64)
+      } else {
+        expr.clone()
+      }
+    }
+    Expr::List(items) => {
+      Expr::List(items.iter().map(coerce_to_real).collect::<Vec<_>>().into())
+    }
+    other => other.clone(),
+  }
+}
+
+fn max_slot_index(expr: &Expr) -> usize {
+  fn walk(e: &Expr, max: &mut usize) {
+    match e {
+      Expr::Slot(n) | Expr::SlotSequence(n) if *n > *max => {
+        *max = *n;
+      }
+      Expr::List(items) => items.iter().for_each(|i| walk(i, max)),
+      Expr::FunctionCall { args, .. } => args.iter().for_each(|i| walk(i, max)),
+      Expr::BinaryOp { left, right, .. } => {
+        walk(left, max);
+        walk(right, max);
+      }
+      Expr::UnaryOp { operand, .. } => walk(operand, max),
+      Expr::Function { body } => walk(body, max),
+      Expr::NamedFunction { body, .. } => walk(body, max),
+      Expr::CurriedCall { func, args } => {
+        walk(func, max);
+        for i in args {
+          walk(i, max);
+        }
+      }
+      Expr::Rule {
+        pattern,
+        replacement,
+      }
+      | Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } => {
+        walk(pattern, max);
+        walk(replacement, max);
+      }
+      Expr::Association(items) => items.iter().for_each(|(k, v)| {
+        walk(k, max);
+        walk(v, max);
+      }),
+      Expr::CompoundExpr(items) => items.iter().for_each(|i| walk(i, max)),
+      _ => {}
+    }
+  }
+  let mut m = 0;
+  walk(expr, &mut m);
+  m
+}
+
+/// Emit Function::slot1 / Function::slota messages for named slots (`#key`)
+/// in an anonymous-function body that cannot be filled from `args`, matching
+/// wolframscript: one message per unfillable named-slot occurrence.
+fn emit_named_slot_messages(body: &Expr, args: &[Expr]) {
+  let mut keys = Vec::new();
+  crate::syntax::collect_named_slot_keys(body, &mut keys);
+  if keys.is_empty() {
+    return;
+  }
+  let body_str = crate::syntax::expr_to_message_form(body);
+  if let Some(Expr::Association(items)) = args.first() {
+    let assoc_str = crate::syntax::format_expr(
+      args.first().unwrap(),
+      crate::syntax::ExprForm::Output,
+    );
+    for key in keys {
+      let filled = items
+        .iter()
+        .any(|(k, _)| matches!(k, Expr::String(s) if s == &key));
+      if !filled {
+        crate::emit_message(&format!(
+          "Function::slota: Named slot {key} in {body_str} &  cannot be filled from {assoc_str}."
+        ));
+      }
+    }
+  } else {
+    let args_str: Vec<String> = args
+      .iter()
+      .map(crate::syntax::expr_to_message_form)
+      .collect();
+    for _ in keys {
+      crate::emit_message(&format!(
+        "Function::slot1: ({} & )[{}] is expected to have an Association as the first argument.",
+        body_str,
+        args_str.join(", ")
+      ));
+    }
+  }
+}
+
+/// Apply `Derivative[n1, …, nk]` to a pure function body symbolically.
+///
+/// For each slot index `i` with `n_i > 0` we substitute `Slot(i)` for a fresh
+/// dummy and try to factor the current expression as `c * dummy_i^p` where
+/// `c` is constant in `dummy_i`. If the factorisation succeeds we replace
+/// the `dummy_i^p` part with the wolframscript-style right-nested chain
+/// `p*((p-1)*…*dummy_i^(p-n_i))` (or `0` when `n_i > p`). When the body
+/// can't be peeled apart that way we fall back to `differentiate_expr`
+/// repeated `n_i` times, which yields the simplified derivative.
+///
+/// Returns `None` if a fallback differentiation step fails (e.g. unknown
+/// function head), letting the caller keep the unevaluated form.
+pub(crate) fn differentiate_function_body(
+  body: &Expr,
+  orders: &[i128],
+) -> Option<Expr> {
+  use crate::evaluator::dispatch::calculus_functions::{
+    build_var_power_derivative_chain, extract_var_power_factor,
+  };
+
+  // Every slot of the body gets a dummy — also those not differentiated —
+  // so the result's factors are ordered as the symbols order, the way
+  // wolframscript builds it (`Derivative[1][#2 Sin[#1] + Cos[#2] &]` is
+  // `#2*Cos[#1] &`), not as bare slots would.
+  let dummies: Vec<String> = (0..orders.len().max(max_slot_index(body)))
+    .map(|i| format!("__d_slot_{}__", i + 1))
+    .collect();
+  let dummy_exprs: Vec<Expr> = dummies
+    .iter()
+    .map(|d| Expr::Identifier(d.clone()))
+    .collect();
+  let mut current = crate::syntax::substitute_slots(body, &dummy_exprs);
+
+  for (i, &n_i) in orders.iter().enumerate() {
+    if n_i <= 0 {
+      continue;
+    }
+    let dummy = &dummies[i];
+    let dummy_expr = &dummy_exprs[i];
+    if let Some((factor, p)) = extract_var_power_factor(&current, dummy)
+      && let Some(chain) = build_var_power_derivative_chain(dummy_expr, p, n_i)
+    {
+      // Wolframscript keeps the literal `1` factor that appears when an
+      // earlier slot's chain reduced to `1` (e.g.
+      // `Derivative[1,2][#1*#2^3 &]` → `1*(3*(2*#2)) &`), so preserve `factor`
+      // even when it's `Integer(1)` — as long as it is an actual factor of a
+      // product, not the implicit one of a bare power
+      // (`Derivative[2][#^3 &]` → `3*(2*#1) &`).
+      let is_product = matches!(&current, Expr::FunctionCall { name, .. } if name == "Times")
+        || matches!(
+          &current,
+          Expr::BinaryOp {
+            op: BinaryOperator::Times,
+            ..
+          }
+        );
+      current = if matches!(chain, Expr::Integer(0)) {
+        Expr::Integer(0)
+      } else if matches!(factor, Expr::Integer(1)) && !is_product {
+        chain
+      } else {
+        times2(factor, chain)
+      };
+      continue;
+    }
+    for _ in 0..n_i {
+      current = match crate::functions::calculus_ast::differentiate_expr(
+        &current, dummy,
+      ) {
+        Ok(v) => v,
+        Err(_) => return None,
+      };
+    }
+  }
+
+  for (i, dummy) in dummies.iter().enumerate() {
+    current =
+      crate::syntax::substitute_variable(&current, dummy, &Expr::Slot(i + 1));
+  }
+  Some(current)
+}
+
+/// Apply `Derivative[n1, …, nk]` to a named-parameter pure function
+/// (`Function[{x1, …, xk}, body]`) symbolically. Mirrors
+/// `differentiate_function_body` above, but differentiates directly with
+/// respect to the function's own parameter names — no dummy/slot
+/// substitution is needed since the parameters are already unique
+/// identifiers naming their positions.
+fn differentiate_named_function_body(
+  body: &Expr,
+  params: &[String],
+  orders: &[i128],
+) -> Option<Expr> {
+  use crate::evaluator::dispatch::calculus_functions::{
+    build_var_power_derivative_chain, extract_var_power_factor,
+  };
+
+  let mut current = body.clone();
+
+  for (param, &n_i) in params.iter().zip(orders.iter()) {
+    if n_i <= 0 {
+      continue;
+    }
+    let var_expr = Expr::Identifier(param.clone());
+    if let Some((factor, p)) = extract_var_power_factor(&current, param)
+      && let Some(chain) = build_var_power_derivative_chain(&var_expr, p, n_i)
+    {
+      current = if matches!(chain, Expr::Integer(0)) {
+        Expr::Integer(0)
+      } else {
+        times2(factor, chain)
+      };
+      continue;
+    }
+    for _ in 0..n_i {
+      current = match crate::functions::calculus_ast::differentiate_expr(
+        &current, param,
+      ) {
+        Ok(v) => v,
+        Err(_) => return None,
+      };
+    }
+  }
+
+  Some(current)
+}
+
+/// Split an expression by its head. E.g., split_by_head(a + b, "Plus") = [a, b]
+fn split_by_head(expr: &Expr, head: &str) -> Vec<Expr> {
+  // Operators like `|` (Alternatives) or `+` (Plus) are stored as (possibly
+  // nested) BinaryOp nodes rather than FunctionCall nodes. Map the operator to
+  // its head name so Distribute can split e.g. `a | b | c` into {a, b, c}.
+  let binop_head = |op: &BinaryOperator| -> Option<&'static str> {
+    match op {
+      BinaryOperator::Plus => Some("Plus"),
+      BinaryOperator::Times => Some("Times"),
+      BinaryOperator::And => Some("And"),
+      BinaryOperator::Or => Some("Or"),
+      BinaryOperator::StringJoin => Some("StringJoin"),
+      BinaryOperator::Alternatives => Some("Alternatives"),
+      _ => None,
+    }
+  };
+  match expr {
+    Expr::FunctionCall { name, args } if name == head => args.to_vec(),
+    Expr::List(items) if head == "List" => items.to_vec(),
+    Expr::BinaryOp { op, left, right } if binop_head(op) == Some(head) => {
+      let mut parts = split_by_head(left, head);
+      parts.extend(split_by_head(right, head));
+      parts
+    }
+    _ => vec![expr.clone()],
+  }
+}
+
+/// Apply Map operation on AST (func /@ list)
+pub fn apply_map_ast(
+  func: &Expr,
+  list: &Expr,
+) -> Result<Expr, InterpreterError> {
+  match list {
+    Expr::List(items) => {
+      let results: Result<Vec<Expr>, _> = items
+        .iter()
+        .map(|item| apply_function_to_arg(func, item))
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    Expr::Association(items) => {
+      // Map over association applies function to values only
+      let results: Result<Vec<(Expr, Expr)>, InterpreterError> = items
+        .iter()
+        .map(|(key, val)| {
+          let new_val = apply_function_to_arg(func, val)?;
+          Ok((key.clone(), new_val))
+        })
+        .collect();
+      Ok(Expr::Association(results?))
+    }
+    // Any other expression maps over its arguments, keeping its head:
+    // `f /@ g[a, b]` is `g[f[a], f[b]]`, and an atom maps to itself.
+    // Delegating keeps the `/@` operator form and `Map[…]` from drifting.
+    _ => crate::functions::list_helpers_ast::map_ast(func, list),
+  }
+}
+
+/// Apply Apply operation on AST (func @@ list)
+pub fn apply_apply_ast(
+  func: &Expr,
+  list: &Expr,
+) -> Result<Expr, InterpreterError> {
+  // Delegate the "what are this expression's parts" question to the same
+  // helper the bracket form `Apply[f, list]` uses (`apply_ast` below), so a
+  // head this operator doesn't special-case itself — notably `Rule`/
+  // `RuleDelayed` (`f @@ (a -> b)` -> `f[a, b]`) and `Association` — still
+  // gets the same parts both forms agree are its children.
+  let items: crate::ExprList = if let Expr::Association(pairs) = list {
+    pairs.iter().map(|(_, v)| v.clone()).collect()
+  } else {
+    match crate::functions::list_helpers_ast::expr_children(list) {
+      Some(items) => items.into(),
+      // Atoms have no children; Apply on an atom returns the atom unchanged
+      None => return Ok(list.clone()),
+    }
+  };
+
+  // Apply converts List[a, b, c] to func[a, b, c]
+  match func {
+    Expr::Identifier(func_name) => {
+      // Resolve variable holding a function name: f = Plus; f @@ {1,2} → 3
+      let name = resolve_identifier_to_func_name(func_name)
+        .unwrap_or_else(|| func_name.clone());
+      // Build `name[items]` and evaluate it through the full pipeline so the
+      // new head's attributes govern argument evaluation: a non-holding head
+      // evaluates items the source head kept unevaluated
+      // (List @@ Hold[1 + 1] -> {2}), while a holding head leaves them
+      // untouched (Hold @@ Hold[1 + 1] -> Hold[1 + 1]).
+      evaluate_expr_to_expr(&Expr::FunctionCall { name, args: items })
+    }
+    Expr::Function { body } => {
+      // Anonymous function applied to a list
+      // For single-arg anonymous functions, apply to first element
+      if items.len() == 1 {
+        apply_function_to_arg(func, &items[0])
+      } else {
+        // Multiple args - substitute each slot
+        let substituted = crate::syntax::substitute_slots(body, &items);
+        evaluate_expr_to_expr(&substituted)
+      }
+    }
+    Expr::NamedFunction { params, body, .. } => {
+      // Named-parameter function applied to list items
+      let bindings: Vec<(&str, &Expr)> = params
+        .iter()
+        .zip(items.iter())
+        .map(|(p, a)| (p.as_str(), a))
+        .collect();
+      let substituted = crate::syntax::substitute_variables(body, &bindings);
+      evaluate_expr_to_expr(&substituted)
+    }
+    // Apply replaces the head of `list` with the whole `func`, whatever it
+    // is: `g[a] @@ {1, 2}` → `g[a][1, 2]`, `Composition[f, g] @@ {1, 2}` →
+    // `f[g[1, 2]]`. Build the curried application and evaluate it so
+    // applicable heads reduce while inert heads stay symbolic.
+    _ => apply_curried_call(func, &items),
+  }
+}
+
+/// Apply MapApply operation on AST (f @@@ {{a, b}, {c, d}} -> {f[a, b], f[c, d]})
+pub fn apply_map_apply_ast(
+  func: &Expr,
+  list: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let items = match list {
+    Expr::List(items) => items.clone(),
+    // `f @@@ expr` is `Apply[f, expr, {1}]`: it replaces the head of each
+    // element of any expression, not just of a list.
+    _ => {
+      return crate::functions::list_helpers_ast::apply_at_level_ast(
+        func,
+        list,
+        &Expr::List(vec![Expr::Integer(1)].into()),
+      );
+    }
+  };
+
+  // MapApply applies func to each sublist
+  let results: Result<Vec<Expr>, InterpreterError> = items
+    .iter()
+    .map(|item| apply_apply_ast(func, item))
+    .collect();
+
+  Ok(Expr::List(results?.into()))
+}
+
+/// Apply Postfix operation on AST (expr // func)
+pub fn apply_postfix_ast(
+  expr: &Expr,
+  func: &Expr,
+) -> Result<Expr, InterpreterError> {
+  // `expr // f` is `f[expr]`, so a `Sequence` argument spreads into f's
+  // arguments the way it would if the call had been written out.
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Sequence"
+    && let Expr::Identifier(head) = func
+  {
+    return evaluate_function_call_ast(
+      head,
+      &args.iter().cloned().collect::<Vec<_>>(),
+    );
+  }
+  apply_function_to_arg(func, expr)
+}
+
+/// Apply a function to an argument (helper for Map, Postfix, etc.)
+pub fn apply_function_to_arg(
+  func: &Expr,
+  arg: &Expr,
+) -> Result<Expr, InterpreterError> {
+  match func {
+    Expr::Identifier(name) => {
+      // Check if this identifier is a variable holding another function/value.
+      // The symbol is evaluated rather than its stored body applied as it
+      // stands: a delayed value (`tpl := tpl = StringTemplate[…]`, the
+      // memoization idiom) yields the function it computes, not the `Set`.
+      let resolved = ENV.with(|e| e.borrow().get(name).cloned());
+      match &resolved {
+        Some(StoredValue::ExprVal(expr)) if !matches!(expr, Expr::Identifier(n) if n == name) =>
+        {
+          let value = evaluate_expr_to_expr(func)?;
+          if !matches!(&value, Expr::Identifier(n) if n == name) {
+            return apply_function_to_arg(&value, arg);
+          }
+        }
+        _ => {}
+      }
+      // Resolve variable holding a function name: t = Flatten; t @ x → Flatten[x]
+      if let Some(resolved_name) = resolve_identifier_to_func_name(name) {
+        return evaluate_function_call_ast(
+          &resolved_name,
+          std::slice::from_ref(arg),
+        );
+      }
+      // Simple function name: f applied to arg
+      evaluate_function_call_ast(name, std::slice::from_ref(arg))
+    }
+    Expr::Function { body } => {
+      // Anonymous function: first substitute #0 with the whole function (to
+      // support recursion like If[#1<=1, 1, #1 #0[#1-1]]&), then substitute
+      // the remaining numeric slots with arg. Skip the self-substitution
+      // pass when #0 is absent — avoids a full tree clone per call.
+      emit_named_slot_messages(body, std::slice::from_ref(arg));
+      let substituted = if crate::syntax::contains_slot_zero(body) {
+        let self_substituted =
+          crate::syntax::substitute_slot_zero_with_self(body, func);
+        crate::syntax::substitute_slots(
+          &self_substituted,
+          std::slice::from_ref(arg),
+        )
+      } else {
+        crate::syntax::substitute_slots(body, std::slice::from_ref(arg))
+      };
+      evaluate_expr_to_expr(&substituted)
+    }
+    Expr::NamedFunction { params, body, .. } => {
+      // Named-parameter function: substitute params with arg
+      if params.len() > 1 {
+        // Too many parameters for a single argument — return unevaluated
+        crate::emit_message(&format!(
+          "Function::fpct: Too many parameters in {{{}}} to be filled from Function[{{{}}}, {}][{}].",
+          params.join(", "),
+          params.join(", "),
+          expr_to_string(body),
+          expr_to_string(arg),
+        ));
+        return Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: vec![arg.clone()],
+        });
+      }
+      let mut substituted = (**body).clone();
+      if let Some(param) = params.first() {
+        substituted =
+          crate::syntax::substitute_variable(&substituted, param, arg);
+      }
+      evaluate_expr_to_expr(&substituted)
+    }
+    Expr::FunctionCall { name, args } => {
+      // Operator forms that evaluate to an actual function: evaluate the head
+      // first, then apply the result. `FindSequenceFunction[seq]` becomes a
+      // pure function, so `FindSequenceFunction[seq][k]` must apply it rather
+      // than flatten to the (erroring) 2-arg `FindSequenceFunction[seq, k]`.
+      if name == "FindSequenceFunction" && args.len() == 1 {
+        let evaluated = evaluate_function_call_ast(name, args)?;
+        if !matches!(&evaluated, Expr::FunctionCall { name: n, .. } if n == name)
+        {
+          return apply_function_to_arg(&evaluated, arg);
+        }
+      }
+      // A `Function[params, body]` written as a FunctionCall (e.g. the named
+      // form `Function[i, body]`) must be *applied* to the argument — binding
+      // its parameters — not have the argument appended as another part.
+      // This is what makes `Function[i, body] /@ list` work (Map applies the
+      // function to each element).
+      if name == "Function" && args.len() >= 2 {
+        return apply_curried_call(func, std::slice::from_ref(arg));
+      }
+      // Composition[f, g, …][x] = f[g[…[x]]] and the left-to-right
+      // RightComposition variant. apply_curried_call already reduces these;
+      // without this, the generic fallback below would append the argument
+      // (producing the unreduced Composition[f, g, x]), so e.g.
+      // `Map[Length@*Union, …]` or `MaximalBy[…, Length@*Union]` failed.
+      if (name == "Composition" || name == "RightComposition")
+        && !args.is_empty()
+      {
+        return apply_curried_call(func, std::slice::from_ref(arg));
+      }
+      // MapAt[f, pos] / SubsetMap[f, pos] operator form: the applied
+      // expression goes in the middle.
+      if (name == "MapAt" || name == "SubsetMap") && args.len() == 2 {
+        let new_args = vec![args[0].clone(), arg.clone(), args[1].clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // Insert[elem, pos] operator form: prepend the applied expression
+      if name == "Insert" && args.len() == 2 {
+        let new_args = vec![arg.clone(), args[0].clone(), args[1].clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // Nest[f, n][x] -> Nest[f, x, n]: the applied expression goes in the
+      // middle (likewise NestList[f, n][x] -> NestList[f, x, n]).
+      if (name == "Nest" || name == "NestList") && args.len() == 2 {
+        let new_args = vec![args[0].clone(), arg.clone(), args[1].clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // Fold[f][list] -> Fold[f, list] (and likewise FoldList): the operator
+      // form appends the applied list after the accumulating function.
+      if (name == "Fold" || name == "FoldList") && args.len() == 1 {
+        let new_args = vec![args[0].clone(), arg.clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // NearestTo[x][data] -> Nearest[data, x] (operator form of Nearest),
+      // so `Map[NearestTo[x], lists]` finds the nearest in each list.
+      if name == "NearestTo" && (args.len() == 1 || args.len() == 2) {
+        let mut new_args = vec![arg.clone()];
+        new_args.extend(args.iter().cloned());
+        return evaluate_function_call_ast("Nearest", &new_args);
+      }
+      // Nearest[data] is a NearestFunction; applying it forwards to the direct
+      // form: Nearest[data][x] -> Nearest[data, x].
+      if name == "Nearest" && args.len() == 1 {
+        let mut new_args = args.to_vec();
+        new_args.push(arg.clone());
+        return evaluate_function_call_ast("Nearest", &new_args);
+      }
+      // Distribution operator forms: CDF[dist][x] -> CDF[dist, x], and the
+      // same for PDF / Quantile / InverseCDF / SurvivalFunction /
+      // HazardFunction. The applied argument is appended. Guarded so the head
+      // already holds a distribution object (a FunctionCall like
+      // NormalDistribution[0, 1]).
+      if matches!(
+        name.as_str(),
+        "CDF"
+          | "PDF"
+          | "Quantile"
+          | "InverseCDF"
+          | "SurvivalFunction"
+          | "HazardFunction"
+      ) && args.len() == 1
+        && matches!(&args[0], Expr::FunctionCall { .. })
+      {
+        let new_args = vec![args[0].clone(), arg.clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // LinearSolve[m][b] -> LinearSolve[m, b] (operator form).
+      if name == "LinearSolve"
+        && args.len() == 1
+        && matches!(&args[0], Expr::List(_))
+      {
+        let new_args = vec![args[0].clone(), arg.clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // Curried function: f[a] applied to b becomes f[a, b]
+      // Special case: operator forms where f[x][y] becomes f[y, x]
+      // (the applied argument becomes the first parameter)
+      if is_subject_first_operator(name)
+        && args.len() == 1
+        && operator_form_accepts_subject(name, arg)
+      {
+        // Operator form: prepend the argument instead of appending
+        let new_args = vec![arg.clone(), args[0].clone()];
+        evaluate_function_call_ast(name, &new_args)
+      } else {
+        // A composite head h[…] applied to an argument is a curried call
+        // h[…][arg] (e.g. `g[a] /@ {1, 2}` → {g[a][1], g[a][2]}), not the
+        // flattened h[…, arg]. apply_curried_call reduces operator heads
+        // (Composition, OperatorApplied, …) and leaves inert heads symbolic.
+        apply_curried_call(func, std::slice::from_ref(arg))
+      }
+    }
+    Expr::Association(_) => {
+      // An association used as a function is a key lookup: `assoc[key]`.
+      // Needed when an association is the function in Map etc.
+      // (`assoc /@ {k1, k2}` → {assoc[k1], assoc[k2]}). apply_curried_call
+      // already implements the lookup (and Missing[…] for absent keys).
+      apply_curried_call(func, std::slice::from_ref(arg))
+    }
+    Expr::CurriedCall { .. } => {
+      // A curried operator used as a mapping function, e.g.
+      // `Map[Curry[Power][2], list]` or `OperatorApplied[f][a] /@ list`.
+      // Route through apply_curried_call so a partially-applied curry
+      // operator fires once its final argument arrives, and any other
+      // curried head accumulates the extra argument.
+      apply_curried_call(func, std::slice::from_ref(arg))
+    }
+    // A compound arithmetic/relational head stays an inert curried call,
+    // e.g. `(f + g) @ x` → `(f + g)[x]`. Stringifying it would mistake
+    // "f + g" for a function name.
+    Expr::BinaryOp { .. } | Expr::UnaryOp { .. } | Expr::Comparison { .. } => {
+      Ok(Expr::CurriedCall {
+        func: Box::new(func.clone()),
+        args: vec![arg.clone()],
+      })
+    }
+    _ => {
+      // Fallback: create a function call expression
+      let func_str = expr_to_string(func);
+      if let Some(name) = func_str.strip_suffix('&') {
+        // It's an anonymous function like "#^2&"
+        let body = string_to_expr(name)?;
+        let substituted =
+          crate::syntax::substitute_slots(&body, std::slice::from_ref(arg));
+        evaluate_expr_to_expr(&substituted)
+      } else {
+        // Treat as a function name
+        evaluate_function_call_ast(&func_str, std::slice::from_ref(arg))
+      }
+    }
+  }
+}
+
+/// Parse a `Curry[...]` operator form — possibly mid-accumulation — into its
+/// target function `f`, the slot permutation, and any already-collected args.
+/// Returns `None` when `func` is not a Curry form.
+///
+/// The permutation is 1-indexed in application order: output position `i`
+/// receives the `perm[i]`-th argument supplied (so `arranged[i] =
+/// collected[perm[i] - 1]`). A bare `Curry[f]` reverses two arguments
+/// (`{2, 1}`); `Curry[f, n]` collects `n` arguments in order (`{1, …, n}`);
+/// `Curry[f, {p1, …}]` uses the explicit permutation.
+fn parse_curry_form(func: &Expr) -> Option<(Expr, Vec<usize>, Vec<Expr>)> {
+  let parse_base = |name: &str, cargs: &[Expr]| -> Option<(Expr, Vec<usize>)> {
+    match cargs.len() {
+      // A bare `Curry[f]` / `OperatorApplied[f]` reverses two arguments, but
+      // `CurryApplied[f]` (no count) does not curry — it stays inert.
+      1 if name == "CurryApplied" => None,
+      1 => Some((cargs[0].clone(), vec![2, 1])),
+      2 => {
+        let perm = match &cargs[1] {
+          Expr::Integer(n) if *n >= 1 => (1..=*n as usize).collect(),
+          Expr::List(items) if !items.is_empty() => {
+            let mut p = Vec::with_capacity(items.len());
+            for it in items {
+              match it {
+                Expr::Integer(k) if *k >= 1 => p.push(*k as usize),
+                _ => return None,
+              }
+            }
+            p
+          }
+          _ => return None,
+        };
+        Some((cargs[0].clone(), perm))
+      }
+      _ => None,
+    }
+  };
+  // `OperatorApplied` is the public-facing spelling of the same operator:
+  // `OperatorApplied[f]` reverses two args, `OperatorApplied[f, n]` collects n
+  // in order, `OperatorApplied[f, {perm}]` uses the explicit permutation.
+  let is_curry =
+    |n: &str| n == "Curry" || n == "OperatorApplied" || n == "CurryApplied";
+  match func {
+    Expr::FunctionCall { name, args } if is_curry(name) => {
+      parse_base(name, args).map(|(f, perm)| (f, perm, Vec::new()))
+    }
+    Expr::CurriedCall { func: inner, args } => match inner.as_ref() {
+      Expr::FunctionCall { name, args: cargs } if is_curry(name) => {
+        parse_base(name, cargs).map(|(f, perm)| (f, perm, args.clone()))
+      }
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// Handle application of a `Curry[...]` operator form to `new_args`.
+/// Returns `None` when `func` is not a Curry form (so normal dispatch runs).
+fn try_apply_curry(
+  func: &Expr,
+  new_args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  let (f, perm, acc) = parse_curry_form(func)?;
+  let n = perm.len();
+  let mut collected = acc;
+  collected.extend_from_slice(new_args);
+
+  if collected.len() < n {
+    // Not enough arguments yet: keep accumulating under the bare `Curry[…]`
+    // head (so `Head[Curry[f][a]]` stays `Curry[f]`).
+    let base = match func {
+      Expr::CurriedCall { func: inner, .. } => (**inner).clone(),
+      other => other.clone(),
+    };
+    return Some(Ok(Expr::CurriedCall {
+      func: Box::new(base),
+      args: collected,
+    }));
+  }
+
+  // Arrange the first `n` collected arguments by the permutation.
+  let mut head_args = Vec::with_capacity(n);
+  for &src in &perm {
+    if src < 1 || src > collected.len() {
+      // Out-of-range slot: leave unevaluated.
+      let base = match func {
+        Expr::CurriedCall { func: inner, .. } => (**inner).clone(),
+        other => other.clone(),
+      };
+      return Some(Ok(Expr::CurriedCall {
+        func: Box::new(base),
+        args: collected,
+      }));
+    }
+    head_args.push(collected[src - 1].clone());
+  }
+  let leftover = collected[n..].to_vec();
+
+  let applied = match apply_curried_call(&f, &head_args) {
+    Ok(e) => e,
+    Err(e) => return Some(Err(e)),
+  };
+  if leftover.is_empty() {
+    Some(Ok(applied))
+  } else {
+    Some(apply_curried_call(&applied, &leftover))
+  }
+}
+
+/// Apply a curried call: f[a][b, c] applies function result f[a] to args [b, c]
+/// Handle application of a `ReverseApplied[f]` / `ReverseApplied[f, n]`
+/// operator to `new_args`. `ReverseApplied[f]` reverses all supplied
+/// arguments (`ReverseApplied[f][x1, …, xn]` = `f[xn, …, x1]`); the `n` form
+/// reverses only the first `n`. Unlike Curry it does not accumulate — it
+/// fires on the first application with whatever arguments are given.
+fn try_apply_reverse_applied(
+  func: &Expr,
+  new_args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  let Expr::FunctionCall { name, args } = func else {
+    return None;
+  };
+  if name != "ReverseApplied" {
+    return None;
+  }
+  let (f, n) = match args.len() {
+    1 => (&args[0], None),
+    2 => match &args[1] {
+      Expr::Integer(k) if *k >= 0 => (&args[0], Some(*k as usize)),
+      _ => return None,
+    },
+    _ => return None,
+  };
+  let mut head_args = new_args.to_vec();
+  match n {
+    None => head_args.reverse(),
+    Some(n) => {
+      let k = n.min(head_args.len());
+      head_args[..k].reverse();
+    }
+  }
+  Some(apply_curried_call(f, &head_args))
+}
+
+/// Whether an operator form may fire on this subject. `Merge`'s only does on a
+/// list of associations or rules; anything else reports `Merge::list1` and
+/// stays a curried call, so `Merge[{<|a -> 1|>}][Total]` is not rewritten to
+/// `Merge[Total, {<|a -> 1|>}]`.
+fn operator_form_accepts_subject(name: &str, subject: &Expr) -> bool {
+  if name != "Merge" {
+    return true;
+  }
+  let is_rule =
+    |e: &Expr| matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. });
+  let is_assoc_like = |e: &Expr| {
+    matches!(e, Expr::Association(_))
+      || is_rule(e)
+      || matches!(e, Expr::List(items) if items.iter().all(&is_rule))
+  };
+  let accepted =
+    matches!(subject, Expr::List(items) if items.iter().all(is_assoc_like));
+  if !accepted {
+    crate::emit_message(&format!(
+      "Merge::list1: The argument {} is not a valid list of Associations or rules or lists of rules.",
+      expr_to_output(subject)
+    ));
+  }
+  accepted
+}
+
+/// Functions whose one-argument call is an operator form that takes the
+/// subject *first* once applied: `f[spec][expr]` is `f[expr, spec]`
+/// (`Select[EvenQ][list]` → `Select[list, EvenQ]`). Both application paths
+/// consult this one list so they cannot drift apart.
+fn is_subject_first_operator(name: &str) -> bool {
+  matches!(
+    name,
+    "ReplaceAll"
+      | "ReplaceRepeated"
+      | "StringStartsQ"
+      | "StringEndsQ"
+      | "StringContainsQ"
+      | "StringFreeQ"
+      | "StringMatchQ"
+      | "StringReplace"
+      | "StringCases"
+      | "StringPosition"
+      | "StringDelete"
+      | "SequenceReplace"
+      | "MemberQ"
+      | "Select"
+      | "SelectFirst"
+      | "AllTrue"
+      | "AnyTrue"
+      | "NoneTrue"
+      | "Discard"
+      | "KeyTake"
+      | "KeyDrop"
+      | "KeySelect"
+      | "KeySortBy"
+      | "Merge"
+      | "Lookup"
+      | "TakeLargest"
+      | "TakeSmallest"
+      | "SortBy"
+      | "OrderingBy"
+      | "GroupBy"
+      | "CountsBy"
+      | "MaximalBy"
+      | "MinimalBy"
+      | "Cases"
+      | "DeleteCases"
+      | "Position"
+      | "FreeQ"
+      | "MatchQ"
+      | "Count"
+      | "AllMatch"
+      | "AnyMatch"
+      | "FlattenAt"
+      | "Delete"
+      | "ReplacePart"
+      | "Extract"
+      | "Append"
+      | "Prepend"
+      | "FirstCase"
+      | "SubsetReplace"
+      | "ContainsAll"
+      | "ContainsAny"
+      | "ContainsNone"
+      | "ContainsOnly"
+      | "ContainsExactly"
+      | "GatherBy"
+      | "SplitBy"
+      | "DeleteDuplicatesBy"
+  )
+}
+
+/// `DateObject[…]["Granularity"]`, and the clock components of a
+/// `TimeObject[{h, m, s}, …]`. `None` for anything the caller should resolve
+/// through `DateValue` instead.
+fn date_object_tag_property(
+  head: &str,
+  obj_args: &[Expr],
+  property: &str,
+) -> Option<Expr> {
+  if property == "Granularity" {
+    return Some(match obj_args.get(1) {
+      Some(Expr::String(tag)) => Expr::String(tag.clone()),
+      // An untagged DateObject list is as fine-grained as its length.
+      _ => Expr::String(
+        match obj_args.first() {
+          Some(Expr::List(items)) => match items.len() {
+            1 => "Year",
+            2 => "Month",
+            3 => "Day",
+            4 => "Hour",
+            5 => "Minute",
+            _ => "Instant",
+          },
+          _ => return None,
+        }
+        .to_string(),
+      ),
+    });
+  }
+  if head != "TimeObject" {
+    return None;
+  }
+  let Some(Expr::List(components)) = obj_args.first() else {
+    return None;
+  };
+  let index = match property {
+    "Hour" => 0,
+    "Minute" => 1,
+    "Second" => 2,
+    _ => return None,
+  };
+  components.get(index).cloned()
+}
+
+/// Try to match `func[args...]` against a SubValue rule registered via
+/// `f[a][b] := …` (also deeper curried nestings like `f[a][b][c] := …`).
+/// Reconstructs the full curried call and matches it against each rule
+/// stored under the outermost head; on a match, substitutes the bindings
+/// into the body. `None` when there's no head to key on or no rule matches
+/// (the caller then falls back to preserving the call symbolically).
+fn try_sub_value_curried_match(
+  func: &Expr,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  let outer_head = {
+    let mut inner: &Expr = func;
+    loop {
+      match inner {
+        Expr::CurriedCall { func: f2, .. } => inner = f2.as_ref(),
+        Expr::FunctionCall { name, .. } => break Some(name.clone()),
+        _ => break None,
+      }
+    }
+  };
+  let head = outer_head?;
+  let rules = crate::evaluator::assignment::SUB_VALUES
+    .with(|m| m.borrow().get(&head).cloned())?;
+  let actual = Expr::CurriedCall {
+    func: Box::new(func.clone()),
+    args: args.to_vec(),
+  };
+  for (lhs, body) in &rules {
+    if let Some(bindings) =
+      crate::evaluator::pattern_matching::match_pattern(&actual, lhs)
+    {
+      return Some(crate::evaluator::pattern_matching::apply_bindings(
+        body, &bindings,
+      ));
+    }
+  }
+  None
+}
+
+/// Nest `funcs` around `args` in the order given and evaluate the result.
+///
+/// `Composition[f, g][x]` is the *expression* `f[g[x]]`, so it is assembled
+/// whole and evaluated once: applying the functions one at a time would
+/// evaluate `g[x]` before `f`'s hold attributes could reach it, and WLX's
+/// `ToExpression[…, InputForm, FakeHold @* ToString]` depends on the
+/// `ToString` staying unevaluated inside the `HoldAll` `FakeHold`.
+fn compose_and_evaluate<'a>(
+  funcs: impl Iterator<Item = &'a Expr>,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let mut built: Vec<Expr> = args.to_vec();
+  for func in funcs {
+    built = vec![crate::evaluator::pattern_matching::rebuild_call_with_head(
+      func.clone(),
+      built,
+    )];
+  }
+  crate::evaluator::evaluate_expr_to_expr(&built[0])
+}
+
+pub fn apply_curried_call(
+  func: &Expr,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if let Some(result) = try_apply_curry(func, args) {
+    return result;
+  }
+  if let Some(result) = try_apply_reverse_applied(func, args) {
+    return result;
+  }
+  match func {
+    Expr::Identifier(name) => {
+      // Simple function name applied to args
+      evaluate_function_call_ast(name, args)
+    }
+    Expr::Function { body } => {
+      // Anonymous function: substitute #0 with the whole function first,
+      // then # with args and evaluate. Skip the self-substitution pass
+      // when #0 is absent — avoids a full tree clone per call.
+      emit_named_slot_messages(body, args);
+      let substituted = if crate::syntax::contains_slot_zero(body) {
+        let self_substituted =
+          crate::syntax::substitute_slot_zero_with_self(body, func);
+        crate::syntax::substitute_slots(&self_substituted, args)
+      } else {
+        crate::syntax::substitute_slots(body, args)
+      };
+      evaluate_expr_to_expr(&substituted)
+    }
+    Expr::NamedFunction { params, body, .. } => {
+      // Named-parameter function: substitute each param with corresponding arg
+      if params.len() > args.len() {
+        // Too many parameters for the given arguments — return unevaluated
+        let args_str: Vec<String> = args.iter().map(expr_to_string).collect();
+        crate::emit_message(&format!(
+          "Function::fpct: Too many parameters in {{{}}} to be filled from Function[{{{}}}, {}][{}].",
+          params.join(", "),
+          params.join(", "),
+          expr_to_string(body),
+          args_str.join(", "),
+        ));
+        return Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        });
+      }
+      let bindings: Vec<(&str, &Expr)> = params
+        .iter()
+        .zip(args.iter())
+        .map(|(p, a)| (p.as_str(), a))
+        .collect();
+      let substituted = crate::syntax::substitute_variables(body, &bindings);
+      evaluate_expr_to_expr(&substituted)
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "StringTemplate" && func_args.len() == 1 => {
+      // StringTemplate[template][args…] — fill the template's slots.
+      crate::functions::string_ast::apply_string_template(&func_args[0], args)
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Query" && args.len() == 1 => {
+      // Query[ops...][data] — successive-level query application. A Dataset
+      // subject goes through the Dataset query so the answer keeps (or drops)
+      // the wrapper the same way `ds[ops…]` does.
+      if let Expr::FunctionCall {
+        name: ds_name,
+        args: ds_args,
+      } = &args[0]
+        && ds_name == "Dataset"
+        && !ds_args.is_empty()
+      {
+        return crate::functions::dataset_ast::dataset_query(
+          ds_args, func_args,
+        );
+      }
+      crate::functions::query_ast::apply_query(func_args, &args[0])
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Entity" && func_args.len() == 2 => {
+      // Entity["type", "name"]["property"] — property access on entities
+      crate::functions::entity_ast::entity_property_access(func_args, args)
+    }
+    // GeometricScene[{{sym -> value, ...}, {}}, {primitives...}, {}]
+    // ["Graphics"] — substitute point symbols into the primitives and return
+    // an ordinary Graphics[{...}] expression. ["Points"] returns the point
+    // definitions. Unknown properties keep the curried form unevaluated.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "GeometricScene"
+      && (func_args.len() == 2 || func_args.len() == 3)
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!();
+      };
+      match prop.as_str() {
+        "Graphics" => {
+          crate::functions::graphics::geometric_scene_graphics(func_args)
+        }
+        "Points" => {
+          crate::functions::graphics::geometric_scene_points(func_args)
+        }
+        _ => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // Around[x, δ]["Value"] / ["Uncertainty"] — property extraction on an
+    // uncertain value. Unknown properties keep the curried form unevaluated.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Around"
+      && func_args.len() == 2
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!();
+      };
+      match prop.as_str() {
+        "Value" => Ok(func_args[0].clone()),
+        "Uncertainty" => Ok(func_args[1].clone()),
+        _ => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // EchoFunction[f][expr] — print ">> f[expr]" (or ">> label f[expr]"
+    // for EchoFunction[label, f], or the expression itself for
+    // EchoFunction[]) and return expr unchanged, like Echo.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "EchoFunction" && func_args.len() <= 2 && args.len() == 1 => {
+      let expr = &args[0];
+      let f = match func_args.len() {
+        0 => None,
+        1 => Some(&func_args[0]),
+        _ => Some(&func_args[1]),
+      };
+      let display = match f {
+        None => expr.clone(),
+        Some(Expr::Identifier(f_name)) => {
+          evaluate_function_call_ast(f_name, std::slice::from_ref(expr))?
+        }
+        Some(other) => apply_curried_call(other, std::slice::from_ref(expr))?,
+      };
+      let line = if func_args.len() == 2 {
+        format!(
+          ">> {} {}",
+          expr_to_output(&func_args[0]),
+          expr_to_output(&display)
+        )
+      } else {
+        format!(">> {}", expr_to_output(&display))
+      };
+      println!("{line}");
+      crate::capture_stdout(&line);
+      Ok(expr.clone())
+    }
+    // EchoLabel[label][expr] — print ">> label expr" and return expr,
+    // exactly Echo[expr, label] in operator form.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "EchoLabel" && func_args.len() == 1 && args.len() == 1 => {
+      let line = format!(
+        ">> {} {}",
+        expr_to_output(&func_args[0]),
+        expr_to_output(&args[0])
+      );
+      println!("{line}");
+      crate::capture_stdout(&line);
+      Ok(args[0].clone())
+    }
+    // DateObject[…]["Granularity"] / TimeObject[…]["Granularity"] report the
+    // granularity tag itself, and a TimeObject's components come from its
+    // {hour, minute, second} list.
+    Expr::FunctionCall {
+      name,
+      args: obj_args,
+    } if (name == "DateObject" || name == "TimeObject")
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(p)
+        if date_object_tag_property(name, obj_args, p).is_some()) =>
+    {
+      let Expr::String(property) = &args[0] else {
+        unreachable!();
+      };
+      Ok(
+        date_object_tag_property(name, obj_args, property)
+          .expect("guarded above"),
+      )
+    }
+    // DateObject[...]["property"] — extract a date component (e.g. "Day",
+    // "DayName", "Week"). Delegates to DateValue, which already resolves every
+    // such property; if it cannot, the curried form is kept unevaluated.
+    Expr::FunctionCall { name, .. }
+      if name == "DateObject"
+        && args.len() == 1
+        && matches!(&args[0], Expr::String(_)) =>
+    {
+      let result = evaluate_function_call_ast(
+        "DateValue",
+        &[func.clone(), args[0].clone()],
+      )?;
+      if matches!(&result, Expr::FunctionCall { name, .. } if name == "DateValue")
+      {
+        Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        })
+      } else {
+        Ok(result)
+      }
+    }
+    // HTTPRequest[…][prop] — property access on the symbolic HTTP request
+    // object: a property string ("Method", "URL", …), the Method symbol, or
+    // a list of those (yielding an association). Unknown properties emit
+    // HTTPRequest::notprop and keep the curried form unevaluated.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "HTTPRequest"
+      && args.len() == 1
+      && matches!(
+        &args[0],
+        Expr::String(_) | Expr::Identifier(_) | Expr::List(_)
+      ) =>
+    {
+      match crate::functions::http_ast::http_request_extract(
+        func_args, &args[0],
+      ) {
+        Some(result) => Ok(result),
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // Success[tag, assoc]["prop"] / Exception[tags, assoc]["prop"] — plain
+    // association lookups. They differ from Failure (and from each other) in
+    // what an absent key reports.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if (name == "Success" || name == "Exception")
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!()
+      };
+      let looked_up = if name == "Success" {
+        crate::functions::confirm_ast::success_property(func_args, prop)
+      } else {
+        crate::functions::confirm_ast::exception_property(func_args, prop)
+      };
+      match looked_up {
+        Some(result) => Ok(result),
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // Failure[tag, assoc]["property"] — the tag, the message with its
+    // parameters filled in, the standard property list, or any key of the
+    // association. An unknown property gives Missing["NotAvailable", prop].
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Failure"
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!()
+      };
+      match crate::functions::confirm_ast::failure_property(func_args, prop) {
+        Some(result) => Ok(result),
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // Molecule[…]["property"] — property access on a molecule object
+    // (e.g. "AtomCount", "MolecularFormula"). Unsupported properties and
+    // invalid molecules keep the curried form unevaluated.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Molecule"
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!()
+      };
+      match crate::functions::molecule_ast::molecule_property(func_args, prop) {
+        Some(result) => Ok(result),
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // TimeSeries[…][t] — value lookup at time `t` (a date or number) or, for a
+    // string argument, a path-property accessor (e.g. ts["Values"], ts["Path"]).
+    Expr::FunctionCall { name, .. }
+      if (name == "TimeSeries" || name == "EventSeries") && args.len() == 1 =>
+    {
+      crate::functions::timeseries_ast::apply_time_series(func, &args[0])
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Interpreter" && func_args.len() == 1 => {
+      // Interpreter["Country"][input] — resolve input to an Entity.
+      crate::functions::country_data::apply_interpreter(&func_args[0], args)
+    }
+    // DiscreteWaveletData[…][wind | All | Automatic | "prop"(, form)] —
+    // wavelet coefficient and property access.
+    Expr::FunctionCall { name, .. }
+      if name == "DiscreteWaveletData"
+        && !args.is_empty()
+        && args.len() <= 2 =>
+    {
+      crate::functions::wavelet_ast::data::apply_dwd(func, args)
+    }
+    // ContinuousWaveletData[…][{oct,voc} | All | "prop"(, form)]
+    Expr::FunctionCall { name, .. }
+      if name == "ContinuousWaveletData"
+        && !args.is_empty()
+        && args.len() <= 2 =>
+    {
+      crate::functions::wavelet_ast::continuous::apply_cwd(func, args)
+    }
+    // LiftingFilterData[wave]["prop"] — filter properties of the wavelet
+    // the lifting data was derived from.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "LiftingFilterData"
+      && func_args.len() == 1
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!()
+      };
+      match prop.as_str() {
+        "Wavelet" => Ok(func_args[0].clone()),
+        "PrimalLowpass" | "PrimalHighpass" | "DualLowpass" | "DualHighpass" => {
+          Ok(crate::functions::wavelet_ast::filters::wavelet_filter_coefficients_ast(&[
+            func_args[0].clone(),
+            args[0].clone(),
+          ]))
+        }
+        _ => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // ShortTimeFourierData[…]["property"] — property access on the data
+    // object produced by ShortTimeFourier (e.g. "Data", "SampleRate").
+    Expr::FunctionCall { name, .. }
+      if name == "ShortTimeFourierData"
+        && args.len() == 1
+        && crate::functions::audio_ast::spectral::stfd_property(
+          func, &args[0],
+        )
+        .is_some() =>
+    {
+      Ok(
+        crate::functions::audio_ast::spectral::stfd_property(func, &args[0])
+          .unwrap(),
+      )
+    }
+    // AssessmentFunction[spec][answer] — grade the answer, returning an
+    // AssessmentResultObject.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "AssessmentFunction" && args.len() == 1 => {
+      crate::functions::assessment_ast::apply_assessment_function(
+        func_args, &args[0],
+      )
+    }
+    // QuestionObject[q, assess][answer] — grade the answer through the
+    // embedded assessment.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "QuestionObject" && args.len() == 1 => {
+      crate::functions::assessment_ast::apply_question_object(
+        func_args, &args[0],
+      )
+    }
+    // AssessmentResultObject[<|…|>]["property"] — property access
+    // (e.g. "Score", "AnswerCorrect", or All for the whole association).
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "AssessmentResultObject" && args.len() == 1 => {
+      crate::functions::assessment_ast::apply_result_object(func_args, &args[0])
+    }
+    // HypothesisTestData[<|…|>]["property"(, testName)] — property access on
+    // the object DistributionFitTest[…, "HypothesisTestData"] returns (e.g.
+    // "FittedDistribution", "AllTests", "TestDataTable").
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "HypothesisTestData"
+      && (args.len() == 1 || args.len() == 2) =>
+    {
+      match crate::functions::math_ast::apply_hypothesis_test_data(
+        func_args, args,
+      ) {
+        Some(result) => Ok(result),
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    // BooleanFunction[bdd][b1, …, bn] — the Boolean-function object applied
+    // to n arguments. Literal True/False (or 1/0) arguments are substituted
+    // in: all n of them give True or False outright, and a proper subset
+    // leaves the restricted function of the remaining arguments, which is
+    // itself a BooleanFunction object. Extra arguments past the n the
+    // function takes are dropped; too few emit ::argr and leave the call as
+    // it stands, all matching wolframscript.
+    Expr::FunctionCall { name, .. }
+      if name == "BooleanFunction"
+        && crate::functions::boolean_ast::bdd_from_object(func).is_some() =>
+    {
+      let (n, table) =
+        crate::functions::boolean_ast::bdd_from_object(func).unwrap();
+      if args.len() < n {
+        crate::emit_message(&format!(
+          "BooleanFunction::argr: BooleanFunction[<{}>] called with {} \
+           argument{}; {n} arguments are expected.",
+          n,
+          args.len(),
+          if args.len() == 1 { "" } else { "s" },
+        ));
+        return Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        });
+      }
+      let args = &args[..n];
+      let literal = |a: &Expr| match a {
+        Expr::Identifier(s) if s == "True" => Some(true),
+        Expr::Identifier(s) if s == "False" => Some(false),
+        Expr::Integer(1) => Some(true),
+        Expr::Integer(0) => Some(false),
+        _ => None,
+      };
+      let fixed: Vec<Option<bool>> = args.iter().map(literal).collect();
+      let free: Vec<usize> = (0..n).filter(|i| fixed[*i].is_none()).collect();
+      if free.len() == n && !table.iter().all(|v| *v == table[0]) {
+        return Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        });
+      }
+      // The table is indexed by the assignment read with the first variable
+      // most significant, so a variable's bit sits at position n - 1 - i.
+      let restricted: Vec<bool> = (0..(1usize << free.len()))
+        .map(|assignment| {
+          let mut index = 0usize;
+          for (i, value) in fixed.iter().enumerate() {
+            let bit = if let Some(b) = value {
+              *b
+            } else {
+              let slot = free.iter().position(|f| *f == i).unwrap();
+              (assignment >> (free.len() - 1 - slot)) & 1 == 1
+            };
+            if bit {
+              index |= 1 << (n - 1 - i);
+            }
+          }
+          table[index]
+        })
+        .collect();
+      // A function that no longer depends on anything is just its value,
+      // whether or not any argument was literal.
+      if restricted.iter().all(|v| *v == restricted[0]) {
+        return Ok(bool_expr(restricted[0]));
+      }
+      Ok(Expr::CurriedCall {
+        func: Box::new(crate::functions::boolean_ast::bdd_object(
+          &restricted,
+          free.len(),
+        )),
+        args: free.iter().map(|i| args[*i].clone()).collect(),
+      })
+    }
+    // BooleanCountingFunction[spec, n][b1, …] — True when the number of True
+    // arguments is one of the counts the spec names. Only literal arguments
+    // decide it; a symbolic one leaves the call as it stands.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "BooleanCountingFunction"
+      && func_args.len() == 2
+      && matches!(&func_args[1], Expr::Integer(k) if *k >= 0) =>
+    {
+      let Expr::Integer(n) = &func_args[1] else {
+        unreachable!()
+      };
+      let mut true_count = 0usize;
+      let mut literal = true;
+      for a in args {
+        match a {
+          Expr::Identifier(s) if s == "True" => true_count += 1,
+          Expr::Identifier(s) if s == "False" => {}
+          _ => {
+            literal = false;
+            break;
+          }
+        }
+      }
+      if literal
+        && let Some(counts) =
+          crate::functions::boolean_ast::counting_spec_counts(
+            &func_args[0],
+            *n as usize,
+          )
+      {
+        return Ok(bool_expr(counts.contains(&true_count)));
+      }
+      Ok(Expr::CurriedCall {
+        func: Box::new(func.clone()),
+        args: args.to_vec(),
+      })
+    }
+    // Distribution operator forms: CDF[dist][x] -> CDF[dist, x] (and PDF,
+    // Quantile, InverseCDF, SurvivalFunction, HazardFunction). Guarded so the
+    // head holds a distribution object (a FunctionCall).
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if matches!(
+      name.as_str(),
+      "CDF"
+        | "PDF"
+        | "Quantile"
+        | "InverseCDF"
+        | "SurvivalFunction"
+        | "HazardFunction"
+    ) && func_args.len() == 1
+      && matches!(&func_args[0], Expr::FunctionCall { .. }) =>
+    {
+      let mut new_args = func_args.to_vec();
+      new_args.extend(args.iter().cloned());
+      evaluate_function_call_ast(name, &new_args)
+    }
+    // Region operator forms: RegionMember[reg][pt] -> RegionMember[reg, pt]
+    // (and the analogous RegionDistance / RegionNearest / SignedRegionDistance
+    // one-argument operators). The head holds a region object (a FunctionCall).
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if matches!(
+      name.as_str(),
+      "RegionMember"
+        | "RegionDistance"
+        | "RegionNearest"
+        | "SignedRegionDistance"
+    ) && func_args.len() == 1
+      && matches!(&func_args[0], Expr::FunctionCall { .. }) =>
+    {
+      let mut new_args = func_args.to_vec();
+      new_args.extend(args.iter().cloned());
+      evaluate_function_call_ast(name, &new_args)
+    }
+    // LinearSolve operator form: LinearSolve[m][b] -> LinearSolve[m, b]. (The
+    // bare LinearSolve[m] is wolframscript's opaque LinearSolveFunction, which
+    // Woxi keeps unevaluated, but the application solves the system.)
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "LinearSolve"
+      && func_args.len() == 1
+      && matches!(&func_args[0], Expr::List(_)) =>
+    {
+      let mut new_args = func_args.to_vec();
+      new_args.extend(args.iter().cloned());
+      evaluate_function_call_ast(name, &new_args)
+    }
+    // TreeFold/TreeMap operator form: T[f][tree] -> T[f, tree].
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if (name == "TreeFold" || name == "TreeMap") && func_args.len() == 1 => {
+      let mut new_args = func_args.to_vec();
+      new_args.extend(args.iter().cloned());
+      evaluate_function_call_ast(name, &new_args)
+    }
+    // TreeReplacePart / TreeSelect operator form: T[spec][tree] ->
+    // T[tree, spec] (the tree argument comes first).
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if (name == "TreeReplacePart" || name == "TreeSelect")
+      && func_args.len() == 1 =>
+    {
+      let mut new_args = args.to_vec();
+      new_args.extend(func_args.iter().cloned());
+      evaluate_function_call_ast(name, &new_args)
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "EntityStore" && func_args.len() == 1 => {
+      // EntityStore[...][Entity["type", "name"], "property"] — callable store form
+      crate::functions::entity_ast::entity_store_property_access(
+        func_args, args,
+      )
+    }
+    // SparseArray[…]["property"] — grid metadata queries.
+    Expr::FunctionCall {
+      name,
+      args: sa_args,
+    } if name == "SparseArray"
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(prop) = &args[0] else {
+        unreachable!()
+      };
+      if let Some(result) =
+        crate::functions::list_helpers_ast::sparse_array_property(sa_args, prop)
+      {
+        Ok(result)
+      } else {
+        crate::emit_message(&format!(
+          "SparseArray::nomthd: There is no method {prop} for SparseArray objects."
+        ));
+        Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        })
+      }
+    }
+    // SocketObject[uuid]["property"] / SocketListener[id]["property"].
+    Expr::FunctionCall {
+      name,
+      args: obj_args,
+    } if (name == "SocketObject" || name == "SocketListener")
+      && obj_args.len() == 1
+      && args.len() == 1
+      && matches!(&args[0], Expr::String(_)) =>
+    {
+      let Expr::String(property) = &args[0] else {
+        unreachable!()
+      };
+      let value = match (name.as_str(), &obj_args[0]) {
+        ("SocketObject", Expr::String(uuid)) => {
+          crate::functions::socket_ast::socket_property(uuid, property)
+        }
+        ("SocketListener", Expr::Integer(id)) => {
+          crate::functions::socket_ast::listener_property(*id, property)
+        }
+        _ => None,
+      };
+      Ok(value.unwrap_or_else(|| Expr::CurriedCall {
+        func: Box::new(func.clone()),
+        args: args.to_vec(),
+      }))
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "InterpolatingFunction"
+      && (2..=4).contains(&func_args.len()) =>
+    {
+      // InterpolatingFunction[domain, data][x] — interpolate at x
+      crate::functions::ode_ast::evaluate_interpolating_function(
+        func_args, args,
+      )
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "FittedModel" && func_args.len() == 1 => {
+      // FittedModel[assoc][x] — evaluate model or query property
+      crate::functions::linear_algebra_ast::evaluate_fitted_model(
+        func_args, args,
+      )
+    }
+    // ResourceFunction["Name"][args…] / ResourceFunction["Name", "Function"][args…]
+    // — fetch the named resource from the Wolfram Function Repository (its
+    // public, unauthenticated pages) on first use and evaluate its published
+    // "Definition" cell, the same way `Get` loads a package. No bundled
+    // catalog: any resource whose definition Woxi's language subset can
+    // evaluate works, not just specific hardcoded names. No network access,
+    // an unknown name, or a definition that fails to evaluate all leave the
+    // call as a held CurriedCall, matching a real kernel offline.
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "ResourceFunction"
+      && (1..=2).contains(&func_args.len())
+      && matches!(&func_args[0], Expr::String(_)) =>
+    {
+      let Expr::String(resource_name) = &func_args[0] else {
+        unreachable!()
+      };
+      #[cfg(not(target_arch = "wasm32"))]
+      let resolved =
+        crate::functions::resource_function_ast::load_resource_function(
+          resource_name,
+        );
+      #[cfg(target_arch = "wasm32")]
+      let resolved: Option<String> = None;
+      match resolved {
+        Some(symbol_name) => evaluate_function_call_ast(&symbol_name, args),
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if (name == "FoldWhile" || name == "FoldWhileList")
+      && func_args.len() == 2
+      && args.len() == 1 =>
+    {
+      // FoldWhile[f, test][list] — the operator form folds the given list,
+      // taking its first element as the initial value.
+      evaluate_function_call_ast(
+        name,
+        &[func_args[0].clone(), args[0].clone(), func_args[1].clone()],
+      )
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "TuringMachine" && func_args.len() == 1 && args.len() == 1 => {
+      // TuringMachine[rule][init] — the operator form is one step.
+      crate::functions::turing_machine_ast::turing_machine_ast(&[
+        func_args[0].clone(),
+        args[0].clone(),
+      ])
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "SubstitutionSystem"
+      && func_args.len() == 1
+      && args.len() == 1 =>
+    {
+      // SubstitutionSystem[rules][init] — the operator form is one step.
+      evaluate_function_call_ast(
+        "SubstitutionSystem",
+        &[func_args[0].clone(), args[0].clone()],
+      )
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "CellularAutomaton"
+      && func_args.len() == 1
+      && args.len() == 1 =>
+    {
+      // CellularAutomaton[rule][init] — the operator form is one step.
+      crate::functions::cellular_automaton_ast::cellular_automaton_ast(&[
+        func_args[0].clone(),
+        args[0].clone(),
+      ])
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "Dataset" && func_args.len() == 3 => {
+      // Dataset[data, type, meta][args...] — dataset querying
+      crate::functions::dataset_ast::dataset_query(func_args, args)
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "ColorDataFunction" && func_args.len() == 4 => {
+      // ColorDataFunction[scheme, "Gradients", range, blend][t] — apply the
+      // stored blend function (the structured form ColorData["scheme"]
+      // evaluates to) at t.
+      apply_curried_call(&func_args[3], args)
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "BezierFunction" && func_args.len() == 1 => {
+      // BezierFunction[{{p1}, {p2}, ...}][t] — evaluate Bezier curve at t
+      Ok(evaluate_bezier_function(func_args, args))
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "BezierFunction" && func_args.len() == 7 => {
+      // Structured form: BezierFunction[degree, knots, {n}, {points, {}}, ...]
+      // The control points live in args[3][0]. Wrap them in a 1-arg
+      // BezierFunction and reuse the standard evaluator.
+      if let Expr::List(slot) = &func_args[3]
+        && !slot.is_empty()
+      {
+        let pts = vec![slot[0].clone()];
+        Ok(evaluate_bezier_function(&pts, args))
+      } else {
+        Err(InterpreterError::EvaluationError(
+          "BezierFunction: invalid structured form".into(),
+        ))
+      }
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "BSplineFunction" && func_args.len() == 9 => {
+      // BSplineFunction[dim, ranges, degrees, closed, {net, Automatic},
+      // knots, ...][params] — evaluate the spline at the given parameters.
+      Ok(evaluate_bspline_function(func_args, args))
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "TransformationFunction" && func_args.len() == 1 => {
+      // TransformationFunction[matrix][{x, y, ...}] — apply affine transformation
+      apply_transformation_function(&func_args[0], args)
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "CompiledFunction"
+      && func_args.len() == 3
+      && matches!(&func_args[2], Expr::Identifier(s) if s == "Listable") =>
+    {
+      // `Compile[…, RuntimeAttributes -> {Listable}]` makes the resulting
+      // CompiledFunction itself Listable: a call with an array deeper than
+      // a parameter's declared rank (e.g. `f[{1+I, 2+I}, y]` where `x` is
+      // declared `_Complex`, i.e. rank 0; or an `{x,_Real,2}` parameter
+      // called with a list of matrices) threads element-wise over the
+      // outermost excess dimension, broadcasting the other arguments — the
+      // idiom Wolfram Demonstrations Project notebooks lean on to evaluate
+      // a `Compile`d kernel over a batch of inputs in one call. Without
+      // this, the list was passed straight into the body as one opaque
+      // value, so a body using it at its declared rank (e.g.
+      // `NestWhileList[…, x, …]`, or `Partition[line, 2, 1]` expecting one
+      // point list) silently computed the wrong thing instead of a
+      // per-element result. When the excess is more than one dimension
+      // (e.g. a `{name,_Real,2}` parameter fed a rank-4 array), peeling
+      // off one dimension here and recursing through `apply_curried_call`
+      // below threads over the remaining excess dimensions in turn, just
+      // as real Mathematica's Listable does.
+      let specs: Vec<&Expr> = match &func_args[0] {
+        Expr::List(items) => items.iter().collect(),
+        other => vec![other],
+      };
+      let ranks: Vec<usize> =
+        specs.iter().map(|s| compile_spec_rank(s)).collect();
+      let threads: Vec<bool> = args
+        .iter()
+        .zip(ranks.iter())
+        .map(|(a, &r)| expr_array_depth(a) > r)
+        .collect();
+      let list_len =
+        args
+          .iter()
+          .zip(threads.iter())
+          .find_map(|(a, &thread)| match a {
+            Expr::List(items) if thread => Some(items.len()),
+            _ => None,
+          });
+      match list_len {
+        Some(len)
+          if args.iter().zip(threads.iter()).all(|(a, &thread)| match a {
+            Expr::List(items) if thread => items.len() == len,
+            _ => true,
+          }) =>
+        {
+          let mut results = Vec::with_capacity(len);
+          for i in 0..len {
+            let threaded_args: Vec<Expr> = args
+              .iter()
+              .zip(threads.iter())
+              .map(|(a, &thread)| match a {
+                Expr::List(items) if thread => items[i].clone(),
+                _ => a.clone(),
+              })
+              .collect();
+            results.push(apply_curried_call(func, &threaded_args)?);
+          }
+          Ok(Expr::List(results.into()))
+        }
+        // No listed threading argument (or mismatched lengths) — behave
+        // exactly like the plain 2-argument CompiledFunction.
+        _ => apply_curried_call(
+          &call(
+            "CompiledFunction",
+            vec![func_args[0].clone(), func_args[1].clone()],
+          ),
+          args,
+        ),
+      }
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "CompiledFunction" && func_args.len() == 2 => {
+      // CompiledFunction[specs, body][args…] — bind each argument at its
+      // declared type and evaluate the body.
+      let specs: Vec<&Expr> = match &func_args[0] {
+        Expr::List(items) => items.iter().collect(),
+        other => vec![other],
+      };
+      let body = &func_args[1];
+      let bound: Vec<(String, Expr)> = specs
+        .iter()
+        .zip(args.iter())
+        .filter_map(|(spec, arg)| {
+          let (name, real) = compile_arg_spec(spec, body)?;
+          Some((
+            name,
+            if real {
+              coerce_to_real(arg)
+            } else {
+              arg.clone()
+            },
+          ))
+        })
+        .collect();
+      let bindings: Vec<(&str, &Expr)> =
+        bound.iter().map(|(p, a)| (p.as_str(), a)).collect();
+      let substituted = crate::syntax::substitute_variables(body, &bindings);
+      let result = evaluate_expr_to_expr(&substituted)?;
+      // A compiled function whose arguments include a real works in machine
+      // reals throughout, so exact numbers that leaked in from literals come
+      // back inexact: `Compile[{{x, _Real, 0}}, Clip[x, {-4, 4}]][-5.]` is
+      // `-4.`, not the exact bound. An all-integer signature keeps its exact
+      // result.
+      let any_real = specs.iter().zip(args.iter()).any(|(spec, _)| {
+        matches!(compile_arg_spec(spec, body), Some((_, true)))
+      });
+      Ok(if any_real {
+        coerce_to_real(&result)
+      } else {
+        result
+      })
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } if name == "CompiledFunction" => {
+      // A `CompiledFunction[…]` restored from a saved notebook (e.g. a
+      // Demonstration's `SaveDefinitions -> True` dump) carries Mathematica's
+      // full serialized form — id tuple, argument patterns, type/constant
+      // tables, raw bytecode, the uncompiled pure function, and a trailing
+      // evaluation flag — not the 2-argument `[specs, body]` shape woxi's own
+      // `Compile` produces above. woxi has no bytecode VM to run the middle
+      // arguments, but real Mathematica always embeds an uncompiled
+      // `Function[…]` alongside the bytecode as a correctness fallback (it's
+      // what runs when the compiled code can't handle an argument); applying
+      // that instead gives the same result the bytecode would. Without this,
+      // the call falls through to the generic case below and returns
+      // unevaluated — which then never collapses to a number and blows up
+      // any surrounding computation that reruns it (e.g. a Manipulate whose
+      // body composes it dozens of times).
+      // `CompiledFunction` holds its arguments (like `Compile`), so an
+      // embedded `Function[…]` is still the literal, unevaluated
+      // `FunctionCall` AST here, not the `NamedFunction`/`Function` value
+      // `Function[…]` evaluates to — evaluate it first to get something
+      // `apply_curried_call` can invoke.
+      match func_args.iter().find(|a| {
+        matches!(a, Expr::NamedFunction { .. } | Expr::Function { .. })
+          || matches!(a, Expr::FunctionCall { name, .. } if name == "Function")
+      }) {
+        Some(pure_fn) => {
+          let pure_fn = evaluate_expr_to_expr(pure_fn)?;
+          apply_curried_call(&pure_fn, args)
+        }
+        None => Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        }),
+      }
+    }
+    Expr::FunctionCall {
+      name,
+      args: func_args,
+    } => {
+      // Property access on a canonical music object, e.g.
+      // MusicNote[<|…|>]["Pitch"] or MusicChord[<|…|>]["PitchList"].
+      if let Some(result) = crate::functions::music_ast::music_property_access(
+        name, func_args, args,
+      ) {
+        return Ok(result);
+      }
+      // Curried function: f[a][b] becomes f[a, b]
+      // Special case: operator forms where f[x][y] becomes f[y, x]
+      if (name == "MapAt" || name == "SubsetMap")
+        && func_args.len() == 2
+        && args.len() == 1
+      {
+        let new_args =
+          vec![func_args[0].clone(), args[0].clone(), func_args[1].clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      if name == "Insert" && func_args.len() == 2 && args.len() == 1 {
+        let new_args =
+          vec![args[0].clone(), func_args[0].clone(), func_args[1].clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // TakeLargestBy[f, n][list] -> TakeLargestBy[list, f, n] (and likewise
+      // TakeSmallestBy): the applied list becomes the first argument.
+      if (name == "TakeLargestBy" || name == "TakeSmallestBy")
+        && func_args.len() == 2
+        && args.len() == 1
+      {
+        let new_args =
+          vec![args[0].clone(), func_args[0].clone(), func_args[1].clone()];
+        return evaluate_function_call_ast(name, &new_args);
+      }
+      // NearestTo[x][data] -> Nearest[data, x];
+      // NearestTo[x, n][data] -> Nearest[data, x, n].
+      if name == "NearestTo" && (func_args.len() == 1 || func_args.len() == 2) {
+        let mut new_args = args.to_vec();
+        new_args.extend(func_args.iter().cloned());
+        return evaluate_function_call_ast("Nearest", &new_args);
+      }
+      // Nearest[data] is a NearestFunction; applying it forwards to the direct
+      // form: Nearest[data][x] -> Nearest[data, x], and
+      // Nearest[data][x, n] -> Nearest[data, x, n].
+      if name == "Nearest"
+        && func_args.len() == 1
+        && (1..=2).contains(&args.len())
+      {
+        let mut new_args = func_args.to_vec();
+        new_args.extend(args.iter().cloned());
+        return evaluate_function_call_ast("Nearest", &new_args);
+      }
+      if is_subject_first_operator(name)
+        && func_args.len() == 1
+        && args.len() == 1
+        && operator_form_accepts_subject(name, &args[0])
+      {
+        // Operator form: prepend the argument instead of appending
+        let new_args = vec![args[0].clone(), func_args[0].clone()];
+        evaluate_function_call_ast(name, &new_args)
+      } else if (name == "Nest" || name == "NestList")
+        && func_args.len() == 2
+        && args.len() == 1
+      {
+        // Nest[f, n][x] -> Nest[f, x, n] (likewise NestList)
+        let new_args =
+          vec![func_args[0].clone(), args[0].clone(), func_args[1].clone()];
+        evaluate_function_call_ast(name, &new_args)
+      } else if (name == "Fold" || name == "FoldList")
+        && func_args.len() == 1
+        && args.len() == 1
+      {
+        // Fold[f][list] -> Fold[f, list] (and likewise FoldList)
+        let new_args = vec![func_args[0].clone(), args[0].clone()];
+        evaluate_function_call_ast(name, &new_args)
+      } else if name == "Composition" && !func_args.is_empty() {
+        // Composition[f, g, h][x] applies functions right-to-left: f[g[h[x]]]
+        Ok(compose_and_evaluate(func_args.iter().rev(), args)?)
+      } else if name == "RightComposition" && !func_args.is_empty() {
+        // RightComposition[f, g, h][x] applies functions left-to-right: h[g[f[x]]]
+        Ok(compose_and_evaluate(func_args.iter(), args)?)
+      } else if (name == "MapAt" || name == "SubsetMap")
+        && func_args.len() == 2
+        && args.len() == 1
+      {
+        // MapAt[f, pos][expr] -> MapAt[f, expr, pos] (likewise SubsetMap)
+        let new_args =
+          vec![func_args[0].clone(), args[0].clone(), func_args[1].clone()];
+        evaluate_function_call_ast(name, &new_args)
+      } else if name == "ReplaceAt" && func_args.len() == 2 && args.len() == 1 {
+        // ReplaceAt[rules, pos][expr] -> ReplaceAt[expr, rules, pos]. Unlike
+        // MapAt, ReplaceAt takes the subject as its FIRST argument.
+        let new_args =
+          vec![args[0].clone(), func_args[0].clone(), func_args[1].clone()];
+        evaluate_function_call_ast(name, &new_args)
+      } else if name == "Key" && func_args.len() == 1 && args.len() == 1 {
+        // Key[k][assoc] — extract value for key k from association
+        let key = &func_args[0];
+        let key_str = expr_to_string(key);
+        match &args[0] {
+          Expr::Association(pairs) => {
+            for (k, v) in pairs {
+              if expr_to_string(k) == key_str {
+                return Ok(
+                  crate::functions::association_ast::assoc_entry_value(k, v),
+                );
+              }
+            }
+            // Key not found: return Missing["KeyAbsent", k]
+            Ok(call(
+              "Missing",
+              vec![Expr::String("KeyAbsent".to_string()), key.clone()],
+            ))
+          }
+          _ => {
+            // Not an association: return unevaluated
+            Ok(Expr::CurriedCall {
+              func: Box::new(func.clone()),
+              args: args.to_vec(),
+            })
+          }
+        }
+      } else if name == "Derivative"
+        && func_args.len() > 1
+        && func_args.iter().all(|a| matches!(a, Expr::Integer(_)))
+      {
+        // If every derivative order is 0, the derivative is the identity:
+        // Derivative[0, 0, ..., 0][f] simplifies to f (or f applied to args,
+        // if this is Derivative[0, ...][f][x, y, ...]).
+        if func_args.iter().all(|a| matches!(a, Expr::Integer(0))) {
+          if args.is_empty() {
+            return Ok(args.first().cloned().unwrap_or_else(|| func.clone()));
+          }
+          if args.len() == 1 {
+            return Ok(args[0].clone());
+          }
+          // Multi-arg: apply the body to the args.
+          return evaluate_function_call_ast("CompoundExpression", args);
+        }
+        // `Derivative[n1, ..., nk][List]` — fold to a Function that
+        // returns a `List` of length `k`. Each entry is `D[#i, #1^n1, …,
+        // #k^nk]`: 1 when exactly that position has order 1 and every
+        // other position has order 0, otherwise 0.
+        if args.len() == 1
+          && matches!(&args[0], Expr::Identifier(s) if s == "List")
+        {
+          let orders: Vec<i128> = func_args
+            .iter()
+            .map(|a| match a {
+              Expr::Integer(n) => *n,
+              _ => 0,
+            })
+            .collect();
+          let any_high = orders.iter().any(|n| *n > 1 || *n < 0);
+          let ones: Vec<usize> = orders
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| if *n == 1 { Some(i) } else { None })
+            .collect();
+          let body: Expr = if any_high || ones.len() > 1 {
+            Expr::List(orders.iter().map(|_| Expr::Integer(0)).collect())
+          } else if ones.len() == 1 {
+            let target = ones[0];
+            Expr::List(
+              (0..orders.len())
+                .map(|i| {
+                  if i == target {
+                    Expr::Integer(1)
+                  } else {
+                    Expr::Integer(0)
+                  }
+                })
+                .collect(),
+            )
+          } else {
+            // Every order is zero — this branch is unreachable because
+            // the all-zeros guard above caught it, but keep the fallback
+            // for completeness.
+            Expr::List((0..orders.len()).map(|i| Expr::Slot(i + 1)).collect())
+          };
+          return Ok(Expr::Function {
+            body: Box::new(body),
+          });
+        }
+        // `Derivative[n1, …, nk][body &]` where the body only uses slots
+        // up to index `k_max`: any non-zero order beyond `k_max`
+        // differentiates with respect to a slot that doesn't appear, so
+        // the result is `0 &`. Matches wolframscript: `Derivative[0, 1][# &]`
+        // → `0 &`.
+        if args.len() == 1
+          && let Expr::Function { body } = &args[0]
+        {
+          let max_slot = max_slot_index(body);
+          let orders: Vec<i128> = func_args
+            .iter()
+            .map(|a| match a {
+              Expr::Integer(n) => *n,
+              _ => 0,
+            })
+            .collect();
+          let beyond_zero = orders
+            .iter()
+            .enumerate()
+            .any(|(i, n)| (i + 1) > max_slot && *n > 0);
+          if beyond_zero {
+            return Ok(Expr::Function {
+              body: Box::new(Expr::Integer(0)),
+            });
+          }
+          // Try to evaluate `Derivative[n1, …, nk][body &]` symbolically.
+          // For each slot k with order n_k > 0 we either factor the current
+          // expression as `c * dummy_k^p` (constant `c` × pure power) and
+          // splice in the right-nested chain `p*((p-1)*…*dummy_k^(p-n_k))`,
+          // or fall back to ordinary `differentiate_expr` repeated n_k
+          // times. The chain branch is what makes wolframscript's preserved
+          // multiplication structure (e.g. `Cos[#1]*(3*(2*#2)) &`) come
+          // through unsimplified.
+          if let Some(result) = differentiate_function_body(body, &orders) {
+            return Ok(Expr::Function {
+              body: Box::new(result),
+            });
+          }
+        }
+        // `Derivative[n1, …, nk][Function[{x1, …, xk}, body]]` — the
+        // named-parameter analogue of the slot-based case above. Each
+        // order lines up with the parameter at the same position, so no
+        // slot renumbering is needed; a mismatched parameter count is left
+        // unevaluated (falls through to the generic CurriedCall below).
+        if args.len() == 1
+          && let Expr::NamedFunction {
+            params,
+            body,
+            bracketed,
+          } = &args[0]
+          && params.len() == func_args.len()
+        {
+          let orders: Vec<i128> = func_args
+            .iter()
+            .map(|a| match a {
+              Expr::Integer(n) => *n,
+              _ => 0,
+            })
+            .collect();
+          if let Some(result) =
+            differentiate_named_function_body(body, params, &orders)
+          {
+            return Ok(Expr::NamedFunction {
+              params: params.clone(),
+              body: Box::new(result),
+              bracketed: *bracketed,
+            });
+          }
+        }
+        // Multi-index derivative: Derivative[n1, n2, ...][f] — keep as
+        // CurriedCall since the flattened form is ambiguous with
+        // Derivative[n, f, x] (nth derivative of f at x).
+        Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        })
+      } else if matches!(
+        name.as_str(),
+        "Derivative"
+          | "Apply"
+          | "Map"
+          | "MapIndexed"
+          | "MapThread"
+          | "Scan"
+          | "Append"
+          | "Prepend"
+          | "Take"
+          | "Drop"
+          | "Between"
+          | "Comap"
+          | "ComapApply"
+          | "KeyMap"
+          | "AssociationMap"
+          | "KeyValueMap"
+      ) {
+        // `Derivative[n][const]` → `0&` for n ≥ 1, `const&` for n == 0.
+        // Caught here (before flattening) so the multi-index `Derivative[1, 0]`
+        // form, which goes through evaluate_function_call_ast directly, stays
+        // symbolic. Constants are atomic numerics that can't be a derivative
+        // order interpretation: Real, Rational, Constant, BigFloat, Complex,
+        // and Integer (since `Derivative[1, 0][f]` already routed through the
+        // multi-index branch above and never reaches here).
+        // `Derivative[n][InterpolatingFunction[…]]` is another
+        // InterpolatingFunction that carries the derivative order, so `f'`
+        // stays an interpolating function the way wolframscript reports it.
+        if name == "Derivative"
+          && func_args.len() == 1
+          && args.len() == 1
+          && let Expr::Integer(extra) = &func_args[0]
+          && *extra >= 0
+          && let Expr::FunctionCall {
+            name: interp_name,
+            args: interp_args,
+          } = &args[0]
+          && interp_name == "InterpolatingFunction"
+          && (2..=4).contains(&interp_args.len())
+          && !matches!(interp_args.get(2), Some(Expr::List(_)))
+        {
+          let mut new_args: Vec<Expr> = interp_args.to_vec();
+          while new_args.len() < 3 {
+            new_args.push(Expr::Integer(1));
+          }
+          let previous = match new_args.get(3) {
+            Some(Expr::Integer(n)) => *n,
+            _ => 0,
+          };
+          let total = previous + extra;
+          if new_args.len() == 4 {
+            new_args[3] = Expr::Integer(total);
+          } else {
+            new_args.push(Expr::Integer(total));
+          }
+          return Ok(call("InterpolatingFunction", new_args));
+        }
+        if name == "Derivative" && func_args.len() == 1 && args.len() == 1 {
+          let arg0 = &args[0];
+          let is_constant_arg = matches!(
+            arg0,
+            Expr::Integer(_)
+              | Expr::Real(_)
+              | Expr::BigFloat(_, _)
+              | Expr::BigInteger(_)
+              | Expr::Constant(_)
+          ) || matches!(
+            arg0,
+            Expr::FunctionCall { name: rn, .. }
+              if rn == "Rational" || rn == "Complex"
+          ) || matches!(
+            arg0,
+            Expr::Identifier(s) if s == "I"
+          );
+          if is_constant_arg {
+            // Integer order: 0 -> const&, otherwise 0&. Non-integer order:
+            // wolframscript also folds to 0& (treating the order as nonzero).
+            let body = match &func_args[0] {
+              Expr::Integer(0) => arg0.clone(),
+              _ => Expr::Integer(0),
+            };
+            return Ok(Expr::Function {
+              body: Box::new(body),
+            });
+          }
+        }
+        // Known operator-form functions: flatten curried call
+        let mut new_args = func_args.clone();
+        new_args.extend(args.iter().cloned());
+        evaluate_function_call_ast(name, &new_args)
+      } else if matches!(
+        name.as_str(),
+        "Replace" | "ReplaceAll" | "ReplaceRepeated"
+      ) && args.len() == 1
+      {
+        // Curried replacement: Replace[rules][expr] = Replace[expr, rules].
+        // The expr argument comes FIRST in the uncurried form — the opposite
+        // of Map/Apply-style operator forms.
+        let mut new_args = args.to_vec();
+        new_args.extend(func_args.iter().cloned());
+        evaluate_function_call_ast(name, &new_args)
+      } else if name == "Function" && func_args.len() >= 2 {
+        // Function[{params...}, body, attrs?][args...] — substitute params
+        // with args in body and evaluate. Hold attributes on the 3rd arg
+        // are honoured by the caller (see function_hold_attributes); here
+        // we just bind and evaluate.
+        let params: Vec<String> = match &func_args[0] {
+          Expr::List(items) => items
+            .iter()
+            .filter_map(|e| match e {
+              Expr::Identifier(n) => Some(n.clone()),
+              _ => None,
+            })
+            .collect(),
+          Expr::Identifier(n) => vec![n.clone()],
+          _ => Vec::new(),
+        };
+        let body = &func_args[1];
+        if params.is_empty() {
+          let substituted = crate::syntax::substitute_slots(body, args);
+          evaluate_expr_to_expr(&substituted)
+        } else {
+          let bindings: Vec<(&str, &Expr)> = params
+            .iter()
+            .zip(args.iter())
+            .map(|(p, a)| (p.as_str(), a))
+            .collect();
+          let substituted =
+            crate::syntax::substitute_variables(body, &bindings);
+          evaluate_expr_to_expr(&substituted)
+        }
+      } else if let Some(result) = try_sub_value_curried_match(func, args) {
+        result
+      } else {
+        // Unknown/symbolic curried call: preserve the CurriedCall form
+        // e.g. f[g][x] stays as f[g][x], not f[g, x]
+        Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        })
+      }
+    }
+    Expr::Association(pairs) => {
+      // assoc["key"] — association lookup, one lookup per key, exactly as
+      // for an association a symbol holds.
+      if args.is_empty() {
+        Ok(Expr::CurriedCall {
+          func: Box::new(func.clone()),
+          args: args.to_vec(),
+        })
+      } else {
+        Ok(
+          crate::evaluator::pattern_matching::association_lookup_chain(
+            pairs, args,
+          ),
+        )
+      }
+    }
+    Expr::List(_) => {
+      // {f, g}[x] stays unevaluated as a CurriedCall in Wolfram Language
+      Ok(Expr::CurriedCall {
+        func: Box::new(func.clone()),
+        args: args.to_vec(),
+      })
+    }
+    Expr::CurriedCall { .. } => {
+      // Nested curried call: `s[a][b][c]` arrives here as
+      // `apply_curried_call(CurriedCall{s[a], [b]}, [c])`. A SubValue rule
+      // spanning this many curry levels (`y[3][i_][t_] := …`, where the
+      // first level's argument is a literal rather than itself a pattern)
+      // only becomes matchable once every level has been applied, so check
+      // for one here before falling back to preserving the bare structure —
+      // otherwise `func` (itself already a CurriedCall from the previous,
+      // unmatched level) never reaches a SubValue lookup at all.
+      if let Some(result) = try_sub_value_curried_match(func, args) {
+        return result;
+      }
+      // Preserve the structure rather than collapsing the head to a
+      // string-named FunctionCall (which loses the AST shape that
+      // pattern-matchers rely on, e.g. `s[a][b][c] /. s[x_][y_][z_] -> …`).
+      Ok(Expr::CurriedCall {
+        func: Box::new(func.clone()),
+        args: args.to_vec(),
+      })
+    }
+    // A compound arithmetic/relational head stays an inert curried call,
+    // e.g. `(f + g)[x]`, rather than being stringified to a function name.
+    // Rules and patterns are heads in the same sense: `(u -> v)[x]` has head
+    // `u -> v`, so collapsing it to a symbol named "u -> v" both misprints it
+    // and makes `Head[Head[…]]` report Symbol instead of Rule.
+    Expr::BinaryOp { .. }
+    | Expr::UnaryOp { .. }
+    | Expr::Comparison { .. }
+    | Expr::Rule { .. }
+    | Expr::RuleDelayed { .. }
+    | Expr::Pattern { .. }
+    | Expr::PatternOptional { .. } => Ok(Expr::CurriedCall {
+      func: Box::new(func.clone()),
+      args: args.to_vec(),
+    }),
+    _ => {
+      // Fallback: try to convert to string and evaluate
+      let func_str = expr_to_string(func);
+      if let Some(name) = func_str.strip_suffix('&') {
+        // It's an anonymous function like "#^2&"
+        let body = string_to_expr(name)?;
+        let substituted = crate::syntax::substitute_slots(&body, args);
+        evaluate_expr_to_expr(&substituted)
+      } else if args.len() == 1 {
+        // Treat as a function name with single arg
+        evaluate_function_call_ast(&func_str, args)
+      } else {
+        // Multiple args - treat as curried
+        evaluate_function_call_ast(&func_str, args)
+      }
+    }
+  }
+}
+
+/// Evaluate BezierFunction[{control_points}][t] using de Casteljau's algorithm.
+fn evaluate_bezier_function(func_args: &[Expr], args: &[Expr]) -> Expr {
+  if args.len() != 1 {
+    return unevaluated("BezierFunction", func_args);
+  }
+
+  // Extract the parameter t as f64
+  let t = match &args[0] {
+    Expr::Real(f) => *f,
+    Expr::Integer(n) => *n as f64,
+    Expr::FunctionCall { name: rn, args: ra }
+      if rn == "Rational" && ra.len() == 2 =>
+    {
+      if let (Expr::Integer(n), Expr::Integer(d)) = (&ra[0], &ra[1]) {
+        *n as f64 / *d as f64
+      } else {
+        return unevaluated("BezierFunction", func_args);
+      }
+    }
+    _ => {
+      // Symbolic t: return unevaluated
+      return unevaluated("BezierFunction", func_args);
+    }
+  };
+
+  // Extract control points from func_args[0] which should be a list of points
+  let Expr::List(points) = &func_args[0] else {
+    return unevaluated("BezierFunction", func_args);
+  };
+
+  if points.is_empty() {
+    return unevaluated("BezierFunction", func_args);
+  }
+
+  // Convert control points to Vec<Vec<f64>>
+  let mut ctrl_pts: Vec<Vec<f64>> = Vec::new();
+  for pt in points {
+    match pt {
+      Expr::List(coords) => {
+        let mut fcoords = Vec::new();
+        for c in coords {
+          match c {
+            Expr::Real(f) => fcoords.push(*f),
+            Expr::Integer(n) => fcoords.push(*n as f64),
+            Expr::FunctionCall { name: rn, args: ra }
+              if rn == "Rational" && ra.len() == 2 =>
+            {
+              if let (Expr::Integer(n), Expr::Integer(d)) = (&ra[0], &ra[1]) {
+                fcoords.push(*n as f64 / *d as f64);
+              } else {
+                return unevaluated("BezierFunction", func_args);
+              }
+            }
+            _ => {
+              return unevaluated("BezierFunction", func_args);
+            }
+          }
+        }
+        ctrl_pts.push(fcoords);
+      }
+      _ => {
+        return unevaluated("BezierFunction", func_args);
+      }
+    }
+  }
+
+  // De Casteljau's algorithm
+  let n = ctrl_pts.len();
+  let dim = ctrl_pts[0].len();
+  let mut work = ctrl_pts;
+  for r in 1..n {
+    for i in 0..n - r {
+      for d in 0..dim {
+        work[i][d] = (1.0 - t) * work[i][d] + t * work[i + 1][d];
+      }
+    }
+  }
+
+  Expr::List(work[0].iter().map(|&v| Expr::Real(v)).collect())
+}
+
+/// Knot span index `k` with `knots[k] <= u < knots[k+1]` (clamped at the
+/// right end), for `n+1` control points of degree `p`. Standard binary
+/// search from The NURBS Book.
+fn bspline_find_span(n: usize, p: usize, u: f64, knots: &[f64]) -> usize {
+  if u >= knots[n + 1] {
+    return n;
+  }
+  if u <= knots[p] {
+    return p;
+  }
+  let (mut low, mut high) = (p, n + 1);
+  let mut mid = usize::midpoint(low, high);
+  while u < knots[mid] || u >= knots[mid + 1] {
+    if u < knots[mid] {
+      high = mid;
+    } else {
+      low = mid;
+    }
+    mid = usize::midpoint(low, high);
+  }
+  mid
+}
+
+/// Evaluate a B-spline of degree `p` with the given `knots` and `ctrl` points
+/// at parameter `u`, using de Boor's algorithm.
+fn de_boor(p: usize, knots: &[f64], ctrl: &[Vec<f64>], u: f64) -> Vec<f64> {
+  let n = ctrl.len() - 1;
+  let dim = ctrl[0].len();
+  let span = bspline_find_span(n, p, u, knots);
+  let mut d: Vec<Vec<f64>> =
+    (0..=p).map(|j| ctrl[span - p + j].clone()).collect();
+  for r in 1..=p {
+    for j in (r..=p).rev() {
+      let i = j + span - p;
+      let denom = knots[i + 1 + p - r] - knots[i];
+      let alpha = if denom.abs() < 1e-12 {
+        0.0
+      } else {
+        (u - knots[i]) / denom
+      };
+      for c in 0..dim {
+        d[j][c] = (1.0 - alpha) * d[j - 1][c] + alpha * d[j][c];
+      }
+    }
+  }
+  d[p].clone()
+}
+
+/// Extract a numeric coordinate vector from a list expression.
+fn bspline_point_coords(e: &Expr) -> Option<Vec<f64>> {
+  match e {
+    Expr::List(coords) => coords
+      .iter()
+      .map(crate::functions::math_ast::try_eval_to_f64)
+      .collect(),
+    _ => None,
+  }
+}
+
+/// Evaluate the structured `BSplineFunction[...]` object at the supplied
+/// parameters (one per spline dimension). Curves take a single parameter and
+/// surfaces take two; the control points are evaluated via (tensor-product)
+/// de Boor. Non-numeric parameters leave the application unevaluated.
+fn evaluate_bspline_function(func_args: &[Expr], args: &[Expr]) -> Expr {
+  // When the spline can't be sampled (symbolic parameters, malformed form),
+  // echo the object applied to its parameters: `BSplineFunction[...][params]`.
+  let unevaluated = || Expr::CurriedCall {
+    func: Box::new(unevaluated("BSplineFunction", func_args)),
+    args: args.to_vec(),
+  };
+
+  let dim = match &func_args[0] {
+    Expr::Integer(d) => *d as usize,
+    _ => return unevaluated(),
+  };
+  if args.len() != dim {
+    return unevaluated();
+  }
+
+  // Parameters must be numeric to sample the spline.
+  let params: Option<Vec<f64>> = args
+    .iter()
+    .map(crate::functions::math_ast::try_eval_to_f64)
+    .collect();
+  let Some(params) = params else {
+    return unevaluated();
+  };
+
+  // Degrees, control net and knot vectors from the structured form.
+  let degrees: Vec<usize> = match &func_args[2] {
+    Expr::List(ds) => ds
+      .iter()
+      .filter_map(|d| match d {
+        Expr::Integer(n) => Some(*n as usize),
+        _ => None,
+      })
+      .collect(),
+    _ => return unevaluated(),
+  };
+  let net = match &func_args[4] {
+    Expr::List(slot) if !slot.is_empty() => &slot[0],
+    _ => return unevaluated(),
+  };
+  let knot_sets: Vec<Vec<f64>> = match &func_args[5] {
+    Expr::List(ks) => ks
+      .iter()
+      .map(|k| match k {
+        Expr::List(vs) => vs
+          .iter()
+          .map(crate::functions::math_ast::try_eval_to_f64)
+          .collect::<Option<Vec<f64>>>(),
+        _ => None,
+      })
+      .collect::<Option<Vec<_>>>()
+      .unwrap_or_default(),
+    _ => return unevaluated(),
+  };
+
+  if degrees.len() != dim || knot_sets.len() != dim {
+    return unevaluated();
+  }
+
+  let result = match dim {
+    1 => {
+      let ctrl: Option<Vec<Vec<f64>>> = match net {
+        Expr::List(pts) => pts.iter().map(bspline_point_coords).collect(),
+        _ => None,
+      };
+      let ctrl = match ctrl {
+        Some(c) if !c.is_empty() => c,
+        _ => return unevaluated(),
+      };
+      de_boor(degrees[0], &knot_sets[0], &ctrl, params[0])
+    }
+    2 => {
+      // Tensor-product surface: collapse the v-direction per row, then the
+      // u-direction across the resulting points.
+      let rows: Option<Vec<Vec<Vec<f64>>>> = match net {
+        Expr::List(rows) => rows
+          .iter()
+          .map(|row| match row {
+            Expr::List(pts) => {
+              pts.iter().map(bspline_point_coords).collect::<Option<_>>()
+            }
+            _ => None,
+          })
+          .collect(),
+        _ => None,
+      };
+      let rows = match rows {
+        Some(r) if !r.is_empty() && r.iter().all(|row| !row.is_empty()) => r,
+        _ => return unevaluated(),
+      };
+      let collapsed: Vec<Vec<f64>> = rows
+        .iter()
+        .map(|row| de_boor(degrees[1], &knot_sets[1], row, params[1]))
+        .collect();
+      de_boor(degrees[0], &knot_sets[0], &collapsed, params[0])
+    }
+    _ => return unevaluated(),
+  };
+
+  Expr::List(result.into_iter().map(Expr::Real).collect())
+}
+
+/// Apply TransformationFunction[matrix] to a point vector.
+/// The matrix is an (n+1)x(n+1) augmented matrix for affine transformation.
+/// Given point {x1, ..., xn}, computes matrix . {x1, ..., xn, 1} and returns
+/// the first n components.
+fn apply_transformation_function(
+  matrix: &Expr,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Ok(Expr::CurriedCall {
+      func: Box::new(call1("TransformationFunction", matrix.clone())),
+      args: args.to_vec(),
+    });
+  }
+  let point = &args[0];
+  let Expr::List(coords) = point else {
+    return Ok(Expr::CurriedCall {
+      func: Box::new(call1("TransformationFunction", matrix.clone())),
+      args: args.to_vec(),
+    });
+  };
+
+  let Expr::List(rows) = matrix else {
+    return Ok(Expr::CurriedCall {
+      func: Box::new(call1("TransformationFunction", matrix.clone())),
+      args: args.to_vec(),
+    });
+  };
+
+  let n = coords.len();
+  // Build homogeneous coordinate vector: {x1, ..., xn, 1}
+  let mut hom = coords.clone();
+  hom.push(Expr::Integer(1));
+
+  // Multiply: take first n rows, dot with homogeneous vector
+  let mut result = Vec::with_capacity(n);
+  for i in 0..n {
+    let Expr::List(row) = &rows[i] else {
+      return Ok(Expr::CurriedCall {
+        func: Box::new(call1("TransformationFunction", matrix.clone())),
+        args: args.to_vec(),
+      });
+    };
+    // Dot product of row with homogeneous vector
+    let dot = Expr::FunctionCall {
+      name: "Plus".to_string(),
+      args: row
+        .iter()
+        .zip(hom.iter())
+        .map(|(a, b)| call("Times", vec![a.clone(), b.clone()]))
+        .collect(),
+    };
+    result.push(evaluate_expr_to_expr(&dot)?);
+  }
+
+  // Homogeneous coordinate from the last row (rows[n]). For affine
+  // transforms this row is {0, ..., 0, 1}, so h = 1 and the division below is
+  // a no-op. For projective transforms (e.g. LinearFractionalTransform) the
+  // last row is {w1, ..., wn, b}, so h = w.point + b rescales the result.
+  if rows.len() > n
+    && let Expr::List(last) = &rows[n]
+    && last.len() == hom.len()
+  {
+    let h = evaluate_expr_to_expr(&Expr::FunctionCall {
+      name: "Plus".to_string(),
+      args: last
+        .iter()
+        .zip(hom.iter())
+        .map(|(a, b)| call("Times", vec![a.clone(), b.clone()]))
+        .collect(),
+    })?;
+    // Only rescale when the homogeneous coordinate is not the constant 1.
+    if !matches!(&h, Expr::Integer(1)) {
+      for comp in &mut result {
+        *comp = evaluate_expr_to_expr(&div2(comp.clone(), h.clone()))?;
+      }
+    }
+  }
+
+  Ok(Expr::List(result.into()))
+}

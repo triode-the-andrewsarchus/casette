@@ -1,0 +1,6 @@
+---
+source: tests/script_snapshot_tests.rs
+expression: stdout
+---
+
+Import::nffil: File file.ppm not found during Import.

@@ -1,0 +1,4701 @@
+use super::*;
+
+/// Report that an in-place modification has nothing to modify:
+/// `<Fn>::rvalue: <target> is not a variable with a value, so its value
+/// cannot be changed.` The target renders in OutputForm, so a string shows
+/// without its quotes, as wolframscript does.
+fn emit_rvalue(fname: &str, target: &Expr) {
+  crate::emit_message(&format!(
+    "{}::rvalue: {} is not a variable with a value, so its value cannot be \
+     changed.",
+    fname,
+    expr_to_output(target)
+  ));
+}
+
+/// A compound-assignment call target with its arguments evaluated:
+/// `f[1 + 1] += 2` reads and writes `f[2]`. Building it once keeps the
+/// "does the target have a value?" comparison honest — the target only
+/// counts as valueless when it evaluates back to exactly this form.
+fn evaluated_call_target(expr: &Expr) -> Result<Expr, InterpreterError> {
+  Ok(match expr {
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(evaluate_expr_to_expr)
+        .collect::<Result<Vec<_>, _>>()?
+        .into(),
+    },
+    Expr::CurriedCall { func, args } => Expr::CurriedCall {
+      func: Box::new(evaluated_call_target(func)?),
+      args: args
+        .iter()
+        .map(evaluate_expr_to_expr)
+        .collect::<Result<Vec<_>, _>>()?,
+    },
+    other => other.clone(),
+  })
+}
+
+thread_local! {
+  /// Symbols currently being looked up — prevents infinite recursion when
+  /// a stored OwnValue references the same symbol (e.g. `s = {a, s}`).
+  static SYMBOLS_BEING_EVALUATED:
+    std::cell::RefCell<std::collections::HashSet<String>> =
+      std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Does `expr` mention any Identifier (other than `self_name`) whose
+/// current stored OwnValue might produce a different result on
+/// re-evaluation? Used to skip wasteful re-evaluation of stored values
+/// that are already at fixpoint.
+/// Compare two operands as exact integers when both are `Integer` /
+/// `BigInteger`. f64 conversion silently rounds 1-ULP differences to
+/// a tie above ~2^53, so `2^60 < 2^60 + 1` would otherwise return
+/// False. Returns `None` if either side isn't an exact integer, in
+/// which case the f64 path takes over.
+fn exact_integer_ord(a: &Expr, b: &Expr) -> Option<std::cmp::Ordering> {
+  // Each side as an exact fraction with a positive denominator. Rationals are
+  // included so a value too small for an f64 still compares correctly: without
+  // this `10^-400 > 0` went through the f64 path, underflowed to 0.0 and
+  // answered False.
+  fn as_fraction(e: &Expr) -> Option<(BigInt, BigInt)> {
+    match e {
+      Expr::Integer(n) => Some((BigInt::from(*n), BigInt::from(1))),
+      Expr::BigInteger(n) => Some((n.clone(), BigInt::from(1))),
+      Expr::FunctionCall { name, args } if name == "Rational" => {
+        let [n, d] = args.as_slice() else { return None };
+        let (num, num_den) = as_fraction(n)?;
+        let (den, den_den) = as_fraction(d)?;
+        // Only a plain integer numerator and denominator make a Rational.
+        if num_den != BigInt::from(1) || den_den != BigInt::from(1) {
+          return None;
+        }
+        if num_traits::Zero::is_zero(&den) {
+          return None;
+        }
+        // Keep the denominator positive so cross-multiplication preserves
+        // the ordering.
+        if den < BigInt::from(0) {
+          Some((-num, -den))
+        } else {
+          Some((num, den))
+        }
+      }
+      _ => None,
+    }
+  }
+  let (an, ad) = as_fraction(a)?;
+  let (bn, bd) = as_fraction(b)?;
+  Some((an * bd).cmp(&(bn * ad)))
+}
+
+pub(super) fn needs_reevaluation(expr: &Expr, self_name: &str) -> bool {
+  match expr {
+    Expr::Identifier(n) => {
+      n != self_name && ENV.with(|e| e.borrow().contains_key(n))
+    }
+    Expr::List(items) => items.iter().any(|a| needs_reevaluation(a, self_name)),
+    // FunctionCall / BinaryOp / UnaryOp / CurriedCall stored via SetDelayed
+    // (`x := expr`) must be re-evaluated on each lookup — that is the whole
+    // point of `:=`. Set (`x = expr`) evaluates the RHS first, so the stored
+    // value would only be a FunctionCall when evaluation didn't reduce it
+    // (e.g. `x = Sin[a]` with `a` unbound); re-evaluating those on lookup is
+    // also the right behaviour (matches wolframscript: when `a` later gets a
+    // value, `x` picks it up).
+    Expr::FunctionCall { .. } => true,
+    Expr::BinaryOp { .. } => true,
+    Expr::UnaryOp { .. } => true,
+    Expr::CurriedCall { .. } => true,
+    // `line := lines[[i]]` reads the part afresh each time, like a call.
+    Expr::Part { .. } => true,
+    Expr::Comparison { .. } => true,
+    Expr::Rule {
+      pattern,
+      replacement,
+    }
+    | Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => {
+      needs_reevaluation(pattern, self_name)
+        || needs_reevaluation(replacement, self_name)
+    }
+    _ => false,
+  }
+}
+
+/// Check whether user-defined rules (DownValues, or upvalues installed via
+/// TagSetDelayed) are attached to the given head.
+fn has_user_rules(name: &str) -> bool {
+  crate::FUNC_DEFS.with(|m| m.borrow().contains_key(name))
+}
+
+/// Whether user-defined rules attached to `head` could apply to `args`.
+///
+/// An upvalue only fires when the symbol it is tagged on appears among the
+/// operands, so unrelated upvalues must not divert an operation from its
+/// built-in path (`Divide[37, 1.8]` stays a single IEEE division even while
+/// some `mytag` carries upvalues on Times). A plain DownValue on the head
+/// itself (`Unprotect[Times]; Times[x_, y_] := …`) has no such restriction and
+/// always counts.
+fn arith_rules_may_apply(head: &str, args: &[Expr]) -> bool {
+  let rule_count =
+    crate::FUNC_DEFS.with(|m| m.borrow().get(head).map_or(0, Vec::len));
+  if rule_count == 0 {
+    return false;
+  }
+  let tags_with_upvalues: Vec<String> = crate::UPVALUES.with(|m| {
+    m.borrow()
+      .iter()
+      .filter(|(_, entries)| entries.iter().any(|e| e.0 == head))
+      .map(|(tag, _)| tag.clone())
+      .collect()
+  });
+  let upvalue_count = crate::UPVALUES.with(|m| {
+    m.borrow()
+      .values()
+      .flatten()
+      .filter(|entry| entry.0 == head)
+      .count()
+  });
+  // More rules than accounted-for upvalues means at least one is a DownValue
+  // on the head; those can match anything.
+  if rule_count > upvalue_count {
+    return true;
+  }
+  args.iter().any(|arg| {
+    let arg_head = match arg {
+      Expr::FunctionCall { name, .. } => name.as_str(),
+      Expr::Identifier(s) => s.as_str(),
+      _ => return false,
+    };
+    tags_with_upvalues.iter().any(|tag| tag == arg_head)
+  })
+}
+
+/// `-a`, `a - b` and `a / b` are shorthand for `Times[-1, a]`,
+/// `Plus[a, Times[-1, b]]` and `Times[a, Power[b, -1]]`. When any head such a
+/// shorthand expands to carries user-defined rules (typically upvalues
+/// installed with TagSetDelayed), the expanded form has to be evaluated
+/// through the rule-aware function-call path so those rules get a chance to
+/// fire. Without it `mytag[3] - mytag[3]` collapses numerically to `0` instead
+/// of reaching the `mytag` upvalues via `mytag[3] + mytag[-3]` and producing
+/// `mytag[0]`.
+///
+/// Returns `None` when no such rule could apply (see `arith_rules_may_apply`),
+/// leaving the built-in arithmetic path in charge. `head` is `"Minus"`,
+/// `"Subtract"` or `"Divide"` with the matching arity; anything else is `None`.
+pub fn expand_arith_shorthand(
+  head: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  // The inner call wraps the last operand; the outer one combines the result
+  // with the remaining operand (absent for the unary `Minus`).
+  let (inner_head, outer_head) = match (head, args.len()) {
+    ("Minus", 1) => ("Times", None),
+    ("Subtract", 2) => ("Times", Some("Plus")),
+    ("Divide", 2) => ("Power", Some("Times")),
+    _ => return None,
+  };
+  if !arith_rules_may_apply(inner_head, args)
+    && !outer_head.is_some_and(|h| arith_rules_may_apply(h, args))
+  {
+    return None;
+  }
+  let last = args[args.len() - 1].clone();
+  let inner_args = if inner_head == "Power" {
+    [last, Expr::Integer(-1)]
+  } else {
+    [Expr::Integer(-1), last]
+  };
+  Some(
+    evaluate_function_call_ast(inner_head, &inner_args).and_then(|inner| {
+      match outer_head {
+        Some(outer) => {
+          evaluate_function_call_ast(outer, &[args[0].clone(), inner])
+        }
+        None => Ok(inner),
+      }
+    }),
+  )
+}
+
+/// Check if a function has a specific Hold attribute (built-in or user-defined).
+fn has_hold_attribute(name: &str, attr: u32) -> bool {
+  get_builtin_attributes(name).contains(attr)
+    || crate::func_attrs_contains(name, attr)
+}
+
+/// Whether `expr`'s head suppresses evaluation of the arguments it holds.
+/// Used to decide whether a subexpression pulled out of it has to be evaluated
+/// once it leaves the wrapper.
+pub(crate) fn head_holds_arguments(expr: &Expr) -> bool {
+  let Expr::FunctionCall { name, .. } = expr else {
+    return false;
+  };
+  use Attributes as A;
+  let attr = A::HoldAll | A::HoldAllComplete | A::HoldFirst | A::HoldRest;
+  has_hold_attribute(name, attr)
+}
+
+/// Whether `name` holds the argument at the 0-based position `index`.
+/// Mirrors the Hold-attribute logic of `evaluate_args_with_hold`, including
+/// its `Association` exception, for callers that walk arguments themselves
+/// (the tracing functions).
+pub(crate) fn holds_argument_at(name: &str, index: usize) -> bool {
+  use Attributes as A;
+  if has_hold_attribute(name, A::HoldAll)
+    || (name != "Association" && has_hold_attribute(name, A::HoldAllComplete))
+  {
+    return true;
+  }
+  if index == 0 {
+    has_hold_attribute(name, A::HoldFirst)
+  } else {
+    has_hold_attribute(name, A::HoldRest)
+  }
+}
+
+/// Evaluate function arguments respecting Hold attributes.
+/// Returns the evaluated (or held) arguments based on the function's attributes.
+/// Held arguments still honour `Evaluate[expr]`: it forces evaluation of the
+/// wrapped expression even though the surrounding head holds. HoldAllComplete
+/// is the exception — it suppresses Evaluate too.
+fn evaluate_args_with_hold(
+  name: &str,
+  args: &[Expr],
+) -> Result<Vec<Expr>, InterpreterError> {
+  // wolframscript reports HoldAllComplete on Association, but the kernel still
+  // builds the association from evaluated parts (`<|a -> <|b -> 1|>|>` nests a
+  // real association) — the attribute does not suppress evaluation there, so
+  // neither does it here.
+  use Attributes as A;
+  let hold_all_complete =
+    name != "Association" && has_hold_attribute(name, A::HoldAllComplete);
+  let hold_all = has_hold_attribute(name, A::HoldAll) || hold_all_complete;
+  let hold_first = has_hold_attribute(name, A::HoldFirst);
+  let hold_rest = has_hold_attribute(name, A::HoldRest);
+
+  let process_held = |arg: &Expr| -> Result<Expr, InterpreterError> {
+    if hold_all_complete {
+      Ok(arg.clone())
+    } else {
+      unwrap_top_level_evaluate(arg)
+    }
+  };
+
+  // HoldAllComplete keeps `Sequence[…]` un-spliced (Wolfram preserves the
+  // wrapper); other hold attributes still splice so multi-arg
+  // `Evaluate[…]` produces a flat sequence in the surrounding context.
+  let maybe_splice = |xs: Vec<Expr>| -> Vec<Expr> {
+    if hold_all_complete {
+      xs
+    } else {
+      splice_top_level_sequences(xs)
+    }
+  };
+  if hold_all {
+    let raw: Result<Vec<Expr>, _> = args.iter().map(process_held).collect();
+    Ok(maybe_splice(raw?))
+  } else if hold_first && !args.is_empty() {
+    let mut result = vec![process_held(&args[0])?];
+    for arg in &args[1..] {
+      result.push(evaluate_argument(arg)?);
+    }
+    Ok(maybe_splice(result))
+  } else if hold_rest && !args.is_empty() {
+    let mut result = vec![evaluate_argument(&args[0])?];
+    for arg in &args[1..] {
+      result.push(process_held(arg)?);
+    }
+    Ok(maybe_splice(result))
+  } else {
+    args.iter().map(evaluate_argument).collect::<Result<_, _>>()
+  }
+}
+
+/// Evaluate one non-held argument, honouring the rule that an `Unevaluated`
+/// wrapper *produced by* the evaluation is stripped and its content evaluated.
+///
+/// Wolfram keeps the wrapper only when `Unevaluated[…]` is written literally in
+/// the argument list (`{0, Unevaluated[1 + 1], 9}` stays as-is), but strips it
+/// as soon as it comes back out of a function: `If`, `Which`, `Switch`,
+/// `Module` and ordinary downvalues all give `{0, 1, 5, 9}` for
+/// `{0, If[True, Unevaluated[Sequence[1, 2 + 3]], {}], 9}`. That makes
+/// `Unevaluated[Sequence[…]]` the idiomatic way to splice a variable number of
+/// items into a list — common in Demonstrations, where a conditional adds
+/// several graphics primitives at once.
+///
+/// The one evaluation that does *not* strip it is applying a pure function
+/// whose body is literally `Unevaluated[…]`: `(Unevaluated[Sequence[#, #^2]]
+/// &)[3]` and `Function[u, Unevaluated[Sequence[1, 2]]][7]` both keep the
+/// wrapper in wolframscript (`{0, Unevaluated[Sequence[3, 3^2]], 9}`), the
+/// same way a literal `Unevaluated[…]` argument does — the substituted body
+/// *is* the argument's written form. A slot standing in for an already
+/// `Unevaluated` argument (`(# &)[Unevaluated[Sequence[1, 2]]]`) is a
+/// different body and still splices.
+fn evaluate_argument(arg: &Expr) -> Result<Expr, InterpreterError> {
+  let evaluated = evaluate_expr_to_expr(arg)?;
+  if matches!(arg, Expr::FunctionCall { name, .. } if name == "Unevaluated")
+    || applies_unevaluated_bodied_function(arg)
+  {
+    return Ok(evaluated);
+  }
+  match &evaluated {
+    Expr::FunctionCall { name, args }
+      if name == "Unevaluated" && args.len() == 1 =>
+    {
+      evaluate_expr_to_expr(&args[0])
+    }
+    _ => Ok(evaluated),
+  }
+}
+
+/// Is `arg` the application of a pure function (`body &`, `Function[…]`)
+/// whose body is a top-level `Unevaluated[…]`? Such a call answers with the
+/// wrapper intact, so the caller must not strip it — see `evaluate_argument`.
+fn applies_unevaluated_bodied_function(arg: &Expr) -> bool {
+  let body = match arg {
+    Expr::CurriedCall { func, .. } => match &**func {
+      Expr::Function { body } => Some(&**body),
+      Expr::NamedFunction { body, .. } => Some(&**body),
+      // `Function[u, body]` / `Function[body]` written out in head form.
+      Expr::FunctionCall { name, args }
+        if name == "Function" && (1..=2).contains(&args.len()) =>
+      {
+        args.last()
+      }
+      _ => None,
+    },
+    _ => None,
+  };
+  matches!(body, Some(Expr::FunctionCall { name, args })
+    if name == "Unevaluated" && args.len() == 1)
+}
+
+/// If `expr` is `Unevaluated[inner]`, return `inner`; otherwise return `expr`
+/// unchanged. Used by select built-ins (Length, Sqrt, etc.) that consume
+/// the Unevaluated wrapper before computing.
+pub fn strip_unevaluated(expr: &Expr) -> Expr {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Unevaluated"
+    && args.len() == 1
+  {
+    return args[0].clone();
+  }
+  expr.clone()
+}
+
+/// If `arg` is `Evaluate[expr]`, evaluate `expr`. Otherwise return `arg`
+/// unchanged. (Only the top-level Evaluate is unwrapped — nested calls
+/// keep their normal evaluation rules.) Multi-argument
+/// `Evaluate[a, b, …]` becomes `Sequence[a-evaluated, b-evaluated, …]`,
+/// which the caller splices into the surrounding args.
+fn unwrap_top_level_evaluate(arg: &Expr) -> Result<Expr, InterpreterError> {
+  if let Expr::FunctionCall { name, args } = arg
+    && name == "Evaluate"
+  {
+    if args.len() == 1 {
+      return evaluate_expr_to_expr(&args[0]);
+    }
+    let evaluated: Result<Vec<Expr>, _> =
+      args.iter().map(evaluate_expr_to_expr).collect();
+    return Ok(call("Sequence", evaluated?));
+  }
+  Ok(arg.clone())
+}
+
+/// Splice any top-level `Sequence[...]` elements in `args` into the list.
+/// Required so that `Hold[Evaluate[1, 2]]` flattens to `Hold[1, 2]` (the
+/// `Evaluate` produces a `Sequence` that gets spliced into Hold's args).
+fn splice_top_level_sequences(args: Vec<Expr>) -> Vec<Expr> {
+  let mut out = Vec::with_capacity(args.len());
+  for a in args {
+    if let Expr::FunctionCall { name, args: inner } = &a
+      && name == "Sequence"
+    {
+      out.extend(inner.iter().cloned());
+    } else {
+      out.push(a);
+    }
+  }
+  out
+}
+
+/// Helper to construct an RGBColor Expr from numeric values.
+/// Uses Integer for whole numbers (0, 1) and Real for fractional values.
+fn rgb_color_expr(r: f64, g: f64, b: f64) -> Expr {
+  fn num(v: f64) -> Expr {
+    if v == 0.0 {
+      Expr::Integer(0)
+    } else if v == 1.0 {
+      Expr::Integer(1)
+    } else {
+      Expr::Real(v)
+    }
+  }
+  call("RGBColor", vec![num(r), num(g), num(b)])
+}
+
+/// Helper to construct a GrayLevel Expr.
+fn gray_level_expr(g: f64) -> Expr {
+  fn num(v: f64) -> Expr {
+    if v == 0.0 {
+      Expr::Integer(0)
+    } else if v == 1.0 {
+      Expr::Integer(1)
+    } else {
+      Expr::Real(v)
+    }
+  }
+  call1("GrayLevel", num(g))
+}
+
+/// Map named color identifiers to their Wolfram Language evaluation result.
+/// Basic colors → RGBColor[r, g, b] or GrayLevel[g]
+/// Light* colors → RGBColor[r, g, b] or GrayLevel[g]
+pub fn named_color_expr(name: &str) -> Option<Expr> {
+  Some(match name {
+    // Basic colors
+    "Red" => rgb_color_expr(1.0, 0.0, 0.0),
+    "Green" => rgb_color_expr(0.0, 1.0, 0.0),
+    "Blue" => rgb_color_expr(0.0, 0.0, 1.0),
+    "Black" => gray_level_expr(0.0),
+    "White" => gray_level_expr(1.0),
+    "Gray" => gray_level_expr(0.5),
+    "Cyan" => rgb_color_expr(0.0, 1.0, 1.0),
+    "Magenta" => rgb_color_expr(1.0, 0.0, 1.0),
+    "Yellow" => rgb_color_expr(1.0, 1.0, 0.0),
+    "Brown" => rgb_color_expr(0.6, 0.4, 0.2),
+    "Orange" => rgb_color_expr(1.0, 0.5, 0.0),
+    "Pink" => rgb_color_expr(1.0, 0.5, 0.5),
+    "Purple" => rgb_color_expr(0.5, 0.0, 0.5),
+    // Light colors
+    "LightRed" => rgb_color_expr(1.0, 0.85, 0.85),
+    "LightBlue" => rgb_color_expr(0.87, 0.94, 1.0),
+    "LightGreen" => rgb_color_expr(0.88, 1.0, 0.88),
+    "LightGray" => gray_level_expr(0.85),
+    "LightOrange" => rgb_color_expr(1.0, 0.9, 0.8),
+    "LightYellow" => rgb_color_expr(1.0, 1.0, 0.85),
+    "LightPurple" => rgb_color_expr(0.94, 0.88, 0.94),
+    "LightCyan" => rgb_color_expr(0.9, 1.0, 1.0),
+    "LightMagenta" => rgb_color_expr(1.0, 0.9, 1.0),
+    "LightBrown" => rgb_color_expr(0.94, 0.91, 0.88),
+    "LightPink" => rgb_color_expr(1.0, 0.925, 0.925),
+    _ => return None,
+  })
+}
+
+/// Map the shorthand line-style directives to the expression they evaluate
+/// to. `Thick` is `Thickness[Large]`, `Dotted` is `Dashing[{0, Small}]`, and
+/// so on — the same relationship [`named_color_expr`] captures for colors.
+pub fn style_directive_expr(name: &str) -> Option<Expr> {
+  let thickness =
+    |size: &str| call1("Thickness", Expr::Identifier(size.to_string()));
+  let small = || id_expr("Small");
+  let dashing =
+    |segments: Vec<Expr>| call1("Dashing", Expr::List(segments.into()));
+  Some(match name {
+    "Thick" => thickness("Large"),
+    "Thin" => thickness("Tiny"),
+    "Dashed" => dashing(vec![small(), small()]),
+    "Dotted" => dashing(vec![Expr::Integer(0), small()]),
+    "DotDashed" => dashing(vec![Expr::Integer(0), small(), small(), small()]),
+    _ => return None,
+  })
+}
+
+/// Find the index of a Label[tag] in a list of expressions where `tag` matches `goto_tag`.
+/// Both the goto tag and each label's tag are compared after evaluation,
+/// since neither Goto nor Label has HoldAll.
+pub fn find_label_index(exprs: &[Expr], goto_tag: &Expr) -> Option<usize> {
+  let tag_str = expr_to_string(goto_tag);
+  for (i, expr) in exprs.iter().enumerate() {
+    if let Expr::FunctionCall { name, args } = expr
+      && name == "Label"
+      && args.len() == 1
+    {
+      // Evaluate the label's tag to match Goto's evaluated tag
+      let label_tag =
+        evaluate_expr_to_expr(&args[0]).unwrap_or_else(|_| args[0].clone());
+      if expr_to_string(&label_tag) == tag_str {
+        return Some(i);
+      }
+    }
+  }
+  None
+}
+
+/// Prepare arguments for iterating functions (Sum, Product, NSum).
+/// The body (args[0]) is kept unevaluated to preserve the iteration variable.
+/// Iterator specs (args[1..]) have their bounds evaluated but variable names preserved.
+fn prepare_iterating_function_args(
+  args: &[Expr],
+) -> Result<Vec<Expr>, InterpreterError> {
+  let mut result = Vec::new();
+
+  // Body stays unevaluated
+  result.push(args[0].clone());
+
+  // Process iterator specs
+  for arg in &args[1..] {
+    if let Expr::List(items) = arg {
+      if items.is_empty() {
+        result.push(arg.clone());
+        continue;
+      }
+      let mut new_items = Vec::new();
+      // First element is the variable name — keep unevaluated
+      new_items.push(items[0].clone());
+      // Remaining elements are bounds — evaluate them
+      for item in &items[1..] {
+        new_items.push(evaluate_expr_to_expr(item)?);
+      }
+      result.push(Expr::List(new_items.into()));
+    } else {
+      result.push(evaluate_expr_to_expr(arg)?);
+    }
+  }
+
+  Ok(result)
+}
+
+/// Early dispatch for FunctionCall in evaluate_expr_to_expr — handles held functions
+/// before argument evaluation. Returns Some(result) if handled, None otherwise.
+#[inline(never)]
+fn evaluate_expr_to_expr_early_dispatch(
+  name: &str,
+  args: &[Expr],
+) -> Result<Option<Expr>, InterpreterError> {
+  match name {
+    "Protect" | "Unprotect" | "Condition" | "MessageName" | "Attributes" => {
+      return Ok(Some(evaluate_function_call_ast(name, args)?));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "Save" if args.len() == 2 => {
+      // HoldRest: evaluate first arg (filename), hold second (symbols)
+      let filename_expr = evaluate_expr_to_expr(&args[0])?;
+      return Ok(Some(evaluate_function_call_ast(
+        name,
+        &[filename_expr, args[1].clone()],
+      )?));
+    }
+    "CompoundExpression" => {
+      if args.is_empty() {
+        return Ok(Some(null_expr()));
+      }
+      let mut result = null_expr();
+      let mut start_index = 0;
+      'goto_loop: loop {
+        // `start_index` is reassigned on a Goto and only takes effect on the
+        // next `'goto_loop` pass, which is exactly the intent.
+        #[allow(clippy::mut_range_bound)]
+        for i in start_index..args.len() {
+          match evaluate_expr_to_expr(&args[i]) {
+            Ok(val) => {
+              // A `Return[val]` produced by Block/Module/While/For
+              // short-circuits the remaining statements — matching
+              // wolframscript's CompoundExpression behavior.
+              if let Expr::FunctionCall { name: n, args: a } = &val
+                && n == "Return"
+                && a.len() == 1
+              {
+                return Ok(Some(val));
+              }
+              result = val;
+            }
+            Err(InterpreterError::GotoSignal(tag)) => {
+              if let Some(label_idx) = find_label_index(args, &tag) {
+                start_index = label_idx + 1;
+                continue 'goto_loop;
+              }
+              return Err(InterpreterError::GotoSignal(tag));
+            }
+            Err(e) => return Err(e),
+          }
+        }
+        break;
+      }
+      // If the final value is a `Sequence[...]`, splice and take the last
+      // spliced element — wolframscript yields `2` for
+      // `a; Sequence[1, 2]`, not the whole Sequence. Empty sequences
+      // collapse to Null.
+      if let Expr::FunctionCall {
+        name: n,
+        args: seq_args,
+      } = &result
+        && n == "Sequence"
+      {
+        result = seq_args.last().cloned().unwrap_or_else(null_expr);
+      }
+      return Ok(Some(result));
+    }
+    "Pattern" if args.len() == 2 => {
+      return Ok(Some(evaluate_pattern_function_ast(args)?));
+    }
+    "RuleDelayed" if args.len() == 2 => {
+      return Ok(Some(evaluate_rule_delayed_ast(args)?));
+    }
+    "AbsoluteTiming" | "Timing" if args.len() == 1 => {
+      let start = web_time::Instant::now();
+      let result = evaluate_expr_to_expr(&args[0])?;
+      let elapsed = start.elapsed().as_secs_f64();
+      return Ok(Some(Expr::List(vec![Expr::Real(elapsed), result].into())));
+    }
+    "RepeatedTiming" if args.len() == 1 => {
+      let mut times = Vec::new();
+      let mut last_result = null_expr();
+      let overall_start = web_time::Instant::now();
+      for _ in 0..100 {
+        let start = web_time::Instant::now();
+        last_result = evaluate_expr_to_expr(&args[0])?;
+        times.push(start.elapsed().as_secs_f64());
+        if times.len() >= 3 && overall_start.elapsed().as_secs_f64() > 0.5 {
+          break;
+        }
+      }
+      times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+      let median = times[times.len() / 2];
+      return Ok(Some(Expr::List(
+        vec![Expr::Real(median), last_result].into(),
+      )));
+    }
+    "Sum" | "ParallelSum" if args.len() >= 2 => {
+      let prepared = prepare_iterating_function_args(args)?;
+      return Ok(Some(crate::functions::list_helpers_ast::sum_ast(
+        &prepared,
+      )?));
+    }
+    "Product" | "ParallelProduct" if args.len() >= 2 => {
+      let prepared = prepare_iterating_function_args(args)?;
+      return Ok(Some(crate::functions::list_helpers_ast::product_ast(
+        &prepared,
+      )?));
+    }
+    "NSum" if args.len() >= 2 => {
+      let prepared = prepare_iterating_function_args(args)?;
+      return Ok(Some(crate::functions::math_ast::nsum_ast(&prepared)?));
+    }
+    "NProduct" if args.len() >= 2 => {
+      let prepared = prepare_iterating_function_args(args)?;
+      return Ok(Some(crate::functions::math_ast::nproduct_ast(&prepared)?));
+    }
+    _ => {}
+  }
+  Ok(None)
+}
+
+/// Whether an expression is a valid rules slot for ReplaceAll /
+/// ReplaceRepeated: a single Rule/RuleDelayed, or a (possibly nested)
+/// list of such rules. Anything else triggers ReplaceAll::reps in
+/// Wolfram.
+fn is_valid_replace_rules(expr: &Expr) -> bool {
+  match expr {
+    Expr::Rule { .. } | Expr::RuleDelayed { .. } => true,
+    Expr::FunctionCall { name, .. }
+      if name == "Rule" || name == "RuleDelayed" =>
+    {
+      true
+    }
+    Expr::List(items) => items.iter().all(is_valid_replace_rules),
+    // An Association is accepted anywhere a list of rules is expected: it
+    // behaves as if it were the list of its key -> value pairs.
+    Expr::Association(_) => true,
+    _ => false,
+  }
+}
+
+/// Emit the `reps` message for a replacement-rules argument that is neither a
+/// rule, a list of rules, nor a dispatch table, and report whether it did.
+///
+/// wolframscript shows the offending argument as a list of rules, so a bare
+/// rule is displayed wrapped in braces while one that is already a list is
+/// shown as is.
+/// Whether `expr` is a literal `Return[val]` — what `Block`, `Module`, `While`
+/// and `For` hand back when a `Return` unwinds out of them. Wolfram lets such
+/// a `Return` keep travelling up through `CompoundExpression` and the loops
+/// until a definition body consumes it, so every one of those boundaries has
+/// to recognise it.
+pub(crate) fn is_literal_return(expr: &Expr) -> bool {
+  matches!(expr, Expr::FunctionCall { name, args }
+    if name == "Return" && args.len() == 1)
+}
+
+pub(crate) fn reject_invalid_replace_rules(head: &str, rules: &Expr) -> bool {
+  if is_valid_replace_rules(rules) {
+    return false;
+  }
+  let shown = match rules {
+    Expr::List(_) => expr_to_output(rules),
+    _ => format!("{{{}}}", expr_to_output(rules)),
+  };
+  crate::emit_message(&format!(
+    "{head}::reps: {shown} is neither a list of replacement rules nor a \
+     valid dispatch table and so cannot be used for replacing."
+  ));
+  true
+}
+
+/// Evaluate `expr` for its value, at a boundary a `Return` does not cross.
+///
+/// Wolfram only lets a `Return` out of a definition body, `Do` and `Scan`;
+/// a `Table` body or a pure function applied to an argument keeps it, so
+/// `Table[Return[1], {2}]` is `{Return[1], Return[1]}` and not `1`. Woxi
+/// raises `Return` as a signal, so those boundaries turn it back into the
+/// expression it names — the same wrapping `Module` and `Block` already do.
+pub fn evaluate_value(expr: &Expr) -> Result<Expr, InterpreterError> {
+  match evaluate_expr_to_expr(expr) {
+    Err(InterpreterError::ReturnValue(val)) => Ok(call1("Return", *val)),
+    other => other,
+  }
+}
+
+/// Evaluate an Expr AST and return a new Expr (not a string).
+/// This is the core function for AST-based evaluation without string round-trips.
+pub fn evaluate_expr_to_expr(expr: &Expr) -> Result<Expr, InterpreterError> {
+  // Dynamically grow the stack when running low. This prevents stack
+  // overflows in debug builds where the massive evaluate_function_call_ast_inner
+  // function uses large stack frames.  The 2 MB red zone triggers a 4 MB
+  // growth so that even deep user-defined recursion (e.g. naive Fibonacci,
+  // n-queens) succeeds regardless of the initial thread stack size.
+  stacker::maybe_grow(2 * 1024 * 1024, 4 * 1024 * 1024, || {
+    evaluate_expr_to_expr_impl(expr)
+  })
+}
+
+fn evaluate_expr_to_expr_impl(expr: &Expr) -> Result<Expr, InterpreterError> {
+  // A terminated evaluation stays terminated: nothing new is evaluated until
+  // the top level clears the latch (see `crate::start_termination`).
+  if let Some(tag) = crate::termination_in_flight() {
+    return Err(InterpreterError::Terminated(tag));
+  }
+
+  // $RecursionLimit enforcement: prevent infinite recursion from
+  // user-defined functions. Exceeding the limit terminates the whole
+  // evaluation, which the top level reports as
+  // `TerminatedEvaluation[RecursionLimit]`.
+  let depth = crate::RECURSION_DEPTH.with(|d| {
+    let cur = d.get();
+    d.set(cur + 1);
+    cur
+  });
+  struct DepthGuard;
+  impl Drop for DepthGuard {
+    fn drop(&mut self) {
+      crate::RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+  }
+  let _guard = DepthGuard;
+
+  // Reading `$RecursionLimit` out of the environment costs a hash lookup, so
+  // it only happens once the depth passes the smallest limit Wolfram accepts
+  // for the variable (20); shallower evaluations can never exceed any limit.
+  const MIN_SETTABLE_RECURSION_LIMIT: usize = 20;
+  if depth > MIN_SETTABLE_RECURSION_LIMIT {
+    let limit = crate::recursion_limit();
+    if depth > limit {
+      return Err(crate::recursion_limit_exceeded(limit));
+    }
+  }
+
+  // Trampoline loop: tail-recursive calls return TailCall instead of
+  // recursing, so the call stack stays flat regardless of recursion depth.
+  // The vast majority of evaluations don't return TailCall, so avoid the
+  // up-front Expr::clone() and only allocate the owned `current` once a
+  // TailCall is actually observed.
+  match evaluate_expr_to_expr_inner(expr) {
+    Err(InterpreterError::TailCall(next)) => {
+      let mut current = *next;
+      loop {
+        match evaluate_expr_to_expr_inner(&current) {
+          Err(InterpreterError::TailCall(next)) => current = *next,
+          result => return result,
+        }
+      }
+    }
+    result => result,
+  }
+}
+
+pub fn evaluate_expr_to_expr_inner(
+  expr: &Expr,
+) -> Result<Expr, InterpreterError> {
+  match expr {
+    Expr::Integer(n) => Ok(Expr::Integer(*n)),
+    Expr::BigInteger(n) => Ok(Expr::BigInteger(n.clone())),
+    Expr::Real(f) => Ok(Expr::Real(*f)),
+    Expr::BigFloat(d, p) => Ok(Expr::BigFloat(d.clone(), *p)),
+    Expr::String(s) => Ok(Expr::String(s.clone())),
+    Expr::Identifier(name) => {
+      // A qualified spelling of a system variable reads through to the one
+      // Woxi actually keeps (`System`Private`$InputFileName` → `$InputFileName`).
+      if let Some(plain) =
+        crate::evaluator::listable::system_variable_alias(name)
+      {
+        return evaluate_expr_to_expr(&Expr::Identifier(plain.to_string()));
+      }
+      // Look up in environment
+      if let Some(stored) = ENV.with(|e| e.borrow().get(name).cloned()) {
+        match stored {
+          // Re-evaluate the stored value so that later changes to free
+          // symbols propagate, matching Wolfram's OwnValues semantics
+          // (`z = 1 + x; x = 2; z` returns 3). Only re-evaluate when the
+          // stored expression mentions a free Identifier that itself has
+          // a stored value — otherwise the stored value is already at
+          // fixpoint and re-evaluating is wasted work (plus risks
+          // quadratic blowup for growing lists like `k = {k, 1}`).
+          StoredValue::ExprVal(e) => {
+            // `a /; cond := body` stored the OwnValue as
+            // `Condition[body, cond]` so the guard can be re-checked at
+            // lookup time. Evaluate the test; if it isn't True the rule
+            // doesn't fire and the symbol returns as itself.
+            if let Expr::FunctionCall {
+              name: cond_name,
+              args: cond_args,
+            } = &e
+              && cond_name == "Condition"
+              && cond_args.len() == 2
+            {
+              let test_eval = evaluate_expr_to_expr(&cond_args[1]);
+              let passes = matches!(
+                test_eval,
+                Ok(Expr::Identifier(ref s)) if s == "True"
+              );
+              if !passes {
+                return Ok(Expr::Identifier(name.clone()));
+              }
+              return evaluate_expr_to_expr(&cond_args[0]);
+            }
+            if matches!(&e, Expr::Identifier(s) if s == name) {
+              return Ok(e);
+            }
+            if !needs_reevaluation(&e, name) {
+              return Ok(e);
+            }
+            let already =
+              SYMBOLS_BEING_EVALUATED.with(|s| s.borrow().contains(name));
+            if already {
+              return Ok(e);
+            }
+            SYMBOLS_BEING_EVALUATED
+              .with(|s| s.borrow_mut().insert(name.clone()));
+            let result = evaluate_expr_to_expr(&e);
+            SYMBOLS_BEING_EVALUATED.with(|s| s.borrow_mut().remove(name));
+            result
+          }
+          StoredValue::Raw(val) => {
+            // Parse the stored value back to Expr. If the parsed result is
+            // itself a free symbol bound to another value (e.g. `a = b;
+            // b = 4` stored a as Raw("b")), recursively evaluate so the
+            // chain resolves all the way through.
+            let parsed = string_to_expr(&val)?;
+            if matches!(&parsed, Expr::Identifier(s) if s == name) {
+              return Ok(parsed);
+            }
+            if !needs_reevaluation(&parsed, name) {
+              return Ok(parsed);
+            }
+            let already =
+              SYMBOLS_BEING_EVALUATED.with(|s| s.borrow().contains(name));
+            if already {
+              return Ok(parsed);
+            }
+            SYMBOLS_BEING_EVALUATED
+              .with(|s| s.borrow_mut().insert(name.clone()));
+            let result = evaluate_expr_to_expr(&parsed);
+            SYMBOLS_BEING_EVALUATED.with(|s| s.borrow_mut().remove(name));
+            result
+          }
+          StoredValue::Association(items) => {
+            // Convert stored association back to Expr::Association
+            let expr_items: Vec<(Expr, Expr)> = items
+              .into_iter()
+              .map(|(k, v)| {
+                let key_expr = string_to_expr(&k).unwrap_or(Expr::String(k));
+                (key_expr, v)
+              })
+              .collect();
+            Ok(Expr::Association(expr_items))
+          }
+        }
+      } else {
+        #[cfg(not(target_arch = "wasm32"))]
+        if name == "Now" {
+          use chrono::Local;
+          let now = Local::now();
+          let seconds = now
+            .format("%S%.f")
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+          let tz_offset_hours = now.offset().local_minus_utc() as f64 / 3600.0;
+          return Ok(Expr::FunctionCall {
+            name: "DateObject".to_string(),
+            args: vec![
+              Expr::List(
+                vec![
+                  Expr::Integer(
+                    now.format("%Y").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Integer(
+                    now.format("%m").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Integer(
+                    now.format("%d").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Integer(
+                    now.format("%H").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Integer(
+                    now.format("%M").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Real(seconds),
+                ]
+                .into(),
+              ),
+              Expr::String("Instant".to_string()),
+              Expr::String("Gregorian".to_string()),
+              Expr::Real(tz_offset_hours),
+            ]
+            .into(),
+          });
+        }
+        #[cfg(target_arch = "wasm32")]
+        if name == "Now" {
+          let now = js_sys::Date::new_0();
+          let seconds =
+            now.get_seconds() as f64 + now.get_milliseconds() as f64 / 1000.0;
+          let tz_offset_hours = -(now.get_timezone_offset() / 60.0);
+          return Ok(Expr::FunctionCall {
+            name: "DateObject".to_string(),
+            args: vec![
+              Expr::List(
+                vec![
+                  Expr::Integer(now.get_full_year() as i128),
+                  Expr::Integer((now.get_month() + 1) as i128),
+                  Expr::Integer(now.get_date() as i128),
+                  Expr::Integer(now.get_hours() as i128),
+                  Expr::Integer(now.get_minutes() as i128),
+                  Expr::Real(seconds),
+                ]
+                .into(),
+              ),
+              Expr::String("Instant".to_string()),
+              Expr::String("Gregorian".to_string()),
+              Expr::Real(tz_offset_hours),
+            ]
+            .into(),
+          });
+        }
+        // Handle Today/Tomorrow/Yesterday → DateObject[{y, m, d}, Day]
+        #[cfg(not(target_arch = "wasm32"))]
+        if name == "Today" || name == "Tomorrow" || name == "Yesterday" {
+          use chrono::{Duration, Local};
+          let now = Local::now();
+          let date = match name.as_str() {
+            "Tomorrow" => now + Duration::days(1),
+            "Yesterday" => now - Duration::days(1),
+            _ => now,
+          };
+          return Ok(Expr::FunctionCall {
+            name: "DateObject".to_string(),
+            args: vec![
+              Expr::List(
+                vec![
+                  Expr::Integer(
+                    date.format("%Y").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Integer(
+                    date.format("%m").to_string().parse::<i128>().unwrap(),
+                  ),
+                  Expr::Integer(
+                    date.format("%d").to_string().parse::<i128>().unwrap(),
+                  ),
+                ]
+                .into(),
+              ),
+              Expr::String("Day".to_string()),
+            ]
+            .into(),
+          });
+        }
+        #[cfg(target_arch = "wasm32")]
+        if name == "Today" || name == "Tomorrow" || name == "Yesterday" {
+          let now = js_sys::Date::new_0();
+          let offset_days: i32 = match name.as_str() {
+            "Tomorrow" => 1,
+            "Yesterday" => -1,
+            _ => 0,
+          };
+          let ms = now.get_time() + (offset_days as f64) * 86_400_000.0;
+          let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
+          return Ok(Expr::FunctionCall {
+            name: "DateObject".to_string(),
+            args: vec![
+              Expr::List(
+                vec![
+                  Expr::Integer(d.get_full_year() as i128),
+                  Expr::Integer((d.get_month() + 1) as i128),
+                  Expr::Integer(d.get_date() as i128),
+                ]
+                .into(),
+              ),
+              Expr::String("Day".to_string()),
+            ]
+            .into(),
+          });
+        }
+        // Handle system $ variables (both unqualified `$Foo` and
+        // System-context-qualified `System`$Foo` forms).
+        if name.starts_with('$')
+          && let Some(val) = get_system_variable(name)
+        {
+          return Ok(val);
+        }
+        if let Some(short) = name.strip_prefix("System`")
+          && short.starts_with('$')
+          && let Some(val) = get_system_variable(short)
+        {
+          return Ok(val);
+        }
+        // Handle named colors (Red → RGBColor[1, 0, 0], etc.)
+        if let Some(color_expr) = named_color_expr(name) {
+          return Ok(color_expr);
+        }
+        // Thick → Thickness[Large], Dashed → Dashing[{Small, Small}], …
+        if let Some(style_expr) = style_directive_expr(name) {
+          return Ok(style_expr);
+        }
+        // Reading a name that spells its context out brings that context
+        // into being — `Contexts["a`*"]` lists `a`` after a bare `a`foo`.
+        crate::evaluator::contexts::note_qualified_symbol(name);
+        // Return as symbolic identifier
+        Ok(Expr::Identifier(name.clone()))
+      }
+    }
+    Expr::Slot(n) => {
+      // Slots should be replaced before evaluation
+      Ok(Expr::Slot(*n))
+    }
+    Expr::SlotSequence(n) => Ok(Expr::SlotSequence(*n)),
+    Expr::Constant(name) => {
+      // After `Unprotect[c]; c = value`, the user has reassigned the
+      // built-in constant. Honour the new OwnValue if one was stored —
+      // matching wolframscript's `Unprotect[Pi]; Pi = 3; Pi → 3`.
+      if let Some(stored) = ENV.with(|e| e.borrow().get(name).cloned()) {
+        match stored {
+          StoredValue::Raw(val) => return string_to_expr(&val),
+          StoredValue::ExprVal(e) => return Ok(e),
+          StoredValue::Association(_) => {}
+        }
+      }
+      Ok(Expr::Constant(name.clone()))
+    }
+    Expr::List(items) => {
+      let mut evaluated: Vec<Expr> = Vec::with_capacity(items.len());
+      // Snapshot FUNC_DEFS state before evaluation so we can detect
+      // whether any list element added or removed DownValues. Wolfram's
+      // evaluator iterates each expression to a fixed point; if a later
+      // element introduces a rule, earlier elements that didn't match
+      // before are re-evaluated against the new rule.
+      //
+      // The key insight: we only need to detect *whether* the rule set
+      // changed, not collect the names. Comparing FUNC_DEFS length
+      // before/after is O(1); only when the length differs do we need
+      // the full re-evaluation pass. Length-equal-but-different (a
+      // remove + insert of the same name) doesn't happen via normal
+      // element evaluation, so the cheap check is sufficient.
+      let len_before = crate::FUNC_DEFS.with(|m| m.borrow().len());
+      for item in items {
+        let val = evaluate_argument(item)?;
+        crate::evaluator::listable::push_list_element(&mut evaluated, val);
+      }
+      // If any new DownValues were introduced during element evaluation,
+      // re-evaluate the elements once so that earlier items pick up
+      // rules defined by later items (matches wolframscript:
+      // `{F[a, b], F[x__]:=H[x]; F[a,b], F=.; F[a,b]}` →
+      // `{H[a, b], H[a, b], H[a, b]}`). Limited to one re-evaluation pass
+      // to avoid infinite loops; deeper fixed-point semantics would need
+      // pervasive iteration in the evaluator itself.
+      let len_after = crate::FUNC_DEFS.with(|m| m.borrow().len());
+      if len_after != len_before {
+        let mut re_eval: Vec<Expr> = Vec::with_capacity(evaluated.len());
+        for item in &evaluated {
+          re_eval.push(evaluate_expr_to_expr(item)?);
+        }
+        return Ok(Expr::List(re_eval.into()));
+      }
+      // A tagged rule can hang on `List` as readily as on `Plus`:
+      // `obj /: {obj, x_} = 3` makes `{obj, 7}` evaluate to 3. Only a rule
+      // that could actually apply diverts the list from being itself.
+      if arith_rules_may_apply("List", &evaluated) {
+        return evaluate_function_call_ast("List", &evaluated);
+      }
+      Ok(Expr::List(evaluated.into()))
+    }
+    Expr::FunctionCall { name, args } => {
+      // Track function calls on the evaluation stack for stack traces.
+      crate::push_eval_stack(name);
+      // A literal `Sequence[…]` argument splices into the enclosing call
+      // before anything else happens — flattening is part of building the
+      // expression, not of evaluating the argument, so it applies through
+      // holds too (`Hold[Sequence[1, 2]]` is `Hold[1, 2]`). Heads carrying
+      // `SequenceHold` (`Set`, `Rule`, …) opt out. Doing it here, ahead of
+      // the held-head special cases below, is what makes
+      // `If[i != 2, i, Sequence[]]` reduce to `If[i != 2, i]` — and hence
+      // to `Null` when the test fails — instead of returning the empty
+      // sequence for the surrounding list to swallow.
+      // The `Sequence`/`Splice` head scan comes first so that the common
+      // call — no splice among the arguments — costs one `matches!` per
+      // argument and never looks the head's attributes up.
+      let flattened_args: Option<crate::ExprList> = if args.iter().any(|a| {
+        matches!(a, Expr::FunctionCall { name: n, .. }
+          if n == "Sequence" || n == "Splice")
+      }) {
+        match crate::evaluator::listable::flatten_sequences(name, args) {
+          std::borrow::Cow::Borrowed(_) => None,
+          std::borrow::Cow::Owned(spliced) => Some(spliced.into()),
+        }
+      } else {
+        None
+      };
+      let args: &crate::ExprList = flattened_args.as_ref().unwrap_or(args);
+      let result: Result<Expr, InterpreterError> = (|| {
+        // Special handling for If - lazy evaluation of branches
+        if name == "If" && (args.len() == 2 || args.len() == 3) {
+          let cond = evaluate_expr_to_expr(&args[0])?;
+          if matches!(&cond, Expr::Identifier(s) if s == "True") {
+            return Err(InterpreterError::TailCall(Box::new(args[1].clone())));
+          } else if matches!(&cond, Expr::Identifier(s) if s == "False") {
+            if args.len() == 3 {
+              return Err(InterpreterError::TailCall(Box::new(
+                args[2].clone(),
+              )));
+            }
+            return Ok(null_expr());
+          }
+          // Condition didn't evaluate to True/False - return unevaluated
+          let mut new_args = vec![cond];
+          for arg in args.iter().skip(1) {
+            new_args.push(arg.clone());
+          }
+          return Ok(Expr::FunctionCall {
+            name: name.clone(),
+            args: new_args.into(),
+          });
+        }
+        // Special handling for Module/Block/Assuming - don't evaluate args (body needs local bindings first)
+        if name == "Module" {
+          return module_ast(args);
+        }
+        if name == "Block" {
+          return block_ast(args);
+        }
+        if name == "Assuming" && args.len() == 2 {
+          return assuming_ast(args);
+        }
+        // Special handling for Set - first arg must be identifier or Part, second gets evaluated
+        if name == "Set" && args.len() == 2 {
+          // Set has HoldFirst, but Evaluate[...] still forces evaluation of
+          // the LHS even through the hold — the standard idiom for
+          // assigning to a programmatically-built symbol, e.g.
+          // `Evaluate[Symbol["p" <> ToString[i]]] = value`.
+          let lhs = unwrap_top_level_evaluate(&args[0])?;
+          return set_ast(&lhs, &args[1]);
+        }
+        // Special handling for SetDelayed - stores function definitions
+        if name == "SetDelayed" && args.len() == 2 {
+          // Before applying the SetDelayed normally, check if any
+          // user-defined SetDelayed rule (typically an UpValue installed
+          // via `(F[x_] := s_) ^:= Q[x, s]`) matches the call. This is
+          // what lets `F[1] := 2` evaluate to `Q[1, 2]` for case 4709 —
+          // Wolfram's UpValues-on-SetDelayed mechanism.
+          let has_setdelayed_rules = crate::FUNC_DEFS.with(|m| {
+            m.borrow().get("SetDelayed").is_some_and(|v| !v.is_empty())
+          });
+          if has_setdelayed_rules {
+            let result =
+              crate::evaluator::evaluate_function_call_ast("SetDelayed", args)?;
+            // If a user-defined rule matched, the result will differ from
+            // the original `SetDelayed[…]` shell. Otherwise fall through
+            // to the built-in handler. `Expr` doesn't impl `PartialEq` so
+            // compare via the canonical InputForm rendering.
+            let original = unevaluated("SetDelayed", args);
+            let unchanged =
+              expr_to_string(&result) == expr_to_string(&original);
+            if !unchanged {
+              return Ok(result);
+            }
+          }
+          return set_delayed_ast(&args[0], &args[1]);
+        }
+        // Special handling for TagSetDelayed - stores upvalue definitions
+        if name == "TagSetDelayed" && args.len() == 3 {
+          return tag_set_delayed_ast(&args[0], &args[1], &args[2], false);
+        }
+        // Special handling for TagSet - stores evaluated upvalue definitions
+        if name == "TagSet" && args.len() == 3 {
+          return tag_set_delayed_ast(&args[0], &args[1], &args[2], true);
+        }
+        // Special handling for TagUnset - removes upvalue definitions
+        if name == "TagUnset" && args.len() == 2 {
+          return tag_unset_ast(&args[0], &args[1]);
+        }
+        // Special handling for UpSet - automatically determines tags from LHS
+        if name == "UpSet" && args.len() == 2 {
+          return upset_ast(&args[0], &args[1]);
+        }
+        // Special handling for UpSetDelayed - like UpSet but delayed (no RHS evaluation)
+        if name == "UpSetDelayed" && args.len() == 2 {
+          return upset_delayed_ast(&args[0], &args[1]);
+        }
+        // Special handling for Increment/Decrement - x++ / x--
+        // and PreIncrement/PreDecrement - ++x / --x
+        if (name == "Increment"
+          || name == "Decrement"
+          || name == "PreIncrement"
+          || name == "PreDecrement")
+          && args.len() == 1
+        {
+          if let Expr::Identifier(var_name) = &args[0] {
+            let current = ENV.with(|e| e.borrow().get(var_name).cloned());
+            let current_val = match current {
+              Some(StoredValue::ExprVal(e)) => e,
+              Some(StoredValue::Raw(s)) => {
+                crate::syntax::string_to_expr(&s).unwrap_or(Expr::Integer(0))
+              }
+              _ => {
+                // Match Mathematica: unset variable → emit rvalue warning
+                // and leave the Increment/Decrement/PreIncrement/PreDecrement
+                // call unevaluated.
+                crate::emit_message(&format!(
+                  "{name}::rvalue: {var_name} is not a variable with a value, so its value cannot be changed."
+                ));
+                return Ok(Expr::FunctionCall {
+                  name: name.clone(),
+                  args: args.clone(),
+                });
+              }
+            };
+            let delta = if name == "Increment" || name == "PreIncrement" {
+              Expr::Integer(1)
+            } else {
+              Expr::Integer(-1)
+            };
+            let new_val =
+              evaluate_expr_to_expr(&plus2(current_val.clone(), delta))?;
+            ENV.with(|e| {
+              e.borrow_mut().insert(
+                var_name.clone(),
+                StoredValue::Raw(expr_to_string(&new_val)),
+              );
+            });
+            // Post-increment/decrement returns old value; pre returns new value
+            if name == "PreIncrement" || name == "PreDecrement" {
+              return Ok(new_val);
+            }
+            return Ok(current_val);
+          }
+          // Handle Part expressions: ++x[[i]], --x[[i]], x[[i]]++, x[[i]]--
+          if let Expr::Part { .. } = &args[0] {
+            // Get the current value at the part position
+            let current_val = evaluate_expr_to_expr(&args[0])?;
+            let delta = if name == "Increment" || name == "PreIncrement" {
+              Expr::Integer(1)
+            } else {
+              Expr::Integer(-1)
+            };
+            let new_val =
+              evaluate_expr_to_expr(&plus2(current_val.clone(), delta))?;
+            // Use Set to assign the new value back to the part
+            crate::evaluator::assignment::set_ast(&args[0], &new_val)?;
+            if name == "PreIncrement" || name == "PreDecrement" {
+              return Ok(new_val);
+            }
+            return Ok(current_val);
+          }
+          // Target is a non-assignable literal (number, string, expression).
+          // Match wolframscript: emit an rvalue message and leave the call
+          // unevaluated — e.g. `--5` → "PreDecrement::rvalue: 5 is not a
+          // variable...".
+          crate::emit_message(&format!(
+            "{}::rvalue: {} is not a variable with a value, so its value cannot be changed.",
+            name,
+            expr_to_string(&args[0])
+          ));
+          return Ok(Expr::FunctionCall {
+            name: name.clone(),
+            args: args.clone(),
+          });
+        }
+        // Special handling for Unset - x =. (removes definition)
+        if name == "Unset" && args.len() == 1 {
+          // Thread over lists: '{a, {b}} =.' → {Unset[a], Unset[{b}]}.
+          if let Expr::List(items) = &args[0] {
+            let mut results = Vec::with_capacity(items.len());
+            for it in items {
+              let r = evaluate_expr_to_expr(&call1("Unset", it.clone()))?;
+              results.push(r);
+            }
+            return Ok(Expr::List(results.into()));
+          }
+          if let Expr::Identifier(var_name) = &args[0] {
+            let had_value = ENV.with(|e| e.borrow_mut().remove(var_name));
+            if had_value.is_none() {
+              // No OwnValue was set. Mathematica still returns Null for
+              // 'foo =.' even if foo was never defined, so do the same.
+              return Ok(null_expr());
+            }
+            return Ok(null_expr());
+          }
+          // OwnValues[sym] =. clears the OwnValue for sym (equivalent to
+          // sym =.). Wolfram returns Null whether or not the value was set.
+          if let Expr::FunctionCall {
+            name: head,
+            args: lhs_args,
+          } = &args[0]
+            && head == "OwnValues"
+            && lhs_args.len() == 1
+            && let Expr::Identifier(var_name) = &lhs_args[0]
+          {
+            ENV.with(|e| e.borrow_mut().remove(var_name));
+            return Ok(null_expr());
+          }
+          // SubValues[sym] =. and DownValues[sym] =. clear the corresponding
+          // function definitions for sym. A SubValue rule (from `f[a][b] =
+          // …`/`f[a][b] := …`) lives in SUB_VALUES rather than FUNC_DEFS, so
+          // both maps need clearing for `SubValues[sym] =.` to actually undo
+          // a curried definition.
+          if let Expr::FunctionCall {
+            name: head,
+            args: lhs_args,
+          } = &args[0]
+            && (head == "DownValues" || head == "SubValues")
+            && lhs_args.len() == 1
+            && let Expr::Identifier(sym_name) = &lhs_args[0]
+          {
+            crate::FUNC_DEFS.with(|m| {
+              m.borrow_mut().remove(sym_name);
+            });
+            if head == "SubValues" {
+              crate::evaluator::assignment::SUB_VALUES.with(|m| {
+                m.borrow_mut().remove(sym_name);
+              });
+            }
+            return Ok(null_expr());
+          }
+          // UpValues[sym] =. removes every upvalue rule attached to
+          // `sym`. Each rule lives in two places: `UPVALUES[sym]` (for
+          // introspection) and `FUNC_DEFS[outer_head]` (where dispatch
+          // looks). Drop both. (Mirrors the upvalue-cleanup branch of
+          // `ClearAll[sym]`.)
+          if let Expr::FunctionCall {
+            name: head,
+            args: lhs_args,
+          } = &args[0]
+            && head == "UpValues"
+            && lhs_args.len() == 1
+            && let Expr::Identifier(sym_name) = &lhs_args[0]
+          {
+            crate::evaluator::assignment::clear_upvalues_of(sym_name);
+            return Ok(null_expr());
+          }
+          // Messages[sym] =. — Woxi has no per-symbol message storage
+          // yet; treat as a no-op success.
+          if let Expr::FunctionCall {
+            name: head,
+            args: lhs_args,
+          } = &args[0]
+            && head == "Messages"
+            && lhs_args.len() == 1
+            && matches!(&lhs_args[0], Expr::Identifier(_))
+          {
+            return Ok(null_expr());
+          }
+          // Pattern-based unset: f[args] =.
+          // Requires a matching DownValue in FUNC_DEFS; otherwise Mathematica
+          // emits an 'Unset::norep' warning and returns $Failed.
+          if let Expr::FunctionCall {
+            name: head,
+            args: lhs_args,
+          } = &args[0]
+          {
+            let had_any = crate::FUNC_DEFS.with(|m| {
+              m.borrow().get(head).is_some_and(|defs| !defs.is_empty())
+            });
+            if !had_any {
+              let lhs_str = expr_to_string(&args[0]);
+              crate::emit_message(&format!(
+                "Unset::norep: Assignment on {head} for {lhs_str} not found."
+              ));
+              return Ok(fail_expr());
+            }
+            // Reconstruct each entry's LHS pattern and remove only the entry
+            // whose LHS matches the unset pattern. Two entries with the same
+            // outer head can have different inner patterns (e.g.
+            // `MakeBoxes[F[x__], fmt_]` vs `MakeBoxes[G[x___], fmt_]`); we
+            // need per-entry comparison so unsetting one keeps the other.
+            let target_lhs_str = expr_to_string(&args[0]);
+            let mut removed_any = false;
+            crate::FUNC_DEFS.with(|m| {
+              let mut map = m.borrow_mut();
+              if let Some(entries) = map.get_mut(head) {
+                let original_len = entries.len();
+                entries.retain(
+                  |(params, conds, _defaults, heads, blank_types, _body)| {
+                    let pattern_args: Vec<Expr> = params
+                      .iter()
+                      .enumerate()
+                      .map(|(i, p)| {
+                        // Structural pattern: pull the original pattern AST
+                        // out of the __StructuralPattern__ marker.
+                        if let Some(Some(Expr::FunctionCall {
+                          name: cn,
+                          args: ca,
+                        })) = conds.get(i)
+                          && cn == "__StructuralPattern__"
+                          && ca.len() == 2
+                        {
+                          return ca[1].clone();
+                        }
+                        // Literal-match (SameQ): use the literal value.
+                        if let Some(Some(Expr::Comparison {
+                          operands,
+                          operators,
+                        })) = conds.get(i)
+                          && operators
+                            .iter()
+                            .any(|op| matches!(op, ComparisonOp::SameQ))
+                          && let Some(literal_val) = operands.get(1)
+                        {
+                          return literal_val.clone();
+                        }
+                        Expr::Pattern {
+                          name: p.clone(),
+                          head: heads.get(i).and_then(std::clone::Clone::clone),
+                          blank_type: blank_types.get(i).copied().unwrap_or(1),
+                        }
+                      })
+                      .collect();
+                    let entry_lhs = Expr::FunctionCall {
+                      name: head.clone(),
+                      args: pattern_args.into(),
+                    };
+                    let entry_lhs_str = expr_to_string(&entry_lhs);
+                    entry_lhs_str != target_lhs_str
+                  },
+                );
+                removed_any = entries.len() < original_len;
+                if entries.is_empty() {
+                  map.remove(head);
+                }
+              }
+            });
+            if !removed_any {
+              let lhs_str = expr_to_string(&args[0]);
+              crate::emit_message(&format!(
+                "Unset::norep: Assignment on {head} for {lhs_str} not found."
+              ));
+              return Ok(fail_expr());
+            }
+            let _ = lhs_args;
+            return Ok(null_expr());
+          }
+          return Ok(null_expr());
+        }
+        // Definition and FullDefinition have HoldAll in Wolfram, so their
+        // argument stays unevaluated. Information has no Hold attribute —
+        // its argument is evaluated like any other call. The `?symbol` REPL
+        // shortcut wraps the arg in `Unevaluated` to preserve symbol
+        // inspection (handled in the Information dispatcher).
+        if (name == "Definition" || name == "FullDefinition") && args.len() == 1
+        {
+          return evaluate_function_call_ast(name, args);
+        }
+        // ApplyTo[x, f] (x //= f): set x to f[x] and return the new
+        // value. HoldFirst; an unset variable emits rvalue.
+        if name == "ApplyTo" && args.len() == 2 {
+          if let Expr::Identifier(var_name) = &args[0] {
+            let current = ENV.with(|e| e.borrow().get(var_name).cloned());
+            let current_val = match current {
+              Some(StoredValue::ExprVal(e)) => e,
+              Some(StoredValue::Raw(s)) => {
+                crate::syntax::string_to_expr(&s).unwrap_or(Expr::Integer(0))
+              }
+              _ => {
+                crate::emit_message(&format!(
+                  "ApplyTo::rvalue: {var_name} is not a variable with a value, so its value cannot be changed."
+                ));
+                return Ok(Expr::FunctionCall {
+                  name: name.clone(),
+                  args: args.clone(),
+                });
+              }
+            };
+            let func = evaluate_expr_to_expr(&args[1])?;
+            let new_val =
+              crate::evaluator::function_application::apply_function_to_arg(
+                &func,
+                &current_val,
+              )?;
+            ENV.with(|e| {
+              e.borrow_mut().insert(
+                var_name.clone(),
+                StoredValue::ExprVal(new_val.clone()),
+              );
+            });
+            return Ok(new_val);
+          }
+          crate::emit_message(&format!(
+            "ApplyTo::rvalue: {} is not a variable with a value, so its value cannot be changed.",
+            expr_to_string(&args[0])
+          ));
+          return Ok(Expr::FunctionCall {
+            name: name.clone(),
+            args: args.clone(),
+          });
+        }
+        // Special handling for AddTo, SubtractFrom, TimesBy, DivideBy - x += y, x -= y, etc.
+        if (name == "AddTo"
+          || name == "SubtractFrom"
+          || name == "TimesBy"
+          || name == "DivideBy")
+          && args.len() == 2
+        {
+          let op = match name.as_str() {
+            "AddTo" => BinaryOperator::Plus,
+            "SubtractFrom" => BinaryOperator::Minus,
+            "TimesBy" => BinaryOperator::Times,
+            "DivideBy" => BinaryOperator::Divide,
+            _ => unreachable!(),
+          };
+          if !matches!(
+            &args[0],
+            Expr::Identifier(_)
+              | Expr::Part { .. }
+              | Expr::FunctionCall { .. }
+              | Expr::CurriedCall { .. }
+              | Expr::List(_)
+          ) {
+            emit_rvalue(name, &args[0]);
+            return Ok(Expr::FunctionCall {
+              name: name.clone(),
+              args: args.clone(),
+            });
+          }
+          // `{w, h} *= k` is `{w, h} = {w, h} k`: the list of targets is
+          // read, combined, and assigned back element by element.
+          if let Expr::List(_) = &args[0] {
+            let current_val = evaluate_expr_to_expr(&args[0])?;
+            let rhs = evaluate_expr_to_expr(&args[1])?;
+            let new_val = evaluate_expr_to_expr(&Expr::BinaryOp {
+              op,
+              left: Box::new(current_val),
+              right: Box::new(rhs),
+            })?;
+            crate::evaluator::assignment::set_ast(&args[0], &new_val)?;
+            return Ok(new_val);
+          }
+          if let Expr::Identifier(var_name) = &args[0] {
+            let current = ENV.with(|e| e.borrow().get(var_name).cloned());
+            let current_val = match current {
+              Some(StoredValue::ExprVal(e)) => e,
+              Some(StoredValue::Raw(s)) => {
+                crate::syntax::string_to_expr(&s).unwrap_or(Expr::Integer(0))
+              }
+              _ => {
+                crate::emit_message(&format!(
+                  "{name}::rvalue: {var_name} is not a variable with a value, so its value cannot be changed."
+                ));
+                // Match Mathematica: leave the whole call unevaluated.
+                return Ok(Expr::FunctionCall {
+                  name: name.clone(),
+                  args: args.clone(),
+                });
+              }
+            };
+            let rhs = evaluate_expr_to_expr(&args[1])?;
+            let new_val = evaluate_expr_to_expr(&Expr::BinaryOp {
+              op,
+              left: Box::new(current_val),
+              right: Box::new(rhs),
+            })?;
+            ENV.with(|e| {
+              e.borrow_mut().insert(
+                var_name.clone(),
+                StoredValue::ExprVal(new_val.clone()),
+              );
+            });
+            return Ok(new_val);
+          }
+          if let Expr::Part { .. } = &args[0] {
+            let rhs = evaluate_expr_to_expr(&args[1])?;
+            let current_val = evaluate_expr_to_expr(&args[0])?;
+            let new_val = evaluate_expr_to_expr(&Expr::BinaryOp {
+              op,
+              left: Box::new(current_val),
+              right: Box::new(rhs),
+            })?;
+            crate::evaluator::assignment::set_ast(&args[0], &new_val)?;
+            return Ok(new_val);
+          }
+          // A call target — `counts[x] += 1` on a symbol used as a lookup
+          // table, or `state["pos"] += n` on one used as a record. Like a
+          // symbol target it has to hold a value already: with no
+          // definition to read, `counts[x]` evaluates back to itself and
+          // wolframscript reports `::rvalue` rather than defining it.
+          if matches!(
+            &args[0],
+            Expr::FunctionCall { .. } | Expr::CurriedCall { .. }
+          ) {
+            let target = evaluated_call_target(&args[0])?;
+            let current_val = evaluate_expr_to_expr(&target)?;
+            if expr_to_string(&current_val) == expr_to_string(&target) {
+              emit_rvalue(name, &args[0]);
+              return Ok(Expr::FunctionCall {
+                name: name.clone(),
+                args: args.clone(),
+              });
+            }
+            let rhs = evaluate_expr_to_expr(&args[1])?;
+            let new_val = evaluate_expr_to_expr(&Expr::BinaryOp {
+              op,
+              left: Box::new(current_val),
+              right: Box::new(rhs),
+            })?;
+            // Write through the target as written — `set_ast` evaluates the
+            // arguments itself, and messages about it quote the source form.
+            crate::evaluator::assignment::set_ast(&args[0], &new_val)?;
+            return Ok(new_val);
+          }
+        }
+        // AppendTo/PrependTo on a Part target: AppendTo[x[[i]], v]
+        // Evaluate the current value at the Part location, append, then
+        // write back via the existing Part-assignment machinery. This is
+        // how wolframscript handles `AppendTo[nums[[k]], i]`.
+        if (name == "AppendTo" || name == "PrependTo")
+          && args.len() == 2
+          && let Expr::Part { .. } = &args[0]
+        {
+          let elem = evaluate_expr_to_expr(&args[1])?;
+          let is_append = name == "AppendTo";
+          let mut current = evaluate_expr_to_expr(&args[0])?;
+          let new_val = match &mut current {
+            Expr::List(items) => {
+              let mut items = std::mem::take(items);
+              if is_append {
+                items.push(elem);
+              } else {
+                items.insert(0, elem);
+              }
+              Expr::List(items)
+            }
+            Expr::FunctionCall {
+              name: head,
+              args: fa,
+            } => {
+              let head = std::mem::take(head);
+              let mut fa = std::mem::take(fa);
+              if is_append {
+                fa.push(elem);
+              } else {
+                fa.insert(0, elem);
+              }
+              Expr::FunctionCall {
+                name: head,
+                args: fa,
+              }
+            }
+            _ => {
+              // The Part location holds an atom, which cannot be extended.
+              // wolframscript reports it against the original Part
+              // expression rather than against the value it found.
+              crate::emit_message(&format!(
+                "{}::normal: Nonatomic expression expected at position 1 in \
+                 {}.",
+                name,
+                expr_to_output(&unevaluated(name, args))
+              ));
+              return Ok(unevaluated(name, args));
+            }
+          };
+          crate::evaluator::assignment::set_ast(&args[0], &new_val)?;
+          return Ok(new_val);
+        }
+        // AppendTo/PrependTo on an indexed (DownValue) target:
+        // AppendTo[f[1], v] after `f[1] = {…}`. Evaluate the stored value,
+        // extend it, and write it back through the same indexed-assignment
+        // path `f[1] = …` takes. A target with no stored value evaluates
+        // to itself — that is the rvalue error case.
+        if (name == "AppendTo" || name == "PrependTo")
+          && args.len() == 2
+          && matches!(&args[0], Expr::FunctionCall { .. })
+        {
+          let is_append = name == "AppendTo";
+          let mut current = evaluate_expr_to_expr(&args[0])?;
+          let has_value = expr_to_string(&current) != expr_to_string(&args[0]);
+          if has_value {
+            let elem = evaluate_expr_to_expr(&args[1])?;
+            let new_val = match &mut current {
+              Expr::List(items) => {
+                let mut items = std::mem::take(items);
+                if is_append {
+                  items.push(elem);
+                } else {
+                  items.insert(0, elem);
+                }
+                Expr::List(items)
+              }
+              Expr::FunctionCall {
+                name: head,
+                args: fa,
+              } => {
+                let head = std::mem::take(head);
+                let mut fa = std::mem::take(fa);
+                if is_append {
+                  fa.push(elem);
+                } else {
+                  fa.insert(0, elem);
+                }
+                Expr::FunctionCall {
+                  name: head,
+                  args: fa,
+                }
+              }
+              _ => {
+                crate::emit_message(&format!(
+                  "{}::normal: Nonatomic expression expected at position 1 \
+                   in {}.",
+                  name,
+                  expr_to_output(&unevaluated(name, args))
+                ));
+                return Ok(unevaluated(name, args));
+              }
+            };
+            crate::evaluator::assignment::set_ast(&args[0], &new_val)?;
+            return Ok(new_val);
+          }
+        }
+        // A target that is neither a symbol nor a Part cannot hold a value.
+        if (name == "AppendTo" || name == "PrependTo")
+          && args.len() == 2
+          && !matches!(&args[0], Expr::Identifier(_) | Expr::Part { .. })
+        {
+          emit_rvalue(name, &args[0]);
+          return Ok(Expr::FunctionCall {
+            name: name.clone(),
+            args: args.clone(),
+          });
+        }
+        // Special handling for AppendTo, PrependTo - x = Append[x, elem]
+        if (name == "AppendTo" || name == "PrependTo")
+          && args.len() == 2
+          && let Expr::Identifier(var_name) = &args[0]
+        {
+          let elem = evaluate_expr_to_expr(&args[1])?;
+          let is_append = name == "AppendTo";
+          // Fast path: stored value is already an ExprVal(List) or
+          // ExprVal(FunctionCall). Mutate the stored ExprList in place
+          // and clone the result once for the return value. Avoids the
+          // O(N) clone-on-read that the previous get(...).cloned() path
+          // paid on every iteration of a `Do[AppendTo[xs, …], …]` loop.
+          let mutated = ENV.with(|e| -> Option<Expr> {
+            let mut env = e.borrow_mut();
+            match env.get_mut(var_name) {
+              Some(StoredValue::ExprVal(stored)) => match stored {
+                Expr::List(items) => {
+                  if is_append {
+                    items.push_back(elem.clone());
+                  } else {
+                    items.push_front(elem.clone());
+                  }
+                  Some(stored.clone())
+                }
+                Expr::FunctionCall {
+                  name: _,
+                  args: fn_args,
+                } => {
+                  if is_append {
+                    fn_args.push_back(elem.clone());
+                  } else {
+                    fn_args.push_front(elem.clone());
+                  }
+                  Some(stored.clone())
+                }
+                _ => None,
+              },
+              _ => None,
+            }
+          });
+          if let Some(new_val) = mutated {
+            // Register the appended/prepended symbol in $PrintForms /
+            // $OutputForms when the target is `$BoxForms`. wolframscript
+            // exposes user-added box forms in those lists even after a
+            // subsequent `$BoxForms=.` clears the OwnValue.
+            if var_name == "$BoxForms"
+              && let Expr::Identifier(form_name) = &args[1]
+            {
+              crate::evaluator::assignment::register_user_print_form(form_name);
+            }
+            return Ok(new_val);
+          }
+
+          // Slow path: stored value is Raw / Association / not yet bound /
+          // a non-list ExprVal. Read, decode, mutate, store back.
+          let current = ENV.with(|e| e.borrow().get(var_name).cloned());
+          let mut current_val = match current {
+            Some(StoredValue::ExprVal(e)) => e,
+            Some(StoredValue::Raw(s)) => crate::syntax::string_to_expr(&s)
+              .unwrap_or(Expr::List(vec![].into())),
+            // An association gains the appended rule as an entry — the same
+            // write `Append[assoc, rule]` followed by `Set` would make.
+            Some(StoredValue::Association(_)) => {
+              let assoc = evaluate_expr_to_expr(&args[0])?;
+              let appended = evaluate_expr_to_expr(&Expr::FunctionCall {
+                name: if is_append { "Append" } else { "Prepend" }.to_string(),
+                args: vec![assoc, elem].into(),
+              })?;
+              crate::evaluator::assignment::set_ast(&args[0], &appended)?;
+              return Ok(appended);
+            }
+            // System variables like `$BoxForms` aren't in ENV until written —
+            // first AppendTo seeds the env from the built-in default.
+            _ => {
+              if let Some(default) =
+                crate::evaluator::listable::get_system_variable(var_name)
+              {
+                default
+              } else {
+                // wolframscript reports that the target has no value and
+                // leaves the call alone; it is not an error.
+                emit_rvalue(name, &args[0]);
+                return Ok(Expr::FunctionCall {
+                  name: name.clone(),
+                  args: args.clone(),
+                });
+              }
+            }
+          };
+          let new_val = match &mut current_val {
+            Expr::List(items) => {
+              let mut items = std::mem::take(items);
+              if is_append {
+                items.push(elem);
+              } else {
+                items.insert(0, elem);
+              }
+              Expr::List(items)
+            }
+            // AppendTo/PrependTo also work on any FunctionCall head
+            // (matches wolframscript: AppendTo[f[a,b], x] -> f[a,b,x]).
+            Expr::FunctionCall {
+              name: head,
+              args: fn_args,
+            } => {
+              let mut new_args = std::mem::take(fn_args);
+              if is_append {
+                new_args.push(elem);
+              } else {
+                new_args.insert(0, elem);
+              }
+              Expr::FunctionCall {
+                name: head.clone(),
+                args: new_args,
+              }
+            }
+            _ => {
+              return Err(InterpreterError::EvaluationError(format!(
+                "{name}: {var_name} is not a list"
+              )));
+            }
+          };
+          // Store as ExprVal rather than re-serializing to a Raw string.
+          // The Raw form forces the next AppendTo/PrependTo on the same
+          // variable to re-parse the entire list, which makes a tight
+          // `Do[AppendTo[xs, …], …]` loop quadratic. ExprVal keeps the
+          // updated list as an Expr in place, so the loop is amortized
+          // O(n).
+          ENV.with(|e| {
+            e.borrow_mut()
+              .insert(var_name.clone(), StoredValue::ExprVal(new_val.clone()));
+          });
+          if var_name == "$BoxForms"
+            && let Expr::Identifier(form_name) = &args[1]
+          {
+            crate::evaluator::assignment::register_user_print_form(form_name);
+          }
+          return Ok(new_val);
+        }
+        // Special handling for AssociateTo - x = Append[x, key -> val]
+        if name == "AssociateTo"
+          && args.len() == 2
+          && let Expr::Identifier(var_name) = &args[0]
+        {
+          let rule = evaluate_expr_to_expr(&args[1])?;
+          // Collect the key→value pairs to add. The second argument may be a
+          // single rule (`a -> b`), an association, or a list of rules and/or
+          // associations (`{k1 -> v1, k2 -> v2}`) — all documented forms.
+          fn collect_pairs(e: &Expr, out: &mut Vec<(Expr, Expr)>) -> bool {
+            match e {
+              Expr::Rule {
+                pattern,
+                replacement,
+              } => {
+                out.push((
+                  pattern.as_ref().clone(),
+                  replacement.as_ref().clone(),
+                ));
+                true
+              }
+              Expr::Association(items) => {
+                out.extend(items.iter().cloned());
+                true
+              }
+              Expr::List(items) => {
+                items.iter().all(|it| collect_pairs(it, out))
+              }
+              _ => false,
+            }
+          }
+          let mut new_pairs: Vec<(Expr, Expr)> = Vec::new();
+          if !collect_pairs(&rule, &mut new_pairs) {
+            // Not a recognized key-value form — return unevaluated.
+            return Ok(call("AssociateTo", vec![args[0].clone(), rule]));
+          }
+          let current = ENV.with(|e| e.borrow().get(var_name).cloned());
+          let mut items = match &current {
+            Some(StoredValue::Association(pairs)) => pairs
+              .iter()
+              .map(|(k, v)| {
+                let ke = crate::syntax::string_to_expr(k)
+                  .unwrap_or(Expr::String(k.clone()));
+                (ke, v.clone())
+              })
+              .collect::<Vec<_>>(),
+            Some(StoredValue::ExprVal(Expr::Association(items))) => {
+              items.clone()
+            }
+            Some(StoredValue::Raw(s)) => {
+              match crate::syntax::string_to_expr(s) {
+                Ok(Expr::Association(ref items)) => items.clone(),
+                _ => {
+                  return Ok(call("AssociateTo", vec![args[0].clone(), rule]));
+                }
+              }
+            }
+            _ => {
+              return Ok(call("AssociateTo", vec![args[0].clone(), rule]));
+            }
+          };
+          for (key, val) in new_pairs {
+            if let Some(pos) = items.iter().position(|(k, _)| {
+              crate::evaluator::pattern_matching::expr_equal(k, &key)
+            }) {
+              items[pos].1 = val;
+            } else {
+              items.push((key, val));
+            }
+          }
+          let new_val = Expr::Association(items);
+          let pairs: Vec<(String, Expr)> = match &new_val {
+            Expr::Association(items) => items
+              .iter()
+              .map(|(k, v)| (expr_to_string(k), v.clone()))
+              .collect(),
+            _ => unreachable!(),
+          };
+          ENV.with(|e| {
+            e.borrow_mut()
+              .insert(var_name.clone(), StoredValue::Association(pairs));
+          });
+          return Ok(new_val);
+        }
+        // Special handling for KeyDropFrom - removes key from association variable
+        if name == "KeyDropFrom"
+          && args.len() == 2
+          && let Expr::Identifier(var_name) = &args[0]
+        {
+          let key = evaluate_expr_to_expr(&args[1])?;
+          let current = ENV.with(|e| e.borrow().get(var_name).cloned());
+          let items = match &current {
+            Some(StoredValue::Association(pairs)) => pairs
+              .iter()
+              .map(|(k, v)| {
+                let ke = crate::syntax::string_to_expr(k)
+                  .unwrap_or(Expr::String(k.clone()));
+                (ke, v.clone())
+              })
+              .collect::<Vec<_>>(),
+            Some(StoredValue::ExprVal(Expr::Association(items))) => {
+              items.clone()
+            }
+            Some(StoredValue::Raw(s)) => {
+              match crate::syntax::string_to_expr(s) {
+                Ok(Expr::Association(ref items)) => items.clone(),
+                _ => {
+                  return Ok(call("KeyDropFrom", vec![args[0].clone(), key]));
+                }
+              }
+            }
+            _ => {
+              // Undefined symbol: wolframscript emits ::blnoval.
+              crate::emit_message(&format!(
+                "KeyDropFrom::blnoval: The symbol {var_name} at position 1 should have an immediate value defined."
+              ));
+              return Ok(call("KeyDropFrom", vec![args[0].clone(), key]));
+            }
+          };
+          let filtered: Vec<(Expr, Expr)> = items
+            .into_iter()
+            .filter(|(k, _)| {
+              !crate::evaluator::pattern_matching::expr_equal(k, &key)
+            })
+            .collect();
+          let new_val = Expr::Association(filtered);
+          let pairs: Vec<(String, Expr)> = match &new_val {
+            Expr::Association(items) => items
+              .iter()
+              .map(|(k, v)| (expr_to_string(k), v.clone()))
+              .collect(),
+            _ => unreachable!(),
+          };
+          ENV.with(|e| {
+            e.borrow_mut()
+              .insert(var_name.clone(), StoredValue::Association(pairs));
+          });
+          return Ok(new_val);
+        }
+        // Special handling for Return - raises ReturnValue to short-circuit evaluation
+        if name == "Return" {
+          let val = if args.is_empty() {
+            null_expr()
+          } else {
+            evaluate_expr_to_expr(&args[0])?
+          };
+          return Err(InterpreterError::ReturnValue(Box::new(val)));
+        }
+        // Special handling for Break[] - raises BreakSignal
+        if name == "Break" && args.is_empty() {
+          return Err(InterpreterError::BreakSignal);
+        }
+        // Special handling for Continue[] - raises ContinueSignal
+        if name == "Continue" && args.is_empty() {
+          return Err(InterpreterError::ContinueSignal);
+        }
+        // Label[tag] is not evaluated — it stays symbolic.
+        // CompoundExpression handles it via find_label_index on the AST.
+        // Special handling for Goto[tag] — evaluates the tag then raises GotoSignal
+        if name == "Goto" && args.len() == 1 {
+          let tag = evaluate_expr_to_expr(&args[0])?;
+          return Err(InterpreterError::GotoSignal(Box::new(tag)));
+        }
+        // Special handling for Throw[value] and Throw[value, tag]
+        if name == "Throw" && !args.is_empty() && args.len() <= 2 {
+          let val = evaluate_expr_to_expr(&args[0])?;
+          let tag = if args.len() == 2 {
+            Some(Box::new(evaluate_expr_to_expr(&args[1])?))
+          } else {
+            None
+          };
+          return Err(InterpreterError::ThrowValue(Box::new(val), tag));
+        }
+        // Special handling for Catch[expr], Catch[expr, form] and
+        // Catch[expr, form, f]. The form is matched as a pattern (so `a | b`
+        // and `_` work); with the 3-argument form, `f[value, tag]` is returned
+        // instead of the bare thrown value.
+        if name == "Catch" && !args.is_empty() && args.len() <= 3 {
+          let tag_pattern = if args.len() >= 2 {
+            Some(evaluate_expr_to_expr(&args[1])?)
+          } else {
+            None
+          };
+          match evaluate_expr_to_expr(&args[0]) {
+            Ok(result) => return Ok(result),
+            Err(InterpreterError::ThrowValue(val, thrown_tag)) => {
+              let matched = match &tag_pattern {
+                // No form: only untagged Throws are caught — a tagged
+                // Throw passes through Catch[expr] to the top level
+                // (Throw::nocatch), matching wolframscript.
+                None => thrown_tag.is_none(),
+                // A form only matches a tagged Throw whose tag matches it.
+                Some(pattern) => match &thrown_tag {
+                  Some(tag) => {
+                    crate::functions::list_helpers_ast::matches_pattern_ast(
+                      tag, pattern,
+                    )
+                  }
+                  None => false,
+                },
+              };
+              if !matched {
+                // Tag doesn't match - re-throw.
+                return Err(InterpreterError::ThrowValue(val, thrown_tag));
+              }
+              // Caught. With a third argument, apply f to value and tag.
+              if args.len() == 3 {
+                let f = evaluate_expr_to_expr(&args[2])?;
+                let tag_expr = thrown_tag.map_or_else(null_expr, |t| *t);
+                let application = if let Expr::Identifier(fname) = &f {
+                  Expr::FunctionCall {
+                    name: fname.clone(),
+                    args: vec![*val, tag_expr].into(),
+                  }
+                } else {
+                  Expr::CurriedCall {
+                    func: Box::new(f),
+                    args: vec![*val, tag_expr],
+                  }
+                };
+                return evaluate_expr_to_expr(&application);
+              }
+              return Ok(*val);
+            }
+            Err(e) => return Err(e),
+          }
+        }
+        // Enclose[expr] / Enclose[expr, handler] — evaluate `expr` with a
+        // confirmation scope open, and turn any confirmation failure thrown
+        // inside it into a result. `Enclose` is HoldFirst, so the body is
+        // still unevaluated here.
+        if name == "Enclose" && !args.is_empty() && args.len() <= 2 {
+          use crate::functions::confirm_ast;
+          let outcome =
+            confirm_ast::with_enclose_scope(|| evaluate_expr_to_expr(&args[0]));
+          let failure = match outcome {
+            Ok(value) => return Ok(value),
+            Err(InterpreterError::ThrowValue(value, tag))
+              if confirm_ast::is_confirmation_throw(&tag) =>
+            {
+              *value
+            }
+            Err(e) => return Err(e),
+          };
+          if args.len() == 1 {
+            return Ok(failure);
+          }
+          let handler = evaluate_expr_to_expr(&args[1])?;
+          // A string second argument reads a property off the failure; any
+          // other handler is applied to it.
+          if let Expr::String(property) = &handler {
+            if let Expr::FunctionCall {
+              name: fname,
+              args: fargs,
+            } = &failure
+              && fname == "Failure"
+              && let Some(value) =
+                confirm_ast::failure_property(fargs, property)
+            {
+              return Ok(value);
+            }
+            return Ok(failure);
+          }
+          let application = if let Expr::Identifier(hname) = &handler {
+            Expr::FunctionCall {
+              name: hname.clone(),
+              args: vec![failure].into(),
+            }
+          } else {
+            Expr::CurriedCall {
+              func: Box::new(handler),
+              args: vec![failure],
+            }
+          };
+          return evaluate_expr_to_expr(&application);
+        }
+
+        // The Confirm* family. All of them are HoldAll, so the original call
+        // is still available for the `::confirmnotag` report.
+        if matches!(
+          name.as_str(),
+          "Confirm"
+            | "ConfirmBy"
+            | "ConfirmMatch"
+            | "ConfirmAssert"
+            | "ConfirmQuiet"
+        ) && !args.is_empty()
+          && args.len() <= 3
+        {
+          use crate::functions::confirm_ast;
+          if !confirm_ast::inside_enclose() {
+            let held = Expr::FunctionCall {
+              name: name.clone(),
+              args: args.to_vec().into(),
+            };
+            return Ok(confirm_ast::no_enclose_failure(name, held));
+          }
+          // `ConfirmQuiet` only suppresses messages; it never fails.
+          if name == "ConfirmQuiet" {
+            crate::push_quiet();
+            let result = evaluate_expr_to_expr(&args[0]);
+            crate::pop_quiet();
+            return result;
+          }
+          let information = if args.len() >= 2 && name == "Confirm" {
+            evaluate_expr_to_expr(&args[1])?
+          } else if args.len() >= 3 {
+            evaluate_expr_to_expr(&args[2])?
+          } else {
+            null_expr()
+          };
+          let value = evaluate_expr_to_expr(&args[0])?;
+          let failure = match name.as_str() {
+            "Confirm" => confirm_ast::is_failure_value(&value)
+              .then(|| confirm_ast::confirm_failure(&value, information)),
+            "ConfirmBy" => {
+              let f = evaluate_expr_to_expr(&args[1])?;
+              let applied = if let Expr::Identifier(fname) = &f {
+                Expr::FunctionCall {
+                  name: fname.clone(),
+                  args: vec![value.clone()].into(),
+                }
+              } else {
+                Expr::CurriedCall {
+                  func: Box::new(f.clone()),
+                  args: vec![value.clone()],
+                }
+              };
+              let verdict = evaluate_expr_to_expr(&applied)?;
+              (!matches!(&verdict, Expr::Identifier(s) if s == "True")).then(
+                || confirm_ast::confirm_by_failure(&value, &f, information),
+              )
+            }
+            "ConfirmMatch" => {
+              let pattern = args[1].clone();
+              let matched =
+                crate::functions::list_helpers_ast::matches_pattern_ast(
+                  &value, &pattern,
+                );
+              (!matched).then(|| {
+                confirm_ast::confirm_match_failure(
+                  &value,
+                  &pattern,
+                  information,
+                )
+              })
+            }
+            // ConfirmAssert reports the *held* test alongside its value.
+            _ => (!matches!(&value, Expr::Identifier(s) if s == "True")).then(
+              || {
+                confirm_ast::confirm_assert_failure(
+                  &args[0],
+                  &value,
+                  information,
+                )
+              },
+            ),
+          };
+          return match failure {
+            Some(f) => Err(confirm_ast::throw_failure(f)),
+            None => Ok(value),
+          };
+        }
+
+        // Special handling for Abort[] - abort computation
+        if name == "Abort" && args.is_empty() {
+          return Err(InterpreterError::Abort);
+        }
+        // Quit[] / Exit[] - terminate the process
+        if (name == "Quit" || name == "Exit") && args.len() <= 1 {
+          #[cfg(not(target_arch = "wasm32"))]
+          {
+            let code = if args.len() == 1 {
+              if let Ok(val) = evaluate_expr_to_expr(&args[0]) {
+                crate::functions::math_ast::try_eval_to_f64(&val)
+                  .map_or(0, |f| f as i32)
+              } else {
+                0
+              }
+            } else {
+              0
+            };
+            std::process::exit(code);
+          }
+          #[cfg(target_arch = "wasm32")]
+          {
+            return Err(InterpreterError::Abort);
+          }
+        }
+        // Interrupt[] behaves like Abort[] in batch mode
+        if name == "Interrupt" && args.is_empty() {
+          return Err(InterpreterError::Abort);
+        }
+        // Pause[n] - sleep for n seconds (wall clock) and return Null.
+        // A negative or non-numeric n emits Pause::numnm and leaves the
+        // call unevaluated, matching wolframscript.
+        if name == "Pause" && args.len() == 1 {
+          let evaluated = evaluate_expr_to_expr(&args[0]).ok();
+          let secs = evaluated
+            .as_ref()
+            .and_then(crate::functions::math_ast::try_eval_to_f64);
+          match secs {
+            Some(s) if s >= 0.0 => {
+              if s > 0.0 {
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::sleep(std::time::Duration::from_secs_f64(s));
+                #[cfg(target_arch = "wasm32")]
+                crate::wasm::sleep_seconds(s);
+              }
+              // A pause is where a socket handler gets its turn: it runs on
+              // this thread, so it can only fire where evaluation stops to
+              // wait. wolframscript behaves the same way.
+              crate::functions::socket_ast::pump_socket_events();
+              return Ok(null_expr());
+            }
+            _ => {
+              let shown = evaluated.as_ref().unwrap_or(&args[0]);
+              let call_str = expr_to_string(&call1("Pause", shown.clone()));
+              crate::emit_message(&format!(
+                "Pause::numnm: Non-negative machine-sized number expected at position 1 in {call_str}."
+              ));
+              return Ok(call1("Pause", shown.clone()));
+            }
+          }
+        }
+        // AbortProtect[expr] evaluates expr and returns its result (the body
+        // runs transparently; the deferred-abort nuance is not modeled).
+        if name == "AbortProtect" && args.len() == 1 {
+          return evaluate_expr_to_expr(&args[0]);
+        }
+        // Special handling for CheckAbort[expr, failexpr]
+        if name == "CheckAbort" && args.len() == 2 {
+          match evaluate_expr_to_expr(&args[0]) {
+            Ok(result) => return Ok(result),
+            Err(InterpreterError::Abort) => {
+              return Err(InterpreterError::TailCall(Box::new(
+                args[1].clone(),
+              )));
+            }
+            Err(e) => return Err(e),
+          }
+        }
+        // Special handling for Check[expr, failexpr] and the tag-filtered
+        // Check[expr, failexpr, s1::t1, ...] form (tags may also come in
+        // lists). With tags, only the listed messages trigger failexpr.
+        if name == "Check" && args.len() >= 2 {
+          fn collect_message_tags(e: &Expr, out: &mut Vec<String>) {
+            match e {
+              Expr::FunctionCall { name, args }
+                if name == "MessageName" && args.len() == 2 =>
+              {
+                let sym = expr_to_string(&args[0]);
+                let tag = match &args[1] {
+                  Expr::String(s) => s.clone(),
+                  other => expr_to_string(other),
+                };
+                out.push(format!("{sym}::{tag}"));
+              }
+              Expr::List(items) => {
+                for item in items {
+                  collect_message_tags(item, out);
+                }
+              }
+              _ => {}
+            }
+          }
+          // A message counts as soon as it is generated, even when
+          // `General::stop` withholds it from the output — so the counters
+          // rather than the captured-message buffer are what is compared.
+          // Only a `Quiet` deeper than this `Check` hides one from it.
+          let depth = crate::quiet_depth();
+          let mut tags: Vec<String> = Vec::new();
+          for spec in &args[2..] {
+            collect_message_tags(spec, &mut tags);
+          }
+          let tag_counts_before: Vec<usize> = tags
+            .iter()
+            .map(|tag| crate::generated_message_count_of(tag, depth))
+            .collect();
+          let messages_before = crate::generated_message_count(depth);
+          let unimplemented_before = crate::unimplemented_call_count();
+          match evaluate_expr_to_expr(&args[0]) {
+            Ok(result) => {
+              let triggered = if args.len() == 2 {
+                crate::generated_message_count(depth) > messages_before
+                  || crate::unimplemented_call_count() > unimplemented_before
+              } else {
+                tags.iter().zip(&tag_counts_before).any(|(tag, before)| {
+                  crate::generated_message_count_of(tag, depth) > *before
+                })
+              };
+              if triggered {
+                return Err(InterpreterError::TailCall(Box::new(
+                  args[1].clone(),
+                )));
+              }
+              return Ok(result);
+            }
+            // `Check` reacts to messages, not to control flow: a `Throw`,
+            // `Return`, `Break`, `Continue`, `Goto` or `Abort` raised inside
+            // it passes straight through, so `Catch[Check[Throw[1], "F"]]`
+            // is `1` and not `"F"`.
+            Err(
+              signal @ (InterpreterError::ReturnValue(_)
+              | InterpreterError::BreakSignal
+              | InterpreterError::ContinueSignal
+              | InterpreterError::ThrowValue(_, _)
+              | InterpreterError::Abort
+              | InterpreterError::Terminated(_)
+              | InterpreterError::TailCall(_)
+              | InterpreterError::GotoSignal(_)),
+            ) => return Err(signal),
+            Err(_) => {
+              return Err(InterpreterError::TailCall(Box::new(
+                args[1].clone(),
+              )));
+            }
+          }
+        }
+        // Special handling for Association[args]: if any raw arg is
+        // structurally non-normalizable (e.g. a List containing a non-Rule
+        // item), short-circuit to the unevaluated `Association[args]` form
+        // BEFORE evaluating args. wolframscript's `Association` has
+        // `HoldAllComplete`, so when normalization can't proceed it keeps
+        // the inner Association literals (with their empty `{}`/`<||>`
+        // entries) intact rather than collapsing them via standalone
+        // evaluation.
+        if name == "Association" && !args.is_empty() {
+          fn is_normalizable_assoc_arg(e: &Expr) -> bool {
+            match e {
+              Expr::Rule { .. }
+              | Expr::RuleDelayed { .. }
+              | Expr::Association(_) => true,
+              Expr::FunctionCall { name: n, args: ca }
+                if n == "Rule" && ca.len() == 2 =>
+              {
+                true
+              }
+              Expr::FunctionCall { name: n, args: ca }
+                if n == "RuleDelayed" && ca.len() == 2 =>
+              {
+                true
+              }
+              Expr::FunctionCall {
+                name: n,
+                args: aargs,
+              } if n == "Association" => {
+                aargs.iter().all(is_normalizable_assoc_arg)
+              }
+              Expr::List(items) => items.iter().all(is_normalizable_assoc_arg),
+              _ => false,
+            }
+          }
+          if !args.iter().all(is_normalizable_assoc_arg) {
+            // HoldAllComplete, but Association still evaluates its arguments
+            // to see whether they normalize to a valid association structure
+            // — e.g. Association[Table[k -> v, ...]] builds from the resulting
+            // list of rules. If the evaluated form is a valid structure, build
+            // from it; otherwise keep the ORIGINAL held arguments
+            // (Association[Range[3]] and Association[x] stay unevaluated).
+            let evaluated: Vec<Expr> = args
+              .iter()
+              .map(crate::evaluator::evaluate_expr_to_expr)
+              .collect::<Result<_, _>>()?;
+            if evaluated.iter().all(is_normalizable_assoc_arg) {
+              return crate::evaluator::evaluate_expr_to_expr(&call(
+                "Association",
+                evaluated,
+              ));
+            }
+            return Ok(unevaluated(name, args));
+          }
+        }
+        // Special handling for Quiet[expr], Quiet[expr, msgs], Quiet[expr, moff, mon]
+        if name == "Quiet" {
+          if (args.is_empty() || args.len() > 3)
+            && let Some(result) =
+              dispatch::arg_count::check_arg_count(name, args)
+          {
+            return result;
+          }
+          return crate::functions::control_flow_ast::quiet_ast(args);
+        }
+        // Special handling for Switch - lazy evaluation of branches.
+        // `>= 2` (rather than `>= 3`) so an even argument count like
+        // `Switch[2, 1]` reaches switch_ast, which reports Switch::argct.
+        if name == "Switch" && args.len() >= 2 {
+          return crate::functions::control_flow_ast::switch_ast(args);
+        }
+        // Special handling for Piecewise - lazy evaluation of branches
+        if name == "Piecewise" && !args.is_empty() && args.len() <= 2 {
+          return crate::functions::control_flow_ast::piecewise_ast(args);
+        }
+        // Special handling for TraceScan - traces evaluation of sub-expressions
+        if name == "TraceScan" && args.len() >= 2 && args.len() <= 3 {
+          return crate::functions::control_flow_ast::trace_scan_ast(args);
+        }
+        // Special handling for TracePrint - prints the evaluation trace
+        if name == "TracePrint" && !args.is_empty() && args.len() <= 2 {
+          return crate::functions::control_flow_ast::trace_print_ast(args);
+        }
+        // Special handling for Table, Do, With - don't evaluate args (body needs iteration/bindings)
+        // These functions take unevaluated expressions as first argument
+        if name == "Table"
+        || name == "Do"
+        // ParallelDo holds its body like Do so side-effecting expressions
+        // (e.g. Print[i]) aren't evaluated once before iteration begins.
+        || name == "ParallelDo"
+        || name == "With"
+        || name == "Block"
+        // BlockRandom is deliberately absent: it is HoldFirst, not HoldAll,
+        // so only its body is held (by the attribute machinery) while any
+        // trailing option evaluates normally.
+        || name == "Function"
+        || name == "For"
+        || name == "While"
+        || name == "ClearAll"
+        || name == "Clear"
+        || name == "Hold"
+        || name == "HoldForm"
+        || name == "HoldComplete"
+        || name == "Unevaluated"
+        || name == "ValueQ"
+        || name == "Reap"
+        || name == "Plot"
+        || name == "Plot3D"
+        // Note: Graphics is NOT held – its args are evaluated normally
+        // (so Thick → Thickness[Large], Red → RGBColor[1,0,0], etc.)
+        || name == "ParametricPlot"
+        // The 3D counterparts of the held 2D plotting heads above need the
+        // same treatment: each takes a symbolic body plus `{var, min, max}`
+        // iterator specs, so a `Module` local reused as one of those
+        // iterator variables (a common idiom — see the "Firm with Two
+        // Plants" Demonstration, whose Manipulate reuses its `Q` control as
+        // ParametricPlot3D's own iterator) must stay unevaluated in the
+        // iterator position rather than being substituted away before the
+        // plot function ever sees it as a symbol.
+        || name == "ParametricPlot3D"
+        || name == "ContourPlot3D"
+        || name == "RegionPlot3D"
+        || name == "VectorPlot3D"
+        || name == "SphericalPlot3D"
+        || name == "RevolutionPlot3D"
+        || name == "PolarPlot"
+        || name == "DensityPlot"
+        || name == "ContourPlot"
+        || name == "RegionPlot"
+        || name == "StreamPlot"
+        || name == "VectorPlot"
+        || name == "StreamDensityPlot"
+        || name == "Show"
+        || name == "GraphicsRow"
+        || name == "GraphicsColumn"
+        || name == "GraphicsGrid"
+        || name == "PlotGrid"
+        || name == "BooleanTable"
+        // Manipulate holds its body and variable specs so that controls
+        // like Plot[Sin[a*x], {x, 0, 6}] aren't evaluated with `a` free
+        // (matching Wolfram Language notebook behavior).
+        || name == "Manipulate"
+        // Animate is Manipulate that auto-plays; it holds its body and
+        // variable spec for the same reason. (ListAnimate is deliberately
+        // NOT held: its argument is a precomputed list of frames that must
+        // evaluate first, matching Wolfram Language.)
+        || name == "Animate"
+        // Control likewise holds its variable spec so that the bound symbol
+        // and any symbolic values stay intact for interactive rendering.
+        || name == "Control"
+        // LocatorPane holds its body graphic so it isn't evaluated with the
+        // locator point free; ClickPane holds its handler so it stays an
+        // un-applied function until fed a click position.
+        || name == "LocatorPane"
+        || name == "ClickPane"
+        // GeometricScene holds its point-definition rules and primitives:
+        // the primitives reference point *symbols*, not values, and must
+        // stay symbolic until a `["Graphics"]` property substitutes them in.
+        || name == "GeometricScene"
+        // NDSolve holds its equations, dependent variable(s) and
+        // independent-variable spec (matching Wolfram: NDSolve has
+        // HoldAll) so that an independent variable name reused elsewhere
+        // in the caller's scope — e.g. a Manipulate animation control
+        // also named `t`, as in the "Spring-Cart-Pendulum System"
+        // Demonstration's `sol[t_] = First[NDSolve[…, {t, 0, tMax}]]` —
+        // isn't substituted with its outer value before the solver ever
+        // sees `t` as the symbolic integration variable. The
+        // equations/bounds still resolve correctly: the solver
+        // substitutes each grid value for the iterator and evaluates the
+        // rest itself (picking up other free symbols, like a
+        // Module-local coefficient, from scope).
+        //
+        // DSolve is deliberately NOT held here even though real Wolfram
+        // gives it the same HoldAll attribute: unlike NDSolve's numeric
+        // stepper, DSolve's symbolic classifiers evaluate sub-expressions
+        // directly rather than through a scoped substitute-then-evaluate
+        // step, so holding its args swaps this bug for a silently wrong
+        // symbolic solution (`y[x] -> 5 + C[1]` instead of `x + C[1]`
+        // under `Block[{x = 5}, …]`) rather than fixing it.
+        || name == "NDSolve"
+        || name == "NDSolveValue"
+        {
+          // Show/GraphicsRow/GraphicsColumn/GraphicsGrid/PlotGrid/
+          // BooleanTable aren't actually HoldAll in Wolfram Language, so a
+          // `Sequence @@ list` argument must reduce to `Sequence[…]` before
+          // the flatten below can splice it (see `resolve_sequence_apply_args`).
+          let resolved: std::borrow::Cow<[Expr]> = if matches!(
+            name.as_str(),
+            "Show"
+              | "GraphicsRow"
+              | "GraphicsColumn"
+              | "GraphicsGrid"
+              | "PlotGrid"
+              | "BooleanTable"
+          ) {
+            crate::evaluator::listable::resolve_sequence_apply_args(args)?
+          } else {
+            std::borrow::Cow::Borrowed(args)
+          };
+          // Flatten Sequence even in held args (unless SequenceHold)
+          let flattened = flatten_sequences(name, &resolved);
+          // Honour Evaluate[...] inside HoldAll wrappers like Hold and
+          // HoldForm — Evaluate forces evaluation of its argument even
+          // through a hold. HoldComplete suppresses it (matching Wolfram).
+          // The plotting heads are included so the common
+          // `Plot[Table[…] // Evaluate, …]` idiom yields the evaluated
+          // list of curves instead of a whole-body expression the
+          // samplers can't decompose.
+          let args: std::borrow::Cow<[Expr]> = if matches!(
+            name.as_str(),
+            "Hold"
+              | "HoldForm"
+              | "Function"
+              | "Reap"
+              | "Manipulate"
+              | "Animate"
+              // Table/Do honour a top-level Evaluate[...] body the same way
+              // the plotting heads do: the body is evaluated once with the
+              // iterator still symbolic (e.g. so `Table[Evaluate[RSolve[…,n]]…,
+              // {n,…}]` solves the recurrence once and then substitutes each n)
+              // instead of being re-derived per value.
+              | "Table"
+              | "Do"
+              | "Plot"
+              | "Plot3D"
+              | "ParametricPlot"
+              | "ParametricPlot3D"
+              | "ContourPlot3D"
+              | "RegionPlot3D"
+              | "VectorPlot3D"
+              | "SphericalPlot3D"
+              | "RevolutionPlot3D"
+              | "PolarPlot"
+              | "DensityPlot"
+              | "ContourPlot"
+              | "RegionPlot"
+              | "StreamPlot"
+              | "VectorPlot"
+              | "StreamDensityPlot"
+          ) {
+            let raw: Vec<Expr> = flattened
+              .iter()
+              .map(unwrap_top_level_evaluate)
+              .collect::<Result<Vec<Expr>, _>>()?;
+            // Multi-arg Evaluate yields a Sequence that must splice into
+            // the surrounding hold context (e.g. `Hold[Evaluate[1, 2]]`
+            // becomes `Hold[1, 2]`).
+            std::borrow::Cow::Owned(splice_top_level_sequences(raw))
+          } else {
+            flattened
+          };
+          // Pass unevaluated args to the function dispatcher
+          return evaluate_function_call_ast(name, &args);
+        }
+        // Check if name is a variable holding a callable value (Function,
+        // FunctionCall like Composition) or an association. Only those two
+        // shapes are wanted here, and this runs for every call whose head is
+        // a symbol, so the store is asked what it holds before anything is
+        // copied out of it — an association can be very large.
+        let head_is_association = ENV.with(|e| {
+          matches!(
+            e.borrow().get(name),
+            Some(
+              StoredValue::Association(_)
+                | StoredValue::ExprVal(Expr::Association(_))
+            )
+          )
+        });
+        let var_val = ENV.with(|e| match e.borrow().get(name) {
+          Some(
+            value @ StoredValue::ExprVal(
+              Expr::Function { .. }
+              | Expr::NamedFunction { .. }
+              | Expr::FunctionCall { .. },
+            ),
+          ) => Some(value.clone()),
+          _ => None,
+        });
+        if let Some(StoredValue::ExprVal(stored_expr)) = &var_val {
+          match stored_expr {
+            Expr::Function { .. }
+            | Expr::NamedFunction { .. }
+            | Expr::FunctionCall { .. } => {
+              // A stored call is a delayed body to evaluate first — the
+              // memoization idiom `tpl := tpl = StringTemplate[…]` yields
+              // the template, not the `Set` — and what it yields is what
+              // gets applied.
+              let head_value = match stored_expr {
+                Expr::FunctionCall { .. } => {
+                  evaluate_expr_to_expr(&Expr::Identifier(name.clone()))?
+                }
+                other => other.clone(),
+              };
+              if let Expr::Identifier(new_head) = &head_value
+                && new_head != name
+              {
+                return Err(InterpreterError::TailCall(Box::new(
+                  Expr::FunctionCall {
+                    name: new_head.clone(),
+                    args: args.to_vec().into(),
+                  },
+                )));
+              }
+              if matches!(
+                head_value,
+                Expr::Function { .. }
+                  | Expr::NamedFunction { .. }
+                  | Expr::FunctionCall { .. }
+              ) {
+                // For Function[{params}, body, attrs] with HoldAll/HoldFirst/
+                // HoldRest, suppress argument evaluation so the function body
+                // sees the unevaluated forms.
+                let hold_attrs = function_hold_attributes(&head_value);
+                let mut prepared: Vec<Expr> = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                  let hold = hold_attrs.0
+                    || (hold_attrs.1 && i == 0)
+                    || (hold_attrs.2 && i > 0);
+                  if hold {
+                    prepared.push(a.clone());
+                  } else {
+                    prepared.push(evaluate_expr_to_expr(a)?);
+                  }
+                }
+                return apply_curried_call(&head_value, &prepared);
+              }
+            }
+            _ => {}
+          }
+        }
+        // Variable holds a symbol name (e.g. t = Flatten) — re-dispatch as that function
+        if let Some(resolved_name) = resolve_identifier_to_func_name(name) {
+          return Err(InterpreterError::TailCall(Box::new(
+            Expr::FunctionCall {
+              name: resolved_name,
+              args: args.to_vec().into(),
+            },
+          )));
+        }
+        // Check if name is a variable holding an association (for nested
+        // access: assoc["a", "b"]). A scoping construct binds its locals as
+        // ordinary expression values, so `Block[{o = <|…|>}, o["k"]]` has to
+        // reach the association through that representation too — it is how
+        // WLX hands a component its `$Options`.
+        if head_is_association {
+          // Evaluate arguments and perform nested access. A `Sequence[…]`
+          // among them splices first, the way it does for any other head —
+          // `f[k_, rest__] := assoc[k, rest]` reaches here with the
+          // sequence still wrapped.
+          let evaluated_args: Vec<Expr> = args
+            .iter()
+            .map(evaluate_expr_to_expr)
+            .collect::<Result<_, _>>()?;
+          let evaluated_args = crate::evaluator::listable::flatten_sequences(
+            name,
+            &evaluated_args,
+          );
+          // A definition written on the symbol takes precedence over the
+          // association it holds, the same way it does for a symbol holding
+          // anything else (`t = 1; t[x_] := x^2; t[3]` is 9). Objects built
+          // out of a symbol keep their fields as definitions and the symbol's
+          // own value as the key list; both have to stay reachable.
+          if crate::FUNC_DEFS.with(|m| m.borrow().contains_key(name)) {
+            let dispatched = evaluate_function_call_ast(name, &evaluated_args)?;
+            let untouched = Expr::FunctionCall {
+              name: name.clone(),
+              args: evaluated_args.to_vec().into(),
+            };
+            if expr_to_string(&dispatched) != expr_to_string(&untouched) {
+              return Ok(dispatched);
+            }
+          }
+          return association_nested_access(name, &evaluated_args);
+        }
+
+        // Try early dispatch for held functions
+        if let Some(result) = evaluate_expr_to_expr_early_dispatch(name, args)?
+        {
+          return Ok(result);
+        }
+
+        // Evaluate arguments (respecting Hold attributes)
+        let evaluated_args = evaluate_args_with_hold(name, args)?;
+        // Flatten Sequence arguments (unless function has SequenceHold attribute)
+        let evaluated_args = flatten_sequences(name, &evaluated_args);
+        // Dispatch to function implementation
+        evaluate_function_call_ast(name, &evaluated_args)
+      })(); // end of closure for stack tracking
+      // Capture stack trace before popping, so errors carry context
+      if matches!(&result, Err(InterpreterError::EvaluationError(_))) {
+        crate::capture_error_trace();
+      }
+      crate::pop_eval_stack();
+      result
+    }
+    Expr::BinaryOp { op, left, right } => {
+      // Short-circuit evaluation for And (&&) and Or (||):
+      // Evaluate left side first, and only evaluate right side if needed.
+      match op {
+        BinaryOperator::And => {
+          let left_val = evaluate_expr_to_expr(left)?;
+          if matches!(&left_val, Expr::Identifier(s) if s == "False") {
+            return Ok(bool_expr(false));
+          }
+          let right_val = evaluate_expr_to_expr(right)?;
+          let has_user_rules =
+            crate::FUNC_DEFS.with(|m| m.borrow().contains_key("And"));
+          if has_user_rules {
+            return evaluate_function_call_ast("And", &[left_val, right_val]);
+          }
+          return crate::functions::boolean_ast::and_ast(&[
+            left_val, right_val,
+          ]);
+        }
+        BinaryOperator::Or => {
+          let left_val = evaluate_expr_to_expr(left)?;
+          if matches!(&left_val, Expr::Identifier(s) if s == "True") {
+            return Ok(bool_expr(true));
+          }
+          let right_val = evaluate_expr_to_expr(right)?;
+          let has_user_rules =
+            crate::FUNC_DEFS.with(|m| m.borrow().contains_key("Or"));
+          if has_user_rules {
+            return evaluate_function_call_ast("Or", &[left_val, right_val]);
+          }
+          return crate::functions::boolean_ast::or_ast(&[left_val, right_val]);
+        }
+        BinaryOperator::StringJoin => {
+          // StringJoin is Flat: evaluate the whole `a <> b <> c` chain as one
+          // StringJoin so string_join_ast sees every operand at once (correct
+          // message positions and a flat result), rather than evaluating each
+          // nested BinaryOp separately and emitting premature messages.
+          fn gather(e: &Expr, out: &mut Vec<Expr>) {
+            if let Expr::BinaryOp {
+              op: BinaryOperator::StringJoin,
+              left,
+              right,
+            } = e
+            {
+              gather(left, out);
+              gather(right, out);
+            } else {
+              out.push(e.clone());
+            }
+          }
+          let mut operands = Vec::new();
+          gather(left, &mut operands);
+          gather(right, &mut operands);
+          let mut evaled = Vec::with_capacity(operands.len());
+          for o in &operands {
+            evaled.push(evaluate_expr_to_expr(o)?);
+          }
+          return crate::functions::string_ast::string_join_ast(&evaled);
+        }
+        BinaryOperator::Plus | BinaryOperator::Minus => {
+          return evaluate_binary_op_chain(*op, left, right, |o| {
+            matches!(o, BinaryOperator::Plus | BinaryOperator::Minus)
+          });
+        }
+        BinaryOperator::Times | BinaryOperator::Divide => {
+          return evaluate_binary_op_chain(*op, left, right, |o| {
+            matches!(o, BinaryOperator::Times | BinaryOperator::Divide)
+          });
+        }
+        _ => {}
+      }
+
+      // An operator always consumes its operands, so an `Unevaluated[…]`
+      // wrapper comes off here the way it does before any other head's rules
+      // run: `Unevaluated[1 + 1] + 3` is 5.
+      let left_val = strip_unevaluated(&evaluate_expr_to_expr(left)?);
+      let right_val = strip_unevaluated(&evaluate_expr_to_expr(right)?);
+      evaluate_binary_op_pair(*op, left_val, right_val)
+    }
+    Expr::UnaryOp { op, operand } => {
+      let val = evaluate_expr_to_expr(operand)?;
+      match op {
+        UnaryOperator::Minus => {
+          // `-x` is `Times[-1, x]`; let user-defined rules on Times apply
+          // before the built-in path.
+          if let Some(result) =
+            expand_arith_shorthand("Minus", std::slice::from_ref(&val))
+          {
+            return result;
+          }
+          // Use times_ast for proper distribution: -(a+b) → -a - b
+          crate::functions::math_ast::times_ast(&[Expr::Integer(-1), val])
+        }
+        UnaryOperator::Not => {
+          if matches!(&val, Expr::Identifier(s) if s == "True") {
+            Ok(bool_expr(false))
+          } else if matches!(&val, Expr::Identifier(s) if s == "False") {
+            Ok(bool_expr(true))
+          } else {
+            Ok(Expr::UnaryOp {
+              op: *op,
+              operand: Box::new(val),
+            })
+          }
+        }
+      }
+    }
+    Expr::Comparison {
+      operands,
+      operators,
+    } => {
+      if operands.len() < 2 || operators.is_empty() {
+        return Ok(bool_expr(true));
+      }
+
+      // As with the arithmetic operators, a comparison consumes its
+      // operands, so `Unevaluated[Symbol] === Symbol` is True. Only the
+      // structural comparisons take the wrapper off here: the arithmetic
+      // ones compare the *unevaluated* content, which Woxi cannot hand them
+      // without evaluating it (see "Unevaluated" in conformance_gaps.md).
+      let structural = operators
+        .iter()
+        .all(|op| matches!(op, ComparisonOp::SameQ | ComparisonOp::UnsameQ));
+      let values: Vec<Expr> = operands
+        .iter()
+        .map(|operand| {
+          let value = evaluate_expr_to_expr(operand)?;
+          Ok(if structural {
+            strip_unevaluated(&value)
+          } else {
+            value
+          })
+        })
+        .collect::<Result<_, InterpreterError>>()?;
+
+      // Mixed-operator chains (e.g. `a == b != c`, `a < b > c`) split into
+      // pairwise `a op1 b && b op2 c && …` per wolframscript. Homogeneous
+      // chains stay intact so downstream code can keep the `Comparison`
+      // node and decide numerically.
+      if operators.len() >= 2 && !all_same_comparison_family(operators) {
+        let mut terms: Vec<Expr> = Vec::with_capacity(operators.len());
+        for i in 0..operators.len() {
+          terms.push(Expr::Comparison {
+            operands: vec![values[i].clone(), values[i + 1].clone()],
+            operators: vec![operators[i]],
+          });
+        }
+        let and_expr = call("And", terms);
+        return evaluate_expr_to_expr(&and_expr);
+      }
+
+      // A tagged rule can hang on `Equal` and its relatives as readily as on
+      // `Plus`: `obj /: (obj == 1) = 5` makes `obj == 1` evaluate to 5.
+      {
+        let (head, args) =
+          crate::syntax::comparison_head_and_args(&values, operators);
+        if arith_rules_may_apply(&head, &args) {
+          return evaluate_function_call_ast(&head, &args);
+        }
+      }
+
+      // Comparisons with complex infinities: the four order relations are
+      // invalid — emit `<Head>::nord` and stay unevaluated like
+      // wolframscript — and Equal/Unequal between TWO complex infinities
+      // is indeterminate (unevaluated, no message). Real-directed
+      // infinities (DirectedInfinity[±1]) stay comparable.
+      {
+        let complex_inf_display = |e: &Expr| -> Option<String> {
+          match e {
+            Expr::Identifier(s) | Expr::Constant(s)
+              if s == "ComplexInfinity" =>
+            {
+              Some("ComplexInfinity".to_string())
+            }
+            Expr::FunctionCall { name, args } if name == "DirectedInfinity" => {
+              match args.len() {
+                0 => Some("ComplexInfinity".to_string()),
+                1 => {
+                  let real = matches!(
+                    &args[0],
+                    Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_)
+                  ) || matches!(&args[0], Expr::FunctionCall { name, .. } if name == "Rational");
+                  if real {
+                    None
+                  } else {
+                    Some(format!("{} Infinity", expr_to_string(&args[0])))
+                  }
+                }
+                _ => None,
+              }
+            }
+            _ => None,
+          }
+        };
+        for i in 0..operators.len() {
+          let op = operators[i];
+          let display = complex_inf_display(&values[i])
+            .or_else(|| complex_inf_display(&values[i + 1]));
+          let Some(display) = display else { continue };
+          let head = match op {
+            ComparisonOp::Less => Some("Less"),
+            ComparisonOp::LessEqual => Some("LessEqual"),
+            ComparisonOp::Greater => Some("Greater"),
+            ComparisonOp::GreaterEqual => Some("GreaterEqual"),
+            _ => None,
+          };
+          if let Some(head) = head {
+            crate::emit_message(&format!(
+              "{head}::nord: Invalid comparison with {display} attempted."
+            ));
+            return Ok(Expr::Comparison {
+              operands: values,
+              operators: operators.clone(),
+            });
+          }
+          let _ = display;
+        }
+
+        // Equal/Unequal with infinities (wolframscript-verified):
+        // any infinity vs a finite numeric quantity → False / True;
+        // two explicit directions compare by direction (Infinity ==
+        // DirectedInfinity[I] → False, DirectedInfinity[I] ==
+        // DirectedInfinity[I] → True); ComplexInfinity (unknown
+        // direction) vs any infinity stays unevaluated.
+        for i in 0..operators.len() {
+          let op = operators[i];
+          if !matches!(op, ComparisonOp::Equal | ComparisonOp::NotEqual) {
+            continue;
+          }
+          let verdict = crate::functions::boolean_ast::infinity_equal_verdict(
+            &values[i],
+            &values[i + 1],
+          );
+          match verdict {
+            None => {}
+            Some(Some(eq)) => {
+              let result = eq == matches!(op, ComparisonOp::Equal);
+              // A false pair settles an Equal chain (and an equal
+              // adjacent pair settles an Unequal chain) of any length;
+              // a true pair is only decisive for a 2-operand comparison.
+              if !result || operands.len() == 2 {
+                return Ok(bool_expr(result));
+              }
+            }
+            Some(None) => {
+              return Ok(Expr::Comparison {
+                operands: values,
+                operators: operators.clone(),
+              });
+            }
+          }
+        }
+      }
+
+      // UnsameQ with 3+ operands is NOT transitive: it requires ALL pairs
+      // to be distinct, not just adjacent ones. Delegate to unsame_q_ast,
+      // which implements the correct all-pairs check.
+      if operators.len() >= 2
+        && operators.iter().all(|op| *op == ComparisonOp::UnsameQ)
+      {
+        return crate::functions::boolean_ast::unsame_q_ast(&values);
+      }
+
+      // Unequal (!=) with 3+ operands is also all-pairs, not adjacent
+      // pairs. "abc" != "def" != "abc" must return False.
+      if operators.len() >= 2
+        && operators.iter().all(|op| *op == ComparisonOp::NotEqual)
+      {
+        let result = crate::functions::boolean_ast::unequal_ast(&values)?;
+        // Preserve the chained-comparison form for symbolic results so
+        // that 1 != 2 != x prints as `1 != 2 != x`, not Unequal[...].
+        if matches!(&result, Expr::FunctionCall { name, .. } if name == "Unequal")
+        {
+          return Ok(Expr::Comparison {
+            operands: values,
+            operators: operators.clone(),
+          });
+        }
+        return Ok(result);
+      }
+
+      // For homogeneous monotone chains (all Less, all LessEqual, all
+      // Greater, all GreaterEqual) detect contradictions across non-adjacent
+      // numeric values. `1 < 3 < x < 2` is False because 3 < ... < 2 cannot
+      // hold even though x is symbolic; without this scan the pair (3, x)
+      // would short-circuit to an unevaluated form.
+      use crate::functions::math_ast::try_eval_to_f64_with_infinity as try_eval_to_f64;
+      let monotone_op = operators.first().filter(|_| {
+        operators.iter().all(|op| {
+          matches!(
+            op,
+            ComparisonOp::Less
+              | ComparisonOp::LessEqual
+              | ComparisonOp::Greater
+              | ComparisonOp::GreaterEqual
+          )
+        }) && operators.iter().skip(1).all(|op| op == &operators[0])
+      });
+      if let Some(op) = monotone_op {
+        let nums: Vec<(usize, f64)> = values
+          .iter()
+          .enumerate()
+          .filter_map(|(i, e)| try_eval_to_f64(e).map(|n| (i, n)))
+          .collect();
+        for w in nums.windows(2) {
+          // f64 conversion silently rounds 1-ULP differences above
+          // ~2^53 to a tie — `2^60 < 2^60 + 1` would otherwise
+          // short-circuit to False. Use the BigInt path when both
+          // endpoints are exact integers; let the f64 fallback handle
+          // any pair that mixes a non-integer.
+          let exact = exact_integer_ord(&values[w[0].0], &values[w[1].0]);
+          let ok = match (exact, op) {
+            (Some(o), ComparisonOp::Less) => {
+              matches!(o, std::cmp::Ordering::Less)
+            }
+            (Some(o), ComparisonOp::LessEqual) => {
+              !matches!(o, std::cmp::Ordering::Greater)
+            }
+            (Some(o), ComparisonOp::Greater) => {
+              matches!(o, std::cmp::Ordering::Greater)
+            }
+            (Some(o), ComparisonOp::GreaterEqual) => {
+              !matches!(o, std::cmp::Ordering::Less)
+            }
+            (None, ComparisonOp::Less) => w[0].1 < w[1].1,
+            (None, ComparisonOp::LessEqual) => w[0].1 <= w[1].1,
+            (None, ComparisonOp::Greater) => w[0].1 > w[1].1,
+            (None, ComparisonOp::GreaterEqual) => w[0].1 >= w[1].1,
+            _ => true,
+          };
+          if !ok {
+            return Ok(bool_expr(false));
+          }
+        }
+      }
+
+      // Evaluate comparison chain
+      for i in 0..operators.len() {
+        let left = &values[i];
+        let right = &values[i + 1];
+        let op = &operators[i];
+
+        // Nothing is known to equal (or differ from) Indeterminate, not even
+        // itself, so the whole chain stays unevaluated instead of being
+        // decided structurally.
+        if matches!(op, ComparisonOp::Equal | ComparisonOp::NotEqual)
+          && (matches!(left, Expr::Identifier(s) | Expr::Constant(s)
+                if s == "Indeterminate")
+            || matches!(right, Expr::Identifier(s) | Expr::Constant(s)
+                if s == "Indeterminate"))
+        {
+          return Ok(Expr::Comparison {
+            operands: values,
+            operators: operators.clone(),
+          });
+        }
+
+        // `True`/`False` and `Null` are each only comparable with their own
+        // kind. `True == False` is False and `Null == Null` is True, but a
+        // Boolean against Null, a number, a string or a list has no value and
+        // stays unevaluated — `1 == True` is not False.
+        if matches!(op, ComparisonOp::Equal | ComparisonOp::NotEqual) {
+          let kind = |e: &Expr| match e {
+            Expr::Identifier(s) | Expr::Constant(s) => match s.as_str() {
+              "True" | "False" => Some(0u8),
+              "Null" => Some(1u8),
+              _ => None,
+            },
+            _ => None,
+          };
+          let (kl, kr) = (kind(left), kind(right));
+          if (kl.is_some() || kr.is_some()) && kl != kr {
+            // Segments before this one already held, so only the
+            // undecidable remainder comes back: `2 > 1 == True` is
+            // `1 == True`, not the whole chain.
+            return Ok(Expr::Comparison {
+              operands: values[i..].to_vec(),
+              operators: operators[i..].to_vec(),
+            });
+          }
+        }
+
+        // Interval comparisons: Interval[{a,b}] < Interval[{c,d}], a scalar
+        // counting as the degenerate interval {s,s}. A determinable result is
+        // used directly; an indeterminate (overlapping) one falls through to
+        // the normal logic, which leaves the comparison unevaluated.
+        if (crate::functions::interval_ast::is_interval(left).is_some()
+          || crate::functions::interval_ast::is_interval(right).is_some())
+          && let Some(b) = interval_compare(*op, left, right)
+        {
+          if !b {
+            return Ok(bool_expr(false));
+          }
+          continue;
+        }
+
+        // Ordering comparisons on DateObject / TimeObject: compare by absolute
+        // time (dates) or seconds-since-midnight (times of day). Both operands
+        // must be the same kind. A determinable result is used; anything else
+        // falls through to the normal (unevaluated) handling.
+        if matches!(
+          op,
+          ComparisonOp::Less
+            | ComparisonOp::LessEqual
+            | ComparisonOp::Greater
+            | ComparisonOp::GreaterEqual
+        ) && let (Some((lv, lk)), Some((rv, rk))) = (
+          crate::functions::datetime_ast::datetime_order_key(left),
+          crate::functions::datetime_ast::datetime_order_key(right),
+        ) && lk == rk
+        {
+          let ok = match op {
+            ComparisonOp::Less => lv < rv,
+            ComparisonOp::LessEqual => lv <= rv,
+            ComparisonOp::Greater => lv > rv,
+            ComparisonOp::GreaterEqual => lv >= rv,
+            _ => true,
+          };
+          if !ok {
+            return Ok(bool_expr(false));
+          }
+          continue;
+        }
+
+        // Enharmonic MusicPitch equality (WL 15): two `MusicPitch` objects
+        // compare equal by their sounding MIDI pitch, so `MusicPitch["C#"]`
+        // equals `MusicPitch["Db"]`. Only `Equal` has this rule — Wolfram
+        // leaves `!=` on distinct pitch objects unevaluated.
+        if matches!(op, ComparisonOp::Equal)
+          && matches!(left, Expr::FunctionCall { name, .. } if name == "MusicPitch")
+          && matches!(right, Expr::FunctionCall { name, .. } if name == "MusicPitch")
+          && let (Some(lm), Some(rm)) = (
+            crate::functions::music_ast::music_pitch_midi(left),
+            crate::functions::music_ast::music_pitch_midi(right),
+          )
+        {
+          if lm != rm {
+            return Ok(bool_expr(false));
+          }
+          continue;
+        }
+
+        // Any other (in)equality touching a MusicPitch stays unevaluated
+        // (after the structurally-identical collapse below), matching
+        // Wolfram: `MusicPitch["C#"] != MusicPitch["Db"]` and
+        // `MusicPitch["C"] == 5` both echo back.
+        if matches!(op, ComparisonOp::Equal | ComparisonOp::NotEqual)
+          && (matches!(left, Expr::FunctionCall { name, .. } if name == "MusicPitch")
+            || matches!(right, Expr::FunctionCall { name, .. } if name == "MusicPitch"))
+        {
+          if expr_to_string(left) == expr_to_string(right) {
+            if matches!(op, ComparisonOp::NotEqual) {
+              return Ok(bool_expr(false));
+            }
+            continue;
+          }
+          return Ok(Expr::Comparison {
+            operands: values,
+            operators: operators.clone(),
+          });
+        }
+
+        let result = match op {
+          ComparisonOp::SameQ => {
+            // SameQ tests structural identity, not numeric equality.
+            // Integer[1] !== Real[1.] even though they are numerically equal.
+            // Special case: a machine-precision Real and a BigFloat with
+            // a precision tag inside the machine-precision band collapse
+            // to the same f64 — Wolfram treats them as SameQ.
+            //
+            // `expr_to_string` reports every `Image[…]` as the same
+            // `-Image-` display placeholder, so the string fast path
+            // would treat any two images as SameQ regardless of their
+            // pixel data — compare the actual raster content instead.
+            if matches!(left, Expr::Image { .. })
+              || matches!(right, Expr::Image { .. })
+            {
+              crate::evaluator::pattern_matching::expr_equal(left, right)
+            } else {
+              expr_to_string(left) == expr_to_string(right)
+                || crate::functions::boolean_ast::same_q_real_bigfloat(
+                  left, right,
+                )
+            }
+          }
+          ComparisonOp::Equal => {
+            // `expr_to_string` reports every `Image[…]` as the same
+            // `-Image-` display placeholder, so the string-identity
+            // fallback further below would treat any two images as
+            // Equal regardless of their pixel data — compare the
+            // actual raster content instead.
+            if matches!(left, Expr::Image { .. })
+              || matches!(right, Expr::Image { .. })
+            {
+              crate::evaluator::pattern_matching::expr_equal(left, right)
+            } else if let Some(ord) = exact_integer_ord(left, right) {
+              matches!(ord, std::cmp::Ordering::Equal)
+            } else {
+              // Two BigFloats with > ~16 digits of precision can carry
+              // distinct stored digit strings even though both collapse
+              // to the same f64. Compare the digit strings truncated to
+              // the *shared* precision so genuinely-different literals
+              // are False but values that agree to the shared precision
+              // (e.g. `N[E, 100]` vs `N[E, 150]`) stay equal.
+              if let (Expr::BigFloat(d_l, p_l), Expr::BigFloat(d_r, p_r)) =
+                (left, right)
+                && p_l.min(*p_r) > 16.0
+              {
+                // Compare to (shared - 1) digits so a 1-ULP difference at
+                // the last shared digit stays equal-within-tolerance.
+                let shared = (p_l.min(*p_r).floor() as usize).saturating_sub(1);
+                if shared > 0
+                  && !crate::functions::boolean_ast::bigfloat_digits_match_to(
+                    d_l, d_r, shared,
+                  )
+                {
+                  return Ok(bool_expr(false));
+                }
+              }
+              if let (Some(l), Some(r)) =
+                (try_eval_to_f64(left), try_eval_to_f64(right))
+              {
+                // Machine-precision Reals are compared up to the last ~7 bits
+                // (matches wolframscript, which treats the f64 guard bits as
+                // "insignificant"). Exact-vs-exact comparisons stay strict.
+                // When a BigFloat with low precision p is involved, also
+                // widen the tolerance to `10^-p · max(|l|, |r|)` so e.g.
+                // `3.1416 == 3.14`2` is True (the shorter operand only
+                // commits to ~2 significant decimals).
+                let involves_real =
+                  matches!(left, Expr::Real(_) | Expr::BigFloat(_, _))
+                    || matches!(right, Expr::Real(_) | Expr::BigFloat(_, _))
+                    || matches!(left, Expr::UnaryOp { operand, .. }
+                if matches!(operand.as_ref(), Expr::Real(_)))
+                    || matches!(right, Expr::UnaryOp { operand, .. }
+                  if matches!(operand.as_ref(), Expr::Real(_)));
+                if involves_real {
+                  let mut tol =
+                    f64::max(l.abs(), r.abs()) * (2.0_f64).powi(-46);
+                  let bigfloat_prec = [left, right]
+                    .iter()
+                    .filter_map(|e| match e {
+                      Expr::BigFloat(_, p) => Some(*p),
+                      _ => None,
+                    })
+                    .reduce(f64::min);
+                  if let Some(p) = bigfloat_prec {
+                    // wolframscript's `Equal` is more lenient than
+                    // `|a - b| < 10^-p`: it returns True whenever
+                    // the precision of the difference is below 1
+                    // (no significant digit). Practically that's
+                    // roughly an extra decade of slack — use
+                    // `10^-(p - 1)` so accuracy-form literals like
+                    // `13.1416``4 == 13.1413``4` match (diff
+                    // 3e-4 within 10^-4.12 ≈ 7.6e-5? no, within
+                    // 10^-(5.12 - 1) ≈ 7.6e-4).
+                    let widened_p = (p - 1.0).max(0.0);
+                    let prec_tol =
+                      f64::max(l.abs(), r.abs()) * 10.0_f64.powf(-widened_p);
+                    if prec_tol > tol {
+                      tol = prec_tol;
+                    }
+                  }
+                  (l - r).abs() <= tol
+                } else {
+                  l == r
+                }
+              } else if expr_to_string(left) == expr_to_string(right) {
+                true
+              } else if let Some(ord) =
+                crate::functions::quantity_ast::try_quantity_compare(
+                  left, right,
+                )
+              {
+                ord == std::cmp::Ordering::Equal
+              } else if crate::functions::boolean_ast::all_components_equal(
+                left, right,
+              ) {
+                // Same head and arity with every leaf determinably equal,
+                // e.g. `RGBColor[0., 0., 1.] == RGBColor[0, 0, 1]`.
+                true
+              } else if crate::functions::boolean_ast::structurally_unequal(
+                left, right,
+              ) {
+                // A structural shape mismatch (different list lengths, or a
+                // `List` lined up against a `Rule`) decides `Equal` no
+                // matter what free symbol is nested inside — e.g.
+                // `{{x -> 1}} == {{}}` is `False` even though `x` is
+                // unbound.
+                false
+              } else if has_free_symbols(left) || has_free_symbols(right) {
+                // Symbolic: return unevaluated
+                return Ok(Expr::Comparison {
+                  operands: values,
+                  operators: operators.clone(),
+                });
+              } else {
+                false
+              }
+            }
+          }
+          ComparisonOp::UnsameQ => {
+            // UnsameQ tests structural non-identity, not numeric inequality.
+            // See the SameQ arm above: images all share the `-Image-`
+            // display placeholder, so compare pixel data instead.
+            if matches!(left, Expr::Image { .. })
+              || matches!(right, Expr::Image { .. })
+            {
+              !crate::evaluator::pattern_matching::expr_equal(left, right)
+            } else {
+              expr_to_string(left) != expr_to_string(right)
+            }
+          }
+          ComparisonOp::NotEqual => {
+            if matches!(left, Expr::Image { .. })
+              || matches!(right, Expr::Image { .. })
+            {
+              !crate::evaluator::pattern_matching::expr_equal(left, right)
+            } else if let Some(ord) = exact_integer_ord(left, right) {
+              !matches!(ord, std::cmp::Ordering::Equal)
+            } else if let (Some(l), Some(r)) =
+              (try_eval_to_f64(left), try_eval_to_f64(right))
+            {
+              l != r
+            } else if expr_to_string(left) == expr_to_string(right) {
+              false
+            } else if crate::functions::boolean_ast::all_components_equal(
+              left, right,
+            ) {
+              // Determinably equal component-wise → `!=` is False.
+              false
+            } else if crate::functions::boolean_ast::structurally_unequal(
+              left, right,
+            ) {
+              // A structural shape mismatch decides `!=` regardless of any
+              // free symbol nested inside, mirroring the `Equal` rule above.
+              true
+            } else if has_free_symbols(left) || has_free_symbols(right) {
+              // Symbolic: return unevaluated
+              return Ok(Expr::Comparison {
+                operands: values,
+                operators: operators.clone(),
+              });
+            } else {
+              true
+            }
+          }
+          ComparisonOp::Less => {
+            if let Some(ord) = exact_integer_ord(left, right) {
+              matches!(ord, std::cmp::Ordering::Less)
+            } else if let (Some(l), Some(r)) =
+              (try_eval_to_f64(left), try_eval_to_f64(right))
+            {
+              l < r
+            } else if let Some(ord) =
+              crate::functions::quantity_ast::try_quantity_compare(left, right)
+            {
+              ord == std::cmp::Ordering::Less
+            } else {
+              // Return unevaluated comparison
+              return Ok(Expr::Comparison {
+                operands: values,
+                operators: operators.clone(),
+              });
+            }
+          }
+          ComparisonOp::LessEqual => {
+            if let Some(ord) = exact_integer_ord(left, right) {
+              !matches!(ord, std::cmp::Ordering::Greater)
+            } else if let (Some(l), Some(r)) =
+              (try_eval_to_f64(left), try_eval_to_f64(right))
+            {
+              l <= r
+            } else if let Some(ord) =
+              crate::functions::quantity_ast::try_quantity_compare(left, right)
+            {
+              ord != std::cmp::Ordering::Greater
+            } else {
+              return Ok(Expr::Comparison {
+                operands: values,
+                operators: operators.clone(),
+              });
+            }
+          }
+          ComparisonOp::Greater => {
+            if let Some(ord) = exact_integer_ord(left, right) {
+              matches!(ord, std::cmp::Ordering::Greater)
+            } else if let (Some(l), Some(r)) =
+              (try_eval_to_f64(left), try_eval_to_f64(right))
+            {
+              l > r
+            } else if let Some(ord) =
+              crate::functions::quantity_ast::try_quantity_compare(left, right)
+            {
+              ord == std::cmp::Ordering::Greater
+            } else {
+              return Ok(Expr::Comparison {
+                operands: values,
+                operators: operators.clone(),
+              });
+            }
+          }
+          ComparisonOp::GreaterEqual => {
+            if let Some(ord) = exact_integer_ord(left, right) {
+              !matches!(ord, std::cmp::Ordering::Less)
+            } else if let (Some(l), Some(r)) =
+              (try_eval_to_f64(left), try_eval_to_f64(right))
+            {
+              l >= r
+            } else if let Some(ord) =
+              crate::functions::quantity_ast::try_quantity_compare(left, right)
+            {
+              ord != std::cmp::Ordering::Less
+            } else {
+              return Ok(Expr::Comparison {
+                operands: values,
+                operators: operators.clone(),
+              });
+            }
+          }
+        };
+
+        if !result {
+          return Ok(bool_expr(false));
+        }
+      }
+      Ok(bool_expr(true))
+    }
+    Expr::CompoundExpr(exprs) => {
+      let mut result = null_expr();
+      let mut start_index = 0;
+      'goto_loop: loop {
+        // `start_index` is reassigned on a Goto and only takes effect on the
+        // next `'goto_loop` pass, which is exactly the intent.
+        #[allow(clippy::mut_range_bound)]
+        for i in start_index..exprs.len() {
+          // Between statements is the other place a socket handler can run.
+          // Costs one relaxed atomic load while no socket is listening.
+          crate::functions::socket_ast::pump_socket_events();
+          match evaluate_expr_to_expr(&exprs[i]) {
+            Ok(val) => {
+              // A `Return[val]` produced by Block/Module/While/For
+              // short-circuits the remaining statements, the same way the
+              // `CompoundExpression[…]` spelling above does.
+              if is_literal_return(&val) {
+                return Ok(val);
+              }
+              result = val;
+            }
+            Err(InterpreterError::GotoSignal(tag)) => {
+              if let Some(label_idx) = find_label_index(exprs, &tag) {
+                start_index = label_idx + 1;
+                continue 'goto_loop;
+              }
+              return Err(InterpreterError::GotoSignal(tag));
+            }
+            Err(e) => return Err(e),
+          }
+        }
+        break;
+      }
+      // Trailing `Sequence[...]` splices into the surrounding context;
+      // wolframscript yields `2` for `a; Sequence[1, 2]`. Empty sequences
+      // collapse to Null.
+      if let Expr::FunctionCall {
+        name: n,
+        args: seq_args,
+      } = &result
+        && n == "Sequence"
+      {
+        result = seq_args.last().cloned().unwrap_or_else(null_expr);
+      }
+      Ok(result)
+    }
+    Expr::Association(items) => {
+      let mut deduped: Vec<(Expr, Expr)> = Vec::new();
+      for (k, v) in items {
+        let key = evaluate_expr_to_expr(k)?;
+        let val = evaluate_expr_to_expr(v)?;
+        if let Some(pos) = deduped.iter().position(|(ek, _)| {
+          crate::evaluator::pattern_matching::expr_equal(ek, &key)
+        }) {
+          deduped[pos].1 = val;
+        } else {
+          deduped.push((key, val));
+        }
+      }
+      Ok(Expr::Association(deduped))
+    }
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => {
+      let p = evaluate_expr_to_expr(pattern)?;
+      let r = evaluate_expr_to_expr(replacement)?;
+      Ok(Expr::Rule {
+        pattern: Box::new(p),
+        replacement: Box::new(r),
+      })
+    }
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => {
+      // RuleDelayed has HoldRest: evaluate the pattern (LHS) but hold the
+      // replacement (RHS) so it re-evaluates per match.
+      let p = evaluate_expr_to_expr(pattern)?;
+      Ok(Expr::RuleDelayed {
+        pattern: Box::new(p),
+        replacement: replacement.clone(),
+      })
+    }
+    Expr::ReplaceAll { expr: e, rules } => {
+      let evaluated_expr = evaluate_expr_to_expr(e)?;
+      let evaluated_rules = evaluate_expr_to_expr(rules)?;
+      // Unwrap Dispatch[rules] → use inner rules
+      let unwrapped =
+        if let Expr::FunctionCall { name, args } = &evaluated_rules {
+          if name == "Dispatch" && args.len() == 1 {
+            &args[0]
+          } else {
+            &evaluated_rules
+          }
+        } else {
+          &evaluated_rules
+        };
+      // Validate rules shape. Wolfram emits ReplaceAll::reps and returns
+      // the call unevaluated when the rules slot isn't a Rule/RuleDelayed
+      // (or list of such, possibly nested for multi-solution forms).
+      // Mirror that here so `eqs /. sol` with `sol` unbound surfaces the
+      // same diagnostic instead of silently returning `eqs`.
+      if reject_invalid_replace_rules("ReplaceAll", unwrapped) {
+        return Ok(Expr::ReplaceAll {
+          expr: Box::new(evaluated_expr),
+          rules: Box::new(evaluated_rules),
+        });
+      }
+      let result = apply_replace_all_ast(&evaluated_expr, unwrapped)?;
+      Err(InterpreterError::TailCall(Box::new(result)))
+    }
+    Expr::ReplaceRepeated { expr: e, rules } => {
+      let evaluated_expr = evaluate_expr_to_expr(e)?;
+      let evaluated_rules = evaluate_expr_to_expr(rules)?;
+      // Unwrap Dispatch[rules] → use inner rules
+      let unwrapped =
+        if let Expr::FunctionCall { name, args } = &evaluated_rules {
+          if name == "Dispatch" && args.len() == 1 {
+            &args[0]
+          } else {
+            &evaluated_rules
+          }
+        } else {
+          &evaluated_rules
+        };
+      // Same `reps` shape-validation as ReplaceAll: emit the matching
+      // ReplaceRepeated::reps message and return the call unevaluated
+      // when the rules slot isn't a Rule / RuleDelayed (or list of
+      // such, possibly nested for multi-solution forms).
+      if reject_invalid_replace_rules("ReplaceRepeated", unwrapped) {
+        return Ok(Expr::ReplaceRepeated {
+          expr: Box::new(evaluated_expr),
+          rules: Box::new(evaluated_rules),
+        });
+      }
+      apply_replace_repeated_ast(&evaluated_expr, unwrapped)
+    }
+    Expr::Map { func, list } => {
+      let evaluated_list = evaluate_expr_to_expr(list)?;
+      apply_map_ast(func, &evaluated_list)
+    }
+    Expr::Apply { func, list } => {
+      // Apply does not hold its head, so evaluate it (matching the function
+      // form `Apply[f, list]`). This normalizes a compound head such as
+      // `f + g` to `Plus[f, g]`, so `(f + g) @@ {1, 2}` yields `(f + g)[1, 2]`
+      // rather than mis-associating as `f + g[1, 2]`.
+      let evaluated_func = evaluate_expr_to_expr(func)?;
+      let evaluated_list = evaluate_expr_to_expr(list)?;
+      apply_apply_ast(&evaluated_func, &evaluated_list)
+    }
+    Expr::MapApply { func, list } => {
+      let evaluated_list = evaluate_expr_to_expr(list)?;
+      apply_map_apply_ast(func, &evaluated_list)
+    }
+    Expr::PrefixApply { func, arg } => {
+      // f @ x is equivalent to f[x]. Per Wolfram semantics the head is
+      // evaluated first, so a dynamic head like `If[cond, A, B]@x` reduces
+      // to `B[x]` rather than being treated as a curried call
+      // `If[cond, A, B, x]`.
+      let evaluated_arg = evaluate_expr_to_expr(arg)?;
+      let evaluated_func = if matches!(func.as_ref(), Expr::FunctionCall { .. })
+      {
+        evaluate_expr_to_expr(func)?
+      } else {
+        (**func).clone()
+      };
+      apply_function_to_arg(&evaluated_func, &evaluated_arg)
+    }
+    Expr::Postfix { expr: e, func } => {
+      // `expr // f` is `f[expr]`. If `f` is a head with HoldAll/
+      // HoldAllComplete (e.g. `Hold`, `FullForm`), pre-evaluating expr
+      // would defeat the hold and let side effects fire. Normalize the
+      // Postfix chain to a `FunctionCall` and let the regular evaluator
+      // apply f's hold attributes — including for chained postfix like
+      // `e // OutputForm // MakeBoxes`, where the inner Postfix needs
+      // to surface as `OutputForm[e]` (a FunctionCall) before MakeBoxes
+      // sees it.
+      let func_holds_all = matches!(
+        func.as_ref(),
+        Expr::Identifier(name)
+          if has_hold_attribute(name, Attributes::HoldAll)
+            || has_hold_attribute(name, Attributes::HoldAllComplete)
+      );
+      if func_holds_all && let Expr::Identifier(name) = func.as_ref() {
+        // Convert any nested `Postfix(e, f)` to `FunctionCall { name: f,
+        // args: [e] }` recursively so the held argument is in normal
+        // structural form.
+        fn normalize_postfix(e: &Expr) -> Expr {
+          if let Expr::Postfix {
+            expr: inner_e,
+            func: inner_f,
+          } = e
+            && let Expr::Identifier(inner_name) = inner_f.as_ref()
+          {
+            Expr::FunctionCall {
+              name: inner_name.clone(),
+              args: vec![normalize_postfix(inner_e)].into(),
+            }
+          } else {
+            e.clone()
+          }
+        }
+        let arg = normalize_postfix(e);
+        return evaluate_expr_to_expr(&Expr::FunctionCall {
+          name: name.clone(),
+          args: vec![arg].into(),
+        });
+      }
+      let evaluated_expr = evaluate_expr_to_expr(e)?;
+      // `expr // f` is `f[expr]`. Like PrefixApply, the head must be
+      // evaluated first so a dynamic head like `expr // If[cond, A, B]`
+      // reduces before application.
+      let evaluated_func = if matches!(func.as_ref(), Expr::FunctionCall { .. })
+      {
+        evaluate_expr_to_expr(func)?
+      } else {
+        (**func).clone()
+      };
+      apply_postfix_ast(&evaluated_expr, &evaluated_func)
+    }
+    Expr::Part { expr: e, index } => {
+      // Fast path: `var[[k]]` where `var` is an Identifier bound to a
+      // List in ENV and `k` is an Integer literal (or evaluates to one
+      // without needing the surrounding Part machinery). Clone only the
+      // indexed element instead of the whole stored list.
+      //
+      // The general path below cleans `eval_part_base` -> `stored.clone()`
+      // -> `extract_part_ast` and pays the full O(N) list copy on every
+      // invocation. asciiLess in build_summary.wls hits this path on
+      // every comparison (`a[[i]]`, `b[[i]]` over ~30 chars × thousands
+      // of compares).
+      if let Expr::Identifier(var_name) = e.as_ref() {
+        let idx_expr = match index.as_ref() {
+          Expr::Integer(n) => Some(*n),
+          other => match evaluate_expr_to_expr(other) {
+            Ok(Expr::Integer(n)) => Some(n),
+            _ => None,
+          },
+        };
+        if let Some(i) = idx_expr {
+          let elem = ENV.with(|env| -> Option<Expr> {
+            let env = env.borrow();
+            match env.get(var_name) {
+              Some(StoredValue::ExprVal(Expr::List(items))) => {
+                let len = items.len() as i128;
+                let pos = if i > 0 {
+                  if i > len {
+                    return None;
+                  }
+                  (i as usize) - 1
+                } else if i < 0 {
+                  let p = len + i;
+                  if p < 0 {
+                    return None;
+                  }
+                  p as usize
+                } else {
+                  return None;
+                };
+                items.get(pos).cloned()
+              }
+              _ => None,
+            }
+          });
+          if let Some(v) = elem {
+            return part_extraction::evaluate_if_part_assigned(var_name, v);
+          }
+        }
+      }
+
+      // Track Part nesting depth for Part::partd warnings
+      PART_DEPTH.with(|d| *d.borrow_mut() += 1);
+
+      // Collect the full chain of Part indices (innermost first)
+      // e.g. Part[Part[Part[base, i], j], k] -> base, [i, j, k]
+      let mut indices_unevaluated = vec![index.as_ref().clone()];
+      let mut base_expr = e.as_ref();
+      while let Expr::Part {
+        expr: inner_e,
+        index: inner_idx,
+      } = base_expr
+      {
+        indices_unevaluated.push(inner_idx.as_ref().clone());
+        base_expr = inner_e.as_ref();
+      }
+      indices_unevaluated.reverse(); // now [i, j, k] order (outermost to innermost)
+
+      // Evaluate all indices
+      let mut indices = Vec::with_capacity(indices_unevaluated.len());
+      for idx in &indices_unevaluated {
+        if let Expr::FunctionCall { name, args } = idx
+          && name == "Span"
+          && (args.len() == 2 || args.len() == 3)
+        {
+          let mut evaluated_args = Vec::with_capacity(args.len());
+          for arg in args {
+            if matches!(arg, Expr::Identifier(s) if s == "All") {
+              evaluated_args.push(arg.clone());
+            } else {
+              evaluated_args.push(evaluate_expr_to_expr(arg)?);
+            }
+          }
+          indices.push(call("Span", evaluated_args));
+        } else {
+          indices.push(evaluate_expr_to_expr(idx)?);
+        }
+      }
+
+      // Check if any index needs the recursive apply_part_indices path:
+      // - `All` always needs it (even alone, to return the expression itself)
+      // - `List` / `Span` / `UpTo` in non-last position need it (to map
+      //   remaining indices over each extracted element rather than extract
+      //   sequentially)
+      let needs_mapping = indices.iter().enumerate().any(|(i, idx)| {
+        matches!(idx, Expr::Identifier(s) if s == "All")
+          || (i + 1 < indices.len()
+            && (matches!(idx, Expr::List(_))
+              || matches!(idx, Expr::FunctionCall { name, .. } if name == "Span")))
+      });
+
+      // Fast path for a chain of integer positions into a variable's stored
+      // list — `m[[i]][[j]]` and `m[[i, j]]` alike. `eval_part_base` below
+      // clones the whole stored value, so reading one cell of a table cost
+      // a copy of the entire table: a Demonstration stepping through a
+      // 7x3900 population history spent seconds per frame on those copies.
+      // Walking the stored value in place and cloning only the element
+      // found makes the read independent of the table's size.
+      if let Expr::Identifier(var_name) = base_expr
+        && indices.iter().all(|i| matches!(i, Expr::Integer(_)))
+      {
+        let elem = ENV.with(|env| -> Option<Expr> {
+          let env = env.borrow();
+          let Some(StoredValue::ExprVal(stored)) = env.get(var_name) else {
+            return None;
+          };
+          let mut current = stored;
+          for idx in &indices {
+            let Expr::List(items) = current else {
+              return None;
+            };
+            let Expr::Integer(i) = idx else {
+              return None;
+            };
+            let len = items.len() as i128;
+            let pos = if *i > 0 && *i <= len {
+              (*i as usize) - 1
+            } else if *i < 0 && len + *i >= 0 {
+              (len + *i) as usize
+            } else {
+              return None;
+            };
+            current = &items[pos];
+          }
+          Some(current.clone())
+        });
+        if let Some(v) = elem {
+          PART_DEPTH.with(|d| *d.borrow_mut() -= 1);
+          return part_extraction::evaluate_if_part_assigned(var_name, v);
+        }
+      }
+
+      // Set when a multi-index extraction reaches an atom with indices left
+      // over — the spec is deeper than the object (Part::partd), as opposed
+      // to an out-of-bounds index (Part::partw, already emitted).
+      let mut hit_atom_mid = false;
+      let base_val = eval_part_base(base_expr)?;
+      // Read off the base's head before the too-deep branch below consumes
+      // the value: `base_val` is the whole object, and cloning it a second
+      // time just to ask what its head is doubled the cost of every failing
+      // Part on a large list.
+      let base_holds = head_holds_arguments(&base_val);
+      let result = if needs_mapping {
+        // All requires collecting indices and mapping — must clone base
+        apply_part_indices(&base_val, &indices)?
+      } else {
+        // Fast path: no All, use original optimized approach
+        let mut result = extract_part_ast(&base_val, &indices[0])?;
+        // A piece of a symbol that has had a Part assignment may still be
+        // unevaluated, and the next index addresses what it evaluates to.
+        if let Expr::Identifier(var_name) = base_expr {
+          result =
+            part_extraction::evaluate_if_part_assigned(var_name, result)?;
+        }
+
+        if indices.len() > 1 {
+          // Multi-index Part: if extraction returns an unevaluated Part at
+          // any level, the spec is deeper than the object — return the full
+          // Part expression unevaluated (matching wolframscript Part::partd).
+          let mut part_too_deep = false;
+          for idx in &indices[1..] {
+            if let Expr::Part { .. } = &result {
+              part_too_deep = true;
+              break;
+            }
+            // An atom has no parts — except part 0, its head:
+            // `{k}[[1, 0]]` is `Symbol`.
+            if (matches!(
+              &result,
+              Expr::Identifier(_)
+                | Expr::Integer(_)
+                | Expr::BigInteger(_)
+                | Expr::Real(_)
+                | Expr::String(_)
+            ) || crate::evaluator::part_extraction::is_atomic_number_expr(
+              &result,
+            )) && !matches!(idx, Expr::Integer(0))
+            {
+              part_too_deep = true;
+              hit_atom_mid = true;
+              break;
+            }
+            result = extract_part_ast(&result, idx)?;
+          }
+          if let Expr::Part { .. } = &result {
+            part_too_deep = true;
+          }
+          if part_too_deep {
+            result = base_val;
+            for idx in &indices {
+              result = Expr::Part {
+                expr: Box::new(result),
+                index: Box::new(idx.clone()),
+              };
+            }
+          }
+        }
+
+        result
+      };
+      PART_DEPTH.with(|d| *d.borrow_mut() -= 1);
+
+      // Taking a part out of a held expression lifts it out of the wrapper
+      // that was suppressing evaluation, so the extracted piece evaluates:
+      // `Hold[1 + 1][[1]]` is 2. Results that keep the holding head (such as
+      // `Hold[1 + 1, 2 + 2][[{1, 2}]]`) are unaffected, since evaluating them
+      // just re-applies the same hold.
+      let result = if base_holds {
+        evaluate_expr_to_expr(&result)?
+      } else {
+        result
+      };
+
+      // A Part assignment stores the expression it rebuilt without evaluating
+      // it, so a piece taken out of a symbol that has had one is evaluated
+      // here — `a = {sC f[x]}; a[[1,1]] = 1` leaves `Times[1, f[x]]` inside
+      // the list, and `a[[1]]` is the `f[x]` it stands for.
+      let result = match base_expr {
+        Expr::Identifier(var_name) => {
+          part_extraction::evaluate_if_part_assigned(var_name, result)?
+        }
+        _ => result,
+      };
+
+      // Part::partd / Part::pspec1: warn only at the outermost Part level
+      let at_outermost = PART_DEPTH.with(|d| *d.borrow() == 0);
+      if at_outermost && let Expr::Part { .. } = &result {
+        // A string part spec on a non-association is never applicable,
+        // regardless of the base (wolframscript: Part::pspec1).
+        if let Some(Expr::String(s)) =
+          indices.iter().find(|i| matches!(i, Expr::String(_)))
+        {
+          crate::emit_message(&format!(
+            "Part::pspec1: Part specification {s} is not applicable."
+          ));
+          return Ok(result);
+        }
+        let base = get_part_base(&result);
+        if hit_atom_mid
+          || matches!(
+            base,
+            Expr::Identifier(_)
+              | Expr::Integer(_)
+              | Expr::BigInteger(_)
+              | Expr::Real(_)
+              | Expr::String(_)
+          )
+          // A tree is an atom, so a part specification is always too deep.
+          || crate::functions::predicate_ast::is_fully_atomic_object(base)
+          // So are a rational and a complex number, whatever they are
+          // stored as.
+          || crate::evaluator::part_extraction::is_atomic_number_expr(base)
+        {
+          // Lazily: the message quotes the whole object, so rendering it is
+          // as expensive as printing the list that was indexed.
+          crate::emit_message_with("Part::partd", || {
+            let part_str = crate::syntax::format_expr(
+              &result,
+              crate::syntax::ExprForm::Output,
+            );
+            format!(
+              "Part::partd: Part specification {part_str} is longer than depth of object."
+            )
+          });
+        }
+      }
+      Ok(result)
+    }
+    Expr::Function { body } => {
+      // Function has HoldAll, but Evaluate[...] inside the body forces
+      // evaluation of its argument before the function is held. Match
+      // wolframscript: Evaluate[expr]& becomes Function[expr_evaluated].
+      let new_body = unwrap_evaluate_in_body(body)?;
+      Ok(Expr::Function {
+        body: Box::new(new_body),
+      })
+    }
+    Expr::NamedFunction {
+      params,
+      body,
+      bracketed,
+    } => {
+      // Return named function as-is
+      Ok(Expr::NamedFunction {
+        params: params.clone(),
+        body: body.clone(),
+        bracketed: *bracketed,
+      })
+    }
+    Expr::Pattern {
+      name,
+      head,
+      blank_type,
+    } => Ok(Expr::Pattern {
+      name: name.clone(),
+      head: head.clone(),
+      blank_type: *blank_type,
+    }),
+    Expr::PatternOptional {
+      name,
+      head,
+      default,
+    } => Ok(Expr::PatternOptional {
+      name: name.clone(),
+      head: head.clone(),
+      default: default.clone(),
+    }),
+    Expr::PatternTest {
+      name,
+      head,
+      blank_type,
+      test,
+    } => Ok(Expr::PatternTest {
+      name: name.clone(),
+      head: head.clone(),
+      blank_type: *blank_type,
+      test: test.clone(),
+    }),
+    Expr::Raw(s) => {
+      // Fallback: parse and evaluate the raw string
+      let parsed = string_to_expr(s)?;
+      // A shape the parser hands back unparsed comes back as the very same
+      // `Raw`; handing that to the trampoline again spins forever. Leave it
+      // alone instead — the caller sees the text it gave.
+      if matches!(&parsed, Expr::Raw(again) if again == s) {
+        return Ok(expr.clone());
+      }
+      Err(InterpreterError::TailCall(Box::new(parsed)))
+    }
+    Expr::Image { .. } => Ok(expr.clone()),
+    Expr::Graphics { .. } => Ok(expr.clone()),
+    Expr::CurriedCall { func, args } => {
+      // Evaluate the curried call: f[a][b] -> apply f[a] to args.
+      // Honour Function[{params}, body, attrs] hold attributes so that
+      // Function[..., HoldAll][1+1] sees its arg unevaluated.
+      let evaluated_func = evaluate_expr_to_expr(func)?;
+      let hold_attrs = function_hold_attributes(&evaluated_func);
+      let mut prepared: Vec<Expr> = Vec::with_capacity(args.len());
+      for (i, a) in args.iter().enumerate() {
+        let hold =
+          hold_attrs.0 || (hold_attrs.1 && i == 0) || (hold_attrs.2 && i > 0);
+        if hold {
+          prepared.push(a.clone());
+        } else {
+          prepared.push(evaluate_expr_to_expr(a)?);
+        }
+      }
+      // An argument that evaluated to `Sequence[…]` splices into the
+      // argument list, exactly as it does for a named head — this is what
+      // makes `Function[{a, b}, …][Sequence @@ {1, 2}]` bind both params.
+      let prepared =
+        crate::evaluator::listable::flatten_sequences("Function", &prepared);
+      apply_curried_call(&evaluated_func, &prepared)
+    }
+  }
+}
+
+/// Evaluate a chain of `Plus`/`Minus` or `Times`/`Divide` `BinaryOp` nodes
+/// iteratively instead of recursing into `evaluate_expr_to_expr` once per
+/// nesting level.
+///
+/// `a*b*c*...` (common in generated code, e.g. a word list built as
+/// `list = w1*w2*...*w1400`) parses as an O(n)-deep nested `BinaryOp` chain.
+/// Naively recursing into `evaluate_expr_to_expr(left)` for each level burns
+/// one `$RecursionLimit` slot per term and terminates the whole evaluation
+/// past ~1024 terms — even though Wolfram evaluates a flat Plus/Times chain
+/// of any length without spending any recursion budget at all (`Times` and
+/// `Plus` are `Flat`: the whole chain is one n-ary expression, not nested
+/// binary calls). Walking the chain with an explicit stack instead of Rust
+/// recursion evaluates each leaf/combine step at constant depth while
+/// reproducing the exact same left-to-right, depth-first evaluation order
+/// (and hence the exact same `evaluate_binary_op_pair` semantics) as the
+/// naive recursive version.
+fn evaluate_binary_op_chain(
+  root_op: BinaryOperator,
+  root_left: &Expr,
+  root_right: &Expr,
+  in_family: impl Fn(BinaryOperator) -> bool,
+) -> Result<Expr, InterpreterError> {
+  enum Work<'a> {
+    Node(&'a Expr),
+    Combine(BinaryOperator),
+  }
+  // `work` is a LIFO stack, so operands must be pushed in reverse of the
+  // order they should be popped/processed: `Combine` goes in first (popped
+  // last, once both operands are ready), then the right operand, then the
+  // left operand last (popped first) — giving the same left-to-right,
+  // depth-first evaluation order as the naive recursive version.
+  let mut work = vec![
+    Work::Combine(root_op),
+    Work::Node(root_right),
+    Work::Node(root_left),
+  ];
+  let mut values: Vec<Expr> = Vec::new();
+  while let Some(item) = work.pop() {
+    match item {
+      Work::Node(e) => {
+        if let Expr::BinaryOp { op, left, right } = e
+          && in_family(*op)
+        {
+          work.push(Work::Combine(*op));
+          work.push(Work::Node(right));
+          work.push(Work::Node(left));
+          continue;
+        }
+        values.push(strip_unevaluated(&evaluate_expr_to_expr(e)?));
+      }
+      Work::Combine(op) => {
+        let right_val = values.pop().expect("chain: missing right operand");
+        let left_val = values.pop().expect("chain: missing left operand");
+        values.push(strip_unevaluated(&evaluate_binary_op_pair(
+          op, left_val, right_val,
+        )?));
+      }
+    }
+  }
+  Ok(values.pop().expect("chain: missing result"))
+}
+
+/// Combine two already-evaluated operands of a `BinaryOp` (`Plus`, `Minus`,
+/// `Times`, `Divide`, `Power`, `Alternatives`).
+fn evaluate_binary_op_pair(
+  op: BinaryOperator,
+  left_val: Expr,
+  right_val: Expr,
+) -> Result<Expr, InterpreterError> {
+  // Splice Sequence operands into the corresponding n-ary operation, e.g.
+  // `Sequence[1, 2] + Sequence[3, 4]` -> `Plus[1, 2, 3, 4]` = 10. Map
+  // subtraction and division onto Plus/Times (with a negated/reciprocal
+  // second operand) so the spliced arguments combine the same way Wolfram
+  // does (`Sequence[1, 2] - 3` -> `Plus[1, 2, -3]` = 0). Re-evaluating the
+  // function-call form runs `flatten_sequences`, which performs the splice.
+  {
+    let is_seq = |e: &Expr| matches!(e, Expr::FunctionCall { name, .. } if name == "Sequence");
+    if is_seq(&left_val) || is_seq(&right_val) {
+      let neg = |e: Expr| call("Times", vec![Expr::Integer(-1), e]);
+      let recip = |e: Expr| pow(e, Expr::Integer(-1));
+      let spliced: Option<(&str, Expr, Expr)> = match op {
+        BinaryOperator::Plus => {
+          Some(("Plus", left_val.clone(), right_val.clone()))
+        }
+        BinaryOperator::Times => {
+          Some(("Times", left_val.clone(), right_val.clone()))
+        }
+        BinaryOperator::Power => {
+          Some(("Power", left_val.clone(), right_val.clone()))
+        }
+        BinaryOperator::StringJoin => {
+          Some(("StringJoin", left_val.clone(), right_val.clone()))
+        }
+        BinaryOperator::Minus => {
+          Some(("Plus", left_val.clone(), neg(right_val.clone())))
+        }
+        BinaryOperator::Divide => {
+          Some(("Times", left_val.clone(), recip(right_val.clone())))
+        }
+        _ => None,
+      };
+      if let Some((name, l, r)) = spliced {
+        return evaluate_expr_to_expr(&call(name, vec![l, r]));
+      }
+    }
+  }
+
+  // For operators with corresponding function names (Plus, Times, Power, etc.),
+  // check if there are user-defined rules (e.g. upvalues from TagSetDelayed).
+  // If so, route through evaluate_function_call_ast which checks FUNC_DEFS first.
+  let func_name = match op {
+    BinaryOperator::Plus => Some("Plus"),
+    BinaryOperator::Times => Some("Times"),
+    BinaryOperator::Power => Some("Power"),
+    BinaryOperator::StringJoin => Some("StringJoin"),
+    _ => None,
+  };
+  if let Some(name) = func_name {
+    if has_user_rules(name) {
+      return evaluate_function_call_ast(name, &[left_val, right_val]);
+    }
+    // If the head symbol has an OwnValue (e.g. `Unprotect[Plus]; Plus=Q`),
+    // substitute the head and re-evaluate as `Q[a, b]` rather than the
+    // built-in plus_ast path. Matches Wolfram: `Plus = Q; a + b` → `Q[a, b]`.
+    let own_value_head: Option<String> = ENV.with(|e| {
+      let env = e.borrow();
+      match env.get(name) {
+        Some(StoredValue::ExprVal(Expr::Identifier(s))) => Some(s.clone()),
+        // OwnValues set via `Sym = simple_identifier` are stored as Raw
+        // text (the assignment shortcut). Treat a single-identifier
+        // textual value the same as a head substitution.
+        Some(StoredValue::Raw(s))
+          if s.chars().all(|c| c.is_alphanumeric() || c == '$') =>
+        {
+          Some(s.clone())
+        }
+        _ => None,
+      }
+    });
+    if let Some(new_head) = own_value_head
+      && new_head != name
+    {
+      return evaluate_function_call_ast(&new_head, &[left_val, right_val]);
+    }
+  }
+
+  // `a - b` / `a / b` expand to Plus/Times/Power; let user-defined rules
+  // on those heads apply before the built-in arithmetic below.
+  let shorthand_head = match op {
+    BinaryOperator::Minus => Some("Subtract"),
+    BinaryOperator::Divide => Some("Divide"),
+    _ => None,
+  };
+  if let Some(head) = shorthand_head
+    && let Some(result) =
+      expand_arith_shorthand(head, &[left_val.clone(), right_val.clone()])
+  {
+    return result;
+  }
+
+  // Check for list threading (arithmetic operations thread over lists)
+  let has_list =
+    matches!(&left_val, Expr::List(_)) || matches!(&right_val, Expr::List(_));
+
+  if has_list
+    && matches!(
+      op,
+      BinaryOperator::Plus
+        | BinaryOperator::Minus
+        | BinaryOperator::Times
+        | BinaryOperator::Divide
+        | BinaryOperator::Power
+    )
+  {
+    return thread_binary_op(&left_val, &right_val, op);
+  }
+
+  // Try numeric evaluation
+  let left_num = expr_to_number(&left_val);
+  let right_num = expr_to_number(&right_val);
+
+  match op {
+    BinaryOperator::Plus => {
+      // Use plus_ast for proper symbolic handling and canonical ordering
+      crate::functions::math_ast::plus_ast(&[left_val, right_val])
+    }
+    BinaryOperator::Minus => {
+      // Handle BigInteger arithmetic
+      if let Some(result) =
+        bigint_binary_op(&left_val, &right_val, |a, b| a - b)
+      {
+        Ok(result)
+      } else if matches!(&left_val, Expr::BigFloat(_, _))
+        || matches!(&right_val, Expr::BigFloat(_, _))
+      {
+        // Arbitrary-precision operands: route through subtract_ast
+        // (a + (-1)*b) so precision is tracked, instead of collapsing to
+        // an f64 Real. Matches `Subtract[N[Pi,30], 3]`.
+        crate::functions::math_ast::subtract_ast(&[left_val, right_val])
+      } else if let (Some(l), Some(r)) = (left_num, right_num) {
+        if matches!(&left_val, Expr::Real(_))
+          || matches!(&right_val, Expr::Real(_))
+        {
+          Ok(Expr::Real(l - r))
+        } else {
+          Ok(num_to_expr(l - r))
+        }
+      } else if matches!(&left_val, Expr::Integer(0)) {
+        // 0 - x => -x via times_ast for proper distribution
+        crate::functions::math_ast::times_ast(&[Expr::Integer(-1), right_val])
+      } else if crate::functions::quantity_ast::is_quantity(&left_val).is_some()
+        || crate::functions::quantity_ast::is_quantity(&right_val).is_some()
+      {
+        // Quantity subtraction: delegate to subtract_ast → Plus[a, Times[-1, b]]
+        crate::functions::math_ast::subtract_ast(&[left_val, right_val])
+      } else {
+        // Use subtract_ast for proper distribution of -1 over Plus
+        crate::functions::math_ast::subtract_ast(&[left_val, right_val])
+      }
+    }
+    BinaryOperator::Times => {
+      // Use times_ast for proper symbolic handling and canonical ordering
+      crate::functions::math_ast::times_ast(&[left_val, right_val])
+    }
+    BinaryOperator::Divide => {
+      // Delegate to divide_ast for proper handling of Rational, Real, etc.
+      crate::functions::math_ast::divide_ast(&[left_val, right_val])
+    }
+    BinaryOperator::Power => {
+      // Delegate to power_ast for proper handling of Rational, Real, etc.
+      crate::functions::math_ast::power_ast(&[left_val, right_val])
+    }
+    BinaryOperator::And | BinaryOperator::Or => {
+      // Handled above with short-circuit evaluation
+      unreachable!()
+    }
+    BinaryOperator::StringJoin => {
+      // Route through string_join_ast so that non-string arguments emit
+      // the StringJoin::string warning and return unevaluated (matching
+      // wolframscript), instead of silently coercing identifiers/integers.
+      crate::functions::string_ast::string_join_ast(&[left_val, right_val])
+    }
+    BinaryOperator::Alternatives => {
+      // `a | b | c` (the `|` operator) is a flat Alternatives head in WL:
+      // Length[a | b | c] == 3. The parser builds it as a nested BinaryOp
+      // chain, so canonicalize the evaluated chain into a flat
+      // Alternatives[...] FunctionCall. This makes structural operations
+      // (Part, Sort, MemberQ, Append, …) see all operands as siblings,
+      // matching wolframscript. Held patterns keep their BinaryOp form and
+      // are handled directly by the pattern matcher, which accepts both.
+      fn push_alt(e: &Expr, out: &mut Vec<Expr>) {
+        match e {
+          Expr::FunctionCall { name, args } if name == "Alternatives" => {
+            out.extend(args.iter().cloned());
+          }
+          Expr::BinaryOp {
+            op: BinaryOperator::Alternatives,
+            left,
+            right,
+          } => {
+            push_alt(left, out);
+            push_alt(right, out);
+          }
+          other => out.push(other.clone()),
+        }
+      }
+      let mut parts = Vec::new();
+      push_alt(&left_val, &mut parts);
+      push_alt(&right_val, &mut parts);
+      Ok(call("Alternatives", parts))
+    }
+  }
+}
+
+/// Inspect a stored Function value for Hold attributes.
+/// Returns (hold_all, hold_first, hold_rest).
+fn function_hold_attributes(expr: &Expr) -> (bool, bool, bool) {
+  let attrs = match expr {
+    Expr::FunctionCall { name, args }
+      if name == "Function" && args.len() >= 3 =>
+    {
+      Some(&args[2])
+    }
+    _ => None,
+  };
+  let has = |needle: &str| -> bool {
+    match attrs {
+      Some(Expr::Identifier(s)) => s == needle,
+      Some(Expr::List(items)) => items
+        .iter()
+        .any(|e| matches!(e, Expr::Identifier(s) if s == needle)),
+      _ => false,
+    }
+  };
+  (
+    has("HoldAll") || has("HoldAllComplete"),
+    has("HoldFirst"),
+    has("HoldRest"),
+  )
+}
+
+/// Recursively unwrap `Evaluate[expr]` subexpressions inside a Function body
+/// (or any held expression), evaluating their arguments. This implements
+/// Wolfram's rule that Evaluate forces evaluation through HoldAll wrappers.
+fn unwrap_evaluate_in_body(body: &Expr) -> Result<Expr, InterpreterError> {
+  if let Expr::FunctionCall { name, args } = body
+    && name == "Evaluate"
+    && args.len() == 1
+  {
+    return evaluate_expr_to_expr(&args[0]);
+  }
+  // Recurse into common compound forms so nested Evaluate gets evaluated too.
+  match body {
+    Expr::FunctionCall { name, args } => {
+      let new_args: Vec<Expr> = args
+        .iter()
+        .map(unwrap_evaluate_in_body)
+        .collect::<Result<_, _>>()?;
+      Ok(Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args.into(),
+      })
+    }
+    Expr::List(items) => {
+      let new_items: Vec<Expr> = items
+        .iter()
+        .map(unwrap_evaluate_in_body)
+        .collect::<Result<_, _>>()?;
+      Ok(Expr::List(new_items.into()))
+    }
+    Expr::BinaryOp { op, left, right } => Ok(Expr::BinaryOp {
+      op: *op,
+      left: Box::new(unwrap_evaluate_in_body(left)?),
+      right: Box::new(unwrap_evaluate_in_body(right)?),
+    }),
+    Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(unwrap_evaluate_in_body(operand)?),
+    }),
+    other => Ok(other.clone()),
+  }
+}
+
+/// Determines whether a comparison chain should stay as a single node or
+/// split into pairwise `&&`. wolframscript's rules:
+///   - Homogeneous operators → keep chain.
+///   - Presence of any NotEqual/UnsameQ in a mixed chain → split.
+///   - Mixing a Less-direction op (`<`, `<=`) with a Greater-direction op
+///     (`>`, `>=`) → split (pairwise makes the directionality explicit).
+///   - Otherwise (Equal/SameQ mixed with one direction of inequalities,
+///     or only Less-direction / only Greater-direction ops) → keep as a
+///     single chain.  These print either as `a == b == c` or `Inequality[…]`.
+///     Numeric range [lo, hi] of an expression for interval comparison: an
+///     `Interval[{a,b}, …]` collapses to its overall min/max, and a scalar number
+///     `s` becomes the degenerate range [s, s]. Returns None if any bound is not a
+///     finite real (e.g. a symbol).
+fn interval_numeric_bounds(expr: &Expr) -> Option<(f64, f64)> {
+  use crate::functions::math_ast::try_eval_to_f64_with_infinity as to_f64;
+  if let Some(subs) = crate::functions::interval_ast::is_interval(expr) {
+    if subs.is_empty() {
+      return None;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (l, h) in &subs {
+      lo = lo.min(to_f64(l)?);
+      hi = hi.max(to_f64(h)?);
+    }
+    Some((lo, hi))
+  } else {
+    let v = to_f64(expr)?;
+    Some((v, v))
+  }
+}
+
+/// Compare two values when at least one is an Interval, following Wolfram:
+/// `X < Y` is True when X lies entirely below Y, False when entirely at/above,
+/// and indeterminate (None) when the ranges overlap. `==`/`!=` resolve only for
+/// disjoint ranges. None lets the caller leave the comparison unevaluated.
+fn interval_compare(
+  op: ComparisonOp,
+  left: &Expr,
+  right: &Expr,
+) -> Option<bool> {
+  use ComparisonOp as C;
+  let (xlo, xhi) = interval_numeric_bounds(left)?;
+  let (ylo, yhi) = interval_numeric_bounds(right)?;
+  let disjoint = xhi < ylo || yhi < xlo;
+  match op {
+    C::Less => {
+      if xhi < ylo {
+        Some(true)
+      } else if xlo >= yhi {
+        Some(false)
+      } else {
+        None
+      }
+    }
+    C::LessEqual => {
+      if xhi <= ylo {
+        Some(true)
+      } else if xlo > yhi {
+        Some(false)
+      } else {
+        None
+      }
+    }
+    C::Greater => {
+      if xlo > yhi {
+        Some(true)
+      } else if xhi <= ylo {
+        Some(false)
+      } else {
+        None
+      }
+    }
+    C::GreaterEqual => {
+      if xlo >= yhi {
+        Some(true)
+      } else if xhi < ylo {
+        Some(false)
+      } else {
+        None
+      }
+    }
+    // Equal/Unequal resolve only when the ranges cannot overlap; identical
+    // intervals are still caught by the structural string-equality fallback.
+    C::Equal if disjoint => Some(false),
+    C::NotEqual if disjoint => Some(true),
+    _ => None,
+  }
+}
+
+fn all_same_comparison_family(ops: &[ComparisonOp]) -> bool {
+  use ComparisonOp as C;
+  let mixed = ops.iter().skip(1).any(|op| op != &ops[0]);
+  if !mixed {
+    return true;
+  }
+  let mut has_unequal = false;
+  let mut has_less = false;
+  let mut has_greater = false;
+  for op in ops {
+    match op {
+      C::NotEqual | C::UnsameQ => has_unequal = true,
+      C::Less | C::LessEqual => has_less = true,
+      C::Greater | C::GreaterEqual => has_greater = true,
+      C::Equal | C::SameQ => {}
+    }
+  }
+  if has_unequal {
+    return false;
+  }
+  if has_less && has_greater {
+    return false;
+  }
+  true
+}
+
+/// Check if an expression contains free symbols (unbound identifiers).
+/// Known constants (True, False, I, Pi, etc.) are NOT free symbols.
+pub fn has_free_symbols(expr: &Expr) -> bool {
+  match expr {
+    Expr::Identifier(name) => !matches!(
+      name.as_str(),
+      "True"
+        | "False"
+        | "Null"
+        | "I"
+        | "Pi"
+        | "E"
+        | "Degree"
+        | "Infinity"
+        | "ComplexInfinity"
+        | "Indeterminate"
+        | "Nothing"
+    ),
+    Expr::Integer(_)
+    | Expr::BigInteger(_)
+    | Expr::Real(_)
+    | Expr::BigFloat(_, _)
+    | Expr::String(_)
+    | Expr::Constant(_)
+    | Expr::Slot(_)
+    | Expr::SlotSequence(_) => false,
+    Expr::List(items) => items.iter().any(has_free_symbols),
+    Expr::BinaryOp { left, right, .. } => {
+      has_free_symbols(left) || has_free_symbols(right)
+    }
+    Expr::UnaryOp { operand, .. } => has_free_symbols(operand),
+    Expr::FunctionCall { name, args } => {
+      has_free_symbols(&Expr::Identifier(name.clone()))
+        || args.iter().any(has_free_symbols)
+    }
+    Expr::Comparison { operands, .. } => operands.iter().any(has_free_symbols),
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => has_free_symbols(pattern) || has_free_symbols(replacement),
+    Expr::Association(pairs) => pairs
+      .iter()
+      .any(|(k, v)| has_free_symbols(k) || has_free_symbols(v)),
+    // Patterns like a_ / a_Integer / a_. are symbolic — they can match
+    // anything, so Unequal[a_, b_] must stay unevaluated (matches Wolfram).
+    Expr::Pattern { .. }
+    | Expr::PatternOptional { .. }
+    | Expr::PatternTest { .. } => true,
+    // Compound heads: `Subscript[c, 1][0]` is as symbolic as `f[0]`, so
+    // `Subscript[c, 1][0] == 0` must stay unevaluated rather than collapse
+    // to False. Both the head and the arguments can carry free symbols.
+    Expr::CurriedCall { func, args } => {
+      has_free_symbols(func) || args.iter().any(has_free_symbols)
+    }
+    Expr::Part { expr, index } => {
+      has_free_symbols(expr) || has_free_symbols(index)
+    }
+    Expr::CompoundExpr(items) => items.iter().any(has_free_symbols),
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => has_free_symbols(pattern) || has_free_symbols(replacement),
+    Expr::ReplaceAll { expr, rules }
+    | Expr::ReplaceRepeated { expr, rules } => {
+      has_free_symbols(expr) || has_free_symbols(rules)
+    }
+    Expr::Map { func, list }
+    | Expr::Apply { func, list }
+    | Expr::MapApply { func, list } => {
+      has_free_symbols(func) || has_free_symbols(list)
+    }
+    Expr::PrefixApply { func, arg } => {
+      has_free_symbols(func) || has_free_symbols(arg)
+    }
+    Expr::Postfix { expr, func } => {
+      has_free_symbols(expr) || has_free_symbols(func)
+    }
+    // A pure function is an opaque object, never a number: comparing one
+    // against anything else stays unevaluated in Wolfram even when its body
+    // is slot-only (`(# &) == 0`).
+    Expr::Function { .. } | Expr::NamedFunction { .. } => true,
+    _ => false,
+  }
+}

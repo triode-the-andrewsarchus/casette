@@ -1,0 +1,1108 @@
+// Unicode spacing characters (en quad U+2000 through hair space
+// U+200A, no-break space U+00A0, four-per-em U+2005, medium math
+// space U+205F) appear in FrontEnd-typeset code (\[ThinSpace],
+// \[VeryThinSpace], ...) and are whitespace in Wolfram input.
+WHITESPACE = _{
+  " " | "\t" | "\r" | "\n" | "\u{00A0}" | '\u{2000}'..'\u{200A}' |
+  "\u{205F}"
+}
+COMMENT = _{ "(*" ~ (COMMENT | (!"(*" ~ !"*)" ~ ANY))* ~ "*)" }
+
+// Span expression: a;;b or a;;b;;c (with optional operands: ;;b, a;;, ;;;;c)
+// Produces Span[a, b] or Span[a, b, c] with defaults (1 for start, All for end)
+//
+// `;;` is an ordinary infix operator of the expression chain (see `Operator`),
+// so the precedence climbing in the AST builder places it against every other
+// operator at once: it binds looser than `+`, `*`, `^` and `.` but tighter
+// than `=`, `:=`, `==`, `&&`, `||`, `|`, `~~`, `/;` and `->` — Wolfram's
+// precedence 305. Building it as a rule of its own could not do that: its
+// operands were whole `Expression`s, so every operator below `;;` ended up
+// *inside* the Span instead of around it.
+//
+// Wolfram lets either operand be left out, and a chain needs an operand for
+// every operator, so each spelling that leaves one out gets a `;;` token of
+// its own — the AST builder reads the token to know which operand is missing.
+// They are ordinary (non-empty) rules: a zero-width operand would let
+// `Expression` match nothing at all.
+// Atomic (`@`) so the two characters are one token.
+SpanNoLhsSep     = @{ ";;" }   // nothing before the `;;`: `;;3`
+SpanNoRhsSep     = @{ ";;" }   // nothing after it: `3;;`, the gap in `1;;;;3`
+SpanNoOperandSep = @{ ";;" }   // nothing on either side: `;;`, `;; ;; 2`
+// PartIndex: an index inside [[ ]] — an ordinary Expression, which covers
+// `m[[2 ;; 5]]` because `;;` is one of its operators.
+PartIndex = _{ Expression }
+
+// Part bracket openers/closers: both ASCII "[[" / "]]" and the Unicode
+// double-struck brackets. We accept the MATHEMATICAL LEFT/RIGHT WHITE
+// SQUARE BRACKETs ⟦ (U+27E6) / ⟧ (U+27E7) — these are what Wolfram's
+// named characters \[LeftDoubleBracket] / \[RightDoubleBracket] map to —
+// as well as the CJK-aligned LEFT/RIGHT WHITE SQUARE BRACKETs 〚 (U+301A)
+// / 〛 (U+301B) for compatibility. Silent rules so the existing
+// PartIndexSuffix structure is unchanged.
+// The ASCII forms are spelled as two separate brackets so whitespace and
+// comments may sit between them: Wolfram reads `m[ [1] ]` as `m[[1]]`
+// because a lone `[…]` can never start an expression.
+PartOpen  = _{ "[" ~ "[" | "\u{27E6}" | "\u{301A}" }
+PartClose = _{ "]" ~ "]" | "\u{27E7}" | "\u{301B}" }
+
+// Part extraction suffix: [[expr, ...]] or 〚expr, ...〛 for indexing
+// One bracket group is its own node so the AST can tell `m[[a, b]]` (one
+// group, two specs — the second applies inside each part the first picks)
+// from `m[[a]][[b]]` (two groups, applied one after the other). Flattening
+// every group's specs into one list made those two the same expression.
+PartIndexGroup = { PartOpen ~ PartIndex ~ ("," ~ PartIndex)* ~ PartClose }
+PartIndexSuffix = { PartIndexGroup+ }
+
+// PartExtract for non-FunctionCall bases only (Slot, Identifier, number)
+// FunctionCall-based Part extraction is handled by FunctionCallExtended
+// List-based Part extraction is handled by ListExtended
+// A trailing `BracketArgs*` lets a Part result be applied as a function:
+// `a[[i]][x]` (e.g. extract a function from a list and call it). A prime
+// between the two differentiates the extracted function first, the way it
+// does after a parenthesis: `solutions[[i]][[2]]'[t]` differentiates the
+// InterpolatingFunction an NDSolve rule was carrying.
+// Extraction and application alternate freely after the first `[[…]]`:
+// `t[[i]]["pos"][[2]]` reads a keyed field out of an extracted association
+// and then takes a part of *that*, the shape association-of-lists data is
+// usually walked in.
+PartExtract = { (Slot | Identifier | UnsignedNumericValue | String) ~ PartIndexGroup+ ~ DerivativePrime? ~ BracketArgs* ~ (PartIndexGroup+ ~ BracketArgs*)* }
+
+// Optional inline whitespace, spelled out so the atomic numeric-literal
+// lookaheads below can see a `^` that is separated from its base by spaces
+// (`-2 ^ 2` must bind as `-(2^2)` just as `-2^2` does).
+PowGap = _{ (" " | "\t" | "\r" | "\n")* }
+
+// `-N^M` should bind as `-(N^M)` (Wolfram's `^` binds tighter than
+// unary `-`), so don't consume the leading `-` when it's followed by
+// digits-then-`^` — let the outer LeadingMinus path handle it.
+Integer = @{ ("-" ~ !(ASCII_DIGIT+ ~ PowGap ~ "^"))? ~ ASCII_DIGIT+ }
+// Integer with scientific notation: 5*^3 → 5000, 5*^-13 → Rational[1, 2000000000000]
+// The exponent may carry an explicit sign: Wolfram reads `1*^+150` too.
+ExponentSign = _{ "-" | "+" }
+IntegerScientific = @{ ("-")? ~ ASCII_DIGIT+ ~ "*^" ~ ExponentSign? ~ ASCII_DIGIT+ }
+// Real: digits followed by a single `.` (optionally more digits). The `!"."`
+// guards prevent `0..` and `0...` from being consumed as `0. ...` — those
+// must fall through so the Repeated/RepeatedNull suffix handlers can see
+// them as `Integer 0` followed by `..` or `...`.
+// The body of a real literal (no sign): a decimal/scientific mantissa.
+RealBody = _{
+    ((ASCII_DIGIT+ ~ "." ~ !"." ~ ASCII_DIGIT*) | ("." ~ !"." ~ ASCII_DIGIT+))
+    ~ ("*^" ~ ExponentSign? ~ ASCII_DIGIT+)?
+}
+// Like the Integer rule, do NOT consume a leading `-` when the literal is
+// immediately followed by `^`: `-10.0^2` must parse as `-(10.0^2) = -100.`
+// (Wolfram precedence), with the `-` released to LeadingMinus.
+Real = @{
+    ("-" ~ !(RealBody ~ PowGap ~ "^"))?
+    ~ RealBody
+}
+UnsignedInteger = @{ ASCII_DIGIT+ }
+UnsignedIntegerScientific = @{ ASCII_DIGIT+ ~ "*^" ~ ExponentSign? ~ ASCII_DIGIT+ }
+UnsignedReal = @{
+    (ASCII_DIGIT+ ~ "." ~ !"." ~ ASCII_DIGIT* | "." ~ !"." ~ ASCII_DIGIT+)
+    ~ ("*^" ~ ExponentSign? ~ ASCII_DIGIT+)?
+}
+// Precision-tagged real: 0.1`1 means 0.1 with precision 1 digit
+// 0.1` means machine precision (bare backtick)
+// Precision value can be integer or real: 0.1`5, 0.1`5.2
+// Integer-form is also accepted: `0`` and `0`3` parse as 0. with the
+// given precision tag (Wolfram allows trailing-backtick on integers).
+// Double-backtick `n``a` is the accuracy form: n with accuracy a digits.
+// In Wolfram, `n``a` ≡ `n`(a + log10(|n|))` for n ≠ 0; for n == 0 it
+// produces a Real(0.) with the accuracy spec preserved on display.
+// A precision-tagged literal may still carry a `*^` exponent after the tag:
+// `1.5`*^-16` is how the Wolfram Language writes a tiny machine real in
+// InputForm, and Demonstrations' coordinate lists are full of them.
+UnsignedPrecisionReal = @{
+    (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* | "." ~ ASCII_DIGIT+ | ASCII_DIGIT+)
+    ~ ("``" | "`")
+    ~ (ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT*)? | "." ~ ASCII_DIGIT+)?
+    ~ ("*^" ~ ExponentSign? ~ ASCII_DIGIT+)?
+}
+PrecisionReal = @{
+    ("-")?
+    ~ (ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* | "." ~ ASCII_DIGIT+ | ASCII_DIGIT+)
+    ~ ("``" | "`")
+    ~ (ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT*)? | "." ~ ASCII_DIGIT+)?
+    ~ ("*^" ~ ExponentSign? ~ ASCII_DIGIT+)?
+}
+UnsignedConstant = { ("Pi" | "Degree" | "E") ~ !(ASCII_ALPHANUMERIC | "_") }
+// Base-prefix literal: base^^digits (e.g. 16^^FF, 2^^1010, 2^^1.01, 16^^FF.A)
+BasePrefix = @{ ASCII_DIGIT+ ~ "^^" ~ ASCII_ALPHANUMERIC+ ~ ("." ~ !"." ~ ASCII_ALPHANUMERIC*)? }
+Constant = { ("-")? ~ ("Pi" | "Degree" | "E") ~ !(ASCII_ALPHANUMERIC | "_") }
+NumericValue = { BasePrefix | PrecisionReal | Real | IntegerScientific | Integer | Constant }
+UnsignedNumericValue = { BasePrefix | UnsignedPrecisionReal | UnsignedReal | UnsignedIntegerScientific | UnsignedInteger | UnsignedConstant }
+
+// Wolfram's own script alphabet (`\[ScriptCapitalD]`, `\[ScriptX]`) lives in
+// the private use area, so Unicode files those characters under `Co` rather
+// than `L` — but they name symbols like any other letter, and a notebook
+// writes them as the bare character. The letters Unicode does have (ℬ, ℯ, ℓ,
+// …) are ordinary `LETTER`s and need no help.
+// `\[FormalA]`..`\[FormalZ]`, their capitalized and Greek variants, and a
+// further "formal script" block live in `\u{F800}`..`\u{F8FF}` and
+// `\u{FA000}`..`\u{FA0FF}` (see the `"Formal…"` entries in
+// named_characters.rs) — Wolfram uses these as ordinary generic symbol
+// names (e.g. a pure function's own bound variable), so a notebook's box
+// form stores them as the bare character just like the other PUA letters
+// below.
+PrivateUseLetter = _{ '\u{F6B2}'..'\u{F6CB}' | '\u{F770}'..'\u{F789}' | '\u{F6E6}'..'\u{F6FF}' | '\u{F7A4}'..'\u{F7BD}' | '\u{F800}'..'\u{F8FF}' | '\u{FA000}'..'\u{FA0FF}' }
+
+// PatternName is an identifier that will be followed by _ in a Pattern
+// It must start with a letter and can contain letters, digits, but NOT trailing underscores
+PatternName = @{ (ASCII_ALPHA | LETTER | PrivateUseLetter) ~ (ASCII_ALPHANUMERIC | LETTER | PrivateUseLetter)* }
+// NamedCharIdentifier: named character sequences like \[Phi], \[Alpha], etc.
+// Matches \[Name] syntax or direct Unicode chars for common symbols
+// Excludes operator named chars (\[Element], \[NotElement], \[ReverseElement], \[DirectedEdge], \[UndirectedEdge],
+// \[Rule], \[RuleDelayed], \[Equal], \[NotEqual], \[LessEqual], \[GreaterEqual], …)
+// which must be parsed as infix operators, not as identifiers in implicit multiplication.
+// Geometric shapes, pictographs, musical accidentals and astronomical
+// symbols that Wolfram treats as ordinary (letterlike) symbol names —
+// e.g. `Head[\[FilledSquare]]` is `Symbol`, not a syntax error. Unicode
+// files them under `So`/`Sm` rather than `L`, so — like PrivateUseLetter
+// above — they need to be named explicitly. A notebook's box form stores
+// these as the bare character (not the `\[Name]` escape), and a
+// Demonstration commonly uses `\[FilledSquare]`/`\[EmptySquare]` etc. as
+// grid-cell markers. Mirrors the "Geometric and miscellaneous symbols"
+// section of `named_char_to_unicode` in syntax.rs.
+LetterlikeSymbolChar = _{ "\u{2026}" | "\u{22EF}" | "\u{22EE}" | "\u{22F0}" | "\u{22F1}" |
+  "\u{2220}" | "\u{25A0}" | "\u{25A1}" | "\u{25FC}" | "\u{25FB}" | "\u{25AA}" | "\u{25AB}"
+  | "\u{25CF}" | "\u{25CB}" | "\u{F750}" | "\u{25E6}" | "\u{25C6}" | "\u{25C7}"
+  | "\u{25B2}" | "\u{25B3}" | "\u{25BC}" | "\u{25BD}" | "\u{25C0}" | "\u{25B6}"
+  | "\u{F528}" | "\u{F527}" | "\u{F725}" | "\u{2713}" | "\u{231A}" | "\u{2605}" | "\u{2736}"
+  | "\u{266F}" | "\u{266D}" | "\u{266E}"
+  | "\u{2609}" | "\u{263F}" | "\u{2640}" | "\u{F3DF}" | "\u{2642}" | "\u{2643}" | "\u{2644}"
+  | "\u{26E2}" | "\u{2646}" | "\u{2647}"
+}
+
+// Bare big-operator glyphs (∑, ∏) used purely for display inside a
+// `HoldForm`/`TraditionalForm`, never invoking the real `Sum`/`Product`
+// function. Also `So`/`Sm`, not `L`. Mirrors the `big_operator_head`
+// handling in notebook.rs and the glyph list in graphics.rs.
+BigOperatorChar = _{ "\u{2211}" | "\u{220F}" }
+
+NamedCharBase = _{ !("\\[DifferentialD]" | "\\[Sqrt]" | "\\[CubeRoot]" | "\\[Piecewise]" | "\\[Element]" | "\\[NotElement]" | "\\[ReverseElement]" | "\\[DirectedEdge]" | "\\[UndirectedEdge]" | "\\[Distributed]" | "\\[Conditioned]" | "\\[Function]" | "\\[Transpose]" | "\\[ConjugateTranspose]" | "\\[Cross]" | "\\[TensorProduct]" | "\\[CircleTimes]" | "\\[CirclePlus]" | "\\[CenterDot]" | "\\[Times]" | "\\[Divide]" | "\\[CircleMinus]" | "\\[Star]" | "\\[Diamond]" | "\\[Backslash]" | "\\[CircleDot]" | "\\[SmallCircle]" | "\\[Wedge]" | "\\[Vee]" | "\\[Cap]" | "\\[Cup]" | "\\[DoubleRightTee]" | "\\[RightTee]" | "\\[DoubleLeftTee]" | "\\[LeftTee]" | "\\[And]" | "\\[Or]" | "\\[Not]" | "\\[Xor]" | "\\[Nand]" | "\\[Nor]" | "\\[Implies]" | "\\[Equivalent]" | "\\[Rule]" | "\\[RuleDelayed]" | "\\[Equal]" | "\\[NotEqual]" | "\\[LessEqual]" | "\\[GreaterEqual]" | "\\[TildeTilde]") ~ "\\[" ~ ASCII_ALPHA+ ~ "]" | "\u{20AC}" | "\u{03F5}" | "\u{03C0}" | "\u{212F}" | "\u{2147}" | "\u{00B0}" | "\u{221E}" | "\u{2148}" | "\u{F74D}" | "\u{F74E}" | "\u{F74F}" | LetterlikeSymbolChar | BigOperatorChar }
+// Adjacent `\[Name]` segments (or named char + identifier chars)
+// concatenate into a single identifier — `\[CapitalGamma]\[Beta]` → `Γβ`,
+// `\[Angle]XYZ` → `∠XYZ`, `i\[Ellipsis]j` (when `i` then `\[Ellipsis]j`
+// is parsed via the `Identifier` rule below). Matches wolframscript's
+// identifier-character semantics where named characters act like
+// identifier-character literals.
+NamedCharIdentifier = @{ NamedCharBase ~ (NamedCharBase | ASCII_ALPHANUMERIC | LETTER | PrivateUseLetter | "_" | "$")* }
+// Identifiers may carry a context prefix using backticks, e.g. `Global`x` or
+// `Foo`Bar`x`. A leading backtick ` `x` ` is shorthand for the current
+// context (Global by default). Each segment after a backtick must begin
+// with a letter/_/$ so numeric precision tags like `1`30`/`Pi`30` aren't
+// accidentally absorbed.
+Identifier = @{
+  ("`" ~ (ASCII_ALPHA | LETTER | PrivateUseLetter | "_" | "$") ~ (ASCII_ALPHANUMERIC | LETTER | PrivateUseLetter | "_" | "$" | NamedCharBase)* ~ ("`" ~ (ASCII_ALPHA | LETTER | PrivateUseLetter | "_" | "$") ~ (ASCII_ALPHANUMERIC | LETTER | PrivateUseLetter | "_" | "$" | NamedCharBase)*)*)
+  | ((ASCII_ALPHA | LETTER | PrivateUseLetter | "_" | "$") ~ (ASCII_ALPHANUMERIC | LETTER | PrivateUseLetter | "_" | "$" | NamedCharBase)* ~ ("`" ~ (ASCII_ALPHA | LETTER | PrivateUseLetter | "_" | "$") ~ (ASCII_ALPHANUMERIC | LETTER | PrivateUseLetter | "_" | "$" | NamedCharBase)*)*)
+}
+String = @{ "\"" ~ ("\\\\" | "\\\"" | "\\n" | "\\t" | "\\r" | (!"\"" ~ !"\\" ~ ANY) | ("\\" ~ ANY))* ~ "\"" }
+
+// Anonymous function syntax: body & where body contains # slots
+SlotSequence = @{ "##" ~ ASCII_DIGIT* }
+Slot = @{ "#" ~ !"#" ~ (ASCII_ALPHA ~ ASCII_ALPHANUMERIC* | ASCII_DIGIT*) }
+// Output reference shortcut: `%n` (digits) is `Out[n]`, plain `%`/`%%`/`%%%` is
+// `Out[$Line - k]`. Atomic so adjacent text isn't dragged in. The digit form
+// must come first so `%5` is consumed as a single token rather than `% * 5`.
+OutShortcut = @{ "%" ~ ASCII_DIGIT+ | "%"+ }
+// SimpleAnonymousFunction is # or # op term followed by & (not &&)
+SimpleAnonymousFunction = { Slot ~ (Operator ~ SlotTerm)? ~ "&" ~ !"&" }
+// SlotTerm is what can follow an operator in an anonymous function body
+SlotTerm = _{ PartExtract | NumericValue | Constant | String | FunctionCall | Identifier | SlotSequence | Slot | &BalancedParens ~ "(" ~ Expression ~ ")" }
+// FunctionAnonymousFunction is a function call (like If[...]) followed by & (not &&)
+// Optional BracketArgs allow direct calls: If[# > 0, #, 0]&[5]
+// ListCall handles List used as a function head: {f, g}[x] → applies each element to args
+ListCall = { List ~ BracketArgs+ }
+// NumericCall handles a numeric literal used as a function head, e.g.
+// `1[2, 3]` (an expression with an integer head, used for labelled trees).
+// Restricted to numeric literals (not Constants) and mirrors `(1)[2, 3]`.
+NumericCall = { (Real | IntegerScientific | Integer) ~ BracketArgs+ }
+// StringCall handles a string literal used as a function head, e.g.
+// `"f"[x]`, which stays unevaluated just like `1[2, 3]`. Typeset labels
+// built by hand use it to apply a box-notation string to an argument:
+// `"\!\(\*SuperscriptBox[\(f\), \(-1\)]\)"[x]`.
+StringCall = { String ~ BracketArgs+ }
+// ListExtended merges List, ListCall, and List-based PartExtract into a single
+// rule to avoid exponential backtracking. Parses List ONCE, then checks for
+// optional Part or Call suffixes.
+// Note: The anonymous-function suffix (&) is NOT consumed here — it is handled
+// at the Expression level via AnonymousFunctionSuffix so that `&` has the
+// correct low precedence (binds the whole infix chain, not just the list).
+ListCallSuffix = { BracketArgs+ }
+ListExtended = {
+    List ~ (
+        PartIndexSuffix   // List[[...]]
+      | ListCallSuffix    // List[...] (ListCall)
+    )?
+}
+// ParenExtended handles Part extraction, bracket-call, and derivative
+// prime on parenthesized expressions:
+//   (expr)[[index]]  — Part extraction
+//   (expr)[args]     — function call on parenthesized expression (e.g. (D[#, x] &)[x^3])
+//   (expr)'          — Derivative[1][expr] (e.g. (#^4&)'' is Derivative[2][#^4&])
+//   (expr)'[args]    — Derivative[n][expr] applied to args
+// Every suffix here starts with `'` or `[`, so a linear scan over the balanced
+// group tells us up front whether the rule can succeed. Without that guard a
+// plain `(expr)` is parsed once here only to be discarded, doubling the cost at
+// every nesting level (see `SoloBracketGroup`).
+ParenCallSuffix = { BracketArgs+ }
+ParenExtended = {
+    &(BalancedParens ~ (DerivativePrime | PartOpen | "["))
+    ~ "(" ~ (&HasSemicolon ~ CompoundExpression | Expression) ~ ")"
+    ~ (DerivativePrime ~ ParenCallSuffix? | PartIndexSuffix | ParenCallSuffix)
+}
+// RuleAnonymousFunction handles ReplacementRule& - for expressions like {#, First@#2} -> "Q" &
+RuleAnonymousFunction = { ReplacementRule ~ "&" ~ !"&" }
+// BaseFunctionCall is a function call that doesn't include anonymous functions to avoid recursion
+// The bracket groups carry the same closing-bracket guard as `BracketArgs`
+// (see there) — this rule spells its arguments out rather than reusing
+// `BracketArgs` because its callers read the `FunctionArg` pairs directly.
+BaseFunctionCall = { (Identifier | NamedCharIdentifier) ~ DerivativePrime? ~ (&BalancedBrackets ~ "[" ~ (FunctionArg ~ ("," ~ FunctionArg)*)? ~ "]")+ }
+
+// Atomic so that WHITESPACE/COMMENT tokens are not consumed within
+// the operator span — otherwise as_str() would include e.g. comments
+// between "/;" and the following negative lookahead, breaking operator
+// recognition in the AST builder.
+Operator = @{
+    "\\[NotElement]" | "\u{2209}" // Named character operator: NotElement (∉)
+  | "\\[ReverseElement]" | "\u{220B}" // Named character operator: ReverseElement (∋)
+  | "\\[Element]" | "\u{2208}" // Named character operator: Element (∈)
+  | "\\[DirectedEdge]" | "\u{F3D5}" // Named character operator: DirectedEdge
+  | "\\[UndirectedEdge]" | "\u{F3D4}" // Named character operator: UndirectedEdge
+  | "\\[Distributed]" | "\u{F3D2}" // Named character operator: Distributed
+  | "\\[Conditioned]" | "\u{F3D3}" // Named character operator: Conditioned
+  | "\\[TildeTilde]" | "\u{2248}" // TildeTilde operator: a ≈ b → TildeTilde[a, b]
+  | "\\[Function]" | "\u{F4A1}" | "|->" // Function-arrow operator: x \[Function] body / x |-> body → Function[x, body]
+  | "\\[Cross]" | "\u{F4A0}" | "\u{F3C4}" | "\u{2A2F}" // Cross product operator: a ⨯ b → Cross[a, b]
+  | "\\[TensorProduct]" | "\u{F3DA}" // TensorProduct operator: a ⊗ b → TensorProduct[a, b]
+  | "\\[CircleTimes]" | "\u{2297}" // CircleTimes operator: a ⊗ b → CircleTimes[a, b]
+  | "\\[CirclePlus]" | "\u{2295}" // CirclePlus operator: a ⊕ b → CirclePlus[a, b]
+  | "\\[CenterDot]" | "\u{00B7}" // CenterDot operator: a · b → CenterDot[a, b]
+  | "\\[Times]" | "\u{00D7}" // Times operator: a × b → a*b
+  | "\\[Divide]" | "\u{00F7}" // Divide operator: a ÷ b → a/b
+  | "\\[CircleMinus]" | "\u{2296}" // CircleMinus operator: a ⊖ b → CircleMinus[a, b]
+  | "\\[Star]" | "\u{22C6}" // Star operator: a ⋆ b → Star[a, b]
+  | "\\[Diamond]" | "\u{22C4}" // Diamond operator: a ⋄ b → Diamond[a, b]
+  | "\\[Backslash]" | "\u{2216}" // Backslash operator: a ∖ b → Backslash[a, b]
+  | "\\[CircleDot]" | "\u{2299}" // CircleDot operator: a ⊙ b → CircleDot[a, b]
+  | "\\[SmallCircle]" | "\u{2218}" // SmallCircle operator: a ∘ b → SmallCircle[a, b]
+  | "\\[Wedge]" | "\u{22C0}" // Wedge operator: a ⋀ b → Wedge[a, b]
+  | "\\[Vee]" | "\u{22C1}" // Vee operator: a ⋁ b → Vee[a, b]
+  | "\\[Cap]" | "\u{2322}" // Cap operator: a ⌢ b → Cap[a, b]
+  | "\\[Cup]" | "\u{2323}" // Cup operator: a ⌣ b → Cup[a, b]
+  | "\\[DoubleRightTee]" | "\u{22A8}" // DoubleRightTee operator: a ⊨ b → DoubleRightTee[a, b]
+  | "\\[RightTee]" | "\u{22A2}" // RightTee operator: a ⊢ b → RightTee[a, b]
+  | "\\[DoubleLeftTee]" | "\u{2AE4}" // DoubleLeftTee operator: a ⫤ b → DoubleLeftTee[a, b]
+  | "\\[LeftTee]" | "\u{22A3}" // LeftTee operator: a ⊣ b → LeftTee[a, b]
+  | "\\[Implies]" | "\u{F523}" // Implies operator (right-associative)
+  | "\\[Equivalent]" | "\u{29E6}" // Equivalent operator: a ⧦ b
+  | "\\[Nand]" | "\u{22BC}" // Nand operator
+  | "\\[Nor]" | "\u{22BD}" // Nor operator
+  | "\\[Xor]" | "\u{22BB}" // Xor operator
+  | "\\[And]" | "\u{2227}" // And operator (named form of &&)
+  | "\\[Or]" | "\u{2228}" // Or operator (named form of ||)
+  | "/@"     // keep first
+  | ";;"     // Span (Wolfram precedence 305: tighter than =, ==, &&, |, ~~ and ->, looser than + and *)
+  | "@@@"    // MapApply operator (must be before @@)
+  | "@@"     // Apply operator (must be before single @)
+  | "@*"     // Composition operator (must be before single @)
+  | "<->"    // TwoWayRule operator (must be before <>, <=, <, and before -> so its "->" substring isn't matched)
+  | "<>"     // StringJoin operator (must be before < and >)
+  | "~~"     // StringExpression operator (must be before single ~)
+  | "&&"     // And operator (must be before single &)
+  | "||"     // Or operator (must be before single |)
+  | "|"      // Alternatives operator
+  | "===" | "=!=" | "==" | "\u{2A75}" | "\\[Equal]" | "\u{F431}" | "!=" | "\u{2260}" | "\\[NotEqual]"  // SameQ, UnsameQ (must be before == and !=), Equal, ⩵, Unequal, ≠
+  | "<=" | "\u{2264}" | "\u{2A7D}" | "\\[LessEqual]" | ">=" | "\u{2265}" | "\u{2A7E}" | "\\[GreaterEqual]"  // LessEqual, ≤, ⩽, GreaterEqual, ≥, ⩾
+  | ">>>" ~ !(">" | "=")   // PutAppend operator (must be before >> and >)
+  | ">>" ~ !(">" | "=")    // Put operator (must be before > and >=)
+  | "/*" ~ !(")")  // RightComposition operator (must be before / ; avoid matching /* in comments)
+  | "/;" ~ !("/")  // Condition operator (must be before / and ;)
+  | "/:" ~ !("/")  // TagSet/TagSetDelayed operator (must be before / and :)
+  | "::" ~ !":"   // MessageName (a::b → MessageName[a, "b"]). Must precede :> and :=.
+  | "\\[RuleDelayed]" | "\u{F51F}" | ":>"     // RuleDelayed (must be before := and >)
+  | ":="
+  | "\\[Rule]" | "\u{F522}" | "->" | "\u{2192}"     // Rule (must be before - and >), →
+  | "^:="    // UpSetDelayed (must be before ^= and :=)
+  | "^="     // UpSet (must be before ^ and =)
+  // Compound assignment. The `AddTo`/`SubtractFrom`/`TimesBy`/`DivideBy`
+  // terms above only take a symbol or a `[[…]]` part as their target, so a
+  // call target (`state["pos"] += n`) reaches the operator chain instead —
+  // `Term` has already taken `state["pos"]` as a `FunctionCallExtended` by
+  // then. Must precede the bare `+`/`-`/`*`/`/` spellings below.
+  | "+=" | "-=" | "*=" | "/="
+  | "+" | "-" | "*" | "/" | "^"
+  | "." ~ !ASCII_DIGIT ~ !"."  // Dot operator (not decimal point, not .. or ...)
+  | "<" | ">"
+  | "=" | "@"
+  // Bare ":" — Pattern / Optional. Must come after "::", ":>", ":=" and
+  // "/:" so those keep ownership of their spellings. `Term` already takes
+  // the pattern forms that start with a name (`x_:v`, `x:body`), so this
+  // only fires for a `:` that follows a complete term — the trailing
+  // default in `x : pat : v`, or `pat : v` where `pat` is not a bare name
+  // (`x_?NumericQ : 2`, `_Integer | _Symbol : 2`).
+  | ":" ~ !("=" | ">" | ":")
+}
+
+// PostfixFunction: function used in postfix application (x // f or x // Map[f])
+// Uses BaseFunctionCall to avoid circular reference with FunctionCall -> FunctionArg -> Expression -> PostfixApplication
+// Optional trailing & allows "x // f &" to parse as x // (f &), matching Wolfram precedence.
+// Parenthesised expressions and List literals can also serve as the postfix
+// operator, supporting `expr // (#1+1&)` and `expr // {#1, Precision[#1]}&`.
+// A bare Slot-based body (`expr // #&`, `expr // #+1&`) is its own
+// alternative: SimpleAnonymousFunction already parses `# op term &` and
+// unlike the other branches doesn't start with `(`, a list, or an
+// identifier, so it needs an explicit path here.
+PostfixFunction = {
+    SimpleAnonymousFunction
+  | (&BalancedParens ~ "(" ~ Expression ~ ")" | List | BaseFunctionCall | Identifier) ~ ("&" ~ !"&")?
+}
+
+// Increment/Decrement: x++ or x-- (postfix operators)
+// Also supports Part extraction: x[[i]]++ or x[[i]]--
+// Allow chained postfix: `a++++` = `(a++)++` (folded in pair_to_expr).
+// `IncrementOp` / `DecrementOp` are named so the chain count survives
+// pest's tokenization (silent literals in `("++")*` would not).
+IncrementOp = { "++" }
+DecrementOp = { "--" }
+// The operand may also be a literal: wolframscript parses `5++` as
+// `Increment[5]` and reports `::rvalue` at evaluation time, and reads
+// `1++2` as `Increment[1] 2` rather than as `1 + (+2)`. The `++` literal
+// is atomic, so a spaced `1 + +2` is still addition.
+Increment = { (PartExtract | Identifier | NumericValue) ~ IncrementOp ~ IncrementOp* }
+Decrement = { (PartExtract | Identifier | NumericValue) ~ DecrementOp ~ DecrementOp* }
+
+// PreIncrement/PreDecrement: ++x or --x (prefix operators)
+// Also supports Part extraction: ++x[[i]] or --x[[i]]
+// Numeric literals are accepted too (wolframscript parses --5 as
+// PreDecrement[5] and then errors at evaluation time — matching that).
+// Right-recursive on PreIncrement so `++++a` parses as `++(++a)` — the
+// rightmost `++a` matches the inner alternative, then each preceding
+// `++` wraps another PreIncrement around it. Allow `Increment` as inner
+// operand so `++++a+++++2` parses as `++(++(a++++)) + 2` (Wolfram's
+// greedy reading: the postfix `++++` chain after `a` is inside the
+// innermost PreIncrement, not split by the trailing `+`).
+PreIncrement = { "++" ~ (PreIncrement | Increment | PartExtract | Identifier | NumericValue) }
+PreDecrement = { "--" ~ (PreDecrement | Decrement | PartExtract | Identifier | NumericValue) }
+
+// InformationQuery: ?symbol or ?pattern* shorthand for Information[symbol]
+InformationQuery = { "?" ~ !"?" ~ InformationPattern }
+// FullInformationQuery: ??symbol or ??pattern* shorthand for Information[symbol, "Full"]
+FullInformationQuery = { "??" ~ InformationPattern }
+// InformationPattern: identifier possibly containing * wildcards (e.g. Plot*, *Plot*, *Plot)
+InformationPattern = @{ (ASCII_ALPHA | "$" | "*")+ ~ (ASCII_ALPHANUMERIC | "$" | "*")* }
+
+// Unset: x =. (removes definition for simple identifiers)
+// Function call unsets (f[x] =.) are handled by UnsetSuffix in Expression.
+// Wolfram allows whitespace between `=` and `.` (e.g. `x = .`), so split
+// the literal across `=` and `.` to leverage pest's implicit whitespace.
+Unset = { Identifier ~ "=" ~ "." ~ !ASCII_DIGIT }
+
+// UnsetSuffix: "=." postfix operator used within Expression to handle f[x] =.
+// This is separate from Term-level Unset because it needs to participate in
+// operator precedence (same level as = assignment).
+UnsetSuffix = { "=" ~ "." ~ !ASCII_DIGIT }
+
+// Compound assignment: x += y, x -= y, x *= y, x /= y
+ApplyToOp = { (PartExtract | Identifier) ~ "//=" ~ Expression }
+AddTo = { (PartExtract | Identifier | NumericValue) ~ "+=" ~ Expression }
+SubtractFrom = { (PartExtract | Identifier | NumericValue) ~ "-=" ~ Expression }
+TimesBy = { (PartExtract | Identifier | NumericValue) ~ "*=" ~ Expression }
+DivideBy = { (PartExtract | Identifier | NumericValue) ~ "/=" ~ Expression }
+
+// ImplicitTimes handles implicit multiplication (e.g., "x y z" or "2 x")
+// Each factor can have a Part suffix ([[...]]) and/or power suffix so that
+// "b y^3" parses as b*(y^3) not (b*y)^3 and "2 x[[1]]" parses as 2*x[[1]]
+// Allow a leading unary minus in the exponent so `y^-m` parses as
+// y^(-m) instead of y^0 - m (Wolfram's implicit-power semantics).
+// The optional `PartIndexSuffix?` after the exponent term lets `y^-m[[1]]`
+// parse as `y^(-Part[m, 1])`, matching Wolfram's `Part` precedence.
+NegSimpleTerm = { "-" ~ SimpleTerm ~ PartIndexSuffix? }
+// FactorialSuffix may follow the exponent because `!` (Factorial) binds
+// tighter than `^` (Power) in Wolfram, so `a^b!` parses as `a^(b!)`.
+ImplicitPowerSuffix = { "^" ~ (NegSimpleTerm ~ FactorialSuffix? | SimpleTerm ~ PartIndexSuffix? ~ FactorialSuffix?) }
+// Allow trailing `..` / `...` (Repeated/RepeatedNull) so `0..1` parses
+// as `Repeated[0] * 1` rather than splitting into two statements.
+// FactorialSuffix on each factor lets `a b!` parse as `a*(b!)` and
+// `a! b!` as `(a!)*(b!)`.
+ImplicitTimesFactor = _{ SimpleTerm ~ PartIndexSuffix? ~ ImplicitPowerSuffix? ~ FactorialSuffix? ~ (RepeatedNullSuffix | RepeatedSuffix)? }
+// NegativeImplicitFirst allows -N as the first factor in implicit multiplication
+// so that "-90 Degree" parses as Times[-90, Degree] instead of failing.
+NegativeImplicitFirst = { "-" ~ UnsignedNumericValue }
+// `ImplicitTimes` is tried before the plain list/association/parenthesis rules,
+// so a term that is just a bracket group gets that group parsed once here (as a
+// candidate first factor), thrown away when no second factor follows, and then
+// parsed again by `ListExtended` / `Association` / the parenthesis alternative.
+// Nesting multiplies that waste at every level, so `{{{{{{{1}}}}}}}` or
+// `((((((1))))))` used to exhaust the parser call limit. `SoloBracketGroup` is a
+// zero-width, linear scan that rejects the attempt up front when the group is
+// followed by something that can never begin a juxtaposed second factor.
+BracketGroupScan = _{ BalancedAssociation | BalancedBraces | BalancedParens }
+// Deliberately conservative: characters that could also start a factor suffix
+// (`[`, `^`, `!`, `.`, `'`, `?`, `:`) are absent, so `{1, 2}^2 x` still takes
+// the (slower) ImplicitTimes path rather than being mis-rejected.
+GroupTerminator = _{
+    EOI | "," | "]" | "}" | ")" | "|>" | ";" | "&"
+  | "+" | "-" | "*" | "/" | "<" | ">" | "=" | "@" | "~" | "|"
+}
+SoloBracketGroup = _{ BracketGroupScan ~ GroupTerminator }
+ImplicitTimes = { !SoloBracketGroup ~ (NegativeImplicitFirst | ImplicitTimesFactor) ~ ImplicitTimesFactor+ }
+
+// TildeInfix: a ~f~ b means f[a, b] — infix function application syntax
+// The function between tildes must be an identifier or function call (BaseFunctionCall)
+// Must not be followed by ~ to avoid conflicting with ~~ (StringExpression)
+TildeInfix = { "~" ~ !"~" ~ (BaseFunctionCall | Identifier) ~ "~" ~ !"~" }
+
+// Unified Expression: parses a base term/operators, then looks for optional postfix/replace operators
+// This avoids redundant parsing by checking for special operators after the main parse
+// Postfix application (//) has lowest precedence and can follow any expression form
+// ReplaceAll (/.) and ReplaceRepeated (//.) can appear after operator chains: x = y /. rules
+ReplaceAllSuffix = { "/." ~ (&HasRuleOperator ~ ReplacementRule | List | ConditionExpr) }
+ReplaceRepeatedSuffix = { "//." ~ (&HasRuleOperator ~ ReplacementRule | List | ConditionExpr) }
+// Repeated (..) and RepeatedNull (...) are postfix pattern operators
+// "..." must be tried before ".." since PEG is ordered-choice
+RepeatedNullSuffix = { "..." }
+RepeatedSuffix = { ".." ~ !"." }
+// AnonymousFunctionSuffix: & (not &&) at Expression level — lowest precedence
+// Handles cases like #^2 + 1 &, # /. {rules} &, etc.
+// Optional BracketArgs allow direct calls: (# /. rules &)[5]
+AnonymousFunctionSuffix = { "&" ~ !"&" ~ BracketArgs* }
+// LeadingMinus marks a leading "-" in an expression: -x, -f[x], -(a+b), etc.
+// Only matches when NOT followed by a digit (so -3 still parses as negative Integer)
+// Handled in parse_expression as a synthetic 0 - expr with proper precedence
+// `-` is NOT a leading unary minus when it's immediately followed by another
+// `-` (which is PreDecrement) or a digit (which forms a signed literal).
+// Atomic: the `!"-"` lookahead must see the next raw character; we don't want
+// whitespace to hide an intervening `-`.
+// `-` at the start of a sub-expression: typically not followed by a
+// digit (so `-3` still parses as a signed Integer literal). The
+// exception is `-N^M`: we want to peel off the unary minus so that
+// `-10^8 = -(10^8) = -100000000` (Wolfram precedence). When the next
+// chars are `digits ^`, treat the `-` as a LeadingMinus regardless of
+// the immediately-following digit — the Integer rule has a matching
+// lookahead to release `digits ^` from its `(-)?` prefix.
+LeadingMinus = @{ "-" ~ !"-" ~ ((!ASCII_DIGIT) | &(RealBody ~ PowGap ~ "^") | &(ASCII_DIGIT+ ~ PowGap ~ "^")) }
+// LeadingPlus marks a leading "+" in an expression: +x, +f[x], +(a+b), etc.
+// Only matches when NOT followed by a digit or "+" (so +3 parses as positive Integer,
+// ++ would be Increment). Semantically +expr is just expr.
+LeadingPlus = { "+" ~ !"+" ~ !"=" }
+// LeadingNot marks prefix "!" as Not[expr]: !True, !x, !(a && b), etc.
+// Must not be followed by "=" (which would be != operator)
+LeadingNot = { "!" ~ !"=" ~ !"!" | "\\[Not]" | "\u{00AC}" }
+// FactorialSuffix: n! or n!! (Factorial / Factorial2)
+// Must not be followed by "=" (which would be != operator)
+FactorialSuffix = { "!!" | "!" ~ !"=" ~ !"!" }
+
+// TransposeSuffix: expr \[Transpose] → Transpose[expr]
+// Both the ASCII named-character form and the Unicode PUA glyph
+// (U+F3C5) are accepted. This is a postfix operator that binds as a
+// suffix on the preceding Term.
+TransposeSuffix = @{ "\\[Transpose]" | "\u{F3C5}" | "\u{F3C7}" }
+// ConjugateTransposeSuffix: expr \[ConjugateTranspose] → ConjugateTranspose[expr]
+ConjugateTransposeSuffix = @{ "\\[ConjugateTranspose]" | "\u{F3C6}" | "\u{F3C8}" }
+// TermSuffix: postfix suffix tokens that can follow a Term (after
+// FactorialSuffix). Silent choice rule — the underlying named rules
+// are the ones that appear in the parse tree.
+TermSuffix = _{ TransposeSuffix | ConjugateTransposeSuffix | PatternTestSuffix }
+// One operand of an expression chain: an optional prefix operator, a Term and
+// the suffixes that bind to it. Spelled out as one alternative per prefix
+// rather than `(LeadingNot | LeadingPlus | LeadingMinus)? ~ Term ~ …` because
+// a PEG never backtracks into a `?` it has already matched.
+ExprOperand = _{ LeadingNot ~ Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? | LeadingPlus ~ Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? | LeadingMinus ~ Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? | Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? }
+// The same operand with `;;`'s omitted left one allowed in front of it, so
+// `x = ;; 3` reads as `Set[x, Span[1, 3]]`.
+SpanOrExprOperand = _{ SpanNoLhsSep ~ ExprOperand | SpanNoOperandSep | ExprOperand }
+// `ExpressionNoImplicit`'s operand: as above, over `TermNoImplicit`.
+ExprOperandNoImplicit = _{ LeadingNot ~ TermNoImplicit ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? | LeadingMinus ~ TermNoImplicit ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? | TermNoImplicit ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)? }
+SpanOrExprOperandNoImplicit = _{ SpanNoLhsSep ~ ExprOperandNoImplicit | SpanNoOperandSep | ExprOperandNoImplicit }
+
+Expression = {
+    SpanOrExprOperand ~ (UnsetSuffix | (Operator | TildeInfix) ~ SpanOrExprOperand | SpanNoRhsSep)*
+    ~ (ReplaceRepeatedSuffix | ReplaceAllSuffix)*
+    ~ ("//" ~ PostfixFunction)*               // Postfix application (lowest precedence): x // f
+    ~ (AnonymousFunctionSuffix ~ ((ReplaceRepeatedSuffix | ReplaceAllSuffix) | (Operator | TildeInfix) ~ SpanOrExprOperand)*  ~ ("//" ~ PostfixFunction)*)*  // Function: expr & (lowest precedence), then optional continuation (Operator/ReplaceAll/ReplaceRepeated may interleave in any order, e.g. `f & /@ list /. rules`) — repeated for chains like `f & [x] & [y]`
+}
+
+// Legacy rules kept for backward compatibility in evaluation code
+PostfixBase = { ReplaceRepeatedExpr | ReplaceAllExpr | Term }
+PostfixApplication = { PostfixBase ~ ("//" ~ PostfixFunction)+ }
+
+// CompoundExpression: multiple expressions separated by ;
+// The result is the value of the last expression (like Wolfram's CompoundExpression)
+// A trailing ; means the result is Null (e.g. "a;" is CompoundExpression[a, Null])
+// Allows consecutive `;` separators with empty expressions between them,
+// matching Wolfram's `a ; ; c` → `CompoundExpression[a, Null, c]`.
+// Each statement may itself be a Span (`5 ;; 2; 1 ;; 10 ;; 2`): an Expression
+// greedily consumes its own `;;`, so every remaining top-level `;` is a genuine
+// CompoundExpression separator — no `;;` guard is needed and a `;;` statement is
+// free to follow a separator (`... ; ;;`). parse_compound_expression counts the
+// `;` separators from the source to reinsert omitted (Null) statements.
+CompoundStatement = _{ Expression }
+// An optional trailing `&` (no expression between it and the last `;`) turns
+// the whole statement sequence into a pure function body — the idiom
+// `(a = #; t = 0; &)` Options like `TrackingFunction` commonly use for a
+// multi-statement callback. Without a statement between the final `;` and
+// `&`, `&` cannot attach to a `CompoundStatement` (there isn't one), so it
+// must be consumed here instead, at the CompoundExpression level.
+// The `&` may itself take the same continuation a `&` at Expression level
+// takes — `(a = #; &) /@ list` is commonly written without the parentheses
+// as `a = #; & /@ list`, and statements may go on after it. Captured as one
+// named rule so `parse_compound_expression` can tell the continuation's
+// operands apart from the statements that follow.
+CompoundAnonSuffix = { AnonymousFunctionSuffix ~ ((ReplaceRepeatedSuffix | ReplaceAllSuffix) | (Operator | TildeInfix) ~ SpanOrExprOperand)* ~ ("//" ~ PostfixFunction)* }
+CompoundExpression = { CompoundStatement ~ (";" ~ CompoundStatement?)+ ~ (CompoundAnonSuffix ~ (";" ~ CompoundStatement?)*)? }
+
+// DerivativeNumeric: numeric literal followed by '...' (e.g. 1', (-1.4)', I via Constant)
+DerivativeNumeric = { (PrecisionReal | Real | IntegerScientific | Integer | Constant) ~ DerivativePrime }
+// DerivativePrime: one or more ' characters after a function name (e.g. f', f'', f''')
+// Transforms f'[x] → Derivative[1][f][x], f''[x] → Derivative[2][f][x], etc.
+DerivativePrime = @{ "'"+ }
+// DerivativeIdentifier: standalone f' or f'' without brackets → Derivative[n][f]
+DerivativeIdentifier = { Identifier ~ DerivativePrime }
+
+// GetShorthand: `<< filename` → Get["filename"]
+// The path runs to the next whitespace, `]`, `,`, `;`, `)`, `}`, or `&`. We
+// also accept a quoted-string form `<< "filename"` for completeness.
+GetShorthand = { "<<" ~ (String | GetPath) }
+GetPath = @{ GetPathChar+ }
+GetPathChar = _{ ASCII_ALPHANUMERIC | LETTER | "~" | "/" | "." | "\\" | "-" | "_" | ":" | "$" | "*" | "?" | "`" | "+" | "!" | "#" | "@" | "=" | "%" | "^" }
+
+// FunctionCallExtended: merges FunctionCall, FunctionCall-based PartExtract,
+// FunctionAnonymousFunction, and FunctionCall-based PartAnonymousFunction
+// into a single rule. This parses the function call ONCE, then checks for
+// optional Part extraction ([[...]]) or anonymous function (&) suffixes.
+// This eliminates exponential backtracking caused by parsing the same
+// FunctionCall 4 times through separate Term alternatives.
+// Named suffix rules so pair_to_expr can detect them reliably.
+// Only match & as FunctionCallAnonSuffix when it is followed by BracketArgs
+// (the direct-call form f[x]&[5]). A bare trailing `&` on a function call is
+// left for the Expression-level AnonymousFunctionSuffix, so `&` can have the
+// correct Wolfram precedence (90): tighter than `=`/`:=` (40) but looser than
+// infix operators like `==`, `+`, etc. — otherwise `Mod[#1,3] == Mod[#2,3] &`
+// would parse as `Equal[Mod[#1,3], Function[Mod[#2,3]]]` instead of
+// `Function[Equal[Mod[#1,3], Mod[#2,3]]]`.
+FunctionCallImplicitSuffix = { ImplicitTimesFactor+ }
+// A prime after the brackets differentiates the whole call, and may itself be
+// applied to arguments: `f[data]'[x]` is `Derivative[1][f[data]][x]`.
+// `BracketArgs*` after a `PartIndexSuffix` applies the extracted value —
+// `group["Summary"]["Events"][[1]]["Duplicates"]` walks a nested
+// association, alternating lookups and part extraction — exactly as
+// `PartExtract` already allows for a symbol or slot base.
+FunctionCallExtended = {
+    (Identifier | NamedCharIdentifier) ~ DerivativePrime? ~ BracketArgs+
+    ~ (DerivativePrime ~ BracketArgs*)?
+    ~ (
+        (PartIndexSuffix ~ BracketArgs*)+ ~ (ImplicitPowerSuffix? ~ FunctionCallImplicitSuffix)?
+      | ImplicitPowerSuffix? ~ FunctionCallImplicitSuffix
+    )?
+}
+
+// SlotCall: #[args] or #n[args] — Slot used as a function head (e.g., in Y combinator: #[#] &)
+// A `[[…]]` after the call extracts from its result — `#["pos"][[1]] &` is the
+// idiom for sorting associations by a keyed field — and the extracted value
+// may be applied in turn, exactly as after a `FunctionCallExtended`.
+SlotCall = { Slot ~ BracketArgs+ ~ (PartIndexSuffix ~ BracketArgs*)* }
+
+// DisplayedBoxes: `\!\(expr\)` — wolframscript renders this as the
+// "displayed box" form. When the inner content is a regular expression
+// (no box operators), the `\!\(…\)` wrapper is a no-op so e.g.
+// `\!\(2+2\)` evaluates to `4`. When the inner has box operators
+// (`\^`, `\_`, …) we fall through to the box-notation form, which is
+// surfaced as HoldComplete[<source>].
+DisplayedBoxes = { BoxBang ~ (BoxLeft ~ Expression ~ BoxRight | BoxNotation) }
+
+// BoxNotation: `\(...\)` raw box-notation literal. Woxi doesn't
+// implement the box AST; we accept and skip the inner content so that
+// scripts mixing box notation with regular expressions still parse.
+// Inner content can include nested `\(...\)` plus the box operators
+// `\^` `\_` `\+` `\&` `\%` `\@`.
+BoxNotation = { BoxLeft ~ BoxInner* ~ BoxRight }
+BoxInner = _{
+    BoxNotation
+  | "\\^" | "\\_" | "\\+" | "\\&" | "\\%" | "\\@" | "\\/" | "\\`"
+  | !BoxRight ~ ANY
+}
+
+// The same four delimiters have a second spelling: `ToString[InputForm[…]]`
+// of a typeset expression writes the box segment with Wolfram's private-use
+// marker characters rather than the backslash escapes (that is what makes
+// the InputForm text of `TraditionalForm[x + y]` 53 characters long), and
+// that text has to read back. They are `BOX_START`/`BOX_OPEN`/`BOX_SEP`/
+// `BOX_CLOSE` in src/functions/string_ast.rs.
+BoxBang = _{ "\\!" | "\u{F7C1}" }
+BoxLeft = _{ "\\(" | "\u{F7C9}" }
+BoxRight = _{ "\\)" | "\u{F7C0}" }
+
+// ⌊x⌋ / ⌈x⌉: the typeset input forms for `\[LeftFloor]…\[RightFloor]` /
+// `\[LeftCeiling]…\[RightCeiling]`, which the FrontEnd renders as bracket
+// pairs around a single expression — Floor[x] / Ceiling[x].
+FloorBrackets = { "\u{230A}" ~ Expression ~ "\u{230B}" }
+CeilingBrackets = { "\u{2308}" ~ Expression ~ "\u{2309}" }
+
+Term = _{
+    DisplayedBoxes
+  | BoxNotation
+  | GetShorthand
+  | FunctionCallExtended
+  | SlotCall
+  | ImplicitTimes
+  | RadicalPrefix
+  | DifferentialPrefix
+  | PiecewisePrefix
+  | FloorBrackets
+  | CeilingBrackets
+  | Unset
+  | ApplyToOp
+  | AddTo
+  | SubtractFrom
+  | TimesBy
+  | DivideBy
+  | Increment
+  | Decrement
+  | PartExtract
+  | Constant
+  | StringCall
+  | String
+  | ListExtended
+  | DerivativeNumeric
+  | NumericCall
+  | NumericValue
+  | PreIncrement
+  | PreDecrement
+  | PatternTest | PatternOptionalNamedBlank | PatternOptionalWithHead | PatternOptionalSimple | PatternOptionalAnonBlank | PatternOptionalDefaultSimple | PatternWithHead | PatternSimple | PatternNamed
+  | DerivativeIdentifier
+  | FullInformationQuery
+  | InformationQuery
+  | NamedCharIdentifier
+  | Identifier
+  | SlotSequence
+  | Slot
+  | OutShortcut
+  | AssociationExtended
+  | Association
+  | ParenExtended
+  | &BalancedParens ~ "(" ~ (&HasSemicolon ~ CompoundExpression | Expression) ~ ")"
+}
+
+// SimpleTerm is used for implicit multiplication - doesn't include ImplicitTimes to avoid recursion
+// Uses UnsignedNumericValue to prevent "n-1" from being parsed as implicit multiplication n*(-1)
+// PrefixApplySimple handles f@x within implicit multiplication so Sqrt@5 binds before n Sqrt@5
+// `\[Sqrt]x` / `\[CubeRoot]x` are prefix operators binding to the next
+// factor, with `^`, `!` and `[[…]]` binding tighter than the radical:
+// `\[Sqrt]x y` is `Sqrt[x] y` but `\[Sqrt]x^2` is `Sqrt[x^2]`.
+RadicalOp = { "\\[Sqrt]" | "\u{221A}" | "\\[CubeRoot]" | "\u{221B}" }
+RadicalPrefix = { RadicalOp ~ SimpleTerm ~ PartIndexSuffix? ~ ImplicitPowerSuffix? ~ FactorialSuffix? }
+// `\[DifferentialD]x` is the differential the calculus notation `ⅆarea == 2 π r ⅆr`
+// is written with: a prefix operator binding to the next factor, so `2 π r ⅆr`
+// is `2 π r DifferentialD[r]`. The FrontEnd stores the character in the private
+// use area (U+F74C); the public code point (U+2146) is a Unicode *letter*, so
+// the prefix has to be tried before `Identifier` or `ⅆarea` reads as one name.
+DifferentialOp = { "\\[DifferentialD]" | "\u{2146}" | "\u{F74C}" }
+DifferentialPrefix = { DifferentialOp ~ SimpleTerm ~ PartIndexSuffix? ~ ImplicitPowerSuffix? }
+// `\[Piecewise]{{v1,c1},{v2,c2},…}` is the special-character input form for
+// `Piecewise[{{v1,c1},{v2,c2},…}]` — the notation front ends use for the
+// piecewise brace notebooks reconstruct from a `GridBox`. It binds like a
+// prefix function application to the following factor (normally a list).
+PiecewiseOp = { "\\[Piecewise]" }
+PiecewisePrefix = { PiecewiseOp ~ SimpleTerm }
+PrefixApplySimple = { (FunctionCall | Identifier) ~ "@" ~ SimpleTerm }
+SimpleTerm = _{
+  // Increment/Decrement come first so a postfix `++` binds to its operand
+  // before the operand is taken on its own: `2 a++` is `2 (a++)`, and
+  // `1++2` is `Increment[1] 2`.
+    Increment
+  | Decrement
+  | RadicalPrefix
+  | DifferentialPrefix
+  | PiecewisePrefix
+  | FloorBrackets
+  | CeilingBrackets
+  | UnsignedNumericValue
+  | PrefixApplySimple
+  | FunctionCall
+  | DerivativeIdentifier
+  | NamedCharIdentifier
+  | PatternTest | PatternOptionalNamedBlank | PatternOptionalWithHead | PatternOptionalSimple | PatternOptionalAnonBlank | PatternOptionalDefaultSimple | PatternWithHead | PatternSimple | PatternNamed
+  | Identifier
+  | SlotSequence
+  | SlotCall
+  | Slot
+  | OutShortcut
+  | List
+  | StringCall
+  | String
+  | &BalancedParens ~ "(" ~ Expression ~ ")"
+}
+
+// TermNoImplicit is like Term but without ImplicitTimes - used for function bodies
+// to prevent greedy matching across statement boundaries
+TermNoImplicit = _{
+    FunctionCallExtended
+  | ImplicitTimes
+  | PiecewisePrefix
+  | FloorBrackets
+  | CeilingBrackets
+  | Unset
+  | ApplyToOp
+  | AddTo
+  | SubtractFrom
+  | TimesBy
+  | DivideBy
+  | Increment
+  | Decrement
+  | PartExtract
+  | Constant
+  | StringCall
+  | String
+  | ListExtended
+  | DerivativeNumeric
+  | NumericCall
+  | NumericValue
+  | PreIncrement
+  | PreDecrement
+  | PatternTest | PatternOptionalNamedBlank | PatternOptionalWithHead | PatternOptionalSimple | PatternOptionalAnonBlank | PatternOptionalDefaultSimple | PatternWithHead | PatternSimple | PatternNamed
+  | DerivativeIdentifier
+  | NamedCharIdentifier
+  | Identifier
+  | SlotSequence
+  | Slot
+  | OutShortcut
+  | AssociationExtended
+  | Association
+  | ParenExtended
+  | &BalancedParens ~ "(" ~ (&HasSemicolon ~ CompoundExpression | Expression) ~ ")"
+}
+
+// ExpressionNoImplicit is like Expression but uses TermNoImplicit
+ExpressionNoImplicit = {
+    SpanOrExprOperandNoImplicit ~ (UnsetSuffix | (Operator | TildeInfix) ~ SpanOrExprOperandNoImplicit | SpanNoRhsSep)*
+    ~ (ReplaceRepeatedSuffix | ReplaceAllSuffix)*
+    ~ ("//" ~ PostfixFunction)*
+    ~ (AnonymousFunctionSuffix ~ (ReplaceRepeatedSuffix | ReplaceAllSuffix)* ~ ((Operator | TildeInfix) ~ SpanOrExprOperandNoImplicit)*  ~ ("//" ~ PostfixFunction)*)?
+}
+
+// Pattern: x_ or x_Head or x_?test or x_ /; condition or x_:default or x_Head:default
+// PatternTest: x_?test or _?test or _?(expr) or x_?(expr)
+// Plus general bare-infix form (no pattern blanks): a?b → PatternTest[a, b];
+// a?b[c] uses a trailing BracketArgs* so it parses as PatternTest[a, b][c]
+// rather than PatternTest[a, b[c]].
+// The test can be an Identifier or a parenthesized expression (e.g. anonymous function)
+PatternTestFunc = _{ Identifier | &BalancedParens ~ "(" ~ (&HasSemicolon ~ CompoundExpression | Expression) ~ ")" }
+PatternTest = {
+    PatternName? ~ PatternBlanks ~ PatternTestHead? ~ "?" ~ PatternTestFunc
+  | PatternTestLhsParen ~ "?" ~ !"?" ~ PatternTestFunc ~ BracketArgs*
+  | PatternTestLhsBare ~ "?" ~ !"?" ~ PatternTestFunc ~ BracketArgs*
+}
+// Every other left side — a function call (`Except[0]?NumericQ`), a list
+// (`{_, _}?VectorQ`), a literal (`"a"?StringQ`) or a bracketed expression
+// (`(1 | 2)?EvenQ`) — is picked up as a suffix on the term that precedes it,
+// so `?` needs no left-side rule of its own and an ordinary term is never
+// parsed twice looking for one. The `BracketArgs*` keeps `?` binding before a
+// trailing `[…]`, exactly as in the bare-infix branch above.
+PatternTestSuffix = { "?" ~ !"?" ~ PatternTestFunc ~ BracketArgs* }
+// A parenthesized left side — `(r_)?Positive` is the same pattern as
+// `r_?Positive`, and a Demonstration writes its argument tests that way.
+// Only a *pattern* may be bracketed here: letting it be any expression
+// makes every parenthesized group try this branch, and a deeply nested one
+// then runs the parser out of its call budget. `(1 | 2)?EvenQ` and friends
+// go through `PatternTestSuffix` instead.
+PatternTestLhsParen = { "(" ~ (PatternWithHead | PatternSimple) ~ ")" }
+// LHS for the bare-infix form: an Identifier that does NOT end with an
+// underscore — `!"_"` after Identifier ensures the pattern branch above
+// keeps ownership of cases like `x_?test`.
+PatternTestLhsBare = @{ Identifier ~ !"_" }
+PatternTestHead = { !("_") ~ Identifier }
+// ConditionExpr is like Expression but stops before -> and :> (rule operators)
+// This prevents the condition from consuming the replacement part of a rule
+// `ConditionExpr`'s operand: as `ExprOperand`, without the `..`/`...` suffixes.
+CondOperand = _{ LeadingNot ~ Term ~ FactorialSuffix? ~ TermSuffix* | LeadingMinus ~ Term ~ FactorialSuffix? ~ TermSuffix* | Term ~ FactorialSuffix? ~ TermSuffix* }
+SpanOrCondOperand = _{ SpanNoLhsSep ~ CondOperand | SpanNoOperandSep | CondOperand }
+ConditionExpr = {
+    SpanOrCondOperand ~ ((ConditionOp | TildeInfix) ~ SpanOrCondOperand | SpanNoRhsSep)*
+}
+// Operators allowed in conditions - excludes -> and :> which mark rule boundaries
+// Atomic so that WHITESPACE/COMMENT tokens are not consumed within the operator span.
+ConditionOp = @{
+    "\\[NotElement]" | "\u{2209}"       // Named character operator: NotElement (∉)
+  | "\\[ReverseElement]" | "\u{220B}"   // Named character operator: ReverseElement (∋)
+  | "\\[Element]" | "\u{2208}"          // Named character operator: Element (∈)
+  | "\\[Distributed]" | "\u{F3D2}"      // Named character operator: Distributed
+  | "\\[Cross]" | "\u{F4A0}" | "\u{F3C4}" | "\u{2A2F}" // Cross product (⨯)
+  | "\\[Cap]" | "\u{2322}"        // Cap (⌢)
+  | "\\[Cup]" | "\u{2323}"        // Cup (⌣)
+  | "\\[DoubleRightTee]" | "\u{22A8}" // DoubleRightTee (⊨)
+  | "\\[RightTee]" | "\u{22A2}"   // RightTee (⊢)
+  | "\\[DoubleLeftTee]" | "\u{2AE4}" // DoubleLeftTee (⫤)
+  | "\\[LeftTee]" | "\u{22A3}"    // LeftTee (⊣)
+  | "::" ~ !":"                   // MessageName: `a :> f::tag` is a rule
+                                  // whose replacement is `MessageName[f, "tag"]`,
+                                  // since `::` binds tighter than everything here
+  | "===" | "=!=" | "==" | "\u{2A75}" | "\\[Equal]" | "\u{F431}" | "!=" | "\u{2260}" | "\\[NotEqual]"  // Comparison, ⩵, ≠
+  | "<->"                         // TwoWayRule (must be before <>, <=, <)
+  | "<>"                          // StringJoin (must be before < to avoid partial match)
+  | "<=" | "\u{2264}" | "\u{2A7D}" | "\\[LessEqual]" | ">=" | "\u{2265}" | "\u{2A7E}" | "\\[GreaterEqual]" | "<" | ">"       // Order comparison, ≤, ≥, ⩽, ⩾
+  | ";;"                          // Span
+  | "/@"                          // Map (must be before the bare "/" of Arithmetic)
+  | "@@@"                         // MapApply (must be before @@)
+  | "@@"                          // Apply (must be before @)
+  | "@"                           // Prefix application
+  | "+" | "-" | "*" | "/" | "^"   // Arithmetic
+  | "&&" | "||"                   // Logical
+  | "|"                           // Alternatives
+  | "~~"                          // StringExpression
+  | "." ~ !ASCII_DIGIT ~ !"."    // Dot operator
+}
+PatternCondition = { PatternName ~ "_" ~ "/;" ~ ConditionExpr }
+// PatternOptional: x_ : default or x_Head : default (Optional pattern with default value)
+// Note: Wolfram uses both "x_:val" and "x_ : val" syntax. The colon must NOT be ":=" (SetDelayed)
+PatternOptionalWithHead = { PatternName ~ "_" ~ Identifier ~ ":" ~ !("=" | ">") ~ Term }
+PatternOptionalSimple = { PatternName ~ "_" ~ ":" ~ !("=" | ">") ~ Term }
+// PatternOptionalAnonBlank: `_:default` — anonymous Optional[Blank[], default]
+// (no name binding). Distinct from PatternOptionalSimple, which requires a
+// PatternName before the `_`.
+PatternOptionalAnonBlank = { "_" ~ !("_" | "?") ~ ":" ~ !("=" | ">" | ":") ~ Term }
+// PatternOptionalNamedBlank: `a:_:b` — an alternative form of `a_:b`
+// where the name binding and the blank are separated by a colon. Wolfram
+// parses both forms identically (`Optional[Pattern[a, Blank[]], b]`).
+// Must be tried before `PatternSimple`/`ColonSequence` so the full triple
+// `name : _ : default` is captured as one pattern.
+PatternOptionalNamedBlank = { PatternName ~ ":" ~ "_" ~ !("_" | "?") ~ Identifier? ~ ":" ~ !("=" | ">") ~ Term }
+// PatternOptionalDefault: x_. or _. (Optional pattern with system-determined default)
+// The dot must not be followed by a digit (decimal) or another dot (.. or ...)
+// Note: x_Head. and _Head. are NOT valid in Wolfram Language (syntax error)
+// Compound-atomic (`$`): the name, the blanks and the head must be adjacent.
+// `m_ g` is `Times[m_, g]`, not `m_g`, and `a_ x_` is a product of two
+// patterns — implicit whitespace between the pieces would glue them together.
+PatternOptionalDefaultSimple = ${ PatternName? ~ "_" ~ "." ~ !ASCII_DIGIT ~ !"." }
+// PatternBlanks: silent atomic rule matching 1-3 underscores (Blank, BlankSequence, BlankNullSequence)
+PatternBlanks = _{ "___" | "__" | "_" }
+PatternWithHead = ${ PatternName? ~ PatternBlanks ~ !("_") ~ Identifier }
+PatternSimple = ${ PatternName? ~ PatternBlanks ~ !("_" | "?" | ".") }
+// PatternNamed: `name : body` is `Pattern[name, body]` — a named pattern
+// where the body is any expression the pattern should match. Distinct
+// from `name_:default` (Optional with default) and `name::tag`
+// (MessageName); the negative lookaheads keep those forms intact.
+// A `: default` may follow, making the whole thing an `Optional`:
+// `parent : _Symbol?UTypeQ : UObject` is a tested slot that may be left out.
+// Without this the default is stranded after the `?test` suffix, since the
+// chained-colon reading below only works when nothing sits between them.
+PatternNamedDefault = { ":" ~ !("=" | ">" | ":") ~ Term }
+PatternNamed = { PatternName ~ ":" ~ !("=" | ">" | ":") ~ Term ~ PatternTestSuffix? ~ (RepeatedNullSuffix | RepeatedSuffix)? ~ PatternNamedDefault? }
+Pattern = { PatternCondition | PatternTest | PatternOptionalNamedBlank | PatternOptionalWithHead | PatternOptionalSimple | PatternOptionalAnonBlank | PatternOptionalDefaultSimple | PatternWithHead | PatternSimple }
+
+// Replacement rule: pattern -> replacement or pattern :> replacement (RuleDelayed)
+// The LHS is a ConditionExpr (expression that stops before -> and :>) with an optional /; condition.
+// Patterns (x_, x_Head, etc.) can appear as terms within the LHS expression.
+// The replacement side recurses so rule chains parse right-associatively:
+// a -> b -> c is Rule[a, Rule[b, c]] (matching wolframscript).
+// Either side may be a Span (`"--" -> 3 ;;` is Rule["--", Span[3, All]]):
+// `;;` is one of `ConditionExpr`'s own operators and binds tighter than the
+// rule operator.
+RuleOperand = _{ ConditionExpr }
+// The replacement may carry its own conditions: `a :> b /; c` is
+// `RuleDelayed[a, Condition[b, c]]`, since `/;` binds tighter than the arrow.
+ReplacementRule = { RuleOperand ~ ("/;" ~ ConditionExpr)? ~ ("->" | "\u{2192}" | ":>") ~ (ReplacementRule | RuleOperand ~ ("/;" ~ ConditionExpr)*) }
+
+// Replacement expressions: expr /. rule or expr //. rule
+ReplaceAllExpr = { Term ~ "/." ~ (&HasRuleOperator ~ ReplacementRule | List | ConditionExpr) }
+ReplaceRepeatedExpr = { Term ~ "//." ~ (&HasRuleOperator ~ ReplacementRule | List | ConditionExpr) }
+
+// An element or argument may be left out: `{a,,b}` is `{a, Null, b}` and
+// `f[a,,b]` is `f[a, Null, b]`. Both rules match nothing, and the
+// lookahead is what keeps them from doing so anywhere but at an item
+// boundary next to a comma — `{}` is the empty list, not `{Null}`. Only
+// the item *after* a comma may run up against the closing bracket
+// (`{a,}` is `{a, Null}`), so that case is a separate rule, used only
+// inside the repetition. The real item is always tried first, so an
+// ordinary call parses its arguments exactly once.
+OmittedArg = { &"," }
+OmittedTrailingArg = { &("}" | "]") }
+ListItemOrOmitted = _{ ListItem | OmittedArg }
+ListItemOrOmittedLast = _{ ListItem | OmittedArg | OmittedTrailingArg }
+List = { &BalancedBraces ~ "{" ~ (ListItemOrOmitted ~ ("," ~ ListItemOrOmittedLast)*)? ~ "}" }
+// ListItem can be a ReplacementRule (with optional & suffix) or an Expression
+// ReplacementRule must be tried first because x_ -> y looks like Expression x_ followed by -> operator
+// RuleAnonymousFunction is merged with ReplacementRule to avoid parsing content twice.
+// HasRuleOperator is a zero-width lookahead that scans for -> or :> at the current
+// nesting depth. This avoids exponential backtracking for deeply nested lists by
+// skipping the ReplacementRule attempt when no rule operator exists.
+RuleAnonSuffix = { "&" ~ !"&" }
+// After a trailing `&` turns the rule into a pure function, that function
+// can itself take a further operator — `pat -> repl & /@ list` (Map over
+// the rule-producing function) is the common idiom for building PopupMenu
+// choices from a lookup table. `RuleReplaceSuffix*` before the optional `&`
+// lets `/.`/`//.` apply to the bare rule *first* and be absorbed into the
+// function body — `pat -> repl /. rules &` (as opposed to `pat -> repl & /.
+// rules`, applied to the function value, handled by the suffixes after
+// RuleAnonSuffix below) — mirroring how a plain Expression orders its own
+// ReplaceAll suffixes before its AnonymousFunctionSuffix.
+ListItemRule = { ReplacementRule ~ RuleReplaceSuffix* ~ ("//" ~ PostfixFunction)* ~ (RuleAnonSuffix ~ ((ReplaceRepeatedSuffix | ReplaceAllSuffix) | (Operator | TildeInfix) ~ RuleOperatorTerm)* ~ ("//" ~ PostfixFunction)*)? }
+// `/.` and `//.` bind looser than `->`, so a rule written as an argument may
+// itself be replaced in: `f[a -> 5 /. 5 -> 6]` is `f[(a -> 5) /. (5 -> 6)]`.
+RuleReplaceSuffix = { ("//." | "/.") ~ (&HasRuleOperator ~ ReplacementRule | List | ConditionExpr) }
+// Comments must be skipped explicitly by the balanced scans below.  They are
+// reachable from atomic rules (`HasSemicolon`), where pest disables the
+// implicit COMMENT rule, so a comment holding an unbalanced bracket, quote or
+// semicolon — e.g. `f[a (* end of For[ *); b]` — would otherwise derail the
+// scan and make the whole expression unparseable.  Listed first in every
+// alternation so `(*` is never mistaken for a parenthesis group.
+ScanComment = @{ "(*" ~ (ScanComment | (!"(*" ~ !"*)" ~ ANY))* ~ "*)" }
+// String literals must be skipped by the balanced scans for the same reason:
+// a quoted `"]"` or `"(*"` is data, not structure.  The escape branch matters
+// because `"\""` is a two-character escape whose second character would
+// otherwise close the literal early and leave the rest of the scan reading
+// code as string content.
+ScanString = @{ "\"" ~ ("\\" ~ ANY | !"\"" ~ ANY)* ~ "\"" }
+// The Term chain used after an infix Operator: an optional leading sign,
+// a Term, then the usual postfix suffixes. Shared by ListItemRule and
+// FunctionArgRule below so `(pattern -> replacement) &` can chain a
+// further operator (`/@`, `@@`, …), matching how a plain Expression
+// continues after its own trailing `&`.
+RuleOperatorTerm = _{
+    LeadingNot ~ Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)?
+  | LeadingPlus ~ Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)?
+  | LeadingMinus ~ Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)?
+  | Term ~ FactorialSuffix? ~ TermSuffix* ~ (RepeatedNullSuffix | RepeatedSuffix)?
+}
+// Scan forward looking for -> or :> at the current nesting depth
+NestedContent = _{ (
+    ScanComment
+  | BalancedAssociation
+  | BalancedBraces
+  | BalancedBrackets
+  | BalancedParens
+  // The Unicode part brackets group the way `[[…]]` does, so the commas
+  // and semicolons inside them are skipped with them.
+  | "\u{27E6}" ~ NestedContent ~ "\u{27E7}"
+  | "\u{301A}" ~ NestedContent ~ "\u{301B}"
+  | ScanString
+  | !("<|" | "|>" | "{" | "}" | "[" | "]" | "(" | ")" | "\u{27E6}" | "\u{27E7}" | "\u{301A}" | "\u{301B}" | "\"") ~ ANY
+)* }
+// A whole balanced group, as a zero-width, linear scan.  Used as a positive
+// guard in front of every rule that parses a group's contents: a PEG has no
+// way to remember that the group turned out to be unclosed, so without the
+// guard each enclosing alternative parses the same contents again and the cost
+// of rejecting an unclosed group grows exponentially with the nesting depth.
+BalancedAssociation = _{ "<|" ~ NestedContent ~ "|>" }
+BalancedBraces      = _{ "{" ~ NestedContent ~ "}" }
+BalancedBrackets    = _{ "[" ~ NestedContent ~ "]" }
+BalancedParens      = _{ "(" ~ NestedContent ~ ")" }
+HasRuleOperator = _{ (
+    ScanComment
+  | BalancedAssociation
+  | BalancedBraces
+  | BalancedBrackets
+  | BalancedParens
+  | "\u{27E6}" ~ NestedContent ~ "\u{27E7}"
+  | "\u{301A}" ~ NestedContent ~ "\u{301B}"
+  | ScanString
+  | "<->"                       // skip TwoWayRule (don't match its "->" substring as a rule operator)
+  | !("->" | "\u{2192}" | ":>" | "<|" | "|>" | "}" | "," | "]" | ")" | "\u{27E7}" | "\u{301B}" | "\"") ~ ANY
+)* ~ ("->" | "\u{2192}" | ":>") }
+// Scan forward looking for ; (compound separator, not ;;) at the current nesting depth.
+// Used as a zero-width lookahead to avoid expensive CompoundExpression backtracking.
+HasSemicolon = @{ (
+    ScanComment
+  | ";;" ~ !(";" | "=")         // skip ;; span separators
+  | BalancedAssociation
+  | BalancedBraces
+  | BalancedBrackets
+  | BalancedParens
+  | "\u{27E6}" ~ NestedContent ~ "\u{27E7}"
+  | "\u{301A}" ~ NestedContent ~ "\u{301B}"
+  | ScanString
+  | !(";" | "<|" | "|>" | "}" | "," | "]" | ")" | "\u{27E7}" | "\u{301B}" | "\"") ~ ANY
+)* ~ ";" ~ !";" }
+ListItem = _{ &HasRuleOperator ~ ListItemRule | &HasSemicolon ~ CompoundExpression | Expression }
+
+AssociationItem = { RuleOperand ~ ("->" | "\u{2192}" | ":>") ~ RuleOperand }
+// Non-rule items inside <|...|> are rare but legal — Wolfram parses <|a, b|>
+// as Association[a, b] and AssociationQ returns False.
+AssociationNonRuleItem = { Expression }
+AssociationElement     = _{ AssociationItem | AssociationNonRuleItem }
+Association     = { &BalancedAssociation ~ "<|" ~ ( AssociationElement ~ ("," ~ AssociationElement)* )? ~ "|>" }
+// AssociationExtended handles bracket access on association literals:
+//   <|...|>["key"]      — key lookup (CurriedCall)
+//   <|...|>[["key"]]    — Part extraction
+// Guarded like `ParenExtended`: both suffixes start with `[`, so the balanced
+// scan avoids parsing a plain `<|...|>` twice.
+AssociationCallSuffix = { BracketArgs+ }
+AssociationExtended = {
+    &(BalancedAssociation ~ (PartOpen | "["))
+    ~ Association ~ (PartIndexSuffix | AssociationCallSuffix)
+}
+
+// Function calls (supports chained calls like f[x][y])
+// Simplified: Just use Expression for most args - patterns and compound expressions via Expression's Term
+// FunctionArg: ReplacementRule (with optional & suffix), CompoundExpression, or Expression
+// Merged RuleAnonymousFunction with ReplacementRule to reduce backtracking.
+// Uses HasRuleOperator lookahead to skip rule parsing when no rule operator exists.
+// A rule may be handed to a postfix function: `f[a -> 5 // Head]` is
+// `f[Head[a -> 5]]`, since `//` binds looser than `->`.
+// See ListItemRule's comment: RuleAnonSuffix gates the extra Operator
+// continuation so `pat -> repl & /@ list` parses as an argument too, and
+// RuleReplaceSuffix* before it lets `pat -> repl /. rules &` absorb the
+// `/.` into the function body instead.
+FunctionArgRule = { ReplacementRule ~ RuleReplaceSuffix* ~ ("//" ~ PostfixFunction)* ~ (RuleAnonSuffix ~ ((ReplaceRepeatedSuffix | ReplaceAllSuffix) | (Operator | TildeInfix) ~ RuleOperatorTerm)* ~ ("//" ~ PostfixFunction)*)? }
+FunctionArg = _{ &HasRuleOperator ~ FunctionArgRule | &HasSemicolon ~ CompoundExpression | Expression }
+// BracketArgs groups arguments within a single bracket pair, allowing proper chained call parsing
+FunctionArgOrOmitted = _{ FunctionArg | OmittedArg }
+FunctionArgOrOmittedLast = _{ FunctionArg | OmittedArg | OmittedTrailingArg }
+// A closing `]` is a precondition for this rule, and finding it costs a linear
+// scan, while parsing the arguments to discover the same thing costs an
+// exponential one: `Term` reaches a function call through three alternatives
+// (`FunctionCallExtended`, and `ImplicitTimes` twice — via `PrefixApplySimple`
+// and `FunctionCall`), so an unclosed `f[g[h[…` used to parse its contents 3^n
+// times before failing.  A truncated 4 KB script took 0.6 s to reject (a fuzz
+// finding); with the guard it is rejected on the first scan.  `NestedContent`
+// skips strings and comments, so a `"]"` or a `(* ] *)` inside the group does
+// not count as the closer.
+BracketArgs = { &BalancedBrackets ~ "[" ~ (FunctionArgOrOmitted ~ ("," ~ FunctionArgOrOmittedLast)*)? ~ "]" }
+// A trailing prime may itself be applied to further bracket args, same as
+// FunctionCallExtended: `x[i]''[t]` -> `Derivative[2][x[i]][t]`. This matters
+// inside implicit multiplication (`m x[i]''[t]`), where SimpleTerm uses this
+// rule rather than FunctionCallExtended.
+FunctionCall = { (Identifier | NamedCharIdentifier | SimpleAnonymousFunction) ~ DerivativePrime? ~ BracketArgs+ ~ (DerivativePrime ~ BracketArgs*)? }
+
+// FunctionDefinition supports multiple pattern arguments: f[a_, b_] := ...
+// `PatternOptionalNamedBlank` (`x:_:v`) and `PatternOptionalAnonBlank`
+// (`_:v`) are deliberately absent: `store_function_definition` has no
+// reader for them, so listing them here let the parameter be swallowed
+// (`f[x:_:2] := x^2` filed as `f[] := x^2`). Leaving them out makes the
+// definition fall through to the general `Expression` path, which builds
+// the same `Optional[…]` pattern the `Hold`ed form does.
+FunctionDefinitionPattern = _{ PatternCondition | PatternTest | PatternOptionalWithHead | PatternOptionalSimple | PatternOptionalDefaultSimple | PatternWithHead | PatternSimple }
+// Body is a simple ExpressionNoImplicit (we removed CompoundExpression option to prevent
+// greedy parsing of subsequent statements as part of the function body)
+// Compound expressions in function bodies should use explicit parentheses: f[x_] := (a; b)
+FunctionDefinition = { Identifier ~ "[" ~ (FunctionDefinitionPattern ~ ("," ~ FunctionDefinitionPattern)*)? ~ "]" ~ ":=" ~ ExpressionNoImplicit }
+
+// TagSetDelayed: tag /: f[patterns...] := body — stores an upvalue for tag
+// TagSet: tag /: f[patterns...] = body — stores an evaluated upvalue for tag
+// TagUnset: tag /: f[patterns...] =. — removes an upvalue for tag
+TagSetDelayed = { Identifier ~ "/:" ~ BaseFunctionCall ~ ":=" ~ ExpressionNoImplicit }
+TagSet = { Identifier ~ "/:" ~ BaseFunctionCall ~ "=" ~ !("." | "=" | "!") ~ ExpressionNoImplicit }
+TagUnset = { Identifier ~ "/:" ~ BaseFunctionCall ~ "=." }
+
+// A bare `;;` / `a;;b` / `;;4` / `a;;b;;c` statement needs no rule of its
+// own: `;;` is an operator of `Expression`, and `//` sits at the end of that
+// rule, so `1;;4 // FullForm` is `FullForm[Span[1, 4]]` without any hoisting.
+Statement = _{ TagSetDelayed | TagUnset | TagSet | FunctionDefinition | Expression }
+
+// StatementSeparator can be a semicolon (traditional) or empty (relying on whitespace/newlines)
+// Atomic so the `!";"` lookahead checks the *immediate* next character.
+// Without atomic mode, pest skips WHITESPACE before evaluating `!";"`, which
+// would (wrongly) reject `; ;;3` because the next non-whitespace char is `;`.
+//
+// Several semicolons in a row with only space or a comment between them
+// (`c = 4; (* c = 6 *); c`) separate the same two statements: what stands
+// between them is the empty statement `Null`, which has no value and no
+// effect. They are taken together here rather than left to produce a
+// statement that is not there. `;;` stays untouched — that is a `Span`.
+StatementSeparator = @{ (";" ~ !";" ~ ((WHITESPACE | COMMENT)+ ~ ";" ~ !";")*)? }
+
+// TrailingSemicolon marks that the last statement ends with ; (suppresses output)
+TrailingSemicolon = @{ ";" ~ !";" }
+
+Program = { SOI ~ (Statement ~ (StatementSeparator ~ Statement)* ~ TrailingSemicolon?)? ~ EOI }

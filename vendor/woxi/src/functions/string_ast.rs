@@ -1,0 +1,16849 @@
+//! AST-native string functions.
+//!
+//! These functions work directly with `Expr` AST nodes, avoiding string round-trips.
+
+use super::*;
+use crate::functions::regex_engine::{
+  Captures, Error as RegexError, WoxiRegex,
+};
+use crate::syntax::pair_to_expr;
+use num_bigint::Sign;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+  // Compiled-regex cache so tight loops calling `StringCases` /
+  // `StringSplit` / `StringReplace` etc. with the same pattern don't pay
+  // regex compilation cost on every iteration. `WoxiRegex` clones are
+  // cheap (the compiled state is Arc'd internally) so the cache value type
+  // is just the compiled regex. Capped to bound memory; on overflow we drop the
+  // entire cache rather than maintain an LRU — the workloads we care
+  // about reuse a handful of patterns at a time.
+  static REGEX_CACHE: RefCell<HashMap<String, WoxiRegex>> =
+    RefCell::new(HashMap::new());
+}
+
+/// Return a compiled regex for `pat`, reusing a cached copy when one
+/// exists. Identical pattern strings always produce identical compiled
+/// regexes, so caching is observationally indistinguishable from
+/// recompiling — only faster.
+fn compile_regex(pat: &str) -> Result<WoxiRegex, RegexError> {
+  REGEX_CACHE.with(|c| {
+    if let Some(re) = c.borrow().get(pat) {
+      return Ok(re.clone());
+    }
+    let re = WoxiRegex::new(&relax_redundant_escapes(pat))?;
+    let mut cache = c.borrow_mut();
+    if cache.len() >= 256 {
+      cache.clear();
+    }
+    cache.insert(pat.to_string(), re.clone());
+    Ok(re)
+  })
+}
+
+/// Drop backslashes that escape a character needing no escape.
+///
+/// The Wolfram Language's `RegularExpression` is PCRE, where a backslash
+/// before any non-word character simply means that character — `\<`, `\!`
+/// and `\-` are all just themselves, and real-world patterns escape
+/// liberally (`"\\<\\!\\-\\-([^\\!|\\<|\\>]*)\\>"` for an HTML comment).
+/// Rust's regex crate rejects those escapes instead, so strip the backslash
+/// where it carries no meaning and keep it where it does: before an
+/// alphanumeric (`\d`, `\b`, `\Q`) or a genuine metacharacter.
+fn relax_redundant_escapes(pat: &str) -> String {
+  const MEANINGFUL: &str = "\\.^$*+?()[]{}|-";
+  let mut out = String::with_capacity(pat.len());
+  let mut chars = pat.chars();
+  while let Some(ch) = chars.next() {
+    if ch != '\\' {
+      out.push(ch);
+      continue;
+    }
+    match chars.next() {
+      None => out.push(ch),
+      Some(next)
+        if next.is_ascii_alphanumeric()
+          || next == '_'
+          || MEANINGFUL.contains(next) =>
+      {
+        out.push(ch);
+        out.push(next);
+      }
+      // A backslash before anything else is redundant in PCRE; Rust's
+      // regex would reject it, so pass the character through alone.
+      Some(next) => out.push(next),
+    }
+  }
+  out
+}
+
+/// Helper to extract a string from an Expr
+fn expr_to_str(expr: &Expr) -> std::string::String {
+  match expr {
+    Expr::String(s) => s.clone(),
+    Expr::Identifier(s) => s.clone(),
+    Expr::Integer(n) => n.to_string(),
+    Expr::BigInteger(n) => n.to_string(),
+    Expr::Real(f) => crate::syntax::format_real(*f),
+    _ => {
+      // Try to get string representation
+      let s = expr_to_string(expr);
+      // If it's a quoted string, strip the quotes
+      if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        s[1..s.len() - 1].to_string()
+      } else {
+        s
+      }
+    }
+  }
+}
+
+/// Helper to get integer from Expr
+fn expr_to_int(expr: &Expr) -> Result<i128, InterpreterError> {
+  match expr {
+    Expr::Integer(n) => Ok(*n),
+    Expr::BigInteger(n) => {
+      use num_traits::ToPrimitive;
+      n.to_i128().ok_or_else(|| {
+        InterpreterError::EvaluationError(
+          "Integer too large for this operation".into(),
+        )
+      })
+    }
+    Expr::Real(f) if f.fract() == 0.0 => Ok(*f as i128),
+    _ => Err(InterpreterError::EvaluationError(
+      "Expected integer argument".into(),
+    )),
+  }
+}
+
+/// StringLength[s] - returns the length of a string
+pub fn string_length_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "StringLength expects exactly 1 argument".into(),
+    ));
+  }
+  // StringLength threads over lists of strings.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|e| string_length_ast(std::slice::from_ref(e)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  if let Expr::String(s) = &args[0] {
+    return Ok(Expr::Integer(s.chars().count() as i128));
+  }
+  // Non-string argument: emit message and return unevaluated (matches wolframscript).
+  crate::emit_message(&format!(
+    "StringLength::string: String expected at position 1 in {}.",
+    expr_to_string(&unevaluated("StringLength", args))
+  ));
+  Ok(unevaluated("StringLength", args))
+}
+
+/// StringTake[s, n] - first n chars; StringTake[s, -n] - last n chars;
+/// StringTake[s, {m, n}] - chars m through n; StringTake[s, {n}] - nth char
+/// Emit StringTake::take / StringDrop::drop for an invalid position range.
+fn string_take_drop_message(fname: &str, from: i128, to: i128, s: &str) {
+  let (tag, verb) = if fname == "StringTake" {
+    ("take", "take")
+  } else {
+    ("drop", "drop")
+  };
+  crate::emit_message(&format!(
+    "{fname}::{tag}: Cannot {verb} positions {from} through {to} in \"{s}\"."
+  ));
+}
+
+/// Emit the `<fname>::seqs: Sequence specification … expected at position 2`
+/// message, rendering the call in OutputForm.
+fn emit_seqs(fname: &str, args: &[Expr]) {
+  crate::emit_message(&format!(
+    "{}::seqs: Sequence specification (+n, -n, {{+n}}, {{-n}}, {{m, n}} or \
+     {{m, n, s}}) expected at position 2 in {}.",
+    fname,
+    crate::syntax::format_expr(
+      &unevaluated(fname, args),
+      crate::syntax::ExprForm::Output
+    )
+  ));
+}
+
+fn emit_ambgsntx(fname: &str) {
+  crate::emit_message(&format!(
+    "{fname}::ambgsntx: Warning: interpreting list of integers as a list of \
+     sequence specifications."
+  ));
+}
+
+/// True for a specification that cannot be a span at all: four or more
+/// entries, every one an integer.
+fn is_ambiguous_int_list(spec: &Expr) -> bool {
+  matches!(spec, Expr::List(elems)
+  if elems.len() >= 4
+    && elems.iter().all(|e| {
+      crate::functions::list_helpers_ast::expr_to_i128(e).is_some()
+    }))
+}
+
+/// Re-read a list of integers as a list of independent sequence
+/// specifications: `StringTake[s, {n1, n2, …}]` is
+/// `{StringTake[s, n1], StringTake[s, n2], …}`. Each element keeps its own
+/// out-of-range reporting, so a bad one is left unevaluated in place.
+fn list_of_specs(
+  fname: &str,
+  subject: &Expr,
+  elems: &crate::expr_list::ExprList,
+  warn: bool,
+) -> Result<Expr, InterpreterError> {
+  if warn {
+    emit_ambgsntx(fname);
+  }
+  let results: Result<Vec<Expr>, InterpreterError> = elems
+    .iter()
+    .map(|e| string_take_drop(fname, &[subject.clone(), e.clone()]))
+    .collect();
+  Ok(Expr::List(results?.into()))
+}
+
+/// Emit the `<fname>::strse: A string or list of strings is expected at
+/// position 1 in <call>.` message, rendering the call in OutputForm.
+fn emit_strse(fname: &str, args: &[Expr]) {
+  crate::emit_message(&format!(
+    "{}::strse: A string or list of strings is expected at position 1 in {}.",
+    fname,
+    crate::syntax::format_expr(
+      &unevaluated(fname, args),
+      crate::syntax::ExprForm::Output
+    )
+  ));
+}
+
+/// Is `e` a valid string subject: a string, or a list whose elements are all
+/// strings? (An empty list counts as valid.)
+fn is_string_subject(e: &Expr) -> bool {
+  match e {
+    Expr::String(_) => true,
+    Expr::List(items) => items.iter().all(|i| matches!(i, Expr::String(_))),
+    _ => false,
+  }
+}
+
+/// What a `String*` function accepts as its first argument.
+enum StringSubject {
+  /// A string or a list of strings (the function threads over the list).
+  Threaded,
+  /// A single string only.
+  Single,
+  /// A list (of anything) — `StringRiffle`.
+  ListOfParts,
+}
+
+/// The first-argument requirement of `name` when called with `argc` arguments,
+/// for the functions that must refuse a non-string subject. `None` means the
+/// call is not one of those (an operator form, say) and is left alone.
+fn string_subject_kind(name: &str, argc: usize) -> Option<StringSubject> {
+  use StringSubject::{ListOfParts, Single, Threaded};
+  Some(match name {
+    "StringCases" | "StringCount" | "StringDelete" | "StringPadLeft"
+    | "StringPadRight" | "StringPart" | "StringPosition"
+    | "StringReplaceList"
+      if argc >= 2 =>
+    {
+      Threaded
+    }
+    "StringFreeQ" | "StringMatchQ" | "StringStartsQ" | "StringEndsQ"
+    | "StringContainsQ"
+      if (2..=3).contains(&argc) =>
+    {
+      Threaded
+    }
+    "StringInsert" if argc == 3 => Threaded,
+    "StringTakeDrop" if argc == 2 => Threaded,
+    "StringTrim" if (1..=2).contains(&argc) => Threaded,
+    "StringRotateLeft" | "StringRotateRight" if (1..=2).contains(&argc) => {
+      Single
+    }
+    "StringReplacePart" if argc == 3 => Single,
+    "StringPartition" if (2..=3).contains(&argc) => Single,
+    "StringRepeat" if argc >= 2 => Single,
+    "StringToByteArray" if argc == 1 => Single,
+    "StringRiffle" if argc >= 1 => ListOfParts,
+    _ => return None,
+  })
+}
+
+/// Refuse a first argument that is not a string subject, the way
+/// wolframscript does, instead of silently coercing it to its printed form
+/// (`StringDelete[foo, "a"]` must not return `"foo"`). Returns the
+/// unevaluated call after emitting the message, or `None` when the argument
+/// is acceptable.
+pub fn guard_string_subject(
+  name: &str,
+  args: &[Expr],
+) -> Option<Result<Expr, InterpreterError>> {
+  let kind = string_subject_kind(name, args.len())?;
+  let first = args.first()?;
+  let (ok, message) = match kind {
+    StringSubject::Threaded => (
+      is_string_subject(first),
+      "strse: A string or list of strings is expected at position 1",
+    ),
+    StringSubject::Single => (
+      matches!(first, Expr::String(_)),
+      "string: String expected at position 1",
+    ),
+    StringSubject::ListOfParts => (
+      matches!(first, Expr::List(_)),
+      "list: List expected at position 1",
+    ),
+  };
+  if ok {
+    return None;
+  }
+  crate::emit_message(&format!(
+    "{}::{} in {}.",
+    name,
+    message,
+    crate::syntax::format_expr(
+      &unevaluated(name, args),
+      crate::syntax::ExprForm::Output
+    )
+  ));
+  Some(Ok(unevaluated(name, args)))
+}
+
+/// Shared StringTake/StringDrop engine, mirroring the Take/Drop position
+/// conventions: scalar n / -n, {i}, {i, j}, {i, j, step}, All, None,
+/// UpTo[n]. The adjacent reversed range {i, i-1} is an empty take /
+/// no-op drop; anything further reversed or out of range emits the
+/// take/drop message and stays unevaluated, as do non-string arguments
+/// (::strse).
+fn string_take_drop(
+  fname: &str,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let unevaluated = || unevaluated(fname, args);
+  // Thread over a list of strings. The ambiguity warning belongs to the call
+  // as a whole, so it is emitted here and suppressed for the elements.
+  if let Expr::List(items) = &args[0] {
+    let ambiguous = fname == "StringTake" && is_ambiguous_int_list(&args[1]);
+    if ambiguous {
+      emit_ambgsntx(fname);
+    }
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let inner = [item.clone(), args[1].clone()];
+        if ambiguous {
+          let Expr::List(elems) = &args[1] else {
+            unreachable!("checked by is_ambiguous_int_list")
+          };
+          list_of_specs(fname, &inner[0], elems, false)
+        } else {
+          string_take_drop(fname, &inner)
+        }
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let Expr::String(s) = &args[0] else {
+    emit_strse(fname, args);
+    return Ok(unevaluated());
+  };
+  let chars: Vec<char> = s.chars().collect();
+  let len = chars.len() as i128;
+  let is_take = fname == "StringTake";
+  let take = |from: usize, to: usize, step: i128| -> Expr {
+    // 1-based inclusive positions, already validated
+    if is_take {
+      let mut out = String::new();
+      let mut i = from as i128;
+      while (step > 0 && i <= to as i128) || (step < 0 && i >= to as i128) {
+        out.push(chars[(i - 1) as usize]);
+        i += step;
+      }
+      Expr::String(out)
+    } else {
+      let mut keep: Vec<bool> = vec![true; chars.len()];
+      let mut i = from as i128;
+      while (step > 0 && i <= to as i128) || (step < 0 && i >= to as i128) {
+        keep[(i - 1) as usize] = false;
+        i += step;
+      }
+      Expr::String(
+        chars
+          .iter()
+          .zip(&keep)
+          .filter(|(_, k)| **k)
+          .map(|(c, _)| c)
+          .collect(),
+      )
+    }
+  };
+  let empty_or_all = |empty: bool| -> Expr {
+    if empty == is_take {
+      // empty take or full drop -> ""
+      Expr::String(String::new())
+    } else {
+      Expr::String(s.clone())
+    }
+  };
+
+  match &args[1] {
+    Expr::Identifier(name) if name == "All" => {
+      // take everything / drop everything
+      Ok(if is_take {
+        Expr::String(s.clone())
+      } else {
+        Expr::String(String::new())
+      })
+    }
+    Expr::Identifier(name) if name == "None" => {
+      // take nothing / drop nothing
+      Ok(if is_take {
+        Expr::String(String::new())
+      } else {
+        Expr::String(s.clone())
+      })
+    }
+    // A list of sub-specifications returns a list
+    Expr::List(elems) if elems.iter().any(|e| matches!(e, Expr::List(_))) => {
+      let results: Result<Vec<Expr>, InterpreterError> = elems
+        .iter()
+        .map(|e| string_take_drop(fname, &[args[0].clone(), e.clone()]))
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    // `{}` is an empty sequence specification: take nothing / drop nothing.
+    Expr::List(elems) if elems.is_empty() => Ok(empty_or_all(true)),
+    Expr::List(elems) if elems.len() == 1 => {
+      let Some(i) = crate::functions::list_helpers_ast::expr_to_i128(&elems[0])
+      else {
+        return Ok(unevaluated());
+      };
+      let real = if i > 0 { i } else { len + i + 1 };
+      if real >= 1 && real <= len {
+        Ok(take(real as usize, real as usize, 1))
+      } else {
+        string_take_drop_message(fname, i, i, s);
+        Ok(unevaluated())
+      }
+    }
+    Expr::List(elems) if elems.len() == 2 || elems.len() == 3 => {
+      let nums: Option<Vec<i128>> = elems
+        .iter()
+        .map(crate::functions::list_helpers_ast::expr_to_i128)
+        .collect();
+      let Some(nums) = nums else {
+        return Ok(unevaluated());
+      };
+      let (m, n) = (nums[0], nums[1]);
+      let step = if nums.len() == 3 { nums[2] } else { 1 };
+      // A zero step is not a usable span. `StringTake` then re-reads the list
+      // as a list of separate specifications; `StringDrop` refuses.
+      if step == 0 {
+        if is_take {
+          return list_of_specs(fname, &args[0], elems, false);
+        }
+        emit_seqs(fname, args);
+        return Ok(unevaluated());
+      }
+      let real_start = if m >= 0 { m } else { len + m + 1 };
+      let real_end = if n >= 0 { n } else { len + n + 1 };
+      if real_end == real_start - step {
+        return Ok(empty_or_all(true));
+      }
+      let in_range = real_start >= 1
+        && real_end >= 1
+        && real_start <= len
+        && real_end <= len;
+      let proper = (step > 0 && real_end >= real_start)
+        || (step < 0 && real_end <= real_start);
+      if in_range && proper {
+        Ok(take(real_start as usize, real_end as usize, step))
+      } else {
+        string_take_drop_message(fname, m, n, s);
+        Ok(unevaluated())
+      }
+    }
+    Expr::FunctionCall {
+      name: up_name,
+      args: up_args,
+    } if up_name == "UpTo" && up_args.len() == 1 => {
+      match crate::functions::list_helpers_ast::expr_to_i128(&up_args[0]) {
+        Some(k) if k >= 0 => {
+          let count = k.min(len);
+          if count == 0 {
+            Ok(empty_or_all(true))
+          } else {
+            Ok(take(1, count as usize, 1))
+          }
+        }
+        _ => Ok(unevaluated()),
+      }
+    }
+    // Four or more entries cannot be a span at all. `StringTake` reads them
+    // as separate specifications (warning that it is doing so); `StringDrop`
+    // refuses.
+    Expr::List(elems)
+      if elems.len() >= 4
+        && elems.iter().all(|e| {
+          crate::functions::list_helpers_ast::expr_to_i128(e).is_some()
+        }) =>
+    {
+      if is_take {
+        return list_of_specs(fname, &args[0], elems, true);
+      }
+      emit_seqs(fname, args);
+      Ok(unevaluated())
+    }
+    other => {
+      let Some(count) = crate::functions::list_helpers_ast::expr_to_i128(other)
+      else {
+        return Ok(unevaluated());
+      };
+      if count.unsigned_abs() > len.unsigned_abs() {
+        let (from, to) = if count >= 0 { (1, count) } else { (count, -1) };
+        string_take_drop_message(fname, from, to, s);
+        return Ok(unevaluated());
+      }
+      if count == 0 {
+        return Ok(empty_or_all(true));
+      }
+      if count > 0 {
+        Ok(take(1, count as usize, 1))
+      } else {
+        Ok(take((len + count + 1) as usize, len as usize, 1))
+      }
+    }
+  }
+}
+
+/// Convert a `Span[i, j]` / `Span[i, j, k]` spec into the equivalent list form
+/// `{i, j}` / `{i, j, k}` that StringTake/StringDrop already understand. A
+/// missing/`All` start becomes 1 and a missing/`All` end becomes -1. Returns
+/// None for non-Span or non-integer (symbolic) bounds.
+fn span_to_list_arg(span: &Expr) -> Option<Expr> {
+  let Expr::FunctionCall { name, args } = span else {
+    return None;
+  };
+  if name != "Span" || !(args.len() == 2 || args.len() == 3) {
+    return None;
+  }
+  let bound = |e: &Expr, all_default: i128| -> Option<Expr> {
+    match e {
+      Expr::Integer(_) => Some(e.clone()),
+      Expr::Identifier(s) if s == "All" => Some(Expr::Integer(all_default)),
+      _ => None,
+    }
+  };
+  let mut list = vec![bound(&args[0], 1)?, bound(&args[1], -1)?];
+  if args.len() == 3 {
+    match &args[2] {
+      Expr::Integer(_) => list.push(args[2].clone()),
+      _ => return None,
+    }
+  }
+  Some(Expr::List(list.into()))
+}
+
+pub fn string_take_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("StringTake", args));
+  }
+  // StringTake[s, i;;j] — a Span spec maps to the {i, j} list form.
+  if let Some(list) = span_to_list_arg(&args[1]) {
+    return string_take_drop("StringTake", &[args[0].clone(), list]);
+  }
+  string_take_drop("StringTake", args)
+}
+
+/// StringDrop[s, n] - drop first n chars; StringDrop[s, -n] - drop last n chars
+/// StringDrop[s, {n}] - drop nth character; StringDrop[s, {m, n}] - drop chars m through n
+pub fn string_drop_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("StringDrop", args));
+  }
+  // StringDrop[s, i;;j] — a Span spec maps to the {i, j} list form.
+  if let Some(list) = span_to_list_arg(&args[1]) {
+    return string_take_drop("StringDrop", &[args[0].clone(), list]);
+  }
+  string_take_drop("StringDrop", args)
+}
+
+/// StringJoin[s1, s2, ...] or StringJoin[{s1, s2, ...}] - concatenates strings
+pub fn string_join_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // StringJoin[] with no arguments is the empty string (matches wolframscript);
+  // this also lets `StringJoin @@ {}` fold cleanly to "".
+  if args.is_empty() {
+    return Ok(Expr::String(String::new()));
+  }
+
+  // StringJoin is Flat: nested StringJoin and lists collapse into a single
+  // flat sequence of leaves. Build that leaf sequence so validation, message
+  // positions, and the unevaluated result all match wolframscript.
+  fn flatten_leaves(expr: &Expr, out: &mut Vec<Expr>) {
+    match expr {
+      Expr::List(items) => {
+        for item in items {
+          flatten_leaves(item, out);
+        }
+      }
+      Expr::FunctionCall { name, args } if name == "StringJoin" => {
+        for a in args {
+          flatten_leaves(a, out);
+        }
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::StringJoin,
+        left,
+        right,
+      } => {
+        flatten_leaves(left, out);
+        flatten_leaves(right, out);
+      }
+      _ => out.push(expr.clone()),
+    }
+  }
+  let mut leaves = Vec::new();
+  for arg in args {
+    flatten_leaves(arg, &mut leaves);
+  }
+
+  // Validate: every leaf must be a string. wolframscript emits one
+  // StringJoin::string message per non-string leaf (with its 1-based position
+  // in the flat sequence), subject to the standard General::stop suppression
+  // after three, then returns the flat StringJoin unevaluated.
+  let non_string: Vec<usize> = leaves
+    .iter()
+    .enumerate()
+    .filter(|(_, l)| !matches!(l, Expr::String(_)))
+    .map(|(i, _)| i + 1)
+    .collect();
+  if !non_string.is_empty() {
+    // Format as infix: leaves joined by `<>`, dropping the enclosing quotes of
+    // each string leaf — so StringJoin["U", 2] renders as `U<>2`.
+    let infix = leaves
+      .iter()
+      .map(|a| match a {
+        Expr::String(s) => s.clone(),
+        _ => expr_to_string(a),
+      })
+      .collect::<Vec<_>>()
+      .join("<>");
+    for pos in non_string {
+      crate::emit_message(&format!(
+        "StringJoin::string: String expected at position {pos} in {infix}."
+      ));
+    }
+    return Ok(call("StringJoin", leaves));
+  }
+
+  let mut joined = String::new();
+
+  // Check if single argument is a list
+  if args.len() == 1
+    && let Expr::List(items) = &args[0]
+  {
+    for item in items {
+      joined.push_str(&expr_to_str(item));
+    }
+    return Ok(Expr::String(joined));
+  }
+
+  // Multiple arguments - join them all, flattening any lists
+  fn collect_strings(
+    expr: &Expr,
+    out: &mut String,
+  ) -> Result<(), InterpreterError> {
+    match expr {
+      Expr::List(items) => {
+        for item in items {
+          collect_strings(item, out)?;
+        }
+      }
+      _ => out.push_str(&expr_to_str(expr)),
+    }
+    Ok(())
+  }
+  for arg in args {
+    collect_strings(arg, &mut joined)?;
+  }
+  Ok(Expr::String(joined))
+}
+
+/// Extract IgnoreCase option from rule arguments (args after the delimiter)
+fn extract_ignore_case(options: &[Expr]) -> bool {
+  for opt in options {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = opt
+      && matches!(pattern.as_ref(), Expr::Identifier(s) if s == "IgnoreCase")
+      && matches!(replacement.as_ref(), Expr::Identifier(s) if s == "True")
+    {
+      return true;
+    }
+  }
+  false
+}
+
+/// Check if an Expr is a RegularExpression[pattern] and extract the pattern string
+/// Whether a string pattern is a plain literal (a `String`, or a list whose
+/// every element is a `String`). Such patterns use exact substring matching
+/// rather than the regex converter, avoiding metacharacter surprises.
+fn is_literal_string_pattern(expr: &Expr) -> bool {
+  match expr {
+    Expr::String(_) => true,
+    Expr::List(items) => items.iter().all(|it| matches!(it, Expr::String(_))),
+    _ => false,
+  }
+}
+
+fn extract_regex_pattern(expr: &Expr) -> Option<String> {
+  match expr {
+    Expr::FunctionCall { name, args }
+      if name == "RegularExpression" && args.len() == 1 =>
+    {
+      if let Expr::String(pat) = &args[0] {
+        Some(pat.clone())
+      } else {
+        None
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Trim leading and trailing empty strings from a split result,
+/// matching Wolfram's StringSplit behavior (interior empty strings are preserved).
+fn trim_empty_strings(parts: &[Expr]) -> Vec<Expr> {
+  let is_empty = |e: &Expr| matches!(e, Expr::String(s) if s.is_empty());
+  let start = parts
+    .iter()
+    .position(|e| !is_empty(e))
+    .unwrap_or(parts.len());
+  let end = parts
+    .iter()
+    .rposition(|e| !is_empty(e))
+    .map_or(0, |i| i + 1);
+  if start >= end {
+    return Vec::new();
+  }
+  parts[start..end].to_vec()
+}
+
+/// StringSplit[s] - splits by whitespace; StringSplit[s, delim] - splits by delimiter
+/// StringSplit[s, RegularExpression[pat]] - splits by regex pattern
+/// Options: IgnoreCase -> True/False
+/// Build a regex for the LHS of a `StringSplit` rule delimiter. Returns the
+/// regex source plus, for a named pattern `name : sub`, the captured name so
+/// the replacement can reference the actual matched delimiter.
+fn split_delim_regex(
+  lhs: &Expr,
+) -> Result<(String, Option<String>), InterpreterError> {
+  // Named pattern: Pattern[name, sub]
+  if let Expr::FunctionCall { name, args } = lhs
+    && name == "Pattern"
+    && args.len() == 2
+    && let Expr::Identifier(var) = &args[0]
+  {
+    let (re, _) = split_delim_regex(&args[1])?;
+    return Ok((re, Some(var.clone())));
+  }
+  // Literal string delimiter.
+  if let Expr::String(d) = lhs {
+    return Ok((regex::escape(d), None));
+  }
+  // List of delimiters → alternation, longest source first so that overlapping
+  // literals (e.g. {"::", ":"}) prefer the longer match.
+  if let Expr::List(items) = lhs {
+    let mut alts: Vec<String> = Vec::new();
+    for it in items {
+      let (re, _) = split_delim_regex(it)?;
+      alts.push(format!("(?:{re})"));
+    }
+    alts.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    return Ok((alts.join("|"), None));
+  }
+  // The implicitly named blanks — `x_`, `x__`, `x_?test` — bind their name to
+  // the matched delimiter just like the explicit `x : patt` form above.
+  if let Expr::Pattern { name, .. } | Expr::PatternTest { name, .. } = lhs
+    && !name.is_empty()
+    && let Some(p) =
+      extract_regex_pattern(lhs).or_else(|| string_pattern_to_regex(lhs))
+  {
+    return Ok((p, Some(name.clone())));
+  }
+  // Character classes / string patterns (DigitCharacter, RegularExpression…).
+  if let Some(p) = extract_regex_pattern(lhs) {
+    return Ok((p, None));
+  }
+  if let Some(p) = string_pattern_to_regex(lhs) {
+    return Ok((p, None));
+  }
+  // Fallback: treat as a literal string.
+  Ok((regex::escape(&expr_to_str(lhs)), None))
+}
+
+/// Compute the replacement expression for a matched delimiter. A plain string
+/// RHS is used verbatim; otherwise the captured name (if any) is substituted
+/// with the matched text and the result evaluated.
+fn split_replacement_value(
+  rhs: &Expr,
+  cap_name: Option<&str>,
+  matched: &str,
+) -> Result<Expr, InterpreterError> {
+  if let Expr::String(r) = rhs {
+    return Ok(Expr::String(r.clone()));
+  }
+  if let Some(name) = cap_name {
+    let substituted = crate::syntax::substitute_variable(
+      rhs,
+      name,
+      &Expr::String(matched.to_string()),
+    );
+    // Identity capture (`x : patt :> x`) needs no evaluation.
+    if let Expr::String(_) = substituted {
+      return Ok(substituted);
+    }
+    return crate::evaluator::evaluate_expr_to_expr(&substituted);
+  }
+  crate::evaluator::evaluate_expr_to_expr(rhs)
+}
+
+/// `StringSplit[s, patt -> repl]` / `patt :> repl`, and lists mixing such
+/// rules with bare delimiters: split on every left-hand side and keep the
+/// (replaced) delimiters between the pieces. A delimiter given without a
+/// right-hand side inserts nothing. Where two delimiters match at the same
+/// place the earlier one in the list wins, even if it matches less text —
+/// `StringSplit["ab", {"a" -> 1, "ab" -> 2}]` is `{1, "b"}`.
+///
+/// Leading and trailing empty *text* segments are dropped, but only when no
+/// explicit maximum number of pieces was requested; internal empties (between
+/// adjacent delimiters) are always preserved.
+fn string_split_with_replacement(
+  s: &str,
+  rules: &[(&Expr, Option<&Expr>)],
+  max_parts: Option<usize>,
+  ignore_case: bool,
+) -> Result<Expr, InterpreterError> {
+  let mut compiled: Vec<(WoxiRegex, Option<String>, Option<&Expr>)> =
+    Vec::with_capacity(rules.len());
+  for (lhs, rhs) in rules {
+    let (pat, cap_name) = split_delim_regex(lhs)?;
+    let pat = if ignore_case {
+      format!("(?i){pat}")
+    } else {
+      pat
+    };
+    let re = compile_regex(&pat).map_err(|e| {
+      InterpreterError::EvaluationError(format!(
+        "Invalid regular expression: {e}"
+      ))
+    })?;
+    compiled.push((re, cap_name, *rhs));
+  }
+
+  let mut result: Vec<Expr> = Vec::new();
+  let mut last = 0usize;
+  let mut splits = 0usize;
+  loop {
+    if let Some(n) = max_parts
+      && splits + 1 >= n
+    {
+      break; // stop after n-1 splits → at most n text pieces
+    }
+    // Earliest match across all rules; ties go to the earlier rule.
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (idx, (re, _, _)) in compiled.iter().enumerate() {
+      let mut from = last;
+      while let Some(m) = re.find_at(s, from) {
+        if m.start() < m.end() {
+          if best.is_none_or(|(start, _, _)| m.start() < start) {
+            best = Some((m.start(), m.end(), idx));
+          }
+          break;
+        }
+        // Skip zero-width matches rather than looping on them.
+        match s[m.end()..].chars().next() {
+          Some(c) => from = m.end() + c.len_utf8(),
+          None => break,
+        }
+      }
+    }
+    let Some((start, end, idx)) = best else { break };
+    result.push(Expr::String(s[last..start].to_string()));
+    let (_, cap_name, rhs) = &compiled[idx];
+    if let Some(rhs) = rhs {
+      result.push(split_replacement_value(
+        rhs,
+        cap_name.as_deref(),
+        &s[start..end],
+      )?);
+    }
+    last = end;
+    splits += 1;
+  }
+  result.push(Expr::String(s[last..].to_string()));
+
+  if max_parts.is_none() {
+    // Drop a leading / trailing empty *text* segment.
+    if let Some(Expr::String(t)) = result.last()
+      && t.is_empty()
+      && result.len() > 1
+    {
+      result.pop();
+    }
+    if let Some(Expr::String(t)) = result.first()
+      && t.is_empty()
+      && result.len() > 1
+    {
+      result.remove(0);
+    }
+  }
+  Ok(Expr::List(result.into()))
+}
+
+pub fn string_split_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Err(InterpreterError::EvaluationError(
+      "StringSplit expects at least 1 argument".into(),
+    ));
+  }
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0]
+    && items.iter().all(|it| matches!(it, Expr::String(_)))
+  {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_split_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  // Anything that is not a string (or the list of strings handled above) is
+  // invalid: Wolfram emits StringSplit::strse referencing the whole call and
+  // leaves it unevaluated, rather than coercing the value to a string.
+  if !matches!(&args[0], Expr::String(_)) {
+    let unevaluated = unevaluated("StringSplit", args);
+    crate::emit_message(&format!(
+      "StringSplit::strse: A string or list of strings is expected at position 1 in {}.",
+      crate::syntax::format_expr(&unevaluated, crate::syntax::ExprForm::Output)
+    ));
+    return Ok(unevaluated);
+  }
+  let s = expr_to_str(&args[0]);
+
+  // 1-argument form: split by whitespace, removing empty strings
+  if args.len() == 1 {
+    let parts: Vec<Expr> = s
+      .split_whitespace()
+      .map(|p| Expr::String(p.to_string()))
+      .collect();
+    return Ok(Expr::List(parts.into()));
+  }
+
+  // Extract max parts (3rd arg if integer) and options from remaining args
+  let (max_parts, option_start) = if args.len() >= 3 {
+    if let Expr::Integer(n) = &args[2] {
+      (Some(*n as usize), 3)
+    } else {
+      (None, 2)
+    }
+  } else {
+    (None, 2)
+  };
+  let ignore_case = extract_ignore_case(&args[option_start..]);
+
+  // Delimiter given as a rule `patt -> repl` / `patt :> repl`, or as a list
+  // that contains at least one such rule: split on the left-hand sides and
+  // keep the (replaced) delimiters interleaved between the pieces. A list of
+  // bare delimiters keeps the plain literal path below.
+  fn as_rule(e: &Expr) -> Option<(&Expr, Option<&Expr>)> {
+    match e {
+      Expr::Rule {
+        pattern,
+        replacement,
+      }
+      | Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } => Some((pattern.as_ref(), Some(replacement.as_ref()))),
+      _ => None,
+    }
+  }
+  let rules: Vec<(&Expr, Option<&Expr>)> = match &args[1] {
+    e if as_rule(e).is_some() => vec![as_rule(e).unwrap()],
+    Expr::List(items) if items.iter().any(|it| as_rule(it).is_some()) => items
+      .iter()
+      .map(|it| as_rule(it).unwrap_or((it, None)))
+      .collect(),
+    _ => Vec::new(),
+  };
+  if !rules.is_empty() {
+    return string_split_with_replacement(&s, &rules, max_parts, ignore_case);
+  }
+
+  // Conditional delimiter: `patt /; test`. Split on each span where the inner
+  // pattern matches and the `/;` test (with captures substituted) is True,
+  // dropping empty pieces like Wolfram's default StringSplit.
+  if let Expr::FunctionCall { name, args: cargs } = &args[1]
+    && name == "Condition"
+    && cargs.len() == 2
+    && let Some((regex_str, _)) = string_pattern_to_regex_with_state(&cargs[0])
+  {
+    let test = &cargs[1];
+    let pat = if ignore_case {
+      format!("(?i){regex_str}")
+    } else {
+      regex_str
+    };
+    let re = compile_regex(&pat).map_err(|e| {
+      InterpreterError::EvaluationError(format!(
+        "Invalid regular expression: {e}"
+      ))
+    })?;
+    let mut parts: Vec<Expr> = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+    while i < s.len() {
+      let mut is_delim = false;
+      if let Some(caps) = re.captures_at(&s, i)
+        && let Some(m) = caps.get(0)
+        && m.start() == i
+        && !m.as_str().is_empty()
+      {
+        let test_sub = substitute_captures(test, &caps);
+        let test_val = crate::evaluator::evaluate_expr_to_expr(&test_sub)?;
+        if matches!(&test_val, Expr::Identifier(t) if t == "True") {
+          if !current.is_empty() {
+            parts.push(Expr::String(std::mem::take(&mut current)));
+          }
+          i += m.len();
+          is_delim = true;
+        }
+      }
+      if !is_delim {
+        let ch = s[i..].chars().next().unwrap();
+        current.push(ch);
+        i += ch.len_utf8();
+      }
+    }
+    if !current.is_empty() {
+      parts.push(Expr::String(current));
+    }
+    return Ok(Expr::List(parts.into()));
+  }
+
+  // Check if the delimiter is a RegularExpression or string pattern. Plain
+  // string literals (and lists of them) use the literal-delimiter path below;
+  // any non-literal delimiter — a bare pattern, or a list that contains one
+  // (e.g. {DigitCharacter}) — goes through the pattern → regex converter.
+  let (regex_from_pattern, split_constraints): (
+    Option<String>,
+    Vec<(String, String)>,
+  ) = if let Some(p) = extract_regex_pattern(&args[1]) {
+    (Some(p), Vec::new())
+  } else if !is_literal_string_pattern(&args[1]) {
+    match string_pattern_to_regex_with_state(&args[1]) {
+      Some((p, c)) => (Some(p), c),
+      None => (None, Vec::new()),
+    }
+  } else {
+    (None, Vec::new())
+  };
+  if let Some(pat) = regex_from_pattern {
+    let regex_pat = if ignore_case {
+      format!("(?i){pat}")
+    } else {
+      pat
+    };
+    let re = compile_regex(&regex_pat).map_err(|e| {
+      InterpreterError::EvaluationError(format!(
+        "Invalid regular expression: {e}"
+      ))
+    })?;
+    let parts: Vec<Expr> = if !split_constraints.is_empty() {
+      // Delimiter has a back-reference (`x_ ~~ x_`): the `regex` crate's
+      // `split` can't enforce it, so split on constraint-satisfying spans.
+      let spans = find_constraint_spans(&re, &split_constraints, &s, false);
+      let mut pieces: Vec<Expr> = Vec::new();
+      let mut last = 0usize;
+      for (splits, (start, end)) in spans.into_iter().enumerate() {
+        if let Some(n) = max_parts
+          && splits + 1 >= n
+        {
+          break;
+        }
+        pieces.push(Expr::String(s[last..start].to_string()));
+        last = end;
+      }
+      pieces.push(Expr::String(s[last..].to_string()));
+      pieces
+    } else if let Some(n) = max_parts {
+      re.splitn(&s, n)
+        .into_iter()
+        .map(|p| Expr::String(p.to_string()))
+        .collect()
+    } else {
+      re.split(&s)
+        .into_iter()
+        .map(|p| Expr::String(p.to_string()))
+        .collect()
+    };
+    // Leading/trailing empty pieces are only dropped when no explicit
+    // maximum number of pieces was requested.
+    let parts = if max_parts.is_none() {
+      trim_empty_strings(&parts)
+    } else {
+      parts
+    };
+    return Ok(Expr::List(parts.into()));
+  }
+
+  // Collect delimiters: either a single string or a list of strings
+  let delims: Vec<String> = match &args[1] {
+    Expr::List(items) => {
+      let mut ds = Vec::new();
+      for item in items {
+        ds.push(expr_to_str(item));
+      }
+      ds
+    }
+    _ => vec![expr_to_str(&args[1])],
+  };
+
+  let parts: Vec<Expr> = if delims.len() == 1 && delims[0].is_empty() {
+    s.chars().map(|c| Expr::String(c.to_string())).collect()
+  } else if delims.len() == 1 {
+    if ignore_case {
+      let re = regex::RegexBuilder::new(&regex::escape(&delims[0]))
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| {
+          InterpreterError::EvaluationError(format!("Regex error: {e}"))
+        })?;
+      if let Some(n) = max_parts {
+        re.splitn(&s, n)
+          .map(|p| Expr::String(p.to_string()))
+          .collect()
+      } else {
+        re.split(&s).map(|p| Expr::String(p.to_string())).collect()
+      }
+    } else if let Some(n) = max_parts {
+      s.splitn(n, &delims[0])
+        .map(|p| Expr::String(p.to_string()))
+        .collect()
+    } else {
+      s.split(&delims[0])
+        .map(|p| Expr::String(p.to_string()))
+        .collect()
+    }
+  } else {
+    // Split by multiple delimiters: scan left to right, trying the longest
+    // delimiter match first. Once `max_parts - 1` pieces have been emitted,
+    // stop splitting so the final piece keeps the original remainder verbatim
+    // (mirroring `splitn`), matching wolframscript.
+    let mut sorted_delims = delims.clone();
+    sorted_delims.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+      if let Some(n) = max_parts
+        && result.len() == n - 1
+      {
+        current.extend(&chars[i..]);
+        break;
+      }
+      let remaining: String = chars[i..].iter().collect();
+      let mut matched = false;
+      for d in &sorted_delims {
+        if !d.is_empty() && remaining.starts_with(d.as_str()) {
+          result.push(Expr::String(current.clone()));
+          current.clear();
+          i += d.chars().count();
+          matched = true;
+          break;
+        }
+      }
+      if !matched {
+        current.push(chars[i]);
+        i += 1;
+      }
+    }
+    result.push(Expr::String(current));
+    result
+  };
+  // Leading/trailing empty pieces are only dropped when no explicit maximum
+  // number of pieces was requested.
+  let parts = if max_parts.is_none() {
+    trim_empty_strings(&parts)
+  } else {
+    parts
+  };
+  Ok(Expr::List(parts.into()))
+}
+
+/// StringStartsQ[s, prefix] - checks if string starts with prefix
+pub fn string_starts_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringStartsQ expects 2 or 3 arguments".into(),
+    ));
+  }
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_starts_q_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  let ignore_case = has_ignore_case_option(args);
+
+  // Try regex-based pattern first
+  if let Some((regex_pat, constraints)) =
+    string_pattern_to_regex_with_state(&args[1])
+  {
+    let full_pat = if ignore_case {
+      format!("(?i)^(?:{regex_pat})")
+    } else {
+      format!("^(?:{regex_pat})")
+    };
+    let re = compile_regex(&full_pat).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid pattern: {e}"))
+    })?;
+    return Ok(Expr::Identifier(
+      if full_match_with_constraints(&re, &constraints, &s) {
+        "True"
+      } else {
+        "False"
+      }
+      .to_string(),
+    ));
+  }
+
+  let prefix = expr_to_str(&args[1]);
+  let result = if ignore_case {
+    s.to_lowercase().starts_with(&prefix.to_lowercase())
+  } else {
+    s.starts_with(&prefix)
+  };
+  Ok(bool_expr(result))
+}
+
+/// StringEndsQ[s, suffix] - checks if string ends with suffix
+pub fn string_ends_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringEndsQ expects 2 or 3 arguments".into(),
+    ));
+  }
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_ends_q_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  let ignore_case = has_ignore_case_option(args);
+
+  // Try regex-based pattern first
+  if let Some((regex_pat, constraints)) =
+    string_pattern_to_regex_with_state(&args[1])
+  {
+    let full_pat = if ignore_case {
+      format!("(?i)(?:{regex_pat})$")
+    } else {
+      format!("(?:{regex_pat})$")
+    };
+    let re = compile_regex(&full_pat).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid pattern: {e}"))
+    })?;
+    return Ok(Expr::Identifier(
+      if full_match_with_constraints(&re, &constraints, &s) {
+        "True"
+      } else {
+        "False"
+      }
+      .to_string(),
+    ));
+  }
+
+  let suffix = expr_to_str(&args[1]);
+  let result = if ignore_case {
+    s.to_lowercase().ends_with(&suffix.to_lowercase())
+  } else {
+    s.ends_with(&suffix)
+  };
+  Ok(bool_expr(result))
+}
+
+/// StringContainsQ[s, sub] - checks if string contains substring
+/// StringContainsQ[s, sub, IgnoreCase -> True] - case-insensitive
+pub fn string_contains_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringContainsQ expects 2 or 3 arguments".into(),
+    ));
+  }
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_contains_q_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  let ignore_case = has_ignore_case_option(args);
+
+  // Every string contains the empty pattern: StringContainsQ["", ""] and
+  // StringContainsQ["ab", ""] are True (wolframscript-verified;
+  // differential fuzzer, seed 11333804031743244357).
+  if matches!(&args[1], Expr::String(sub) if sub.is_empty()) {
+    return Ok(bool_expr(true));
+  }
+
+  // Try regex-based pattern first
+  if let Some(compiled) = compile_string_pattern(&args[1], ignore_case) {
+    let (re, constraints) = compiled?;
+    let present =
+      !find_constraint_spans(&re, &constraints, &s, false).is_empty();
+    return Ok(bool_expr(present));
+  }
+
+  let sub = expr_to_str(&args[1]);
+  let result = if ignore_case {
+    s.to_lowercase().contains(&sub.to_lowercase())
+  } else {
+    s.contains(&sub)
+  };
+  Ok(bool_expr(result))
+}
+
+/// Check if args contain IgnoreCase -> True option
+fn has_ignore_case_option(args: &[Expr]) -> bool {
+  for arg in args.iter().skip(2) {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = arg
+      && expr_to_string(pattern) == "IgnoreCase"
+      && expr_to_string(replacement) == "True"
+    {
+      return true;
+    }
+  }
+  false
+}
+
+/// StringReplace[s, pattern -> replacement] - replaces occurrences
+/// StringReplace[s, {rule1, rule2, ...}] - applies multiple rules
+/// Expand regex capture-group backreferences in a RegularExpression
+/// replacement string: `$0` is the whole match, `$1`…`$n` (and `${n}`) the
+/// numbered groups. A `$` not followed by a digit or `{` (including `$$`) is
+/// left verbatim, matching Wolfram.
+fn expand_dollar_replacement(template: &str, caps: &Captures) -> String {
+  let mut out = String::new();
+  let mut chars = template.chars().peekable();
+  while let Some(c) = chars.next() {
+    if c != '$' {
+      out.push(c);
+      continue;
+    }
+    match chars.peek() {
+      Some('{') => {
+        chars.next(); // consume '{'
+        let mut num = String::new();
+        let mut closed = false;
+        for d in chars.by_ref() {
+          if d == '}' {
+            closed = true;
+            break;
+          }
+          num.push(d);
+        }
+        if let (true, Ok(n)) = (closed, num.parse::<usize>()) {
+          if let Some(g) = caps.get(n) {
+            out.push_str(g.as_str());
+          }
+        } else {
+          out.push_str("${");
+          out.push_str(&num);
+          if closed {
+            out.push('}');
+          }
+        }
+      }
+      Some(d) if d.is_ascii_digit() => {
+        let mut num = String::new();
+        while let Some(&d) = chars.peek() {
+          if d.is_ascii_digit() {
+            num.push(d);
+            chars.next();
+          } else {
+            break;
+          }
+        }
+        if let Ok(n) = num.parse::<usize>()
+          && let Some(g) = caps.get(n)
+        {
+          out.push_str(g.as_str());
+        }
+      }
+      // A lone `$` (or `$$`, `$x`, …) is literal.
+      _ => out.push('$'),
+    }
+  }
+  out
+}
+
+/// Expand `$0`/`$1`/… regex backreferences in every string literal within an
+/// expression (used for StringCases RegularExpression transforms).
+fn expand_dollar_in_expr(expr: &Expr, caps: &Captures) -> Expr {
+  match expr {
+    Expr::String(s) => Expr::String(expand_dollar_replacement(s, caps)),
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(|e| expand_dollar_in_expr(e, caps))
+        .collect::<Vec<_>>()
+        .into(),
+    ),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(|e| expand_dollar_in_expr(e, caps))
+        .collect::<Vec<_>>()
+        .into(),
+    },
+    // `"<" <> "$1" <> ">"` is a BinaryOp, so the operators have to be walked
+    // too or the backreference never reaches its string literal.
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(expand_dollar_in_expr(left, caps)),
+      right: Box::new(expand_dollar_in_expr(right, caps)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(expand_dollar_in_expr(operand, caps)),
+    },
+    other => other.clone(),
+  }
+}
+
+pub fn string_replace_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 4 {
+    return Err(InterpreterError::EvaluationError(
+      "StringReplace expects 2 to 4 arguments".into(),
+    ));
+  }
+
+  // The optional replacement limit is the first integer after the rules; the
+  // `IgnoreCase -> True` option may appear as a trailing argument.
+  let max_replacements = args[2..].iter().find_map(|a| match a {
+    Expr::Integer(n) => Some(*n as usize),
+    _ => None,
+  });
+  let ignore_case = has_ignore_case_option(args);
+
+  // The subject (position 1) must be a string or a list of strings. A
+  // non-string — or a list containing a non-string — makes wolframscript emit
+  // StringReplace::strse and return the call unevaluated, rather than coercing
+  // the argument to its textual form (e.g. `StringReplace[xyz, "a" -> "x"]`).
+  if !is_string_subject(&args[0]) {
+    emit_strse("StringReplace", args);
+    return Ok(unevaluated("StringReplace", args));
+  }
+
+  // Handle list of strings as first arg
+  if let Expr::List(strings) = &args[0] {
+    let mut results = Vec::new();
+    for s_expr in strings {
+      let mut new_args = vec![s_expr.clone()];
+      new_args.extend_from_slice(&args[1..]);
+      results.push(string_replace_ast(&new_args)?);
+    }
+    return Ok(Expr::List(results.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+
+  /// A replacement rule: either a simple literal pattern or a regex pattern.
+  enum ReplaceRule {
+    Simple {
+      pattern: String,
+      replacement: String,
+    },
+    Regex {
+      regex: WoxiRegex,
+      replacement: String,
+      /// Whether `$0`/`$1`/… in the replacement expand to regex capture
+      /// groups. Only RegularExpression patterns do this; a plain literal
+      /// pattern (e.g. compiled for IgnoreCase) keeps `$n` verbatim.
+      expand_dollar: bool,
+      /// Back-reference constraints (repeated pattern names must capture equal
+      /// substrings), e.g. from `x_ ~~ x_`. Empty for literal/regex patterns.
+      constraints: Vec<(String, String)>,
+    },
+    /// Regex pattern with a delayed replacement expression (RuleDelayed).
+    /// Captured named groups are substituted into the expression before evaluation.
+    /// `condition` is the optional `/;` test (`patt /; test`): when present,
+    /// the captured names are substituted into it and it must evaluate to
+    /// `True` for the match to apply.
+    RegexDelayed {
+      regex: WoxiRegex,
+      replacement_expr: Expr,
+      condition: Option<Expr>,
+      /// Back-reference constraints (see `Regex::constraints`).
+      constraints: Vec<(String, String)>,
+      /// Whether `$0`/`$1`/… in the replacement expand to capture groups.
+      /// Only a RegularExpression pattern has them; a literal or symbolic
+      /// string pattern leaves `$1` alone.
+      expand_dollar: bool,
+    },
+  }
+
+  fn extract_rule(
+    expr: &Expr,
+    ignore_case: bool,
+  ) -> Result<ReplaceRule, InterpreterError> {
+    let (pattern_expr, replacement_expr, is_delayed) = match expr {
+      Expr::Rule {
+        pattern,
+        replacement,
+      } => (pattern.as_ref(), replacement.as_ref(), false),
+      Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } => (pattern.as_ref(), replacement.as_ref(), true),
+      _ => {
+        return Err(InterpreterError::EvaluationError(
+          "StringReplace: rules must be of the form pattern -> replacement"
+            .into(),
+        ));
+      }
+    };
+
+    // A non-string replacement (e.g. `"b" -> 5`) must be preserved as an
+    // expression rather than coerced to text, so that the final result becomes
+    // a StringExpression. Such rules are routed through the RegexDelayed path
+    // (which keeps the replacement as an Expr) even when they are immediate
+    // Rules — a constant Expr simply evaluates to itself for each match.
+    let replacement_is_string = matches!(replacement_expr, Expr::String(_));
+
+    // Unwrap a `/;` condition on the pattern: `patt /; test` parses to
+    // `Condition[patt, test]`. A conditional pattern must evaluate its test
+    // for each candidate match, so route it through `RegexDelayed` (with the
+    // test attached) regardless of the replacement's shape.
+    if let Expr::FunctionCall { name, args } = pattern_expr
+      && name == "Condition"
+      && args.len() == 2
+    {
+      let inner_pattern = &args[0];
+      let test = &args[1];
+      let (regex_str, constraints) =
+        string_pattern_to_regex_with_state(inner_pattern).ok_or_else(|| {
+          InterpreterError::EvaluationError(
+            "StringReplace: unsupported conditional pattern".into(),
+          )
+        })?;
+      let regex_str = if ignore_case {
+        format!("(?i){regex_str}")
+      } else {
+        regex_str
+      };
+      let re = compile_regex(&regex_str).map_err(|e| {
+        InterpreterError::EvaluationError(format!(
+          "StringReplace: invalid pattern regex: {e}"
+        ))
+      })?;
+      return Ok(ReplaceRule::RegexDelayed {
+        regex: re,
+        replacement_expr: replacement_expr.clone(),
+        condition: Some(test.clone()),
+        constraints,
+        expand_dollar: false,
+      });
+    }
+
+    // For simple string literals, use direct matching. A delayed rule (:>)
+    // still has to evaluate its RHS for each match, so compile the escaped
+    // literal as a regex and route it through RegexDelayed. With IgnoreCase,
+    // compile the escaped literal as a case-insensitive regex instead.
+    if let Expr::String(pat_str) = pattern_expr {
+      if (is_delayed || !replacement_is_string) && !pat_str.is_empty() {
+        let prefix = if ignore_case { "(?i)" } else { "" };
+        let re =
+          compile_regex(&format!("{}{}", prefix, regex::escape(pat_str)))
+            .map_err(|e| {
+              InterpreterError::EvaluationError(format!(
+                "StringReplace: invalid pattern regex: {e}"
+              ))
+            })?;
+        return Ok(ReplaceRule::RegexDelayed {
+          regex: re,
+          replacement_expr: replacement_expr.clone(),
+          condition: None,
+          constraints: Vec::new(),
+          expand_dollar: false,
+        });
+      }
+      let replacement = expr_to_str(replacement_expr);
+      if ignore_case && !pat_str.is_empty() {
+        let re = compile_regex(&format!("(?i){}", regex::escape(pat_str)))
+          .map_err(|e| {
+            InterpreterError::EvaluationError(format!(
+              "StringReplace: invalid pattern regex: {e}"
+            ))
+          })?;
+        return Ok(ReplaceRule::Regex {
+          regex: re,
+          replacement,
+          expand_dollar: false,
+          constraints: Vec::new(),
+        });
+      }
+      return Ok(ReplaceRule::Simple {
+        pattern: pat_str.clone(),
+        replacement,
+      });
+    }
+
+    // For complex patterns (Alternatives, StringExpression, etc.), use regex
+    if let Some((regex_str, constraints)) =
+      string_pattern_to_regex_with_state(pattern_expr)
+    {
+      let regex_str = if ignore_case {
+        format!("(?i){regex_str}")
+      } else {
+        regex_str
+      };
+      let re = compile_regex(&regex_str).map_err(|e| {
+        InterpreterError::EvaluationError(format!(
+          "StringReplace: invalid pattern regex: {e}"
+        ))
+      })?;
+
+      // Delayed rules (:>) evaluate their RHS for each match (after
+      // substituting any named captures), so route them through RegexDelayed
+      // even when the pattern has no capture groups — otherwise a constant
+      // RHS like `LetterCharacter :> ToUpperCase["x"]` is inserted unevaluated.
+      // A *plain-string* RHS is constant, so the delayed/immediate distinction
+      // is moot: route it like a Rule below so `$1`/`$2` backreferences expand
+      // (RegularExpression["(a)(b)"] :> "$2$1" -> "ba", matching wolframscript).
+      // A RegularExpression pattern is what gives `$1`… their meaning, and
+      // the expansion happens before the right-hand side is evaluated —
+      // `RegularExpression["(b)"] :> "<" <> "$1" <> ">"` gives "<b>".
+      let from_regular_expression = matches!(
+        pattern_expr,
+        Expr::FunctionCall { name, .. } if name == "RegularExpression"
+      );
+      if !replacement_is_string {
+        return Ok(ReplaceRule::RegexDelayed {
+          regex: re,
+          replacement_expr: replacement_expr.clone(),
+          condition: None,
+          constraints,
+          expand_dollar: from_regular_expression,
+        });
+      }
+
+      // For Rule (->), also substitute captured names into the replacement
+      // as strings before returning
+      if re.capture_names().iter().flatten().next().is_some() {
+        return Ok(ReplaceRule::RegexDelayed {
+          regex: re,
+          replacement_expr: replacement_expr.clone(),
+          condition: None,
+          constraints,
+          expand_dollar: from_regular_expression,
+        });
+      }
+
+      let replacement = expr_to_str(replacement_expr);
+      return Ok(ReplaceRule::Regex {
+        regex: re,
+        replacement,
+        // Regex capture-group backreferences ($1, $2, …) are a
+        // RegularExpression feature.
+        expand_dollar: matches!(
+          pattern_expr,
+          Expr::FunctionCall { name, .. } if name == "RegularExpression"
+        ),
+        constraints,
+      });
+    }
+
+    // Fallback: try expr_to_str for identifiers etc.
+    let pat_str = expr_to_str(pattern_expr);
+    let replacement = expr_to_str(replacement_expr);
+    if ignore_case && !pat_str.is_empty() {
+      let re = compile_regex(&format!("(?i){}", regex::escape(&pat_str)))
+        .map_err(|e| {
+          InterpreterError::EvaluationError(format!(
+            "StringReplace: invalid pattern regex: {e}"
+          ))
+        })?;
+      return Ok(ReplaceRule::Regex {
+        regex: re,
+        replacement,
+        expand_dollar: false,
+        constraints: Vec::new(),
+      });
+    }
+    Ok(ReplaceRule::Simple {
+      pattern: pat_str,
+      replacement,
+    })
+  }
+
+  // Collect all rules into a vec
+  let rules: Vec<ReplaceRule> = match &args[1] {
+    Expr::List(rule_list) => {
+      let mut v = Vec::new();
+      for rule in rule_list {
+        v.push(extract_rule(rule, ignore_case)?);
+      }
+      v
+    }
+    rule => vec![extract_rule(rule, ignore_case)?],
+  };
+
+  // Scan-based replacement: scan left-to-right, at each position try each rule.
+  //
+  // The result is a list of ordered segments: runs of literal/string text are
+  // accumulated into `buffer`, while a delayed replacement whose RHS evaluates
+  // to a *non-string* (e.g. `n :> StringLength[n]` yielding an integer) flushes
+  // the buffer and is pushed as its own segment. Adjacent strings coalesce
+  // naturally because they share the same buffer. The caller joins an
+  // all-string result into a single String, or wraps a mixed result in
+  // StringExpression — matching wolframscript, which returns e.g.
+  // StringReplace["abc", "b" -> 5] = StringExpression["a", 5, "c"].
+  fn scan_replace(
+    s: &str,
+    rules: &[ReplaceRule],
+    max: Option<usize>,
+  ) -> Result<Vec<Expr>, InterpreterError> {
+    let mut segments: Vec<Expr> = Vec::new();
+    let mut buffer = String::new();
+    let mut count = 0usize;
+    let mut i = 0;
+    // Try the zero-width (empty) regex matches anchored at position `pos`.
+    // Returns Some(replacement) for the first rule that matches empty there.
+    // These are assertions like WordBoundary (\b), StartOfString, etc. that
+    // consume no characters but still trigger a replacement.
+    fn zero_width_match<'a>(
+      s: &str,
+      rules: &'a [ReplaceRule],
+      pos: usize,
+    ) -> Option<&'a str> {
+      for rule in rules {
+        if let ReplaceRule::Regex {
+          regex, replacement, ..
+        } = rule
+          && let Some(m) = regex.find_at(s, pos)
+          && m.start() == pos
+          && m.as_str().is_empty()
+        {
+          return Some(replacement.as_str());
+        }
+      }
+      None
+    }
+    while i < s.len() {
+      if max.is_some() && count >= max.unwrap() {
+        buffer.push_str(&s[i..]);
+        break;
+      }
+      // Zero-width assertion matches (e.g. WordBoundary) are emitted before
+      // the character at the current position, without consuming it.
+      if let Some(replacement) = zero_width_match(s, rules, i) {
+        buffer.push_str(replacement);
+        count += 1;
+        if max.is_some() && count >= max.unwrap() {
+          buffer.push_str(&s[i..]);
+          break;
+        }
+      }
+      let mut matched = false;
+      for rule in rules {
+        match rule {
+          ReplaceRule::Simple {
+            pattern,
+            replacement,
+          } => {
+            if pattern.is_empty() {
+              continue;
+            }
+            if s[i..].starts_with(pattern.as_str()) {
+              buffer.push_str(replacement);
+              i += pattern.len();
+              count += 1;
+              matched = true;
+              break;
+            }
+          }
+          ReplaceRule::Regex {
+            regex,
+            replacement,
+            expand_dollar,
+            constraints,
+          } => {
+            // Use captures_at on the full string so anchors like ^ and \b can
+            // inspect surrounding characters. Require the match to start
+            // exactly at position i.
+            if let Some(caps) = regex.captures_at(s, i)
+              && let Some(m) = caps.get(0)
+              && m.start() == i
+              && !m.as_str().is_empty()
+              && caps_satisfy_constraints(&caps, constraints)
+            {
+              if *expand_dollar {
+                buffer.push_str(&expand_dollar_replacement(replacement, &caps));
+              } else {
+                buffer.push_str(replacement);
+              }
+              i += m.len();
+              count += 1;
+              matched = true;
+              break;
+            }
+          }
+          ReplaceRule::RegexDelayed {
+            regex,
+            replacement_expr,
+            condition,
+            constraints,
+            expand_dollar,
+          } => {
+            if let Some(caps) = regex.captures_at(s, i)
+              && let Some(m) = caps.get(0)
+              && m.start() == i
+              && !m.as_str().is_empty()
+              && caps_satisfy_constraints(&caps, constraints)
+            {
+              // A `/;` condition must hold for this match. Substitute the
+              // captured names into it and evaluate; skip the rule otherwise.
+              if let Some(cond) = condition {
+                let cond_sub = substitute_captures(cond, &caps);
+                let cond_val =
+                  crate::evaluator::evaluate_expr_to_expr(&cond_sub)?;
+                if !matches!(&cond_val, Expr::Identifier(t) if t == "True") {
+                  continue;
+                }
+              }
+              // Substitute named captures into the replacement expr, and the
+              // numbered backreferences before it is evaluated.
+              let mut substituted =
+                substitute_captures(replacement_expr, &caps);
+              if *expand_dollar {
+                substituted = expand_dollar_in_expr(&substituted, &caps);
+              }
+              // Evaluate the substituted expression
+              let evaluated =
+                crate::evaluator::evaluate_expr_to_expr(&substituted)?;
+              // A string RHS joins into the running buffer; a non-string RHS
+              // flushes the buffer and becomes its own segment, so the final
+              // result is a StringExpression rather than a coerced string.
+              if let Expr::String(rs) = &evaluated {
+                buffer.push_str(rs);
+              } else {
+                if !buffer.is_empty() {
+                  segments.push(Expr::String(std::mem::take(&mut buffer)));
+                }
+                segments.push(evaluated);
+              }
+              i += m.len();
+              count += 1;
+              matched = true;
+              break;
+            }
+          }
+        }
+      }
+      if !matched {
+        let ch = s[i..].chars().next().unwrap();
+        buffer.push(ch);
+        i += ch.len_utf8();
+      }
+    }
+    // Zero-width assertions can also match at the very end of the string
+    // (e.g. WordBoundary after the final word character). The main loop
+    // stops at `i == s.len()`, so check that final position here. Honour the
+    // replacement limit so we don't exceed `max`.
+    if max.is_none_or(|m| count < m)
+      && zero_width_match(s, rules, s.len()).is_some()
+      && let Some(replacement) = zero_width_match(s, rules, s.len())
+    {
+      buffer.push_str(replacement);
+    }
+    if !buffer.is_empty() {
+      segments.push(Expr::String(buffer));
+    }
+    Ok(segments)
+  }
+
+  Ok(join_replacement_segments(scan_replace(
+    &s,
+    &rules,
+    max_replacements,
+  )?))
+}
+
+/// StringReplaceList[s, rules] / StringReplaceList[s, rules, n]
+///
+/// One result per *individual* match: the whole subject with just that single
+/// match replaced. The matches are enumerated exactly the way `Overlaps -> All`
+/// reports them — every span at every start position from left to right, with
+/// the rules tried in their written order within one start position — so a
+/// variable-length pattern contributes one result per length it can take:
+/// `StringReplaceList["abcd", __ -> "X"]` is
+/// `{X, Xd, Xcd, Xbcd, aX, aXd, aXcd, abX, abXd, abcX}`. `n` keeps only the
+/// first `n` results.
+pub fn string_replace_list_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let call = || unevaluated("StringReplaceList", args);
+
+  // The optional count limit. `Infinity` means unlimited; an option rule (or a
+  // list of them) in the third slot is not a count. Anything else is refused.
+  let mut max_results = usize::MAX;
+  match args.get(2) {
+    None => {}
+    Some(Expr::Integer(n)) if *n >= 0 => max_results = *n as usize,
+    Some(Expr::Identifier(id)) if id == "Infinity" => {}
+    Some(Expr::Rule { .. } | Expr::RuleDelayed { .. } | Expr::List(_)) => {}
+    Some(_) => {
+      crate::emit_message(&format!(
+        "StringReplaceList::innf: Non-negative integer or Infinity expected \
+         at position 3 in {}.",
+        crate::syntax::format_expr(&call(), crate::syntax::ExprForm::Output)
+      ));
+      return Ok(call());
+    }
+  }
+
+  // A list of strings gives one result list per string.
+  if let Expr::List(items) = &args[0] {
+    let mut per_string = Vec::with_capacity(items.len());
+    for item in items {
+      let mut inner = args.to_vec();
+      inner[0] = item.clone();
+      per_string.push(string_replace_list_ast(&inner)?);
+    }
+    return Ok(Expr::List(per_string.into()));
+  }
+  let s = expr_to_str(&args[0]);
+
+  // An empty rule list leaves the subject alone.
+  if matches!(&args[1], Expr::List(items) if items.is_empty()) {
+    return Ok(args[0].clone());
+  }
+  // Every rule has to be a replacement rule. wolframscript names the *last*
+  // offending element in the message and leaves the call unevaluated.
+  let is_rule =
+    |e: &Expr| matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. });
+  let offender = match &args[1] {
+    Expr::List(items) => items.iter().rev().find(|i| !is_rule(i)),
+    other if !is_rule(other) => Some(other),
+    _ => None,
+  };
+  if let Some(offender) = offender {
+    crate::emit_message(&format!(
+      "StringReplaceList::srep: {} is not a valid string replacement rule.",
+      crate::syntax::format_expr(offender, crate::syntax::ExprForm::Output)
+    ));
+    return Ok(call());
+  }
+  let Some(rules) = extract_cases_rules(&args[1]) else {
+    return Ok(call());
+  };
+
+  let ignore_case = has_ignore_case_option(args);
+  let mut results: Vec<Expr> = Vec::with_capacity(max_results.min(16));
+  for m in all_rule_matches(&s, &rules, ignore_case, max_results)? {
+    let mut substituted = substitute_captures(m.rhs, &m.caps);
+    if m.expand_dollar {
+      substituted = expand_dollar_in_expr(&substituted, &m.caps);
+    }
+    let replacement = crate::evaluator::evaluate_expr_to_expr(&substituted)?;
+    // The result is the subject with only this match replaced. Empty flanks
+    // are dropped so a non-string replacement gives StringExpression[5, "bc"]
+    // rather than StringExpression["", 5, "bc"].
+    let (bs, be) = m.span;
+    let segments: Vec<Expr> = [
+      Expr::String(s[..bs].to_string()),
+      replacement,
+      Expr::String(s[be..].to_string()),
+    ]
+    .into_iter()
+    .filter(|seg| !matches!(seg, Expr::String(t) if t.is_empty()))
+    .collect();
+    results.push(join_replacement_segments(segments));
+  }
+  Ok(Expr::List(results.into()))
+}
+
+/// Coalesce the ordered segments a replacement produced into its result. An
+/// all-string result (the common case) joins into a single String; a result
+/// containing any non-string segment stays a `StringExpression`, matching
+/// wolframscript's `StringReplace["abc", "b" -> 5]` =
+/// `StringExpression["a", 5, "c"]`.
+fn join_replacement_segments(segments: Vec<Expr>) -> Expr {
+  if segments.iter().any(|e| !matches!(e, Expr::String(_))) {
+    return call("StringExpression", segments);
+  }
+  let mut joined = String::new();
+  for seg in &segments {
+    if let Expr::String(s) = seg {
+      joined.push_str(s);
+    }
+  }
+  Expr::String(joined)
+}
+
+/// ToUpperCase[s] - converts string to uppercase
+pub fn to_upper_case_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "ToUpperCase expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over lists (including nested lists) like Wolfram does.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| to_upper_case_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  // Only a string is transformed. Any other expression (number, symbol, …)
+  // stays unevaluated — wolframscript emits no message and leaves the call as
+  // is (e.g. ToUpperCase[x] echoes, it does not uppercase the symbol name).
+  if let Expr::String(s) = &args[0] {
+    return Ok(Expr::String(s.to_uppercase()));
+  }
+  Ok(unevaluated("ToUpperCase", args))
+}
+
+/// ToLowerCase[s] - converts string to lowercase
+pub fn to_lower_case_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "ToLowerCase expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over lists (including nested lists) like Wolfram does.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| to_lower_case_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  // Only a string is transformed; any other expression stays unevaluated.
+  if let Expr::String(s) = &args[0] {
+    return Ok(Expr::String(s.to_lowercase()));
+  }
+  Ok(unevaluated("ToLowerCase", args))
+}
+
+/// Characters[s] - converts string to list of characters
+pub fn characters_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "Characters expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over lists like Wolfram does.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| characters_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  // Only a string yields a character list. Any other expression (number,
+  // symbol, compound expression) stays unevaluated — wolframscript accepts
+  // only a string or a list of strings and emits no message otherwise.
+  if let Expr::String(s) = &args[0] {
+    let chars: Vec<Expr> =
+      s.chars().map(|c| Expr::String(c.to_string())).collect();
+    return Ok(Expr::List(chars.into()));
+  }
+  Ok(unevaluated("Characters", args))
+}
+
+/// StringRiffle[list] or StringRiffle[list, sep] or StringRiffle[list, {left, sep, right}]
+/// or StringRiffle[list, sep_outer, sep_inner, ...] for nested lists.
+pub fn string_riffle_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Err(InterpreterError::EvaluationError(
+      "StringRiffle expects at least 1 argument".into(),
+    ));
+  }
+
+  // A non-list first argument reports StringRiffle::list and stays
+  // unevaluated (see guard_string_subject); aborting the evaluation here
+  // would kill the whole script.
+  if let Some(refused) = guard_string_subject("StringRiffle", args) {
+    return refused;
+  }
+
+  // Build the effective separator list. If none provided, use defaults
+  // matching the nesting depth of the input: innermost " ", then "\n",
+  // then "\n\n", "\n\n\n", ...
+  let owned_default_seps: Vec<Expr>;
+  let sep_slice: &[Expr] = if args.len() == 1 {
+    let depth = list_depth(&args[0]);
+    owned_default_seps = (0..depth)
+      .rev()
+      .map(|i| match i {
+        0 => Expr::String(" ".to_string()),
+        n => Expr::String("\n".repeat(n)),
+      })
+      .collect();
+    &owned_default_seps
+  } else {
+    &args[1..]
+  };
+
+  let result = string_riffle_recursive(&args[0], sep_slice)?;
+  Ok(Expr::String(result))
+}
+
+/// Returns the maximum nesting depth of Lists in `expr`.
+/// A non-list has depth 0; `{a, b}` (atoms) has depth 1; `{{a}}` has depth 2.
+fn list_depth(expr: &Expr) -> usize {
+  match expr {
+    Expr::List(items) => 1 + items.iter().map(list_depth).max().unwrap_or(0),
+    _ => 0,
+  }
+}
+
+/// Renders `expr` as a plain string, stripping quotes from string children.
+/// Lists are rendered as `{a, b, c}` with elements separated by `", "`.
+fn expr_to_plain_string(expr: &Expr) -> String {
+  match expr {
+    Expr::List(items) => {
+      let parts: Vec<String> = items.iter().map(expr_to_plain_string).collect();
+      format!("{{{}}}", parts.join(", "))
+    }
+    _ => expr_to_str(expr),
+  }
+}
+
+/// Recursively riffle `expr` using `seps` as the separator stack from outer
+/// to inner. When `seps` runs out, non-list elements are stringified and
+/// list elements are rendered with plain list notation.
+fn string_riffle_recursive(
+  expr: &Expr,
+  seps: &[Expr],
+) -> Result<String, InterpreterError> {
+  match expr {
+    Expr::List(items) if !seps.is_empty() => {
+      // Parse the current separator: either a string or a {left, sep, right}
+      // triple.
+      let (left, sep, right) = match &seps[0] {
+        Expr::List(triple) if triple.len() == 3 => (
+          expr_to_str(&triple[0]),
+          expr_to_str(&triple[1]),
+          expr_to_str(&triple[2]),
+        ),
+        other => (String::new(), expr_to_str(other), String::new()),
+      };
+      let rest = &seps[1..];
+      let parts: Result<Vec<String>, _> = items
+        .iter()
+        .map(|it| string_riffle_recursive(it, rest))
+        .collect();
+      Ok(format!("{}{}{}", left, parts?.join(&sep), right))
+    }
+    _ => Ok(expr_to_plain_string(expr)),
+  }
+}
+
+/// StringPosition[s, sub] - find all positions of substring
+pub fn string_position_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringPosition expects at least 2 arguments".into(),
+    ));
+  }
+
+  // Thread over a list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| {
+        let mut call = vec![s.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_position_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+  // Trailing arguments: an optional count limit (Integer) and/or an
+  // `Overlaps -> True | False | All` option. StringPosition reports
+  // overlapping matches by default.
+  let mut max_results: Option<usize> = None;
+  let overlaps = parse_overlaps_option(&args[2..], Overlaps::Yes);
+  for a in &args[2..] {
+    if !matches!(a, Expr::Rule { .. })
+      && let Ok(n) = expr_to_int(a)
+    {
+      max_results = Some(n as usize);
+    }
+  }
+  // IgnoreCase -> True makes the pattern match regardless of case: the regex
+  // path gets the `(?i)` flag and the literal path compares case-folded.
+  let ignore_case = has_ignore_case_option(args);
+
+  // Resolve the pattern to a regex. Plain string literals (and lists of
+  // them) use the exact literal path below; RegularExpression and every other
+  // string pattern (character classes, Alternatives, `_?test`, lists
+  // containing patterns, …) go through the shared pattern → regex converter.
+  let (regex_pat, pat_constraints): (Option<String>, Vec<(String, String)>) =
+    if let Some(rp) = extract_regex_pattern(&args[1]) {
+      (Some(rp), Vec::new())
+    } else if is_literal_string_pattern(&args[1]) {
+      (None, Vec::new())
+    } else if let Some((rp, c)) = string_pattern_to_regex_with_state(&args[1]) {
+      (Some(rp), c)
+    } else {
+      (None, Vec::new())
+    };
+
+  let s_chars: Vec<char> = s.chars().collect();
+  // For each match: (start_index_0based, length_in_chars)
+  let mut raw_matches: Vec<(usize, usize)> = Vec::new();
+
+  // Bare conditional pattern: `patt /; test`. Match the inner pattern at each
+  // position and keep the span only when the `/;` test (with captures
+  // substituted in) evaluates to True.
+  if let Expr::FunctionCall { name, args: cargs } = &args[1]
+    && name == "Condition"
+    && cargs.len() == 2
+    && let Some((regex_str, _)) = string_pattern_to_regex_with_state(&cargs[0])
+  {
+    let test = &cargs[1];
+    let pat = if ignore_case {
+      format!("(?i){regex_str}")
+    } else {
+      regex_str
+    };
+    if let Ok(re) = compile_regex(&pat) {
+      for start_char in 0..s_chars.len() {
+        let byte_offset: usize =
+          s_chars[..start_char].iter().map(|c| c.len_utf8()).sum();
+        if let Some(caps) = re.captures_at(&s, byte_offset)
+          && let Some(m) = caps.get(0)
+          && m.start() == byte_offset
+          && !m.as_str().is_empty()
+        {
+          let test_sub = substitute_captures(test, &caps);
+          let test_val = crate::evaluator::evaluate_expr_to_expr(&test_sub)?;
+          if matches!(&test_val, Expr::Identifier(t) if t == "True") {
+            raw_matches.push((start_char, m.as_str().chars().count()));
+          }
+        }
+      }
+    }
+  } else if let Some(pat) = regex_pat.as_ref() {
+    // Regex-based matching: find all overlapping matches
+    let pat = if ignore_case {
+      format!("(?i){pat}")
+    } else {
+      pat.clone()
+    };
+    if overlaps == Overlaps::All {
+      // Every match at every start position, already in report order.
+      let byte_to_char: std::collections::HashMap<usize, usize> = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
+        .enumerate()
+        .map(|(ci, bi)| (bi, ci))
+        .collect();
+      let spans = all_overlap_spans(&pat, &pat_constraints, &s)?;
+      let mut positions = Vec::new();
+      for (bs, be) in spans {
+        if let Some(max) = max_results
+          && positions.len() >= max
+        {
+          break;
+        }
+        let start = byte_to_char[&bs];
+        let end = byte_to_char[&be];
+        positions.push(Expr::List(
+          vec![
+            Expr::Integer((start + 1) as i128),
+            Expr::Integer(end as i128),
+          ]
+          .into(),
+        ));
+      }
+      return Ok(Expr::List(positions.into()));
+    }
+    if let Ok(re) = compile_regex(&pat) {
+      for start_char in 0..s_chars.len() {
+        // Get byte offset for this character position
+        let byte_offset: usize =
+          s_chars[..start_char].iter().map(|c| c.len_utf8()).sum();
+        let substr = &s[byte_offset..];
+        if let Some(caps) = re.captures(substr)
+          && let Some(m) = caps.get(0)
+          && m.start() == 0
+          && !m.as_str().is_empty()
+          && caps_satisfy_constraints(&caps, &pat_constraints)
+        {
+          let match_chars = m.as_str().chars().count();
+          raw_matches.push((start_char, match_chars));
+        }
+      }
+    }
+  } else {
+    // Literal substring matching
+    let subs: Vec<String> = match &args[1] {
+      Expr::List(items) => {
+        let mut v = Vec::with_capacity(items.len());
+        for it in items {
+          v.push(expr_to_str(it));
+        }
+        v
+      }
+      _ => vec![expr_to_str(&args[1])],
+    };
+
+    for sub in &subs {
+      if sub.is_empty() {
+        // An empty pattern matches (with length 0) before every character and
+        // once after the last, giving the n+1 positions {i, i-1} — matching
+        // wolframscript's `StringPosition["ab", ""]` -> {{1,0},{2,1},{3,2}}.
+        for i in 0..=s_chars.len() {
+          raw_matches.push((i, 0));
+        }
+        continue;
+      }
+      let sub_chars: Vec<char> = sub.chars().collect();
+      if sub_chars.len() > s_chars.len() {
+        continue;
+      }
+      for i in 0..=s_chars.len() - sub_chars.len() {
+        let mut matched = true;
+        for (j, &sub_char) in sub_chars.iter().enumerate() {
+          let c = s_chars[i + j];
+          let eq = c == sub_char
+            || (ignore_case && c.to_lowercase().eq(sub_char.to_lowercase()));
+          if !eq {
+            matched = false;
+            break;
+          }
+        }
+        if matched {
+          raw_matches.push((i, sub_chars.len()));
+        }
+      }
+    }
+  }
+
+  // Sort by start position, then by length, and drop duplicates so that
+  // multiple alternatives matching at the same span don't yield repeats.
+  raw_matches.sort_unstable();
+  raw_matches.dedup();
+
+  // `Overlaps -> False` keeps matches greedily left-to-right, skipping any
+  // that begin before the end of the previously kept match.
+  if !overlaps.overlapping() {
+    let mut filtered: Vec<(usize, usize)> = Vec::new();
+    let mut next_start = 0usize;
+    for (start, len) in raw_matches {
+      if start >= next_start {
+        filtered.push((start, len));
+        next_start = start + len;
+      }
+    }
+    raw_matches = filtered;
+  }
+
+  let mut positions = Vec::new();
+  for (start, len) in raw_matches {
+    if let Some(max) = max_results
+      && positions.len() >= max
+    {
+      break;
+    }
+    let s1 = (start + 1) as i128;
+    let e1 = (start + len) as i128;
+    positions.push(Expr::List(
+      vec![Expr::Integer(s1), Expr::Integer(e1)].into(),
+    ));
+  }
+
+  Ok(Expr::List(positions.into()))
+}
+
+/// StringMatchQ[s, pattern] - test if string matches pattern
+/// StringMatchQ[s, pattern, IgnoreCase -> True] - case-insensitive
+pub fn string_match_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringMatchQ expects 2 or 3 arguments".into(),
+    ));
+  }
+
+  // Thread over a list of strings: StringMatchQ[{s1, s2, ...}, pat]
+  // returns {StringMatchQ[s1, pat], StringMatchQ[s2, pat], ...}.
+  if let Expr::List(items) = &args[0] {
+    let mut result: Vec<Expr> = Vec::with_capacity(items.len());
+    for item in items {
+      let mut sub_args: Vec<Expr> = Vec::with_capacity(args.len());
+      sub_args.push(item.clone());
+      sub_args.extend(args[1..].iter().cloned());
+      result.push(string_match_q_ast(&sub_args)?);
+    }
+    return Ok(Expr::List(result.into()));
+  }
+
+  let ignore_case = has_ignore_case_option(args);
+  let s = if ignore_case {
+    expr_to_str(&args[0]).to_lowercase()
+  } else {
+    expr_to_str(&args[0])
+  };
+
+  // Try pattern-based matching (DigitCharacter, LetterCharacter, Repeated, etc.)
+  if let Some((regex_str, constraints)) =
+    string_pattern_to_regex_with_state(&args[1])
+  {
+    let case_flag = if ignore_case { "(?i)" } else { "" };
+    let full_regex = format!("{case_flag}^(?:{regex_str})$");
+    let re = compile_regex(&full_regex).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid string pattern: {e}"))
+    })?;
+    return Ok(Expr::Identifier(
+      if full_match_with_constraints(&re, &constraints, &s) {
+        "True"
+      } else {
+        "False"
+      }
+      .to_string(),
+    ));
+  }
+
+  // Try RegularExpression pattern
+  if let Some(pat) = extract_regex_pattern(&args[1]) {
+    let case_flag = if ignore_case { "(?i)" } else { "" };
+    let full_regex = format!("{case_flag}^(?:{pat})$");
+    let re = compile_regex(&full_regex).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid regex: {e}"))
+    })?;
+    return Ok(bool_expr(re.is_match(&s)));
+  }
+
+  // Fall back to string-based wildcard matching
+  let pattern_str = if ignore_case {
+    expr_to_str(&args[1]).to_lowercase()
+  } else {
+    expr_to_str(&args[1])
+  };
+  let matches = wildcard_match(&s, &pattern_str);
+  Ok(bool_expr(matches))
+}
+
+/// Simple wildcard matching
+fn wildcard_match(s: &str, pattern: &str) -> bool {
+  let s_chars: Vec<char> = s.chars().collect();
+  let p_chars: Vec<char> = pattern.chars().collect();
+
+  fn is_non_uppercase(c: char) -> bool {
+    !c.is_ascii_uppercase()
+  }
+
+  fn match_helper(s: &[char], p: &[char]) -> bool {
+    match (s.is_empty(), p.is_empty()) {
+      (true, true) => true,
+      (_, true) => false,
+      (true, false) => p.iter().all(|&c| c == '*'),
+      (false, false) => match p[0] {
+        '*' => match_helper(s, &p[1..]) || match_helper(&s[1..], p),
+        '@' => {
+          if !is_non_uppercase(s[0]) {
+            return false;
+          }
+          match_helper(&s[1..], &p[1..]) || match_helper(&s[1..], p)
+        }
+        c => s[0] == c && match_helper(&s[1..], &p[1..]),
+      },
+    }
+  }
+
+  match_helper(&s_chars, &p_chars)
+}
+
+/// StringReverse[s] - reverse the string
+pub fn string_reverse_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "StringReverse expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over lists (including nested lists) like Wolfram does.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| string_reverse_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  // Only a string is reversed. Any other expression emits StringReverse::string
+  // and stays unevaluated (matching Wolfram, which reports the offending value
+  // as `StringReverse[value]` at position 1).
+  if let Expr::String(s) = &args[0] {
+    return Ok(Expr::String(s.chars().rev().collect()));
+  }
+  let unevaluated = unevaluated("StringReverse", args);
+  crate::emit_message(&format!(
+    "StringReverse::string: String expected at position 1 in {}.",
+    crate::syntax::format_expr(&unevaluated, crate::syntax::ExprForm::Output)
+  ));
+  Ok(unevaluated)
+}
+
+/// StringRepeat[s, n] - repeat string n times
+pub fn string_repeat_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringRepeat expects 2 or 3 arguments".into(),
+    ));
+  }
+  let s = expr_to_str(&args[0]);
+  // Both counts have to be whole and not negative; zero is allowed and
+  // gives the empty string, despite what the message calls for.
+  let count = |position: usize| -> Option<usize> {
+    let value = expr_to_int(&args[position - 1]).ok().filter(|n| *n >= 0);
+    if value.is_none() {
+      crate::emit_message(&format!(
+        "StringRepeat::intp: Positive integer expected at position {} in {}.",
+        position,
+        crate::syntax::format_expr(
+          &unevaluated("StringRepeat", args),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+    }
+    value.map(|n| n as usize)
+  };
+  let Some(n) = count(2) else {
+    return Ok(unevaluated("StringRepeat", args));
+  };
+  let repeated = s.repeat(n);
+  if args.len() == 3 {
+    // Third argument is the length to truncate to.
+    let Some(max_len) = count(3) else {
+      return Ok(unevaluated("StringRepeat", args));
+    };
+    let truncated: String = repeated.chars().take(max_len).collect();
+    Ok(Expr::String(truncated))
+  } else {
+    Ok(Expr::String(repeated))
+  }
+}
+
+/// StringTrim[s] or StringTrim[s, patt] - trim whitespace or pattern
+pub fn string_trim_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringTrim expects 1 or 2 arguments".into(),
+    ));
+  }
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_trim_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+
+  if args.len() == 1 {
+    Ok(Expr::String(s.trim().to_string()))
+  } else if let Expr::String(patt) = &args[1] {
+    // Plain string literal: strip one occurrence from each end
+    let trimmed = s.strip_prefix(patt.as_str()).unwrap_or(&s);
+    let trimmed = trimmed.strip_suffix(patt.as_str()).unwrap_or(trimmed);
+    Ok(Expr::String(trimmed.to_string()))
+  } else if let Some((regex_pat, constraints)) =
+    string_pattern_to_regex_with_state(&args[1])
+  {
+    // String pattern (Repeated, Whitespace, etc.): use regex, stripping a
+    // leading and a trailing match only when it satisfies any back-reference
+    // constraints (`x_ ~~ x_`).
+    let start_re =
+      compile_regex(&format!("^(?:{regex_pat})")).map_err(|e| {
+        InterpreterError::EvaluationError(format!("Invalid pattern: {e}"))
+      })?;
+    let end_re = compile_regex(&format!("(?:{regex_pat})$")).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid pattern: {e}"))
+    })?;
+    let after_start = if let Some(caps) = start_re.captures(&s)
+      && let Some(m) = caps.get(0)
+      && !m.as_str().is_empty()
+      && caps_satisfy_constraints(&caps, &constraints)
+    {
+      s[m.end()..].to_string()
+    } else {
+      s.clone()
+    };
+    let trimmed = if let Some(caps) = end_re.captures(&after_start)
+      && let Some(m) = caps.get(0)
+      && !m.as_str().is_empty()
+      && caps_satisfy_constraints(&caps, &constraints)
+    {
+      after_start[..m.start()].to_string()
+    } else {
+      after_start
+    };
+    Ok(Expr::String(trimmed))
+  } else {
+    // Unrecognized pattern: return unevaluated
+    Ok(unevaluated("StringTrim", args))
+  }
+}
+
+/// Substitute named captures into an expression, replacing pattern variable
+/// identifiers with matched string values.
+fn substitute_captures(expr: &Expr, captures: &Captures) -> Expr {
+  match expr {
+    Expr::Identifier(name) => {
+      if let Some(m) = captures.name(name) {
+        Expr::String(m.as_str().to_string())
+      } else {
+        expr.clone()
+      }
+    }
+    Expr::FunctionCall { name, args } => {
+      let new_args: Vec<Expr> = args
+        .iter()
+        .map(|a| substitute_captures(a, captures))
+        .collect();
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args.into(),
+      }
+    }
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(substitute_captures(left, captures)),
+      right: Box::new(substitute_captures(right, captures)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(substitute_captures(operand, captures)),
+    },
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(|a| substitute_captures(a, captures))
+        .collect(),
+    ),
+    // A rule (or delayed rule) RHS such as `w -> d` must have its pattern
+    // variables substituted on both sides, not be left verbatim.
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => Expr::Rule {
+      pattern: Box::new(substitute_captures(pattern, captures)),
+      replacement: Box::new(substitute_captures(replacement, captures)),
+    },
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => Expr::RuleDelayed {
+      pattern: Box::new(substitute_captures(pattern, captures)),
+      replacement: Box::new(substitute_captures(replacement, captures)),
+    },
+    Expr::Comparison {
+      operands,
+      operators,
+    } => Expr::Comparison {
+      operands: operands
+        .iter()
+        .map(|a| substitute_captures(a, captures))
+        .collect(),
+      operators: operators.clone(),
+    },
+    Expr::Association(pairs) => Expr::Association(
+      pairs
+        .iter()
+        .map(|(k, v)| {
+          (
+            substitute_captures(k, captures),
+            substitute_captures(v, captures),
+          )
+        })
+        .collect(),
+    ),
+    _ => expr.clone(),
+  }
+}
+
+/// Convert a bare (top-level) string pattern using Wolfram's metacharacter
+/// shorthand: `*` matches any sequence and `@` matches one-or-more
+/// non-uppercase characters. Every other character is matched literally.
+fn bare_string_metachars_to_regex(s: &str) -> String {
+  let mut result = String::new();
+  for ch in s.chars() {
+    match ch {
+      '*' => result.push_str(".*"),
+      '@' => result.push_str("[^A-Z]+"),
+      _ => result.push_str(&regex::escape(&ch.to_string())),
+    }
+  }
+  result
+}
+
+/// Append `?` to every greedy quantifier in `regex` so repetition matches
+/// the shortest substring. Skips quantifiers that are already lazy, leaves a
+/// standalone `?` (optional) untouched, and never touches escaped literals
+/// (e.g. `\*` / `\+`, which are literal characters, not quantifiers).
+fn make_non_greedy(regex: &str) -> String {
+  let bytes = regex.as_bytes();
+  let mut out = String::with_capacity(bytes.len() + 4);
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes[i];
+    if b == b'\\' && i + 1 < bytes.len() {
+      // Escaped character: copy the backslash and its target verbatim; the
+      // escaped char is a literal, never a quantifier.
+      out.push('\\');
+      out.push(bytes[i + 1] as char);
+      i += 2;
+      continue;
+    }
+    out.push(b as char);
+    let next = bytes.get(i + 1).copied();
+    let make_lazy = match b {
+      b'+' | b'*' => next != Some(b'?'),
+      b'}' => {
+        // Only quantifier `{..}` (not a literal brace) should be lazy.
+        // Determine if we're closing a quantifier by scanning backward to
+        // the matching `{` and ensuring the content is digits/commas.
+        let mut j = i;
+        let mut found_open = false;
+        while j > 0 {
+          j -= 1;
+          let c = bytes[j];
+          if c == b'{' {
+            found_open = true;
+            break;
+          }
+          if !(c.is_ascii_digit() || c == b',') {
+            break;
+          }
+        }
+        found_open && next != Some(b'?')
+      }
+      _ => false,
+    };
+    if make_lazy {
+      out.push('?');
+    }
+    i += 1;
+  }
+  out
+}
+
+/// Compute the set-difference of two regex character classes (`base \ excluded`)
+/// when both are simple bracket forms like `[a-zA-Z0-9\p{L}]`. Returns a
+/// regex string representing only the atoms present in `base` but not in
+/// `excluded`. Returns None if either side is not a single bracket class.
+fn char_class_difference(excluded: &str, base: &str) -> Option<String> {
+  let parse = |s: &str| -> Option<Vec<String>> {
+    let body = s.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+    if body.starts_with('^') {
+      // Negated classes are not currently supported here.
+      return None;
+    }
+    let mut atoms: Vec<String> = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+      let c = chars[i];
+      if c == '\\' && i + 1 < chars.len() {
+        // Escape sequence: \p{L}, \w, \d, \s, \\, etc.
+        let next = chars[i + 1];
+        if next == 'p' || next == 'P' {
+          // \p{...} — capture through closing brace.
+          let mut j = i + 2;
+          if j < chars.len() && chars[j] == '{' {
+            while j < chars.len() && chars[j] != '}' {
+              j += 1;
+            }
+            if j < chars.len() {
+              j += 1; // include }
+              atoms.push(chars[i..j].iter().collect());
+              i = j;
+              continue;
+            }
+          }
+          atoms.push(format!("\\{next}"));
+          i += 2;
+          continue;
+        }
+        atoms.push(format!("\\{next}"));
+        i += 2;
+        continue;
+      }
+      // Range like a-z?
+      if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i + 2] != ']' {
+        atoms.push(format!("{}-{}", c, chars[i + 2]));
+        i += 3;
+        continue;
+      }
+      atoms.push(c.to_string());
+      i += 1;
+    }
+    Some(atoms)
+  };
+
+  let excluded_atoms = parse(excluded)?;
+  let base_atoms = parse(base)?;
+  let kept: Vec<String> = base_atoms
+    .into_iter()
+    .filter(|a| !excluded_atoms.contains(a))
+    .collect();
+  if kept.is_empty() {
+    return Some(r"(?!.)".to_string());
+  }
+  Some(format!("[{}]", kept.join("")))
+}
+
+/// True if `name` is usable as a Rust regex named-capture identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Wolfram pattern variables that contain
+/// special characters can't round-trip as regex group names — fall back
+/// to a non-capturing group in that case.
+fn is_valid_regex_capture_name(name: &str) -> bool {
+  let mut chars = name.chars();
+  match chars.next() {
+    Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+    _ => return false,
+  }
+  chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Tracks pattern-variable bindings while translating a Wolfram string
+/// pattern to a regex. Repeated pattern names are realised as Wolfram-style
+/// back-references: the second occurrence reuses the first occurrence's
+/// regex body (so e.g. `x : WordCharacter .. ~~ "-" ~~ x_` matches the same
+/// run on both sides of the dash), and the resulting (orig, dup) capture-name
+/// pair is recorded so callers can post-filter matches whose captures don't
+/// actually agree.
+struct PatternState {
+  /// Maps a pattern name to the regex body of its first occurrence.
+  first_body: std::collections::HashMap<String, String>,
+  /// Counter used to name duplicate captures uniquely (`name__dupN`).
+  dup_counter: usize,
+  /// Pairs `(original_capture_name, duplicate_capture_name)` whose captures
+  /// must compare equal for the overall match to be accepted.
+  constraints: Vec<(String, String)>,
+}
+
+impl PatternState {
+  fn new() -> Self {
+    Self {
+      first_body: std::collections::HashMap::new(),
+      dup_counter: 0,
+      constraints: Vec::new(),
+    }
+  }
+}
+
+/// Public entry point: builds the regex and discards any back-reference
+/// constraints (callers that need them should use
+/// `string_pattern_to_regex_with_state` instead).
+fn string_pattern_to_regex(expr: &Expr) -> Option<String> {
+  string_pattern_to_regex_with_state(expr).map(|(s, _)| s)
+}
+
+/// Like `string_pattern_to_regex` but also returns the list of `(orig, dup)`
+/// capture-name pairs that must agree for a regex match to be considered a
+/// real Wolfram pattern match.
+fn string_pattern_to_regex_with_state(
+  expr: &Expr,
+) -> Option<(String, Vec<(String, String)>)> {
+  let mut state = PatternState::new();
+  // A bare string pattern uses Wolfram's metacharacter shorthand (`*` matches
+  // any run, `@` matches one-or-more non-uppercase). Strings nested inside a
+  // compound pattern (StringExpression via `~~`, Shortest, …) match literally,
+  // so this only fires when the whole pattern is a single string.
+  let regex = if let Expr::String(s) = expr {
+    bare_string_metachars_to_regex(s)
+  } else {
+    string_pattern_to_regex_inner(expr, &mut state)?
+  };
+  // Enable the "dot matches newline" flag so blanks (`.`, `.+`, `.*`) and `*`
+  // span newlines, matching Wolfram string patterns — e.g. Shortest[___]
+  // stripping a multi-line block comment.
+  Some((format!("(?s){regex}"), state.constraints))
+}
+
+/// Wrap a regex body in a named capture group. On a repeated name, reuse the
+/// first occurrence's regex body (so the duplicate matches the *same* shape
+/// as the original) and record a constraint that the captured substrings
+/// must compare equal — emulating Wolfram's pattern back-references on top
+/// of the Rust `regex` crate, which has no native backreference support.
+fn maybe_named_group(
+  name: &str,
+  body: &str,
+  state: &mut PatternState,
+) -> String {
+  if !is_valid_regex_capture_name(name) {
+    return format!("(?:{body})");
+  }
+  if let Some(first_body) = state.first_body.get(name).cloned() {
+    let dup_name = format!("{}__dup{}", name, state.dup_counter);
+    state.dup_counter += 1;
+    state.constraints.push((name.to_string(), dup_name.clone()));
+    format!("(?P<{dup_name}>{first_body})")
+  } else {
+    state.first_body.insert(name.to_string(), body.to_string());
+    format!("(?P<{name}>{body})")
+  }
+}
+
+/// Do the regex `caps` satisfy all back-reference `constraints` — i.e. every
+/// repeated Wolfram pattern name (`x_ ~~ … ~~ x_`) captured equal substrings?
+/// The `regex` crate has no native backreferences, so `maybe_named_group`
+/// records these `(orig, dup)` capture-name pairs and matching sites verify
+/// them here. A missing capture (optional group didn't participate) is treated
+/// as satisfied.
+fn caps_satisfy_constraints(
+  caps: &Captures,
+  constraints: &[(String, String)],
+) -> bool {
+  constraints.iter().all(|(orig, dup)| {
+    match (caps.name(orig), caps.name(dup)) {
+      (Some(a), Some(b)) => a.as_str() == b.as_str(),
+      _ => true,
+    }
+  })
+}
+
+/// The regex source for a string-pattern expression (with the `(?i)`
+/// case-insensitivity flag applied when requested) plus its back-reference
+/// constraints. Returns `None` when `expr` is not a recognised string pattern.
+fn string_pattern_regex_source(
+  expr: &Expr,
+  ignore_case: bool,
+) -> Option<(String, Vec<(String, String)>)> {
+  let (regex_str, constraints) = string_pattern_to_regex_with_state(expr)?;
+  Some((
+    if ignore_case {
+      format!("(?i){regex_str}")
+    } else {
+      regex_str
+    },
+    constraints,
+  ))
+}
+
+/// Compile a string-pattern expression to a regex plus its back-reference
+/// constraints, applying the `(?i)` case-insensitivity flag when requested.
+/// Returns `None` when `expr` is not a recognised string pattern.
+fn compile_string_pattern(
+  expr: &Expr,
+  ignore_case: bool,
+) -> Option<Result<(WoxiRegex, Vec<(String, String)>), InterpreterError>> {
+  let (regex_str, constraints) =
+    string_pattern_regex_source(expr, ignore_case)?;
+  Some(
+    compile_regex(&regex_str)
+      .map(|re| (re, constraints))
+      .map_err(|e| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid string pattern: {e}"
+        ))
+      }),
+  )
+}
+
+/// Is `expr` something `ReadString` accepts as a terminator?
+///
+/// wolframscript takes a string, an `Alternatives` or `StringExpression` of
+/// any parts, a blank, and a character class, but refuses a bare anchor or
+/// repeat: `ReadString[s, StartOfLine ~~ "c"]` reads, `ReadString[s,
+/// StartOfLine]` reports `ReadString::iterm`. The head is what decides —
+/// `EndOfLine` alone is refused, `EndOfLine | "\r"` is not.
+pub(crate) fn is_read_terminator(expr: &Expr) -> bool {
+  match expr {
+    Expr::String(_) => true,
+    Expr::Identifier(name) | Expr::Constant(name) => matches!(
+      name.as_str(),
+      "DigitCharacter"
+        | "LetterCharacter"
+        | "WordCharacter"
+        | "WhitespaceCharacter"
+        | "HexadecimalCharacter"
+        | "PunctuationCharacter"
+    ),
+    Expr::Pattern { .. } => true,
+    Expr::FunctionCall { name, .. } => matches!(
+      name.as_str(),
+      "StringExpression"
+        | "Alternatives"
+        | "Blank"
+        | "BlankSequence"
+        | "BlankNullSequence"
+    ),
+    _ => false,
+  }
+}
+
+/// The byte range of the first match of the string pattern `pattern` inside
+/// `text`, searching from `from`. `None` when it does not match.
+///
+/// Anchors are resolved against the whole of `text`, not against the tail
+/// being searched, so a `StartOfLine` in the pattern means a real line start.
+/// `ReadString` uses this to stop at a pattern terminator.
+pub(crate) fn first_string_pattern_match(
+  text: &str,
+  from: usize,
+  pattern: &Expr,
+) -> Option<std::ops::Range<usize>> {
+  let (re, constraints) = compile_string_pattern(pattern, false)?.ok()?;
+  let mut i = from;
+  loop {
+    let caps = re.captures_at(text, i)?;
+    let m = caps.get(0)?;
+    if caps_satisfy_constraints(&caps, &constraints) {
+      return Some(m.range());
+    }
+    // Step one character past this match's start and look again.
+    let next = text[m.start()..].chars().next().map(char::len_utf8)?;
+    i = m.start() + next;
+    if i > text.len() {
+      return None;
+    }
+  }
+}
+
+/// Find all non-empty match spans (byte ranges) of `re` in `s` that satisfy the
+/// back-reference `constraints`. Scans left to right; with `overlapping` it
+/// advances one character past each match start, otherwise past the whole
+/// match. This is the constraint-aware analogue of `re.find_iter`.
+fn find_constraint_spans(
+  re: &WoxiRegex,
+  constraints: &[(String, String)],
+  s: &str,
+  overlapping: bool,
+) -> Vec<(usize, usize)> {
+  let mut spans = Vec::new();
+  let mut i = 0;
+  while i < s.len() {
+    if let Some(caps) = re.captures_at(s, i)
+      && let Some(m) = caps.get(0)
+      && m.start() == i
+      && !m.as_str().is_empty()
+      && caps_satisfy_constraints(&caps, constraints)
+    {
+      spans.push((m.start(), m.end()));
+      let ch = s[i..].chars().next().unwrap();
+      i = if overlapping {
+        i + ch.len_utf8()
+      } else {
+        m.end()
+      };
+    } else {
+      let ch = s[i..].chars().next().unwrap();
+      i += ch.len_utf8();
+    }
+  }
+  spans
+}
+
+/// The three settings of the `Overlaps` option shared by the string and
+/// sequence matching functions.
+///
+/// * `No` (`Overlaps -> False`) — keep matches greedily left to right, each
+///   one starting after the previous match ends.
+/// * `Yes` (`Overlaps -> True`) — report the preferred match at every start
+///   position, so matches may overlap.
+/// * `All` (`Overlaps -> All`) — report *every* match at every start position,
+///   not just the preferred one.
+///
+/// The default differs per function: `StringPosition`/`SequencePosition` report
+/// overlapping matches by default, `StringCases`/`StringCount`/`SequenceCases`/
+/// `SequenceCount` do not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Overlaps {
+  No,
+  Yes,
+  All,
+}
+
+impl Overlaps {
+  /// True when matches may start before the previous one ends.
+  pub(crate) fn overlapping(self) -> bool {
+    self != Self::No
+  }
+}
+
+/// Read the `Overlaps -> …` option out of the trailing arguments (which may
+/// also hold a count limit or other options), falling back to `default`.
+/// Unrecognised settings are ignored, as wolframscript ignores them too.
+pub(crate) fn parse_overlaps_option(
+  args: &[Expr],
+  default: Overlaps,
+) -> Overlaps {
+  let mut mode = default;
+  let mut visit = |arg: &Expr| {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = arg
+      && matches!(pattern.as_ref(), Expr::Identifier(n) if n == "Overlaps")
+      && let Expr::Identifier(v) = replacement.as_ref()
+    {
+      match v.as_str() {
+        "False" => mode = Overlaps::No,
+        "True" => mode = Overlaps::Yes,
+        "All" => mode = Overlaps::All,
+        _ => {}
+      }
+    }
+  };
+  for arg in args {
+    match arg {
+      Expr::List(items) => items.iter().for_each(&mut visit),
+      other => visit(other),
+    }
+  }
+  mode
+}
+
+/// `pat` wrapped so that it only matches a slice in its entirety — the probe
+/// `all_overlap_spans` uses to discover every match length at a start position.
+fn anchored_regex(pat: &str) -> Result<WoxiRegex, InterpreterError> {
+  compile_regex(&format!("\\A(?:{pat})\\z")).map_err(|e| {
+    InterpreterError::EvaluationError(format!("Invalid string pattern: {e}"))
+  })
+}
+
+/// Every span the pattern `pat` can match in `s`, in the order wolframscript's
+/// `Overlaps -> All` reports them: grouped by start position from left to
+/// right, and within one start position ordered by the pattern's own
+/// preference.
+///
+/// `Overlaps -> All` asks for all matches rather than the one preferred match
+/// per start position, so the single span the regex engine returns is not
+/// enough — every candidate end position has to be probed with the pattern
+/// anchored at both ends. The engine's preferred span then fixes the order
+/// within a start position: longest first when the preferred span is the
+/// longest candidate (greedy quantifiers, `Alternatives` written long to
+/// short), shortest first otherwise (`Shortest[…]`, alternatives written short
+/// to long).
+///
+/// Returned spans are byte ranges and may be empty, because `___` matches the
+/// empty string at every character boundary including the one past the last
+/// character. Zero-width assertions other than a leading `StartOfString` or a
+/// trailing `EndOfString` (notably `WordBoundary`) are evaluated against the
+/// probed slice rather than the whole string.
+fn all_overlap_spans(
+  pat: &str,
+  constraints: &[(String, String)],
+  s: &str,
+) -> Result<Vec<(usize, usize)>, InterpreterError> {
+  let re = compile_regex(pat).map_err(|e| {
+    InterpreterError::EvaluationError(format!("Invalid string pattern: {e}"))
+  })?;
+  let anchored = anchored_regex(pat)?;
+  // `\A` / `\z` in the pattern itself would match at the edges of every probed
+  // slice, so honour them by pinning the start / end position instead.
+  let mut body = pat;
+  while let Some(rest) = body.strip_prefix("(?") {
+    // Skip leading bare flag groups like `(?s)` / `(?i)`; a `(?:`/`(?s:` group
+    // is part of the pattern proper and must stay.
+    match rest.find(')') {
+      Some(end) if !rest[..end].contains(':') => body = &rest[end + 1..],
+      _ => break,
+    }
+  }
+  let pinned_start = body.starts_with("\\A");
+  let pinned_end = body.ends_with("\\z");
+
+  let mut bounds: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+  bounds.push(s.len());
+
+  let mut spans: Vec<(usize, usize)> = Vec::new();
+  for (bi, &start) in bounds.iter().enumerate() {
+    if pinned_start && start != 0 {
+      break;
+    }
+    // Candidate lengths, ascending.
+    let mut lens: Vec<usize> = Vec::new();
+    for &end in &bounds[bi..] {
+      if pinned_end && end != s.len() {
+        continue;
+      }
+      if full_match_with_constraints(&anchored, constraints, &s[start..end]) {
+        lens.push(end - start);
+      }
+    }
+    if lens.is_empty() {
+      continue;
+    }
+    let preferred = re
+      .captures_at(s, start)
+      .filter(|caps| caps_satisfy_constraints(caps, constraints))
+      .and_then(|caps| caps.get(0))
+      .filter(|m| m.start() == start)
+      .map(|m| m.end() - start);
+    // The preferred length comes first; when it is the longest candidate the
+    // pattern is greedy, so the rest follow descending.
+    if preferred != Some(lens[0]) {
+      lens.reverse();
+    }
+    spans.extend(lens.into_iter().map(|len| (start, start + len)));
+  }
+  Ok(spans)
+}
+
+/// One match of one rule, as `Overlaps -> All` enumerates them.
+struct RuleMatch<'a> {
+  /// Byte range of the matched substring within the subject.
+  span: (usize, usize),
+  /// Captures of the match, for substituting the rule's right-hand side.
+  caps: Captures<'a>,
+  /// The rule's right-hand side.
+  rhs: &'a Expr,
+  /// Whether `$0`/`$1`/… in the right-hand side expand (`RegularExpression`).
+  expand_dollar: bool,
+}
+
+/// Every match of every rule in `rules`, in the order `Overlaps -> All`
+/// reports them: grouped by start position from left to right, with the rules
+/// tried in their written order within one start position. At most `limit`
+/// matches are returned.
+///
+/// `rules` holds the `(pattern regex, back-reference constraints, right-hand
+/// side, expand `$n`)` tuples that `extract_cases_rules` produces.
+fn all_rule_matches<'a>(
+  s: &'a str,
+  rules: &'a [(String, Vec<(String, String)>, Expr, bool)],
+  ignore_case: bool,
+  limit: usize,
+) -> Result<Vec<RuleMatch<'a>>, InterpreterError> {
+  // Per rule: the both-ends-anchored probe and the spans it matches.
+  let mut per_rule = Vec::with_capacity(rules.len());
+  for (pat, constraints, rhs, expand_dollar) in rules {
+    let pat = if ignore_case {
+      format!("(?i){pat}")
+    } else {
+      pat.clone()
+    };
+    per_rule.push((
+      anchored_regex(&pat)?,
+      all_overlap_spans(&pat, constraints, s)?,
+      rhs,
+      *expand_dollar,
+    ));
+  }
+  let mut out: Vec<RuleMatch<'a>> = Vec::new();
+  for start in s.char_indices().map(|(i, _)| i).chain([s.len()]) {
+    for (anchored, spans, rhs, expand_dollar) in &per_rule {
+      for &(bs, be) in spans.iter().filter(|(bs, _)| *bs == start) {
+        if out.len() >= limit {
+          return Ok(out);
+        }
+        // The span came from this very probe, so it always matches again; the
+        // second pass is only to recover the capture groups.
+        let Some(caps) = anchored.captures(&s[bs..be]) else {
+          continue;
+        };
+        out.push(RuleMatch {
+          span: (bs, be),
+          caps,
+          rhs,
+          expand_dollar: *expand_dollar,
+        });
+      }
+    }
+  }
+  Ok(out)
+}
+
+/// True if `re` (anchored with `^…$` by the caller) matches all of `s` while
+/// satisfying the back-reference `constraints`.
+fn full_match_with_constraints(
+  re: &WoxiRegex,
+  constraints: &[(String, String)],
+  s: &str,
+) -> bool {
+  match re.captures(s) {
+    Some(caps) => caps_satisfy_constraints(&caps, constraints),
+    None => false,
+  }
+}
+
+/// True if `re` is a regex body that matches exactly one character — either
+/// a single non-metacharacter, or a backslash escape of one character. Used
+/// by `Except[c]` to lift the inner pattern into a negated character class
+/// (`[^c]`), which composes with `..` quantifiers in the Rust `regex` crate
+/// without requiring look-around.
+fn is_single_char_atom(re: &str) -> bool {
+  let mut chars = re.chars();
+  match (chars.next(), chars.next(), chars.next()) {
+    (Some(c), None, _) => !"\\^$.|?*+()[]{}".contains(c),
+    (Some('\\'), Some(_), None) => true,
+    _ => false,
+  }
+}
+
+/// Convert a Wolfram string pattern expression to a regex pattern string.
+/// Returns None if the expression is not a recognized string pattern.
+/// The regex for one DatePattern element name, or None for strings that
+/// are not element names (they match literally). Ranges are purely
+/// numeric — wolframscript accepts "31/4" and "2/30" (no calendar logic)
+/// but rejects month 13, day 32, hour 24, minute/second 60.
+fn date_pattern_element_regex(name: &str) -> Option<&'static str> {
+  // The alternatives run longest first: the engine takes the leftmost one
+  // that matches, so `0?[1-9]` ahead of `[12][0-9]` would read only the "1"
+  // of a day written "15".
+  Some(match name {
+    "Year" => "[0-9]{1,4}",
+    "Month" => "(?:1[0-2]|0?[1-9])",
+    "Day" => "(?:3[01]|[12][0-9]|0?[1-9])",
+    "Hour" | "Hour24" => "(?:2[0-3]|1[0-9]|0?[0-9])",
+    "Hour12" => "(?:1[0-2]|0?[1-9])",
+    "Minute" => "(?:[0-5]?[0-9])",
+    "Second" => "(?:[0-5]?[0-9])",
+    // Case-insensitive, longest alternatives first so StringCases
+    // captures full names.
+    "DayName" => {
+      "(?i:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)"
+    }
+    "MonthName" => {
+      "(?i:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)"
+    }
+    _ => return None,
+  })
+}
+
+/// DatePattern[{e1, e2, …}] / DatePattern[{…}, sep] as a regex. Element
+/// names become their field regexes; other strings match literally. A
+/// single separator (the default class [/-.:], or the given pattern)
+/// is required between two adjacent field elements — never next to a
+/// literal (wolframscript-verified: "2024-01/05" matches Year/Month/Day,
+/// "2024--01--05" and "2024 01 05" do not).
+fn date_pattern_to_regex(
+  args: &crate::ExprList,
+  seen: &mut PatternState,
+) -> Option<String> {
+  if args.is_empty() || args.len() > 2 {
+    return None;
+  }
+  let Expr::List(items) = &args[0] else {
+    return None;
+  };
+  if items.is_empty() {
+    return None;
+  }
+  let sep = match args.get(1) {
+    None => "[/\\-.:]".to_string(),
+    Some(sep_pat) => string_pattern_to_regex_inner(sep_pat, seen)?,
+  };
+  let mut out = String::new();
+  let mut prev_was_element = false;
+  for item in items {
+    let Expr::String(s) = item else {
+      return None;
+    };
+    if let Some(field) = date_pattern_element_regex(s) {
+      if prev_was_element {
+        out.push_str(&sep);
+      }
+      out.push_str(field);
+      prev_was_element = true;
+    } else {
+      out.push_str(&regex::escape(s));
+      prev_was_element = false;
+    }
+  }
+  Some(out)
+}
+
+fn string_pattern_to_regex_inner(
+  expr: &Expr,
+  seen: &mut PatternState,
+) -> Option<String> {
+  Some(match expr {
+    // A string literal nested inside a compound pattern matches literally —
+    // the `*`/`@` metacharacter shorthand only applies to a bare top-level
+    // string (handled in `string_pattern_to_regex_with_state`). So e.g.
+    // `"/*" ~~ Shortest[___] ~~ "*/"` matches a literal `/*…*/`.
+    Expr::String(s) => regex::escape(s),
+
+    // Character class patterns and blank patterns
+    Expr::Identifier(name) => match name.as_str() {
+      "DigitCharacter" => "[0-9]".to_string(),
+      "LetterCharacter" => "[a-zA-Z\\p{L}]".to_string(),
+      "WhitespaceCharacter" => "\\s".to_string(),
+      "Whitespace" => "\\s+".to_string(),
+      // Wolfram's `WordCharacter` matches only ASCII letters and digits
+      // (verified by `StringMatchQ["ö", WordCharacter]` → False), so don't
+      // include the broader `\p{L}` Unicode-letter class here.
+      "WordCharacter" => "[a-zA-Z0-9]".to_string(),
+      // PunctuationCharacter matches any Unicode punctuation character
+      // (general category P) plus the ASCII symbol characters
+      // `$ + < = > ^ ` | ~` (which Unicode classifies as symbols, not
+      // punctuation, but Wolfram treats as punctuation). Verified against
+      // wolframscript across the BMP.
+      "PunctuationCharacter" => "(?:\\p{P}|[$+<=>^`|~])".to_string(),
+      "HexadecimalCharacter" => "[0-9a-fA-F]".to_string(),
+      // NumberString matches an optional leading sign followed by digits
+      // with an optional decimal point, or a leading-decimal form like `.5`
+      // (no exponent — Wolfram treats `1e5` as two number strings).
+      "NumberString" => "[+-]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)".to_string(),
+      "_" => ".".to_string(), // Blank: any single character
+      "__" => ".+".to_string(), // BlankSequence: one or more characters
+      "___" => ".*".to_string(), // BlankNullSequence: zero or more characters
+      // Position anchors — StringMatchQ already anchors at both ends, so these
+      // collapse to empty matches there, but inside patterns used with
+      // StringCases/StringReplace they bind to regex anchors.
+      "StartOfString" => "\\A".to_string(),
+      "EndOfString" => "\\z".to_string(),
+      "StartOfLine" => "(?m:^)".to_string(),
+      "EndOfLine" => "(?m:$)".to_string(),
+      "WordBoundary" => "\\b".to_string(),
+      _ => return None,
+    },
+
+    // Blank/BlankSequence/BlankNullSequence as Pattern AST nodes
+    Expr::Pattern {
+      name,
+      head: None,
+      blank_type,
+    } => {
+      let inner = match blank_type {
+        1 => ".",  // Blank: any single character
+        2 => ".+", // BlankSequence: one or more characters
+        3 => ".*", // BlankNullSequence: zero or more characters
+        _ => return None,
+      };
+      if name.is_empty() {
+        inner.to_string()
+      } else {
+        maybe_named_group(name, inner, seen)
+      }
+    }
+
+    // A blank with a character-class predicate test, e.g. `_?LetterQ`,
+    // `x_?DigitQ`, `__?UpperCaseQ`. Map the known single-character predicates
+    // to the matching regex character class; the blank type controls the
+    // repetition (Blank → one char, BlankSequence → one or more, etc.).
+    Expr::PatternTest {
+      name,
+      head: None,
+      blank_type,
+      test,
+    } => {
+      let class = match test.as_ref() {
+        Expr::Identifier(t) => match t.as_str() {
+          "LetterQ" => "[a-zA-Z\\p{L}]",
+          "DigitQ" => "[0-9]",
+          "UpperCaseQ" => "[A-Z\\p{Lu}]",
+          "LowerCaseQ" => "[a-z\\p{Ll}]",
+          _ => return None,
+        },
+        _ => return None,
+      };
+      let inner = match blank_type {
+        1 => class.to_string(),
+        2 => format!("{class}+"),
+        3 => format!("{class}*"),
+        _ => return None,
+      };
+      if name.is_empty() {
+        inner
+      } else {
+        maybe_named_group(name, &inner, seen)
+      }
+    }
+
+    // `name : pattern` parses as `Pattern[name, pattern]` — wrap the
+    // inner regex in a named capture group so a downstream rule's RHS
+    // can refer back to the matched substring.
+    Expr::FunctionCall { name, args }
+      if name == "Pattern" && args.len() == 2 =>
+    {
+      let inner = string_pattern_to_regex_inner(&args[1], seen)?;
+      if let Expr::Identifier(var) = &args[0] {
+        maybe_named_group(var, &inner, seen)
+      } else {
+        format!("(?:{inner})")
+      }
+    }
+
+    // Alternatives as BinaryOp (e.g. pat1 | pat2)
+    Expr::BinaryOp {
+      op: BinaryOperator::Alternatives,
+      left,
+      right,
+    } => {
+      let l = string_pattern_to_regex_inner(left, seen)?;
+      let r = string_pattern_to_regex_inner(right, seen)?;
+      format!("(?:{l}|{r})")
+    }
+
+    // Alternatives[pat1, pat2, ...] = pat1 | pat2 | ...
+    Expr::FunctionCall { name, args }
+      if name == "Alternatives" && !args.is_empty() =>
+    {
+      let parts: Option<Vec<String>> = args
+        .iter()
+        .map(|a| string_pattern_to_regex_inner(a, seen))
+        .collect();
+      format!("(?:{})", parts?.join("|"))
+    }
+
+    // A list {pat1, pat2, ...} in a string-pattern context is treated as
+    // Alternatives[pat1, pat2, ...].
+    Expr::List(items) if !items.is_empty() => {
+      let parts: Option<Vec<String>> = items
+        .iter()
+        .map(|a| string_pattern_to_regex_inner(a, seen))
+        .collect();
+      format!("(?:{})", parts?.join("|"))
+    }
+
+    // DatePattern[{elements…}] / DatePattern[{…}, sep] — date fields with
+    // separators.
+    Expr::FunctionCall { name, args } if name == "DatePattern" => {
+      date_pattern_to_regex(args, seen)?
+    }
+
+    // StringExpression[pat1, pat2, ...] = pat1 ~~ pat2 ~~ ...
+    // PatternSequence[pat1, …] means the same thing in a string pattern: the
+    // parts follow one another.
+    Expr::FunctionCall { name, args }
+      if (name == "StringExpression" || name == "PatternSequence")
+        && !args.is_empty() =>
+    {
+      let parts: Option<Vec<String>> = args
+        .iter()
+        .map(|a| string_pattern_to_regex_inner(a, seen))
+        .collect();
+      parts?.join("")
+    }
+
+    // Repeated[pat] = pat.. (one or more)
+    Expr::FunctionCall { name, args }
+      if name == "Repeated" && (args.len() == 1 || args.len() == 2) =>
+    {
+      // Wolfram parses `x : pat..` as `Pattern[x, Repeated[pat]]` — `..`
+      // binds tighter than `:`. Our parser produces `Repeated[Pattern[x,
+      // pat]]` instead. The two are equivalent under matching, but only
+      // the outer-Pattern shape captures the *whole* run as `x` rather
+      // than just the last single-char match. Rewrite the inner pattern
+      // by lifting the named Pattern out so the named capture spans all
+      // repetitions.
+      let (capture_name, inner_pat) = match &args[0] {
+        Expr::FunctionCall {
+          name: pn,
+          args: pargs,
+        } if pn == "Pattern" && pargs.len() == 2 => {
+          if let Expr::Identifier(var) = &pargs[0] {
+            (Some(var.clone()), &pargs[1])
+          } else {
+            (None, &args[0])
+          }
+        }
+        _ => (None, &args[0]),
+      };
+      let base = string_pattern_to_regex_inner(inner_pat, seen)?;
+      let body = if args.len() == 1 {
+        format!("(?:{base})+")
+      } else {
+        // Repeated[pat, n] means 1..n, Repeated[pat, {n}] means exactly n
+        let quantifier = match &args[1] {
+          Expr::Integer(n) => format!("{{1,{n}}}"),
+          Expr::List(items) if items.len() == 1 => {
+            let n = crate::functions::math_ast::expr_to_i128(&items[0])?;
+            format!("{{{n}}}")
+          }
+          Expr::List(items) if items.len() == 2 => {
+            let min = crate::functions::math_ast::expr_to_i128(&items[0])?;
+            let max = crate::functions::math_ast::expr_to_i128(&items[1])?;
+            format!("{{{min},{max}}}")
+          }
+          _ => return None,
+        };
+        format!("(?:{base}){quantifier}")
+      };
+      match capture_name {
+        Some(var) => maybe_named_group(&var, &body, seen),
+        None => body,
+      }
+    }
+
+    // RepeatedNull[pat] = pat... (zero or more)
+    Expr::FunctionCall { name, args }
+      if name == "RepeatedNull" && args.len() == 1 =>
+    {
+      let (capture_name, inner_pat) = match &args[0] {
+        Expr::FunctionCall {
+          name: pn,
+          args: pargs,
+        } if pn == "Pattern" && pargs.len() == 2 => {
+          if let Expr::Identifier(var) = &pargs[0] {
+            (Some(var.clone()), &pargs[1])
+          } else {
+            (None, &args[0])
+          }
+        }
+        _ => (None, &args[0]),
+      };
+      let base = string_pattern_to_regex_inner(inner_pat, seen)?;
+      let body = format!("(?:{base})*");
+      match capture_name {
+        Some(var) => maybe_named_group(&var, &body, seen),
+        None => body,
+      }
+    }
+
+    // RegularExpression["pattern"] - use the regex directly
+    Expr::FunctionCall { name, args }
+      if name == "RegularExpression" && args.len() == 1 =>
+    {
+      if let Expr::String(re_str) = &args[0] {
+        re_str.clone()
+      } else {
+        return None;
+      }
+    }
+
+    // Shortest[pat] — match the shortest substring (non-greedy).
+    Expr::FunctionCall { name, args }
+      if name == "Shortest" && args.len() == 1 =>
+    {
+      let constraints_before = seen.constraints.len();
+      let inner = string_pattern_to_regex_inner(&args[0], seen)?;
+      if seen.constraints.len() > constraints_before {
+        // A duplicate-name back-reference inside Shortest would conflict
+        // with non-greedy semantics: the engine would commit to a shortest
+        // match that fails the equality post-filter and never try the
+        // longer match where both captures agree. Skip the non-greedy
+        // rewrite here — the equality constraint already pins down the
+        // unique valid match length.
+        inner
+      } else {
+        make_non_greedy(&inner)
+      }
+    }
+
+    // Longest[pat] — default greedy match; equivalent to pat itself.
+    Expr::FunctionCall { name, args }
+      if name == "Longest" && args.len() == 1 =>
+    {
+      string_pattern_to_regex_inner(&args[0], seen)?
+    }
+
+    // Except[pattern] — negate a single-character class. Only meaningful
+    // when the inner pattern translates to a character-class regex like
+    // `[...]` (Except matches exactly one non-matching character).
+    Expr::FunctionCall { name, args }
+      if name == "Except" && args.len() == 1 =>
+    {
+      let inner = string_pattern_to_regex_inner(&args[0], seen)?;
+      // If the inner regex is already a character class, negate it.
+      if let Some(stripped) = inner.strip_prefix('[')
+        && let Some(body) = stripped.strip_suffix(']')
+      {
+        if let Some(neg_body) = body.strip_prefix('^') {
+          // Double negation — just drop the ^.
+          return Some(format!("[{neg_body}]"));
+        }
+        return Some(format!("[^{body}]"));
+      }
+      // Single-character literal (e.g. `]` → `\]`, `a` → `a`): lift into
+      // a negated character class so that `Except[c]..` quantifies as
+      // `[^c]+` instead of `(?:(?!c).)+`. The Rust `regex` crate has no
+      // look-around, so this is the only shape that composes with `..`
+      // / `...` quantifiers without errors.
+      if is_single_char_atom(&inner) {
+        return Some(format!("[^{inner}]"));
+      }
+      // Otherwise fall back to a regex negative lookahead + any char.
+      format!("(?:(?!{inner}).)")
+    }
+
+    // Except[c, base] — match `base` but not `c`. The Rust `regex` crate
+    // does not support look-around, so realize the set difference at the
+    // character-class level: parse both regex character classes into atoms
+    // (single chars, ranges, escape classes) and drop any atom from `base`
+    // that also appears in `excluded`.
+    Expr::FunctionCall { name, args }
+      if name == "Except" && args.len() == 2 =>
+    {
+      let excluded = string_pattern_to_regex_inner(&args[0], seen)?;
+      let base = string_pattern_to_regex_inner(&args[1], seen)?;
+      char_class_difference(&excluded, &base)?
+    }
+
+    _ => return None,
+  })
+}
+
+/// StringCases[s, patt] - find all substrings matching pattern
+pub fn string_cases_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringCases expects at least 2 arguments".into(),
+    ));
+  }
+  // A list of strings gives one list of matches per string, so
+  // StringCases[{"aba", "cd"}, "a"] is {{"a", "a"}, {}} rather than a single
+  // flattened list.
+  if let Expr::List(items) = &args[0] {
+    let mut per_string = Vec::with_capacity(items.len());
+    for item in items {
+      let mut rest = args.to_vec();
+      rest[0] = item.clone();
+      per_string.push(string_cases_ast(&rest)?);
+    }
+    return Ok(Expr::List(per_string.into()));
+  }
+  let s = expr_to_str(&args[0]);
+
+  // Parse the optional trailing arguments: a max-count (Integer/Infinity)
+  // and/or an `Overlaps -> True | All` option (default: non-overlapping).
+  let mut max_count: usize = usize::MAX;
+  let mode = parse_overlaps_option(&args[2..], Overlaps::No);
+  let overlaps = mode.overlapping();
+  for a in &args[2..] {
+    match a {
+      Expr::Integer(n) if *n >= 0 => max_count = *n as usize,
+      Expr::Identifier(id) if id == "Infinity" => max_count = usize::MAX,
+      _ => {}
+    }
+  }
+  // IgnoreCase -> True makes every pattern match case-insensitively; it is
+  // applied by prefixing the compiled regexes with the `(?i)` flag.
+  let ignore_case = has_ignore_case_option(args);
+  let with_ci = |pat: &str| -> String {
+    if ignore_case {
+      format!("(?i){pat}")
+    } else {
+      pat.to_string()
+    }
+  };
+
+  // Rule or list of rules: at each position, try each rule's LHS pattern;
+  // on a match, emit the (capture-substituted) RHS and advance past it.
+  if let Some(rules) = extract_cases_rules(&args[1]) {
+    let mut compiled: Vec<(WoxiRegex, Vec<(String, String)>, Expr, bool)> =
+      Vec::with_capacity(rules.len());
+    for (pat, constraints, rhs, expand_dollar) in &rules {
+      let re = compile_regex(&with_ci(pat)).map_err(|e| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid string pattern: {e}"
+        ))
+      })?;
+      compiled.push((re, constraints.clone(), rhs.clone(), *expand_dollar));
+    }
+
+    if mode == Overlaps::All {
+      // Every match of every rule at every start position; each one emits its
+      // rule's (capture-substituted) right-hand side.
+      let mut result: Vec<Expr> = Vec::new();
+      for m in all_rule_matches(&s, &rules, ignore_case, max_count)? {
+        let mut substituted = substitute_captures(m.rhs, &m.caps);
+        if m.expand_dollar {
+          substituted = expand_dollar_in_expr(&substituted, &m.caps);
+        }
+        result.push(crate::evaluator::evaluate_expr_to_expr(&substituted)?);
+      }
+      return Ok(Expr::List(result.into()));
+    }
+
+    let mut result: Vec<Expr> = Vec::new();
+    let mut i = 0;
+    while i < s.len() && result.len() < max_count {
+      let mut matched = false;
+      for (re, constraints, rhs, expand_dollar) in &compiled {
+        if let Some(caps) = re.captures_at(&s, i)
+          && let Some(m) = caps.get(0)
+          && m.start() == i
+          && !m.as_str().is_empty()
+          && constraints.iter().all(|(orig, dup)| {
+            match (caps.name(orig), caps.name(dup)) {
+              (Some(a), Some(b)) => a.as_str() == b.as_str(),
+              _ => true,
+            }
+          })
+        {
+          let mut substituted = substitute_captures(rhs, &caps);
+          if *expand_dollar {
+            substituted = expand_dollar_in_expr(&substituted, &caps);
+          }
+          let evaluated =
+            crate::evaluator::evaluate_expr_to_expr(&substituted)?;
+          result.push(evaluated);
+          // Overlapping matches advance one character past the start; the
+          // default skips the whole matched substring.
+          if overlaps {
+            let ch = s[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+          } else {
+            i += m.len();
+          }
+          matched = true;
+          break;
+        }
+      }
+      if !matched {
+        let ch = s[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+      }
+    }
+    return Ok(Expr::List(result.into()));
+  }
+
+  // Bare conditional pattern: `patt /; test`. Match the inner pattern, then
+  // require the `/;` test (with the captured names substituted in) to evaluate
+  // to True before emitting the matched substring.
+  if let Expr::FunctionCall { name, args: cargs } = &args[1]
+    && name == "Condition"
+    && cargs.len() == 2
+    && let Some((regex_str, constraints)) =
+      string_pattern_to_regex_with_state(&cargs[0])
+  {
+    let test = &cargs[1];
+    let re = compile_regex(&with_ci(&regex_str)).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid string pattern: {e}"))
+    })?;
+    let mut out: Vec<Expr> = Vec::new();
+    let mut i = 0;
+    while i < s.len() && out.len() < max_count {
+      let mut matched = false;
+      if let Some(caps) = re.captures_at(&s, i)
+        && let Some(m) = caps.get(0)
+        && m.start() == i
+        && !m.as_str().is_empty()
+        && constraints.iter().all(|(orig, dup)| {
+          match (caps.name(orig), caps.name(dup)) {
+            (Some(a), Some(b)) => a.as_str() == b.as_str(),
+            _ => true,
+          }
+        })
+      {
+        let test_sub = substitute_captures(test, &caps);
+        let test_val = crate::evaluator::evaluate_expr_to_expr(&test_sub)?;
+        if matches!(&test_val, Expr::Identifier(t) if t == "True") {
+          out.push(Expr::String(m.as_str().to_string()));
+          if overlaps {
+            let ch = s[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+          } else {
+            i += m.len();
+          }
+          matched = true;
+        }
+      }
+      if !matched {
+        let ch = s[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+      }
+    }
+    return Ok(Expr::List(out.into()));
+  }
+
+  // Try pattern-based matching first
+  if let Some((regex_str, constraints)) =
+    string_pattern_to_regex_with_state(&args[1])
+  {
+    let re = compile_regex(&with_ci(&regex_str)).map_err(|e| {
+      InterpreterError::EvaluationError(format!("Invalid string pattern: {e}"))
+    })?;
+    let matches: Vec<Expr> = if mode == Overlaps::All {
+      // Every match at every start position, not just the preferred one.
+      all_overlap_spans(&with_ci(&regex_str), &constraints, &s)?
+        .into_iter()
+        .take(max_count)
+        .map(|(bs, be)| Expr::String(s[bs..be].to_string()))
+        .collect()
+    } else if overlaps {
+      // Overlapping: emit a match for every char start position where the
+      // (anchored) pattern matches, satisfying any back-reference constraints.
+      let mut out: Vec<Expr> = Vec::new();
+      for (idx, _) in s.char_indices() {
+        if out.len() >= max_count {
+          break;
+        }
+        if let Some(caps) = re.captures_at(&s, idx)
+          && let Some(m) = caps.get(0)
+          && m.start() == idx
+          && !m.as_str().is_empty()
+          && constraints.iter().all(|(orig, dup)| {
+            match (caps.name(orig), caps.name(dup)) {
+              (Some(a), Some(b)) => a.as_str() == b.as_str(),
+              _ => true,
+            }
+          })
+        {
+          out.push(Expr::String(m.as_str().to_string()));
+        }
+      }
+      out
+    } else if constraints.is_empty() {
+      re.find_iter(&s)
+        .into_iter()
+        .take(max_count)
+        .map(|m| Expr::String(m.as_str().to_string()))
+        .collect()
+    } else {
+      // Non-overlapping match with back-reference constraints. Scan position
+      // by position (like the rules branch above) so that when the match at
+      // one start fails its constraints, the next start is still tried —
+      // `captures_iter` would instead greedily consume those characters and
+      // skip a valid later match (e.g. miss the "ff" in "abcdeff").
+      let mut out: Vec<Expr> = Vec::new();
+      let mut i = 0;
+      while i < s.len() && out.len() < max_count {
+        if let Some(caps) = re.captures_at(&s, i)
+          && let Some(m) = caps.get(0)
+          && m.start() == i
+          && !m.as_str().is_empty()
+          && constraints.iter().all(|(orig, dup)| {
+            match (caps.name(orig), caps.name(dup)) {
+              (Some(a), Some(b)) => a.as_str() == b.as_str(),
+              _ => true,
+            }
+          })
+        {
+          out.push(Expr::String(m.as_str().to_string()));
+          i += m.len();
+        } else {
+          let ch = s[i..].chars().next().unwrap();
+          i += ch.len_utf8();
+        }
+      }
+      out
+    };
+    return Ok(Expr::List(matches.into()));
+  }
+
+  // Fall back to literal string matching. Under IgnoreCase, search case-
+  // insensitively and emit the actual matched substring (which may differ
+  // from the pattern in case).
+  let patt = expr_to_str(&args[1]);
+  if ignore_case && !patt.is_empty() {
+    let re =
+      compile_regex(&format!("(?i){}", regex::escape(&patt))).map_err(|e| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid string pattern: {e}"
+        ))
+      })?;
+    let matches: Vec<Expr> = re
+      .find_iter(&s)
+      .into_iter()
+      .take(max_count)
+      .map(|m| Expr::String(m.as_str().to_string()))
+      .collect();
+    return Ok(Expr::List(matches.into()));
+  }
+
+  let mut matches = Vec::new();
+  let mut start = 0;
+  while let Some(pos) = s[start..].find(&patt) {
+    matches.push(Expr::String(patt.clone()));
+    if matches.len() >= max_count {
+      break;
+    }
+    // Overlapping advances one character past the match start.
+    start = if overlaps {
+      let match_start = start + pos;
+      match_start + s[match_start..].chars().next().map_or(1, char::len_utf8)
+    } else {
+      start + pos + patt.len()
+    };
+  }
+
+  Ok(Expr::List(matches.into()))
+}
+
+/// Extract a list of (pattern_regex, back_reference_constraints,
+/// replacement_expr) tuples from a rule or list of rules. Returns None if
+/// the expression is not a rule or rule list, or if any pattern cannot be
+/// converted to a regex.
+fn extract_cases_rules(
+  expr: &Expr,
+) -> Option<Vec<(String, Vec<(String, String)>, Expr, bool)>> {
+  fn one(e: &Expr) -> Option<(String, Vec<(String, String)>, Expr, bool)> {
+    let (pat, rep) = match e {
+      Expr::Rule {
+        pattern,
+        replacement,
+      }
+      | Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } => (pattern.as_ref(), replacement.as_ref()),
+      _ => return None,
+    };
+    let (regex_str, constraints) = string_pattern_to_regex_with_state(pat)?;
+    // RegularExpression patterns expand $0/$1/… in the replacement.
+    let expand_dollar = matches!(
+      pat,
+      Expr::FunctionCall { name, .. } if name == "RegularExpression"
+    );
+    Some((regex_str, constraints, rep.clone(), expand_dollar))
+  }
+  match expr {
+    Expr::Rule { .. } | Expr::RuleDelayed { .. } => Some(vec![one(expr)?]),
+    Expr::List(items)
+      if !items.is_empty()
+        && items.iter().all(|i| {
+          matches!(i, Expr::Rule { .. } | Expr::RuleDelayed { .. })
+        }) =>
+    {
+      let mut v = Vec::with_capacity(items.len());
+      for it in items {
+        v.push(one(it)?);
+      }
+      Some(v)
+    }
+    _ => None,
+  }
+}
+
+/// ToString[expr] - convert expression to string
+/// Render `NumberForm[x, n]` to a string: a real `x` is rounded to `n`
+/// significant figures and shown with a trailing decimal point and no padding
+/// zeros (`3.14`, `3.`, `1200.`); an integer `x` is shown unchanged.
+/// Whether `NumberForm[x, n]` requests fewer significant figures than the
+/// number has integer digits, triggering Wolfram's `NumberForm::reqsigz`
+/// warning. Only applies in the fixed-notation range: a value whose original
+/// decimal exponent `m0 = floor(log10(|x|))` is `>= 6` renders in scientific
+/// notation (mantissa fits `n`) and never warns. Otherwise the number has
+/// `m0 + 1` integer digits, so `n <= m0` means `n` cannot cover them all.
+/// Threads element-wise over a list argument.
+fn number_form_reqsigz(x: &Expr, n: i64) -> bool {
+  match x {
+    Expr::Real(f) if *f != 0.0 && n >= 1 => {
+      let m0 = f.abs().log10().floor() as i64;
+      m0 < 6 && n <= m0
+    }
+    Expr::List(items) => items.iter().any(|e| number_form_reqsigz(e, n)),
+    _ => false,
+  }
+}
+
+fn number_form_to_string(x: &Expr, n: i64) -> Option<String> {
+  // Integer argument: shown unchanged, ignoring the precision.
+  if let Expr::Integer(i) = x {
+    return Some(i.to_string());
+  }
+  let f = match x {
+    Expr::Real(f) => *f,
+    _ => return None,
+  };
+  if n < 1 {
+    return None;
+  }
+  if f == 0.0 {
+    return Some("0.".to_string());
+  }
+  let neg = f < 0.0;
+  let ax = f.abs();
+  let m = ax.log10().floor() as i64;
+  // Round to n significant figures.
+  let factor = 10f64.powi((n - 1 - m) as i32);
+  let rounded = (ax * factor).round() / factor;
+  // Rounding can bump the magnitude (e.g. 9.99 -> 10), so recompute it.
+  let m2 = if rounded == 0.0 {
+    0
+  } else {
+    rounded.log10().floor() as i64
+  };
+  let decimals = (n - 1 - m2).max(0) as usize;
+  let mut s = format!("{rounded:.decimals$}");
+  if s.contains('.') {
+    // Drop padding zeros but keep the trailing point (3.00 -> 3.).
+    while s.ends_with('0') {
+      s.pop();
+    }
+  } else {
+    s.push('.');
+  }
+  Some(if neg { format!("-{s}") } else { s })
+}
+
+/// Render the `n`-significant-figure form of `NumberForm[x, n]` (and the
+/// single-argument `NumberForm[x]`, where `n = 6`). A real whose decimal
+/// exponent is `>= 6` or `<= -6` (|x| >= 10^6 or |x| < 10^-5) switches to 2D
+/// scientific notation, matching wolframscript's default ExponentFunction;
+/// integers and in-range reals use the fixed-notation renderer.
+fn number_form_render(x: &Expr, n: i64) -> Option<String> {
+  let (mantissa, exp) = number_form_parts(x, n)?;
+  Some(sci_parts_to_2d_string(&mantissa, exp))
+}
+
+/// Decompose `NumberForm[x, n]` (and single-argument `NumberForm[x]`, where
+/// `n = 6`) into a mantissa string and optional base-10 exponent. A real whose
+/// decimal exponent (of the value rounded to `n` significant figures) is `>= 6`
+/// or `<= -6` switches to scientific notation (matching wolframscript's default
+/// ExponentFunction) and yields a `Some(exp)`; integers and in-range reals
+/// render in fixed notation with a `None` exponent.
+pub(crate) fn number_form_parts(
+  x: &Expr,
+  n: i64,
+) -> Option<(String, Option<i64>)> {
+  if let Expr::Real(f) = x
+    && *f != 0.0
+    && n >= 1
+  {
+    let ax = f.abs();
+    let m0 = ax.log10().floor() as i64;
+    // Use the exponent of the value rounded to n significant figures, so
+    // e.g. 999999.9 rounding up to 10^6 is detected as out of range.
+    let factor = 10f64.powi((n - 1 - m0) as i32);
+    let rounded = (ax * factor).round() / factor;
+    let m = if rounded == 0.0 {
+      0
+    } else {
+      rounded.log10().floor() as i64
+    };
+    if m >= 6 || m <= -6 {
+      return scientific_form_parts(x, n);
+    }
+  }
+  Some((number_form_to_string(x, n)?, None))
+}
+
+/// Render `NumberForm[x, {n, f}]` as a `(mantissa, exponent)` pair. The fixed
+/// `f`-decimal-places renderer never produces a `× 10^e` factor, so the
+/// exponent is always `None`.
+pub(crate) fn number_form_fixed_parts(
+  x: &Expr,
+  f: i64,
+) -> Option<(String, Option<i64>)> {
+  Some((number_form_fixed_to_string(x, f)?, None))
+}
+
+/// Group a digit string into blocks of `block`, counting from the RIGHT (used
+/// for the integer part), joined by `sep`. E.g. ("1234567", 3, ",") -> "1,234,567".
+fn group_digits_from_right(digits: &str, block: usize, sep: &str) -> String {
+  let chars: Vec<char> = digits.chars().collect();
+  if chars.is_empty() {
+    return String::new();
+  }
+  let mut groups: Vec<String> = Vec::new();
+  let mut i = chars.len();
+  while i > 0 {
+    let start = i.saturating_sub(block);
+    groups.push(chars[start..i].iter().collect());
+    i = start;
+  }
+  groups.reverse();
+  groups.join(sep)
+}
+
+/// Group a digit string into blocks of `block`, counting from the LEFT (used
+/// for the fractional part), joined by `sep`. E.g. ("23457", 3, " ") -> "234 57".
+fn group_digits_from_left(digits: &str, block: usize, sep: &str) -> String {
+  let chars: Vec<char> = digits.chars().collect();
+  if chars.is_empty() {
+    return String::new();
+  }
+  let mut groups: Vec<String> = Vec::new();
+  let mut i = 0;
+  while i < chars.len() {
+    let end = (i + block).min(chars.len());
+    groups.push(chars[i..end].iter().collect());
+    i = end;
+  }
+  groups.join(sep)
+}
+
+/// Decompose `ScientificForm[x]` / `ScientificForm[x, n]` into its mantissa
+/// string and (optional) base-10 exponent. The exponent is `None` when the
+/// value renders without a `× 10^e` factor (integer argument, or an exponent of
+/// zero). This drives both the `ToString` 2D text renderer and the box-form
+/// renderer used by the Playground/Studio SVG output.
+pub(crate) fn scientific_form_parts(
+  x: &Expr,
+  n: i64,
+) -> Option<(String, Option<i64>)> {
+  // Integer argument: shown unchanged, ignoring the precision.
+  if let Expr::Integer(i) = x {
+    return Some((i.to_string(), None));
+  }
+  let v = match x {
+    Expr::Real(f) => *f,
+    _ => return None,
+  };
+  let n = if n < 1 { 1 } else { n };
+  let prec = (n - 1) as usize;
+  // Rust's `{:e}` formatter produces a normalized mantissa (one nonzero digit
+  // before the point) and renormalizes after rounding (9.9995e3 -> 1.00000e4).
+  let formatted = format!("{v:.prec$e}");
+  let (mantissa_raw, exp_raw) = formatted.split_once('e')?;
+  let exp: i64 = exp_raw.parse().ok()?;
+  // Drop padding zeros from the fractional part but keep the trailing point.
+  let mantissa = match mantissa_raw.split_once('.') {
+    Some((int_part, frac_part)) => {
+      format!("{}.{}", int_part, frac_part.trim_end_matches('0'))
+    }
+    None => format!("{mantissa_raw}."),
+  };
+  if exp == 0 {
+    return Some((mantissa, None));
+  }
+  Some((mantissa, Some(exp)))
+}
+
+/// Render a `(mantissa, exponent)` decomposition as the 2D text form used under
+/// `ToString`: the exponent sits as a superscript on the line above the
+/// `mantissa × 10` line. A `None` exponent collapses to just the mantissa.
+fn sci_parts_to_2d_string(mantissa: &str, exp: Option<i64>) -> String {
+  match exp {
+    None => mantissa.to_string(),
+    Some(e) => {
+      let line2 = format!("{mantissa} \u{00d7} 10");
+      let indent = " ".repeat(line2.chars().count());
+      format!("{indent}{e}\n{line2}")
+    }
+  }
+}
+
+/// Render `NumberForm[x, n, ExponentFunction -> f]` / `ScientificForm[...]`:
+/// take the value's base-10 exponent (after rounding to `n` significant
+/// figures), pass it through `f`, and re-express the number as
+/// `mantissa × 10^e'` with that exponent. `f` returning `Null` (or an exponent
+/// of 0) suppresses the `× 10` factor, leaving just the mantissa. Integer `x`
+/// is shown unchanged.
+fn number_form_exponent_function_to_string(
+  x: &Expr,
+  n: i64,
+  f: &Expr,
+) -> Option<String> {
+  // Integers are displayed verbatim, ignoring the exponent function.
+  if let Expr::Integer(i) = x {
+    return Some(i.to_string());
+  }
+  let v = match x {
+    Expr::Real(r) => *r,
+    _ => return None,
+  };
+  if v == 0.0 {
+    return None;
+  }
+  let n = if n < 1 { 1 } else { n };
+  let neg = v < 0.0;
+  let av = v.abs();
+
+  // Normalized mantissa/exponent after rounding to n significant figures
+  // (e.g. 9.99 at n=2 renormalizes to 1.0×10^1, so the exponent is 1).
+  let formatted = format!("{:.*e}", (n - 1) as usize, av);
+  let (_, exp_raw) = formatted.split_once('e')?;
+  let e: i64 = exp_raw.parse().ok()?;
+
+  // Apply the user exponent function to the natural exponent.
+  let applied = crate::functions::list_helpers_ast::apply_func_ast(
+    f,
+    &Expr::Integer(e as i128),
+  )
+  .ok()?;
+  let applied =
+    crate::evaluator::evaluate_expr_to_expr(&applied).unwrap_or(applied);
+  // Null suppresses the exponent: fall back to the plain number rendering.
+  if matches!(&applied, Expr::Identifier(s) if s == "Null") {
+    return number_form_render(x, n);
+  }
+  let e_prime = match &applied {
+    Expr::Integer(k) => *k as i64,
+    _ => return None,
+  };
+
+  // Mantissa at the chosen exponent, keeping n significant figures total.
+  let decimals = (n - 1 - e + e_prime).max(0) as usize;
+  let mant_val = av / 10f64.powi(e_prime as i32);
+  let mant_str = format!("{mant_val:.decimals$}");
+  // Trim trailing fractional zeros but keep the decimal point.
+  let mant_trimmed = match mant_str.split_once('.') {
+    Some((int_part, frac)) => {
+      format!("{}.{}", int_part, frac.trim_end_matches('0'))
+    }
+    None => format!("{mant_str}."),
+  };
+  let mant_final = if neg {
+    format!("-{mant_trimmed}")
+  } else {
+    mant_trimmed
+  };
+  let exp_opt = if e_prime == 0 { None } else { Some(e_prime) };
+  Some(sci_parts_to_2d_string(&mant_final, exp_opt))
+}
+
+/// Horizontally concatenate multi-line text blocks, bottom-aligned: their last
+/// lines share a baseline and shorter blocks are padded with blank lines on top.
+/// Each block's lines are right-padded to the block's own max width so columns
+/// stay aligned (e.g. an exponent sitting above its mantissa).
+fn hcat_2d_blocks(blocks: &[String]) -> String {
+  let split: Vec<Vec<&str>> =
+    blocks.iter().map(|b| b.lines().collect()).collect();
+  let height = split.iter().map(std::vec::Vec::len).max().unwrap_or(0);
+  let widths: Vec<usize> = split
+    .iter()
+    .map(|lines| lines.iter().map(|l| l.chars().count()).max().unwrap_or(0))
+    .collect();
+  let mut out_lines: Vec<String> = Vec::with_capacity(height);
+  for row in 0..height {
+    let mut line = String::new();
+    for (bi, lines) in split.iter().enumerate() {
+      let top_pad = height - lines.len();
+      let cell = if row >= top_pad {
+        lines[row - top_pad]
+      } else {
+        ""
+      };
+      line.push_str(cell);
+      line
+        .push_str(&" ".repeat(widths[bi].saturating_sub(cell.chars().count())));
+    }
+    out_lines.push(line.trim_end().to_string());
+  }
+  out_lines.join("\n")
+}
+
+/// Build the 2D text rendering of a list of already-rendered (possibly
+/// multi-line) element strings: `{elem, elem, ...}` with the braces and commas
+/// on the baseline, matching wolframscript's `ScientificForm[{...}]` output.
+fn list_form_2d_string(elems: &[String]) -> String {
+  let mut blocks: Vec<String> = Vec::with_capacity(elems.len() * 2 + 2);
+  blocks.push("{".to_string());
+  for (i, e) in elems.iter().enumerate() {
+    if i > 0 {
+      blocks.push(", ".to_string());
+    }
+    blocks.push(e.clone());
+  }
+  blocks.push("}".to_string());
+  hcat_2d_blocks(&blocks)
+}
+
+/// Apply a single-value 2D form renderer to an argument, threading over a list
+/// (these display forms are Listable). Returns `None` if any element is one the
+/// renderer leaves unhandled.
+fn render_form_threaded<F>(arg: &Expr, render: F) -> Option<String>
+where
+  F: Fn(&Expr) -> Option<String>,
+{
+  if let Expr::List(items) = arg {
+    let parts: Option<Vec<String>> = items.iter().map(&render).collect();
+    Some(list_form_2d_string(&parts?))
+  } else {
+    render(arg)
+  }
+}
+
+/// Decompose `EngineeringForm[x]` / `EngineeringForm[x, n]` into its mantissa
+/// string and (optional) base-10 exponent — like [`scientific_form_parts`] but
+/// the exponent is forced to a multiple of 3 (mantissa in `[1, 1000)`).
+pub(crate) fn engineering_form_parts(
+  x: &Expr,
+  n: i64,
+) -> Option<(String, Option<i64>)> {
+  // Integer argument: shown unchanged, ignoring the precision.
+  if let Expr::Integer(i) = x {
+    return Some((i.to_string(), None));
+  }
+  let v = match x {
+    Expr::Real(f) => *f,
+    _ => return None,
+  };
+  let n = if n < 1 { 1 } else { n };
+  let prec = (n - 1) as usize;
+  // Scientific decomposition (normalized mantissa, renormalized after rounding).
+  let formatted = format!("{v:.prec$e}");
+  let (mantissa_raw, exp_raw) = formatted.split_once('e')?;
+  let e: i64 = exp_raw.parse().ok()?;
+  // Engineering exponent is the largest multiple of 3 not exceeding `e`; the
+  // mantissa's decimal point shifts right by `shift` places accordingly.
+  let shift = e.rem_euclid(3);
+  let eng_exp = e - shift;
+  let neg = mantissa_raw.starts_with('-');
+  let body = mantissa_raw.trim_start_matches('-');
+  let mut digits: String = body.chars().filter(|c| *c != '.').collect();
+  let int_len = (shift + 1) as usize;
+  while digits.len() < int_len {
+    digits.push('0');
+  }
+  let (ip, fp) = digits.split_at(int_len);
+  let fp = fp.trim_end_matches('0');
+  let mantissa = if fp.is_empty() {
+    format!("{ip}.")
+  } else {
+    format!("{ip}.{fp}")
+  };
+  let mantissa = if neg {
+    format!("-{mantissa}")
+  } else {
+    mantissa
+  };
+  if eng_exp == 0 {
+    return Some((mantissa, None));
+  }
+  Some((mantissa, Some(eng_exp)))
+}
+
+/// Render `NumberForm[x, {n, f}]`: a real `x` shown with exactly `f` digits
+/// after the decimal point (zero-padded), e.g. `3.0 -> 3.00`. An integer `x`
+/// is shown unchanged.
+fn number_form_fixed_to_string(x: &Expr, f: i64) -> Option<String> {
+  if let Expr::Integer(i) = x {
+    return Some(i.to_string());
+  }
+  let val = match x {
+    Expr::Real(v) => *v,
+    _ => return None,
+  };
+  if f < 0 {
+    return None;
+  }
+  let f = f as usize;
+  let mut s = format!("{val:.f$}");
+  // `{:.0}` omits the decimal point; NumberForm keeps a trailing one (3.).
+  if f == 0 {
+    s.push('.');
+  }
+  Some(s)
+}
+
+/// Default (one-argument) `DecimalForm` rendering of a real: always decimal
+/// notation, keeping the full integer part and rounding the fraction to machine
+/// precision (~6 significant figures). `1234567.89 -> 1234568.`, `0.0001 ->
+/// 0.0001`.
+/// Number of digits to the left of the decimal point in the magnitude of a
+/// real or integer value (always at least 1, so e.g. `0.5` counts as one).
+/// Returns `None` for non-numeric expressions.
+fn integer_digit_count(magnitude: &Expr) -> Option<i64> {
+  let f = match magnitude {
+    Expr::Integer(i) => i.unsigned_abs() as f64,
+    Expr::Real(f) => f.abs(),
+    _ => return None,
+  };
+  if f < 1.0 {
+    Some(1)
+  } else {
+    Some(f.log10().floor() as i64 + 1)
+  }
+}
+
+fn decimal_form_default(f: f64) -> String {
+  if f == 0.0 {
+    return "0.".to_string();
+  }
+  let neg = f < 0.0;
+  let ax = f.abs();
+  let m = ax.log10().floor() as i64;
+  // Decimal places implied by 6 significant figures; never negative, so the
+  // integer part is always shown in full.
+  let decimals = (6 - 1 - m).max(0) as usize;
+  let factor = 10f64.powi(decimals as i32);
+  let rounded = (ax * factor).round() / factor;
+  let mut s = format!("{rounded:.decimals$}");
+  if s.contains('.') {
+    while s.ends_with('0') {
+      s.pop();
+    }
+  } else {
+    s.push('.');
+  }
+  if neg { format!("-{s}") } else { s }
+}
+
+/// Render an integer in the given base (2..=36) using lowercase digits, keeping
+/// a leading `-` for negatives. `255` in base 16 → `ff`, `-255` → `-ff`.
+fn integer_to_base_string(n: i128, base: i128) -> String {
+  if n == 0 {
+    return "0".to_string();
+  }
+  const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+  let neg = n < 0;
+  let mut value = n.unsigned_abs();
+  let base = base as u128;
+  let mut out: Vec<u8> = Vec::new();
+  while value > 0 {
+    out.push(DIGITS[(value % base) as usize]);
+    value /= base;
+  }
+  if neg {
+    out.push(b'-');
+  }
+  out.reverse();
+  String::from_utf8(out).unwrap()
+}
+
+/// The digit string `BaseForm[x, b]` displays — for an integer, a real,
+/// or an arbitrary-precision real (which shows as many base-`b` digits as
+/// its own precision justifies).
+pub(crate) fn base_form_digits(value: &Expr, base: i128) -> Option<String> {
+  match value {
+    Expr::Integer(n) => Some(integer_to_base_string(*n, base)),
+    // A machine real displays six significant decimal digits, so it shows
+    // the base-`b` equivalent of those.
+    Expr::Real(x) => real_to_base_string(*x, base, 6.0),
+    // An arbitrary-precision real keeps all of its digits: converting
+    // through an f64 would cut it back to 53 bits.
+    Expr::BigFloat(digits, precision) => {
+      decimal_string_to_base_string(digits, base, *precision)
+    }
+    _ => None,
+  }
+}
+
+/// Render the decimal digit string of an arbitrary-precision real in base
+/// `b`, exactly, to as many base-`b` digits as `decimal_digits` of
+/// precision justify. The conversion runs on big integers so none of the
+/// stored digits are lost on the way.
+fn decimal_string_to_base_string(
+  decimal: &str,
+  base: i128,
+  decimal_digits: f64,
+) -> Option<String> {
+  use num_traits::{Signed, Zero};
+
+  const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+  if !(2..=36).contains(&base) {
+    return None;
+  }
+  let decimal = decimal.trim();
+  let (neg, decimal) = match decimal.strip_prefix('-') {
+    Some(rest) => (true, rest),
+    None => (false, decimal),
+  };
+  let (int_str, frac_str) = match decimal.split_once('.') {
+    Some((i, f)) => (i, f),
+    None => (decimal, ""),
+  };
+  if !int_str
+    .chars()
+    .chain(frac_str.chars())
+    .all(|c| c.is_ascii_digit())
+  {
+    return None;
+  }
+  let numerator: BigInt = format!("{int_str}{frac_str}").parse().ok()?;
+  let denominator = BigInt::from(10u32).pow(frac_str.len() as u32);
+  let big_base = BigInt::from(base);
+
+  let significant = (decimal_digits * 10f64.ln() / (base as f64).ln())
+    .round()
+    .max(1.0) as i64;
+
+  let mut int_part = &numerator / &denominator;
+  let mut remainder = &numerator % &denominator;
+  let mut int_digits: Vec<u8> = Vec::new();
+  while int_part.is_positive() {
+    let d = (&int_part % &big_base).to_string().parse::<usize>().ok()?;
+    int_digits.push(DIGITS[d]);
+    int_part /= &big_base;
+  }
+  int_digits.reverse();
+
+  let mut frac_digits: Vec<u8> = Vec::new();
+  let mut seen_significant = !int_digits.is_empty();
+  let mut used = int_digits.len() as i64;
+  while (used < significant || !seen_significant) && !remainder.is_zero() {
+    remainder *= &big_base;
+    let d = (&remainder / &denominator)
+      .to_string()
+      .parse::<usize>()
+      .ok()?;
+    remainder %= &denominator;
+    if d > 0 {
+      seen_significant = true;
+    }
+    if seen_significant {
+      used += 1;
+    }
+    frac_digits.push(DIGITS[d.min(base as usize - 1)]);
+  }
+  while frac_digits.last() == Some(&b'0') {
+    frac_digits.pop();
+  }
+
+  let int_out = if int_digits.is_empty() {
+    "0".to_string()
+  } else {
+    String::from_utf8(int_digits).ok()?
+  };
+  let frac_out = String::from_utf8(frac_digits).ok()?;
+  let sign = if neg { "-" } else { "" };
+  Some(if frac_out.is_empty() {
+    format!("{sign}{int_out}.")
+  } else {
+    format!("{sign}{int_out}.{frac_out}")
+  })
+}
+
+/// Render a real `x` in base `b`, to as many base-`b` digits as the
+/// number's precision justifies: a machine real shows the base-`b`
+/// equivalent of its 6 displayed significant decimal digits, an
+/// arbitrary-precision one the equivalent of its own precision. Trailing
+/// zeros are dropped, so a value that terminates in that base prints
+/// short (`3.5` in base 2 is `11.1`).
+fn real_to_base_string(
+  x: f64,
+  base: i128,
+  decimal_digits: f64,
+) -> Option<String> {
+  if !x.is_finite() || !(2..=36).contains(&base) {
+    return None;
+  }
+  const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+  let b = base as f64;
+  let significant = (decimal_digits * 10f64.ln() / b.ln()).round().max(1.0);
+  let neg = x < 0.0;
+  let mut value = x.abs();
+
+  // Integer part first, most significant digit last.
+  let mut int_digits: Vec<u8> = Vec::new();
+  let mut int_part = value.trunc();
+  value -= int_part;
+  while int_part >= 1.0 {
+    let d = (int_part % b) as usize;
+    int_digits.push(DIGITS[d]);
+    int_part = (int_part / b).trunc();
+  }
+  int_digits.reverse();
+
+  // Fraction digits, up to the precision budget left after the integer
+  // part (a leading run of zeros costs nothing — precision counts from
+  // the first significant digit).
+  let mut frac_digits: Vec<u8> = Vec::new();
+  let mut seen_significant = !int_digits.is_empty();
+  let mut used = int_digits.len() as f64;
+  let mut carry_from = None;
+  while used < significant || !seen_significant {
+    if value == 0.0 {
+      break;
+    }
+    value *= b;
+    let d = value.trunc() as usize;
+    value -= value.trunc();
+    if d > 0 {
+      seen_significant = true;
+    }
+    if seen_significant {
+      used += 1.0;
+    }
+    frac_digits.push(DIGITS[d.min(base as usize - 1)]);
+    if used >= significant {
+      // Round the last digit from what remains — a tie rounds *down*,
+      // which is what Wolfram shows for a value whose tail is exactly
+      // half a unit in the last place (`BaseForm[1.5, 3]` is
+      // `1.111111111111`, not `…112`).
+      if value > 0.5 {
+        carry_from = Some(frac_digits.len());
+      }
+      break;
+    }
+  }
+
+  // Propagate the rounding carry through the fraction, then the integer.
+  if carry_from.is_some() {
+    let mut i = frac_digits.len();
+    let mut carry = true;
+    while carry && i > 0 {
+      i -= 1;
+      let d = DIGITS
+        .iter()
+        .position(|&c| c == frac_digits[i])
+        .unwrap_or(0);
+      if d + 1 < base as usize {
+        frac_digits[i] = DIGITS[d + 1];
+        carry = false;
+      } else {
+        frac_digits[i] = DIGITS[0];
+      }
+    }
+    if carry {
+      let mut j = int_digits.len();
+      while carry && j > 0 {
+        j -= 1;
+        let d = DIGITS.iter().position(|&c| c == int_digits[j]).unwrap_or(0);
+        if d + 1 < base as usize {
+          int_digits[j] = DIGITS[d + 1];
+          carry = false;
+        } else {
+          int_digits[j] = DIGITS[0];
+        }
+      }
+      if carry {
+        int_digits.insert(0, DIGITS[1]);
+      }
+    }
+  }
+
+  while frac_digits.last() == Some(&b'0') {
+    frac_digits.pop();
+  }
+  let int_str = if int_digits.is_empty() {
+    "0".to_string()
+  } else {
+    String::from_utf8(int_digits).ok()?
+  };
+  let frac_str = String::from_utf8(frac_digits).ok()?;
+  let sign = if neg { "-" } else { "" };
+  Some(if frac_str.is_empty() {
+    format!("{sign}{int_str}.")
+  } else {
+    format!("{sign}{int_str}.{frac_str}")
+  })
+}
+
+/// Render `TableForm[matrix]` (or a 1D vector) as the aligned text grid that
+/// Wolfram produces under `ToString`. Columns are left-aligned and padded to the
+/// widest cell in the column, joined by three spaces; rows are separated by a
+/// blank line (`\n\n`); trailing whitespace is trimmed from every line.
+/// Returns `None` for arguments that are not lists.
+fn table_form_to_string(arg: &Expr) -> Option<String> {
+  let Expr::List(items) = arg else {
+    return None;
+  };
+  // A matrix is a non-empty list whose every element is itself a list.
+  let is_matrix =
+    !items.is_empty() && items.iter().all(|it| matches!(it, Expr::List(_)));
+  if is_matrix {
+    let rows: Vec<Vec<String>> = items
+      .iter()
+      .map(|row| match row {
+        Expr::List(cells) => cells.iter().map(expr_to_output).collect(),
+        _ => vec![],
+      })
+      .collect();
+    let ncols = rows.iter().map(std::vec::Vec::len).max().unwrap_or(0);
+    let mut col_w = vec![0usize; ncols];
+    for row in &rows {
+      for (j, cell) in row.iter().enumerate() {
+        col_w[j] = col_w[j].max(cell.chars().count());
+      }
+    }
+    let lines: Vec<String> = rows
+      .iter()
+      .map(|row| {
+        let padded: Vec<String> = row
+          .iter()
+          .enumerate()
+          .map(|(j, cell)| {
+            let pad = col_w[j].saturating_sub(cell.chars().count());
+            format!("{}{}", cell, " ".repeat(pad))
+          })
+          .collect();
+        padded.join("   ").trim_end().to_string()
+      })
+      .collect();
+    Some(lines.join("\n\n"))
+  } else {
+    // A flat vector renders one element per row.
+    let lines: Vec<String> = items.iter().map(expr_to_output).collect();
+    Some(lines.join("\n\n"))
+  }
+}
+
+/// Render `MatrixForm[matrix]` to a text grid. Unlike `TableForm` (which sizes
+/// each column independently), every cell is padded to a single uniform width —
+/// the widest cell anywhere in the matrix — left-aligned, with three-space
+/// separators and a blank line between rows. A flat vector renders as a single
+/// column, one element per row.
+fn matrix_form_to_string(arg: &Expr) -> Option<String> {
+  let Expr::List(items) = arg else {
+    return None;
+  };
+  let is_matrix =
+    !items.is_empty() && items.iter().all(|it| matches!(it, Expr::List(_)));
+  if is_matrix {
+    let rows: Vec<Vec<String>> = items
+      .iter()
+      .map(|row| match row {
+        Expr::List(cells) => cells.iter().map(expr_to_output).collect(),
+        _ => vec![],
+      })
+      .collect();
+    // Single uniform column width: the widest cell anywhere in the matrix.
+    let width = rows
+      .iter()
+      .flat_map(|r| r.iter())
+      .map(|c| c.chars().count())
+      .max()
+      .unwrap_or(0);
+    let lines: Vec<String> = rows
+      .iter()
+      .map(|row| {
+        let padded: Vec<String> = row
+          .iter()
+          .map(|cell| {
+            let pad = width.saturating_sub(cell.chars().count());
+            format!("{}{}", cell, " ".repeat(pad))
+          })
+          .collect();
+        padded.join("   ").trim_end().to_string()
+      })
+      .collect();
+    Some(lines.join("\n\n"))
+  } else {
+    // A flat vector renders one element per row (single column).
+    let lines: Vec<String> = items.iter().map(expr_to_output).collect();
+    Some(lines.join("\n\n"))
+  }
+}
+
+/// Recursively remove `HoldForm[x]` wrappers, replacing each with its content.
+/// HoldForm is transparent in OutputForm (so `ToString[HoldForm[1 + 1]]` is
+/// `1 + 1` and `ToString[f[HoldForm[a + b]]]` is `f[a + b]`), but it is kept in
+/// InputForm and the bare REPL echo — hence the stripping happens only in
+/// ToString's OutputForm paths, not in the shared formatters. The content is
+/// structurally re-emitted (never re-evaluated), so the held form is preserved.
+fn strip_hold_form(e: &Expr) -> Expr {
+  match e {
+    Expr::FunctionCall { name, args }
+      if name == "HoldForm" && args.len() == 1 =>
+    {
+      strip_hold_form(&args[0])
+    }
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.iter().map(strip_hold_form).collect::<Vec<_>>().into(),
+    },
+    Expr::List(items) => {
+      Expr::List(items.iter().map(strip_hold_form).collect::<Vec<_>>().into())
+    }
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(strip_hold_form(left)),
+      right: Box::new(strip_hold_form(right)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(strip_hold_form(operand)),
+    },
+    other => other.clone(),
+  }
+}
+
+pub fn to_string_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // A few heads print differently under ToString than in the bare
+  // script-mode echo (`MessageName` is the one that matters); the renderers
+  // tell the two apart by this flag.
+  crate::syntax::rendering_for_to_string(|| to_string_ast_inner(args))
+}
+
+fn to_string_ast_inner(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "ToString expects 1 or 2 arguments".into(),
+    ));
+  }
+
+  // ToString holds nothing, so an `Unevaluated[…]` written as its own argument
+  // loses the wrapper and only the content is printed: `ToString[Unevaluated[
+  // 1 + 1], InputForm]` is "1 + 1". A wrapper further in (`{0, Unevaluated[
+  // 1 + 1], 9}`) is part of the expression and prints as itself.
+  let args: Vec<Expr> =
+    std::iter::once(crate::evaluator::strip_unevaluated(&args[0]))
+      .chain(args[1..].iter().cloned())
+      .collect();
+  let args = &args[..];
+
+  // The optional second argument must be a format symbol (InputForm,
+  // OutputForm, TeXForm, …), never a number. wolframscript rejects e.g.
+  // ToString[255, 2] with ToString::fmtval and returns the call unevaluated,
+  // rather than silently ignoring the bogus format and stringifying the value.
+  if args.len() == 2 {
+    let is_numeric_form = matches!(
+      &args[1],
+      Expr::Integer(_)
+        | Expr::Real(_)
+        | Expr::BigInteger(_)
+        | Expr::BigFloat(_, _)
+    ) || matches!(&args[1], Expr::FunctionCall { name, .. } if name == "Rational");
+    if is_numeric_form {
+      crate::emit_message(&format!(
+        "ToString::fmtval: {} is not a valid format type.",
+        expr_to_output(&args[1])
+      ));
+      return Ok(unevaluated("ToString", args));
+    }
+  }
+
+  // When the requested form is structural InputForm, display-directive
+  // wrappers (TableForm, Column, BaseForm, NumberForm, AccountingForm,
+  // DecimalForm, PaddedForm) are NOT rendered to their 2D text form — they
+  // keep the symbolic head, matching wolframscript:
+  // `ToString[Column[{1,2,3}], InputForm]` -> "Column[{1, 2, 3}]". The
+  // InputForm branch further down handles this via expr_to_input_form.
+  let is_input_form = args.len() == 2
+    && matches!(&args[1], Expr::Identifier(f) if f == "InputForm");
+  // TeXForm must not take the 2D-OutputForm intercepts below (e.g. Subscript):
+  // it is rendered by the dedicated TeX path further down. TraditionalForm
+  // is the same story — it typesets into boxes rather than into 2D text, so
+  // a display wrapper has to reach its own box rule instead of being
+  // flattened to text on the way.
+  // (`is_tex_form` reads as "a form that typesets" — the name predates
+  // TraditionalForm joining it.)
+  let is_tex_form = args.len() == 2
+    && matches!(&args[1], Expr::Identifier(f) if
+      f == "TeXForm" || f == "TraditionalForm");
+
+  // TableForm[matrix] — render as an aligned text grid (left-aligned columns
+  // padded to the widest cell, three-space separators, blank line between rows).
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "TableForm"
+    && !is_input_form
+    && !is_tex_form
+    && inner_args.len() == 1
+    && let Some(rendered) = table_form_to_string(&inner_args[0])
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // Grid[matrix] — under ToString, wolframscript renders Grid exactly like
+  // TableForm (left-aligned columns padded to the widest cell, three-space
+  // separators, blank line between rows). Only the bare one-argument form is
+  // handled; option arguments (Frame, alignment, ...) fall through.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "Grid"
+    && !is_input_form
+    && !is_tex_form
+    && inner_args.len() == 1
+    && let Some(rendered) = table_form_to_string(&inner_args[0])
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // MatrixForm[matrix] — like TableForm but with a single uniform column width
+  // (the widest cell anywhere in the matrix) rather than per-column widths.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "MatrixForm"
+    && !is_input_form
+    && !is_tex_form
+    && inner_args.len() == 1
+    && let Some(rendered) = matrix_form_to_string(&inner_args[0])
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // Column[{e1, e2, ...}] / ColumnForm[{e1, e2, ...}] — stack the elements one
+  // per line (single newline). Trailing alignment/option arguments do not
+  // affect the plain-text form. Column keeps its symbolic head under InputForm;
+  // ColumnForm (the legacy directive) renders to text under every form.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && ((name == "Column" && !is_input_form && !is_tex_form)
+      || (name == "ColumnForm" && !is_tex_form))
+    && !inner_args.is_empty()
+    && let Expr::List(items) = &inner_args[0]
+  {
+    let lines: Vec<String> = items.iter().map(expr_to_output).collect();
+    return Ok(Expr::String(lines.join("\n")));
+  }
+
+  // BaseForm[n, b] — render the integer n in base b with the base shown as a
+  // subscript on the line below (e.g. `ff` over `  16`). Base 10 shows no
+  // subscript. Negative numbers keep their sign on the digit line.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "BaseForm"
+    && !is_input_form
+    && inner_args.len() == 2
+    && let Expr::Integer(b) = &inner_args[1]
+    && (2..=36).contains(b)
+    && let Some(digits) = base_form_digits(&inner_args[0], *b)
+  {
+    let rendered = if *b == 10 {
+      digits
+    } else {
+      let indent = " ".repeat(digits.chars().count());
+      format!("{digits}\n{indent}{b}")
+    };
+    return Ok(Expr::String(rendered));
+  }
+
+  // Subscript[base, sub] / Superscript[base, sup] — under ToString these
+  // render in 2D OutputForm: the script sits on a separate line, indented by
+  // the width of the base. `ToString[Subscript[x, 2]]` → "x\n 2";
+  // `ToString[Superscript[x, 2]]` → " 2\nx" (script above the base). The
+  // InputForm target keeps the head literal (`"Subscript[x, 2]"`) and falls
+  // through to the generic path below.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && (name == "Subscript" || name == "Superscript")
+    && !is_input_form
+    && !is_tex_form
+    && inner_args.len() == 2
+  {
+    let base_str = to_string_default_form(&inner_args[0]);
+    let script_str = to_string_default_form(&inner_args[1]);
+    let indent = " ".repeat(base_str.chars().count());
+    let rendered = if name == "Subscript" {
+      format!("{base_str}\n{indent}{script_str}")
+    } else {
+      format!("{indent}{script_str}\n{base_str}")
+    };
+    return Ok(Expr::String(rendered));
+  }
+
+  // Style[content, directives...] — the directives (font size, weight, color)
+  // are display-only and carry no plain-text form, so ToString renders just
+  // the inner content. Recurse through ToString (preserving any explicit form
+  // argument) so a nested display wrapper such as `NumberForm` still resolves,
+  // e.g. `ToString[Style[NumberForm[50., {3, 1}], 18]]` -> "50.0". InputForm
+  // and TeXForm keep the literal `Style[...]` head and fall through.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "Style"
+    && !is_input_form
+    && !is_tex_form
+    && !inner_args.is_empty()
+  {
+    let mut recursed = args.to_vec();
+    recursed[0] = inner_args[0].clone();
+    return to_string_ast(&recursed);
+  }
+
+  // Row[{e1, e2, ...}] / Row[{e1, e2, ...}, sep] — concatenate the elements
+  // (joining with `sep` when given). Each element is rendered through ToString
+  // so nested display wrappers resolve, matching wolframscript's
+  // `ToString[Row[{NumberForm[50., {3, 1}], " pct"}]]` -> "50.0 pct".
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "Row"
+    && !is_input_form
+    && !is_tex_form
+    && !inner_args.is_empty()
+    && let Expr::List(items) = &inner_args[0]
+  {
+    let render = |e: &Expr| -> String {
+      let mut recursed = args.to_vec();
+      recursed[0] = e.clone();
+      match to_string_ast(&recursed) {
+        Ok(Expr::String(ref s)) => s.clone(),
+        Ok(other) => expr_to_output(&other),
+        Err(_) => expr_to_output(e),
+      }
+    };
+    let parts: Vec<String> = items.iter().map(&render).collect();
+    let joined = if inner_args.len() >= 2 {
+      parts.join(&render(&inner_args[1]))
+    } else {
+      parts.concat()
+    };
+    return Ok(Expr::String(joined));
+  }
+
+  // Quantity[m, unit] — the two string conversions spell the unit out
+  // ("3 meters") or abbreviate it ("3 m"); the script-mode echo keeps the
+  // `Quantity[3, Meters]` wrapper, so only this path renders words.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "Quantity"
+    && !is_input_form
+    && !is_tex_form
+    && let Some(rendered) = quantity_to_text(inner_args, false)
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // A list holding a quantity renders element-wise, so the units inside it
+  // are spelled out too: `{1 meter, 2 feet}`.
+  if let Expr::List(items) = &args[0]
+    && !is_input_form
+    && !is_tex_form
+    && items.iter().any(contains_quantity)
+  {
+    let parts: Vec<String> = items
+      .iter()
+      .map(|e| {
+        let mut recursed = args.to_vec();
+        recursed[0] = e.clone();
+        match to_string_ast(&recursed) {
+          Ok(Expr::String(ref s)) => s.clone(),
+          _ => to_string_default_form(e),
+        }
+      })
+      .collect();
+    return Ok(Expr::String(format!("{{{}}}", parts.join(", "))));
+  }
+
+  // NumberForm[x, n], PaddedForm[x, {n, f}], AccountingForm[x] and every
+  // option combination they take (NumberPoint, NumberSeparator, DigitBlock,
+  // NumberPadding, NumberSigns, SignPadding) go through one renderer, so the
+  // three heads cannot drift apart.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && matches!(
+      name.as_str(),
+      "NumberForm" | "PaddedForm" | "AccountingForm"
+    )
+    && !is_input_form
+    && !is_tex_form
+    && !inner_args.is_empty()
+    && let Some(rendered) = number_form_family_to_string(name, inner_args)
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // NumberForm[x, n, ExponentFunction -> f] / ScientificForm[x, n, …] — apply a
+  // custom exponent function that re-expresses the number as mantissa × 10^e'.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && (name == "NumberForm" || name == "ScientificForm")
+    && !is_input_form
+    && let Some(f) = inner_args.iter().find_map(|a| match a {
+      Expr::Rule {
+        pattern,
+        replacement,
+      } if matches!(pattern.as_ref(), Expr::Identifier(s) if s == "ExponentFunction") => {
+        Some(replacement.as_ref())
+      }
+      _ => None,
+    })
+  {
+    let positional: Vec<&Expr> = inner_args
+      .iter()
+      .filter(|a| !matches!(a, Expr::Rule { .. }))
+      .collect();
+    if let Some(&x) = positional.first() {
+      let n = match positional.get(1) {
+        Some(Expr::Integer(n)) => *n as i64,
+        _ => 6,
+      };
+      if let Some(rendered) = render_form_threaded(x, |x| {
+        number_form_exponent_function_to_string(x, n, f)
+      }) {
+        return Ok(Expr::String(rendered));
+      }
+    }
+  }
+
+  // ScientificForm[x] / ScientificForm[x, n] — scientific (mantissa × 10^exp)
+  // rendering. Default 6 significant figures; the exponent is shown as a
+  // superscript on the line above. Exponent 0 collapses to just the mantissa.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "ScientificForm"
+    && !is_input_form
+    && let Some(rendered) = exponent_form_to_string(name, inner_args)
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // EngineeringForm[x] / EngineeringForm[x, n] — like ScientificForm but the
+  // exponent is forced to a multiple of 3 (mantissa in [1, 1000)).
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "EngineeringForm"
+    && !is_input_form
+    && let Some(rendered) = exponent_form_to_string(name, inner_args)
+  {
+    return Ok(Expr::String(rendered));
+  }
+
+  // DecimalForm[x] / DecimalForm[x, n] — decimal (non-scientific) rendering.
+  // The one-argument form keeps the integer part exact and rounds the fraction
+  // to machine precision; the two-argument form rounds to n significant
+  // figures. Both always use decimal notation and keep the minus sign.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "DecimalForm"
+    && !is_input_form
+    && (inner_args.len() == 1 || inner_args.len() == 2)
+  {
+    let rendered = match inner_args.get(1) {
+      None => match &inner_args[0] {
+        Expr::Integer(i) => Some(i.to_string()),
+        Expr::Real(f) => Some(decimal_form_default(*f)),
+        _ => None,
+      },
+      Some(Expr::Integer(n)) => {
+        number_form_to_string(&inner_args[0], *n as i64)
+      }
+      _ => None,
+    };
+    if let Some(rendered) = rendered {
+      // DecimalForm drops a trailing decimal point when there is no
+      // fractional part (wolframscript: `1234568.` -> `1234568`).
+      let rendered = rendered
+        .strip_suffix('.')
+        .map(str::to_string)
+        .unwrap_or(rendered);
+      return Ok(Expr::String(rendered));
+    }
+  }
+
+  // PaddedForm[expr, n] / PaddedForm[expr, {n, f}] — right-aligned
+  // number rendering (width n+1 for the integer spec, n+2 for {n, f},
+  // reserving sign/decimal-point columns like wolframscript). The
+  // NumberPadding -> {p1, p2} option replaces the left padding character
+  // (e.g. "0" for zero-padded fields), with the sign column filling like
+  // the NumberForm NumberPadding handling above. A BaseForm[x, b] inner
+  // value pads the base-b digit string and keeps the subscript base line.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "PaddedForm"
+    && !is_input_form
+    && inner_args.len() >= 2
+  {
+    let positional: Vec<&Expr> = inner_args
+      .iter()
+      .filter(|a| !matches!(a, Expr::Rule { .. }))
+      .collect();
+    if positional.len() == 2 {
+      let lpad = number_padding_left(inner_args);
+      let rpad = number_padding_right(inner_args);
+      if let Some((digits, base)) =
+        padded_base_form_digits(positional[0], positional[1], &lpad)
+      {
+        let rendered = if base == 10 {
+          digits
+        } else {
+          let indent = " ".repeat(digits.chars().count());
+          format!("{digits}\n{indent}{base}")
+        };
+        return Ok(Expr::String(rendered));
+      }
+      if let Some(rendered) =
+        padded_form_to_string(positional[0], positional[1], &lpad, &rpad)
+      {
+        return Ok(Expr::String(rendered));
+      }
+    }
+  }
+
+  // If the expression is MathMLForm[inner], produce MathML regardless of form argument
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "MathMLForm"
+    && inner_args.len() == 1
+  {
+    let mathml = expr_to_mathml(&inner_args[0]);
+    // InputForm includes trailing newline; default/OutputForm does not
+    let is_input_form = args.len() == 2
+      && matches!(&args[1], Expr::Identifier(f) if f == "InputForm");
+    if is_input_form {
+      return Ok(Expr::String(mathml));
+    }
+    return Ok(Expr::String(mathml.trim_end_matches('\n').to_string()));
+  }
+
+  // If the expression is StandardForm[inner], produce box form representation
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "StandardForm"
+    && inner_args.len() == 1
+  {
+    return Ok(Expr::String(expr_to_box_form(&inner_args[0])));
+  }
+
+  // If the expression is TraditionalForm[inner], produce \!\(\*FormBox[boxes, TraditionalForm]\)
+  // using the same box escape notation as StandardForm but wrapped in FormBox.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "TraditionalForm"
+    && inner_args.len() == 1
+  {
+    let box_str = expr_to_boxes(&inner_args[0]);
+    // Use Unicode box markers (like StandardForm) so that:
+    // - OutputForm renders as DisplayForm[FormBox[..., TraditionalForm]]
+    // - InputForm renders as \!\(\*FormBox[..., TraditionalForm]\)
+    return Ok(Expr::String(format!(
+      "{BOX_START}{BOX_OPEN}{BOX_SEP}FormBox[{box_str}, TraditionalForm]{BOX_CLOSE}"
+    )));
+  }
+
+  // If the expression is TeXForm[inner], produce TeX representation.
+  // When the inner expression's head has user-defined MakeBoxes or
+  // Format rules, route through the box AST (so user delimiters like
+  // `<~` / `~>` surface in the rendered TeX), otherwise use the
+  // direct expression-to-TeX path.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "TeXForm"
+    && inner_args.len() == 1
+  {
+    let inner = &inner_args[0];
+    // `TeXForm[InputForm[expr]]` renders the InputForm string of `expr`
+    // (with user `Format[…, InputForm]` rules applied) inside `\text{…}`,
+    // with `{` / `}` escaped using TeX's `$\{$` / `$\}$` braces.
+    if let Expr::FunctionCall {
+      name: ifname,
+      args: ifargs,
+    } = inner
+      && ifname == "InputForm"
+      && ifargs.len() == 1
+    {
+      let formatted = crate::evaluator::dispatch::complex_and_special::apply_format_recursively(
+        &ifargs[0],
+        "InputForm",
+      );
+      // Use OutputForm-style rendering (strings without surrounding
+      // quotes), then escape `{` / `}` using TeX's `$\{$` / `$\}$`.
+      let input_text = expr_to_output(&formatted);
+      let escaped = input_text.replace('{', "$\\{$").replace('}', "$\\}$");
+      return Ok(Expr::String(format!("\\text{{{escaped}}}")));
+    }
+    if let Expr::FunctionCall { name: head, .. } = inner {
+      let has_format = crate::evaluator::assignment::FORMAT_VALUES
+        .with(|m| m.borrow().contains_key(head));
+      let has_user_mb = crate::FUNC_DEFS.with(|m| {
+        m.borrow().get("MakeBoxes").is_some_and(|entries| {
+          entries.iter().any(|(_, conditions, _, _, _, _)| {
+            // User MakeBoxes patterns like `MakeBoxes[F[x__], fmt_]`
+            // are stored as `__StructuralPattern__[__sp0, F[x__]]` in
+            // the conditions of the first slot. Check whether any
+            // entry's structural pattern matches the inner head.
+            conditions.first().is_some_and(|cond| {
+              matches!(
+                cond,
+                Some(Expr::FunctionCall { name: cn, args: ca })
+                  if cn == "__StructuralPattern__"
+                  && ca.len() == 2
+                  && matches!(
+                    &ca[1],
+                    Expr::FunctionCall { name: pn, .. } if pn == head
+                  )
+              )
+            })
+          })
+        })
+      });
+      if has_format || has_user_mb {
+        // Pass `TeXForm` as the target so the Format pre-check in
+        // MakeBoxes only fires on `Format[…, TeXForm]` rules. User
+        // MakeBoxes patterns use `fmt_` and match any form, so they
+        // still apply.
+        let mb_call =
+          call("MakeBoxes", vec![inner.clone(), id_expr("TeXForm")]);
+        if let Ok(box_ast) = crate::evaluator::evaluate_expr_to_expr(&mb_call) {
+          return Ok(Expr::String(box_ast_to_tex(&box_ast)));
+        }
+      }
+    }
+    return Ok(Expr::String(expr_to_tex(inner)));
+  }
+
+  // If the expression is OutputForm[inner], produce the OutputForm-rendered
+  // text (e.g. `f'[x]` for derivative prime notation). Mirrors what
+  // wolframscript prints when ToString unwraps the form wrapper.
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "OutputForm"
+    && inner_args.len() == 1
+  {
+    return Ok(Expr::String(crate::syntax::expr_to_output_form_2d(
+      &inner_args[0],
+    )));
+  }
+
+  // `ToString[InputForm[expr]]` (single arg, default OutputForm rendering)
+  // unwraps the InputForm head and renders the inner expression in
+  // InputForm — wolframscript prints `a + b`, not `InputForm[a + b]`,
+  // because the outer form is OutputForm and `InputForm[x]`'s OutputForm
+  // is the InputForm of x.
+  //
+  // For the 2-arg form `ToString[InputForm[expr], InputForm]` the target
+  // is structural InputForm, which keeps the `InputForm[…]` head visible
+  // (`"InputForm[a + b]"`). Skip this unwrap path in that case; the
+  // 2-arg branch below renders the wrapped expression via
+  // `expr_to_input_form`, which preserves the wrapper.
+  if args.len() == 1
+    && let Expr::FunctionCall {
+      name,
+      args: inner_args,
+    } = &args[0]
+    && name == "InputForm"
+    && inner_args.len() == 1
+  {
+    let formatted =
+      crate::evaluator::dispatch::complex_and_special::apply_format_recursively(
+        &inner_args[0],
+        "InputForm",
+      );
+    return Ok(Expr::String(crate::syntax::expr_to_input_form(&formatted)));
+  }
+
+  // If the expression is FortranForm[inner], produce Fortran representation
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "FortranForm"
+    && inner_args.len() == 1
+  {
+    return Ok(Expr::String(expr_to_fortran(&inner_args[0])));
+  }
+
+  // If the expression is CForm[inner], produce C representation
+  if let Expr::FunctionCall {
+    name,
+    args: inner_args,
+  } = &args[0]
+    && name == "CForm"
+    && inner_args.len() == 1
+  {
+    return Ok(Expr::String(expr_to_c(&inner_args[0])));
+  }
+
+  // Check for form argument
+  if args.len() == 2
+    && let Expr::Identifier(form) = &args[1]
+  {
+    match form.as_str() {
+      "InputForm" => {
+        // If the expression is CForm[inner], produce C code instead
+        if let Expr::FunctionCall {
+          name,
+          args: inner_args,
+        } = &args[0]
+          && name == "CForm"
+          && inner_args.len() == 1
+        {
+          return Ok(Expr::String(expr_to_c(&inner_args[0])));
+        }
+        // InputForm: infix operators + quoted strings. Apply
+        // user-defined `Format[head[…], InputForm]` rules bottom-up
+        // first so e.g. `Format[F[x_, y_], InputForm] := {F[x], "In"}`
+        // surfaces in the printed text.
+        let formatted =
+          crate::evaluator::dispatch::complex_and_special::apply_format_recursively(
+            &args[0],
+            "InputForm",
+          );
+        let s = crate::syntax::expr_to_input_form(&formatted);
+        return Ok(Expr::String(s));
+      }
+      "TeXForm" => {
+        return Ok(Expr::String(expr_to_tex(&args[0])));
+      }
+      "CForm" => {
+        return Ok(Expr::String(expr_to_c(&args[0])));
+      }
+      "FortranForm" => {
+        return Ok(Expr::String(expr_to_fortran(&args[0])));
+      }
+      "OutputForm" => {
+        // Apply user-defined `Format[head[…], OutputForm]` rules
+        // bottom-up before rendering, matching wolframscript.
+        let formatted = strip_hold_form(
+          &crate::evaluator::dispatch::complex_and_special::apply_format_recursively(
+            &args[0],
+            "OutputForm",
+          ),
+        );
+        let s = crate::syntax::expr_to_output_form_2d(&formatted);
+        return Ok(Expr::String(s));
+      }
+      "TraditionalForm" => {
+        // Typeset into TraditionalForm boxes and hand them back in the
+        // box-syntax escape notation `\!\(\*FormBox[…, TraditionalForm]\)`,
+        // the same way `ToString[expr, StandardForm]` returns its boxes —
+        // a String that displays as the typeset expression rather than as
+        // its own source. `Sin[x]` becomes
+        // `RowBox[{"sin", "(", "x", ")"}]`, a quotient a `FractionBox`.
+        let formatted =
+          crate::evaluator::dispatch::complex_and_special::apply_format_recursively(
+            &args[0],
+            "TraditionalForm",
+          );
+        let boxes =
+          crate::evaluator::dispatch::complex_and_special::expr_to_box_form_traditional(
+            &formatted,
+          );
+        let box_text = linear_syntax_box_text(&boxes);
+        return Ok(Expr::String(format!(
+          "{BOX_START}{BOX_OPEN}{BOX_SEP}FormBox[{box_text}, \
+           TraditionalForm]{BOX_CLOSE}"
+        )));
+      }
+      "StandardForm" => {
+        // Build the box AST via MakeBoxes (which dispatches user-defined
+        // Format / MakeBoxes rules), then encode it using Wolfram's
+        // box-syntax escape characters (`\!\(\*…\)`). The resulting
+        // String displays as `DisplayForm[…]` in OutputForm — matching
+        // what wolframscript prints for `ToString[expr, StandardForm]`.
+        let make_boxes_call =
+          call("MakeBoxes", vec![args[0].clone(), id_expr("StandardForm")]);
+        let box_ast = crate::evaluator::evaluate_expr_to_expr(&make_boxes_call)
+          .unwrap_or_else(|_| args[0].clone());
+        let box_inner_text = linear_syntax_box_text(&box_ast);
+        return Ok(Expr::String(format!(
+          "{BOX_START}{BOX_OPEN}{BOX_SEP}{box_inner_text}{BOX_CLOSE}"
+        )));
+      }
+      _ => {}
+    }
+  }
+  // Other forms: fall through to default (OutputForm-like) behavior
+
+  // ToString[FullForm[expr]] returns the structural FullForm string of `expr`,
+  // matching wolframscript: `ToString[FullForm[(a*Sqrt[x])^-1]]` →
+  // `Times[Power[a, -1], Power[x, Rational[-1, 2]]]`.
+  if args.len() == 1
+    && let Expr::FunctionCall {
+      name,
+      args: inner_args,
+    } = &args[0]
+    && name == "FullForm"
+    && inner_args.len() == 1
+  {
+    return Ok(Expr::String(crate::functions::expr_form::render_full_form(
+      &inner_args[0],
+    )));
+  }
+
+  // Special case: StringForm["template", args...] → substitute placeholders
+  if let Expr::FunctionCall {
+    name,
+    args: sf_args,
+  } = &args[0]
+    && name == "StringForm"
+    && !sf_args.is_empty()
+    && let Expr::String(template) = &sf_args[0]
+  {
+    return Ok(Expr::String(format_string_form(template, &sf_args[1..])));
+  }
+
+  // Arbitrary-precision numbers: ToString drops the `\`p` precision marker
+  // and returns the decimal expansion rounded (not truncated) to `p`
+  // significant figures, matching wolframscript: `ToString[N[Pi, 5]]` is
+  // "3.1416" (not "3.1415") and `ToString[N[999/1000, 2]]` is "1.0".
+  if let Expr::BigFloat(digits, prec) = &args[0] {
+    return Ok(Expr::String(format_bigfloat_for_to_string(digits, *prec)));
+  }
+
+  // Default (no form or unrecognized form): OutputForm.
+  // Resolve any nested form wrappers (TeXForm, CForm, FortranForm) first,
+  // matching wolframscript behavior where ToString extracts form conversions.
+  // Then truncate machine-precision Reals to 6 significant digits — Wolfram's
+  // ToString default for `Real` values, which is *not* the same as the REPL
+  // /Print display (those keep full f64 precision). The default form IS
+  // OutputForm, so the 2D renderer applies: `ToString[3/4]` is the
+  // three-line `3` / `-` / `4`, and `ToString[x^2]` puts the exponent on
+  // its own line (wolframscript-verified; differential fuzzer, seed
+  // 1783530056735545937).
+  let resolved = strip_hold_form(&resolve_form_wrappers(&args[0]));
+  let truncated = truncate_machine_reals_for_to_string(&resolved);
+  let s = crate::syntax::expr_to_output_form_2d(&truncated);
+  Ok(Expr::String(s))
+}
+
+/// Format `expr` the way `ToString[expr]` (default OutputForm) does:
+/// machine-precision Reals are shown at 6 significant digits (so the f64
+/// noise in e.g. `0.47000000000000003` renders as `0.47`). Used for chart
+/// labels, which Wolfram typesets in OutputForm rather than full precision.
+pub fn to_string_default_form(expr: &Expr) -> String {
+  expr_to_output(&truncate_machine_reals_for_to_string(expr))
+}
+
+/// Round a machine-precision Real to 6 significant decimal digits — the
+/// width wolframscript uses for `ToString[real]` on a default
+/// (MachinePrecision) Real. Returns NaN/inf unchanged; 0.0 stays 0.0.
+fn round_real_to_6_sig_digits(f: f64) -> f64 {
+  if f == 0.0 || !f.is_finite() {
+    return f;
+  }
+  // Round to 6 significant digits via scientific formatting. Multiplying by a
+  // 10^k factor (which is not exactly representable in f64) loses precision —
+  // e.g. 1.5e10 would round-trip to 1.4999999999999998e10. Formatting to 5
+  // digits after the point in `e` notation rounds correctly.
+  format!("{f:.5e}").parse().unwrap_or(f)
+}
+
+/// Render an arbitrary-precision number the way `ToString` does: drop the
+/// `` `p `` precision marker and round (not truncate) the decimal expansion
+/// to `p` significant figures — matching wolframscript: `ToString[N[Pi, 5]]`
+/// is "3.1416" (not "3.1415") and `ToString[N[999/1000, 2]]` is "1.0".
+fn format_bigfloat_for_to_string(digits: &str, prec: f64) -> String {
+  let trimmed = digits.trim();
+  let (sign, body) = if let Some(rest) = trimmed.strip_prefix('-') {
+    ("-", rest)
+  } else {
+    ("", trimmed)
+  };
+  let prec_digits = prec.round() as i64;
+  if prec_digits > 0 {
+    format!(
+      "{}{}",
+      sign,
+      crate::round_significant(body, prec_digits as usize)
+    )
+  } else {
+    // Non-positive precision (e.g. an accuracy form): keep the digits.
+    format!("{sign}{body}")
+  }
+}
+
+/// Recursively replace each `Expr::Real(f)` in `expr` with its
+/// 6-sig-digit-rounded counterpart, so the default ToString path
+/// emits e.g. `15.8406` for the f64 value `15.840646417884168`. Each
+/// `Expr::BigFloat` is rendered the same way a top-level BigFloat argument
+/// to `ToString` is (backtick marker dropped, rounded to its precision) —
+/// otherwise a BigFloat nested inside a List or FunctionCall would print
+/// its raw InputForm digits with the marker still attached, e.g.
+/// `ToString[{N[Pi, 5]}]` would wrongly be "{3.1415926535897932385`5.}"
+/// instead of "{3.1416}".
+fn truncate_machine_reals_for_to_string(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Real(f) => Expr::Real(round_real_to_6_sig_digits(*f)),
+    Expr::BigFloat(digits, prec) => {
+      Expr::Raw(format_bigfloat_for_to_string(digits, *prec))
+    }
+    Expr::List(items) => Expr::List(
+      items
+        .iter()
+        .map(truncate_machine_reals_for_to_string)
+        .collect(),
+    ),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args
+        .iter()
+        .map(truncate_machine_reals_for_to_string)
+        .collect(),
+    },
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(truncate_machine_reals_for_to_string(left)),
+      right: Box::new(truncate_machine_reals_for_to_string(right)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(truncate_machine_reals_for_to_string(operand)),
+    },
+    _ => expr.clone(),
+  }
+}
+
+/// Recursively replace TeXForm/CForm/FortranForm wrappers with their converted
+/// string representation. This matches wolframscript behavior where ToString
+/// extracts the converted form from nested wrappers.
+fn resolve_form_wrappers(expr: &Expr) -> Expr {
+  match expr {
+    Expr::FunctionCall { name, args } if args.len() == 1 => match name.as_str()
+    {
+      "TeXForm" => Expr::Identifier(expr_to_tex(&args[0])),
+      "CForm" => Expr::Identifier(expr_to_c(&args[0])),
+      "FortranForm" => Expr::Identifier(expr_to_fortran(&args[0])),
+      _ => expr.clone(),
+    },
+    Expr::List(items) => {
+      Expr::List(items.iter().map(resolve_form_wrappers).collect())
+    }
+    _ => expr.clone(),
+  }
+}
+
+/// Convert a Wolfram expression to LaTeX (TeX) notation.
+/// Render a box AST (typically the result of `MakeBoxes[expr,
+/// StandardForm]`) as TeX. Used by `ToString[TeXForm[expr]]` when the
+/// expression's head has user-defined MakeBoxes or Format rules so
+/// custom box delimiters (`<~`, `~>`, etc.) surface in the rendered
+/// TeX.
+fn box_ast_to_tex(expr: &Expr) -> String {
+  fn tex_special_chars(s: &str) -> String {
+    s.replace('~', "\\sim ")
+  }
+  match expr {
+    Expr::String(s) => {
+      // Box-element strings whose contents are wrapped in literal `"`
+      // characters represent user-supplied Wolfram strings — wrap
+      // their unquoted contents in `\text{…}`. Strings ending in a
+      // backtick (the precision/accuracy marker on Real / BigFloat
+      // box elements) drop the trailing `\``. Everything else gets
+      // TeX special-character translation (notably `~` → `\sim `).
+      if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        format!("\\text{{{}}}", &s[1..s.len() - 1])
+      } else if let Some(stripped) = s.strip_suffix('`') {
+        tex_special_chars(stripped)
+      } else {
+        tex_special_chars(s)
+      }
+    }
+    Expr::FunctionCall { name, args }
+      if name == "RowBox" && args.len() == 1 =>
+    {
+      if let Expr::List(items) = &args[0] {
+        items.iter().map(box_ast_to_tex).collect::<String>()
+      } else {
+        box_ast_to_tex(&args[0])
+      }
+    }
+    Expr::FunctionCall { name, args }
+      if name == "FractionBox" && args.len() == 2 =>
+    {
+      format!(
+        "\\frac{{{}}}{{{}}}",
+        box_ast_to_tex(&args[0]),
+        box_ast_to_tex(&args[1])
+      )
+    }
+    Expr::FunctionCall { name, args }
+      if name == "SqrtBox" && !args.is_empty() =>
+    {
+      format!("\\sqrt{{{}}}", box_ast_to_tex(&args[0]))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "SuperscriptBox" && args.len() == 2 =>
+    {
+      format!(
+        "{}^{{{}}}",
+        box_ast_to_tex(&args[0]),
+        box_ast_to_tex(&args[1])
+      )
+    }
+    Expr::FunctionCall { name, args }
+      if name == "SubscriptBox" && args.len() == 2 =>
+    {
+      format!(
+        "{}_{{{}}}",
+        box_ast_to_tex(&args[0]),
+        box_ast_to_tex(&args[1])
+      )
+    }
+    _ => expr_to_tex(expr),
+  }
+}
+
+/// Render a BigFloat digit string at exactly `prec` significant digits. Used
+/// by TeX/C/Fortran rendering where the precision-tag suffix isn't shown but
+/// the digit count should still reflect the stored precision. `digits` is
+/// e.g. `-14.` or `3.14`; `prec` is the significant-digit count. Returns
+/// `-14.0` for `("-14.", 3.0)`.
+fn pad_bigfloat_to_precision(digits: &str, prec: f64) -> String {
+  let prec_target = prec.round().max(0.0) as usize;
+  if prec_target == 0 {
+    return digits.to_string();
+  }
+  let (sign, rest) = if let Some(r) = digits.strip_prefix('-') {
+    ("-", r)
+  } else {
+    ("", digits)
+  };
+  format!("{sign}{}", crate::round_significant(rest, prec_target))
+}
+
+/// The rows of `items` when it is a matrix for TeX purposes: every element is
+/// a list, they all have the same length, and that length is not zero. (Their
+/// entries may be anything, including lists — `{{{1, 2}}, {{3, 4}}}` is a
+/// one-column array of two lists.)
+fn tex_matrix_rows(items: &[Expr]) -> Option<Vec<Vec<Expr>>> {
+  if items.is_empty() {
+    return None;
+  }
+  let mut rows = Vec::with_capacity(items.len());
+  for item in items {
+    let Expr::List(row) = item else {
+      return None;
+    };
+    rows.push(row.to_vec());
+  }
+  let width = rows[0].len();
+  if width == 0 || rows.iter().any(|r| r.len() != width) {
+    return None;
+  }
+  Some(rows)
+}
+
+thread_local! {
+  /// Set by the sum renderer just before it renders a term, and consumed by
+  /// the product renderer: a negated `Star` term of a sum is written
+  /// without brackets (`a-\frac{1}{2}*f(x)`), while on its own it is
+  /// `-\left(\frac{1}{2}*f(x)\right)`.
+  static TEX_SUM_TERM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Set while the contents of a `HoldForm` are rendered: a held expression
+  /// is shown exactly as written, so its sums and products keep their
+  /// argument order instead of being rearranged for display.
+  static TEX_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+  /// Nesting depth of `expr_to_tex`. Only the outermost call applies the
+  /// user's `Format[…, TraditionalForm]` rules and trims the result.
+  static TEX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the expression being rendered sits inside a `HoldForm`.
+fn tex_held() -> bool {
+  TEX_HELD.with(std::cell::Cell::get)
+}
+
+/// Render an expression as TeX, the way `TeXForm` does.
+///
+/// wolframscript typesets through `TraditionalForm`, so a user-defined
+/// `Format[head[…], TraditionalForm]` rule shapes the output (Rubi's `Int`
+/// shows as an integral sign); the rules are applied once, to the whole
+/// expression, before rendering. The result is trimmed at the end only —
+/// every TeX control word is written with a trailing space (`\pi `), which
+/// wolframscript keeps inside the string and drops at its end.
+pub fn expr_to_tex(expr: &Expr) -> String {
+  struct Depth;
+  impl Drop for Depth {
+    fn drop(&mut self) {
+      TEX_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+  }
+  let outermost = TEX_DEPTH.with(|d| {
+    let depth = d.get();
+    d.set(depth + 1);
+    depth == 0
+  });
+  let _depth = Depth;
+  if !outermost {
+    return expr_to_tex_inner(expr);
+  }
+  use crate::evaluator::dispatch::complex_and_special as forms;
+  let formatted = if forms::has_format_rules() {
+    Some(forms::apply_format_recursively(expr, "TraditionalForm"))
+  } else {
+    None
+  };
+  let was_held = TEX_HELD.with(|h| h.replace(false));
+  let out = expr_to_tex_inner(formatted.as_ref().unwrap_or(expr));
+  TEX_HELD.with(|h| h.set(was_held));
+  out.trim_end().to_string()
+}
+
+fn expr_to_tex_inner(expr: &Expr) -> String {
+  // Only a product consumes the "term of a sum" flag; any other node
+  // clears it so it cannot leak into a nested product.
+  let is_product = matches!(
+    expr,
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      ..
+    } | Expr::BinaryOp {
+      op: BinaryOperator::Times | BinaryOperator::Divide,
+      ..
+    }
+  ) || matches!(expr, Expr::FunctionCall { name, args }
+      if name == "Times" && args.len() >= 2);
+  if !is_product {
+    TEX_SUM_TERM.with(|f| f.set(false));
+  }
+  // HoldForm[x] is a display wrapper; render its content transparently —
+  // but as written, without the reordering an evaluated sum gets.
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "HoldForm"
+    && args.len() == 1
+  {
+    let was_held = TEX_HELD.with(|h| h.replace(true));
+    let out = expr_to_tex(&args[0]);
+    TEX_HELD.with(|h| h.set(was_held));
+    return out;
+  }
+  // OutputForm[x] renders the content to its OutputForm text first, then
+  // TeXForm wraps that in `\text{…}`. Wolfram prints
+  // `b // OutputForm // TeXForm` as `\text{b}`.
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "OutputForm"
+    && args.len() == 1
+  {
+    let rendered = crate::syntax::expr_to_output_form_2d(&args[0]);
+    return format!("\\text{{{rendered}}}");
+  }
+  match expr {
+    Expr::Integer(n) => n.to_string(),
+    Expr::BigInteger(n) => n.to_string(),
+    Expr::Real(f) => tex_real(*f),
+    Expr::BigFloat(digits, prec) => {
+      // TeX rendering of a precision-tagged BigFloat uses the
+      // plain decimal digits (no `…` precision marker), padded
+      // with trailing zeros to show all `prec` significant
+      // digits. wolframscript's `-14.`3 // TeXForm` → `-14.0`
+      // (3 sig digits = "14" + "0").
+      pad_bigfloat_to_precision(digits, *prec)
+    }
+    Expr::String(s) => format!("\\text{{{}}}", tex_escape_text(s)),
+    // Raw is the rendered output of OutputForm / 2d boxes — treat as text.
+    Expr::Raw(s) => format!("\\text{{{s}}}"),
+    Expr::Identifier(name) | Expr::Constant(name) => tex_identifier(name),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      ..
+    } => tex_product(expr),
+    Expr::UnaryOp {
+      op: UnaryOperator::Not,
+      operand,
+    } => format!("\\neg {}", tex_logic_operand(operand, "Not", 40)),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      TEX_SUM_TERM.with(|f| f.set(true));
+      let l = expr_to_tex(left);
+      TEX_SUM_TERM.with(|f| f.set(true));
+      let r = expr_to_tex(right);
+      TEX_SUM_TERM.with(|f| f.set(false));
+      // Check if right side starts with minus to avoid x+-y
+      if r.starts_with('-') {
+        format!("{l}{r}")
+      } else {
+        format!("{l}+{r}")
+      }
+    }
+    // A held `a - b` is written as it stands: the subtrahend is bracketed
+    // when it is a sum (`a-(b-c)`), and `a - -b` keeps both signs.
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      TEX_SUM_TERM.with(|f| f.set(true));
+      let l = expr_to_tex(left);
+      TEX_SUM_TERM.with(|f| f.set(true));
+      let r = expr_to_tex(right);
+      TEX_SUM_TERM.with(|f| f.set(false));
+      let r = if is_tex_sum(right) { tex_paren(&r) } else { r };
+      format!("{l}-{r}")
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times | BinaryOperator::Divide,
+      ..
+    } => tex_product(expr),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => tex_power(left, right),
+    Expr::BinaryOp {
+      op: BinaryOperator::And,
+      left,
+      right,
+    } => format!(
+      "{}\\land {}",
+      tex_logic_operand(left, "And", 20),
+      tex_logic_operand(right, "And", 20)
+    ),
+    Expr::BinaryOp {
+      op: BinaryOperator::Or,
+      left,
+      right,
+    } => format!(
+      "{}\\lor {}",
+      tex_logic_operand(left, "Or", 20),
+      tex_logic_operand(right, "Or", 20)
+    ),
+    Expr::BinaryOp {
+      op: BinaryOperator::StringJoin,
+      left,
+      right,
+    } => format!("{} \\diamond {}", expr_to_tex(left), expr_to_tex(right)),
+    Expr::BinaryOp {
+      op: BinaryOperator::Alternatives,
+      left,
+      right,
+    } => format!("{} | {}", expr_to_tex(left), expr_to_tex(right)),
+    Expr::Comparison {
+      operands,
+      operators,
+    } => {
+      let mut result = expr_to_tex(&operands[0]);
+      for (i, op) in operators.iter().enumerate() {
+        let op_tex = match op {
+          ComparisonOp::Equal => "=",
+          ComparisonOp::NotEqual => "\\neq ",
+          ComparisonOp::Less => "<",
+          ComparisonOp::LessEqual => "\\leq ",
+          ComparisonOp::Greater => ">",
+          ComparisonOp::GreaterEqual => "\\geq ",
+          ComparisonOp::SameQ => "===",
+          ComparisonOp::UnsameQ => "=!=",
+        };
+        result.push_str(op_tex);
+        if i + 1 < operands.len() {
+          result.push_str(&expr_to_tex(&operands[i + 1]));
+        }
+      }
+      result
+    }
+    Expr::List(items) => {
+      // A rectangular list of non-empty rows is typeset as an array; anything
+      // else (a vector, a ragged list, empty rows) keeps the brace form.
+      if tex_matrix_rows(items).is_some()
+        && let Some(array) = tex_array_body(expr, false)
+      {
+        return format!("\\left(\n{array}\n\\right)");
+      }
+      let parts: Vec<String> = items.iter().map(expr_to_tex).collect();
+      tex_braces(&parts.join(","))
+    }
+    Expr::FunctionCall { name, args } => tex_function_call(name, args),
+    // Patterns are typeset as text, with the blanks escaped for TeX:
+    // `x_` is `\text{x$\_$}`, `d_Integer` is `\text{d$\_$Integer}`.
+    Expr::Pattern {
+      name,
+      head,
+      blank_type,
+    } => tex_pattern_text(name, head.as_deref(), *blank_type),
+    Expr::PatternOptional {
+      name,
+      head,
+      default,
+    } => match default {
+      Some(default) => format!(
+        "{}:{}",
+        tex_pattern_text(name, head.as_deref(), 1),
+        expr_to_tex(default)
+      ),
+      None => format!("\\text{{{}$\\_$.}}", tex_escape_text(name)),
+    },
+    Expr::PatternTest {
+      name,
+      head,
+      blank_type,
+      test,
+    } => format!(
+      "{}?{}",
+      tex_pattern_text(name, head.as_deref(), *blank_type),
+      expr_to_tex(test)
+    ),
+    // wolframscript writes the arrow tight on its left: `x\to y` — unless
+    // the left side ends in a macro, which needs the separating space
+    // (`\alpha \to y`).
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => format!(
+      "{}\\to {}",
+      tex_arrow_lhs(pattern),
+      expr_to_tex(replacement)
+    ),
+    // A delayed rule keeps the colon of `:>`: `x:\to y`.
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => format!(
+      "{}:\\to {}",
+      tex_arrow_lhs(pattern),
+      expr_to_tex(replacement)
+    ),
+    // An association is bracketed with the private-use code points
+    // wolframscript uses for `<|` and `|>`.
+    Expr::Association(pairs) => {
+      let parts: Vec<String> = pairs
+        .iter()
+        .map(|(k, v)| match v {
+          Expr::RuleDelayed { replacement, .. } => {
+            format!("{}:\\to {}", tex_arrow_lhs(k), expr_to_tex(replacement))
+          }
+          _ => format!("{}\\to {}", tex_arrow_lhs(k), expr_to_tex(v)),
+        })
+        .collect();
+      format!("\\unicode{{f113}}{}\\unicode{{f114}}", parts.join(","))
+    }
+    Expr::CurriedCall { func, args } => {
+      // `Inactive[f][x…]` typesets like the active call, except that an
+      // inactive product shows its `\times`.
+      if let Expr::FunctionCall { name, args: inner } = func.as_ref()
+        && name == "Inactive"
+        && inner.len() == 1
+        && let Expr::Identifier(head) = &inner[0]
+      {
+        if head == "Times" {
+          return args
+            .iter()
+            .map(expr_to_tex)
+            .collect::<Vec<_>>()
+            .join("\\times ");
+        }
+        return tex_function_call(head, args);
+      }
+      // Derivative[orders…][f]  -> f', f'', f^{(n)}, …
+      if let Expr::FunctionCall { name, args: orders } = func.as_ref()
+        && name == "Derivative"
+        && args.len() == 1
+      {
+        return tex_derivative(orders, &args[0], None);
+      }
+      // Derivative[orders…][f][x…]  -> f'(x), f''(x), f^{(n)}(x), …
+      if let Expr::CurriedCall {
+        func: inner_func,
+        args: inner_args,
+      } = func.as_ref()
+        && let Expr::FunctionCall { name, args: orders } = inner_func.as_ref()
+        && name == "Derivative"
+        && inner_args.len() == 1
+      {
+        return tex_derivative(orders, &inner_args[0], Some(args));
+      }
+      // `f[a][b]` is `f(a)(b)`; a compound head is bracketed first:
+      // `f[a][b][c]` is `(f(a)(b))(c)` and `(a b)[c]` is `(a b)(c)`.
+      let head = match func.as_ref() {
+        Expr::CurriedCall { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. } => tex_paren(&expr_to_tex(func)),
+        Expr::FunctionCall { name, args: inner }
+          if matches!(name.as_str(), "Plus" | "Times") && inner.len() >= 2 =>
+        {
+          tex_paren(&expr_to_tex(func))
+        }
+        _ => expr_to_tex(func),
+      };
+      format!("{head}{}", tex_paren_list(args))
+    }
+    _ => expr_to_output(expr),
+  }
+}
+
+/// The TeX text of a pattern: the name, the blanks written as `$\_$` and an
+/// optional head, all inside `\text{…}` as wolframscript writes it.
+fn tex_pattern_text(name: &str, head: Option<&str>, blanks: u8) -> String {
+  let blanks = "\\_".repeat(usize::from(blanks.max(1)));
+  format!(
+    "\\text{{{}${blanks}${}}}",
+    tex_escape_text(name),
+    head.map(tex_escape_text).unwrap_or_default()
+  )
+}
+
+/// Whether rendered TeX is "tall" — holds a fraction, radical, script,
+/// stacked accent or derivative prime — so that the delimiters around it
+/// need `\left…\right` sizing. Text runs (`\text{x$\_$}`) are ignored:
+/// their contents are typeset as words, not as mathematics.
+fn tex_is_tall(inner: &str) -> bool {
+  let mut rest = inner;
+  let mut stripped = String::with_capacity(inner.len());
+  while let Some(start) = rest.find("\\text{") {
+    stripped.push_str(&rest[..start]);
+    let body = &rest[start + "\\text{".len()..];
+    let mut depth = 1usize;
+    let mut end = body.len();
+    for (i, c) in body.char_indices() {
+      match c {
+        '{' => depth += 1,
+        '}' => {
+          depth -= 1;
+          if depth == 0 {
+            end = i + 1;
+            break;
+          }
+        }
+        _ => {}
+      }
+    }
+    rest = &body[end..];
+  }
+  stripped.push_str(rest);
+  ["\\frac", "\\sqrt", "\\overset", "\\underset", "^", "_", "'"]
+    .iter()
+    .any(|marker| stripped.contains(marker))
+}
+
+/// Wrap rendered TeX in a delimiter pair, sized with `\left…\right` when
+/// the content is tall: `f(x)` but `f\left(\frac{a}{b}\right)`.
+fn tex_wrap(inner: &str, open: &str, close: &str) -> String {
+  if tex_is_tall(inner) {
+    format!("\\left{open}{inner}\\right{close}")
+  } else {
+    format!("{open}{inner}{close}")
+  }
+}
+
+/// Parenthesize rendered TeX, sizing the parentheses to the content.
+fn tex_paren(inner: &str) -> String {
+  tex_wrap(inner, "(", ")")
+}
+
+/// Square-bracket rendered TeX, sizing the brackets to the content.
+fn tex_bracket(inner: &str) -> String {
+  tex_wrap(inner, "[", "]")
+}
+
+/// Brace rendered TeX as a list, sizing the braces to the content.
+fn tex_braces(inner: &str) -> String {
+  tex_wrap(inner, "\\{", "\\}")
+}
+
+/// A script (sub- or superscript) needs braces only when it is more than
+/// one character: `^n` but `^{n+1}`.
+fn tex_script_group(tex: &str) -> String {
+  if tex.chars().count() == 1 {
+    tex.to_string()
+  } else {
+    format!("{{{tex}}}")
+  }
+}
+
+/// The body of an integral, sum, product or derivative: a sum is bracketed
+/// (`\int (a+b) \, dx`, `\int \left(\frac{a}{b}+c\right) \, dx`), anything
+/// else stands as it is.
+fn tex_summand(body: &Expr) -> String {
+  let tex = expr_to_tex(body);
+  if is_tex_sum(body) {
+    tex_paren(&tex)
+  } else {
+    tex
+  }
+}
+
+/// A function's argument list, comma-separated inside sized parentheses.
+fn tex_paren_list(args: &[Expr]) -> String {
+  tex_paren(&args.iter().map(expr_to_tex).collect::<Vec<_>>().join(","))
+}
+
+/// The factors a product is made of, in writing order, as `Times` would
+/// hold them: nested products are flattened, a division contributes its
+/// divisor as a reciprocal power, and a unary minus contributes a `-1`.
+/// `inverted` collects the factors of a divisor.
+fn product_factors(expr: &Expr, inverted: bool, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      product_factors(left, inverted, out);
+      product_factors(right, inverted, out);
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      product_factors(left, inverted, out);
+      product_factors(right, !inverted, out);
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      out.push(Expr::Integer(-1));
+      product_factors(operand, inverted, out);
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      for arg in args {
+        product_factors(arg, inverted, out);
+      }
+    }
+    _ if !inverted => out.push(expr.clone()),
+    // A divisor that is itself a power flips its exponent's sign; anything
+    // else becomes a reciprocal.
+    Expr::FunctionCall { name, args }
+      if name == "Power"
+        && args.len() == 2
+        && matches!(&args[1], Expr::Integer(_)) =>
+    {
+      let Expr::Integer(n) = &args[1] else {
+        unreachable!()
+      };
+      out.push(pow(args[0].clone(), Expr::Integer(-n)));
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } if matches!(right.as_ref(), Expr::Integer(_)) => {
+      let Expr::Integer(n) = right.as_ref() else {
+        unreachable!()
+      };
+      out.push(pow(left.as_ref().clone(), Expr::Integer(-n)));
+    }
+    _ => out.push(pow(expr.clone(), Expr::Integer(-1))),
+  }
+}
+
+/// Render a product written with infix operators (`a b / c`, `-x`) through
+/// the same path as an evaluated `Times`, so it becomes one fraction with
+/// its sign in front.
+fn tex_product(expr: &Expr) -> String {
+  let mut factors = Vec::new();
+  product_factors(expr, false, &mut factors);
+  tex_times_nary_with(&factors, false)
+}
+
+/// The terms of a sum written with infix operators or as a `Plus` call, in
+/// writing order; a subtrahend arrives negated.
+fn sum_terms(expr: &Expr, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      sum_terms(left, out);
+      sum_terms(right, out);
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      sum_terms(left, out);
+      out.push(call(
+        "Times",
+        vec![Expr::Integer(-1), right.as_ref().clone()],
+      ));
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      out.extend(args.iter().cloned());
+    }
+    Expr::FunctionCall { name, args } if name == NEGATED_SUM => {
+      let mut inner = Vec::new();
+      sum_terms(&args[0], &mut inner);
+      out.extend(
+        inner
+          .into_iter()
+          .map(|t| call("Times", vec![Expr::Integer(-1), t])),
+      );
+    }
+    _ => out.push(expr.clone()),
+  }
+}
+
+/// Whether an expression is a sum (`a + b`, `a - b`, `Plus[a, b]`).
+fn is_tex_sum(expr: &Expr) -> bool {
+  matches!(
+    expr,
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus | BinaryOperator::Minus,
+      ..
+    }
+  ) || matches!(expr, Expr::FunctionCall { name, args }
+      if (name == "Plus" && args.len() >= 2)
+        || (name == NEGATED_SUM && args.len() == 1))
+}
+
+/// A private wrapper the product renderer puts around a sum that absorbs
+/// the product's minus sign (`-(a + b) c` → `(-a-b) c`); it never leaves
+/// the renderer.
+const NEGATED_SUM: &str = "TeX`NegatedSum";
+
+/// A sum with its sign flipped, term by term: `-(a + b)` is `-a-b`, the way
+/// wolframscript distributes a minus over a held sum.
+fn tex_negated_sum(sum: &Expr) -> String {
+  let mut terms = Vec::new();
+  sum_terms(sum, &mut terms);
+  let negated: Vec<Expr> = terms
+    .into_iter()
+    .map(|t| call("Times", vec![Expr::Integer(-1), t]))
+    .collect();
+  tex_function_call("Plus", &negated)
+}
+
+/// Convert an identifier to its TeX representation.
+/// Wrap already-rendered TeX in a delimiter pair (`\lfloor`/`\rfloor`, `|`/`|`,
+/// `\|`/`\|`, …). wolframscript sizes the delimiters with `\left…\right` when
+/// the content is "tall" — a fraction, radical, superscript or subscript —
+/// (Floor[x/2] → `\left\lfloor \frac{x}{2}\right\rfloor`) and uses the plain
+/// delimiters otherwise (Floor[x] → `\lfloor x\rfloor`).
+fn tex_delimited(inner: &str, ldelim: &str, rdelim: &str) -> String {
+  // The closing delimiter is written with a trailing space, like a control
+  // word (`| x| `, `\lfloor x\rfloor `); the end of the output is trimmed.
+  if tex_is_tall(inner) {
+    format!("\\left{ldelim} {inner}\\right{rdelim} ")
+  } else {
+    format!("{ldelim} {inner}{rdelim} ")
+  }
+}
+
+/// The superscript a `Direction` option puts on a one-sided limit point:
+/// `"FromAbove"` and `Direction -> -1` approach from the right (`^+`),
+/// `"FromBelow"` and `Direction -> 1` from the left (`^-`).
+fn tex_limit_direction(option: &Expr) -> Option<&'static str> {
+  let Expr::Rule {
+    pattern,
+    replacement,
+  } = option
+  else {
+    return None;
+  };
+  if !matches!(pattern.as_ref(), Expr::Identifier(n) if n == "Direction") {
+    return None;
+  }
+  match replacement.as_ref() {
+    Expr::String(s) if s == "FromAbove" => Some("^+"),
+    Expr::String(s) if s == "FromBelow" => Some("^-"),
+    Expr::Integer(-1) => Some("^+"),
+    Expr::Integer(1) => Some("^-"),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } if matches!(operand.as_ref(), Expr::Integer(1)) => Some("^+"),
+    _ => None,
+  }
+}
+
+/// TeX rendering of a machine real. wolframscript typesets the DISPLAY form
+/// (six significant figures), writing a large magnitude as
+/// `1.23457\times 10^6`. A magnitude below `1e-5` is the one case it gives
+/// up on: it prints the InputForm text — precision backtick, `*^` and all —
+/// inside a `\text{…}`.
+fn tex_real(f: f64) -> String {
+  if !f.is_finite() {
+    return crate::syntax::format_real(f);
+  }
+  let parts = crate::functions::graphics::machine_real_display_parts(f);
+  match parts.exponent {
+    None => parts.mantissa,
+    Some(exponent) if exponent > 0 => {
+      // TeX braces are only needed once the exponent has more than one
+      // character: `10^6` but `10^{10}`.
+      let exponent = exponent.to_string();
+      if exponent.len() == 1 {
+        format!("{}\\times 10^{}", parts.mantissa, exponent)
+      } else {
+        format!("{}\\times 10^{{{}}}", parts.mantissa, exponent)
+      }
+    }
+    Some(_) => {
+      let raw = crate::syntax::format_real(f);
+      match raw.split_once("*^") {
+        Some((mantissa, exponent)) => format!(
+          "\\text{{{mantissa}$\\grave{{ }}$*${{}}^{{\\wedge}}${exponent}}}"
+        ),
+        None => raw,
+      }
+    }
+  }
+}
+
+/// Whether a term is a numeric multiple of `I` — the imaginary half of a
+/// complex number (`I`, `2 I`, `-3.5 I`).
+fn is_imaginary_term(expr: &Expr) -> bool {
+  match expr {
+    Expr::Identifier(name) | Expr::Constant(name) => name == "I",
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => is_imaginary_term(operand),
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      (is_imaginary_term(left) && is_tex_number(right))
+        || (is_tex_number(left) && is_imaginary_term(right))
+    }
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() == 2 => {
+      (is_imaginary_term(&args[0]) && is_tex_number(&args[1]))
+        || (is_tex_number(&args[0]) && is_imaginary_term(&args[1]))
+    }
+    _ => false,
+  }
+}
+
+/// Whether a term is a plain number for the purpose of the complex-atom test.
+fn is_tex_number(expr: &Expr) -> bool {
+  matches!(
+    expr,
+    Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_) | Expr::BigFloat(..)
+  )
+}
+
+/// The TeX of a complex number written as its two halves. wolframscript
+/// separates a NON-NEGATIVE machine-real real part from the sign of the
+/// imaginary part with a thin space: `2.\, +3.5 i`, but `-2.-3.5 i`.
+fn tex_complex_atom(re: &Expr, im: &Expr) -> String {
+  let re_tex = expr_to_tex(re);
+  let im_tex = expr_to_tex(im);
+  let thin_space = matches!(re, Expr::Real(f) if *f >= 0.0);
+  let separator = if thin_space { "\\, " } else { "" };
+  if let Some(rest) = im_tex.strip_prefix('-') {
+    format!("{re_tex}{separator}-{rest}")
+  } else {
+    format!("{re_tex}{separator}+{im_tex}")
+  }
+}
+
+/// A TeX subscript operand: braces only when it is more than one character
+/// (`\gamma _1` but `\gamma _{10}`).
+fn tex_subscript_arg(expr: &Expr) -> String {
+  let rendered = expr_to_tex(expr);
+  if rendered.chars().count() == 1 {
+    rendered
+  } else {
+    format!("{{{rendered}}}")
+  }
+}
+
+/// Escape the characters wolframscript protects inside a `\text{…}` run:
+/// each is written as its own inline-math group (`a_b` → `a$\_$b`).
+fn tex_escape_text(text: &str) -> String {
+  let mut out = String::with_capacity(text.len());
+  for c in text.chars() {
+    match c {
+      '_' | '#' | '$' | '%' | '&' | '{' | '}' => {
+        out.push_str(&format!("${}{}$", '\\', c));
+      }
+      '^' => out.push_str("${}^{\\wedge}$"),
+      '~' => out.push_str("$\\sim $"),
+      '<' | '>' => out.push_str(&format!("${c}$")),
+      other => out.push(other),
+    }
+  }
+  out
+}
+
+/// An exponent's TeX. wolframscript writes a simple quotient inline up in the
+/// superscript (`x^{3/2}`, `e^{-x/2}`) instead of stacking it, as long as
+/// neither half is a sum and the denominator is a single token.
+fn tex_exponent(exp: &Expr) -> String {
+  let rendered = expr_to_tex(exp);
+  let (sign, body) = match rendered.strip_prefix('-') {
+    Some(rest) => ("-", rest),
+    None => ("", rendered.as_str()),
+  };
+  let Some(rest) = body.strip_prefix("\\frac{") else {
+    return rendered;
+  };
+  let Some((numerator, rest)) = rest.split_once("}{") else {
+    return rendered;
+  };
+  let Some(denominator) = rest.strip_suffix('}') else {
+    return rendered;
+  };
+  let simple = |part: &str| {
+    !part.contains('{')
+      && !part.contains('}')
+      && !part.contains('+')
+      && !part.contains('-')
+  };
+  // A negative quotient only goes inline when its denominator is a number:
+  // wolframscript writes `e^{-x/2}` but `x^{-\frac{a}{b}}`.
+  let numeric_denominator = denominator.chars().all(|c| c.is_ascii_digit());
+  if simple(numerator)
+    && simple(denominator)
+    && !denominator.contains(' ')
+    && (sign.is_empty() || numeric_denominator)
+  {
+    format!("{sign}{numerator}/{denominator}")
+  } else {
+    rendered
+  }
+}
+
+/// The positive counterpart of a NUMERIC negative exponent (`-3/2` → `3/2`),
+/// or `None` when the exponent is not a negative number. Used to move the
+/// power into a denominator the way wolframscript does.
+fn negated_numeric_exponent(exp: &Expr) -> Option<Expr> {
+  match exp {
+    Expr::FunctionCall { name, args }
+      if name == "Rational"
+        && args.len() == 2
+        && matches!(&args[0], Expr::Integer(n) if *n < 0) =>
+    {
+      let Expr::Integer(n) = &args[0] else {
+        return None;
+      };
+      Some(call("Rational", vec![Expr::Integer(-n), args[1].clone()]))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } if matches!(left.as_ref(), Expr::Integer(n) if *n < 0)
+      && matches!(right.as_ref(), Expr::Integer(_)) =>
+    {
+      let Expr::Integer(n) = left.as_ref() else {
+        return None;
+      };
+      Some(Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left: Box::new(Expr::Integer(-n)),
+        right: right.clone(),
+      })
+    }
+    _ => None,
+  }
+}
+
+/// The left side of a rule arrow, with the space a trailing TeX macro needs
+/// before the following control word.
+fn tex_arrow_lhs(expr: &Expr) -> String {
+  let mut rendered = expr_to_tex(expr);
+  if ends_with_tex_macro(&rendered) {
+    rendered.push(' ');
+  }
+  rendered
+}
+
+fn tex_identifier(name: &str) -> String {
+  let shown = if name.contains('`') {
+    crate::evaluator::contexts::display_name(name)
+  } else {
+    name.to_string()
+  };
+  let tex = tex_identifier_bare(&shown);
+  // wolframscript writes every control word with a trailing space (`\pi `,
+  // `\alpha `) so the character after it can never be read as part of the
+  // name; the space is only dropped at the very end of the output.
+  if ends_with_tex_macro(&tex) {
+    format!("{tex} ")
+  } else {
+    tex
+  }
+}
+
+fn tex_identifier_bare(name: &str) -> String {
+  match name {
+    "Pi" => "\\pi".to_string(),
+    "E" => "e".to_string(),
+    "I" => "i".to_string(),
+    "Infinity" => "\\infty".to_string(),
+    "True" => "\\text{True}".to_string(),
+    "False" => "\\text{False}".to_string(),
+    // Single ASCII letter identifiers stay as-is
+    s if s.len() == 1 => s.to_string(),
+    // Lower-case Greek NAMES carry the macro; the capitalised spellings are
+    // ordinary symbols in wolframscript (`Alpha` → `\text{Alpha}`), so only
+    // the lower-case ones are listed here.
+    "alpha" => "\\alpha".to_string(),
+    "beta" => "\\beta".to_string(),
+    "gamma" => "\\gamma".to_string(),
+    "delta" => "\\delta".to_string(),
+    "epsilon" => "\\epsilon".to_string(),
+    "zeta" => "\\zeta".to_string(),
+    "eta" => "\\eta".to_string(),
+    "theta" => "\\theta".to_string(),
+    "iota" => "\\iota".to_string(),
+    "kappa" => "\\kappa".to_string(),
+    "lambda" => "\\lambda".to_string(),
+    "mu" => "\\mu".to_string(),
+    "nu" => "\\nu".to_string(),
+    "xi" => "\\xi".to_string(),
+    "omicron" => "o".to_string(),
+    "pi" => "\\pi".to_string(),
+    "rho" => "\\rho".to_string(),
+    "sigma" => "\\sigma".to_string(),
+    "tau" => "\\tau".to_string(),
+    "upsilon" => "\\upsilon".to_string(),
+    "phi" => "\\phi".to_string(),
+    "chi" => "\\chi".to_string(),
+    "psi" => "\\psi".to_string(),
+    "omega" => "\\omega".to_string(),
+    // Greek CHARACTERS (\[Alpha] and friends) carry the macro too. The
+    // capitals that look like Latin letters render as that letter.
+    s if s.chars().count() == 1 => match s.chars().next().unwrap() {
+      '\u{03b1}' => "\\alpha".to_string(),
+      '\u{03b2}' => "\\beta".to_string(),
+      '\u{03b3}' => "\\gamma".to_string(),
+      '\u{03b4}' => "\\delta".to_string(),
+      '\u{03f5}' => "\\epsilon".to_string(),
+      '\u{03b5}' => "\\varepsilon".to_string(),
+      '\u{03b6}' => "\\zeta".to_string(),
+      '\u{03b7}' => "\\eta".to_string(),
+      '\u{03b8}' => "\\theta".to_string(),
+      '\u{03d1}' => "\\vartheta".to_string(),
+      '\u{03b9}' => "\\iota".to_string(),
+      '\u{03ba}' => "\\kappa".to_string(),
+      '\u{03f0}' => "\\varkappa".to_string(),
+      '\u{03bb}' => "\\lambda".to_string(),
+      '\u{03bc}' => "\\mu".to_string(),
+      '\u{03bd}' => "\\nu".to_string(),
+      '\u{03be}' => "\\xi".to_string(),
+      '\u{03bf}' => "o".to_string(),
+      '\u{03c0}' => "\\pi".to_string(),
+      '\u{03d6}' => "\\varpi".to_string(),
+      '\u{03c1}' => "\\rho".to_string(),
+      '\u{03f1}' => "\\varrho".to_string(),
+      '\u{03c3}' => "\\sigma".to_string(),
+      '\u{03c2}' => "\\varsigma".to_string(),
+      '\u{03c4}' => "\\tau".to_string(),
+      '\u{03c5}' => "\\upsilon".to_string(),
+      '\u{03d5}' => "\\phi".to_string(),
+      '\u{03c6}' => "\\varphi".to_string(),
+      '\u{03c7}' => "\\chi".to_string(),
+      '\u{03c8}' => "\\psi".to_string(),
+      '\u{03c9}' => "\\omega".to_string(),
+      '\u{0393}' => "\\Gamma".to_string(),
+      '\u{0394}' => "\\Delta".to_string(),
+      '\u{0398}' => "\\Theta".to_string(),
+      '\u{039b}' => "\\Lambda".to_string(),
+      '\u{039e}' => "\\Xi".to_string(),
+      '\u{03a0}' => "\\Pi".to_string(),
+      '\u{03a3}' => "\\Sigma".to_string(),
+      '\u{03a5}' => "\\Upsilon".to_string(),
+      '\u{03a6}' => "\\Phi".to_string(),
+      '\u{03a8}' => "\\Psi".to_string(),
+      '\u{03a9}' => "\\Omega".to_string(),
+      // The capitals spelled with a Latin lookalike.
+      '\u{0391}' => "A".to_string(),
+      '\u{0392}' => "B".to_string(),
+      '\u{0395}' => "E".to_string(),
+      '\u{0396}' => "Z".to_string(),
+      '\u{0397}' => "H".to_string(),
+      '\u{0399}' => "I".to_string(),
+      '\u{039a}' => "K".to_string(),
+      '\u{039c}' => "M".to_string(),
+      '\u{039d}' => "N".to_string(),
+      '\u{039f}' => "O".to_string(),
+      '\u{03a1}' => "P".to_string(),
+      '\u{03a4}' => "T".to_string(),
+      '\u{03a7}' => "X".to_string(),
+      other => format!("\\text{{{other}}}"),
+    },
+    // Multi-letter identifiers get \text{}
+    s => format!("\\text{{{s}}}"),
+  }
+}
+
+/// Handle binary multiplication in TeX (space-separated).
+/// Delegates to `tex_times_nary` for fraction handling.
+/// Check if an expression is Power[base, negative_integer]
+/// and return (base, positive_exponent) if so.
+fn as_neg_int_power(expr: &Expr) -> Option<(&Expr, i128)> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      if let Expr::Integer(n) = &args[1]
+        && *n < 0
+      {
+        return Some((&args[0], -n));
+      }
+      None
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      if let Expr::Integer(n) = right.as_ref()
+        && *n < 0
+      {
+        return Some((left.as_ref(), -n));
+      }
+      // Also handle UnaryOp Minus wrapping an integer
+      if let Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand,
+      } = right.as_ref()
+        && let Expr::Integer(n) = operand.as_ref()
+        && *n > 0
+      {
+        return Some((left.as_ref(), *n));
+      }
+      None
+    }
+    _ => None,
+  }
+}
+
+/// Render a denominator factor: base^exp with exp omitted if 1.
+/// Uses plain parens `(...)` for compound bases (matching wolframscript),
+/// and only wraps in parens when exponent > 1.
+fn tex_denom_factor(base: &Expr, pos_exp: i128) -> String {
+  if pos_exp == 1 {
+    // No parens needed in denominator when exponent is 1
+    expr_to_tex(base)
+  } else if matches!(base, Expr::FunctionCall { name, args }
+    if args.len() == 1 && !matches!(name.as_str(), "Plus" | "Times"))
+  {
+    // A function power keeps its usual shape: `\log ^2(x)`, `f(x)^2`.
+    tex_power(base, &Expr::Integer(pos_exp))
+  } else {
+    let exp_str = pos_exp.to_string();
+    if exp_str.len() == 1 {
+      format!("{}^{}", tex_parens_plain(base), exp_str)
+    } else {
+      format!("{}^{{{}}}", tex_parens_plain(base), exp_str)
+    }
+  }
+}
+
+/// Wrap compound expressions in plain parens `(...)` for use in
+/// denominators (matching wolframscript style, not `\left(\right)`).
+fn tex_parens_plain(expr: &Expr) -> String {
+  let needs_parens = match expr {
+    Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => true,
+    Expr::FunctionCall { name, args } if args.len() >= 2 => {
+      matches!(name.as_str(), "Plus" | "Times")
+    }
+    _ => false,
+  };
+  if needs_parens {
+    tex_paren(&expr_to_tex(expr))
+  } else {
+    expr_to_tex(expr)
+  }
+}
+
+/// The cofunction that writes the reciprocal of a trigonometric function:
+/// `1/Sin[u]` is `Csc[u]`, `1/Sec[u]` is `Cos[u]`.
+fn tex_reciprocal_trig(base: &Expr) -> Option<Expr> {
+  let Expr::FunctionCall { name, args } = base else {
+    return None;
+  };
+  if args.len() != 1 {
+    return None;
+  }
+  let cofunction = match name.as_str() {
+    "Sin" => "Csc",
+    "Csc" => "Sin",
+    "Cos" => "Sec",
+    "Sec" => "Cos",
+    "Tan" => "Cot",
+    "Cot" => "Tan",
+    "Sinh" => "Csch",
+    "Csch" => "Sinh",
+    "Cosh" => "Sech",
+    "Sech" => "Cosh",
+    "Tanh" => "Coth",
+    "Coth" => "Tanh",
+    _ => return None,
+  };
+  Some(call(cofunction, vec![args[0].clone()]))
+}
+
+/// The quotient function a numerator and a reciprocal (already turned into
+/// its cofunction) collapse into: `Cos[u] Csc[u]` is `Cot[u]`, `Sin[u]
+/// Sec[u]` is `Tan[u]`, and likewise for the hyperbolic pair.
+fn tex_trig_quotient(numer: &Expr, reciprocal: &Expr) -> Option<Expr> {
+  let (
+    Expr::FunctionCall { name: n, args: na },
+    Expr::FunctionCall { name: r, args: ra },
+  ) = (numer, reciprocal)
+  else {
+    return None;
+  };
+  if na.len() != 1
+    || ra.len() != 1
+    || !crate::evaluator::pattern_matching::expr_equal(&na[0], &ra[0])
+  {
+    return None;
+  }
+  let quotient = match (n.as_str(), r.as_str()) {
+    ("Cos", "Csc") => "Cot",
+    ("Sin", "Sec") => "Tan",
+    ("Cosh", "Csch") => "Coth",
+    ("Sinh", "Sech") => "Tanh",
+    _ => return None,
+  };
+  Some(call(quotient, vec![na[0].clone()]))
+}
+
+/// `Power[base, -p/q]` split into the base and the positive exponent.
+fn negative_power_parts(expr: &Expr) -> Option<(&Expr, Expr)> {
+  let (base, exp) = match expr {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (&args[0], &args[1])
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => (left.as_ref(), right.as_ref()),
+    _ => return None,
+  };
+  match tex_rational_parts(exp) {
+    Some((p, q)) if p < 0 && q > 1 => Some((
+      base,
+      call("Rational", vec![Expr::Integer(-p), Expr::Integer(q)]),
+    )),
+    _ => None,
+  }
+}
+
+/// The integer numerator and denominator of a rational literal, whether it
+/// is stored as `Rational[p, q]` or as the parsed quotient `p/q`.
+fn tex_rational_parts(expr: &Expr) -> Option<(i128, i128)> {
+  match expr {
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      match (&args[0], &args[1]) {
+        (Expr::Integer(p), Expr::Integer(q)) => Some((*p, *q)),
+        _ => None,
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => match (left.as_ref(), right.as_ref()) {
+      (Expr::Integer(p), Expr::Integer(q)) => Some((*p, *q)),
+      _ => None,
+    },
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => tex_rational_parts(operand).map(|(p, q)| (-p, q)),
+    _ => None,
+  }
+}
+
+/// The box weight of a power: a radical for a root, a fraction for a
+/// negative exponent, a script otherwise (see `tex_box_weight`).
+fn tex_power_weight(base: &Expr, exp: &Expr) -> usize {
+  let base = tex_box_weight(base);
+  match (exp, tex_rational_parts(exp)) {
+    (Expr::Integer(n), _) if *n < 0 => 2 + base,
+    (_, Some((p, _))) => {
+      if p < 0 {
+        2 + base
+      } else {
+        1 + base
+      }
+    }
+    (exp, None) => 1 + base + tex_box_weight(exp),
+  }
+}
+
+/// A rough count of the boxes wolframscript's TraditionalForm would build
+/// for an expression: one for each row, script, radical or bracket, two for
+/// a fraction, none for an atom. It decides whether a rational coefficient
+/// folds into a fraction with its factor (`\frac{f(x^2)}{2}`, weight 2) or
+/// stays beside it (`\frac{1}{2} \log \left(1+x^2\right)`, weight 3).
+fn tex_box_weight(expr: &Expr) -> usize {
+  let sum_of = |items: &[Expr]| items.iter().map(tex_box_weight).sum::<usize>();
+  match expr {
+    Expr::Integer(_)
+    | Expr::BigInteger(_)
+    | Expr::Real(_)
+    | Expr::BigFloat(..)
+    | Expr::Identifier(_)
+    | Expr::Constant(_)
+    | Expr::String(_) => 0,
+    Expr::List(items) => 1 + sum_of(items),
+    Expr::UnaryOp { operand, .. } => 1 + tex_box_weight(operand),
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => 2 + tex_box_weight(left) + tex_box_weight(right),
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => tex_power_weight(left, right),
+    Expr::BinaryOp { left, right, .. } => {
+      1 + tex_box_weight(left) + tex_box_weight(right)
+    }
+    // `f(x)'` is a script on the row of the call; `f'(x)` a script on `f`
+    // in a row.
+    Expr::CurriedCall { func, args } if matches!(func.as_ref(), Expr::FunctionCall { name, .. } if name == "Derivative") => {
+      1 + sum_of(args)
+    }
+    Expr::CurriedCall { func, args }
+      if matches!(func.as_ref(), Expr::CurriedCall { func: inner, .. }
+        if matches!(inner.as_ref(), Expr::FunctionCall { name, .. } if name == "Derivative")) =>
+    {
+      2 + sum_of(args)
+    }
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Rational" => 2,
+      "Complex" => 1,
+      "Power" if args.len() == 2 => tex_power_weight(&args[0], &args[1]),
+      // `x'` is a script on `x`; `f'(x)` a script on `f` in a row.
+      "Derivative" if args.len() == 2 => 1 + tex_box_weight(&args[1]),
+      "Derivative" if args.len() > 2 => 2 + sum_of(&args[2..]),
+      "Plus" | "Times" | "Star" | "Sqrt" | "Abs" => 1 + sum_of(args),
+      // An inverse function is written with a script on its name
+      // (`\tan ^{-1}`), one box more than a plain call.
+      "ArcSin" | "ArcCos" | "ArcTan" | "ArcCot" | "ArcSec" | "ArcCsc"
+      | "ArcSinh" | "ArcCosh" | "ArcTanh" | "ArcCoth" | "ArcSech"
+      | "ArcCsch" => 2 + sum_of(args),
+      // A call with several arguments is a row of rows, with separators.
+      _ if args.len() >= 2 => 3 + sum_of(args),
+      _ => 1 + sum_of(args),
+    },
+    Expr::CurriedCall { func, args } => 1 + tex_box_weight(func) + sum_of(args),
+    _ => 1,
+  }
+}
+
+/// Handle n-ary Times in TeX, splitting into \frac when negative-integer
+/// Power factors are present (matching Wolfram TeXForm).
+fn tex_times_nary(args: &[Expr]) -> String {
+  // Only an evaluated, flat `Times[-1, sum, …]` distributes its sign over
+  // the sum (see below); a product written with operators never does.
+  let flat_minus_one = args.len() >= 3
+    && args.iter().any(|a| matches!(a, Expr::Integer(-1)))
+    && args.iter().any(is_tex_sum);
+  tex_times_nary_with(args, flat_minus_one)
+}
+
+fn tex_times_nary_with(args: &[Expr], distribute_sign: bool) -> String {
+  let sum_term = TEX_SUM_TERM.with(|f| f.replace(false));
+  let tex_needs_product_parens = |arg: &Expr| -> bool {
+    is_tex_sum(arg)
+      || matches!(arg, Expr::FunctionCall { name, args }
+        if name == "Star" && args.len() >= 2)
+  };
+
+  // Every negative numeric factor contributes its sign to the front of the
+  // product and stays behind as its magnitude; a `-1` (also what a unary
+  // minus contributes) vanishes: `a (-b) c` is `-a b c`, `-2 x/3` is
+  // `-\frac{2 x}{3}`. A `1` left over from `1/2 Sin[x]` is dropped too.
+  // Nested products and quotients among the arguments are spliced in as
+  // factors (`Times[-1, Times[-1, c]]` is `c`).
+  let mut flat: Vec<Expr> = Vec::with_capacity(args.len());
+  for arg in args {
+    product_factors(arg, false, &mut flat);
+  }
+  let args: &[Expr] = &flat;
+  let mut negate = false;
+  let mut from_minus_one = false;
+  let mut owned: Vec<Expr> = Vec::with_capacity(args.len());
+  for arg in args {
+    match arg {
+      Expr::Integer(-1) => {
+        negate = !negate;
+        from_minus_one = true;
+      }
+      Expr::Integer(n) if *n < 0 => {
+        negate = !negate;
+        from_minus_one = false;
+        owned.push(Expr::Integer(-n));
+      }
+      Expr::Real(f) if *f < 0.0 => {
+        negate = !negate;
+        from_minus_one = false;
+        owned.push(Expr::Real(-f));
+      }
+      _ => owned.push(arg.clone()),
+    }
+  }
+  // A written `p/q …` (`-4/3 Star[…]`, `1/2 Sin[x]`, `x/2`) carries its
+  // numerator and denominator as separate factors; gather them into the
+  // rational coefficient an evaluated product would hold, so both render
+  // alike.
+  if let Some(q_pos) = owned.iter().position(|f| {
+    matches!(f, Expr::FunctionCall { name, args }
+      if name == "Power" && args.len() == 2
+        && matches!(&args[0], Expr::Integer(q) if *q > 1)
+        && matches!(&args[1], Expr::Integer(-1)))
+  }) {
+    let removed = owned.remove(q_pos);
+    let Expr::FunctionCall { args: pw, .. } = &removed else {
+      unreachable!()
+    };
+    let Expr::Integer(q) = pw[0] else {
+      unreachable!()
+    };
+    let p = match owned.first() {
+      Some(Expr::Integer(p)) => {
+        let p = *p;
+        owned.remove(0);
+        p
+      }
+      _ => 1,
+    };
+    owned.insert(
+      0,
+      call("Rational", vec![Expr::Integer(p), Expr::Integer(q)]),
+    );
+  }
+  if owned.len() > 1 {
+    owned.retain(|f| !matches!(f, Expr::Integer(1)));
+  }
+  if owned.is_empty() {
+    owned.push(Expr::Integer(1));
+  }
+  // An evaluated product's `-1` factor is distributed over its sum factor,
+  // as wolframscript shows `Times[-1, Plus[a, b], c]`: `c (-a-b)`. Only a
+  // bare `-1` in a flat product with further factors does this; `-2 (a +
+  // b)` keeps its coefficient, and a held `-(b + c) d` or `-(b + c)` stays
+  // as written.
+  if negate
+    && from_minus_one
+    && distribute_sign
+    && let Some(pos) = owned.iter().position(is_tex_sum)
+  {
+    let sum = owned[pos].clone();
+    owned[pos] = call(NEGATED_SUM, vec![sum]);
+    negate = false;
+  }
+  let factors: &[Expr] = &owned;
+
+  // A leading rational coefficient p/q (q > 1) is folded into the fraction —
+  // wolframscript renders `Sqrt[x]/2` as `\frac{\sqrt{x}}{2}`, not
+  // `\frac{1}{2}\sqrt{x}`, and `2 x/(3 y)` as `\frac{2 x}{3 y}` — unless the
+  // rest of the product is "large": several factors, or one factor whose
+  // typeset boxes are too many for wolframscript's taste (see
+  // `tex_box_weight`). Then the coefficient stays a separate `\frac{p}{q}`:
+  // `(1/2)(a+b)c` → `\frac{1}{2} c (a+b)`, `(3x^2-1)/2` →
+  // `\frac{1}{2} \left(3 x^2-1\right)`. Other denominator factors always
+  // fold everything into one fraction (`\frac{a+b}{3 c}`).
+  let mut rat_num: Option<i128> = None; // |p|, folded into the numerator
+  let mut rat_den: Option<i128> = None; // q, folded into the denominator
+  let mut leading_rational: Option<&Expr> = None;
+  let factors: &[Expr] = if let Some(
+    first @ Expr::FunctionCall { name, args: ra },
+  ) = factors.first()
+    && name == "Rational"
+    && ra.len() == 2
+    && let (Expr::Integer(p), Expr::Integer(q)) = (&ra[0], &ra[1])
+    && q.abs() > 1
+  {
+    let rest = &factors[1..];
+    let other_denominators = rest.iter().any(|f| {
+      as_neg_int_power(f).is_some() || negative_power_parts(f).is_some()
+    });
+    // Several factors form one more row, and a sum among them is bracketed.
+    let weight = match rest {
+      [] => 0,
+      [only] => tex_box_weight(only),
+      many => {
+        1 + many
+          .iter()
+          .map(|f| tex_box_weight(f) + usize::from(is_tex_sum(f)))
+          .sum::<usize>()
+      }
+    };
+    let fold =
+      other_denominators || weight + usize::from(negate != (*p < 0)) <= 2;
+    if fold {
+      if *p < 0 {
+        negate = !negate;
+      }
+      rat_num = Some(p.abs());
+      rat_den = Some(q.abs());
+      rest
+    } else {
+      // Keep the coefficient as a standalone \frac{p}{q} factor.
+      leading_rational = Some(first);
+      rest
+    }
+  } else {
+    factors
+  };
+
+  // Partition remaining factors into numerator factors and denominator factors
+  let mut numer_args: Vec<&Expr> = Vec::new();
+  let mut denom: Vec<(String, bool)> = Vec::new(); // (tex, is a bare sum)
+  if let Some(d) = rat_den {
+    denom.push((d.to_string(), false));
+  }
+  // A reciprocal trigonometric function is written as its cofunction in
+  // the numerator, in place: `1/Sin[x]` is `\csc (x)`, `Sec[x]/Sin[x]` is
+  // `\csc (x) \sec (x)`.
+  let mut numer_owned: Vec<Expr> = Vec::new();
+  for arg in factors {
+    if let Some((base, pos_exp)) = as_neg_int_power(arg) {
+      if let Some(cofunction) = tex_reciprocal_trig(base) {
+        numer_owned.push(if pos_exp == 1 {
+          cofunction
+        } else {
+          pow(cofunction, Expr::Integer(pos_exp))
+        });
+        continue;
+      }
+      denom.push((
+        tex_denom_factor(base, pos_exp),
+        pos_exp == 1 && is_tex_sum(base),
+      ));
+    } else if let Some((base, positive)) = negative_power_parts(arg) {
+      // `x^(-1/2)` is a denominator `\sqrt{x}`.
+      denom.push((tex_power(base, &positive), false));
+    } else {
+      numer_owned.push(arg.clone());
+    }
+  }
+  // `Cos[x]/Sin[x]` is `\cot (x)`: a cofunction next to the function it
+  // complements collapses into the quotient function.
+  let mut i = 0;
+  while i < numer_owned.len() {
+    let partner = (0..numer_owned.len()).filter(|&j| j != i).find_map(|j| {
+      tex_trig_quotient(&numer_owned[j], &numer_owned[i]).map(|q| (j, q))
+    });
+    if let Some((j, quotient)) = partner {
+      let keep = i.min(j);
+      numer_owned.remove(i.max(j));
+      numer_owned[keep] = quotient;
+      i = 0;
+    } else {
+      i += 1;
+    }
+  }
+  numer_args.extend(numer_owned.iter());
+  // A sum among several denominator factors needs its parentheses back:
+  // `\frac{1}{3 (1+x)}`, while alone it is `\frac{1}{1+x}`.
+  let denom: Vec<String> = if denom.len() > 1 {
+    denom
+      .into_iter()
+      .map(|(tex, is_sum)| if is_sum { tex_paren(&tex) } else { tex })
+      .collect()
+  } else {
+    denom.into_iter().map(|(tex, _)| tex).collect()
+  };
+  // wolframscript moves the symbols and powers of an evaluated product in
+  // front of a parenthesised sum that has no constant term: `(a+b) c` is
+  // `c (a+b)` and `x (a+b) c` is `c x (a+b)`, while the polynomial `(x+1) y`
+  // keeps its order. A held product keeps its written order.
+  let constant_free_sum = |e: &Expr| {
+    // `(a+b)^2` counts like `a+b`.
+    let e = match e {
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        &args[0]
+      }
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        ..
+      } => left.as_ref(),
+      other => other,
+    };
+    if !is_tex_sum(e) {
+      return false;
+    }
+    let mut terms = Vec::new();
+    sum_terms(e, &mut terms);
+    !terms.iter().any(|t| {
+      matches!(t, Expr::Integer(_) | Expr::Real(_))
+        || tex_rational_parts(t).is_some()
+    })
+  };
+  if !tex_held()
+    && let Some(first_sum) =
+      numer_args.iter().position(|a| constant_free_sum(a))
+  {
+    let (before, after) = numer_args.split_at(first_sum);
+    let is_atom = |e: &&Expr| {
+      matches!(
+        e,
+        Expr::Integer(_)
+          | Expr::Real(_)
+          | Expr::Identifier(_)
+          | Expr::Constant(_)
+      ) || matches!(e, Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2
+          && matches!(&args[0], Expr::Identifier(_) | Expr::Constant(_)))
+        || matches!(e, Expr::BinaryOp { op: BinaryOperator::Power, left, .. }
+          if matches!(left.as_ref(), Expr::Identifier(_) | Expr::Constant(_)))
+    };
+    let moved: Vec<&Expr> = after.iter().copied().filter(is_atom).collect();
+    if !moved.is_empty() {
+      let mut reordered: Vec<&Expr> = before.to_vec();
+      reordered.extend(moved);
+      reordered.extend(after.iter().copied().filter(|e| !is_atom(e)));
+      numer_args = reordered;
+    }
+  }
+
+  // A `Plus`/`Minus` factor in a multi-factor product needs parentheses, e.g.
+  // `a (b+c)`. A lone numerator factor (the whole numerator of a fraction, or
+  // a single product term) is already grouped by its brace, so it must not.
+  // A folded integer coefficient (rat_num > 1) or a standalone \frac coefficient
+  // counts as another factor for this decision.
+  let extra_lead =
+    matches!(rat_num, Some(n) if n > 1) || leading_rational.is_some();
+  let multi = numer_args.len() > 1 || (extra_lead && !numer_args.is_empty());
+  let mut numer: Vec<String> = Vec::new();
+  if let Some(r) = leading_rational {
+    numer.push(expr_to_tex(r));
+  } else if let Some(n) = rat_num
+    && n > 1
+  {
+    numer.push(n.to_string());
+  }
+  numer.extend(numer_args.iter().map(|arg| {
+    let tex = expr_to_tex(arg);
+    // A negated lone factor is bracketed when it is a `Star` (`-(a*b)`;
+    // except as a term of a sum) or, in a held expression, a sum with no
+    // fraction to sit in: `-(b+c)`, but `-\frac{b+c}{d}`.
+    let negated_alone = !multi
+      && negate
+      && (matches!(arg, Expr::FunctionCall { name, args }
+          if name == "Star" && args.len() >= 2 && !sum_term)
+        || (denom.is_empty() && is_tex_sum(arg)));
+    if (multi || negated_alone) && tex_needs_product_parens(arg) {
+      tex_paren(&tex)
+    } else {
+      tex
+    }
+  }));
+
+  let sign = if negate { "-" } else { "" };
+
+  if denom.is_empty() {
+    // No denominator factors — simple product
+    let body = numer.join(" ");
+    format!("{sign}{body}")
+  } else {
+    let numer_tex = if numer.is_empty() {
+      "1".to_string()
+    } else {
+      numer.join(" ")
+    };
+    let denom_tex = denom.join(" ");
+    format!("{sign}\\frac{{{numer_tex}}}{{{denom_tex}}}")
+  }
+}
+
+/// Handle power expressions in TeX
+fn tex_power(base: &Expr, exp: &Expr) -> String {
+  // Special case: Power[x, 1/2] → \sqrt{x}
+  if let Expr::BinaryOp {
+    op: BinaryOperator::Divide,
+    left,
+    right,
+  } = exp
+    && matches!(left.as_ref(), Expr::Integer(1))
+    && matches!(right.as_ref(), Expr::Integer(2))
+  {
+    return format!("\\sqrt{{{}}}", expr_to_tex(base));
+  }
+  // Power[x, Rational[1, 2]] → \sqrt{x}
+  if let Expr::FunctionCall { name, args } = exp
+    && name == "Rational"
+    && args.len() == 2
+  {
+    if matches!(&args[0], Expr::Integer(1))
+      && matches!(&args[1], Expr::Integer(2))
+    {
+      return format!("\\sqrt{{{}}}", expr_to_tex(base));
+    }
+    if matches!(&args[0], Expr::Integer(1)) {
+      return format!(
+        "\\sqrt[{}]{{{}}}",
+        expr_to_tex(&args[1]),
+        expr_to_tex(base)
+      );
+    }
+  }
+
+  // Negative integer exponent: Power[x, -n] → \frac{1}{x^n} — except for a
+  // trigonometric function, whose reciprocal is its cofunction:
+  // `1/Sin[x]` is `\csc (x)`, `1/Sin[x]^2` is `\csc ^2(x)`.
+  if let Expr::Integer(n) = exp
+    && *n < 0
+  {
+    if let Some(cofunction) = tex_reciprocal_trig(base) {
+      return if *n == -1 {
+        expr_to_tex(&cofunction)
+      } else {
+        tex_power(&cofunction, &Expr::Integer(-n))
+      };
+    }
+    return format!("\\frac{{1}}{{{}}}", tex_denom_factor(base, -n));
+  }
+  // A negative rational exponent moves into the denominator as well:
+  // `x^(-3/2)` → `\frac{1}{x^{3/2}}`, `x^(-1/2)` → `\frac{1}{\sqrt{x}}`.
+  if let Some(positive) = negated_numeric_exponent(exp) {
+    return format!("\\frac{{1}}{{{}}}", tex_power(base, &positive));
+  }
+
+  // Powers of trig/hyperbolic/log functions move the exponent onto the
+  // function name: Sin[x]^2 -> \sin ^2(x), Sech[x]^2 -> \text{sech}^2(x).
+  // (Inverse trig like ArcSin is excluded — it keeps the trailing ^2.)
+  if let Expr::FunctionCall { name, args } = base
+    && args.len() == 1
+  {
+    let exp_tex = expr_to_tex(exp);
+    let exp_grp = if exp_tex.chars().count() == 1 {
+      exp_tex
+    } else {
+      format!("{{{exp_tex}}}")
+    };
+    let arg = expr_to_tex(&args[0]);
+    if matches!(
+      name.as_str(),
+      "Sin"
+        | "Cos"
+        | "Tan"
+        | "Cot"
+        | "Sec"
+        | "Csc"
+        | "Sinh"
+        | "Cosh"
+        | "Tanh"
+        | "Coth"
+        | "Log"
+    ) {
+      return format!("\\{} ^{}({})", name.to_lowercase(), exp_grp, arg);
+    }
+    if matches!(name.as_str(), "Sech" | "Csch") {
+      return format!("\\text{{{}}}^{}({})", name.to_lowercase(), exp_grp, arg);
+    }
+  }
+
+  let mut base_tex = tex_base_with_parens(base);
+  let exp_tex = tex_exponent(exp);
+  // A base that ends in a TeX macro needs a space before the caret, or the
+  // caret would be read as part of the macro name: `\pi ^2`.
+  if ends_with_tex_macro(&base_tex) {
+    base_tex.push(' ');
+  }
+
+  // Single-character exponents don't need braces in Wolfram TeXForm
+  if exp_tex.chars().count() == 1 {
+    format!("{base_tex}^{exp_tex}")
+  } else {
+    format!("{base_tex}^{{{exp_tex}}}")
+  }
+}
+
+/// Whether rendered TeX ends with a control word (`\pi`, `\infty`, …), which
+/// must be separated from a following `^` or `_`.
+fn ends_with_tex_macro(tex: &str) -> bool {
+  let trailing_letters: String = tex
+    .chars()
+    .rev()
+    .take_while(char::is_ascii_alphabetic)
+    .collect();
+  if trailing_letters.is_empty() {
+    return false;
+  }
+  tex[..tex.len() - trailing_letters.len()].ends_with('\\')
+}
+
+/// Wrap base in parens if needed for power
+fn tex_base_with_parens(base: &Expr) -> String {
+  let needs_parens = match base {
+    Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => true,
+    Expr::FunctionCall { name, args } if args.len() >= 2 => {
+      matches!(name.as_str(), "Plus" | "Times")
+    }
+    _ => false,
+  };
+  if needs_parens {
+    tex_paren(&expr_to_tex(base))
+  } else {
+    expr_to_tex(base)
+  }
+}
+
+/// Render a matrix (list of equal-length row lists) as a LaTeX `array`
+/// environment. Returns `None` when the argument is not a list of row lists.
+/// The LaTeX array body of a table-like argument, or `None` when the argument
+/// is not a list at all.
+///
+/// A proper matrix keeps its rows. Otherwise `pad_ragged` decides: TableForm
+/// and Grid pad short rows with `\text{}` up to the widest row, while
+/// MatrixForm lays the elements out in a single column (so a ragged
+/// `{{1, 2}, {3}}` becomes one column of `\{1,2\}` and `\{3\}`).
+fn tex_array_body(expr: &Expr, pad_ragged: bool) -> Option<String> {
+  let Expr::List(items) = expr else {
+    return None;
+  };
+  let rows: Vec<Vec<String>> = if let Some(matrix) = tex_matrix_rows(items) {
+    matrix
+      .iter()
+      .map(|row| row.iter().map(expr_to_tex).collect())
+      .collect()
+  } else {
+    let all_rows: Option<Vec<Vec<Expr>>> = items
+      .iter()
+      .map(|i| match i {
+        Expr::List(row) => Some(row.to_vec()),
+        _ => None,
+      })
+      .collect();
+    let widest = all_rows
+      .as_ref()
+      .and_then(|rows| rows.iter().map(Vec::len).max())
+      .unwrap_or(0);
+    match all_rows {
+      Some(rows) if pad_ragged && widest > 0 => rows
+        .iter()
+        .map(|row| {
+          let mut cells: Vec<String> = row.iter().map(expr_to_tex).collect();
+          cells.resize(widest, "\\text{}".to_string());
+          cells
+        })
+        .collect(),
+      // A single column: one cell per element.
+      _ => items.iter().map(|i| vec![expr_to_tex(i)]).collect(),
+    }
+  };
+  let ncols = rows.first().map_or(1, Vec::len);
+  let lines: Vec<String> = rows
+    .iter()
+    .map(|r| format!(" {} \\\\", r.join(" & ")))
+    .collect();
+  let col_spec: String =
+    std::iter::repeat_n("c", ncols).collect::<Vec<_>>().join("");
+  Some(format!(
+    "\\begin{{array}}{{{}}}\n{}\n\\end{{array}}",
+    col_spec,
+    lines.join("\n")
+  ))
+}
+
+/// Render a derivative `Derivative[orders…][f]` (optionally applied to
+/// `applied` arguments) in TeX. Single orders 1 and 2 use prime marks, higher
+/// or multiple orders use the `f^{(n)}` / `f^{(n1,n2)}` superscript notation.
+fn tex_derivative(
+  orders: &[Expr],
+  f: &Expr,
+  applied: Option<&[Expr]>,
+) -> String {
+  let suffix = if orders.len() == 1 {
+    match &orders[0] {
+      Expr::Integer(1) => "'".to_string(),
+      Expr::Integer(2) => "''".to_string(),
+      other => format!("^{{({})}}", expr_to_tex(other)),
+    }
+  } else {
+    let os: Vec<String> = orders.iter().map(expr_to_tex).collect();
+    format!("^{{({})}}", os.join(","))
+  };
+  let mut s = format!("{}{}", expr_to_tex(f), suffix);
+  if let Some(a) = applied {
+    let args_tex: Vec<String> = a.iter().map(expr_to_tex).collect();
+    s.push_str(&format!("({})", args_tex.join(",")));
+  }
+  s
+}
+
+/// Classify a logical operator for TeX parenthesization, returning
+/// `(kind, precedence)` for And/Or/Xor/Implies/Not (higher binds tighter).
+fn tex_logic_op(expr: &Expr) -> Option<(&'static str, u8)> {
+  match expr {
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "And" if args.len() >= 2 => Some(("And", 20)),
+      "Or" if args.len() >= 2 => Some(("Or", 20)),
+      "Xor" if args.len() >= 2 => Some(("Xor", 20)),
+      "Implies" if args.len() == 2 => Some(("Implies", 10)),
+      "Not" if args.len() == 1 => Some(("Not", 40)),
+      _ => None,
+    },
+    Expr::UnaryOp {
+      op: UnaryOperator::Not,
+      ..
+    } => Some(("Not", 40)),
+    Expr::BinaryOp {
+      op: BinaryOperator::And,
+      ..
+    } => Some(("And", 20)),
+    Expr::BinaryOp {
+      op: BinaryOperator::Or,
+      ..
+    } => Some(("Or", 20)),
+    _ => None,
+  }
+}
+
+/// Render a logical operand, parenthesizing it per Wolfram's TeXForm rules:
+/// a child of strictly lower precedence is wrapped, as is an equal-precedence
+/// child of a different kind (mixing And/Or/Xor) or any Implies under Implies.
+fn tex_logic_operand(
+  child: &Expr,
+  parent_kind: &str,
+  parent_prec: u8,
+) -> String {
+  let inner = expr_to_tex(child);
+  if let Some((ck, cp)) = tex_logic_op(child) {
+    let paren = cp < parent_prec
+      || (cp == parent_prec && (ck != parent_kind || parent_kind == "Implies"));
+    if paren {
+      return format!("({inner})");
+    }
+  }
+  inner
+}
+
+/// Render an operand atomically, wrapping compound expressions (sums,
+/// products, …) in parentheses. Atoms and genuine function calls render
+/// bare; arithmetic-operator heads (Plus/Times/…) are parenthesized.
+fn tex_atom_or_paren(expr: &Expr) -> String {
+  let inner = expr_to_tex(expr);
+  let atomic = match expr {
+    Expr::Integer(_)
+    | Expr::Real(_)
+    | Expr::Identifier(_)
+    | Expr::Constant(_)
+    | Expr::String(_) => true,
+    Expr::FunctionCall { name, .. } => !matches!(
+      name.as_str(),
+      "Plus" | "Times" | "Subtract" | "Divide" | "Power"
+    ),
+    _ => false,
+  };
+  if atomic { inner } else { tex_paren(&inner) }
+}
+
+/// Render an operand for a postfix operator (factorial), parenthesizing
+/// additive/multiplicative compounds but NOT powers (which bind tighter than
+/// the operator): (n+1)! and (2 x)! but x^2!.
+fn tex_postfix_arg(expr: &Expr) -> String {
+  let inner = expr_to_tex(expr);
+  let needs = match expr {
+    Expr::BinaryOp {
+      op:
+        BinaryOperator::Plus
+        | BinaryOperator::Minus
+        | BinaryOperator::Times
+        | BinaryOperator::Divide,
+      ..
+    } => true,
+    Expr::FunctionCall { name, .. } => {
+      matches!(name.as_str(), "Plus" | "Times" | "Subtract" | "Divide")
+    }
+    _ => false,
+  };
+  if needs { tex_paren(&inner) } else { inner }
+}
+
+/// Render a subscript index, wrapping it in braces only when multi-character.
+fn tex_sub(expr: &Expr) -> String {
+  let s = expr_to_tex(expr);
+  if s.chars().count() == 1 {
+    s
+  } else {
+    format!("{{{s}}}")
+  }
+}
+
+/// Map a domain symbol to its blackboard-bold TeX set, for Element[_, dom].
+fn tex_set_domain(expr: &Expr) -> Option<&'static str> {
+  if let Expr::Identifier(d) = expr {
+    return match d.as_str() {
+      "Reals" => Some("\\mathbb{R}"),
+      "Integers" => Some("\\mathbb{Z}"),
+      "Complexes" => Some("\\mathbb{C}"),
+      "Rationals" => Some("\\mathbb{Q}"),
+      "Primes" => Some("\\mathbb{P}"),
+      _ => None,
+    };
+  }
+  None
+}
+
+/// Handle function calls in TeX
+fn tex_function_call(name: &str, args: &[Expr]) -> String {
+  match name {
+    // Logical operators (infix) with precedence-aware parenthesization.
+    "And" if args.len() >= 2 => args
+      .iter()
+      .map(|a| tex_logic_operand(a, "And", 20))
+      .collect::<Vec<_>>()
+      .join("\\land "),
+    "Or" if args.len() >= 2 => args
+      .iter()
+      .map(|a| tex_logic_operand(a, "Or", 20))
+      .collect::<Vec<_>>()
+      .join("\\lor "),
+    "Xor" if args.len() >= 2 => args
+      .iter()
+      .map(|a| tex_logic_operand(a, "Xor", 20))
+      .collect::<Vec<_>>()
+      .join("\\veebar "),
+    "Implies" if args.len() == 2 => format!(
+      "{}\\Rightarrow {}",
+      tex_logic_operand(&args[0], "Implies", 10),
+      tex_logic_operand(&args[1], "Implies", 10)
+    ),
+    // Set membership: Element[x, Reals] -> x\in \mathbb{R}.
+    "Element" if args.len() == 2 && tex_set_domain(&args[1]).is_some() => {
+      let dom = tex_set_domain(&args[1]).unwrap();
+      let lhs = if matches!(
+        &args[0],
+        Expr::BinaryOp {
+          op: BinaryOperator::Alternatives,
+          ..
+        }
+      ) {
+        tex_paren_list(&args[0..=0]).clone()
+      } else {
+        expr_to_tex(&args[0])
+      };
+      format!("{lhs}\\in {dom}")
+    }
+    // Max/Min/GCD use LaTeX operator names; LCM is plain text.
+    "Max" if !args.is_empty() => format!("\\max {}", tex_paren_list(args)),
+    "Min" if !args.is_empty() => format!("\\min {}", tex_paren_list(args)),
+    "GCD" if !args.is_empty() => format!("\\gcd {}", tex_paren_list(args)),
+    "LCM" if !args.is_empty() => {
+      format!("\\text{{lcm}}{}", tex_paren_list(args))
+    }
+    // Mod[a, b] -> (a \bmod b), parenthesizing compound operands.
+    "Mod" if args.len() == 2 => format!(
+      "({} \\bmod {})",
+      tex_atom_or_paren(&args[0]),
+      tex_atom_or_paren(&args[1])
+    ),
+    // Norm[v] -> \| v\| (vector bars).
+    "Norm" if args.len() == 1 => {
+      tex_delimited(&expr_to_tex(&args[0]), "\\|", "\\|")
+    }
+    // Factorial2[n] -> n!! (typeset as \text{!!}).
+    "Factorial2" if args.len() == 1 => {
+      format!("{}\\text{{!!}}", tex_postfix_arg(&args[0]))
+    }
+    // Bessel functions -> J_n(x), Y_n(x), I_n(x), K_n(x).
+    "BesselJ" | "BesselY" | "BesselI" | "BesselK" if args.len() == 2 => {
+      format!(
+        "{}_{}{}",
+        &name[6..7],
+        tex_sub(&args[0]),
+        tex_paren_list(&args[1..=1])
+      )
+    }
+    // LegendreP[n, x] -> P_n(x).
+    "LegendreP" if args.len() == 2 => {
+      format!("P_{}{}", tex_sub(&args[0]), tex_paren_list(&args[1..=1]))
+    }
+    // Subscripted families: index in a subscript, optional applied argument.
+    // Fibonacci[n] -> F_n, Fibonacci[n, x] -> F_n(x); SphericalBesselJ[n, x]
+    // -> j_n(x); ExpIntegralE[n, x] -> E_n(x).
+    "Fibonacci" | "LucasL" | "SphericalBesselJ" | "SphericalBesselY"
+    | "ExpIntegralE" | "BernoulliB" | "EulerE"
+      if (1..=2).contains(&args.len()) =>
+    {
+      let letter = match name {
+        "Fibonacci" => "F",
+        "LucasL" => "L",
+        "SphericalBesselJ" => "j",
+        "SphericalBesselY" => "y",
+        "BernoulliB" => "B",
+        _ => "E",
+      };
+      if args.len() == 1 {
+        format!("{}_{}", letter, tex_sub(&args[0]))
+      } else {
+        format!(
+          "{}_{}{}",
+          letter,
+          tex_sub(&args[0]),
+          tex_paren_list(&args[1..=1])
+        )
+      }
+    }
+    // HarmonicNumber[n] -> H_n; HarmonicNumber[n, r] -> H_n^{(r)}.
+    "HarmonicNumber" if args.len() == 1 => format!("H_{}", tex_sub(&args[0])),
+    "HarmonicNumber" if args.len() == 2 => {
+      format!("H_{}^{{({})}}", tex_sub(&args[0]), expr_to_tex(&args[1]))
+    }
+    // Pochhammer[a, n] -> (a)_n.
+    "Pochhammer" if args.len() == 2 => {
+      format!("({})_{}", expr_to_tex(&args[0]), tex_sub(&args[1]))
+    }
+    // Surd[x, n] -> \sqrt[n]{x} (also covers CubeRoot, which folds to Surd).
+    "Surd" if args.len() == 2 => format!(
+      "\\sqrt[{}]{{{}}}",
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[0])
+    ),
+    // Matrix/linear-algebra notation. Transpose/Inverse parenthesize a
+    // compound base; Det uses determinant bars (like Abs).
+    "Transpose" if args.len() == 1 => {
+      format!("{}^T", tex_atom_or_paren(&args[0]))
+    }
+    "Inverse" if args.len() == 1 => {
+      format!("{}^{{-1}}", tex_atom_or_paren(&args[0]))
+    }
+    "Det" if args.len() == 1 => format!("| {}|", expr_to_tex(&args[0])),
+    "Arg" if args.len() == 1 => {
+      format!("\\arg {}", tex_paren_list(&args[0..=0]))
+    }
+    // Norm[v, p] -> \| v\| _p (the 1-arg form is handled above).
+    "Norm" if args.len() == 2 => {
+      format!("\\| {}\\| _{}", expr_to_tex(&args[0]), tex_sub(&args[1]))
+    }
+    // Stirling numbers: S_n^{(k)} and \mathcal{S}_n^{(k)}.
+    "StirlingS1" if args.len() == 2 => {
+      format!("S_{}^{{({})}}", tex_sub(&args[0]), expr_to_tex(&args[1]))
+    }
+    "StirlingS2" if args.len() == 2 => format!(
+      "\\mathcal{{S}}_{}^{{({})}}",
+      tex_sub(&args[0]),
+      expr_to_tex(&args[1])
+    ),
+    // Multinomial[a, b, c, ...] -> (a+b+c;a,b,c) (>=3 args; 2 folds to Binomial).
+    "Multinomial" if args.len() >= 3 => {
+      let parts: Vec<String> = args.iter().map(expr_to_tex).collect();
+      format!("({};{})", parts.join("+"), parts.join(","))
+    }
+    // Integral/error special functions with conventional abbreviations.
+    "Erfi" if args.len() == 1 => {
+      format!("\\text{{erfi}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "FresnelC" if args.len() == 1 => {
+      format!("C{}", tex_paren_list(&args[0..=0]))
+    }
+    "FresnelS" if args.len() == 1 => {
+      format!("S{}", tex_paren_list(&args[0..=0]))
+    }
+    "ExpIntegralEi" if args.len() == 1 => {
+      format!("\\text{{Ei}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "LogIntegral" if args.len() == 1 => {
+      format!("\\text{{li}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "SinIntegral" if args.len() == 1 => {
+      format!("\\text{{Si}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "CosIntegral" if args.len() == 1 => {
+      format!("\\text{{Ci}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "Gudermannian" if args.len() == 1 => {
+      format!("\\text{{gd}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "Haversine" if args.len() == 1 => {
+      format!("\\text{{hav}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "AiryAi" if args.len() == 1 => {
+      format!("\\text{{Ai}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "AiryBi" if args.len() == 1 => {
+      format!("\\text{{Bi}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "AiryAiPrime" if args.len() == 1 => {
+      format!("\\text{{Ai}}'{}", tex_paren_list(&args[0..=0]))
+    }
+    "AiryBiPrime" if args.len() == 1 => {
+      format!("\\text{{Bi}}'{}", tex_paren_list(&args[0..=0]))
+    }
+    "InverseErf" if args.len() == 1 => {
+      format!("\\text{{erf}}^{{-1}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "InverseErfc" if args.len() == 1 => {
+      format!("\\text{{erfc}}^{{-1}}{}", tex_paren_list(&args[0..=0]))
+    }
+    // Single-letter special functions: EllipticK/E -> K(m)/E(m),
+    // ProductLog -> W(x), HypergeometricU -> U(a,b,x), LerchPhi -> \Phi (...).
+    "EllipticK" if args.len() == 1 => {
+      format!("K{}", tex_paren_list(&args[0..=0]))
+    }
+    "EllipticE" if args.len() == 1 => {
+      format!("E{}", tex_paren_list(&args[0..=0]))
+    }
+    "ProductLog" if args.len() == 1 => {
+      format!("W{}", tex_paren_list(&args[0..=0]))
+    }
+    "HypergeometricU" if args.len() == 3 => format!(
+      "U({},{},{})",
+      expr_to_tex(&args[0]),
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[2])
+    ),
+    "LerchPhi" if args.len() == 3 => format!(
+      "\\Phi ({},{},{})",
+      expr_to_tex(&args[0]),
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[2])
+    ),
+    // PolyLog[s, x] -> \text{Li}_s(x).
+    "PolyLog" if args.len() == 2 => format!(
+      "\\text{{Li}}_{}{}",
+      tex_sub(&args[0]),
+      tex_paren_list(&args[1..=1])
+    ),
+    // Accent functions: OverHat -> \hat{x}, etc.
+    "OverHat" | "OverTilde" | "OverDot" | "UnderBar" if args.len() == 1 => {
+      let acc = match name {
+        "OverHat" => "hat",
+        "OverTilde" => "tilde",
+        "OverDot" => "dot",
+        _ => "underline",
+      };
+      format!("\\{}{{{}}}", acc, expr_to_tex(&args[0]))
+    }
+    // PolyGamma[n, x] -> \psi ^{(n)}(x).
+    "PolyGamma" if args.len() == 2 => format!(
+      "\\psi ^{{({})}}{}",
+      expr_to_tex(&args[0]),
+      tex_paren_list(&args[1..=1])
+    ),
+    // DiracDelta / HeavisideTheta -> \delta (x) / \theta (x).
+    "DiracDelta" if args.len() == 1 => {
+      format!("\\delta {}", tex_paren_list(&args[0..=0]))
+    }
+    "HeavisideTheta" if args.len() == 1 => {
+      format!("\\theta {}", tex_paren_list(&args[0..=0]))
+    }
+    // OverBar[x] -> \bar{x}.
+    "OverBar" if args.len() == 1 => {
+      format!("\\bar{{{}}}", expr_to_tex(&args[0]))
+    }
+    // Vector products: Cross -> a\times b, Dot -> a.b, CenterDot -> a\cdot b.
+    "Cross" if args.len() >= 2 => args
+      .iter()
+      .map(expr_to_tex)
+      .collect::<Vec<_>>()
+      .join("\\times "),
+    "Dot" if args.len() >= 2 => {
+      args.iter().map(expr_to_tex).collect::<Vec<_>>().join(".")
+    }
+    "CenterDot" if args.len() >= 2 => args
+      .iter()
+      .map(expr_to_tex)
+      .collect::<Vec<_>>()
+      .join("\\cdot "),
+    // Other binary infix operators with dedicated LaTeX symbols.
+    "CircleTimes" | "CirclePlus" | "CircleDot" | "Wedge" | "Vee"
+    | "SmallCircle" | "Diamond" | "Tilde" | "TildeTilde" | "Proportional"
+      if args.len() >= 2 =>
+    {
+      let sep = match name {
+        "CircleTimes" => "\\otimes ",
+        "CirclePlus" => "\\oplus ",
+        "CircleDot" => "\\odot ",
+        "Wedge" => "\\wedge ",
+        "Vee" => "\\vee ",
+        "SmallCircle" => "\\circ ",
+        "Diamond" => "\\diamond ",
+        "Tilde" => "\\sim ",
+        "TildeTilde" => "\\approx ",
+        _ => "\\propto ",
+      };
+      args.iter().map(expr_to_tex).collect::<Vec<_>>().join(sep)
+    }
+    // Binary-only relation operators (the n-ary forms fall through to the
+    // bracket fallback, matching wolframscript). Only the operators with a
+    // working evaluated/OutputForm representation are handled here.
+    "CircleMinus" | "Backslash" | "LeftArrow" if args.len() == 2 => {
+      let sep = match name {
+        "CircleMinus" => "\\ominus ",
+        "Backslash" => "\\backslash ",
+        _ => "\\leftarrow ", // LeftArrow
+      };
+      format!("{}{}{}", expr_to_tex(&args[0]), sep, expr_to_tex(&args[1]))
+    }
+    // AngleBracket[a, b, ...] -> \langle a,b,...\rangle.
+    "AngleBracket" if !args.is_empty() => format!(
+      "\\langle {}\\rangle",
+      args.iter().map(expr_to_tex).collect::<Vec<_>>().join(",")
+    ),
+    // UnitStep -> \theta (x); Sinc -> \text{sinc}(x).
+    "UnitStep" if !args.is_empty() => {
+      format!("\\theta {}", tex_paren_list(args))
+    }
+    "Sinc" if args.len() == 1 => {
+      format!("\\text{{sinc}}{}", tex_paren_list(&args[0..=0]))
+    }
+    // KroneckerDelta[i, j, ...] -> \delta _{i,j,...}.
+    "KroneckerDelta" if !args.is_empty() => format!(
+      "\\delta _{{{}}}",
+      args.iter().map(expr_to_tex).collect::<Vec<_>>().join(",")
+    ),
+    // Single-order Derivative[order, f, applied…] (the parser flattens
+    // Derivative[n][f][x] into this form). The bare Derivative[n, m, …]
+    // operator keeps an integer second argument and falls through.
+    "Derivative"
+      if args.len() >= 2 && !matches!(&args[1], Expr::Integer(_)) =>
+    {
+      let applied = if args.len() > 2 {
+        Some(&args[2..])
+      } else {
+        None
+      };
+      tex_derivative(&args[0..1], &args[1], applied)
+    }
+    // Trig functions
+    "Sin" | "Cos" | "Tan" | "Cot" | "Sec" | "Csc" if args.len() == 1 => {
+      let fn_tex = format!("\\{}", name.to_lowercase());
+      format!("{} {}", fn_tex, tex_paren_list(&args[0..=0]))
+    }
+    // Inverse trig
+    "ArcSin" if args.len() == 1 => {
+      format!("\\sin ^{{-1}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "ArcCos" if args.len() == 1 => {
+      format!("\\cos ^{{-1}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "ArcTan" if args.len() == 1 => {
+      format!("\\tan ^{{-1}}{}", tex_paren_list(&args[0..=0]))
+    }
+    // Remaining inverse trig (the primitives have a LaTeX command name).
+    "ArcCot" | "ArcSec" | "ArcCsc" if args.len() == 1 => {
+      format!(
+        "\\{} ^{{-1}}{}",
+        name[3..].to_lowercase(),
+        tex_paren_list(&args[0..=0])
+      )
+    }
+    // Hyperbolic functions: sinh/cosh/tanh/coth are LaTeX primitives,
+    // sech/csch are rendered with \text{}.
+    "Sinh" | "Cosh" | "Tanh" | "Coth" if args.len() == 1 => {
+      format!("\\{} {}", name.to_lowercase(), tex_paren_list(&args[0..=0]))
+    }
+    "Sech" | "Csch" if args.len() == 1 => {
+      format!(
+        "\\text{{{}}}{}",
+        name.to_lowercase(),
+        tex_paren_list(&args[0..=0])
+      )
+    }
+    // Inverse hyperbolic functions.
+    "ArcSinh" | "ArcCosh" | "ArcTanh" | "ArcCoth" if args.len() == 1 => {
+      format!(
+        "\\{} ^{{-1}}{}",
+        name[3..].to_lowercase(),
+        tex_paren_list(&args[0..=0])
+      )
+    }
+    "ArcSech" | "ArcCsch" if args.len() == 1 => {
+      format!(
+        "\\text{{{}}}^{{-1}}{}",
+        name[3..].to_lowercase(),
+        tex_paren_list(&args[0..=0])
+      )
+    }
+    // Special functions with dedicated LaTeX notation.
+    "Sign" if args.len() == 1 => {
+      format!("\\text{{sgn}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "Gamma" if !args.is_empty() => {
+      let inner: Vec<String> = args.iter().map(expr_to_tex).collect();
+      format!("\\Gamma {}", tex_paren(&inner.join(",")))
+    }
+    "Zeta" if args.len() == 1 || args.len() == 2 => {
+      format!("\\zeta {}", tex_paren_list(args))
+    }
+    // The Stieltjes constants carry their index as a subscript.
+    "StieltjesGamma" if args.len() == 1 => {
+      format!("\\gamma _{}", tex_subscript_arg(&args[0]))
+    }
+    // Gauss hypergeometric function: `\, _2F_1(a,b;c;x)`.
+    "Hypergeometric2F1" if args.len() == 4 => format!(
+      "\\, _2F_1({},{};{};{})",
+      expr_to_tex(&args[0]),
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[2]),
+      expr_to_tex(&args[3])
+    ),
+    // Set operations.
+    "Union" if args.len() >= 2 => args
+      .iter()
+      .map(expr_to_tex)
+      .collect::<Vec<_>>()
+      .join("\\cup "),
+    "Intersection" if args.len() >= 2 => args
+      .iter()
+      .map(expr_to_tex)
+      .collect::<Vec<_>>()
+      .join("\\cap "),
+    "Subset" if args.len() == 2 => format!(
+      "{}\\subset {}",
+      expr_to_tex(&args[0]),
+      expr_to_tex(&args[1])
+    ),
+    "SubsetEqual" if args.len() == 2 => format!(
+      "{}\\subseteq {}",
+      expr_to_tex(&args[0]),
+      expr_to_tex(&args[1])
+    ),
+    // Quantifiers put the bound variable under the sign.
+    "ForAll" if args.len() == 2 => format!(
+      "\\forall _{}{}",
+      tex_subscript_arg(&args[0]),
+      expr_to_tex(&args[1])
+    ),
+    "Exists" if args.len() == 2 => format!(
+      "\\exists _{}{}",
+      tex_subscript_arg(&args[0]),
+      expr_to_tex(&args[1])
+    ),
+    // The remaining logical connectives.
+    "Equivalent" if args.len() >= 2 => args
+      .iter()
+      .map(|a| tex_logic_operand(a, "Equivalent", 20))
+      .collect::<Vec<_>>()
+      .join("\\unicode{29e6}"),
+    "Nand" if args.len() >= 2 => args
+      .iter()
+      .map(|a| tex_logic_operand(a, "Nand", 20))
+      .collect::<Vec<_>>()
+      .join("\\barwedge "),
+    "Nor" if args.len() >= 2 => args
+      .iter()
+      .map(|a| tex_logic_operand(a, "Nor", 20))
+      .collect::<Vec<_>>()
+      .join("\\bar{\\vee}"),
+    n if n == NEGATED_SUM && args.len() == 1 => tex_negated_sum(&args[0]),
+    // `e:_` is the named blank `e_`.
+    "Pattern"
+      if args.len() == 2
+        && matches!(&args[0], Expr::Identifier(_))
+        && matches!(&args[1], Expr::Pattern { name, .. } if name.is_empty()) =>
+    {
+      let Expr::Identifier(n) = &args[0] else {
+        unreachable!()
+      };
+      let Expr::Pattern {
+        head, blank_type, ..
+      } = &args[1]
+      else {
+        unreachable!()
+      };
+      tex_pattern_text(n, head.as_deref(), *blank_type)
+    }
+    // Star[a, b] is the infix `a*b`; Rubi shows a distributed coefficient
+    // with it.
+    "Star" if args.len() >= 2 => {
+      args.iter().map(expr_to_tex).collect::<Vec<_>>().join("*")
+    }
+    // Overscript[x, o] / Underscript[x, u] stack the script on the base.
+    "Overscript" if args.len() == 2 => format!(
+      "\\overset{{{}}}{{{}}}",
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[0])
+    ),
+    "Underscript" if args.len() == 2 => format!(
+      "\\underset{{{}}}{{{}}}",
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[0])
+    ),
+    // Display wrappers that only affect styling render their content.
+    "Style" if !args.is_empty() => expr_to_tex(&args[0]),
+    "Defer" | "Inactive" if args.len() == 1 => expr_to_tex(&args[0]),
+    // Row concatenates its items, with the optional separator between them.
+    "Row" if !args.is_empty() => {
+      let items: Vec<String> = match &args[0] {
+        Expr::List(items) => items.iter().map(expr_to_tex).collect(),
+        other => vec![expr_to_tex(other)],
+      };
+      // A string separator is written literally, not as a `\text{…}` run.
+      let separator = match args.get(1) {
+        Some(Expr::String(text)) => text.clone(),
+        Some(other) => expr_to_tex(other),
+        None => String::new(),
+      };
+      items.join(&separator)
+    }
+    // Column stacks its items in a left-aligned array.
+    "Column" if !args.is_empty() => {
+      let items: Vec<String> = match &args[0] {
+        Expr::List(items) => items.iter().map(expr_to_tex).collect(),
+        other => vec![expr_to_tex(other)],
+      };
+      let mut out = String::from("\\begin{array}{l}\n");
+      for item in items {
+        out.push_str(&format!(" {item} \\\\\n"));
+      }
+      out.push_str("\\end{array}");
+      out
+    }
+    // Underoverscript[base, under, over] stacks both scripts on the base.
+    "Underoverscript" if args.len() == 3 => format!(
+      "\\underset{{{}}}{{\\overset{{{}}}{{{}}}}}",
+      expr_to_tex(&args[1]),
+      expr_to_tex(&args[2]),
+      expr_to_tex(&args[0])
+    ),
+    "Re" if args.len() == 1 => {
+      format!("\\Re{}", tex_paren_list(&args[0..=0]))
+    }
+    "Im" if args.len() == 1 => {
+      format!("\\Im{}", tex_paren_list(&args[0..=0]))
+    }
+    "Erf" if args.len() == 1 => {
+      format!("\\text{{erf}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "Erfc" if args.len() == 1 => {
+      format!("\\text{{erfc}}{}", tex_paren_list(&args[0..=0]))
+    }
+    "Beta" if args.len() == 2 => {
+      format!("B({},{})", expr_to_tex(&args[0]), expr_to_tex(&args[1]))
+    }
+    // Conjugate: postfix star, parenthesizing compound arguments.
+    "Conjugate" if args.len() == 1 => {
+      format!("{}^*", tex_atom_or_paren(&args[0]))
+    }
+    // Log
+    "Log" if args.len() == 1 => {
+      format!("\\log {}", tex_paren_list(&args[0..=0]))
+    }
+    "Log" if args.len() == 2 => {
+      format!(
+        "\\log _{{{}}}{}",
+        expr_to_tex(&args[0]),
+        tex_paren_list(&args[1..=1])
+      )
+    }
+    // Sqrt
+    "Sqrt" if args.len() == 1 => {
+      format!("\\sqrt{{{}}}", expr_to_tex(&args[0]))
+    }
+    // Abs
+    "Abs" if args.len() == 1 => tex_delimited(&expr_to_tex(&args[0]), "|", "|"),
+    // Rational
+    "Rational" if args.len() == 2 => {
+      // Pull a leading minus out of the fraction: -3/4 -> -\frac{3}{4}.
+      let num = expr_to_tex(&args[0]);
+      let den = expr_to_tex(&args[1]);
+      if let Some(rest) = num.strip_prefix('-') {
+        format!("-\\frac{{{rest}}}{{{den}}}")
+      } else {
+        format!("\\frac{{{num}}}{{{den}}}")
+      }
+    }
+    // Plus (n-ary) — use Wolfram canonical order but move pure numeric
+    // constants to the end (matching Wolfram's TeXForm convention),
+    // then rotate so a non-negative term leads (avoid starting with -z+x, prefer x-z)
+    "Plus" if !args.is_empty() => {
+      let tex_term = |term: &Expr| {
+        TEX_SUM_TERM.with(|f| f.set(true));
+        let t = expr_to_tex(term);
+        TEX_SUM_TERM.with(|f| f.set(false));
+        t
+      };
+      // A held sum is shown as written: no constants-last reordering and
+      // no rotation to a leading positive term.
+      if tex_held() {
+        let mut result = String::new();
+        for (i, term) in args.iter().enumerate() {
+          let t = tex_term(term);
+          if i > 0 && !t.starts_with('-') {
+            result.push('+');
+          }
+          result.push_str(&t);
+        }
+        return result;
+      }
+      // Partition into symbolic and numeric terms, keeping relative order.
+      // A numeric multiple of `I` counts as numeric: wolframscript treats a
+      // complex number as one atom, so it trails the symbolic terms just as
+      // a plain number does.
+      let mut symbolic: Vec<&Expr> = Vec::new();
+      let mut numeric: Vec<&Expr> = Vec::new();
+      // The named constants (`Pi`, `E`) trail the symbolic terms just as
+      // the numbers do: `x+\pi `, `1+e`; an imaginary term comes last of
+      // all (`\pi +i`).
+      let mut imaginary: Vec<&Expr> = Vec::new();
+      for arg in args {
+        if is_imaginary_term(arg) {
+          imaginary.push(arg);
+        } else if matches!(
+          arg,
+          Expr::Integer(_) | Expr::Real(_) | Expr::Constant(_)
+        ) || matches!(arg, Expr::Identifier(s) if s == "Pi" || s == "E")
+        {
+          numeric.push(arg);
+        } else {
+          symbolic.push(arg);
+        }
+      }
+      numeric.extend(imaginary);
+      // Real part and imaginary part together form one complex atom, printed
+      // in that order and bracketed when other terms surround it.
+      let complex_unit = match numeric.as_slice() {
+        [re, im]
+          if !is_imaginary_term(re)
+            && is_imaginary_term(im)
+            && !symbolic.is_empty() =>
+        {
+          Some(format!("({})", tex_complex_atom(re, im)))
+        }
+        [re, im] if !is_imaginary_term(re) && is_imaginary_term(im) => {
+          Some(tex_complex_atom(re, im))
+        }
+        _ => None,
+      };
+      let reordered_args: Vec<&Expr> = if complex_unit.is_some() {
+        symbolic.clone()
+      } else {
+        symbolic.iter().copied().chain(numeric).collect()
+      };
+      let mut tex_strs: Vec<String> =
+        reordered_args.iter().map(|a| tex_term(a)).collect();
+      if let Some(unit) = complex_unit {
+        tex_strs.push(unit);
+      }
+      // Find first non-negative term to lead with
+      let lead = tex_strs
+        .iter()
+        .position(|s| !s.starts_with('-'))
+        .unwrap_or(0);
+      let reordered: Vec<&str> = tex_strs[lead..]
+        .iter()
+        .chain(tex_strs[..lead].iter())
+        .map(std::string::String::as_str)
+        .collect();
+      let mut result = reordered[0].to_string();
+      for t in reordered.iter().skip(1) {
+        if t.starts_with('-') {
+          result.push_str(t);
+        } else {
+          result.push('+');
+          result.push_str(t);
+        }
+      }
+      result
+    }
+    // Times (n-ary)
+    "Times" if args.len() >= 2 => tex_times_nary(args),
+    // Power
+    "Power" if args.len() == 2 => tex_power(&args[0], &args[1]),
+    // Exp
+    "Exp" if args.len() == 1 => {
+      format!("e^{{{}}}", expr_to_tex(&args[0]))
+    }
+    // Factorial
+    "Factorial" if args.len() == 1 => {
+      format!("{}!", tex_postfix_arg(&args[0]))
+    }
+    // Sum
+    "Sum" if args.len() == 2 => {
+      if let Expr::List(bounds) = &args[1]
+        && bounds.len() >= 3
+      {
+        return format!(
+          "\\sum _{{{}={}}}^{} {}",
+          expr_to_tex(&bounds[0]),
+          expr_to_tex(&bounds[1]),
+          tex_script_group(&expr_to_tex(&bounds[2])),
+          tex_summand(&args[0])
+        );
+      }
+      format!("\\text{{Sum}}{}", tex_paren_list(args))
+    }
+    // Product
+    "Product" if args.len() == 2 => {
+      if let Expr::List(bounds) = &args[1]
+        && bounds.len() >= 3
+      {
+        return format!(
+          "\\prod _{{{}={}}}^{} {}",
+          expr_to_tex(&bounds[0]),
+          expr_to_tex(&bounds[1]),
+          tex_script_group(&expr_to_tex(&bounds[2])),
+          tex_summand(&args[0])
+        );
+      }
+      format!("\\text{{Product}}{}", tex_paren_list(args))
+    }
+    // Integrate
+    "Integrate" if args.len() == 2 => {
+      // TeX convention: a single-character subscript/superscript needs no
+      // braces (e.g. `\int_a^b` vs `\int_{ab}^{...}`), matching wolframscript.
+      fn brace_if_needed(s: &str) -> String {
+        if s.chars().count() == 1 {
+          s.to_string()
+        } else {
+          format!("{{{s}}}")
+        }
+      }
+      if let Expr::List(bounds) = &args[1]
+        && bounds.len() == 3
+      {
+        return format!(
+          "\\int_{}^{} {} \\, d{}",
+          brace_if_needed(&expr_to_tex(&bounds[1])),
+          brace_if_needed(&expr_to_tex(&bounds[2])),
+          tex_summand(&args[0]),
+          expr_to_tex(&bounds[0])
+        );
+      }
+      // Indefinite integral
+      format!(
+        "\\int {} \\, d{}",
+        tex_summand(&args[0]),
+        expr_to_tex(&args[1])
+      )
+    }
+    // Derivative
+    "D" if args.len() == 2 => {
+      format!(
+        "\\frac{{\\partial {}}}{{\\partial {}}}",
+        tex_summand(&args[0]),
+        expr_to_tex(&args[1])
+      )
+    }
+    // Limit. wolframscript sets the limit point under an upright `lim`, and
+    // marks a one-sided limit with a superscript sign on the point:
+    // `\underset{x\to 0^+}{\text{lim}}f(x)`.
+    "Limit" if args.len() == 2 || args.len() == 3 => {
+      if let Expr::Rule {
+        pattern,
+        replacement,
+      } = &args[1]
+      {
+        let side = args.get(2).and_then(tex_limit_direction).unwrap_or("");
+        return format!(
+          "\\underset{{{}\\to {}{}}}{{\\text{{lim}}}}{}",
+          expr_to_tex(pattern),
+          expr_to_tex(replacement),
+          side,
+          expr_to_tex(&args[0])
+        );
+      }
+      format!(
+        "\\text{{Limit}}({}, {})",
+        expr_to_tex(&args[0]),
+        expr_to_tex(&args[1])
+      )
+    }
+    // MatrixForm — a parenthesized LaTeX array. A non-list argument is
+    // transparent: `MatrixForm[x] // TeXForm` is just `x`.
+    "MatrixForm" if args.len() == 1 => match tex_array_body(&args[0], false) {
+      Some(arr) => format!("\\left(\n{arr}\n\\right)"),
+      None => expr_to_tex(&args[0]),
+    },
+    // TableForm — a bare LaTeX array (no surrounding parentheses).
+    "TableForm" if args.len() == 1 => match tex_array_body(&args[0], true) {
+      Some(arr) => arr,
+      None => expr_to_tex(&args[0]),
+    },
+    // Grid needs a list of rows; anything else stays as text (in brackets,
+    // unlike the other heads).
+    "Grid" if args.len() == 1 => {
+      let rows_of_lists = matches!(&args[0], Expr::List(items)
+        if !items.is_empty()
+          && items.iter().all(|i| matches!(i, Expr::List(_))));
+      match tex_array_body(&args[0], true).filter(|_| rows_of_lists) {
+        Some(arr) => arr,
+        None => format!("\\text{{Grid}}[{}]", expr_to_tex(&args[0])),
+      }
+    }
+    // Piecewise[{{v1, c1}, …}, default] -> a LaTeX cases environment.
+    "Piecewise" if !args.is_empty() => {
+      if let Expr::List(cases) = &args[0] {
+        let mut rows: Vec<String> = Vec::new();
+        let mut closed = false;
+        for case in cases {
+          if let Expr::List(pair) = case
+            && pair.len() == 2
+          {
+            let cond = expr_to_tex(&pair[1]);
+            closed = cond == "\\text{True}";
+            rows.push(format!(" {} & {}", expr_to_tex(&pair[0]), cond));
+          }
+        }
+        // Wolfram always shows the catch-all; append the default (2nd arg, or
+        // 0) with a True condition unless an explicit True case already closed.
+        if !closed {
+          let def = args.get(1).map_or_else(|| "0".to_string(), expr_to_tex);
+          rows.push(format!(" {def} & \\text{{True}}"));
+        }
+        format!("\\begin{{cases}}\n{}\n\\end{{cases}}", rows.join(" \\\\\n"))
+      } else {
+        format!("\\text{{Piecewise}}{}", tex_paren_list(args))
+      }
+    }
+    // Complex
+    "Complex" if args.len() == 2 => {
+      let re = expr_to_tex(&args[0]);
+      let im = expr_to_tex(&args[1]);
+      format!("{re}+{im} i")
+    }
+    // Subscript[x, i, j, ...] -> x_{i, j, ...}
+    "Subscript" if args.len() >= 2 => {
+      let base = expr_to_tex(&args[0]);
+      let idx_tex: Vec<String> = args[1..].iter().map(expr_to_tex).collect();
+      if args.len() == 2 {
+        let s = &idx_tex[0];
+        if s.chars().count() == 1 {
+          format!("{base}_{s}")
+        } else {
+          format!("{base}_{{{s}}}")
+        }
+      } else {
+        format!("{}_{{{}}}", base, idx_tex.join(", "))
+      }
+    }
+    // Superscript[x, n] -> x^n or x^{n}
+    "Superscript" if args.len() == 2 => {
+      let base = expr_to_tex(&args[0]);
+      let exp = expr_to_tex(&args[1]);
+      if exp.chars().count() == 1 {
+        format!("{base}^{exp}")
+      } else {
+        format!("{base}^{{{exp}}}")
+      }
+    }
+    // Subsuperscript[x, b, c] -> x_b^c (with brace wrapping for multi-char parts)
+    "Subsuperscript" if args.len() == 3 => {
+      let base = expr_to_tex(&args[0]);
+      let sub = expr_to_tex(&args[1]);
+      let sup = expr_to_tex(&args[2]);
+      let sub_part = if sub.chars().count() == 1 {
+        format!("_{sub}")
+      } else {
+        format!("_{{{sub}}}")
+      };
+      let sup_part = if sup.chars().count() == 1 {
+        format!("^{sup}")
+      } else {
+        format!("^{{{sup}}}")
+      };
+      format!("{base}{sub_part}{sup_part}")
+    }
+    // Floor[x] -> \lfloor x\rfloor, Ceiling[x] -> \lceil x\rceil.
+    "Floor" if args.len() == 1 => {
+      tex_delimited(&expr_to_tex(&args[0]), "\\lfloor", "\\rfloor")
+    }
+    "Ceiling" if args.len() == 1 => {
+      tex_delimited(&expr_to_tex(&args[0]), "\\lceil", "\\rceil")
+    }
+    // Binomial[n, k] -> \binom{n}{k}.
+    "Binomial" if args.len() == 2 => {
+      format!(
+        "\\binom{{{}}}{{{}}}",
+        expr_to_tex(&args[0]),
+        expr_to_tex(&args[1])
+      )
+    }
+    // Default rendering. wolframscript keeps WL square brackets for a built-in
+    // function that has no special TeX rule (Round[x] -> \text{Round}[x],
+    // Quotient[a, b] -> \text{Quotient}[a, b]), but renders an unknown/user
+    // function with math parentheses (f[x] -> f(x), myf[x] -> \text{myf}(x)).
+    _ => {
+      let args_tex: Vec<String> = args.iter().map(expr_to_tex).collect();
+      // A package symbol is written by its short name while its context is
+      // on `$ContextPath` (`Int`, not `Rubi`Int`).
+      let shown = crate::evaluator::contexts::display_name(name);
+      let name = shown.as_str();
+      if crate::evaluator::get_builtin_function_info(name).is_some() {
+        format!("\\text{{{}}}{}", name, tex_bracket(&args_tex.join(",")))
+      } else {
+        let head = if name.chars().count() == 1 {
+          name.to_string()
+        } else {
+          format!("\\text{{{name}}}")
+        };
+        format!("{}{}", head, tex_paren(&args_tex.join(",")))
+      }
+    }
+  }
+}
+
+// ====================================================================
+// MathML generation
+// ====================================================================
+
+/// Convert a Wolfram expression to MathML (presentation MathML).
+/// Returns the complete `<math>...</math>` block with proper indentation.
+fn expr_to_mathml(expr: &Expr) -> String {
+  let inner = mathml_inner(expr, 1);
+  format!("<math>\n{inner}\n</math>\n")
+}
+
+/// Render a single expression as a MathML fragment at the given indentation depth.
+fn mathml_inner(expr: &Expr, depth: usize) -> String {
+  let indent = " ".repeat(depth);
+
+  match expr {
+    // Numbers
+    Expr::Integer(n) => format!("{indent}<mn>{n}</mn>"),
+    Expr::BigInteger(n) => format!("{indent}<mn>{n}</mn>"),
+    Expr::Real(f) => {
+      format!("{}<mn>{}</mn>", indent, crate::syntax::format_real(*f))
+    }
+
+    // Strings
+    Expr::String(s) => format!("{}<ms>{}</ms>", indent, mathml_escape(s)),
+
+    // Identifiers and constants
+    Expr::Identifier(name) | Expr::Constant(name) => {
+      format!("{}<mi>{}</mi>", indent, mathml_identifier(name))
+    }
+
+    // Unary minus
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let inner = mathml_inner(operand, depth + 1);
+      format!(
+        "{}<mrow>\n{}<mo>-</mo>\n{}\n{}</mrow>",
+        indent,
+        " ".repeat(depth + 1),
+        inner,
+        indent
+      )
+    }
+
+    // Binary operators
+    Expr::BinaryOp { op, left, right } => match op {
+      BinaryOperator::Plus => {
+        let l = mathml_inner(left, depth + 1);
+        let r = mathml_inner(right, depth + 1);
+        format!(
+          "{}<mrow>\n{}\n{}<mo>+</mo>\n{}\n{}</mrow>",
+          indent,
+          l,
+          " ".repeat(depth + 1),
+          r,
+          indent
+        )
+      }
+      BinaryOperator::Minus => {
+        let l = mathml_inner(left, depth + 1);
+        let r = mathml_inner(right, depth + 1);
+        format!(
+          "{}<mrow>\n{}\n{}<mo>-</mo>\n{}\n{}</mrow>",
+          indent,
+          l,
+          " ".repeat(depth + 1),
+          r,
+          indent
+        )
+      }
+      BinaryOperator::Times => {
+        let l = mathml_inner(left, depth + 1);
+        let r = mathml_inner(right, depth + 1);
+        format!(
+          "{}<mrow>\n{}\n{}<mo>&#8290;</mo>\n{}\n{}</mrow>",
+          indent,
+          l,
+          " ".repeat(depth + 1),
+          r,
+          indent
+        )
+      }
+      BinaryOperator::Divide => {
+        let l = mathml_inner(left, depth + 1);
+        let r = mathml_inner(right, depth + 1);
+        format!("{indent}<mfrac>\n{l}\n{r}\n{indent}</mfrac>")
+      }
+      BinaryOperator::Power => {
+        if let Some(sqrt_arg) = crate::functions::is_sqrt(expr) {
+          let b = mathml_inner(sqrt_arg, depth + 1);
+          return format!("{indent}<msqrt>\n{b}\n{indent}</msqrt>");
+        }
+        let b = mathml_inner(left, depth + 1);
+        let e = mathml_inner(right, depth + 1);
+        format!("{indent}<msup>\n{b}\n{e}\n{indent}</msup>")
+      }
+      _ => {
+        // Fallback: render as operator
+        let op_str = format!("{op:?}");
+        let l = mathml_inner(left, depth + 1);
+        let r = mathml_inner(right, depth + 1);
+        format!(
+          "{}<mrow>\n{}\n{}<mo>{}</mo>\n{}\n{}</mrow>",
+          indent,
+          l,
+          " ".repeat(depth + 1),
+          op_str,
+          r,
+          indent
+        )
+      }
+    },
+
+    // Lists
+    Expr::List(items) => mathml_list(items, depth),
+
+    // Function calls
+    Expr::FunctionCall { name, args } => {
+      mathml_function_call(name, args, depth)
+    }
+
+    // Fallback: render via output form
+    _ => {
+      let s = expr_to_output(expr);
+      format!("{}<mi>{}</mi>", indent, mathml_escape(&s))
+    }
+  }
+}
+
+fn mathml_escape(s: &str) -> String {
+  s.replace('&', "&amp;")
+    .replace('<', "&lt;")
+    .replace('>', "&gt;")
+}
+
+fn mathml_identifier(name: &str) -> &str {
+  match name {
+    "Pi" => "&#960;",
+    "E" => "&#8519;",
+    "I" => "&#8520;",
+    "Infinity" | "DirectedInfinity" => "&#8734;",
+    _ => name,
+  }
+}
+
+fn mathml_list(items: &[Expr], depth: usize) -> String {
+  let indent = " ".repeat(depth);
+  let inner_indent = " ".repeat(depth + 1);
+  let inner2_indent = " ".repeat(depth + 2);
+
+  // Build comma-separated items inside {  }
+  let mut parts = Vec::new();
+  for (i, item) in items.iter().enumerate() {
+    parts.push(mathml_inner(item, depth + 2));
+    if i + 1 < items.len() {
+      parts.push(format!("{inner2_indent}<mo>,</mo>"));
+    }
+  }
+
+  format!(
+    "{}<mrow>\n{}<mo>{{</mo>\n{}<mrow>\n{}\n{}</mrow>\n{}<mo>}}</mo>\n{}</mrow>",
+    indent,
+    inner_indent,
+    inner_indent,
+    parts.join("\n"),
+    inner_indent,
+    inner_indent,
+    indent
+  )
+}
+
+fn mathml_function_call(name: &str, args: &[Expr], depth: usize) -> String {
+  let indent = " ".repeat(depth);
+  let inner = " ".repeat(depth + 1);
+
+  match name {
+    // Rational
+    "Rational" if args.len() == 2 => {
+      let n = mathml_inner(&args[0], depth + 1);
+      let d = mathml_inner(&args[1], depth + 1);
+      format!("{indent}<mfrac>\n{n}\n{d}\n{indent}</mfrac>")
+    }
+
+    // Power
+    "Power" if args.len() == 2 => {
+      // Power[x, Rational[1, 2]] → Sqrt
+      if let Expr::FunctionCall { name: rn, args: ra } = &args[1]
+        && rn == "Rational"
+        && ra.len() == 2
+        && matches!(&ra[0], Expr::Integer(1))
+        && matches!(&ra[1], Expr::Integer(2))
+      {
+        let b = mathml_inner(&args[0], depth + 1);
+        return format!("{indent}<msqrt>\n{b}\n{indent}</msqrt>");
+      }
+      let b = mathml_inner(&args[0], depth + 1);
+      let e = mathml_inner(&args[1], depth + 1);
+      format!("{indent}<msup>\n{b}\n{e}\n{indent}</msup>")
+    }
+
+    // Sqrt
+    "Sqrt" if args.len() == 1 => {
+      let b = mathml_inner(&args[0], depth + 1);
+      format!("{indent}<msqrt>\n{b}\n{indent}</msqrt>")
+    }
+
+    // Plus (n-ary)
+    "Plus" if !args.is_empty() => {
+      let mut parts = Vec::new();
+      parts.push(mathml_inner(&args[0], depth + 1));
+      for arg in args.iter().skip(1) {
+        // Check if argument has a leading minus (Times[-1, ...])
+        let is_neg = matches!(arg,
+          Expr::FunctionCall { name: n, args: a }
+            if n == "Times" && !a.is_empty() && matches!(&a[0], Expr::Integer(-1))
+        ) || matches!(arg, Expr::Integer(n) if *n < 0)
+          || matches!(
+            arg,
+            Expr::UnaryOp {
+              op: UnaryOperator::Minus,
+              ..
+            }
+          );
+
+        if is_neg {
+          parts.push(format!("{inner}<mo>-</mo>"));
+          // Render the negated form
+          match arg {
+            Expr::FunctionCall { name: n, args: a }
+              if n == "Times"
+                && a.len() >= 2
+                && matches!(&a[0], Expr::Integer(-1)) =>
+            {
+              if a.len() == 2 {
+                parts.push(mathml_inner(&a[1], depth + 1));
+              } else {
+                parts.push(mathml_function_call("Times", &a[1..], depth + 1));
+              }
+            }
+            Expr::Integer(n) if *n < 0 => {
+              parts.push(format!("{}<mn>{}</mn>", inner, -n));
+            }
+            Expr::UnaryOp {
+              op: UnaryOperator::Minus,
+              operand,
+            } => {
+              parts.push(mathml_inner(operand, depth + 1));
+            }
+            _ => parts.push(mathml_inner(arg, depth + 1)),
+          }
+        } else {
+          parts.push(format!("{inner}<mo>+</mo>"));
+          parts.push(mathml_inner(arg, depth + 1));
+        }
+      }
+      format!("{}<mrow>\n{}\n{}</mrow>", indent, parts.join("\n"), indent)
+    }
+
+    // Times (n-ary)
+    "Times" if args.len() >= 2 => {
+      // Check for leading -1
+      if matches!(&args[0], Expr::Integer(-1)) {
+        let rest = &args[1..];
+        if rest.len() == 1 {
+          let r = mathml_inner(&rest[0], depth + 1);
+          return format!(
+            "{indent}<mrow>\n{inner}<mo>-</mo>\n{r}\n{indent}</mrow>"
+          );
+        }
+        let r = mathml_function_call("Times", rest, depth + 1);
+        return format!(
+          "{indent}<mrow>\n{inner}<mo>-</mo>\n{r}\n{indent}</mrow>"
+        );
+      }
+      let mut parts = Vec::new();
+      parts.push(mathml_inner(&args[0], depth + 1));
+      for arg in args.iter().skip(1) {
+        parts.push(format!("{inner}<mo>&#8290;</mo>"));
+        parts.push(mathml_inner(arg, depth + 1));
+      }
+      format!("{}<mrow>\n{}\n{}</mrow>", indent, parts.join("\n"), indent)
+    }
+
+    // Trig functions (lowercase in MathML)
+    "Sin" | "Cos" | "Tan" | "Cot" | "Sec" | "Csc" | "Log" | "Exp"
+      if args.len() == 1 =>
+    {
+      let fn_name = name.to_lowercase();
+      let a = mathml_inner(&args[0], depth + 1);
+      format!(
+        "{indent}<mrow>\n{inner}<mi>{fn_name}</mi>\n{inner}<mo>&#8289;</mo>\n{inner}<mo>(</mo>\n{a}\n{inner}<mo>)</mo>\n{indent}</mrow>"
+      )
+    }
+
+    // Complex
+    "Complex" if args.len() == 2 => {
+      let re = mathml_inner(&args[0], depth + 1);
+      let im = mathml_inner(&args[1], depth + 1);
+      format!(
+        "{indent}<mrow>\n{re}\n{inner}<mo>+</mo>\n{im}\n{inner}<mo>&#8290;</mo>\n{inner}<mi>&#8520;</mi>\n{indent}</mrow>"
+      )
+    }
+
+    // Default: render as function application
+    _ => {
+      let args_inner: Vec<String> =
+        args.iter().map(|a| mathml_inner(a, depth + 1)).collect();
+      let mut parts = Vec::new();
+      for (i, a) in args_inner.iter().enumerate() {
+        parts.push(a.clone());
+        if i + 1 < args_inner.len() {
+          parts.push(format!("{inner}<mo>,</mo>"));
+        }
+      }
+      format!(
+        "{}<mrow>\n{}<mi>{}</mi>\n{}<mo>&#8289;</mo>\n{}<mo>(</mo>\n{}\n{}<mo>)</mo>\n{}</mrow>",
+        indent,
+        inner,
+        mathml_escape_str(name),
+        inner,
+        inner,
+        parts.join("\n"),
+        inner,
+        indent
+      )
+    }
+  }
+}
+
+fn mathml_escape_str(s: &str) -> String {
+  s.replace('&', "&amp;")
+    .replace('<', "&lt;")
+    .replace('>', "&gt;")
+}
+
+// ====================================================================
+// StandardForm box representation
+// ====================================================================
+
+// Wolfram private-use Unicode characters for box syntax.
+// These are used internally in strings; InputForm converts them to \!, \(, \*, \).
+/// Render a box tree the way the box-syntax escape notation spells it:
+/// like `InputForm`, except that a rule inside a box — the shape every box
+/// option takes — is written out as `Rule[lhs, rhs]` rather than with the
+/// `->` operator, matching wolframscript's
+/// `ToString[Style[…], TraditionalForm]`.
+pub fn linear_syntax_box_text(expr: &Expr) -> String {
+  let parts = |args: &[Expr]| -> String {
+    args
+      .iter()
+      .map(linear_syntax_box_text)
+      .collect::<Vec<_>>()
+      .join(", ")
+  };
+  match expr {
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => format!(
+      "Rule[{}, {}]",
+      linear_syntax_box_text(pattern),
+      linear_syntax_box_text(replacement)
+    ),
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => format!(
+      "RuleDelayed[{}, {}]",
+      linear_syntax_box_text(pattern),
+      linear_syntax_box_text(replacement)
+    ),
+    Expr::FunctionCall { name, args } => {
+      format!("{name}[{}]", parts(args))
+    }
+    Expr::List(items) => format!("{{{}}}", parts(items)),
+    other => crate::syntax::expr_to_input_form(other),
+  }
+}
+
+pub const BOX_START: char = '\u{f7c1}'; // \!
+pub const BOX_OPEN: char = '\u{f7c9}'; // \(
+pub const BOX_SEP: char = '\u{f7c8}'; // \*
+pub const BOX_CLOSE: char = '\u{f7c0}'; // \)
+
+/// One piece of a string that mixes literal text with inline box segments.
+/// `is_box` marks a piece whose `text` is a bare box-expression source such
+/// as `SubscriptBox[p, 0]`; a literal piece keeps the original characters.
+pub struct InlineBoxSegment {
+  pub text: String,
+  pub is_box: bool,
+}
+
+/// Split a string on the inline linear-syntax box segments a notebook
+/// FrontEnd typesets: `\!\(\*SubscriptBox[\(p\), \(0\)]\)`, stored as the
+/// private-use markers `BOX_START BOX_OPEN BOX_SEP … BOX_CLOSE`. A control
+/// label like `"value to test against \!\(\*SubscriptBox[\(p\), \(0\)]\)"`
+/// splits into the prose and the box expression, so each can be rendered on
+/// its own terms.
+///
+/// A box segment's text has every marker removed and the box-element quotes
+/// unwrapped (`SubscriptBox["p", "0"]` → `SubscriptBox[p, 0]`), which is
+/// both what OutputForm displays inside `DisplayForm[…]` and what the
+/// notebook box-to-InputForm converter accepts.
+///
+/// `\!\(…\)` *without* the `\*` marker is full 2D linear syntax (`\!\(a +
+/// b\)`) rather than a box expression; parsing that needs a linear-syntax
+/// parser, so it stays a literal segment.
+pub fn split_inline_boxes(s: &str) -> Vec<InlineBoxSegment> {
+  let chars: Vec<char> = s.chars().collect();
+  let mut segments: Vec<InlineBoxSegment> = Vec::new();
+  let mut literal = String::new();
+  let mut i = 0;
+  while i < chars.len() {
+    // A box segment is `BOX_START BOX_OPEN BOX_SEP … BOX_CLOSE`, where the
+    // closing marker is the one that balances the opening one.
+    if chars[i] == BOX_START
+      && chars.get(i + 1) == Some(&BOX_OPEN)
+      && chars.get(i + 2) == Some(&BOX_SEP)
+      && let Some(end) = matching_box_close(&chars, i + 1)
+    {
+      if !literal.is_empty() {
+        segments.push(InlineBoxSegment {
+          text: std::mem::take(&mut literal),
+          is_box: false,
+        });
+      }
+      segments.push(InlineBoxSegment {
+        text: strip_box_markup(&chars[i + 3..end]),
+        is_box: true,
+      });
+      i = end + 1;
+      continue;
+    }
+    literal.push(chars[i]);
+    i += 1;
+  }
+  if !literal.is_empty() {
+    segments.push(InlineBoxSegment {
+      text: literal,
+      is_box: false,
+    });
+  }
+  segments
+}
+
+/// Index of the `BOX_CLOSE` that balances the `BOX_OPEN` at `open`, or None
+/// when the segment is unterminated.
+fn matching_box_close(chars: &[char], open: usize) -> Option<usize> {
+  let mut depth = 0usize;
+  for (offset, c) in chars[open..].iter().enumerate() {
+    match *c {
+      BOX_OPEN => depth += 1,
+      BOX_CLOSE => {
+        depth -= 1;
+        if depth == 0 {
+          return Some(open + offset);
+        }
+      }
+      _ => {}
+    }
+  }
+  None
+}
+
+/// Drop the grouping markers inside a box segment and unwrap the quotes
+/// around its elements, keeping `\"` and `\\` escapes as literal characters.
+///
+/// A box segment spells a list of boxes `List[…]` where displaying it shows
+/// `{…}` — the segment is box *source*, and what it displays is the box
+/// expression it parses into.
+fn strip_box_markup(chars: &[char]) -> String {
+  let mut out = String::with_capacity(chars.len());
+  // One entry per `[` still open, set for the ones a `List` head opened.
+  // Only the box source's own brackets count — a box holding text keeps
+  // whatever it says.
+  let mut brackets: Vec<bool> = Vec::new();
+  let mut in_box_text = false;
+  let mut i = 0;
+  while i < chars.len() {
+    match chars[i] {
+      BOX_OPEN | BOX_CLOSE | BOX_SEP | BOX_START => {}
+      '"' => in_box_text = !in_box_text,
+      '\\' if matches!(chars.get(i + 1), Some('"' | '\\')) => {
+        out.push(chars[i + 1]);
+        i += 2;
+        continue;
+      }
+      'L'
+        if !in_box_text
+          && chars[i..].starts_with(&['L', 'i', 's', 't', '['])
+          && !chars[..i].last().is_some_and(|c| c.is_alphanumeric()) =>
+      {
+        brackets.push(true);
+        out.push('{');
+        i += 5;
+        continue;
+      }
+      '[' if !in_box_text => {
+        brackets.push(false);
+        out.push('[');
+      }
+      ']' if !in_box_text => out.push(if brackets.pop().unwrap_or(false) {
+        '}'
+      } else {
+        ']'
+      }),
+      c => out.push(c),
+    }
+    i += 1;
+  }
+  out
+}
+
+/// Convert a Wolfram expression to its StandardForm box representation.
+/// Returns a string using private-use Unicode box markers internally.
+/// In InputForm these render as `\!\(\*RowBox[{"..."}]\)`;
+/// in OutputForm they render as `DisplayForm[RowBox[{...}]]`.
+pub fn expr_to_box_form(expr: &Expr) -> String {
+  let box_str = expr_to_boxes(expr);
+  // If the result is NOT already a box (RowBox, FractionBox, etc.), wrap in RowBox
+  if box_str.contains("Box[") {
+    format!("{BOX_START}{BOX_OPEN}{BOX_SEP}{box_str}{BOX_CLOSE}")
+  } else {
+    format!("{BOX_START}{BOX_OPEN}{BOX_SEP}RowBox[{{{box_str}}}]{BOX_CLOSE}")
+  }
+}
+
+/// Convert an expression to its box form representation.
+/// All atoms are string-quoted to match Wolfram's box format.
+pub fn expr_to_boxes(expr: &Expr) -> String {
+  match expr {
+    // Simple atoms — all quoted in box form
+    Expr::Integer(n) => format!("\"{n}\""),
+    Expr::BigInteger(n) => format!("\"{n}\""),
+    Expr::Real(f) => format!("\"{}\"", crate::syntax::format_real(*f)),
+    Expr::String(s) => {
+      format!("\"\\\"{}\\\"\"", escape_box_text(s))
+    }
+    Expr::Identifier(name) | Expr::Constant(name) => format!("\"{name}\""),
+
+    // Unary minus
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      format!("RowBox[{{\"-\", {}}}]", expr_to_boxes(operand))
+    }
+
+    // Binary operators
+    Expr::BinaryOp { op, left, right } => match op {
+      BinaryOperator::Plus => {
+        format!(
+          "RowBox[{{{}, \"+\", {}}}]",
+          expr_to_boxes(left),
+          expr_to_boxes(right)
+        )
+      }
+      BinaryOperator::Minus => {
+        format!(
+          "RowBox[{{{}, \"-\", {}}}]",
+          expr_to_boxes(left),
+          expr_to_boxes(right)
+        )
+      }
+      BinaryOperator::Times => {
+        format!(
+          "RowBox[{{{}, \" \", {}}}]",
+          expr_to_boxes(left),
+          expr_to_boxes(right)
+        )
+      }
+      BinaryOperator::Divide => {
+        format!(
+          "FractionBox[{}, {}]",
+          expr_to_boxes(left),
+          expr_to_boxes(right)
+        )
+      }
+      BinaryOperator::Power => {
+        if let Some(sqrt_arg) = crate::functions::is_sqrt(expr) {
+          return format!("SqrtBox[{}]", expr_to_boxes(sqrt_arg));
+        }
+        format!(
+          "SuperscriptBox[{}, {}]",
+          expr_to_boxes(left),
+          expr_to_boxes(right)
+        )
+      }
+      _ => {
+        let op_str = match op {
+          BinaryOperator::And => "&&",
+          BinaryOperator::Or => "||",
+          BinaryOperator::StringJoin => "<>",
+          BinaryOperator::Alternatives => "|",
+          _ => "?",
+        };
+        format!(
+          "RowBox[{{{}, \"{}\", {}}}]",
+          expr_to_boxes(left),
+          op_str,
+          expr_to_boxes(right)
+        )
+      }
+    },
+
+    // Lists
+    Expr::List(items) => {
+      let mut parts = vec!["\"{\"".to_string()];
+      if !items.is_empty() {
+        let inner: Vec<String> = items.iter().map(expr_to_boxes).collect();
+        parts.push(format!("RowBox[{{{}}}]", inner.join(", \",\", ")));
+      }
+      parts.push("\"}\"".to_string());
+      format!("RowBox[{{{}}}]", parts.join(", "))
+    }
+
+    // Function calls
+    Expr::FunctionCall { name, args } => box_function_call(name, args),
+
+    // Fallback
+    _ => expr_to_output(expr),
+  }
+}
+
+/// Escape `s` for the box-source layer, where a box is delimited by `"` and
+/// a literal newline would break the source across lines.
+fn escape_box_text(s: &str) -> String {
+  s.replace('\\', "\\\\")
+    .replace('"', "\\\"")
+    .replace('\n', "\\n")
+}
+
+/// The boxes for `-term` when `term` is negative, so a `Plus` can join it
+/// with a `-` instead of `+ -`. `None` when the term is not negative.
+fn negated_term_boxes(arg: &Expr) -> Option<String> {
+  match arg {
+    Expr::Integer(n) if *n < 0 => Some(format!("\"{}\"", -n)),
+    Expr::Real(f) if *f < 0.0 => {
+      Some(format!("\"{}\"", crate::syntax::format_real(-f)))
+    }
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      let positive_first = match &args[0] {
+        Expr::Integer(-1) => None,
+        Expr::Integer(n) if *n < 0 => Some(Expr::Integer(-n)),
+        Expr::Real(f) if *f < 0.0 => Some(Expr::Real(-f)),
+        _ => return None,
+      };
+      let rest: Vec<Expr> = positive_first
+        .into_iter()
+        .chain(args[1..].iter().cloned())
+        .collect();
+      Some(if rest.len() == 1 {
+        expr_to_boxes(&rest[0])
+      } else {
+        box_function_call("Times", &rest)
+      })
+    }
+    _ => None,
+  }
+}
+
+fn box_function_call(name: &str, args: &[Expr]) -> String {
+  match name {
+    // `Row` typesets through one of the FrontEnd's row templates rather than
+    // as a function call — the parts are laid out side by side, and the
+    // separator (when there is one) travels with them inside the template.
+    "Row"
+      if (1..=2).contains(&args.len()) && matches!(args[0], Expr::List(_)) =>
+    {
+      let Expr::List(items) = &args[0] else {
+        unreachable!("guarded by the match arm")
+      };
+      let parts = items.iter().map(expr_to_boxes);
+      let (template, elements): (&str, Vec<String>) = match args.get(1) {
+        // A string separator is carried twice: first as the text it draws,
+        // then as the string literal it was written as.
+        Some(sep @ Expr::String(text)) => (
+          "RowWithSeparators",
+          [format!("\"{}\"", escape_box_text(text)), expr_to_boxes(sep)]
+            .into_iter()
+            .chain(parts)
+            .collect(),
+        ),
+        // Any other separator is a box of its own, and the template's name
+        // loses its plural.
+        Some(sep) => (
+          "RowWithSeparator",
+          std::iter::once(expr_to_boxes(sep)).chain(parts).collect(),
+        ),
+        None => ("RowDefault", parts.collect()),
+      };
+      format!("TemplateBox[List[{}], \"{template}\"]", elements.join(", "))
+    }
+
+    // Rational → FractionBox
+    "Rational" if args.len() == 2 => {
+      format!(
+        "FractionBox[{}, {}]",
+        expr_to_boxes(&args[0]),
+        expr_to_boxes(&args[1])
+      )
+    }
+
+    // Power → SuperscriptBox
+    "Power" if args.len() == 2 => {
+      // Power[x, Rational[1, 2]] → SqrtBox
+      if let Expr::FunctionCall { name: rn, args: ra } = &args[1]
+        && rn == "Rational"
+        && ra.len() == 2
+        && matches!(&ra[0], Expr::Integer(1))
+        && matches!(&ra[1], Expr::Integer(2))
+      {
+        return format!("SqrtBox[{}]", expr_to_boxes(&args[0]));
+      }
+      format!(
+        "SuperscriptBox[{}, {}]",
+        expr_to_boxes(&args[0]),
+        expr_to_boxes(&args[1])
+      )
+    }
+
+    // Sqrt → SqrtBox
+    "Sqrt" if args.len() == 1 => {
+      format!("SqrtBox[{}]", expr_to_boxes(&args[0]))
+    }
+
+    // Plus → RowBox with + separators
+    "Plus" if !args.is_empty() => {
+      let mut parts = Vec::new();
+      parts.push(expr_to_boxes(&args[0]));
+      for arg in args.iter().skip(1) {
+        // A term with a negative leading coefficient joins with `-` and
+        // loses the sign, so `Plus[-5, Times[-5, x]]` reads `-5 - 5 x`
+        // rather than `-5 + -5 x`. A coefficient of exactly -1 disappears
+        // entirely (`-x`, not `-1 x`).
+        if let Some(positive) = negated_term_boxes(arg) {
+          parts.push("\"-\"".to_string());
+          parts.push(positive);
+        } else {
+          parts.push("\"+\"".to_string());
+          parts.push(expr_to_boxes(arg));
+        }
+      }
+      format!("RowBox[{{{}}}]", parts.join(", "))
+    }
+
+    // Times → RowBox with space separators, or FractionBox for fractions
+    "Times" if args.len() >= 2 => {
+      // Leading -1
+      if matches!(&args[0], Expr::Integer(-1)) {
+        if args.len() == 2 {
+          return format!("RowBox[{{\"-\", {}}}]", expr_to_boxes(&args[1]));
+        }
+        let rest = box_function_call("Times", &args[1..]);
+        return format!("RowBox[{{\"-\", {rest}}}]");
+      }
+      // Check for fraction form: Times[..., Power[den, -1]]
+      let full_expr = unevaluated("Times", args);
+      let (num, den) =
+        crate::functions::polynomial_ast::together::extract_num_den(&full_expr);
+      if !matches!(&den, Expr::Integer(1)) {
+        return format!(
+          "FractionBox[{}, {}]",
+          expr_to_boxes(&num),
+          expr_to_boxes(&den)
+        );
+      }
+      let parts: Vec<String> = args.iter().map(expr_to_boxes).collect();
+      format!("RowBox[{{{}}}]", parts.join(", \" \", "))
+    }
+
+    // Default: function application
+    _ => {
+      let args_boxes: Vec<String> = args.iter().map(expr_to_boxes).collect();
+      format!(
+        "RowBox[{{\"{}[\", {}, \"]\"}}]",
+        name,
+        args_boxes.join(", \",\", ")
+      )
+    }
+  }
+}
+
+/// Format a StringForm expression by substituting placeholders.
+/// `template` is the format string, `values` are the arguments to substitute.
+/// `` `` `` placeholders are replaced sequentially, `` `n` `` with the nth argument.
+/// Out-of-range indices leave the placeholder literal in the output and
+/// emit a StringForm::sfr warning, matching wolframscript.
+pub(crate) fn format_string_form(template: &str, values: &[Expr]) -> String {
+  format_string_form_with(template, values, expr_to_output)
+}
+
+/// Fill a message's template slots — the same `` `` `` / `` `n` ``
+/// placeholders `StringForm` uses, which is what a message text is.
+///
+/// A slot with no argument to fill it stays literal *and stays quiet*: the
+/// message being reported is the news, and `StringForm::sfr` on top of it
+/// would only describe the template.
+pub(crate) fn format_message_template(
+  template: &str,
+  values: &[Expr],
+) -> String {
+  format_slots(template, values, expr_to_output, false)
+}
+
+/// `format_string_form`, rendering each substituted value with `fmt` instead
+/// of always using `OutputForm` text. A graphic's `PlotLabel ->
+/// StringForm["…", args]` typesets its arguments the same as everything
+/// else in the label (so `NumberForm`/`Power`/etc. render properly), unlike
+/// `Print`/`ToString`'s plain OutputForm text.
+pub(crate) fn format_string_form_with(
+  template: &str,
+  values: &[Expr],
+  fmt: impl Fn(&Expr) -> String,
+) -> String {
+  format_slots(template, values, fmt, true)
+}
+
+/// Substitute `` `` `` / `` `n` `` slots, warning with `StringForm::sfr` on
+/// an out-of-range one only when `warn` is set.
+fn format_slots(
+  template: &str,
+  values: &[Expr],
+  fmt: impl Fn(&Expr) -> String,
+  warn: bool,
+) -> String {
+  let mut result = String::new();
+  let chars: Vec<char> = template.chars().collect();
+  let len = chars.len();
+  let mut i = 0;
+  // Last slot consumed by any placeholder (`` or `n`). The next `` picks
+  // up at last_index + 1. Starts at 0 so the first `` pulls arg 1.
+  let mut last_index: i64 = 0;
+
+  while i < len {
+    if chars[i] == '`' {
+      // Check for `` (sequential placeholder)
+      if i + 1 < len && chars[i + 1] == '`' {
+        let idx = last_index + 1;
+        if idx >= 1 && (idx as usize) <= values.len() {
+          result.push_str(&fmt(&values[(idx - 1) as usize]));
+        } else {
+          // Out of range — keep the `` literal and warn.
+          result.push('`');
+          result.push('`');
+          if warn {
+            crate::emit_message(&format!(
+              "StringForm::sfr: Item {} requested in \"{}\" out of \
+               range; {} items available.",
+              idx,
+              template,
+              values.len()
+            ));
+          }
+        }
+        last_index = idx;
+        i += 2;
+        continue;
+      }
+      // Check for `n` or `-n` (indexed placeholder; negative indices are
+      // always out-of-range and emit StringForm::sfr).
+      let num_start = i + 1;
+      let mut end = num_start;
+      if end < len && chars[end] == '-' {
+        end += 1;
+      }
+      let digits_start = end;
+      while end < len && chars[end].is_ascii_digit() {
+        end += 1;
+      }
+      if end > digits_start && end < len && chars[end] == '`' {
+        let signed: i64 = chars[num_start..end]
+          .iter()
+          .collect::<String>()
+          .parse()
+          .unwrap_or(0);
+        if signed >= 1 && (signed as usize) <= values.len() {
+          let idx = signed as usize;
+          result.push_str(&fmt(&values[idx - 1]));
+        } else {
+          // Out of range — keep the `n` placeholder literal and warn.
+          result.push('`');
+          result.extend(chars[num_start..end].iter());
+          result.push('`');
+          if warn {
+            crate::emit_message(&format!(
+              "StringForm::sfr: Item {} requested in \"{}\" out of \
+               range; {} items available.",
+              signed,
+              template,
+              values.len()
+            ));
+          }
+        }
+        // Numbered placeholders also update last_index so the next `` is
+        // relative to the most recent numbered reference.
+        last_index = signed;
+        i = end + 1;
+        continue;
+      }
+    }
+    result.push(chars[i]);
+    i += 1;
+  }
+  result
+}
+
+/// Apply a `StringTemplate[template]` to arguments, filling its slots:
+///   `` `` ``        sequential positional argument
+///   `` `n` ``       the n-th positional argument
+///   `` `name` ``    the value for key `name` (from a single association arg)
+/// Positional arguments come from the call args; named slots are filled from a
+/// single association argument. An unfilled slot renders as the empty string,
+/// matching wolframscript.
+pub fn apply_string_template(
+  template: &Expr,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let tmpl = match template {
+    Expr::String(s) => s.clone(),
+    _ => {
+      return Ok(Expr::CurriedCall {
+        func: Box::new(call1("StringTemplate", template.clone())),
+        args: args.to_vec(),
+      });
+    }
+  };
+
+  // Named bindings from a single association argument.
+  let mut named: std::collections::HashMap<String, Expr> =
+    std::collections::HashMap::new();
+  if args.len() == 1
+    && let Expr::Association(pairs) = &args[0]
+  {
+    for (k, v) in pairs {
+      let key = match k {
+        Expr::String(s) => s.clone(),
+        other => expr_to_string(other),
+      };
+      named.insert(key, v.clone());
+    }
+  }
+
+  let tmpl = expand_expression_slots(&tmpl, args)?;
+  let chars: Vec<char> = tmpl.chars().collect();
+  let mut result = String::new();
+  let mut i = 0;
+  let mut seq: usize = 0;
+  while i < chars.len() {
+    if chars[i] == '`'
+      && let Some(rel) = chars[i + 1..].iter().position(|&c| c == '`')
+    {
+      let close = i + 1 + rel;
+      let content: String = chars[i + 1..close].iter().collect();
+      let value: Option<&Expr> = if content.is_empty() {
+        seq += 1;
+        args.get(seq - 1)
+      } else if content.chars().all(|c| c.is_ascii_digit()) {
+        let n: usize = content.parse().unwrap_or(0);
+        seq = n;
+        n.checked_sub(1).and_then(|j| args.get(j))
+      } else {
+        named.get(&content)
+      };
+      if let Some(v) = value {
+        result.push_str(&expr_to_output(v));
+      }
+      // Unfilled slots contribute nothing.
+      i = close + 1;
+      continue;
+    }
+    result.push(chars[i]);
+    i += 1;
+  }
+  Ok(Expr::String(result))
+}
+
+/// ToExpression[s] / ToExpression[s, form] / ToExpression[s, form, h]
+/// - Parse and evaluate `s` as code. `form` (InputForm, StandardForm, ...)
+///   is accepted but the parser is the same regardless.
+/// - With `h`, apply `h` to the evaluated expression before returning.
+pub fn to_expression_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  to_expression_ast_as(args, "ToExpression")
+}
+
+/// `to_expression_ast` with the symbol that owns the `sntxi` / `sntx` syntax
+/// messages made explicit. `Input[]` reuses the whole parse-and-evaluate
+/// path but reports syntax problems as `Syntax::…`, the way the reader does.
+pub fn to_expression_ast_as(
+  args: &[Expr],
+  message_symbol: &str,
+) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "ToExpression expects 1 to 3 arguments".into(),
+    ));
+  }
+  // ToExpression[InterpretationBox[boxes, expr]] returns the interpreted
+  // expression directly (the second argument), evaluated. This matches
+  // wolframscript: `ToExpression[InterpretationBox["Four", 4]]` → 4.
+  if let Expr::FunctionCall {
+    name,
+    args: ib_args,
+  } = &args[0]
+    && name == "InterpretationBox"
+    && ib_args.len() == 2
+  {
+    let interpreted = crate::evaluator::evaluate_expr_to_expr(&ib_args[1])?;
+    if args.len() == 3 {
+      let wrapped = crate::evaluator::pattern_matching::rebuild_call_with_head(
+        args[2].clone(),
+        vec![interpreted],
+      );
+      return crate::evaluator::evaluate_expr_to_expr(&wrapped);
+    }
+    return Ok(interpreted);
+  }
+  let s = expr_to_str(&args[0]);
+  // Empty (or whitespace-only) input is Null, not a value.
+  if s.trim().is_empty() {
+    return Ok(null_expr());
+  }
+  // Syntactically invalid input yields $Failed with a Wolfram syntax message
+  // (sntxi/sntx), rather than leaking the internal parser error.
+  if let Some(msg) = to_expression_syntax_error(&s, message_symbol) {
+    crate::emit_message(&msg);
+    return Ok(fail_expr());
+  }
+  // Three-argument form ToExpression[str, form, h]: wrap the *parsed but
+  // unevaluated* expression with head `h`, then evaluate `h[parsed]`. This
+  // lets a holding head keep its argument unevaluated — e.g.
+  // ToExpression["1+1", InputForm, Hold] is Hold[1 + 1], not Hold[2].
+  if args.len() == 3 {
+    // The parse is read like any other input: its symbols resolve against
+    // the contexts open now (`MakeExpression["Int[u]"]` with `Rubi\`` on
+    // `$ContextPath` names `Rubi\`Int`, not a fresh `Global\`Int`).
+    let parsed =
+      crate::evaluator::contexts::rewrite(&parse_program_to_expr(&s)?);
+    // The head need not be a symbol: WLX wraps its interpolations with
+    // `FakeHold @* ToString`, and `Composition[…][parsed]` is a call of a
+    // compound head, not of a symbol spelled `"FakeHold @* ToString"`.
+    let wrapped = crate::evaluator::pattern_matching::rebuild_call_with_head(
+      args[2].clone(),
+      vec![parsed],
+    );
+    return crate::evaluator::evaluate_expr_to_expr(&wrapped);
+  }
+  // Multi-statement input (e.g. "2\n3" or "2; 3") evaluates each statement
+  // in order and returns the last result, matching Wolfram semantics.
+  parse_and_evaluate_program(&s)
+}
+
+/// Parse `src` as a Wolfram program and return the (unevaluated) expression
+/// for its single top-level statement. Multiple `;`-separated statements
+/// become a `CompoundExpression`. Used by the three-argument ToExpression
+/// form so a holding head receives the unevaluated parse.
+pub(crate) fn parse_program_to_expr(
+  src: &str,
+) -> Result<Expr, InterpreterError> {
+  use crate::Rule;
+  let normalized = if src.contains('\r') {
+    src.replace("\r\n", "\n").replace('\r', "\n")
+  } else {
+    src.to_string()
+  };
+  let preprocessed = crate::insert_statement_separators(normalized.trim());
+  if let Ok(mut pairs) = crate::parse(&preprocessed)
+    && let Some(program) = pairs.next()
+    && program.as_rule() == Rule::Program
+  {
+    let mut exprs: Vec<Expr> = Vec::new();
+    for node in program.into_inner() {
+      if crate::is_statement_rule(node.as_rule()) {
+        exprs.push(pair_to_expr(node));
+      }
+    }
+    // A trailing `;` ends an empty statement, so the program is a
+    // `CompoundExpression` whose last part is `Null` — `ToExpression["a :=
+    // 1;", InputForm, Hold]` is `Hold[a := 1; ]`, not `Hold[a := 1]`. WLX
+    // reads a `.wlx` file statement by statement this way and matches on the
+    // trailing `Null` to find the names to localise.
+    if normalized.trim_end().ends_with(';') && !exprs.is_empty() {
+      exprs.push(null_expr());
+    }
+    match exprs.len() {
+      0 => {}
+      1 => return Ok(exprs.into_iter().next().unwrap()),
+      _ => {
+        return Ok(call("CompoundExpression", exprs));
+      }
+    }
+  }
+  crate::syntax::string_to_expr(&normalized)
+}
+
+/// If `src` is not syntactically valid Wolfram input, return the message
+/// `ToExpression` emits for it: `sntxi` for an incomplete expression (the
+/// parse failed at end of input) or `sntx` for invalid syntax elsewhere.
+/// Returns `None` when the input parses — it may still fail at evaluation
+/// time, which is handled by the normal evaluation path.
+fn to_expression_syntax_error(src: &str, symbol: &str) -> Option<String> {
+  use crate::Rule;
+  let normalized = if src.contains('\r') {
+    src.replace("\r\n", "\n").replace('\r', "\n")
+  } else {
+    src.to_string()
+  };
+  let preprocessed = crate::insert_statement_separators(normalized.trim());
+  // A `\!\(\*boxes\)` escape is read along with the source around it, so box
+  // source the reader rejects is a syntax error even though the grammar
+  // happily takes the escape as a token.
+  if let Some(escape) = crate::syntax::double_escaped_box_escape(&normalized) {
+    return Some(format!(
+      "{symbol}::sntx: Invalid syntax in or before \"{escape}\"."
+    ));
+  }
+  // The program grammar accepts it -> syntactically valid.
+  if let Ok(mut pairs) = crate::parse(&preprocessed)
+    && pairs.next().is_some_and(|p| p.as_rule() == Rule::Program)
+  {
+    return None;
+  }
+  // The single-expression fallback accepts it -> valid.
+  if crate::syntax::string_to_expr(&normalized).is_ok() {
+    return None;
+  }
+  // Both paths failed: classify the parse error by where it occurred.
+  let offset = match crate::parse(&preprocessed) {
+    Err(e) => {
+      use pest::error::InputLocation;
+      match e.location {
+        InputLocation::Pos(p) => p,
+        InputLocation::Span((s, _)) => s,
+      }
+    }
+    Ok(_) => return None,
+  };
+  if offset >= preprocessed.trim_end().len() {
+    Some(format!(
+      "{symbol}::sntxi: Incomplete expression; more input is needed."
+    ))
+  } else {
+    let snippet = preprocessed[offset..].trim();
+    Some(format!(
+      "{symbol}::sntx: Invalid syntax in or before \"{snippet}\"."
+    ))
+  }
+}
+
+/// Parse `src` as a Wolfram program and evaluate every top-level
+/// Expression statement in order, returning the last result.
+/// Falls back to `string_to_expr` + evaluate for inputs the parser treats as
+/// a single expression.
+fn parse_and_evaluate_program(src: &str) -> Result<Expr, InterpreterError> {
+  use crate::Rule;
+  let normalized = if src.contains('\r') {
+    src.replace("\r\n", "\n").replace('\r', "\n")
+  } else {
+    src.to_string()
+  };
+  // Insert `;` at top-level newline boundaries so the grammar treats
+  // lines as distinct statements instead of implicit multiplication.
+  let preprocessed = crate::insert_statement_separators(normalized.trim());
+  if let Ok(mut pairs) = crate::parse(&preprocessed)
+    && let Some(program) = pairs.next()
+    && program.as_rule() == Rule::Program
+  {
+    let mut last: Option<Expr> = None;
+    // Every alternative of the grammar's `Statement` rule must be handled,
+    // not just `Expression`. A definition whose left side carries a pattern
+    // (`f[x_] := …`) parses as `FunctionDefinition`, and skipping that node
+    // silently threw the definition away.
+    for node in program.into_inner() {
+      if crate::is_statement_rule(node.as_rule()) {
+        // Text turned into an expression is read now, so its symbols
+        // resolve against the contexts open now.
+        let expr = crate::evaluator::contexts::rewrite(&pair_to_expr(node));
+        last = Some(crate::evaluator::evaluate_expr_to_expr(&expr)?);
+      }
+    }
+    if let Some(v) = last {
+      return Ok(v);
+    }
+  }
+  // Fallback path for inputs the program grammar rejected.
+  let parsed = crate::evaluator::contexts::rewrite(
+    &crate::syntax::string_to_expr(&normalized)?,
+  );
+  crate::evaluator::evaluate_expr_to_expr(&parsed)
+}
+
+/// StringPadLeft[s, n] or StringPadLeft[s, n, pad] - pad string on left
+/// Outcome of the one-argument `StringPad{Left,Right}[{s1, …}]` form.
+enum PadOneArg {
+  /// Pad every string to the longest one's length; delegate to the 2-arg form
+  /// with these arguments.
+  Rewrite(Vec<Expr>),
+  /// An empty list pads to itself.
+  Empty,
+  /// The argument is not a list of strings (`::strlist`).
+  Invalid,
+}
+
+/// Classify the single argument of `StringPad{Left,Right}[arg]`.
+fn string_pad_one_arg(args: &[Expr]) -> PadOneArg {
+  let [Expr::List(items)] = args else {
+    return PadOneArg::Invalid;
+  };
+  if items.is_empty() {
+    return PadOneArg::Empty;
+  }
+  if !items.iter().all(|e| matches!(e, Expr::String(_))) {
+    return PadOneArg::Invalid;
+  }
+  let max_len = items
+    .iter()
+    .filter_map(|e| match e {
+      Expr::String(s) => Some(s.chars().count()),
+      _ => None,
+    })
+    .max()
+    .unwrap_or(0);
+  PadOneArg::Rewrite(vec![args[0].clone(), Expr::Integer(max_len as i128)])
+}
+
+/// Emit `<name>::strlist` for a one-argument call whose argument is not a list
+/// of strings, and return the unevaluated call.
+fn string_pad_strlist(name: &str, args: &[Expr]) -> Expr {
+  let call = unevaluated(name, args);
+  crate::emit_message(&format!(
+    "{}::strlist: List of strings expected at position 1 in {}.",
+    name,
+    crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+  ));
+  call
+}
+
+/// Validate the length argument (position 2) of StringPadLeft/StringPadRight:
+/// it must be a non-negative machine integer. On failure, emits the ::intnm
+/// message and returns the unevaluated call (matching wolframscript) rather
+/// than raising an error.
+fn string_pad_length(name: &str, args: &[Expr]) -> Result<usize, Expr> {
+  match &args[1] {
+    Expr::Integer(n) if *n >= 0 => Ok(*n as usize),
+    _ => {
+      let call = unevaluated(name, args);
+      crate::emit_message(&format!(
+        "{}::intnm: Non-negative machine-sized integer expected at position 2 in {}.",
+        name,
+        crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+      ));
+      Err(call)
+    }
+  }
+}
+
+pub fn string_pad_left_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // StringPadLeft[{s1, …}] pads each string to the longest one's length.
+  if args.len() == 1 {
+    return match string_pad_one_arg(args) {
+      PadOneArg::Rewrite(rewritten) => string_pad_left_ast(&rewritten),
+      PadOneArg::Empty => Ok(Expr::List(vec![].into())),
+      PadOneArg::Invalid => Ok(string_pad_strlist("StringPadLeft", args)),
+    };
+  }
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringPadLeft expects 2 or 3 arguments".into(),
+    ));
+  }
+
+  // The padding (3rd argument) must be a non-empty string. Wolfram emits
+  // StringPadLeft::stringnz and returns the call unevaluated for anything
+  // else (empty string, a number, a list), even when the result would be a
+  // pure truncation, so validate before threading or padding.
+  if args.len() == 3 && !matches!(&args[2], Expr::String(p) if !p.is_empty()) {
+    let call = unevaluated("StringPadLeft", args);
+    crate::emit_message(&format!(
+      "StringPadLeft::stringnz: String of non-zero length expected at \
+       position 3 in {}.",
+      crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+    ));
+    return Ok(call);
+  }
+
+  // The length (2nd argument) must be a non-negative integer.
+  let target_len = match string_pad_length("StringPadLeft", args) {
+    Ok(n) => n,
+    Err(call) => return Ok(call),
+  };
+
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| {
+        let mut call = vec![s.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_pad_left_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+  let pad_str = if args.len() == 3 {
+    expr_to_str(&args[2])
+  } else {
+    " ".to_string()
+  };
+
+  let char_count = s.chars().count();
+  if char_count >= target_len {
+    Ok(Expr::String(
+      s.chars().skip(char_count - target_len).collect(),
+    ))
+  } else {
+    // Wolfram fills entire target with right-aligned repeating pad,
+    // then overlays the original string at the right end
+    let pad_len = pad_str.chars().count();
+    let offset = (pad_len - (target_len % pad_len)) % pad_len;
+    let pad_needed = target_len - char_count;
+    let padding: String = pad_str
+      .chars()
+      .cycle()
+      .skip(offset)
+      .take(pad_needed)
+      .collect();
+    Ok(Expr::String(format!("{padding}{s}")))
+  }
+}
+
+/// StringPadRight[s, n] or StringPadRight[s, n, pad] - pad string on right
+pub fn string_pad_right_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // StringPadRight[{s1, …}] pads each string to the longest one's length.
+  if args.len() == 1 {
+    return match string_pad_one_arg(args) {
+      PadOneArg::Rewrite(rewritten) => string_pad_right_ast(&rewritten),
+      PadOneArg::Empty => Ok(Expr::List(vec![].into())),
+      PadOneArg::Invalid => Ok(string_pad_strlist("StringPadRight", args)),
+    };
+  }
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringPadRight expects 2 or 3 arguments".into(),
+    ));
+  }
+
+  // The padding (3rd argument) must be a non-empty string. Wolfram emits
+  // StringPadRight::stringnz and returns the call unevaluated for anything
+  // else (empty string, a number, a list), even when the result would be a
+  // pure truncation, so validate before threading or padding.
+  if args.len() == 3 && !matches!(&args[2], Expr::String(p) if !p.is_empty()) {
+    let call = unevaluated("StringPadRight", args);
+    crate::emit_message(&format!(
+      "StringPadRight::stringnz: String of non-zero length expected at \
+       position 3 in {}.",
+      crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+    ));
+    return Ok(call);
+  }
+
+  // The length (2nd argument) must be a non-negative integer.
+  let target_len = match string_pad_length("StringPadRight", args) {
+    Ok(n) => n,
+    Err(call) => return Ok(call),
+  };
+
+  // Thread over list of strings in the first argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| {
+        let mut call = vec![s.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_pad_right_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+  let pad_str = if args.len() == 3 {
+    expr_to_str(&args[2])
+  } else {
+    " ".to_string()
+  };
+
+  let char_count = s.chars().count();
+  if char_count >= target_len {
+    Ok(Expr::String(s.chars().take(target_len).collect()))
+  } else {
+    // Wolfram fills entire target with left-aligned repeating pad,
+    // then overlays the original string at the left end
+    let pad_len = pad_str.chars().count();
+    let offset = char_count % pad_len;
+    let pad_needed = target_len - char_count;
+    let padding: String = pad_str
+      .chars()
+      .cycle()
+      .skip(offset)
+      .take(pad_needed)
+      .collect();
+    Ok(Expr::String(format!("{s}{padding}")))
+  }
+}
+
+/// InsertLinebreaks[s] / InsertLinebreaks[s, n] — wrap `s` so each line is at
+/// most `n` characters (default 78). Greedy word wrap: words are kept whole
+/// where they fit, packed onto a line separated by single spaces; a word longer
+/// than `n` is hard-broken every `n` characters. The number of characters is
+/// counted by Unicode code point.
+pub fn insert_linebreaks_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("InsertLinebreaks", args));
+  if args.is_empty() || args.len() > 2 {
+    return unevaluated();
+  }
+  let s = match &args[0] {
+    Expr::String(s) => s.clone(),
+    _ => return unevaluated(),
+  };
+  // The width must be a positive integer; wolframscript leaves the call
+  // unevaluated (with an ::intp message) otherwise.
+  let n = match args.get(1) {
+    None => 78usize,
+    Some(Expr::Integer(n)) if *n > 0 => *n as usize,
+    Some(_) => return unevaluated(),
+  };
+
+  let mut lines: Vec<String> = Vec::new();
+  let mut current = String::new();
+  let mut line_has_word = false;
+
+  // Place a single (space-delimited) word, hard-breaking it when it does not
+  // fit on an empty line.
+  fn place_word(
+    word: &str,
+    n: usize,
+    lines: &mut Vec<String>,
+    current: &mut String,
+    line_has_word: &mut bool,
+  ) {
+    if *line_has_word {
+      let need = current.chars().count() + 1 + word.chars().count();
+      if need <= n {
+        current.push(' ');
+        current.push_str(word);
+        return;
+      }
+      // Does not fit: finish the current line and retry on a fresh one.
+      lines.push(std::mem::take(current));
+      *line_has_word = false;
+    }
+    // Empty line: hard-break any prefix that exceeds the width.
+    let mut rest: String = word.to_string();
+    while rest.chars().count() > n {
+      let head: String = rest.chars().take(n).collect();
+      lines.push(head);
+      rest = rest.chars().skip(n).collect();
+    }
+    *current = rest;
+    *line_has_word = true;
+  }
+
+  for word in s.split(' ') {
+    place_word(word, n, &mut lines, &mut current, &mut line_has_word);
+  }
+  lines.push(current);
+  Ok(Expr::String(lines.join("\n")))
+}
+
+/// StringCount[s, sub] - count occurrences of substring or pattern
+pub fn string_count_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringCount expects at least 2 arguments".into(),
+    ));
+  }
+
+  // Thread over list of strings in the first argument, preserving any options.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| {
+        let mut call = vec![s.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_count_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+  let ignore_case = has_ignore_case_option(args);
+  let mode = parse_overlaps_option(&args[2..], Overlaps::No);
+  let overlaps = mode.overlapping();
+
+  // The empty pattern matches at every character boundary:
+  // StringCount["ab", ""] = 3, StringCount["", ""] = 1
+  // (wolframscript-verified; differential fuzzer, seed
+  // 8863040114037283151).
+  if matches!(&args[1], Expr::String(sub) if sub.is_empty()) {
+    return Ok(Expr::Integer(s.chars().count() as i128 + 1));
+  }
+
+  // A conditional pattern (`patt /; test`) needs per-match evaluation of the
+  // test; delegate to StringCases (which handles it) and count the matches.
+  if let Expr::FunctionCall { name, .. } = &args[1]
+    && name == "Condition"
+  {
+    let cases = string_cases_ast(args)?;
+    if let Expr::List(items) = &cases {
+      return Ok(Expr::Integer(items.len() as i128));
+    }
+  }
+
+  // Try regex-based pattern first (handles RegularExpression, string patterns,
+  // lists-of-patterns as alternatives, etc.)
+  if let Some((pat, constraints)) =
+    string_pattern_regex_source(&args[1], ignore_case)
+  {
+    let count = if mode == Overlaps::All {
+      all_overlap_spans(&pat, &constraints, &s)?.len()
+    } else {
+      let re = compile_regex(&pat).map_err(|e| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid string pattern: {e}"
+        ))
+      })?;
+      find_constraint_spans(&re, &constraints, &s, overlaps).len()
+    };
+    return Ok(Expr::Integer(count as i128));
+  }
+
+  // Fallback to plain string matching.
+  let sub = expr_to_str(&args[1]);
+  if sub.is_empty() {
+    // The empty pattern matches at every character boundary:
+    // StringCount["ab", ""] = 3, StringCount["", ""] = 1
+    // (wolframscript-verified; differential fuzzer, seed
+    // 8863040114037283151).
+    return Ok(Expr::Integer(s.chars().count() as i128 + 1));
+  }
+  let (hay, needle) = if ignore_case {
+    (s.to_lowercase(), sub.to_lowercase())
+  } else {
+    (s.clone(), sub.clone())
+  };
+  let count = if overlaps {
+    count_overlapping_substring(&hay, &needle)
+  } else {
+    hay.matches(&needle).count()
+  };
+  Ok(Expr::Integer(count as i128))
+}
+
+/// Count overlapping occurrences of `needle` in `hay` — one per start position
+/// (in chars) where `needle` occurs.
+fn count_overlapping_substring(hay: &str, needle: &str) -> usize {
+  if needle.is_empty() {
+    return 0;
+  }
+  let mut count = 0;
+  for (i, _) in hay.char_indices() {
+    if hay[i..].starts_with(needle) {
+      count += 1;
+    }
+  }
+  count
+}
+
+/// StringFreeQ[s, sub] - check if string does NOT contain substring or pattern
+/// StringFreeQ[s, sub, IgnoreCase -> True] - case-insensitive
+pub fn string_free_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringFreeQ expects 2 or 3 arguments".into(),
+    ));
+  }
+
+  // Thread over a list of strings in the first argument (matches wolframscript).
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| {
+        let mut call = vec![s.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_free_q_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+  let ignore_case = has_ignore_case_option(args);
+
+  // No string is free of the empty pattern: StringFreeQ["", ""] is False
+  // (wolframscript-verified).
+  if matches!(&args[1], Expr::String(sub) if sub.is_empty()) {
+    return Ok(bool_expr(false));
+  }
+
+  // Try regex-based pattern first
+  if let Some(compiled) = compile_string_pattern(&args[1], ignore_case) {
+    let (re, constraints) = compiled?;
+    let present =
+      !find_constraint_spans(&re, &constraints, &s, false).is_empty();
+    return Ok(bool_expr(!present));
+  }
+
+  let sub = expr_to_str(&args[1]);
+  let contains = if ignore_case {
+    s.to_lowercase().contains(&sub.to_lowercase())
+  } else {
+    s.contains(&sub)
+  };
+  Ok(bool_expr(!contains))
+}
+
+/// ToCharacterCode[s] - converts a string to a list of character codes
+pub fn to_character_code_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "ToCharacterCode expects 1 or 2 arguments".into(),
+    ));
+  }
+
+  // Encoding selector: "UTF8" / "UTF-8" returns the byte sequence for each
+  // character; any ASCII-compatible encoding like "ISO8859-1" returns the
+  // codepoints directly.
+  let encoding = args.get(1).map(|e| match e {
+    Expr::String(s) => s.clone(),
+    _ => expr_to_string(e),
+  });
+  let is_utf8 = encoding.as_deref().is_some_and(|e| {
+    let e = e.replace('-', "").to_ascii_lowercase();
+    e == "utf8"
+  });
+
+  let codes_for = |s: &str| -> Vec<Expr> {
+    if is_utf8 {
+      s.as_bytes()
+        .iter()
+        .map(|b| Expr::Integer(*b as i128))
+        .collect()
+    } else {
+      s.chars().map(|c| Expr::Integer(c as i128)).collect()
+    }
+  };
+
+  // Handle list of strings — all elements must be strings (or lists of
+  // strings, handled recursively). Non-string atoms trigger a
+  // ToCharacterCode::strse warning and the call returns unevaluated.
+  if let Expr::List(items) = &args[0] {
+    if !items.iter().all(|i| matches!(i, Expr::String(_))) {
+      crate::emit_message(&format!(
+        "ToCharacterCode::strse: A string or list of strings is \
+         expected at position 1 in {}.",
+        expr_to_string(&unevaluated("ToCharacterCode", args))
+      ));
+      return Ok(unevaluated("ToCharacterCode", args));
+    }
+    let mut results = Vec::new();
+    for item in items {
+      let s = expr_to_str(item);
+      results.push(Expr::List(codes_for(&s).into()));
+    }
+    return Ok(Expr::List(results.into()));
+  }
+  // Single-argument form: only accept actual strings; everything else
+  // returns unevaluated with the strse warning.
+  if !matches!(&args[0], Expr::String(_)) {
+    crate::emit_message(&format!(
+      "ToCharacterCode::strse: A string or list of strings is \
+       expected at position 1 in {}.",
+      expr_to_string(&unevaluated("ToCharacterCode", args))
+    ));
+    return Ok(unevaluated("ToCharacterCode", args));
+  }
+  let s = expr_to_str(&args[0]);
+  Ok(Expr::List(codes_for(&s).into()))
+}
+
+/// FromCharacterCode[n] or FromCharacterCode[{n1, n2, ...}] - converts character codes to a string
+pub fn from_character_code_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "FromCharacterCode expects exactly 1 argument".into(),
+    ));
+  }
+
+  match &args[0] {
+    Expr::Integer(n) => {
+      let c = char::from_u32(*n as u32).ok_or_else(|| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid character code: {n}"
+        ))
+      })?;
+      Ok(Expr::String(c.to_string()))
+    }
+    Expr::BigInteger(n) => {
+      use num_traits::ToPrimitive;
+      let code = n.to_u32().ok_or_else(|| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid character code: {n}"
+        ))
+      })?;
+      let c = char::from_u32(code).ok_or_else(|| {
+        InterpreterError::EvaluationError(format!(
+          "Invalid character code: {n}"
+        ))
+      })?;
+      Ok(Expr::String(c.to_string()))
+    }
+    Expr::List(items) => {
+      // Check if this is a list of lists (nested)
+      if !items.is_empty() && matches!(&items[0], Expr::List(_)) {
+        let mut results = Vec::new();
+        for item in items {
+          let sub_result = from_character_code_ast(std::slice::from_ref(item))?;
+          results.push(sub_result);
+        }
+        return Ok(Expr::List(results.into()));
+      }
+      let mut result = String::new();
+      for item in items {
+        let code = match item {
+          Expr::Integer(n) => *n as u32,
+          Expr::BigInteger(n) => {
+            use num_traits::ToPrimitive;
+            n.to_u32().ok_or_else(|| {
+              InterpreterError::EvaluationError(format!(
+                "Invalid character code: {n}"
+              ))
+            })?
+          }
+          _ => {
+            return Err(InterpreterError::EvaluationError(
+              "FromCharacterCode expects integer arguments".into(),
+            ));
+          }
+        };
+        let c = char::from_u32(code).ok_or_else(|| {
+          InterpreterError::EvaluationError(format!(
+            "Invalid character code: {code}"
+          ))
+        })?;
+        result.push(c);
+      }
+      Ok(Expr::String(result))
+    }
+    _ => Err(InterpreterError::EvaluationError(
+      "FromCharacterCode expects an integer or list of integers".into(),
+    )),
+  }
+}
+
+/// CharacterRange[c1, c2] - generates a list of characters from c1 to c2
+pub fn character_range_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "CharacterRange expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // Each endpoint is either a character code (non-negative integer) or a
+  // single-character string. CharacterRange[97, 99] -> {"a", "b", "c"};
+  // CharacterRange["a","c"] is the same. (Previously integers were stringified,
+  // so 97 became the digit '9' and CharacterRange[97, 99] wrongly produced
+  // {"9"}.) wolframscript requires BOTH endpoints to be the same kind — a
+  // mixed call like CharacterRange["a", 99] is left unevaluated.
+  let unevaluated = || Ok(unevaluated("CharacterRange", args));
+  let a0_int = matches!(&args[0], Expr::Integer(n) if *n >= 0);
+  let a1_int = matches!(&args[1], Expr::Integer(n) if *n >= 0);
+  if a0_int != a1_int {
+    return unevaluated();
+  }
+  let endpoint_code = |e: &Expr| -> Option<u32> {
+    if let Expr::Integer(n) = e {
+      return (*n >= 0).then_some(*n as u32);
+    }
+    expr_to_str(e).chars().next().map(|c| c as u32)
+  };
+  let (Some(start), Some(end)) =
+    (endpoint_code(&args[0]), endpoint_code(&args[1]))
+  else {
+    return unevaluated();
+  };
+
+  if start > end {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  let chars: Vec<Expr> = (start..=end)
+    .filter_map(char::from_u32)
+    .map(|c| Expr::String(c.to_string()))
+    .collect();
+  Ok(Expr::List(chars.into()))
+}
+
+/// Encode the absolute value of an i128/BigInt-backed integer as a
+/// Wolfram-compatible Base64 string. The alphabet (in digit-value order
+/// 0..63) is `A-Z`, `a-z`, `0-9`, `+`, `/`; the sign of the input is
+/// dropped, matching Wolfram's `IntegerString[n, "Base64"]`.
+fn integer_to_base64_string(n: &Expr) -> Result<String, InterpreterError> {
+  const ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let abs_big = match n {
+    Expr::BigInteger(b) => match b.sign() {
+      Sign::Minus => -b,
+      _ => b.clone(),
+    },
+    _ => BigInt::from(expr_to_int(n)?.unsigned_abs()),
+  };
+  if abs_big == BigInt::from(0) {
+    return Ok("A".to_string());
+  }
+  let mut val = abs_big;
+  let base = BigInt::from(64);
+  let mut digits: Vec<u8> = Vec::new();
+  while val > BigInt::from(0) {
+    let rem = &val % &base;
+    let d = rem
+      .to_string()
+      .parse::<usize>()
+      .expect("remainder fits in usize");
+    digits.push(ALPHABET[d]);
+    val /= &base;
+  }
+  digits.reverse();
+  Ok(String::from_utf8(digits).expect("ASCII alphabet"))
+}
+
+/// Encode a positive integer as a Roman numeral string. Wolfram's
+/// `IntegerString[n, "Roman"]` uses the standard subtractive form for
+/// 1..3999 and an OverscriptBox-based "vinculum" form for larger values;
+/// we implement the plain subtractive form (sufficient for the
+/// 1..3999 range), and fall back to the unevaluated head for inputs
+/// outside that range.
+fn integer_to_roman_string(n: i128) -> Option<String> {
+  if !(1..=3999).contains(&n) {
+    return None;
+  }
+  let mut n = n as u32;
+  let table: &[(u32, &str)] = &[
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+  ];
+  let mut out = String::new();
+  for (v, s) in table {
+    while n >= *v {
+      out.push_str(s);
+      n -= *v;
+    }
+  }
+  Some(out)
+}
+
+/// IntegerString[n] or IntegerString[n, base] or IntegerString[n, base, length] - convert integer to string
+pub fn integer_string_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "IntegerString expects 1, 2, or 3 arguments".into(),
+    ));
+  }
+
+  // Wolfram accepts a named "numeric system" as the base, e.g.
+  // `IntegerString[n, "Base64"]`. Handle the named forms before the
+  // generic integer-base path so the string isn't rejected by
+  // `expr_to_int`.
+  if args.len() >= 2
+    && let Expr::String(name) = &args[1]
+  {
+    let result = match name.as_str() {
+      "Base64" => integer_to_base64_string(&args[0])?,
+      "Roman" => {
+        let Some(s) =
+          expr_to_int(&args[0]).ok().and_then(integer_to_roman_string)
+        else {
+          // Unsupported range / non-integer — leave unevaluated rather
+          // than guess at the vinculum/OverscriptBox encoding.
+          return Ok(unevaluated("IntegerString", args));
+        };
+        s
+      }
+      _ => {
+        crate::emit_message(&format!(
+          "IntegerString::numsys: Invalid numeric system {name}."
+        ));
+        return Ok(unevaluated("IntegerString", args));
+      }
+    };
+    return Ok(Expr::String(result));
+  }
+
+  let unevaluated = || unevaluated("IntegerString", args);
+  let show =
+    |e: &Expr| crate::syntax::format_expr(e, crate::syntax::ExprForm::Output);
+
+  // Position 1 must be an integer; explicit non-integer numbers (even
+  // integral reals like 2.) emit ::int, symbols stay silent.
+  if !matches!(&args[0], Expr::Integer(_) | Expr::BigInteger(_)) {
+    let is_explicit_non_integer =
+      matches!(&args[0], Expr::Real(_) | Expr::BigFloat(..))
+        || matches!(&args[0], Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2);
+    if is_explicit_non_integer {
+      crate::emit_message(&format!(
+        "IntegerString::int: Integer expected at position 1 in {}.",
+        show(&unevaluated())
+      ));
+    }
+    return Ok(unevaluated());
+  }
+
+  // Position 2: an explicit base outside 2..36 emits ::basf; symbolic
+  // bases stay silently unevaluated.
+  let base: u32 = if args.len() >= 2 {
+    match &args[1] {
+      Expr::Integer(b) if (2..=36).contains(b) => *b as u32,
+      Expr::Integer(_)
+      | Expr::BigInteger(_)
+      | Expr::Real(_)
+      | Expr::BigFloat(..) => {
+        crate::emit_message(&format!(
+          "IntegerString::basf: Requested base {} should be an integer between 2 and 36.",
+          show(&args[1])
+        ));
+        return Ok(unevaluated());
+      }
+      _ => return Ok(unevaluated()),
+    }
+  } else {
+    10
+  };
+
+  // IntegerString uses absolute value (drops sign). Handle BigInteger
+  // directly via num-bigint's to_str_radix; fall back to i128 for
+  // smaller integers.
+  let mut result = if let Expr::BigInteger(n) = &args[0] {
+    match n.sign() {
+      Sign::Minus => (-n).to_str_radix(base),
+      _ => n.to_str_radix(base),
+    }
+  } else {
+    let n = expr_to_int(&args[0])?;
+    let abs_n = n.unsigned_abs();
+    if abs_n == 0 {
+      "0".to_string()
+    } else {
+      let mut val = abs_n;
+      let mut digits = String::new();
+      while val > 0 {
+        let digit = (val % base as u128) as u32;
+        digits.push(char::from_digit(digit, base).unwrap());
+        val /= base as u128;
+      }
+      digits.chars().rev().collect()
+    }
+  };
+
+  // If length is specified, pad or truncate
+  if args.len() == 3 {
+    let target_len = expr_to_int(&args[2])? as usize;
+    if result.len() < target_len {
+      // Pad with zeros on the left
+      let padding: String =
+        std::iter::repeat_n('0', target_len - result.len()).collect();
+      result = format!("{padding}{result}");
+    } else if result.len() > target_len {
+      // Truncate from the left (keep rightmost digits)
+      result = result[result.len() - target_len..].to_string();
+    }
+  }
+
+  Ok(Expr::String(result))
+}
+
+// ─── Alphabet ──────────────────────────────────────────────────────
+
+/// Alphabet[] / Alphabet[language] - Returns the list of lowercase letters
+/// for the named language, defaulting to English.
+pub fn alphabet_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let lang: Option<&str> = match args.first() {
+    None => None,
+    Some(Expr::String(s)) => Some(s.as_str()),
+    Some(_) => {
+      return Ok(unevaluated("Alphabet", args));
+    }
+  };
+
+  let ascii: Vec<Expr> =
+    ('a'..='z').map(|c| Expr::String(c.to_string())).collect();
+
+  let chars_to_list = |s: &str| -> Vec<Expr> {
+    s.chars().map(|c| Expr::String(c.to_string())).collect()
+  };
+
+  let letters: Vec<Expr> = match lang {
+    None
+    | Some(
+      "English" | "French" | "German" | "Italian" | "Dutch" | "Portuguese"
+      | "Latin",
+    ) => ascii,
+    Some("Spanish") => chars_to_list("abcdefghijklmnñopqrstuvwxyz"),
+    Some("Swedish" | "Finnish") => {
+      chars_to_list("abcdefghijklmnopqrstuvwxyzåäö")
+    }
+    Some("Norwegian" | "Danish") => {
+      chars_to_list("abcdefghijklmnopqrstuvwxyzæøå")
+    }
+    Some("Polish") => [
+      "a", "ą", "b", "c", "ć", "d", "e", "ę", "f", "g", "h", "i", "j", "k",
+      "l", "ł", "m", "n", "ń", "o", "ó", "p", "r", "s", "ś", "t", "u", "w",
+      "y", "z", "ź", "ż",
+    ]
+    .iter()
+    .map(|s| Expr::String((*s).to_string()))
+    .collect(),
+    Some("Russian") => chars_to_list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя"),
+    // Pan-Cyrillic: superset covering several national alphabets (Russian,
+    // Ukrainian, Serbian, …) including combined graphemes like з́ and с́.
+    // Matches wolframscript's list, so Alphabet["Russian"] ≠ Alphabet["Cyrillic"].
+    Some("Cyrillic") => [
+      "а", "б", "в", "г", "ґ", "д", "ђ", "ѓ", "е", "ё", "є", "ж", "з", "з́",
+      "ѕ", "и", "і", "ї", "й", "ј", "к", "л", "љ", "м", "н", "њ", "о", "п",
+      "р", "с", "с́", "т", "ћ", "ќ", "у", "ў", "ф", "х", "ц", "ч", "џ", "ш",
+      "щ", "ъ", "ы", "ь", "э", "ю", "я",
+    ]
+    .iter()
+    .map(|s| Expr::String((*s).to_string()))
+    .collect(),
+    Some("Greek") => chars_to_list("αβγδεζηθικλμνξοπρστυφχψω"),
+    Some(_) => {
+      return Ok(unevaluated("Alphabet", args));
+    }
+  };
+  Ok(Expr::List(letters.into()))
+}
+
+// ─── FromLetterNumber / LetterNumber ──────────────────────────────
+
+/// FromLetterNumber[n] - give the nth letter of the English alphabet.
+/// Out-of-range or 0 returns a space character.
+/// Negative numbers wrap cyclically (e.g., -1 -> z).
+/// Works with lists of integers too.
+pub fn from_letter_number_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // Two-argument form: FromLetterNumber[n, alphabet] indexes into the named
+  // alphabet (1-based, negative counts from the end), with out-of-range or 0
+  // giving a space — the same convention as the English default.
+  if args.len() == 2 {
+    let unevaluated = || Ok(unevaluated("FromLetterNumber", args));
+    let alphabet = alphabet_ast(std::slice::from_ref(&args[1]))?;
+    let Expr::List(letters) = &alphabet else {
+      return unevaluated();
+    };
+    let len = letters.len() as i128;
+    let from_index = |n: i128| -> Expr {
+      let pos = if (1..=len).contains(&n) {
+        n
+      } else if (-len..=-1).contains(&n) {
+        len + n + 1
+      } else {
+        return Expr::String(" ".to_string());
+      };
+      letters[(pos - 1) as usize].clone()
+    };
+    return match &args[0] {
+      Expr::Integer(n) => Ok(from_index(*n)),
+      Expr::List(items) => {
+        let results: Vec<Expr> = items
+          .iter()
+          .map(|item| match item {
+            Expr::Integer(n) => from_index(*n),
+            other => other.clone(),
+          })
+          .collect();
+        Ok(Expr::List(results.into()))
+      }
+      _ => unevaluated(),
+    };
+  }
+
+  fn letter_from_int(n: i128) -> Expr {
+    // Valid range: 1..=26 for positive, -26..=-1 for negative
+    // Everything else (0, >26, <-26) returns space
+    let pos = if (1..=26).contains(&n) {
+      n as u8 // 1..=26
+    } else if (-26..=-1).contains(&n) {
+      (26 + n + 1) as u8 // -1->26, -2->25, ..., -26->1
+    } else {
+      return Expr::String(" ".to_string());
+    };
+    let ch = (b'a' + pos - 1) as char;
+    Expr::String(ch.to_string())
+  }
+
+  match &args[0] {
+    Expr::Integer(n) => Ok(letter_from_int(*n)),
+    Expr::List(items) => {
+      let results: Result<Vec<Expr>, InterpreterError> = items
+        .iter()
+        .map(|item| match item {
+          Expr::Integer(n) => Ok(letter_from_int(*n)),
+          _ => Ok(call1("FromLetterNumber", item.clone())),
+        })
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    _ => Ok(unevaluated("FromLetterNumber", args)),
+  }
+}
+
+/// Position of a character in the requested alphabet (1-indexed, 0 if not
+/// present). Supports English (default), Greek, Cyrillic, Russian.
+fn alphabet_position(ch: char, alphabet: &str) -> i128 {
+  match alphabet {
+    "English" | "" => {
+      let lower = ch.to_ascii_lowercase();
+      if lower.is_ascii_lowercase() {
+        (lower as i128) - ('a' as i128) + 1
+      } else {
+        0
+      }
+    }
+    "Greek" => {
+      // Lowercase Greek letters α(U+03B1)..ω(U+03C9) with final sigma ς
+      // mapped to the same position as σ. Uppercase is normalized to lower.
+      let c = ch as u32;
+      // Uppercase Α..Ω (U+0391..U+03A9); convert to lowercase equivalent.
+      let lower_code = if (0x0391..=0x03A9).contains(&c) {
+        c + 0x20 // Α -> α etc.
+      } else {
+        c
+      };
+      // Standard 24-letter ordering:
+      // α β γ δ ε ζ η θ ι κ λ μ ν ξ ο π ρ σ(ς) τ υ φ χ ψ ω
+      match lower_code {
+        0x03B1 => 1,           // α
+        0x03B2 => 2,           // β
+        0x03B3 => 3,           // γ
+        0x03B4 => 4,           // δ
+        0x03B5 => 5,           // ε
+        0x03B6 => 6,           // ζ
+        0x03B7 => 7,           // η
+        0x03B8 => 8,           // θ
+        0x03B9 => 9,           // ι
+        0x03BA => 10,          // κ
+        0x03BB => 11,          // λ
+        0x03BC => 12,          // μ
+        0x03BD => 13,          // ν
+        0x03BE => 14,          // ξ
+        0x03BF => 15,          // ο
+        0x03C0 => 16,          // π
+        0x03C1 => 17,          // ρ
+        0x03C2 | 0x03C3 => 18, // ς, σ
+        0x03C4 => 19,          // τ
+        0x03C5 => 20,          // υ
+        0x03C6 => 21,          // φ
+        0x03C7 => 22,          // χ
+        0x03C8 => 23,          // ψ
+        0x03C9 => 24,          // ω
+        _ => 0,
+      }
+    }
+    _ => 0,
+  }
+}
+
+/// LetterNumber["c"] - give the position of a letter in the English alphabet.
+/// LetterNumber["c", "Greek"] - position in the Greek alphabet.
+/// Returns 0 for non-letter characters.
+pub fn letter_number_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let alphabet = match args.get(1) {
+    Some(Expr::String(s)) => s.clone(),
+    Some(_) => {
+      return Ok(unevaluated("LetterNumber", args));
+    }
+    None => "English".to_string(),
+  };
+  match &args[0] {
+    Expr::String(s) => {
+      let chars: Vec<char> = s.chars().collect();
+      if chars.len() == 1 {
+        Ok(Expr::Integer(alphabet_position(chars[0], &alphabet)))
+      } else {
+        // For multi-character strings, return a list
+        let results: Vec<Expr> = chars
+          .iter()
+          .map(|ch| Expr::Integer(alphabet_position(*ch, &alphabet)))
+          .collect();
+        Ok(Expr::List(results.into()))
+      }
+    }
+    Expr::List(items) => {
+      let results: Result<Vec<Expr>, InterpreterError> = items
+        .iter()
+        .map(|item| {
+          let mut call = vec![item.clone()];
+          if args.len() == 2 {
+            call.push(args[1].clone());
+          }
+          letter_number_ast(&call)
+        })
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    _ => Ok(unevaluated("LetterNumber", args)),
+  }
+}
+
+// ─── CharacterName ─────────────────────────────────────────────────
+
+/// The Wolfram Language character name of `c`, or `None` when there is no
+/// known name (non-ASCII / unmapped). Letters and digits are algorithmic;
+/// space and ASCII punctuation use the fixed `Raw*` names.
+fn character_name(c: char) -> Option<String> {
+  if c.is_ascii_uppercase() {
+    return Some(format!("LatinCapitalLetter{c}"));
+  }
+  if c.is_ascii_lowercase() {
+    return Some(format!("LatinSmallLetter{}", c.to_ascii_uppercase()));
+  }
+  if c.is_ascii_digit() {
+    const WORDS: [&str; 10] = [
+      "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight",
+      "Nine",
+    ];
+    return Some(format!("Digit{}", WORDS[(c as usize) - ('0' as usize)]));
+  }
+  let raw = match c {
+    '\t' => "RawTab",
+    ' ' => "RawSpace",
+    '!' => "RawExclamation",
+    '"' => "RawDoubleQuote",
+    '#' => "RawNumberSign",
+    '$' => "RawDollar",
+    '%' => "RawPercent",
+    '&' => "RawAmpersand",
+    '\'' => "RawQuote",
+    '(' => "RawLeftParenthesis",
+    ')' => "RawRightParenthesis",
+    '*' => "RawStar",
+    '+' => "RawPlus",
+    ',' => "RawComma",
+    '-' => "RawDash",
+    '.' => "RawDot",
+    '/' => "RawSlash",
+    ':' => "RawColon",
+    ';' => "RawSemicolon",
+    '<' => "RawLess",
+    '=' => "RawEqual",
+    '>' => "RawGreater",
+    '?' => "RawQuestion",
+    '@' => "RawAt",
+    '[' => "RawLeftBracket",
+    '\\' => "RawBackslash",
+    ']' => "RawRightBracket",
+    '^' => "RawWedge",
+    '_' => "RawUnderscore",
+    '`' => "RawBackquote",
+    '{' => "RawLeftBrace",
+    '|' => "RawVerticalBar",
+    '}' => "RawRightBrace",
+    '~' => "RawTilde",
+    _ => return None,
+  };
+  Some(raw.to_string())
+}
+
+/// CharacterName[c] — the character name of a single character (String), the
+/// character with the given character code (Integer), or a list of names for a
+/// multi-character string. Unmapped characters leave the call unevaluated.
+pub fn character_name_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("CharacterName", args));
+  match &args[0] {
+    Expr::Integer(n) if *n >= 0 => {
+      match char::from_u32(*n as u32).and_then(character_name) {
+        Some(name) => Ok(Expr::String(name)),
+        None => unevaluated(),
+      }
+    }
+    Expr::String(s) => {
+      let chars: Vec<char> = s.chars().collect();
+      if chars.is_empty() {
+        return unevaluated();
+      }
+      let names: Option<Vec<String>> =
+        chars.iter().map(|c| character_name(*c)).collect();
+      match names {
+        Some(names) if chars.len() == 1 => Ok(Expr::String(names[0].clone())),
+        Some(names) => {
+          Ok(Expr::List(names.into_iter().map(Expr::String).collect()))
+        }
+        None => unevaluated(),
+      }
+    }
+    _ => unevaluated(),
+  }
+}
+
+// ─── LetterQ ───────────────────────────────────────────────────────
+
+/// LetterQ[string] - True if string consists entirely of letters
+pub fn letter_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "LetterQ expects exactly 1 argument".into(),
+    ));
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      let result = s.chars().all(char::is_alphabetic);
+      Ok(bool_expr(result))
+    }
+    _ => Ok(bool_expr(false)),
+  }
+}
+
+// ─── UpperCaseQ ────────────────────────────────────────────────────
+
+/// UpperCaseQ[string] - True if string consists entirely of uppercase letters
+pub fn upper_case_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "UpperCaseQ expects exactly 1 argument".into(),
+    ));
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      let result = s.chars().all(|c| c.is_alphabetic() && c.is_uppercase());
+      Ok(bool_expr(result))
+    }
+    _ => Ok(bool_expr(false)),
+  }
+}
+
+// ─── LowerCaseQ ────────────────────────────────────────────────────
+
+/// LowerCaseQ[string] - True if string consists entirely of lowercase letters
+pub fn lower_case_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "LowerCaseQ expects exactly 1 argument".into(),
+    ));
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      let result = s.chars().all(|c| c.is_alphabetic() && c.is_lowercase());
+      Ok(bool_expr(result))
+    }
+    _ => Ok(bool_expr(false)),
+  }
+}
+
+// ─── PrintableASCIIQ ───────────────────────────────────────────────
+
+/// PrintableASCIIQ[string] - True if every character is printable ASCII
+/// (character codes 32 through 126 inclusive; the empty string is True).
+/// Threads over a flat list of strings, returning a list of booleans.
+/// A non-string argument — or a list that is not entirely strings — emits
+/// the `::strse` message and stays unevaluated.
+pub fn printable_ascii_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || unevaluated("PrintableASCIIQ", args);
+  let strse = || {
+    crate::emit_message(&format!(
+      "PrintableASCIIQ::strse: A string or list of strings is expected at position 1 in {}.",
+      crate::syntax::format_expr(
+        &unevaluated(),
+        crate::syntax::ExprForm::Output
+      )
+    ));
+  };
+  let is_printable =
+    |s: &str| s.chars().all(|c| (32..=126).contains(&(c as u32)));
+
+  match &args[0] {
+    Expr::String(s) => Ok(bool_expr(is_printable(s))),
+    Expr::List(items) if items.iter().all(|e| matches!(e, Expr::String(_))) => {
+      let results: Vec<Expr> = items
+        .iter()
+        .map(|e| match e {
+          Expr::String(s) => bool_expr(is_printable(s)),
+          _ => unreachable!(),
+        })
+        .collect();
+      Ok(Expr::List(results.into()))
+    }
+    _ => {
+      strse();
+      Ok(unevaluated())
+    }
+  }
+}
+
+// ─── StringInsert ──────────────────────────────────────────────────
+
+/// StringInsert[string, snew, n] - inserts snew at position n in string
+/// Map a 1-based `StringInsert` position `n` (positive = before the n-th
+/// character, negative = counted from the end) into a 0-based insertion index
+/// for a string of length `len`. Valid positions are `1..=len+1` and
+/// `-(len+1)..=-1`; anything else (including 0 and out-of-range values) yields
+/// `None`, which callers turn into an unevaluated result.
+fn string_insert_index(n: i128, len: i128) -> Option<usize> {
+  if (1..=len + 1).contains(&n) {
+    Some((n - 1) as usize)
+  } else if (-(len + 1)..=-1).contains(&n) {
+    Some((len + 1 + n) as usize)
+  } else {
+    None
+  }
+}
+
+/// Emit `StringInsert::ins` for an out-of-range position and return the
+/// unevaluated call, matching wolframscript.
+fn string_insert_invalid(args: &[Expr], pos: i128) -> Expr {
+  crate::emit_message(&format!(
+    "StringInsert::ins: Cannot insert at position {} in {}.",
+    pos,
+    crate::syntax::format_expr(&args[0], crate::syntax::ExprForm::Output)
+  ));
+  unevaluated("StringInsert", args)
+}
+
+pub fn string_insert_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringInsert expects exactly 3 arguments".into(),
+    ));
+  }
+
+  // The inserted text (position 2) must be a single string. A list or any
+  // other expression there emits StringInsert::string and stays unevaluated,
+  // matching wolframscript (checked before the list-of-strings first-argument
+  // form, so the message reports the whole original call).
+  if !matches!(&args[1], Expr::String(_)) {
+    let call = unevaluated("StringInsert", args);
+    crate::emit_message(&format!(
+      "StringInsert::string: String expected at position 2 in {}.",
+      crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+    ));
+    return Ok(call);
+  }
+
+  // Handle list of strings as first argument
+  if let Expr::List(strings) = &args[0] {
+    let mut results = Vec::new();
+    for s_expr in strings {
+      let new_args = vec![s_expr.clone(), args[1].clone(), args[2].clone()];
+      results.push(string_insert_ast(&new_args)?);
+    }
+    return Ok(Expr::List(results.into()));
+  }
+
+  let s = expr_to_str(&args[0]);
+  let insert = expr_to_str(&args[1]);
+
+  // Handle list of positions
+  if let Expr::List(positions) = &args[2] {
+    let mut pos_list: Vec<i128> = Vec::new();
+    for p in positions {
+      pos_list.push(expr_to_int(p)?);
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i128;
+
+    // Convert all positions to 0-based indices. If any position is out of
+    // range the whole call stays unevaluated (with a ::ins message for the
+    // first offending position), matching wolframscript.
+    let mut abs_positions: Vec<usize> = Vec::new();
+    for &n in &pos_list {
+      match string_insert_index(n, len) {
+        Some(pos) => abs_positions.push(pos),
+        None => return Ok(string_insert_invalid(args, n)),
+      }
+    }
+
+    // Sort positions in ascending order
+    abs_positions.sort_unstable();
+
+    // Build result by inserting at each position, adjusting for previous insertions
+    let mut result = String::new();
+    let mut last = 0;
+    for (i, &pos) in abs_positions.iter().enumerate() {
+      let adjusted_pos = pos;
+      if adjusted_pos > last {
+        result.extend(&chars[last..adjusted_pos.min(chars.len())]);
+      }
+      result.push_str(&insert);
+      last = adjusted_pos;
+      let _ = i;
+    }
+    if last < chars.len() {
+      result.extend(&chars[last..]);
+    }
+    return Ok(Expr::String(result));
+  }
+
+  let n = expr_to_int(&args[2])?;
+
+  let chars: Vec<char> = s.chars().collect();
+  let len = chars.len() as i128;
+
+  // Positive n inserts before the n-th character, negative counts from the
+  // end. Out-of-range positions leave the call unevaluated.
+  let Some(pos) = string_insert_index(n, len) else {
+    return Ok(string_insert_invalid(args, n));
+  };
+
+  let mut result: String = chars[..pos].iter().collect();
+  result.push_str(&insert);
+  result.extend(&chars[pos..]);
+  Ok(Expr::String(result))
+}
+
+// ─── StringReplacePart ─────────────────────────────────────────────
+
+/// StringReplacePart["string", "new", {m, n}] - replace characters m through n
+/// StringReplacePart["string", "new", {{m1,n1},{m2,n2},...}] - replace multiple ranges
+/// StringReplacePart["string", {"s1","s2",...}, {{m1,n1},{m2,n2},...}] - different replacements
+pub fn string_replace_part_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 3 {
+    return Err(InterpreterError::EvaluationError(
+      "StringReplacePart expects exactly 3 arguments".into(),
+    ));
+  }
+
+  let s = expr_to_str(&args[0]);
+  let chars: Vec<char> = s.chars().collect();
+  let len = chars.len() as i128;
+
+  // Resolve a position index (1-based, negative from the end). `None` when it
+  // falls outside the string.
+  let resolve_index = |n: i128| -> Option<usize> {
+    let idx = if n > 0 { n - 1 } else { len + n };
+    if idx < 0 || idx >= len {
+      return None;
+    }
+    Some(idx as usize)
+  };
+
+  // A span the string does not have is reported and the call left alone; it
+  // used to raise a hard error, which took the whole evaluation down.
+  let repart = |m: i128, n: i128| {
+    crate::emit_message(&format!(
+      "StringReplacePart::repart: Cannot replace positions {m} through {n} in \
+       \"{s}\"."
+    ));
+  };
+
+  // Parse a range {m, n} into (start, end) 0-based inclusive. `None` means the
+  // span is unusable and the message has already been emitted.
+  let parse_range = |elems: &[Expr]| -> Option<(usize, usize)> {
+    if elems.len() != 2 {
+      return None;
+    }
+    let m = expr_to_int(&elems[0]).ok()?;
+    let n = expr_to_int(&elems[1]).ok()?;
+    if let (Some(start), Some(end)) = (resolve_index(m), resolve_index(n)) {
+      Some((start, end))
+    } else {
+      repart(m, n);
+      None
+    }
+  };
+
+  // Determine ranges and replacements
+  match &args[2] {
+    // A bare index `n` stands for the span `{1, n}`, so
+    // StringReplacePart["abc", "x", 2] is "xc".
+    other if !matches!(other, Expr::List(_)) && expr_to_int(other).is_ok() => {
+      let n = expr_to_int(other)?;
+      let span = Expr::List(vec![Expr::Integer(1), Expr::Integer(n)].into());
+      let mut rewritten = args.to_vec();
+      rewritten[2] = span;
+      let value = string_replace_part_ast(&rewritten)?;
+      // The rewritten call reports against its own span; hand back the call as
+      // written when it declined.
+      if matches!(&value, Expr::FunctionCall { name, .. } if name == "StringReplacePart")
+      {
+        return Ok(unevaluated("StringReplacePart", args));
+      }
+      Ok(value)
+    }
+    // Single range: {m, n}
+    Expr::List(elems)
+      if elems.len() == 2 && !matches!(&elems[0], Expr::List(_)) =>
+    {
+      let Some((start, end)) = parse_range(elems) else {
+        return Ok(unevaluated("StringReplacePart", args));
+      };
+      let replacement = expr_to_str(&args[1]);
+      let mut result = String::new();
+      result.extend(&chars[..start]);
+      result.push_str(&replacement);
+      if end + 1 < chars.len() {
+        result.extend(&chars[end + 1..]);
+      }
+      Ok(Expr::String(result))
+    }
+    // Multiple ranges: {{m1,n1}, {m2,n2}, ...}
+    Expr::List(ranges) => {
+      let mut range_vec: Vec<(usize, usize)> = Vec::new();
+      for range in ranges {
+        if let Expr::List(elems) = range {
+          let Some(span) = parse_range(elems) else {
+            return Ok(unevaluated("StringReplacePart", args));
+          };
+          range_vec.push(span);
+        } else {
+          return Err(InterpreterError::EvaluationError(
+            "StringReplacePart: expected list of ranges".into(),
+          ));
+        }
+      }
+
+      // Get replacements (single string or list of strings)
+      let replacements: Vec<String> = if let Expr::List(repls) = &args[1] {
+        if repls.len() != range_vec.len() {
+          return Err(InterpreterError::EvaluationError(
+            "StringReplacePart: number of replacements must match number of ranges".into(),
+          ));
+        }
+        repls.iter().map(expr_to_str).collect::<Vec<_>>()
+      } else {
+        let r = expr_to_str(&args[1]);
+        vec![r; range_vec.len()]
+      };
+
+      // Sort ranges by start position, along with their replacements
+      let mut indexed: Vec<(usize, (usize, usize), &str)> = range_vec
+        .iter()
+        .zip(replacements.iter())
+        .enumerate()
+        .map(|(i, (&range, repl))| (i, range, repl.as_str()))
+        .collect();
+      indexed.sort_by_key(|&(_, (start, _), _)| start);
+
+      // Build result
+      let mut result = String::new();
+      let mut pos = 0;
+      for (_, (start, end), repl) in &indexed {
+        if *start > pos {
+          result.extend(&chars[pos..*start]);
+        }
+        result.push_str(repl);
+        pos = end + 1;
+      }
+      if pos < chars.len() {
+        result.extend(&chars[pos..]);
+      }
+      Ok(Expr::String(result))
+    }
+    _ => Ok(unevaluated("StringReplacePart", args)),
+  }
+}
+
+// ─── StringDelete ──────────────────────────────────────────────────
+
+/// StringDelete[string, sub] - deletes all occurrences of sub from string
+pub fn string_delete_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringDelete expects at least 2 arguments".into(),
+    ));
+  }
+  // Thread over list of strings in the first argument, preserving options.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        string_delete_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  let ignore_case = has_ignore_case_option(args);
+
+  // Deleting is replacing every match of the pattern with the empty string.
+  // Reuse the shared string-pattern → regex conversion so character classes
+  // (DigitCharacter, …), blanks, alternation lists, and string literals all
+  // work, matching StringReplace[s, patt -> ""].
+  if let Some(compiled) = compile_string_pattern(&args[1], ignore_case) {
+    let (re, constraints) = compiled?;
+    // Delete every non-overlapping match honoring back-reference constraints
+    // (`x_ ~~ x_`); keep the text between them.
+    let spans = find_constraint_spans(&re, &constraints, &s, false);
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    for (start, end) in spans {
+      out.push_str(&s[last..start]);
+      last = end;
+    }
+    out.push_str(&s[last..]);
+    return Ok(Expr::String(out));
+  }
+
+  // Fallback: plain substring deletion (single pattern or list of literals).
+  if let Expr::List(items) = &args[1] {
+    let mut result = s;
+    for item in items {
+      let sub = expr_to_str(item);
+      result = result.replace(&sub, "");
+    }
+    return Ok(Expr::String(result.clone()));
+  }
+  let sub = expr_to_str(&args[1]);
+  Ok(Expr::String(s.replace(&sub, "")))
+}
+
+// ─── Capitalize ────────────────────────────────────────────────────
+
+/// Capitalize[string] - capitalizes the first letter of the string
+pub fn capitalize_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Capitalize expects 1 or 2 arguments".into(),
+    ));
+  }
+  // Thread over a list of strings, preserving the optional type argument.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        let mut call = vec![item.clone()];
+        call.extend(args[1..].iter().cloned());
+        capitalize_ast(&call)
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+
+  // Capitalize the first character of a whitespace-delimited word.
+  let cap_word = |w: &str| -> String {
+    let mut chars = w.chars();
+    match chars.next() {
+      Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+      None => String::new(),
+    }
+  };
+
+  // The two-argument form selects which words to capitalize.
+  if args.len() == 2 {
+    let kind = match &args[1] {
+      Expr::String(k) => k.clone(),
+      _ => expr_to_string(&args[1]),
+    };
+    if !matches!(kind.as_str(), "AllWords" | "FirstWord" | "LongWords") {
+      // "TitleCase" depends on part-of-speech data we do not model; any
+      // other value is invalid (Capitalize::nform). Leave unevaluated.
+      if kind != "TitleCase" {
+        crate::emit_message(&format!(
+          "Capitalize::nform: Argument {} is not \"AllWords\", \"FirstWord\", \"LongWords\" or \"TitleCase\".",
+          crate::syntax::format_expr(&args[1], crate::syntax::ExprForm::Output)
+        ));
+      }
+      return Ok(unevaluated("Capitalize", args));
+    }
+    // Rebuild the string, capitalizing the selected words while preserving
+    // the original whitespace runs.
+    let mut result = String::new();
+    let mut word_idx = 0usize;
+    for (is_ws, seg) in split_keep_whitespace(&s) {
+      if is_ws {
+        result.push_str(&seg);
+      } else {
+        let cap = match kind.as_str() {
+          "AllWords" => true,
+          "FirstWord" => word_idx == 0,
+          "LongWords" => seg.chars().count() > 3,
+          _ => unreachable!(),
+        };
+        result.push_str(&if cap { cap_word(&seg) } else { seg.clone() });
+        word_idx += 1;
+      }
+    }
+    return Ok(Expr::String(result));
+  }
+
+  // One-argument form: capitalize only the first character of the string.
+  Ok(Expr::String(cap_word(&s)))
+}
+
+/// Split a string into alternating (is_whitespace, segment) runs, preserving
+/// the original characters so they can be rejoined unchanged.
+fn split_keep_whitespace(s: &str) -> Vec<(bool, String)> {
+  let mut out: Vec<(bool, String)> = Vec::new();
+  for c in s.chars() {
+    let is_ws = c.is_whitespace();
+    match out.last_mut() {
+      Some((last_ws, run)) if *last_ws == is_ws => run.push(c),
+      _ => out.push((is_ws, c.to_string())),
+    }
+  }
+  out
+}
+
+// ─── Decapitalize ──────────────────────────────────────────────────
+
+/// Decapitalize[string] - lowercases the first letter of the string
+pub fn decapitalize_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "Decapitalize expects exactly 1 argument".into(),
+    ));
+  }
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| decapitalize_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  if s.is_empty() {
+    return Ok(Expr::String(s));
+  }
+  let mut chars = s.chars();
+  let first = chars.next().unwrap().to_lowercase().to_string();
+  let rest: String = chars.collect();
+  Ok(Expr::String(format!("{first}{rest}")))
+}
+
+// ─── DigitQ ────────────────────────────────────────────────────────
+
+/// DigitQ[string] - True if string consists entirely of digits
+pub fn digit_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "DigitQ expects exactly 1 argument".into(),
+    ));
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      let result = s.chars().all(|c| c.is_ascii_digit());
+      Ok(bool_expr(result))
+    }
+    _ => Ok(bool_expr(false)),
+  }
+}
+
+/// EditDistance[s1, s2] - Levenshtein distance between two strings.
+/// Also accepts lists of items, and an optional IgnoreCase -> True rule.
+pub fn edit_distance_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "EditDistance expects 2 or 3 arguments".into(),
+    ));
+  }
+  let ignore_case = args.len() == 3 && extract_ignore_case(&args[2..]);
+
+  fn to_tokens(expr: &Expr, lower: bool) -> std::vec::Vec<std::string::String> {
+    match expr {
+      Expr::String(s) => {
+        let s = if lower { s.to_lowercase() } else { s.clone() };
+        s.chars().map(|c| c.to_string()).collect()
+      }
+      Expr::List(items) => items.iter().map(expr_to_output).collect(),
+      _ => {
+        let s = expr_to_str(expr);
+        let s = if lower { s.to_lowercase() } else { s };
+        s.chars().map(|c| c.to_string()).collect()
+      }
+    }
+  }
+
+  let a = to_tokens(&args[0], ignore_case);
+  let b = to_tokens(&args[1], ignore_case);
+  let n = a.len();
+  let m = b.len();
+
+  let mut dp = vec![vec![0usize; m + 1]; n + 1];
+  for i in 0..=n {
+    dp[i][0] = i;
+  }
+  for j in 0..=m {
+    dp[0][j] = j;
+  }
+  for i in 1..=n {
+    for j in 1..=m {
+      let cost = usize::from(a[i - 1] != b[j - 1]);
+      dp[i][j] = (dp[i - 1][j] + 1)
+        .min(dp[i][j - 1] + 1)
+        .min(dp[i - 1][j - 1] + cost);
+    }
+  }
+  Ok(Expr::Integer(dp[n][m] as i128))
+}
+
+/// Tokenize an alignment argument: a string into its characters, a list into
+/// its (output-formatted) elements.
+fn alignment_tokens(expr: &Expr) -> std::vec::Vec<std::string::String> {
+  match expr {
+    Expr::String(s) => s.chars().map(|c| c.to_string()).collect(),
+    Expr::List(items) => items.iter().map(expr_to_output).collect(),
+    _ => {
+      let s = expr_to_str(expr);
+      s.chars().map(|c| c.to_string()).collect()
+    }
+  }
+}
+
+/// NeedlemanWunschSimilarity[s1, s2] - global sequence-alignment score with the
+/// default scoring (match +1, mismatch -1, gap penalty 1). When one input is
+/// empty, wolframscript returns the length of the other.
+pub fn needleman_wunsch_similarity_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("NeedlemanWunschSimilarity", args));
+  }
+  let a = alignment_tokens(&args[0]);
+  let b = alignment_tokens(&args[1]);
+  let (n, m) = (a.len(), b.len());
+  if n == 0 || m == 0 {
+    return Ok(Expr::Real(n.max(m) as f64));
+  }
+  let mut dp = vec![vec![0i64; m + 1]; n + 1];
+  for (i, row) in dp.iter_mut().enumerate() {
+    row[0] = -(i as i64);
+  }
+  for j in 0..=m {
+    dp[0][j] = -(j as i64);
+  }
+  for i in 1..=n {
+    for j in 1..=m {
+      let s = if a[i - 1] == b[j - 1] { 1 } else { -1 };
+      dp[i][j] = (dp[i - 1][j - 1] + s)
+        .max(dp[i - 1][j] - 1)
+        .max(dp[i][j - 1] - 1);
+    }
+  }
+  Ok(Expr::Real(dp[n][m] as f64))
+}
+
+/// SmithWatermanSimilarity[s1, s2] - local sequence-alignment score with the
+/// default scoring (match +1, mismatch -1, gap penalty 1). Cell scores are
+/// floored at 0 and the result is the maximum cell value.
+pub fn smith_waterman_similarity_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Ok(unevaluated("SmithWatermanSimilarity", args));
+  }
+  let a = alignment_tokens(&args[0]);
+  let b = alignment_tokens(&args[1]);
+  let (n, m) = (a.len(), b.len());
+  let mut dp = vec![vec![0i64; m + 1]; n + 1];
+  let mut best = 0i64;
+  for i in 1..=n {
+    for j in 1..=m {
+      let s = if a[i - 1] == b[j - 1] { 1 } else { -1 };
+      let v = (dp[i - 1][j - 1] + s)
+        .max(dp[i - 1][j] - 1)
+        .max(dp[i][j - 1] - 1)
+        .max(0);
+      dp[i][j] = v;
+      best = best.max(v);
+    }
+  }
+  Ok(Expr::Real(best as f64))
+}
+
+/// DamerauLevenshteinDistance[s1, s2] - like Levenshtein distance but also
+/// allows a single transposition of two adjacent characters as a unit cost.
+/// Also accepts lists of items (compared by equality).
+pub fn damerau_levenshtein_distance_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "DamerauLevenshteinDistance expects 2 or 3 arguments".into(),
+    ));
+  }
+  let ignore_case = args.len() == 3 && extract_ignore_case(&args[2..]);
+
+  fn to_tokens(expr: &Expr, lower: bool) -> std::vec::Vec<std::string::String> {
+    match expr {
+      Expr::String(s) => {
+        let s = if lower { s.to_lowercase() } else { s.clone() };
+        s.chars().map(|c| c.to_string()).collect()
+      }
+      Expr::List(items) => items.iter().map(expr_to_output).collect(),
+      _ => {
+        let s = expr_to_str(expr);
+        let s = if lower { s.to_lowercase() } else { s };
+        s.chars().map(|c| c.to_string()).collect()
+      }
+    }
+  }
+
+  let a = to_tokens(&args[0], ignore_case);
+  let b = to_tokens(&args[1], ignore_case);
+  let n = a.len();
+  let m = b.len();
+
+  // True (unrestricted) Damerau-Levenshtein distance, matching Wolfram. Unlike
+  // the Optimal String Alignment variant — which forbids editing any substring
+  // more than once and so over-counts cases like "ca" -> "abc" (3 vs 2) — this
+  // uses a last-occurrence table so a transposition can interleave with other
+  // edits. The matrix is offset by +1 so the algorithm's logical index -1 maps
+  // to row/column 0, which holds the "infinity" border (max_dist).
+  let max_dist = n + m;
+  let mut d = vec![vec![0usize; m + 2]; n + 2];
+  d[0][0] = max_dist;
+  for i in 0..=n {
+    d[i + 1][0] = max_dist; // logical d[i][-1]
+    d[i + 1][1] = i; // logical d[i][0]
+  }
+  for j in 0..=m {
+    d[0][j + 1] = max_dist; // logical d[-1][j]
+    d[1][j + 1] = j; // logical d[0][j]
+  }
+  // Last row (1-based) at which each token last appeared in `a`; 0 = never.
+  let mut last_seen: std::collections::HashMap<String, usize> =
+    std::collections::HashMap::new();
+  for i in 1..=n {
+    // Column (1-based) of the last token in `b` matched so far in this row.
+    let mut db = 0usize;
+    for j in 1..=m {
+      let k = *last_seen.get(&b[j - 1]).unwrap_or(&0);
+      let l = db;
+      let cost = if a[i - 1] == b[j - 1] {
+        db = j;
+        0
+      } else {
+        1
+      };
+      // Index mapping: logical d[x][y] is stored at d[x+1][y+1].
+      let transposition = d[k][l] + (i - k - 1) + 1 + (j - l - 1);
+      d[i + 1][j + 1] = (d[i][j] + cost) // substitution
+        .min(d[i + 1][j] + 1) // insertion
+        .min(d[i][j + 1] + 1) // deletion
+        .min(transposition);
+    }
+    last_seen.insert(a[i - 1].clone(), i);
+  }
+  Ok(Expr::Integer(d[n + 1][m + 1] as i128))
+}
+
+/// The (start index in `a`, start index in `b`, length) of the longest
+/// contiguous run of tokens common to `a` and `b`. Among runs of the maximal
+/// length, wolframscript returns the one minimizing the sum of the two start
+/// positions, breaking a remaining tie by the smaller start in `a`. Returns
+/// (0, 0, 0) when there is no common token.
+fn longest_common_run(a: &[String], b: &[String]) -> (usize, usize, usize) {
+  let n = a.len();
+  let m = b.len();
+  let mut dp = vec![vec![0usize; m + 1]; n + 1];
+  let mut max_len = 0usize;
+  let mut end_i = 0usize; // end position in `a`
+  let mut end_j = 0usize; // end position in `b`
+  for i in 1..=n {
+    for j in 1..=m {
+      if a[i - 1] == b[j - 1] {
+        dp[i][j] = dp[i - 1][j - 1] + 1;
+        // A longer run always wins; among equal-length runs prefer the
+        // smaller (i + j) end-position sum, then the smaller i. Because every
+        // candidate compared here shares the same length, ordering by the end
+        // positions is equivalent to ordering by the start positions.
+        let better = dp[i][j] > max_len
+          || (dp[i][j] == max_len && (i + j, i) < (end_i + end_j, end_i));
+        if better {
+          max_len = dp[i][j];
+          end_i = i;
+          end_j = j;
+        }
+      }
+    }
+  }
+  (end_i - max_len, end_j - max_len, max_len)
+}
+
+/// Token sequences for LongestCommonSubsequence-family functions: a string's
+/// characters or a list's elements (compared by their output form).
+fn lcs_tokens(expr: &Expr) -> Option<Vec<String>> {
+  match expr {
+    Expr::List(items) => Some(items.iter().map(expr_to_output).collect()),
+    Expr::String(s) => Some(s.chars().map(|c| c.to_string()).collect()),
+    _ => None,
+  }
+}
+
+/// LongestCommonSubsequence[s1, s2] — Wolfram's LongestCommonSubsequence
+/// returns the longest *contiguous* match. Strings yield the matching
+/// substring; lists yield the matching sublist of elements.
+pub fn longest_common_subsequence_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "LongestCommonSubsequence expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // List inputs compare whole elements and return the matching sublist.
+  if let (Expr::List(l1), Expr::List(l2)) = (&args[0], &args[1]) {
+    let t1: Vec<String> = l1.iter().map(expr_to_output).collect();
+    let t2: Vec<String> = l2.iter().map(expr_to_output).collect();
+    let (start, _, len) = longest_common_run(&t1, &t2);
+    let sub: Vec<Expr> = l1[start..start + len].to_vec();
+    return Ok(Expr::List(sub.into()));
+  }
+
+  let s1 = expr_to_str(&args[0]);
+  let s2 = expr_to_str(&args[1]);
+  let chars1: Vec<char> = s1.chars().collect();
+  let chars2: Vec<char> = s2.chars().collect();
+  let t1: Vec<String> = chars1
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect();
+  let t2: Vec<String> = chars2
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect();
+  let (start, _, len) = longest_common_run(&t1, &t2);
+  let result: String = chars1[start..start + len].iter().collect();
+  Ok(Expr::String(result))
+}
+
+/// LongestCommonSubsequencePositions[s1, s2] — the 1-indexed inclusive
+/// {start, end} spans of the longest common contiguous run within each
+/// argument: `{{start1, end1}, {start2, end2}}`. Returns `{}` when there is
+/// no common element.
+pub fn longest_common_subsequence_positions_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "LongestCommonSubsequencePositions expects exactly 2 arguments".into(),
+    ));
+  }
+  let (Some(t1), Some(t2)) = (lcs_tokens(&args[0]), lcs_tokens(&args[1]))
+  else {
+    return Ok(unevaluated("LongestCommonSubsequencePositions", args));
+  };
+  let (start1, start2, len) = longest_common_run(&t1, &t2);
+  if len == 0 {
+    return Ok(Expr::List(vec![].into()));
+  }
+  let span = |start: usize| {
+    Expr::List(
+      vec![
+        Expr::Integer((start + 1) as i128),
+        Expr::Integer((start + len) as i128),
+      ]
+      .into(),
+    )
+  };
+  Ok(Expr::List(vec![span(start1), span(start2)].into()))
+}
+
+/// LongestCommonSequence[s1, s2] — the longest *noncontiguous* common
+/// subsequence (classic LCS dynamic programming), distinct from Wolfram's
+/// contiguous LongestCommonSubsequence. Strings yield the matching characters
+/// as a string; lists yield the matching sublist of elements. Returns an empty
+/// string/list when there is no common element.
+pub fn longest_common_sequence_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "LongestCommonSequence expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // List inputs compare whole elements and return the matching sublist.
+  if let (Expr::List(l1), Expr::List(l2)) = (&args[0], &args[1]) {
+    let t1: Vec<String> = l1.iter().map(expr_to_output).collect();
+    let t2: Vec<String> = l2.iter().map(expr_to_output).collect();
+    let sub: Vec<Expr> = lcs_index_pairs(&t1, &t2)
+      .iter()
+      .map(|&(i, _)| l1[i].clone())
+      .collect();
+    return Ok(Expr::List(sub.into()));
+  }
+
+  let s1 = expr_to_str(&args[0]);
+  let s2 = expr_to_str(&args[1]);
+  let chars1: Vec<char> = s1.chars().collect();
+  let chars2: Vec<char> = s2.chars().collect();
+  let t1: Vec<String> = chars1
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect();
+  let t2: Vec<String> = chars2
+    .iter()
+    .map(std::string::ToString::to_string)
+    .collect();
+  let result: String = lcs_index_pairs(&t1, &t2)
+    .iter()
+    .map(|&(i, _)| chars1[i])
+    .collect();
+  Ok(Expr::String(result))
+}
+
+/// Index pairs (into the first and second sequence) forming the longest
+/// common subsequence. Backtracking prefers moving up (decreasing the first
+/// index) on ties, matching Wolfram's choice among equal-length results.
+fn lcs_index_pairs(t1: &[String], t2: &[String]) -> Vec<(usize, usize)> {
+  let m = t1.len();
+  let n = t2.len();
+  let mut l = vec![vec![0usize; n + 1]; m + 1];
+  for i in 1..=m {
+    for j in 1..=n {
+      l[i][j] = if t1[i - 1] == t2[j - 1] {
+        l[i - 1][j - 1] + 1
+      } else {
+        l[i - 1][j].max(l[i][j - 1])
+      };
+    }
+  }
+  let mut idx = Vec::new();
+  let (mut i, mut j) = (m, n);
+  while i > 0 && j > 0 {
+    if t1[i - 1] == t2[j - 1] {
+      idx.push((i - 1, j - 1));
+      i -= 1;
+      j -= 1;
+    } else if l[i - 1][j] >= l[i][j - 1] {
+      i -= 1;
+    } else {
+      j -= 1;
+    }
+  }
+  idx.reverse();
+  idx
+}
+
+/// LongestCommonSequencePositions[s1, s2] — the 1-indexed inclusive
+/// {start, end} spans in each argument covering the longest *noncontiguous*
+/// common sequence (the positions of what LongestCommonSequence returns):
+/// `{spans1, spans2}`. Consecutive matched positions merge into one span.
+/// Returns `{}` when there is no common element.
+pub fn longest_common_sequence_positions_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "LongestCommonSequencePositions expects exactly 2 arguments".into(),
+    ));
+  }
+  // Wolfram only evaluates for two strings or two lists; mixed or other
+  // argument types stay unevaluated.
+  let (t1, t2) = match (&args[0], &args[1]) {
+    (Expr::String(_), Expr::String(_)) | (Expr::List(_), Expr::List(_)) => {
+      (lcs_tokens(&args[0]).unwrap(), lcs_tokens(&args[1]).unwrap())
+    }
+    _ => {
+      return Ok(unevaluated("LongestCommonSequencePositions", args));
+    }
+  };
+  let pairs = lcs_index_pairs(&t1, &t2);
+  if pairs.is_empty() {
+    return Ok(Expr::List(vec![].into()));
+  }
+  // Group each side's (sorted) indices into maximal runs of consecutive
+  // positions, emitted as 1-indexed inclusive {start, end} spans.
+  let spans = |indices: Vec<usize>| {
+    let mut result: Vec<Expr> = Vec::new();
+    let mut start = indices[0];
+    let mut prev = indices[0];
+    for &i in &indices[1..] {
+      if i != prev + 1 {
+        result.push(Expr::List(
+          vec![
+            Expr::Integer((start + 1) as i128),
+            Expr::Integer((prev + 1) as i128),
+          ]
+          .into(),
+        ));
+        start = i;
+      }
+      prev = i;
+    }
+    result.push(Expr::List(
+      vec![
+        Expr::Integer((start + 1) as i128),
+        Expr::Integer((prev + 1) as i128),
+      ]
+      .into(),
+    ));
+    Expr::List(result.into())
+  };
+  let idx1: Vec<usize> = pairs.iter().map(|&(i, _)| i).collect();
+  let idx2: Vec<usize> = pairs.iter().map(|&(_, j)| j).collect();
+  Ok(Expr::List(vec![spans(idx1), spans(idx2)].into()))
+}
+
+/// SequenceAlignment[s1, s2] — aligns two strings using Needleman-Wunsch
+/// Returns a list of matching segments and {diff1, diff2} pairs.
+pub fn sequence_alignment_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "SequenceAlignment expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // Handle both strings and lists. For lists we keep the original elements
+  // (`orig1`/`orig2`) so segments can be emitted as element sublists rather
+  // than concatenated strings; `chars1`/`chars2` are only used for comparison.
+  let (is_string, chars1, chars2, orig1, orig2) = match (&args[0], &args[1]) {
+    (Expr::String(s1), Expr::String(s2)) => {
+      let c1: Vec<String> = s1.chars().map(|c| c.to_string()).collect();
+      let c2: Vec<String> = s2.chars().map(|c| c.to_string()).collect();
+      (true, c1, c2, Vec::<Expr>::new(), Vec::<Expr>::new())
+    }
+    (Expr::List(l1), Expr::List(l2)) => {
+      let c1: Vec<String> = l1.iter().map(expr_to_output).collect();
+      let c2: Vec<String> = l2.iter().map(expr_to_output).collect();
+      let o1: Vec<Expr> = l1.iter().cloned().collect();
+      let o2: Vec<Expr> = l2.iter().cloned().collect();
+      (false, c1, c2, o1, o2)
+    }
+    _ => {
+      return Ok(unevaluated("SequenceAlignment", args));
+    }
+  };
+
+  let n = chars1.len();
+  let m = chars2.len();
+
+  // Needleman-Wunsch DP with match=1, mismatch=-1, gap=-1
+  let mut dp = vec![vec![0i64; m + 1]; n + 1];
+  for i in 0..=n {
+    dp[i][0] = -(i as i64);
+  }
+  for j in 0..=m {
+    dp[0][j] = -(j as i64);
+  }
+  for i in 1..=n {
+    for j in 1..=m {
+      let match_score = if chars1[i - 1] == chars2[j - 1] {
+        1
+      } else {
+        -1
+      };
+      dp[i][j] = (dp[i - 1][j - 1] + match_score)
+        .max(dp[i - 1][j] - 1)
+        .max(dp[i][j - 1] - 1);
+    }
+  }
+
+  // Traceback
+  let mut aligned1: Vec<Option<usize>> = Vec::new(); // index into chars1 or None for gap
+  let mut aligned2: Vec<Option<usize>> = Vec::new(); // index into chars2 or None for gap
+  let (mut i, mut j) = (n, m);
+  while i > 0 || j > 0 {
+    if i > 0 && j > 0 {
+      let match_score = if chars1[i - 1] == chars2[j - 1] {
+        1
+      } else {
+        -1
+      };
+      if dp[i][j] == dp[i - 1][j - 1] + match_score {
+        aligned1.push(Some(i - 1));
+        aligned2.push(Some(j - 1));
+        i -= 1;
+        j -= 1;
+        continue;
+      }
+    }
+    if i > 0 && dp[i][j] == dp[i - 1][j] - 1 {
+      aligned1.push(Some(i - 1));
+      aligned2.push(None);
+      i -= 1;
+    } else {
+      aligned1.push(None);
+      aligned2.push(Some(j - 1));
+      j -= 1;
+    }
+  }
+  aligned1.reverse();
+  aligned2.reverse();
+
+  // Emit a segment from indices into the first (`from_first`) or second
+  // sequence: a concatenated string for string input, a sublist of the
+  // original elements for list input.
+  let make_seg = |idxs: &[usize], from_first: bool| -> Expr {
+    if is_string {
+      let src = if from_first { &chars1 } else { &chars2 };
+      Expr::String(idxs.iter().map(|&x| src[x].clone()).collect::<String>())
+    } else {
+      let src = if from_first { &orig1 } else { &orig2 };
+      Expr::List(
+        idxs
+          .iter()
+          .map(|&x| src[x].clone())
+          .collect::<Vec<_>>()
+          .into(),
+      )
+    }
+  };
+
+  // Build result segments
+  let mut result: Vec<Expr> = Vec::new();
+  let mut k = 0;
+  let len = aligned1.len();
+
+  while k < len {
+    if aligned1[k].is_some() && aligned2[k].is_some() {
+      let i1 = aligned1[k].unwrap();
+      let j1 = aligned2[k].unwrap();
+      if chars1[i1] == chars2[j1] {
+        // Matching segment (both sides identical, so emit one piece).
+        let mut idxs = vec![i1];
+        k += 1;
+        while k < len
+          && aligned1[k].is_some()
+          && aligned2[k].is_some()
+          && chars1[aligned1[k].unwrap()] == chars2[aligned2[k].unwrap()]
+        {
+          idxs.push(aligned1[k].unwrap());
+          k += 1;
+        }
+        result.push(make_seg(&idxs, true));
+      } else {
+        // Mismatch: a {removed, inserted} pair.
+        let mut idx1 = vec![i1];
+        let mut idx2 = vec![j1];
+        k += 1;
+        while k < len
+          && aligned1[k].is_some()
+          && aligned2[k].is_some()
+          && chars1[aligned1[k].unwrap()] != chars2[aligned2[k].unwrap()]
+        {
+          idx1.push(aligned1[k].unwrap());
+          idx2.push(aligned2[k].unwrap());
+          k += 1;
+        }
+        result.push(Expr::List(
+          vec![make_seg(&idx1, true), make_seg(&idx2, false)].into(),
+        ));
+      }
+    } else {
+      // Gap on one side: a {removed, inserted} pair where one side is empty.
+      let mut idx1 = Vec::new();
+      let mut idx2 = Vec::new();
+      while k < len && (aligned1[k].is_none() || aligned2[k].is_none()) {
+        if let Some(i1) = aligned1[k] {
+          idx1.push(i1);
+        }
+        if let Some(j1) = aligned2[k] {
+          idx2.push(j1);
+        }
+        k += 1;
+      }
+      result.push(Expr::List(
+        vec![make_seg(&idx1, true), make_seg(&idx2, false)].into(),
+      ));
+    }
+  }
+
+  Ok(Expr::List(result.into()))
+}
+
+/// StringPart[s, n] - nth character; StringPart[s, {n1,n2,...}] - multiple characters
+pub fn string_part_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringPart expects exactly 2 arguments".into(),
+    ));
+  }
+  // A list of strings is handled string by string.
+  if let Expr::List(items) = &args[0] {
+    let mut per_string = Vec::with_capacity(items.len());
+    for item in items {
+      per_string.push(string_part_ast(&[item.clone(), args[1].clone()])?);
+    }
+    return Ok(Expr::List(per_string.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  let chars: Vec<char> = s.chars().collect();
+  let len = chars.len() as i128;
+
+  fn resolve_index(n: i128, len: i128) -> Option<usize> {
+    let idx = if n > 0 { n - 1 } else { len + n };
+    if idx < 0 || idx >= len {
+      return None;
+    }
+    Some(idx as usize)
+  }
+
+  // An out-of-range position emits ::partw and leaves the call
+  // unevaluated (a recoverable condition in wolframscript, not an
+  // evaluation abort). The message shows the offending position spec —
+  // the single index, or the whole list when any of its entries is bad.
+  let partw_unevaluated = || {
+    crate::emit_message(&format!(
+      "StringPart::partw: Part {} of {} does not exist.",
+      crate::syntax::format_expr(&args[1], crate::syntax::ExprForm::Output),
+      s
+    ));
+    unevaluated("StringPart", args)
+  };
+
+  // A specification that is not a position at all -- a symbol, a real --
+  // is a different complaint from one that is simply out of range.
+  let pkspec1_unevaluated = || {
+    crate::emit_message(&format!(
+      "StringPart::pkspec1: The expression {} cannot be used as a part \
+       specification.",
+      crate::syntax::format_expr(&args[1], crate::syntax::ExprForm::Output)
+    ));
+    unevaluated("StringPart", args)
+  };
+
+  if let Expr::List(indices) = &args[1] {
+    // Inside a list, anything unusable is reported as the whole list
+    // not existing rather than as a bad specification.
+    let mut result = Vec::new();
+    for idx_expr in indices {
+      let Ok(n) = expr_to_int(idx_expr) else {
+        return Ok(partw_unevaluated());
+      };
+      let Some(idx) = resolve_index(n, len) else {
+        return Ok(partw_unevaluated());
+      };
+      result.push(Expr::String(chars[idx].to_string()));
+    }
+    Ok(Expr::List(result.into()))
+  } else {
+    let Ok(n) = expr_to_int(&args[1]) else {
+      return Ok(pkspec1_unevaluated());
+    };
+    let Some(idx) = resolve_index(n, len) else {
+      return Ok(partw_unevaluated());
+    };
+    Ok(Expr::String(chars[idx].to_string()))
+  }
+}
+
+/// StringTakeDrop[s, n] - returns {StringTake[s,n], StringDrop[s,n]}
+pub fn string_take_drop_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringTakeDrop expects exactly 2 arguments".into(),
+    ));
+  }
+  // Each string of a list gets its own {taken, dropped} pair, so
+  // StringTakeDrop[{"ab"}, 1] is {{"a", "b"}} — not the pair of threaded
+  // StringTake / StringDrop results.
+  if let Expr::List(items) = &args[0] {
+    let mut per_string = Vec::with_capacity(items.len());
+    for item in items {
+      per_string.push(string_take_drop_ast(&[item.clone(), args[1].clone()])?);
+    }
+    return Ok(Expr::List(per_string.into()));
+  }
+  let taken = string_take_ast(args)?;
+  let dropped = string_drop_ast(args)?;
+  Ok(Expr::List(vec![taken, dropped].into()))
+}
+
+/// HammingDistance[s1, s2] - number of positions where characters differ.
+/// Also accepts an IgnoreCase -> True option.
+pub fn hamming_distance_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "HammingDistance expects 2 or 3 arguments".into(),
+    ));
+  }
+  let ignore_case = args.len() == 3 && extract_ignore_case(&args[2..]);
+  let s1 = expr_to_str(&args[0]);
+  let s2 = expr_to_str(&args[1]);
+  let s1 = if ignore_case { s1.to_lowercase() } else { s1 };
+  let s2 = if ignore_case { s2.to_lowercase() } else { s2 };
+  let chars1: Vec<char> = s1.chars().collect();
+  let chars2: Vec<char> = s2.chars().collect();
+
+  if chars1.len() != chars2.len() {
+    // Recoverable in wolframscript: ::idim plus the unevaluated call, not
+    // an evaluation abort.
+    crate::emit_message(&format!(
+      "HammingDistance::idim: {} and {} must have the same length.",
+      expr_to_str(&args[0]),
+      expr_to_str(&args[1])
+    ));
+    return Ok(unevaluated("HammingDistance", args));
+  }
+
+  let dist = chars1
+    .iter()
+    .zip(chars2.iter())
+    .filter(|(a, b)| a != b)
+    .count();
+  Ok(Expr::Integer(dist as i128))
+}
+
+/// Tokenize a string into words the way TextWords/WordCounts do: split on
+/// whitespace, then trim leading and trailing non-alphanumeric characters from
+/// each token (internal hyphens/apostrophes are kept, e.g. "YT-1300",
+/// "don't"). Empty results (pure punctuation) are dropped.
+pub fn text_word_tokens(s: &str) -> Vec<String> {
+  s.split_whitespace()
+    .map(|tok| tok.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+    .filter(|w| !w.is_empty())
+    .collect()
+}
+
+// ─── DeleteStopwords ──────────────────────────────────────────────
+
+/// The default English stopword list: articles, pronouns, prepositions,
+/// conjunctions, and forms of common auxiliary/modal verbs.
+static STOPWORDS: LazyLock<std::collections::HashSet<&'static str>> =
+  LazyLock::new(|| {
+    [
+      "a",
+      "about",
+      "above",
+      "after",
+      "again",
+      "against",
+      "all",
+      "am",
+      "an",
+      "and",
+      "any",
+      "are",
+      "aren't",
+      "as",
+      "at",
+      "be",
+      "because",
+      "been",
+      "before",
+      "being",
+      "below",
+      "between",
+      "both",
+      "but",
+      "by",
+      "can",
+      "can't",
+      "cannot",
+      "could",
+      "couldn't",
+      "did",
+      "didn't",
+      "do",
+      "does",
+      "doesn't",
+      "doing",
+      "don't",
+      "down",
+      "during",
+      "each",
+      "few",
+      "for",
+      "from",
+      "further",
+      "had",
+      "hadn't",
+      "has",
+      "hasn't",
+      "have",
+      "haven't",
+      "having",
+      "he",
+      "he'd",
+      "he'll",
+      "he's",
+      "her",
+      "here",
+      "here's",
+      "hers",
+      "herself",
+      "him",
+      "himself",
+      "his",
+      "how",
+      "how's",
+      "i",
+      "i'd",
+      "i'll",
+      "i'm",
+      "i've",
+      "if",
+      "in",
+      "into",
+      "is",
+      "isn't",
+      "it",
+      "it's",
+      "its",
+      "itself",
+      "let's",
+      "me",
+      "more",
+      "most",
+      "mustn't",
+      "my",
+      "myself",
+      "no",
+      "nor",
+      "not",
+      "of",
+      "off",
+      "on",
+      "once",
+      "only",
+      "or",
+      "other",
+      "ought",
+      "our",
+      "ours",
+      "ourselves",
+      "out",
+      "over",
+      "own",
+      "same",
+      "shan't",
+      "she",
+      "she'd",
+      "she'll",
+      "she's",
+      "should",
+      "shouldn't",
+      "so",
+      "some",
+      "such",
+      "than",
+      "that",
+      "that's",
+      "the",
+      "their",
+      "theirs",
+      "them",
+      "themselves",
+      "then",
+      "there",
+      "there's",
+      "these",
+      "they",
+      "they'd",
+      "they'll",
+      "they're",
+      "they've",
+      "this",
+      "those",
+      "through",
+      "to",
+      "too",
+      "under",
+      "until",
+      "up",
+      "very",
+      "was",
+      "wasn't",
+      "we",
+      "we'd",
+      "we'll",
+      "we're",
+      "we've",
+      "were",
+      "weren't",
+      "what",
+      "what's",
+      "when",
+      "when's",
+      "where",
+      "where's",
+      "which",
+      "while",
+      "who",
+      "who's",
+      "whom",
+      "why",
+      "why's",
+      "with",
+      "won't",
+      "would",
+      "wouldn't",
+      "you",
+      "you'd",
+      "you'll",
+      "you're",
+      "you've",
+      "your",
+      "yours",
+      "yourself",
+      "yourselves",
+    ]
+    .into_iter()
+    .collect()
+  });
+
+fn is_stopword(word: &str) -> bool {
+  let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+  !trimmed.is_empty() && STOPWORDS.contains(trimmed.to_lowercase().as_str())
+}
+
+/// DeleteStopwords[text] - deletes stopwords ("the", "a", "of", ...) from a
+/// string or a list of words. Membership is case-insensitive.
+///
+/// In a string only the *words* go; everything between them — spaces and
+/// punctuation alike — stays exactly where it was, so a deleted word leaves
+/// its surrounding whitespace behind: `"the cat sat on the mat"` becomes
+/// `" cat sat   mat"`, matching wolframscript.
+///
+/// Anything that is not a string or a list of strings (an association of
+/// word counts, a number, …) is a `DeleteStopwords::strse` error.
+pub fn delete_stopwords_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  fn strse(args: &[Expr]) -> Expr {
+    let call = unevaluated("DeleteStopwords", args);
+    crate::emit_message_to_stdout(&format!(
+      "DeleteStopwords::strse: A string or list of strings is expected at position 1 in {}.",
+      crate::syntax::format_expr(&call, crate::syntax::ExprForm::Output)
+    ));
+    call
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      let is_word_char = |c: char| c.is_alphanumeric() || c == '\'';
+      let mut out = String::with_capacity(s.len());
+      let mut word = String::new();
+      let flush = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+          if !is_stopword(word) {
+            out.push_str(word);
+          }
+          word.clear();
+        }
+      };
+      for ch in s.chars() {
+        if is_word_char(ch) {
+          word.push(ch);
+        } else {
+          flush(&mut word, &mut out);
+          out.push(ch);
+        }
+      }
+      flush(&mut word, &mut out);
+      Ok(Expr::String(out))
+    }
+    Expr::List(items) => {
+      if !items.iter().all(|i| matches!(i, Expr::String(_))) {
+        return Ok(strse(args));
+      }
+      let kept: Vec<Expr> = items
+        .iter()
+        .filter(|item| !matches!(item, Expr::String(s) if is_stopword(s)))
+        .cloned()
+        .collect();
+      Ok(Expr::List(kept.into()))
+    }
+    _ => Ok(strse(args)),
+  }
+}
+
+/// WordCounts[s] - counts of words; WordCounts[s, n] - counts of word n-grams
+/// (keyed by lists of n words). Sorted by count descending, then by last
+/// occurrence descending, matching wolframscript.
+/// WordFrequency[text, word] - the fraction of words in `text` equal to
+/// `word` (a Real). `word` may be a list, giving an association of fractions.
+/// Case-sensitive by default; `IgnoreCase -> True` folds case.
+pub fn word_frequency_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("WordFrequency", args));
+  let s = expr_to_str(&args[0]);
+  let ignore_case = extract_ignore_case(&args[2..]);
+  let words = text_word_tokens(&s);
+  let total = words.len();
+
+  let frequency = |target: &str| -> f64 {
+    if total == 0 {
+      return 0.0;
+    }
+    let count = words
+      .iter()
+      .filter(|w| {
+        if ignore_case {
+          w.to_lowercase() == target.to_lowercase()
+        } else {
+          w.as_str() == target
+        }
+      })
+      .count();
+    count as f64 / total as f64
+  };
+
+  match &args[1] {
+    Expr::String(word) => Ok(Expr::Real(frequency(word))),
+    Expr::List(items) => {
+      let mut pairs = Vec::with_capacity(items.len());
+      for item in items {
+        match item {
+          Expr::String(w) => {
+            pairs.push((Expr::String(w.clone()), Expr::Real(frequency(w))));
+          }
+          _ => return unevaluated(),
+        }
+      }
+      Ok(Expr::Association(pairs))
+    }
+    _ => unevaluated(),
+  }
+}
+
+pub fn word_counts_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let s = expr_to_str(&args[0]);
+  let n = if args.len() == 2 {
+    let n = expr_to_int(&args[1])?;
+    if n < 1 {
+      return Ok(Expr::Association(Vec::new()));
+    }
+    Some(n as usize)
+  } else {
+    None
+  };
+
+  let words = text_word_tokens(&s);
+
+  // Build the units to count: single words, or n-grams as word lists.
+  // Each unit carries a dedup key (the joined words) and its display Expr.
+  let units: Vec<(String, Expr)> = match n {
+    None => words
+      .iter()
+      .map(|w| (w.clone(), Expr::String(w.clone())))
+      .collect(),
+    Some(n) => {
+      if words.len() < n {
+        Vec::new()
+      } else {
+        (0..=words.len() - n)
+          .map(|i| {
+            let gram = &words[i..i + n];
+            let key = gram.join("\u{0}");
+            let list = Expr::List(
+              gram.iter().map(|w| Expr::String(w.clone())).collect(),
+            );
+            (key, list)
+          })
+          .collect()
+      }
+    }
+  };
+
+  // Count, tracking count and last position, preserving first display Expr.
+  let mut counts: Vec<(Expr, i128, usize)> = Vec::new();
+  let mut seen: std::collections::HashMap<String, usize> =
+    std::collections::HashMap::new();
+  for (pos, (key, disp)) in units.into_iter().enumerate() {
+    if let Some(&idx) = seen.get(&key) {
+      counts[idx].1 += 1;
+      counts[idx].2 = pos;
+    } else {
+      seen.insert(key, counts.len());
+      counts.push((disp, 1, pos));
+    }
+  }
+  // Sort by count descending, then by last position descending.
+  counts.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+  Ok(Expr::Association(
+    counts
+      .into_iter()
+      .map(|(disp, count, _)| (disp, Expr::Integer(count)))
+      .collect(),
+  ))
+}
+
+/// Build an association of n-gram counts in first-occurrence order (the order
+/// Counts uses), as the two-argument CharacterCounts/LetterCounts forms do.
+fn ngram_counts(grams: Vec<String>) -> Expr {
+  let mut counts: Vec<(String, i128)> = Vec::new();
+  let mut seen: std::collections::HashMap<String, usize> =
+    std::collections::HashMap::new();
+  for g in grams {
+    if let Some(&idx) = seen.get(&g) {
+      counts[idx].1 += 1;
+    } else {
+      seen.insert(g.clone(), counts.len());
+      counts.push((g, 1));
+    }
+  }
+  Expr::Association(
+    counts
+      .into_iter()
+      .map(|(g, n)| (Expr::String(g), Expr::Integer(n)))
+      .collect(),
+  )
+}
+
+/// Sliding window n-grams (length `n`) over a slice of characters.
+fn char_ngrams(chars: &[char], n: usize) -> Vec<String> {
+  if n == 0 || chars.len() < n {
+    return Vec::new();
+  }
+  (0..=chars.len() - n)
+    .map(|i| chars[i..i + n].iter().collect())
+    .collect()
+}
+
+/// CharacterCounts[s, n] - counts of length-n character n-grams (sliding window
+/// over all characters), in first-occurrence order.
+pub fn character_counts_ngram_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  // Thread over a list of strings: each string gets its own n-gram counts.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| character_counts_ngram_ast(&[s.clone(), args[1].clone()]))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  // The n-gram length has to be a positive whole number; note that this
+  // message names no call.
+  let Some(n) = expr_to_int(&args[1]).ok().filter(|n| *n >= 1) else {
+    crate::emit_message(
+      "CharacterCounts::arg2: Positive integer expected in position 2.",
+    );
+    return Ok(unevaluated("CharacterCounts", args));
+  };
+  if n == 1 {
+    return character_counts_ast(&args[0..1]);
+  }
+  let chars: Vec<char> = s.chars().collect();
+  Ok(ngram_counts(char_ngrams(&chars, n as usize)))
+}
+
+/// LetterCounts[s] - association of letter (alphabetic) frequencies, sorted by
+/// count descending then by last position descending.
+pub fn letter_counts_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // Thread over a list of strings: LetterCounts[{s1, …}] = {LetterCounts[s1], …}.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| letter_counts_ast(std::slice::from_ref(s)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  // Count letters preserving first-occurrence order.
+  let mut counts: Vec<(char, i128)> = Vec::new();
+  let mut seen: std::collections::HashMap<char, usize> =
+    std::collections::HashMap::new();
+  for ch in s.chars() {
+    if ch.is_alphabetic() {
+      if let Some(&idx) = seen.get(&ch) {
+        counts[idx].1 += 1;
+      } else {
+        seen.insert(ch, counts.len());
+        counts.push((ch, 1));
+      }
+    }
+  }
+  // Sort by frequency descending, breaking ties by reverse first-occurrence
+  // (reverse, then stable-sort), matching CharacterCounts and wolframscript.
+  counts.reverse();
+  counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+  Ok(Expr::Association(
+    counts
+      .into_iter()
+      .map(|(ch, count)| (Expr::String(ch.to_string()), Expr::Integer(count)))
+      .collect(),
+  ))
+}
+
+/// LetterCounts[s, n] - counts of length-n letter n-grams. Non-letter
+/// characters break the sliding window (n-grams never span them), in
+/// first-occurrence order.
+pub fn letter_counts_ngram_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  // Thread over a list of strings: each string gets its own n-gram counts.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| letter_counts_ngram_ast(&[s.clone(), args[1].clone()]))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+  // The n-gram length has to be a positive whole number; note that this
+  // message names no call.
+  let Some(n) = expr_to_int(&args[1]).ok().filter(|n| *n >= 1) else {
+    crate::emit_message(
+      "LetterCounts::arg2: Positive integer expected in position 2.",
+    );
+    return Ok(unevaluated("LetterCounts", args));
+  };
+  if n == 1 {
+    return letter_counts_ast(&args[0..1]);
+  }
+  let n = n as usize;
+  let mut grams: Vec<String> = Vec::new();
+  // Split into maximal runs of alphabetic characters and take n-grams in each.
+  let mut run: Vec<char> = Vec::new();
+  let flush = |run: &mut Vec<char>, grams: &mut Vec<String>| {
+    if !run.is_empty() {
+      grams.extend(char_ngrams(run, n));
+      run.clear();
+    }
+  };
+  for c in s.chars() {
+    if c.is_alphabetic() {
+      run.push(c);
+    } else {
+      flush(&mut run, &mut grams);
+    }
+  }
+  flush(&mut run, &mut grams);
+  Ok(ngram_counts(grams))
+}
+
+/// CharacterCounts[s] - association of character frequencies, sorted by frequency descending
+pub fn character_counts_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "CharacterCounts expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over a list of strings: one association per string.
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|s| character_counts_ast(std::slice::from_ref(s)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  let s = expr_to_str(&args[0]);
+
+  // Count characters preserving first-occurrence order
+  let mut counts: Vec<(char, i128)> = Vec::new();
+  let mut seen: std::collections::HashMap<char, usize> =
+    std::collections::HashMap::new();
+  for c in s.chars() {
+    if let Some(&idx) = seen.get(&c) {
+      counts[idx].1 += 1;
+    } else {
+      seen.insert(c, counts.len());
+      counts.push((c, 1));
+    }
+  }
+
+  // Sort by frequency descending, then by reverse first-occurrence for ties
+  // (reverse the list, then stable-sort by frequency descending)
+  counts.reverse();
+  counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+
+  let items: Vec<(Expr, Expr)> = counts
+    .into_iter()
+    .map(|(c, n)| (Expr::String(c.to_string()), Expr::Integer(n)))
+    .collect();
+  Ok(Expr::Association(items))
+}
+
+/// RemoveDiacritics[s] - remove diacritical marks from string
+pub fn remove_diacritics_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "RemoveDiacritics expects exactly 1 argument".into(),
+    ));
+  }
+  let s = expr_to_str(&args[0]);
+  use unicode_normalization::UnicodeNormalization;
+  // NFD decompose, then filter out combining marks (Unicode category Mn)
+  let result: String = s.nfd().filter(|c| !is_combining_mark(*c)).collect();
+  Ok(Expr::String(result))
+}
+
+/// Check if a character is a Unicode combining mark (category Mn/Mc/Me)
+fn is_combining_mark(c: char) -> bool {
+  let cp = c as u32;
+  // Combining Diacritical Marks: U+0300..U+036F
+  // Combining Diacritical Marks Extended: U+1AB0..U+1AFF
+  // Combining Diacritical Marks Supplement: U+1DC0..U+1DFF
+  // Combining Diacritical Marks for Symbols: U+20D0..U+20FF
+  // Combining Half Marks: U+FE20..U+FE2F
+  (0x0300..=0x036F).contains(&cp)
+    || (0x1AB0..=0x1AFF).contains(&cp)
+    || (0x1DC0..=0x1DFF).contains(&cp)
+    || (0x20D0..=0x20FF).contains(&cp)
+    || (0xFE20..=0xFE2F).contains(&cp)
+}
+
+/// StringRotateLeft[s] or StringRotateLeft[s, n] - rotate characters left
+pub fn string_rotate_left_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringRotateLeft expects 1 or 2 arguments".into(),
+    ));
+  }
+  let s = expr_to_str(&args[0]);
+  let n = if args.len() == 2 {
+    if let Ok(n) = expr_to_int(&args[1]) {
+      n
+    } else {
+      crate::emit_message(&format!(
+        "StringRotateLeft::int: Integer expected at position 2 in {}.",
+        crate::syntax::format_expr(
+          &unevaluated("StringRotateLeft", args),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+      return Ok(unevaluated("StringRotateLeft", args));
+    }
+  } else {
+    1
+  };
+
+  let chars: Vec<char> = s.chars().collect();
+  if chars.is_empty() {
+    return Ok(Expr::String(s));
+  }
+
+  let len = chars.len();
+  let shift = ((n % len as i128) + len as i128) as usize % len;
+  let mut result: Vec<char> = Vec::with_capacity(len);
+  result.extend_from_slice(&chars[shift..]);
+  result.extend_from_slice(&chars[..shift]);
+  Ok(Expr::String(result.into_iter().collect()))
+}
+
+/// StringRotateRight[s] or StringRotateRight[s, n] - rotate characters right
+pub fn string_rotate_right_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringRotateRight expects 1 or 2 arguments".into(),
+    ));
+  }
+  let s = expr_to_str(&args[0]);
+  let n = if args.len() == 2 {
+    if let Ok(n) = expr_to_int(&args[1]) {
+      n
+    } else {
+      crate::emit_message(&format!(
+        "StringRotateRight::int: Integer expected at position 2 in {}.",
+        crate::syntax::format_expr(
+          &unevaluated("StringRotateRight", args),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+      return Ok(unevaluated("StringRotateRight", args));
+    }
+  } else {
+    1
+  };
+
+  // Rotate right by n = rotate left by -n
+  let chars: Vec<char> = s.chars().collect();
+  if chars.is_empty() {
+    return Ok(Expr::String(s));
+  }
+
+  let len = chars.len();
+  let shift = ((-(n % len as i128) % len as i128) + len as i128) as usize % len;
+  let mut result: Vec<char> = Vec::with_capacity(len);
+  result.extend_from_slice(&chars[shift..]);
+  result.extend_from_slice(&chars[..shift]);
+  Ok(Expr::String(result.into_iter().collect()))
+}
+
+/// AlphabeticSort[list] - case-insensitive alphabetic sort
+pub fn alphabetic_sort_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "AlphabeticSort expects exactly 1 argument".into(),
+    ));
+  }
+  match &args[0] {
+    Expr::List(items) => {
+      let mut sorted = items.clone();
+      sorted.sort_by(|a, b| {
+        let sa = expr_to_string(a).to_lowercase();
+        let sb = expr_to_string(b).to_lowercase();
+        sa.cmp(&sb)
+      });
+      Ok(Expr::List(sorted))
+    }
+    _ => Err(InterpreterError::EvaluationError(
+      "AlphabeticSort expects a list argument".into(),
+    )),
+  }
+}
+
+/// Hash[s] or Hash[s, type] or Hash[s, type, format]
+/// Standard IEEE 802.3 CRC-32 (the zlib/PNG variant, polynomial 0xEDB88320).
+fn crc32(data: &[u8]) -> u32 {
+  let mut crc: u32 = 0xFFFF_FFFF;
+  for &byte in data {
+    crc ^= byte as u32;
+    for _ in 0..8 {
+      crc = if crc & 1 != 0 {
+        (crc >> 1) ^ 0xEDB8_8320
+      } else {
+        crc >> 1
+      };
+    }
+  }
+  !crc
+}
+
+/// Adler-32 checksum (RFC 1950).
+fn adler32(data: &[u8]) -> u32 {
+  const MOD: u32 = 65521;
+  let mut a: u32 = 1;
+  let mut b: u32 = 0;
+  for &byte in data {
+    a = (a + byte as u32) % MOD;
+    b = (b + a) % MOD;
+  }
+  (b << 16) | a
+}
+
+/// MD2 message digest (RFC 1319). Returns the 16-byte digest.
+fn md2(data: &[u8]) -> [u8; 16] {
+  // S-table: a fixed permutation of 0..255 derived from the digits of pi.
+  const S: [u8; 256] = [
+    41, 46, 67, 201, 162, 216, 124, 1, 61, 54, 84, 161, 236, 240, 6, 19, 98,
+    167, 5, 243, 192, 199, 115, 140, 152, 147, 43, 217, 188, 76, 130, 202, 30,
+    155, 87, 60, 253, 212, 224, 22, 103, 66, 111, 24, 138, 23, 229, 18, 190,
+    78, 196, 214, 218, 158, 222, 73, 160, 251, 245, 142, 187, 47, 238, 122,
+    169, 104, 121, 145, 21, 178, 7, 63, 148, 194, 16, 137, 11, 34, 95, 33, 128,
+    127, 93, 154, 90, 144, 50, 39, 53, 62, 204, 231, 191, 247, 151, 3, 255, 25,
+    48, 179, 72, 165, 181, 209, 215, 94, 146, 42, 172, 86, 170, 198, 79, 184,
+    56, 210, 150, 164, 125, 182, 118, 252, 107, 226, 156, 116, 4, 241, 69, 157,
+    112, 89, 100, 113, 135, 32, 134, 91, 207, 101, 230, 45, 168, 2, 27, 96, 37,
+    173, 174, 176, 185, 246, 28, 70, 97, 105, 52, 64, 126, 15, 85, 71, 163, 35,
+    221, 81, 175, 58, 195, 92, 249, 206, 186, 197, 234, 38, 44, 83, 13, 110,
+    133, 40, 132, 9, 211, 223, 205, 244, 65, 129, 77, 82, 106, 220, 55, 200,
+    108, 193, 171, 250, 36, 225, 123, 8, 12, 189, 177, 74, 120, 136, 149, 139,
+    227, 99, 232, 109, 233, 203, 213, 254, 59, 0, 29, 57, 242, 239, 183, 14,
+    102, 88, 208, 228, 166, 119, 114, 248, 235, 117, 75, 10, 49, 68, 80, 180,
+    143, 237, 31, 26, 219, 153, 141, 51, 159, 17, 131, 20,
+  ];
+
+  // Pad so the length is a multiple of 16; the pad byte equals the pad length.
+  let mut msg = data.to_vec();
+  let pad = 16 - (msg.len() % 16);
+  msg.extend(std::iter::repeat_n(pad as u8, pad));
+
+  // Append the 16-byte checksum.
+  let mut checksum = [0u8; 16];
+  let mut l = 0u8;
+  for block in msg.chunks(16) {
+    for j in 0..16 {
+      let c = block[j];
+      checksum[j] ^= S[(c ^ l) as usize];
+      l = checksum[j];
+    }
+  }
+  msg.extend_from_slice(&checksum);
+
+  // Compute the digest from the 48-byte state X.
+  let mut x = [0u8; 48];
+  for block in msg.chunks(16) {
+    for j in 0..16 {
+      x[16 + j] = block[j];
+      x[32 + j] = x[16 + j] ^ x[j];
+    }
+    let mut t = 0u8;
+    for j in 0..18 {
+      for k in 0..48 {
+        x[k] ^= S[t as usize];
+        t = x[k];
+      }
+      t = t.wrapping_add(j as u8);
+    }
+  }
+
+  let mut out = [0u8; 16];
+  out.copy_from_slice(&x[0..16]);
+  out
+}
+
+pub fn hash_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "Hash expects 1, 2, or 3 arguments".into(),
+    ));
+  }
+
+  let hash_type = if args.len() >= 2 {
+    expr_to_str(&args[1])
+  } else {
+    "Expression".to_string()
+  };
+
+  // For the default Expression hash, hash the expression's InputForm representation
+  if hash_type == "Expression" {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let repr = expr_to_string(&args[0]);
+    let mut hasher = DefaultHasher::new();
+    repr.hash(&mut hasher);
+    let h = hasher.finish();
+    return Ok(Expr::Integer(h as i128));
+  }
+
+  // A `ByteArray` is hashed over its bytes, so it gives the same digest as
+  // the string of those bytes; anything else is hashed over how it prints.
+  let data = match byte_array_bytes(&args[0]) {
+    Some(bytes) => bytes,
+    None => expr_to_str(&args[0]).into_bytes(),
+  };
+
+  let format = if args.len() == 3 {
+    expr_to_str(&args[2])
+  } else {
+    "Integer".to_string()
+  };
+
+  let Some(hex_string) = hash_bytes(&data, &hash_type) else {
+    crate::emit_message(&format!(
+      "Hash::invhash: {hash_type} is not a valid Hash specification."
+    ));
+    return Ok(unevaluated("Hash", args));
+  };
+  if let Some(result) = format_digest(&hex_string, &format) {
+    Ok(result)
+  } else {
+    crate::emit_message(&format!("Hash::uform: Invalid hash format {format}."));
+    Ok(unevaluated("Hash", args))
+  }
+}
+
+/// The digest of `data` as a hex string, or `None` when the algorithm is not
+/// one wolframscript names.
+pub fn hash_bytes(data: &[u8], hash_type: &str) -> Option<String> {
+  let hex = |digest: &[u8]| -> String {
+    use std::fmt::Write;
+    digest.iter().fold(String::new(), |mut out, b| {
+      let _ = write!(out, "{b:02x}");
+      out
+    })
+  };
+  let hex_string = match hash_type {
+    "MD2" => hex(&md2(data)),
+    "MD4" => {
+      use md4::Digest;
+      hex(&md4::Md4::digest(data))
+    }
+    "MD5" => {
+      use md5::Digest;
+      hex(&md5::Md5::digest(data))
+    }
+    "SHA" | "SHA1" => {
+      use sha1::Digest;
+      hex(&sha1::Sha1::digest(data))
+    }
+    "SHA224" => {
+      use sha2::Digest;
+      hex(&sha2::Sha224::digest(data))
+    }
+    "SHA256" => {
+      use sha2::Digest;
+      hex(&sha2::Sha256::digest(data))
+    }
+    "SHA384" => {
+      use sha2::Digest;
+      hex(&sha2::Sha384::digest(data))
+    }
+    "SHA512" => {
+      use sha2::Digest;
+      hex(&sha2::Sha512::digest(data))
+    }
+    "SHA3-224" => {
+      use sha3::Digest;
+      hex(&sha3::Sha3_224::digest(data))
+    }
+    "SHA3-256" => {
+      use sha3::Digest;
+      hex(&sha3::Sha3_256::digest(data))
+    }
+    "SHA3-384" => {
+      use sha3::Digest;
+      hex(&sha3::Sha3_384::digest(data))
+    }
+    "SHA3-512" => {
+      use sha3::Digest;
+      hex(&sha3::Sha3_512::digest(data))
+    }
+    // The pre-standard Keccak padding, which Ethereum kept.
+    "Keccak256" => {
+      use sha3::Digest;
+      hex(&sha3::Keccak256::digest(data))
+    }
+    "RIPEMD160" => {
+      use ripemd::Digest;
+      hex(&ripemd::Ripemd160::digest(data))
+    }
+    // The Bitcoin address digest: RIPEMD160 of the SHA256.
+    "RIPEMD160SHA256" => {
+      use ripemd::Digest;
+      hex(&ripemd::Ripemd160::digest(
+        <sha2::Sha256 as ripemd::Digest>::digest(data),
+      ))
+    }
+    "CRC32" => format!("{:08x}", crc32(data)),
+    "Adler32" => format!("{:08x}", adler32(data)),
+    _ => return None,
+  };
+  Some(hex_string)
+}
+
+/// A hex digest written the way one of wolframscript's hash formats asks for,
+/// or `None` when the format is not one of them.
+pub fn format_digest(hex_string: &str, format: &str) -> Option<Expr> {
+  // Raw digest bytes, recovered from the hex string.
+  let bytes: Vec<u8> = (0..hex_string.len())
+    .step_by(2)
+    .filter_map(|i| u8::from_str_radix(&hex_string[i..i + 2], 16).ok())
+    .collect();
+
+  match format {
+    "HexString" => Some(Expr::String(hex_string.to_string())),
+    "Base64Encoding" => {
+      use base64::Engine;
+      let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+      Some(Expr::String(b64))
+    }
+    // A Woxi ByteArray stores its bytes as an internal base64 string.
+    "ByteArray" => {
+      use base64::Engine;
+      let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+      Some(call1("ByteArray", Expr::String(b64)))
+    }
+    // The integer, zero-padded to the fixed width of the digest size — the
+    // number of decimal digits of 256^nbytes (matching wolframscript).
+    "DecimalString" => {
+      let n =
+        BigInt::parse_bytes(hex_string.as_bytes(), 16).unwrap_or_default();
+      let width = BigInt::from(256u32)
+        .pow(bytes.len() as u32)
+        .to_string()
+        .len();
+      Some(Expr::String(format!("{n:0>width$}")))
+    }
+    "Integer" => {
+      let n =
+        BigInt::parse_bytes(hex_string.as_bytes(), 16).unwrap_or_default();
+      use num_traits::ToPrimitive;
+      Some(match n.to_i128() {
+        Some(i) => Expr::Integer(i),
+        None => Expr::BigInteger(n),
+      })
+    }
+    _ => None,
+  }
+}
+
+/// Compress[expr] — compresses an expression into a base64-encoded string
+pub fn compress_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(format!(
+      "Compress expects 1 argument, got {}",
+      args.len()
+    )));
+  }
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  let repr = expr_to_string(&evaluated);
+
+  use flate2::Compression;
+  use flate2::write::ZlibEncoder;
+  use std::io::Write;
+
+  let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+  encoder.write_all(repr.as_bytes()).map_err(|e| {
+    InterpreterError::EvaluationError(format!("Compress failed: {e}"))
+  })?;
+  let compressed = encoder.finish().map_err(|e| {
+    InterpreterError::EvaluationError(format!("Compress failed: {e}"))
+  })?;
+
+  use base64::Engine;
+  let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+  Ok(Expr::String(format!("1:eJx{encoded}")))
+}
+
+/// Inflate a `"1:..."` compressed string to raw bytes, accepting both
+/// wolframscript's standard layout (`"1:"` + base64 of the zlib stream) and
+/// woxi's own legacy layout (`"1:eJx"` + base64 of the zlib stream). The
+/// standard layout is tried first; on failure the legacy `eJx` literal is
+/// stripped and the remainder retried.
+fn inflate_compressed(s: &str) -> Result<Vec<u8>, InterpreterError> {
+  use base64::Engine;
+  use flate2::read::ZlibDecoder;
+  use std::io::Read;
+
+  // Compressed strings may be line-wrapped and carry leading/trailing
+  // whitespace (e.g. inside a multi-line `CompressedData["..."]`); strip all
+  // whitespace before locating the prefix and base64-decoding.
+  let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+  let body = cleaned.strip_prefix("1:").ok_or_else(|| {
+    InterpreterError::EvaluationError(
+      "Uncompress: invalid compressed data".to_string(),
+    )
+  })?;
+
+  let try_inflate = |b64: &str| -> Option<Vec<u8>> {
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let mut out = Vec::new();
+    ZlibDecoder::new(&decoded[..]).read_to_end(&mut out).ok()?;
+    Some(out)
+  };
+
+  if let Some(bytes) = try_inflate(body) {
+    return Ok(bytes);
+  }
+  if let Some(rest) = body.strip_prefix("eJx")
+    && let Some(bytes) = try_inflate(rest)
+  {
+    return Ok(bytes);
+  }
+  Err(InterpreterError::EvaluationError(
+    "Uncompress: invalid compressed data".to_string(),
+  ))
+}
+
+/// Turn a `"1:..."` compressed string into the original expression. Handles
+/// wolframscript's binary `!boR` serialization (packed arrays, nested
+/// expressions) as well as woxi's text serialization.
+fn decompress_to_expr(s: &str) -> Result<Expr, InterpreterError> {
+  let bytes = inflate_compressed(s)?;
+
+  if let Some(expr) = crate::functions::wl_serialize::deserialize(&bytes) {
+    // The payload is an ordinary expression and evaluates like one — a
+    // Demonstrations texture arrives as `Image[CompressedData[…]]` whose
+    // payload is `RawArray[type, data]`, and `Image` needs the
+    // `NumericArray` that evaluates to, not the legacy head.
+    return Ok(crate::evaluator::evaluate_expr_to_expr(&expr).unwrap_or(expr));
+  }
+
+  let text = String::from_utf8(bytes).map_err(|e| {
+    InterpreterError::EvaluationError(format!("Uncompress decode failed: {e}"))
+  })?;
+  crate::syntax::string_to_expr(&text).map_err(|e| {
+    InterpreterError::EvaluationError(format!("Uncompress parse failed: {e}"))
+  })
+}
+
+/// Uncompress[str] — decompresses a string produced by Compress
+pub fn uncompress_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(format!(
+      "Uncompress expects 1 argument, got {}",
+      args.len()
+    )));
+  }
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  let s = match &evaluated {
+    Expr::String(s) => s.clone(),
+    _ => {
+      return Ok(call1("Uncompress", evaluated));
+    }
+  };
+  decompress_to_expr(&s)
+}
+
+/// CompressedData[str] — inert form holding a compressed expression; evaluates
+/// to the original expression (like `Uncompress`).
+pub fn compressed_data_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Ok(unevaluated("CompressedData", args));
+  }
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  match &evaluated {
+    Expr::String(s) => decompress_to_expr(s),
+    _ => Ok(call1("CompressedData", evaluated)),
+  }
+}
+
+/// Extract text content for ReadList from the first argument.
+/// Handles:
+/// - StringToStream["text"] → returns the text
+/// - "filename" → reads the file (CLI only)
+fn readlist_get_text(source: &Expr) -> Result<String, InterpreterError> {
+  match source {
+    // StringToStream["text"] → use text directly
+    Expr::FunctionCall { name, args }
+      if name == "StringToStream" && args.len() == 1 =>
+    {
+      if let Expr::String(s) = &args[0] {
+        Ok(s.clone())
+      } else {
+        Err(InterpreterError::EvaluationError(
+          "StringToStream expects a string argument".into(),
+        ))
+      }
+    }
+    // InputStream[name, id] — look up in stream registry
+    Expr::FunctionCall { name, args }
+      if name == "InputStream" && args.len() == 2 =>
+    {
+      crate::evaluator::dispatch::io_functions::readlist_inputstream(args)
+    }
+    // String path → read file. In the browser the host-registered virtual
+    // file store (set_virtual_file) replaces the filesystem.
+    #[cfg(target_arch = "wasm32")]
+    Expr::String(path) => match crate::wasm::virtual_file(path) {
+      Some(bytes) => String::from_utf8(bytes).map_err(|_| {
+        InterpreterError::EvaluationError(format!(
+          "ReadList: \"{}\" is not valid UTF-8 text",
+          path
+        ))
+      }),
+      None => Err(InterpreterError::EvaluationError(format!(
+        "ReadList::noopen: Cannot open {}.",
+        path
+      ))),
+    },
+    // A `"!command"` spec reads the output of an external command instead
+    // of a file.
+    #[cfg(not(target_arch = "wasm32"))]
+    Expr::String(path) => {
+      let content =
+        match crate::evaluator::dispatch::io_functions::command_file_spec(path)
+        {
+          Some(command) => {
+            crate::evaluator::dispatch::io_functions::run_command_capture(
+              command,
+            )
+          }
+          None => std::fs::read_to_string(crate::vfs::resolve(path)).ok(),
+        };
+      content.ok_or_else(|| {
+        InterpreterError::EvaluationError(format!(
+          "ReadList::noopen: Cannot open {path}."
+        ))
+      })
+    }
+    _ => Err(InterpreterError::EvaluationError(
+      "ReadList expects a filename string or StringToStream[\"text\"]".into(),
+    )),
+  }
+}
+
+/// ReadList[source] or ReadList[source, type] or ReadList[source, type, n]
+pub fn read_list_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 3 {
+    return Err(InterpreterError::EvaluationError(
+      "ReadList expects 1 to 3 arguments".into(),
+    ));
+  }
+
+  let text = readlist_get_text(&args[0])?;
+
+  // Determine the read type (default: Expression)
+  let read_type = if args.len() >= 2 {
+    &args[1]
+  } else {
+    &id_expr("Expression")
+  };
+
+  // Optional max count: must be a non-negative machine integer when
+  // given. Match wolframscript on rejection: emit `ReadList::intnm`
+  // and leave the call unevaluated.
+  let max_count: Option<usize> = if args.len() == 3 {
+    match &args[2] {
+      Expr::Integer(n) if *n >= 0 => Some(*n as usize),
+      _ => {
+        let formatted_args = args
+          .iter()
+          .map(expr_to_string)
+          .collect::<Vec<_>>()
+          .join(", ");
+        crate::emit_message(&format!(
+          "ReadList::intnm: Non-negative machine-sized integer expected at position 3 in ReadList[{formatted_args}]."
+        ));
+        return Ok(unevaluated("ReadList", args));
+      }
+    }
+  } else {
+    None
+  };
+
+  // Handle composite types like {Word, Word}
+  if let Expr::List(types) = read_type {
+    return Ok(read_list_record(&text, types, max_count));
+  }
+
+  let type_name = match read_type {
+    Expr::Identifier(s) => s.as_str(),
+    _ => "Expression",
+  };
+
+  let mut results = Vec::new();
+
+  match type_name {
+    "String" => {
+      // Each line is a string
+      for line in text.lines() {
+        if let Some(max) = max_count
+          && results.len() >= max
+        {
+          break;
+        }
+        results.push(Expr::String(line.to_string()));
+      }
+    }
+    "Word" => {
+      // Whitespace-separated words (returned as strings)
+      for word in text.split_whitespace() {
+        if let Some(max) = max_count
+          && results.len() >= max
+        {
+          break;
+        }
+        results.push(Expr::String(word.to_string()));
+      }
+    }
+    "Number" => {
+      // Whitespace-separated numbers
+      for token in text.split_whitespace() {
+        if let Some(max) = max_count
+          && results.len() >= max
+        {
+          break;
+        }
+        if let Ok(n) = token.parse::<i128>() {
+          results.push(Expr::Integer(n));
+        } else if let Ok(f) = token.parse::<f64>() {
+          results.push(Expr::Real(f));
+        }
+        // Skip non-numeric tokens
+      }
+    }
+    // "Expression", and any unrecognized type, is read as an expression.
+    _ => {
+      // Parse and evaluate each line as a Wolfram expression
+      for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+          continue;
+        }
+        if let Some(max) = max_count
+          && results.len() >= max
+        {
+          break;
+        }
+        if let Ok(expr) = crate::syntax::string_to_expr(trimmed) {
+          match crate::evaluator::evaluate_expr_to_expr(&expr) {
+            Ok(val) => results.push(val),
+            Err(_) => results.push(expr),
+          }
+        } else {
+          // If parsing fails, skip
+        }
+      }
+    }
+  }
+
+  Ok(Expr::List(results.into()))
+}
+
+/// Handle ReadList with record types like {Word, Word}
+fn read_list_record(
+  text: &str,
+  types: &[Expr],
+  max_count: Option<usize>,
+) -> Expr {
+  let mut results = Vec::new();
+
+  for line in text.lines() {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    if let Some(max) = max_count
+      && results.len() >= max
+    {
+      break;
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut record = Vec::new();
+
+    for (i, type_spec) in types.iter().enumerate() {
+      let type_name = match type_spec {
+        Expr::Identifier(s) => s.as_str(),
+        _ => "Expression",
+      };
+      let token = tokens.get(i).unwrap_or(&"");
+      match type_name {
+        "Word" => record.push(Expr::String(token.to_string())),
+        "Number" => {
+          if let Ok(n) = token.parse::<i128>() {
+            record.push(Expr::Integer(n));
+          } else if let Ok(f) = token.parse::<f64>() {
+            record.push(Expr::Real(f));
+          } else {
+            record.push(Expr::Identifier(token.to_string()));
+          }
+        }
+        "String" => record.push(Expr::String(token.to_string())),
+        _ => {
+          if let Ok(expr) = crate::syntax::string_to_expr(token) {
+            if let Ok(val) = crate::evaluator::evaluate_expr_to_expr(&expr) {
+              record.push(val);
+            } else {
+              record.push(expr);
+            }
+          }
+        }
+      }
+    }
+
+    results.push(Expr::List(record.into()));
+  }
+
+  Expr::List(results.into())
+}
+
+/// Convert an expression to C language format
+/// Flatten a (possibly nested) Times tree — represented either as
+/// FunctionCall{Times} or chained BinaryOp::Times — into a flat factor list.
+fn flatten_times(expr: &Expr, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      for a in args {
+        flatten_times(a, out);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      flatten_times(left, out);
+      flatten_times(right, out);
+    }
+    _ => out.push(expr.clone()),
+  }
+}
+
+/// Render a single Times factor for C/Fortran output, parenthesizing
+/// additive (Plus/Minus) factors so the surrounding product stays correct.
+fn c_like_factor(expr: &Expr, fortran: bool) -> String {
+  let s = if fortran {
+    expr_to_fortran(expr)
+  } else {
+    expr_to_c(expr)
+  };
+  if matches!(expr, Expr::FunctionCall { name, .. } if name == "Plus")
+    || matches!(
+      expr,
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus | BinaryOperator::Minus,
+        ..
+      }
+    )
+  {
+    format!("({s})")
+  } else {
+    s
+  }
+}
+
+/// Render a Times expression as a C/Fortran fraction with correct
+/// numerator/denominator grouping. Factors with a negative integer power and
+/// the denominator of a Rational coefficient move below the division bar;
+/// a leading -1 coefficient becomes a unary minus. `fortran` selects backend.
+fn c_like_times(args: &[Expr], fortran: bool) -> String {
+  let render = |e: &Expr| {
+    if fortran {
+      expr_to_fortran(e)
+    } else {
+      expr_to_c(e)
+    }
+  };
+  // A leading -1 coefficient renders as a unary minus over the rest.
+  let (neg, factors): (bool, &[Expr]) =
+    if args.len() > 1 && matches!(&args[0], Expr::Integer(-1)) {
+      (true, &args[1..])
+    } else {
+      (false, args)
+    };
+
+  let mut num: Vec<String> = Vec::new();
+  let mut den: Vec<String> = Vec::new();
+  for a in factors {
+    // Negative integer power -> denominator factor with positive exponent
+    // (as_neg_int_power already returns the positive exponent).
+    if let Some((base, e)) = as_neg_int_power(a) {
+      if e == 1 {
+        den.push(c_like_factor(base, fortran));
+      } else {
+        let pos = pow(base.clone(), Expr::Integer(e));
+        den.push(render(&pos));
+      }
+      continue;
+    }
+    // Rational coefficient p/q -> p above (unless 1), q. below the bar.
+    if let Expr::FunctionCall { name, args: ra } = a
+      && name == "Rational"
+      && ra.len() == 2
+      && let (Expr::Integer(p), Expr::Integer(q)) = (&ra[0], &ra[1])
+    {
+      if *p != 1 {
+        num.push(p.to_string());
+      }
+      den.push(format!("{q}."));
+      continue;
+    }
+    num.push(c_like_factor(a, fortran));
+  }
+
+  let group = |v: &[String]| -> String {
+    if v.len() > 1 {
+      format!("({})", v.join("*"))
+    } else {
+      v.join("*")
+    }
+  };
+  let compound = !den.is_empty() || num.len() > 1;
+  let body = if den.is_empty() {
+    if num.is_empty() {
+      "1".to_string()
+    } else {
+      num.join("*")
+    }
+  } else {
+    let num_s = if num.is_empty() {
+      "1".to_string()
+    } else {
+      group(&num)
+    };
+    format!("{}/{}", num_s, group(&den))
+  };
+  if neg && compound {
+    format!("-({body})")
+  } else if neg {
+    format!("-{body}")
+  } else {
+    body
+  }
+}
+
+/// Is `expr` the exact rational `n/d` used as an exponent?
+fn is_rational_exponent(expr: &Expr, n: i128, d: i128) -> bool {
+  matches!(expr, Expr::FunctionCall { name, args }
+    if name == "Rational"
+      && args.len() == 2
+      && matches!(&args[0], Expr::Integer(a) if *a == n)
+      && matches!(&args[1], Expr::Integer(b) if *b == d))
+}
+
+/// A comparison. A single relation is infix (`a < b`, or `a.lt.b` in Fortran);
+/// a chain of two or more becomes the function form `Less(a,b,c)`.
+fn c_like_comparison(
+  operands: &[Expr],
+  operators: &[ComparisonOp],
+  render: &dyn Fn(&Expr) -> String,
+  fortran: bool,
+) -> String {
+  let head = |op: &ComparisonOp| match op {
+    ComparisonOp::Equal => "Equal",
+    ComparisonOp::NotEqual => "Unequal",
+    ComparisonOp::Less => "Less",
+    ComparisonOp::LessEqual => "LessEqual",
+    ComparisonOp::Greater => "Greater",
+    ComparisonOp::GreaterEqual => "GreaterEqual",
+    ComparisonOp::SameQ => "SameQ",
+    ComparisonOp::UnsameQ => "UnsameQ",
+  };
+  if operators.len() != 1 {
+    let name = operators.first().map_or("Equal", head);
+    let parts: Vec<String> = operands.iter().map(render).collect();
+    return format!("{}({})", name, parts.join(","));
+  }
+  let infix = match (&operators[0], fortran) {
+    (ComparisonOp::Equal, false) => " == ",
+    (ComparisonOp::NotEqual, false) => " != ",
+    (ComparisonOp::Less, false) => " < ",
+    (ComparisonOp::LessEqual, false) => " <= ",
+    (ComparisonOp::Greater, false) => " > ",
+    (ComparisonOp::GreaterEqual, false) => " >= ",
+    (ComparisonOp::Equal, true) => ".eq.",
+    (ComparisonOp::NotEqual, true) => ".ne.",
+    (ComparisonOp::Less, true) => ".lt.",
+    (ComparisonOp::LessEqual, true) => ".le.",
+    (ComparisonOp::Greater, true) => ".gt.",
+    (ComparisonOp::GreaterEqual, true) => ".ge.",
+    (op, _) => {
+      let parts: Vec<String> = operands.iter().map(render).collect();
+      return format!("{}({})", head(op), parts.join(","));
+    }
+  };
+  let parts: Vec<String> = operands.iter().map(render).collect();
+  parts.join(infix)
+}
+
+/// A machine real the way CForm and FortranForm print it: plain decimal while
+/// the decimal exponent stays within ±6, and `<mantissa>e<exp>` outside that
+/// (`1000000.` is `1.e6`, `0.000001` is `1.e-6`).
+fn c_like_real(value: f64) -> String {
+  let plain = |v: f64| -> String {
+    let s = format!("{v}");
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+      s
+    } else {
+      format!("{s}.")
+    }
+  };
+  if value == 0.0 || !value.is_finite() {
+    return plain(value);
+  }
+  let exponent = value.abs().log10().floor() as i32;
+  if (-6..6).contains(&exponent) {
+    return plain(value);
+  }
+  let scientific = format!("{value:e}");
+  match scientific.split_once('e') {
+    Some((mantissa, exp)) if !mantissa.contains('.') => {
+      format!("{mantissa}.e{exp}")
+    }
+    _ => scientific,
+  }
+}
+
+/// Is this term a negated one, so that the sum should read `a - b` rather than
+/// `a + -b`? Returns the term without its sign when it is.
+fn negated_term(expr: &Expr) -> Option<Expr> {
+  match expr {
+    Expr::Integer(n) if *n < 0 => Some(Expr::Integer(-n)),
+    Expr::Real(f) if *f < 0.0 => Some(Expr::Real(-f)),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => Some((**operand).clone()),
+    Expr::FunctionCall { name, args }
+      if name == "Times" && !args.is_empty() =>
+    {
+      let head = negated_term(&args[0])?;
+      let mut rest: Vec<Expr> = vec![head];
+      rest.extend(args[1..].iter().cloned());
+      // A leading coefficient of -1 disappears entirely: -x, not -1*x.
+      if matches!(rest[0], Expr::Integer(1)) && rest.len() > 1 {
+        rest.remove(0);
+      }
+      Some(if rest.len() == 1 {
+        rest.remove(0)
+      } else {
+        call("Times", rest)
+      })
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let head = negated_term(left)?;
+      Some(if matches!(head, Expr::Integer(1)) {
+        (**right).clone()
+      } else {
+        Expr::BinaryOp {
+          op: BinaryOperator::Times,
+          left: Box::new(head),
+          right: right.clone(),
+        }
+      })
+    }
+    _ => None,
+  }
+}
+
+/// Join the terms of a sum, turning a negated term into a subtraction.
+fn c_like_plus(args: &[Expr], render: &dyn Fn(&Expr) -> String) -> String {
+  let mut out = String::new();
+  for (i, term) in args.iter().enumerate() {
+    match (i, negated_term(term)) {
+      (0, _) => out.push_str(&render(term)),
+      (_, Some(positive)) => {
+        out.push_str(" - ");
+        out.push_str(&render(&positive));
+      }
+      (_, None) => {
+        out.push_str(" + ");
+        out.push_str(&render(term));
+      }
+    }
+  }
+  out
+}
+
+/// The direction of `Infinity`, `-Infinity`, `ComplexInfinity` or
+/// `DirectedInfinity[…]`, which both forms print as `DirectedInfinity(dir)`.
+fn c_like_infinity(expr: &Expr) -> Option<String> {
+  match expr {
+    Expr::Identifier(n) | Expr::Constant(n) if n == "Infinity" => {
+      Some("DirectedInfinity(1)".to_string())
+    }
+    Expr::Identifier(n) if n == "ComplexInfinity" => {
+      Some("DirectedInfinity()".to_string())
+    }
+    _ if crate::functions::math_ast::is_neg_infinity(expr) => {
+      Some("DirectedInfinity(-1)".to_string())
+    }
+    _ => None,
+  }
+}
+
+/// The real and imaginary parts of an explicitly numeric complex expression.
+fn c_like_complex_parts(expr: &Expr) -> Option<(Expr, Expr)> {
+  let (re, im) =
+    crate::evaluator::dispatch::complex_and_special::split_real_imag_symbolic(
+      expr,
+    )?;
+  let numeric = |e: &Expr| {
+    matches!(e, Expr::Integer(_) | Expr::Real(_) | Expr::BigInteger(_))
+      || matches!(e, Expr::UnaryOp { operand, .. }
+        if matches!(operand.as_ref(), Expr::Integer(_) | Expr::Real(_)))
+  };
+  if matches!(im, Expr::Integer(0)) || !numeric(&re) || !numeric(&im) {
+    return None;
+  }
+  Some((re, im))
+}
+
+pub fn expr_to_c(expr: &Expr) -> String {
+  if let Some(infinity) = c_like_infinity(expr) {
+    return infinity;
+  }
+  if let Some((re, im)) = c_like_complex_parts(expr) {
+    return format!("Complex({},{})", expr_to_c(&re), expr_to_c(&im));
+  }
+  match expr {
+    Expr::Integer(n) => n.to_string(),
+    Expr::BigInteger(n) => n.to_string(),
+    Expr::Real(f) => c_like_real(*f),
+    Expr::String(s) => format!("\"{s}\""),
+    Expr::Identifier(name) => name.clone(),
+    Expr::Constant(name) => name.clone(),
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Plus" => c_like_plus(args, &expr_to_c),
+      "Times" => {
+        let mut factors = Vec::new();
+        flatten_times(expr, &mut factors);
+        c_like_times(&factors, false)
+      }
+      // C spells these as operators rather than calls.
+      "And" => args.iter().map(expr_to_c).collect::<Vec<_>>().join(" && "),
+      "Or" => args.iter().map(expr_to_c).collect::<Vec<_>>().join(" || "),
+      "Not" if args.len() == 1 => format!("!{}", expr_to_c(&args[0])),
+      "Mod" if args.len() == 2 => {
+        format!("{} % {}", expr_to_c(&args[0]), expr_to_c(&args[1]))
+      }
+      "Power" if args.len() == 2 => {
+        if matches!(&args[1], Expr::Integer(-1)) {
+          format!("1/{}", c_paren(&args[0]))
+        } else if is_rational_exponent(&args[1], 1, 2) {
+          format!("Sqrt({})", expr_to_c(&args[0]))
+        } else if is_rational_exponent(&args[1], -1, 2) {
+          format!("1/Sqrt({})", expr_to_c(&args[0]))
+        } else {
+          format!("Power({},{})", expr_to_c(&args[0]), expr_to_c(&args[1]))
+        }
+      }
+      "Rational" if args.len() == 2 => {
+        // CForm evaluates exact rationals to machine-precision decimals.
+        if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+          let s = format!("{}", *n as f64 / *d as f64);
+          if s.contains('.') || s.contains('e') || s.contains('E') {
+            s
+          } else {
+            format!("{s}.")
+          }
+        } else {
+          format!("{}/{}", expr_to_c(&args[0]), c_paren(&args[1]))
+        }
+      }
+      _ => format!("{}({})", name, c_args(args)),
+    },
+    Expr::BinaryOp { op, left, right } => {
+      let l = expr_to_c(left);
+      let r = expr_to_c(right);
+      match op {
+        BinaryOperator::Plus => format!("{l} + {r}"),
+        BinaryOperator::Minus => format!("{l} - {r}"),
+        BinaryOperator::Times => {
+          let mut factors = Vec::new();
+          flatten_times(expr, &mut factors);
+          c_like_times(&factors, false)
+        }
+        BinaryOperator::Divide => format!("{l}/{r}"),
+        BinaryOperator::Power => {
+          if matches!(right.as_ref(), Expr::Integer(-1)) {
+            format!("1/{}", c_paren(left))
+          } else if is_rational_exponent(right, 1, 2) {
+            format!("Sqrt({})", expr_to_c(left))
+          } else if is_rational_exponent(right, -1, 2) {
+            format!("1/Sqrt({})", expr_to_c(left))
+          } else {
+            format!("Power({l},{r})")
+          }
+        }
+        _ => format!("{op:?}({l},{r})"),
+      }
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      format!("-{}", c_paren(operand))
+    }
+    Expr::List(items) => {
+      let parts: Vec<String> = items.iter().map(expr_to_c).collect();
+      format!("List({})", parts.join(","))
+    }
+    // `f[a][b]` is `f(a)(b)`; this also covers Derivative[n][f][x].
+    Expr::CurriedCall { func, args } => {
+      format!("{}({})", expr_to_c(func), c_args(args))
+    }
+    Expr::Comparison {
+      operands,
+      operators,
+    } => c_like_comparison(operands, operators, &expr_to_c, false),
+    // Rational numbers are FunctionCall{name:"Rational", args:[num, den]}
+    // but they get evaluated before reaching here, so this pattern is rare
+    _ => expr_to_string(expr),
+  }
+}
+
+/// Add parentheses for C output if needed
+fn c_paren(expr: &Expr) -> String {
+  let s = expr_to_c(expr);
+  match expr {
+    Expr::FunctionCall { name, .. } if name == "Plus" => format!("({s})"),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      ..
+    } => format!("({s})"),
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      ..
+    } => format!("({s})"),
+    _ => s,
+  }
+}
+
+/// Format C function arguments
+fn c_args(args: &[Expr]) -> String {
+  args.iter().map(expr_to_c).collect::<Vec<_>>().join(",")
+}
+
+/// Convert an expression to Fortran language format
+pub fn expr_to_fortran(expr: &Expr) -> String {
+  if let Some(infinity) = c_like_infinity(expr) {
+    return infinity;
+  }
+  if let Some((re, im)) = c_like_complex_parts(expr) {
+    return format!("({},{})", expr_to_fortran(&re), expr_to_fortran(&im));
+  }
+  match expr {
+    Expr::Integer(n) => n.to_string(),
+    Expr::BigInteger(n) => n.to_string(),
+    Expr::Real(f) => c_like_real(*f),
+    Expr::String(s) => format!("\"{s}\""),
+    Expr::Identifier(name) => name.clone(),
+    Expr::Constant(name) => name.clone(),
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Plus" => c_like_plus(args, &expr_to_fortran),
+      "Times" => {
+        let mut factors = Vec::new();
+        flatten_times(expr, &mut factors);
+        c_like_times(&factors, true)
+      }
+      // Fortran spells the logical operators between dots.
+      "And" => args
+        .iter()
+        .map(expr_to_fortran)
+        .collect::<Vec<_>>()
+        .join(".and."),
+      "Or" => args
+        .iter()
+        .map(expr_to_fortran)
+        .collect::<Vec<_>>()
+        .join(".or."),
+      "Not" if args.len() == 1 => {
+        format!(".not.{}", expr_to_fortran(&args[0]))
+      }
+      "Power" if args.len() == 2 => fortran_power(&args[0], &args[1]),
+      "Rational" if args.len() == 2 => {
+        // Wolfram FortranForm evaluates rationals to decimal
+        if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+          let val = *n as f64 / *d as f64;
+          let s = format!("{val}");
+          // Ensure decimal point
+          if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+            format!("{s}.")
+          } else {
+            s
+          }
+        } else {
+          format!("{}./{}", expr_to_fortran(&args[0]), fortran_paren(&args[1]))
+        }
+      }
+      _ => format!("{}({})", name, fortran_args(args)),
+    },
+    Expr::BinaryOp { op, left, right } => {
+      // Power[x, Rational[1, 2]] → Sqrt(x) in Fortran
+      if matches!(op, BinaryOperator::Power)
+        && let Some(sqrt_arg) = crate::functions::is_sqrt(expr)
+      {
+        return format!("Sqrt({})", expr_to_fortran(sqrt_arg));
+      }
+      let l = expr_to_fortran(left);
+      let r = expr_to_fortran(right);
+      match op {
+        BinaryOperator::Plus => format!("{l} + {r}"),
+        BinaryOperator::Minus => format!("{l} - {r}"),
+        BinaryOperator::Times => {
+          let mut factors = Vec::new();
+          flatten_times(expr, &mut factors);
+          c_like_times(&factors, true)
+        }
+        BinaryOperator::Divide => format!("{l}/{r}"),
+        BinaryOperator::Power => fortran_power(left, right),
+        _ => format!("{op:?}({l},{r})"),
+      }
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      format!("-{}", fortran_paren(operand))
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Not,
+      operand,
+    } => {
+      format!(".not.{}", expr_to_fortran(operand))
+    }
+    Expr::List(items) => {
+      let parts: Vec<String> = items.iter().map(expr_to_fortran).collect();
+      format!("List({})", parts.join(","))
+    }
+    // `f[a][b]` is `f(a)(b)`; this also covers Derivative[n][f][x].
+    Expr::CurriedCall { func, args } => {
+      format!("{}({})", expr_to_fortran(func), fortran_args(args))
+    }
+    Expr::Comparison {
+      operands,
+      operators,
+    } => c_like_comparison(operands, operators, &expr_to_fortran, true),
+    _ => expr_to_string(expr),
+  }
+}
+
+/// `base**exponent`, with the parentheses Fortran needs: `**` binds tighter
+/// than anything but an atom, so a compound or negative exponent — and a base
+/// that is itself a sum, product, quotient or power — has to be wrapped.
+/// An exponent of -1 (or -1/2) is written as a reciprocal instead.
+fn fortran_power(base: &Expr, exponent: &Expr) -> String {
+  if is_rational_exponent(exponent, 1, 2) {
+    return format!("Sqrt({})", expr_to_fortran(base));
+  }
+  if is_rational_exponent(exponent, -1, 2) {
+    return format!("1/Sqrt({})", expr_to_fortran(base));
+  }
+  if matches!(exponent, Expr::Integer(-1)) {
+    return format!("1/{}", fortran_paren(base));
+  }
+  // `**` is right-associative, so a Power exponent needs no parentheses; a
+  // sum, product or negative one does.
+  let exponent_needs_parens = matches!(exponent, Expr::FunctionCall { name, .. }
+      if matches!(name.as_str(), "Plus" | "Times"))
+    || matches!(
+      exponent,
+      Expr::BinaryOp {
+        op: BinaryOperator::Plus
+          | BinaryOperator::Minus
+          | BinaryOperator::Times
+          | BinaryOperator::Divide,
+        ..
+      }
+    )
+    || matches!(
+      exponent,
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        ..
+      }
+    )
+    || matches!(exponent, Expr::Integer(n) if *n < 0)
+    || matches!(exponent, Expr::Real(f) if *f < 0.0);
+  let exponent_text = expr_to_fortran(exponent);
+  let base_needs_parens = !matches!(
+    base,
+    Expr::Integer(_)
+      | Expr::BigInteger(_)
+      | Expr::Real(_)
+      | Expr::Identifier(_)
+      | Expr::Constant(_)
+  ) && !matches!(base, Expr::FunctionCall { name, .. }
+      if !matches!(name.as_str(), "Plus" | "Times" | "Power" | "Rational"));
+  format!(
+    "{}**{}",
+    if base_needs_parens {
+      format!("({})", expr_to_fortran(base))
+    } else {
+      expr_to_fortran(base)
+    },
+    if exponent_needs_parens {
+      format!("({exponent_text})")
+    } else {
+      exponent_text
+    }
+  )
+}
+
+/// Add parentheses for Fortran output if needed
+fn fortran_paren(expr: &Expr) -> String {
+  let s = expr_to_fortran(expr);
+  match expr {
+    Expr::FunctionCall { name, .. } if name == "Plus" => format!("({s})"),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      ..
+    } => format!("({s})"),
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      ..
+    } => format!("({s})"),
+    Expr::Integer(n) if *n < 0 => format!("({s})"),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      ..
+    } => format!("({s})"),
+    _ => s,
+  }
+}
+
+/// Format Fortran function arguments
+fn fortran_args(args: &[Expr]) -> String {
+  args
+    .iter()
+    .map(expr_to_fortran)
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+/// Rebuild an expression tree, applying `f` to every node. When `f` returns
+/// `Some(replacement)` the node (and its subtree) is replaced; otherwise the
+/// node is rebuilt with its children transformed. Mirrors the variant coverage
+/// of `substitute_slot_zero_with_self` so slot-bearing template expressions are
+/// fully rewritten — in particular it does **not** descend into `Function` /
+/// `NamedFunction` bodies, whose slots belong to the inner function. Callers
+/// that need those (e.g. display rounding, which has no scope) handle the two
+/// variants in `f` themselves.
+pub(crate) fn map_expr_tree(
+  expr: &Expr,
+  f: &dyn Fn(&Expr) -> Option<Expr>,
+) -> Expr {
+  if let Some(replacement) = f(expr) {
+    return replacement;
+  }
+  let go = |e: &Expr| map_expr_tree(e, f);
+  match expr {
+    Expr::List(items) => Expr::List(items.iter().map(go).collect()),
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.iter().map(go).collect(),
+    },
+    // A head mapped to a symbol makes an ordinary call:
+    // `Defer[Int][u, x]` with `Defer[Int]` → `Int` is `Int[u, x]`.
+    Expr::CurriedCall { func, args } => {
+      let func = go(func);
+      if let Expr::Identifier(name) = &func {
+        Expr::FunctionCall {
+          name: name.clone(),
+          args: args.iter().map(go).collect(),
+        }
+      } else {
+        Expr::CurriedCall {
+          func: Box::new(func),
+          args: args.iter().map(go).collect(),
+        }
+      }
+    }
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(go(left)),
+      right: Box::new(go(right)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(go(operand)),
+    },
+    Expr::Comparison {
+      operands,
+      operators,
+    } => Expr::Comparison {
+      operands: operands.iter().map(go).collect(),
+      operators: operators.clone(),
+    },
+    Expr::CompoundExpr(items) => {
+      Expr::CompoundExpr(items.iter().map(go).collect())
+    }
+    Expr::Association(items) => {
+      Expr::Association(items.iter().map(|(k, v)| (go(k), go(v))).collect())
+    }
+    Expr::Rule {
+      pattern,
+      replacement,
+    } => Expr::Rule {
+      pattern: Box::new(go(pattern)),
+      replacement: Box::new(go(replacement)),
+    },
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } => Expr::RuleDelayed {
+      pattern: Box::new(go(pattern)),
+      replacement: Box::new(go(replacement)),
+    },
+    Expr::PrefixApply { func, arg } => Expr::PrefixApply {
+      func: Box::new(go(func)),
+      arg: Box::new(go(arg)),
+    },
+    Expr::Postfix { expr: e, func } => Expr::Postfix {
+      expr: Box::new(go(e)),
+      func: Box::new(go(func)),
+    },
+    Expr::Map { func, list } => Expr::Map {
+      func: Box::new(go(func)),
+      list: Box::new(go(list)),
+    },
+    Expr::Apply { func, list } => Expr::Apply {
+      func: Box::new(go(func)),
+      list: Box::new(go(list)),
+    },
+    Expr::MapApply { func, list } => Expr::MapApply {
+      func: Box::new(go(func)),
+      list: Box::new(go(list)),
+    },
+    Expr::ReplaceAll { expr: e, rules } => Expr::ReplaceAll {
+      expr: Box::new(go(e)),
+      rules: Box::new(go(rules)),
+    },
+    Expr::ReplaceRepeated { expr: e, rules } => Expr::ReplaceRepeated {
+      expr: Box::new(go(e)),
+      rules: Box::new(go(rules)),
+    },
+    Expr::Part { expr: e, index } => Expr::Part {
+      expr: Box::new(go(e)),
+      index: Box::new(go(index)),
+    },
+    other => other.clone(),
+  }
+}
+
+/// Convert anonymous-function slots into `TemplateSlot` markers inside an
+/// embedded `<* … *>` expression: `#`/`#1` → `TemplateSlot[1]` and the named
+/// `#key` (parsed as `Slot["key"]`) → `TemplateSlot[key]`.
+fn slots_to_template_slots(expr: &Expr) -> Expr {
+  map_expr_tree(expr, &|e| match e {
+    Expr::Slot(n) => {
+      Some(call("TemplateSlot", vec![Expr::Integer(*n as i128)]))
+    }
+    Expr::FunctionCall { name, args } if name == "Slot" && args.len() == 1 => {
+      let key = match &args[0] {
+        // Named slots use a string key (`TemplateSlot["name"]`).
+        Expr::String(s) => Expr::String(s.clone()),
+        Expr::Integer(n) => Expr::Integer(*n),
+        other => other.clone(),
+      };
+      Some(call1("TemplateSlot", key))
+    }
+    _ => None,
+  })
+}
+
+/// Parse the body of an embedded `<* … *>` template expression into an `Expr`
+/// with its slots converted to `TemplateSlot` markers. Returns `None` if the
+/// body is empty or fails to parse.
+fn parse_template_expression(body: &str) -> Option<Expr> {
+  let body = body.trim();
+  if body.is_empty() {
+    return None;
+  }
+  let pairs = crate::parse(body).ok()?;
+  for program in pairs {
+    for node in program.into_inner() {
+      if matches!(node.as_rule(), crate::Rule::Expression) {
+        return Some(slots_to_template_slots(&crate::syntax::pair_to_expr(
+          node,
+        )));
+      }
+    }
+  }
+  None
+}
+
+/// Parse a template string into the `TemplateObject` parts list: a list of
+/// literal `String` segments, `TemplateSlot[key]` markers, and
+/// `TemplateExpression[expr]` nodes. A `` `name` `` slot becomes
+/// `TemplateSlot[name]` (a symbol), a `` `1` `` slot becomes `TemplateSlot[1]`
+/// (an integer), and an empty `` `` `` slot becomes the next positional
+/// `TemplateSlot[n]`. A `<* expr *>` section becomes `TemplateExpression[expr]`
+/// with `#`/`#key` slot references rewritten to `TemplateSlot`. An unterminated
+/// backtick is kept as a literal character, matching wolframscript.
+fn parse_template_parts(template: &str) -> Vec<Expr> {
+  let chars: Vec<char> = template.chars().collect();
+  let mut parts: Vec<Expr> = Vec::new();
+  let mut literal = String::new();
+  let mut positional: i128 = 1;
+  let mut i = 0;
+  while i < chars.len() {
+    // Embedded expression: <* … *>
+    if chars[i] == '<' && chars.get(i + 1) == Some(&'*') {
+      let mut end = None;
+      let mut j = i + 2;
+      while j + 1 < chars.len() {
+        if chars[j] == '*' && chars[j + 1] == '>' {
+          end = Some(j);
+          break;
+        }
+        j += 1;
+      }
+      if let Some(end) = end {
+        let body: String = chars[i + 2..end].iter().collect();
+        if let Some(expr) = parse_template_expression(&body) {
+          if !literal.is_empty() {
+            parts.push(Expr::String(std::mem::take(&mut literal)));
+          }
+          parts.push(call1("TemplateExpression", expr));
+        }
+        i = end + 2;
+        continue;
+      }
+      // No closing `*>`: fall through and treat `<` as a literal character.
+    }
+    if chars[i] == '`' {
+      // Read the slot key up to the next backtick.
+      let mut key = String::new();
+      let mut j = i + 1;
+      let mut closed = false;
+      while j < chars.len() {
+        if chars[j] == '`' {
+          closed = true;
+          break;
+        }
+        key.push(chars[j]);
+        j += 1;
+      }
+      if !closed {
+        // Unterminated slot: keep the backtick and key as literal text.
+        literal.push('`');
+        literal.push_str(&key);
+        break;
+      }
+      if !literal.is_empty() {
+        parts.push(Expr::String(std::mem::take(&mut literal)));
+      }
+      let key_expr = if key.is_empty() {
+        let k = positional;
+        positional += 1;
+        Expr::Integer(k)
+      } else if let Ok(n) = key.parse::<i128>() {
+        Expr::Integer(n)
+      } else {
+        // Named slots use a string key (matches wolframscript's
+        // `TemplateSlot["name"]`).
+        Expr::String(key)
+      };
+      parts.push(call1("TemplateSlot", key_expr));
+      i = j + 1;
+      continue;
+    }
+    literal.push(chars[i]);
+    i += 1;
+  }
+  if !literal.is_empty() {
+    parts.push(Expr::String(literal));
+  }
+  parts
+}
+
+/// Build a `TemplateObject` expression from a template string. The optional
+/// `bound_args` association is inserted as the second element (used by the
+/// two-argument `FileTemplate[src, args]` / `XMLTemplate[src, args]` forms).
+/// `insertion_function` selects the slot renderer (`TextString` for plain
+/// string templates, `HTMLFragment` for XML templates). The result renders
+/// identically to wolframscript, e.g.
+/// `TemplateObject[{Hello , TemplateSlot[name]}, CombinerFunction -> StringJoin,
+/// InsertionFunction -> TextString, MetaInformation -> <||>]`.
+pub fn build_template_object(
+  template: &str,
+  bound_args: Option<Expr>,
+  insertion_function: &str,
+) -> Expr {
+  let parts = Expr::List(parse_template_parts(template).into());
+  let mut object_args: Vec<Expr> = vec![parts];
+  if let Some(assoc) = bound_args {
+    object_args.push(assoc);
+  }
+  let option = |name: &str, value: Expr| Expr::Rule {
+    pattern: Box::new(Expr::Identifier(name.to_string())),
+    replacement: Box::new(value),
+  };
+  object_args.push(option("CombinerFunction", id_expr("StringJoin")));
+  // XMLTemplate reports its insertion function as the string "HTMLFragment";
+  // plain string templates use the TextString symbol.
+  let insertion_value = if insertion_function == "HTMLFragment" {
+    Expr::String(insertion_function.to_string())
+  } else {
+    Expr::Identifier(insertion_function.to_string())
+  };
+  object_args.push(option("InsertionFunction", insertion_value));
+  object_args.push(option("MetaInformation", Expr::Association(Vec::new())));
+  call("TemplateObject", object_args)
+}
+
+/// Look up the bound value for a `TemplateSlot[key]`: an integer key indexes a
+/// positional list (1-based); a symbol/string key selects an association entry.
+/// Returns the raw value `Expr` (used directly inside `TemplateExpression`).
+fn template_slot_value(key: &Expr, args: &Expr) -> Option<Expr> {
+  match args {
+    Expr::List(items) => match key {
+      Expr::Integer(n) if *n >= 1 && (*n as usize) <= items.len() => {
+        Some(items[(*n as usize) - 1].clone())
+      }
+      _ => None,
+    },
+    Expr::Association(pairs) => {
+      let key_str = match key {
+        Expr::String(s) => s.clone(),
+        Expr::Identifier(s) => s.clone(),
+        other => expr_to_string(other),
+      };
+      pairs.iter().find_map(|(k, v)| {
+        let k_str = match k {
+          Expr::String(s) => s.clone(),
+          Expr::Identifier(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        (k_str == key_str).then(|| v.clone())
+      })
+    }
+    Expr::FunctionCall { name, args: pairs } if name == "Association" => {
+      let key_str = match key {
+        Expr::String(s) => s.clone(),
+        Expr::Identifier(s) => s.clone(),
+        other => expr_to_string(other),
+      };
+      pairs.iter().find_map(|rule| {
+        let (k, v) = match rule {
+          Expr::Rule {
+            pattern,
+            replacement,
+          }
+          | Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } => (pattern.as_ref(), replacement.as_ref()),
+          _ => return None,
+        };
+        let k_str = match k {
+          Expr::String(s) => s.clone(),
+          Expr::Identifier(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        (k_str == key_str).then(|| v.clone())
+      })
+    }
+    _ => None,
+  }
+}
+
+/// Apply a `TemplateObject[{parts...}, ...]` to arguments. Each
+/// `TemplateSlot[key]` is filled from a list (by 1-indexed position) or an
+/// association (by key name); each `TemplateExpression[expr]` has its slots
+/// substituted, is evaluated, and the result rendered. Returns the combined
+/// string.
+fn template_object_apply(
+  parts: &[Expr],
+  args: &Expr,
+) -> Result<Expr, InterpreterError> {
+  let render = |e: &Expr| -> String {
+    match e {
+      Expr::String(s) => s.clone(),
+      other => expr_to_string(other),
+    }
+  };
+
+  let mut result = String::new();
+  for part in parts {
+    match part {
+      Expr::String(s) => result.push_str(s),
+      Expr::FunctionCall {
+        name,
+        args: slot_args,
+      } if name == "TemplateSlot" && slot_args.len() == 1 => {
+        if let Some(value) = template_slot_value(&slot_args[0], args) {
+          result.push_str(&render(&value));
+        }
+      }
+      Expr::FunctionCall {
+        name,
+        args: expr_args,
+      } if name == "TemplateExpression" && expr_args.len() == 1 => {
+        // Substitute TemplateSlot markers with their bound values, then
+        // evaluate the resulting expression and render it.
+        let substituted = map_expr_tree(&expr_args[0], &|e| match e {
+          Expr::FunctionCall { name, args: a }
+            if name == "TemplateSlot" && a.len() == 1 =>
+          {
+            template_slot_value(&a[0], args)
+          }
+          _ => None,
+        });
+        let evaluated = crate::evaluator::evaluate_expr_to_expr(&substituted)?;
+        result.push_str(&render(&evaluated));
+      }
+      other => result.push_str(&expr_to_string(other)),
+    }
+  }
+  Ok(Expr::String(result))
+}
+
+/// TemplateApply[template, args] - Apply arguments to a string template.
+/// Replaces `n` with the nth argument (1-indexed) from a list,
+/// or `key` with the value from an association.
+pub fn template_apply_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Ok(unevaluated("TemplateApply", args));
+  }
+  // `StringTemplate[s]` is just a wrapper around the template text.
+  if let Expr::FunctionCall { name, args: inner } = &args[0]
+    && name == "StringTemplate"
+    && inner.len() == 1
+  {
+    let mut unwrapped = vec![inner[0].clone()];
+    unwrapped.extend(args[1..].iter().cloned());
+    return template_apply_ast(&unwrapped);
+  }
+  // TemplateApply[template] evaluates the template's expression slots with no
+  // parameters to fill.
+  if args.len() == 1 {
+    return template_apply_ast(&[
+      args[0].clone(),
+      Expr::List(Vec::new().into()),
+    ]);
+  }
+
+  let template = match &args[0] {
+    Expr::String(s) => s.clone(),
+    // TemplateObject[{parts...}, ...] — produced by StringTemplate/FileTemplate.
+    // Fill each TemplateSlot directly from the parts list.
+    Expr::FunctionCall {
+      name,
+      args: object_args,
+    } if name == "TemplateObject" && !object_args.is_empty() => {
+      if let Expr::List(parts) = &object_args[0] {
+        return template_object_apply(parts, &args[1]);
+      }
+      return Ok(args[0].clone());
+    }
+    // An expression template: walk it, filling TemplateSlot / TemplateExpression
+    // and expanding TemplateIf / TemplateSequence.
+    other => {
+      let parts = expand_template_parts(other, &args[1])?;
+      return Ok(match parts.len() {
+        1 => parts.into_iter().next().unwrap(),
+        // Nothing left, or several spliced pieces, is a Sequence.
+        _ => call("Sequence", parts),
+      });
+    }
+  };
+
+  // Expression slots evaluate before the parameter slots are filled.
+  let slot_args: Vec<Expr> = match &args[1] {
+    Expr::List(items) => items.iter().cloned().collect(),
+    other => vec![other.clone()],
+  };
+  let template = expand_expression_slots(&template, &slot_args)?;
+
+  // Build replacement map
+  let replacements: std::collections::HashMap<String, String> = match &args[1] {
+    Expr::List(items) => {
+      let mut map = std::collections::HashMap::new();
+      for (i, item) in items.iter().enumerate() {
+        let value_str = match item {
+          Expr::String(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        map.insert((i + 1).to_string(), value_str);
+      }
+      map
+    }
+    Expr::Association(pairs) => {
+      let mut map = std::collections::HashMap::new();
+      for (k, v) in pairs {
+        let key = match k {
+          Expr::String(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        let value = match v {
+          Expr::String(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        map.insert(key, value);
+      }
+      map
+    }
+    Expr::FunctionCall {
+      name,
+      args: assoc_args,
+    } if name == "Association" => {
+      let mut map = std::collections::HashMap::new();
+      for arg in assoc_args {
+        let (key_expr, val_expr): (&Expr, &Expr) = match arg {
+          Expr::Rule {
+            pattern,
+            replacement,
+          } => (pattern.as_ref(), replacement.as_ref()),
+          Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } => (pattern.as_ref(), replacement.as_ref()),
+          Expr::FunctionCall {
+            name: rule_name,
+            args: rule_args,
+          } if (rule_name == "Rule" || rule_name == "RuleDelayed")
+            && rule_args.len() == 2 =>
+          {
+            (&rule_args[0], &rule_args[1])
+          }
+          _ => continue,
+        };
+        let key = match key_expr {
+          Expr::String(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        let value = match val_expr {
+          Expr::String(s) => s.clone(),
+          other => expr_to_string(other),
+        };
+        map.insert(key, value);
+      }
+      map
+    }
+    _ => {
+      return Ok(unevaluated("TemplateApply", args));
+    }
+  };
+
+  // Replace `key` or `` (positional) patterns in the template
+  let mut result = String::new();
+  let mut chars = template.chars().peekable();
+  let mut positional_index: usize = 1; // counter for `` positional slots
+  while let Some(ch) = chars.next() {
+    if ch == '`' {
+      // Read until closing backtick
+      let mut key = String::new();
+      loop {
+        match chars.next() {
+          Some('`') => break,
+          Some(c) => key.push(c),
+          None => {
+            // No closing backtick - include literally
+            result.push('`');
+            result.push_str(&key);
+            return Ok(Expr::String(result));
+          }
+        }
+      }
+      // Empty key `` means positional slot (1st, 2nd, etc.)
+      let lookup_key = if key.is_empty() {
+        let k = positional_index.to_string();
+        positional_index += 1;
+        k
+      } else {
+        key.clone()
+      };
+      if let Some(replacement) = replacements.get(&lookup_key) {
+        result.push_str(replacement);
+      } else {
+        // No replacement found - keep the slot
+        result.push('`');
+        result.push_str(&key);
+        result.push('`');
+      }
+    } else {
+      result.push(ch);
+    }
+  }
+
+  Ok(Expr::String(result))
+}
+
+/// StringPartition[string, n] partitions string into non-overlapping substrings of length n.
+/// StringPartition[string, n, d] partitions with offset d.
+pub fn string_partition_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || unevaluated("StringPartition", args);
+  // A non-string first argument stays unevaluated.
+  let s = match &args[0] {
+    Expr::String(s) => s.clone(),
+    _ => return Ok(unevaluated()),
+  };
+  // The block size (position 2) must be a positive machine integer; anything
+  // else (0, negative, non-integer, symbolic) emits ::intpm and leaves the
+  // call unevaluated — matching wolframscript, rather than raising an error.
+  let n = match &args[1] {
+    Expr::Integer(n) if *n > 0 => *n as usize,
+    _ => {
+      crate::emit_message(&format!(
+        "StringPartition::intpm: Positive machine-sized integer expected at position 2 in {}.",
+        crate::syntax::format_expr(
+          &unevaluated(),
+          crate::syntax::ExprForm::Output
+        )
+      ));
+      return Ok(unevaluated());
+    }
+  };
+  // The offset (position 3) must likewise be a positive integer; it defaults
+  // to the block size.
+  let d = if args.len() >= 3 {
+    match &args[2] {
+      Expr::Integer(d) if *d > 0 => *d as usize,
+      _ => {
+        crate::emit_message(&format!(
+          "StringPartition::intp: Positive integer expected at position 3 in {}.",
+          crate::syntax::format_expr(
+            &unevaluated(),
+            crate::syntax::ExprForm::Output
+          )
+        ));
+        return Ok(unevaluated());
+      }
+    }
+  } else {
+    n
+  };
+
+  let chars: Vec<char> = s.chars().collect();
+  let mut parts = Vec::new();
+  let mut i = 0;
+  while i + n <= chars.len() {
+    let part: String = chars[i..i + n].iter().collect();
+    parts.push(Expr::String(part));
+    i += d;
+  }
+  Ok(Expr::List(parts.into()))
+}
+
+// ─── DictionaryWordQ ──────────────────────────────────────────────
+
+use std::sync::LazyLock;
+
+static DICTIONARY_WORDS: LazyLock<std::collections::HashSet<String>> =
+  LazyLock::new(|| {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let compressed = include_bytes!("../../resources/dictionary_words.txt.gz");
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut text = String::new();
+    decoder
+      .read_to_string(&mut text)
+      .expect("Failed to decompress dictionary");
+
+    text.lines().map(str::to_lowercase).collect()
+  });
+
+/// DictionaryWordQ[string] - True if string is a dictionary word
+pub fn dictionary_word_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "DictionaryWordQ expects exactly 1 argument".into(),
+    ));
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      let result = s.is_empty() || DICTIONARY_WORDS.contains(&s.to_lowercase());
+      Ok(bool_expr(result))
+    }
+    _ => Ok(unevaluated("DictionaryWordQ", args)),
+  }
+}
+
+/// URLEncode[string] - percent-encode a string for use in URLs
+pub fn url_encode_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  match &evaluated {
+    Expr::String(s) => Ok(Expr::String(percent_encode(s))),
+    Expr::Integer(n) => Ok(Expr::String(n.to_string())),
+    Expr::Real(f) => Ok(Expr::String(format!("{f}"))),
+    Expr::BigFloat(digits, _) => Ok(Expr::String(digits.clone())),
+    Expr::Identifier(id) if id == "None" => Ok(Expr::String(String::new())),
+    Expr::FunctionCall { name, .. } if name == "Missing" => {
+      Ok(Expr::String(String::new()))
+    }
+    Expr::List(items) => {
+      // Thread over lists
+      let encoded: Result<Vec<Expr>, _> = items
+        .iter()
+        .map(|item| url_encode_ast(std::slice::from_ref(item)))
+        .collect();
+      Ok(Expr::List(encoded?.into()))
+    }
+    _ => Ok(unevaluated("URLEncode", args)),
+  }
+}
+
+/// URLDecode[string] - decode a percent-encoded URL string
+pub fn url_decode_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  match &evaluated {
+    Expr::String(s) => Ok(Expr::String(percent_decode(s))),
+    Expr::List(items) => {
+      let decoded: Result<Vec<Expr>, _> = items
+        .iter()
+        .map(|item| url_decode_ast(std::slice::from_ref(item)))
+        .collect();
+      Ok(Expr::List(decoded?.into()))
+    }
+    _ => Ok(unevaluated("URLDecode", args)),
+  }
+}
+
+/// Render a query key/value to its string form before percent-encoding.
+/// Strings pass through verbatim; True/False lower-case (matching WL); other
+/// atoms use their standard textual form.
+fn query_stringify(e: &Expr) -> String {
+  match e {
+    Expr::String(s) => s.clone(),
+    Expr::Identifier(id) if id == "True" => "true".to_string(),
+    Expr::Identifier(id) if id == "False" => "false".to_string(),
+    _ => expr_to_string(e),
+  }
+}
+
+/// Percent-encode a query component, using "+" for spaces (as URLQueryEncode
+/// does, unlike URLEncode which emits "%20").
+fn query_encode_component(s: &str) -> String {
+  percent_encode(s).replace("%20", "+")
+}
+
+/// A query key or value encoded the way URLQueryEncode does (spaces as `+`).
+pub fn url_query_component(s: &str) -> String {
+  query_encode_component(s)
+}
+
+/// URLQueryEncode[assoc | {rules...}] - build a URL query string.
+pub fn url_query_encode_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Ok(unevaluated("URLQueryEncode", args));
+  }
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+
+  // Collect the key/value pairs from either an Association or a list of rules.
+  let pairs: Vec<(Expr, Expr)> = match &evaluated {
+    Expr::Association(entries) => entries.clone(),
+    Expr::List(items) => {
+      let mut out = Vec::with_capacity(items.len());
+      for item in items {
+        match item {
+          Expr::Rule {
+            pattern,
+            replacement,
+          }
+          | Expr::RuleDelayed {
+            pattern,
+            replacement,
+          } => out.push(((**pattern).clone(), (**replacement).clone())),
+          _ => return Ok(unevaluated("URLQueryEncode", args)),
+        }
+      }
+      out
+    }
+    _ => return Ok(unevaluated("URLQueryEncode", args)),
+  };
+
+  let encoded = pairs
+    .iter()
+    .map(|(k, v)| {
+      format!(
+        "{}={}",
+        query_encode_component(&query_stringify(k)),
+        query_encode_component(&query_stringify(v))
+      )
+    })
+    .collect::<Vec<_>>()
+    .join("&");
+  Ok(Expr::String(encoded))
+}
+
+/// URLQueryDecode[string] - parse a URL query string into a list of rules.
+pub fn url_query_decode_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Ok(unevaluated("URLQueryDecode", args));
+  }
+  let evaluated = crate::evaluator::evaluate_expr_to_expr(&args[0])?;
+  let Expr::String(s) = &evaluated else {
+    return Ok(unevaluated("URLQueryDecode", args));
+  };
+  if s.is_empty() {
+    return Ok(Expr::List(Vec::new().into()));
+  }
+  // Query components separate "+" as space, so restore that before percent
+  // decoding (a literal "+" arrives percent-encoded as "%2B").
+  let decode = |part: &str| percent_decode(&part.replace('+', " "));
+  let rules = s
+    .split('&')
+    .map(|segment| {
+      let (raw_key, raw_val) = match segment.split_once('=') {
+        Some((k, v)) => (k, v),
+        None => (segment, ""),
+      };
+      Expr::Rule {
+        pattern: Box::new(Expr::String(decode(raw_key))),
+        replacement: Box::new(Expr::String(decode(raw_val))),
+      }
+    })
+    .collect::<Vec<_>>();
+  Ok(Expr::List(rules.into()))
+}
+
+fn percent_encode(s: &str) -> String {
+  let mut result = String::with_capacity(s.len() * 3);
+  for byte in s.as_bytes() {
+    match *byte {
+      // Unreserved characters (RFC 3986): ALPHA / DIGIT / "-" / "." / "_" / "~"
+      b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+        result.push(*byte as char);
+      }
+      _ => {
+        result.push('%');
+        result.push_str(&format!("{byte:02X}"));
+      }
+    }
+  }
+  result
+}
+
+pub(crate) fn percent_decode(s: &str) -> String {
+  let mut result = Vec::new();
+  let bytes = s.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] == b'%'
+      && i + 2 < bytes.len()
+      && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+    {
+      result.push(byte);
+      i += 3;
+      continue;
+    }
+    result.push(bytes[i]);
+    i += 1;
+  }
+  String::from_utf8_lossy(&result).to_string()
+}
+
+/// StringToByteArray[string] - convert a string to a ByteArray (UTF-8 encoding)
+/// StringToByteArray[string, encoding] - with specified encoding (only UTF-8 supported)
+pub fn string_to_byte_array_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "StringToByteArray expects 1 or 2 arguments".into(),
+    ));
+  }
+  let Expr::String(s) = &args[0] else {
+    return Ok(unevaluated("StringToByteArray", args));
+  };
+  // Encode as UTF-8 bytes and create ByteArray
+  let bytes = s.as_bytes();
+  use base64::Engine;
+  let engine = base64::engine::general_purpose::STANDARD;
+  let b64 = engine.encode(bytes);
+  Ok(call1("ByteArray", Expr::String(b64)))
+}
+
+/// ByteArrayToString[bytearray] - convert a ByteArray to a string (UTF-8 decoding)
+/// ByteArrayToString[bytearray, encoding] - with specified encoding (only UTF-8 supported)
+pub fn byte_array_to_string_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "ByteArrayToString expects 1 or 2 arguments".into(),
+    ));
+  }
+  // Extract bytes from ByteArray
+  if let Expr::FunctionCall {
+    name,
+    args: ba_args,
+  } = &args[0]
+    && name == "ByteArray"
+    && ba_args.len() == 1
+  {
+    let bytes: Vec<u8> = match &ba_args[0] {
+      Expr::String(b64) => {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        engine.decode(b64).unwrap_or_default()
+      }
+      Expr::List(items) => items
+        .iter()
+        .filter_map(|item| {
+          if let Expr::Integer(n) = item {
+            Some(*n as u8)
+          } else {
+            None
+          }
+        })
+        .collect(),
+      _ => {
+        return Ok(unevaluated("ByteArrayToString", args));
+      }
+    };
+    return Ok(Expr::String(String::from_utf8_lossy(&bytes).to_string()));
+  }
+  crate::emit_message(&format!(
+    "ByteArrayToString::barray: {} is not a ByteArray object or {{}}.",
+    expr_to_string(&args[0])
+  ));
+  Ok(unevaluated("ByteArrayToString", args))
+}
+
+/// Extract the bytes of a ByteArray, which stores its data either as a base64
+/// string or as a list of integer byte values.
+pub fn byte_array_bytes(expr: &Expr) -> Option<Vec<u8>> {
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "ByteArray"
+    && args.len() == 1
+  {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    return match &args[0] {
+      Expr::String(b64) => engine.decode(b64).ok(),
+      Expr::List(items) => items
+        .iter()
+        .map(|e| match e {
+          Expr::Integer(n) if (0..=255).contains(n) => Some(*n as u8),
+          _ => None,
+        })
+        .collect(),
+      _ => None,
+    };
+  }
+  None
+}
+
+/// BaseEncode[bytearray] — Base64-encode a ByteArray to a string.
+pub fn base_encode_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("BaseEncode", args));
+  if args.len() != 1 {
+    return unevaluated();
+  }
+  if let Some(bytes) = byte_array_bytes(&args[0]) {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(Expr::String(b64))
+  } else {
+    crate::emit_message(&format!(
+      "BaseEncode::barray: {} is not a ByteArray object.",
+      crate::syntax::format_expr(&args[0], crate::syntax::ExprForm::Output)
+    ));
+    unevaluated()
+  }
+}
+
+/// BaseDecode["string"] — Base64-decode a string to a ByteArray.
+pub fn base_decode_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("BaseDecode", args));
+  if args.len() != 1 {
+    return unevaluated();
+  }
+  match &args[0] {
+    Expr::String(s) => {
+      use base64::Engine;
+      let engine = base64::engine::general_purpose::STANDARD;
+      match engine.decode(s) {
+        // Store the (canonicalised) base64 — Woxi's ByteArray representation.
+        Ok(bytes) => {
+          Ok(call1("ByteArray", Expr::String(engine.encode(&bytes))))
+        }
+        Err(_) => unevaluated(),
+      }
+    }
+    other => {
+      crate::emit_message(&format!(
+        "BaseDecode::strx: String expected instead of {}.",
+        crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+      ));
+      unevaluated()
+    }
+  }
+}
+
+/// TextSentences["string"] — split a string into sentences.
+/// TextSentences["string", n] — first n sentences.
+///
+/// Rule-based segmentation approximating Wolfram's NLP behaviour:
+/// a sentence ends at a run of `.`/`!`/`?` (plus any closing quotes or
+/// brackets) followed by whitespace or end of input — unless the run is
+/// an ellipsis or the preceding token is an abbreviation.
+pub fn text_sentences_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = |args: &[Expr]| unevaluated("TextSentences", args);
+
+  if args.is_empty() || args.len() > 2 {
+    return Ok(unevaluated(args));
+  }
+  let Expr::String(text) = &args[0] else {
+    crate::emit_message(
+      "TextSentences::arg1: String or ContentObject expected at position 1.",
+    );
+    return Ok(unevaluated(args));
+  };
+  let limit = match args.get(1) {
+    None => None,
+    Some(Expr::Integer(n)) if *n >= 1 => Some(*n as usize),
+    Some(_) => {
+      crate::emit_message(
+        "TextSentences::arg2: Positive integer expected at position 2.",
+      );
+      return Ok(unevaluated(args));
+    }
+  };
+
+  let mut sentences: Vec<Expr> = split_sentences(text)
+    .into_iter()
+    .map(Expr::String)
+    .collect();
+  if let Some(n) = limit {
+    sentences.truncate(n);
+  }
+  Ok(Expr::List(sentences.into()))
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+  let chars: Vec<char> = text.chars().collect();
+  let mut sentences = Vec::new();
+  let mut start = 0usize;
+  let mut i = 0usize;
+
+  while i < chars.len() {
+    if !matches!(chars[i], '.' | '!' | '?') {
+      i += 1;
+      continue;
+    }
+
+    // Collect the terminator run (e.g. ".", "?!", "...")
+    let run_start = i;
+    while i < chars.len() && matches!(chars[i], '.' | '!' | '?') {
+      i += 1;
+    }
+    let run_len = i - run_start;
+    let all_dots = chars[run_start..i].iter().all(|&c| c == '.');
+
+    // Include closing quotes/brackets in the sentence
+    while i < chars.len()
+      && matches!(
+        chars[i],
+        '"' | '\'' | '\u{201d}' | '\u{2019}' | ')' | ']' | '}'
+      )
+    {
+      i += 1;
+    }
+    let boundary_end = i;
+
+    // A boundary needs trailing whitespace or end of input
+    // (so decimals like "5.50" never split)
+    if boundary_end < chars.len() && !chars[boundary_end].is_whitespace() {
+      continue;
+    }
+    // An ellipsis does not end a sentence
+    if all_dots && run_len >= 3 {
+      continue;
+    }
+    // Abbreviations (only relevant for a single ".") do not end a sentence
+    if all_dots
+      && run_len == 1
+      && is_abbreviation(&chars[..run_start], &chars[boundary_end..])
+    {
+      continue;
+    }
+
+    let sentence: String = chars[start..boundary_end].iter().collect();
+    let sentence = sentence.trim();
+    if !sentence.is_empty() {
+      sentences.push(sentence.to_string());
+    }
+    start = boundary_end;
+  }
+
+  // Trailing text without a terminator is its own sentence
+  let rest: String = chars[start..].iter().collect();
+  let rest = rest.trim();
+  if !rest.is_empty() {
+    sentences.push(rest.to_string());
+  }
+
+  sentences
+}
+
+/// Decide whether the token directly before a `.` is an abbreviation.
+/// `before` is everything up to (not including) the period;
+/// `after` is everything after the boundary (starting at the whitespace).
+fn is_abbreviation(before: &[char], after: &[char]) -> bool {
+  // Token immediately preceding the period (letters and internal periods)
+  let mut tok_start = before.len();
+  while tok_start > 0 && !before[tok_start - 1].is_whitespace() {
+    tok_start -= 1;
+  }
+  let token: String = before[tok_start..].iter().collect();
+  // Strip leading quotes/brackets from the token
+  let token = token
+    .trim_start_matches(['"', '\'', '\u{201c}', '\u{2018}', '(', '[', '{']);
+
+  if token.is_empty() {
+    return false;
+  }
+
+  // Tokens with internal periods: U.S.A, p.m, a.m, e.g, i.e, ...
+  if token.contains('.') {
+    return true;
+  }
+  // Single-letter initials: "J. Smith"
+  if token.chars().count() == 1 && token.chars().all(char::is_alphabetic) {
+    return true;
+  }
+  // Titles and common abbreviations that never end a sentence
+  const ALWAYS: &[&str] = &[
+    "Mr", "Mrs", "Ms", "Dr", "Prof", "Rev", "Gen", "Sen", "Rep", "Sgt", "Col",
+    "Capt", "Lt", "Mt", "St", "vs", "cf", "al",
+  ];
+  if ALWAYS.contains(&token) {
+    return true;
+  }
+  // Abbreviations that only continue when followed by a number
+  // ("No. 5", "Fig. 3", "Eq. 2")
+  const BEFORE_NUMBER: &[&str] = &["No", "Fig", "Eq", "Sec", "Ch", "pp", "p"];
+  if BEFORE_NUMBER.contains(&token) {
+    let next = after.iter().find(|c| !c.is_whitespace());
+    return matches!(next, Some(c) if c.is_ascii_digit());
+  }
+
+  false
+}
+
+/// Whether the expression is (or contains) a `Quantity`.
+fn contains_quantity(expr: &Expr) -> bool {
+  match expr {
+    Expr::FunctionCall { name, .. } if name == "Quantity" => true,
+    Expr::FunctionCall { args, .. } => args.iter().any(contains_quantity),
+    Expr::List(items) => items.iter().any(contains_quantity),
+    _ => false,
+  }
+}
+
+/// Render `Quantity[magnitude, unit]` as text. `abbreviated` picks the
+/// `TextString` form (which also applies the TextString number rules to the
+/// magnitude); otherwise the unit is spelled out, as `ToString` writes it.
+fn quantity_to_text(args: &[Expr], abbreviated: bool) -> Option<String> {
+  if args.len() != 2 {
+    return None;
+  }
+  let (magnitude, unit) = (&args[0], &args[1]);
+  let is_one = matches!(magnitude, Expr::Integer(1));
+  let magnitude_text = if abbreviated {
+    text_string_render(magnitude)
+      .unwrap_or_else(|| text_string_to_string_form(magnitude))
+  } else {
+    // The full ToString path, so an exact fraction keeps its 2D layout.
+    text_string_to_string_form(magnitude)
+  };
+  let unit_text = crate::functions::quantity_ast::quantity_unit_text(
+    unit,
+    is_one,
+    abbreviated,
+  )?;
+  use crate::functions::quantity_ast::UnitText;
+  Some(match unit_text {
+    UnitText::Prefix(p) => format!("{p}{magnitude_text}"),
+    UnitText::PrefixWords(p, words) => {
+      format!("{p}{magnitude_text} {words}")
+    }
+    UnitText::Suffix(s) => format!("{magnitude_text}{s}"),
+    UnitText::Words(words) => {
+      // A magnitude that spans several lines (a fraction) carries the unit on
+      // its baseline: "1250" over "---- feet" over "381".
+      let lines: Vec<&str> = magnitude_text.split('\n').collect();
+      if lines.len() > 1 {
+        let bar = lines
+          .iter()
+          .position(|l| {
+            !l.trim().is_empty() && l.trim().chars().all(|c| c == '-')
+          })
+          .unwrap_or(lines.len() - 1);
+        lines
+          .iter()
+          .enumerate()
+          .map(|(i, l)| {
+            if i == bar {
+              format!("{l} {words}")
+            } else {
+              (*l).to_string()
+            }
+          })
+          .collect::<Vec<_>>()
+          .join("\n")
+      } else {
+        format!("{magnitude_text} {words}")
+      }
+    }
+  })
+}
+
+/// `TextString[expr]` — the human-readable text form. Numbers differ from
+/// `ToString`: every approximate real is written in full decimal (never
+/// `1.23457*^6`), a real whose integer part is shorter than six digits keeps a
+/// fractional digit (`2.` is "2.0"), and an exact numeric expression that is
+/// not a bare symbol is numericized to six significant digits (`1/3` is
+/// "0.333333", `Sqrt[2]` is "1.41421", while `Pi` stays "Pi").
+pub fn text_string_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return to_string_ast(args);
+  }
+  match text_string_render(&args[0]) {
+    Some(rendered) => Ok(Expr::String(rendered)),
+    None => to_string_ast(args),
+  }
+}
+
+/// The `TextString` rendering of a real: full decimal notation, with a
+/// fractional digit kept when the integer part is shorter than the six
+/// significant digits of machine display (`100.` is "100.0", `123456.` stays
+/// "123456.").
+fn text_string_real(f: f64) -> String {
+  let mut s = decimal_form_default(f);
+  if s.ends_with('.')
+    && s
+      .trim_start_matches('-')
+      .trim_end_matches('.')
+      .chars()
+      .count()
+      < 6
+  {
+    s.push('0');
+  }
+  s
+}
+
+/// The numeric value of an expression that `TextString` numericizes. A bare
+/// symbol is left alone (`Pi`, `E`, `GoldenRatio` print as themselves) and so
+/// is anything `N` cannot reduce to a machine real.
+fn text_string_numeric_value(expr: &Expr) -> Option<f64> {
+  if matches!(expr, Expr::Identifier(_) | Expr::Constant(_)) {
+    return None;
+  }
+  match crate::evaluator::evaluate_function_call_ast(
+    "N",
+    std::slice::from_ref(expr),
+  ) {
+    Ok(Expr::Real(f)) => Some(f),
+    _ => None,
+  }
+}
+
+/// The `TextString` form of a list element or association entry: anything the
+/// number rules do not cover keeps its ordinary `ToString` rendering, so
+/// `TextString[{1/2, Pi}]` is "{0.5, Pi}".
+fn text_string_part(expr: &Expr) -> String {
+  text_string_render(expr).unwrap_or_else(|| text_string_to_string_form(expr))
+}
+
+/// The ordinary `ToString` rendering of an expression, used wherever
+/// `TextString` has no rule of its own.
+fn text_string_to_string_form(expr: &Expr) -> String {
+  match to_string_ast(std::slice::from_ref(expr)) {
+    Ok(Expr::String(ref s)) => s.clone(),
+    _ => to_string_default_form(expr),
+  }
+}
+
+fn text_string_render(expr: &Expr) -> Option<String> {
+  match expr {
+    // Exact integers keep every digit.
+    Expr::Integer(i) => return Some(i.to_string()),
+    Expr::BigInteger(i) => return Some(i.to_string()),
+    Expr::Real(f) => return Some(text_string_real(*f)),
+    Expr::String(s) => return Some(s.clone()),
+    Expr::List(items) => {
+      let parts: Vec<String> = items.iter().map(text_string_part).collect();
+      return Some(format!("{{{}}}", parts.join(", ")));
+    }
+    Expr::Association(pairs) => {
+      let parts: Vec<String> = pairs
+        .iter()
+        .map(|(k, v)| {
+          format!("{} -> {}", text_string_part(k), text_string_part(v))
+        })
+        .collect();
+      return Some(format!("<|{}|>", parts.join(", ")));
+    }
+    // An extended-precision number keeps every digit it carries.
+    Expr::BigFloat(..) => return Some(text_string_to_string_form(expr)),
+    // A missing value contributes nothing to the text.
+    Expr::FunctionCall { name, .. } if name == "Missing" => {
+      return Some(String::new());
+    }
+    // A quantity abbreviates its unit: "3 m".
+    Expr::FunctionCall { name, args } if name == "Quantity" => {
+      return quantity_to_text(args, true);
+    }
+    // `TextString` does not apply format rules, so a held `Definition[sym]`
+    // reads as the call itself rather than as the definition text.
+    Expr::FunctionCall { name, args }
+      if (name == "Definition" || name == "FullDefinition")
+        && args.len() == 1
+        && matches!(&args[0], Expr::Identifier(_)) =>
+    {
+      return Some(format!("{}[{}]", name, text_string_part(&args[0])));
+    }
+    _ => {}
+  }
+
+  // Infinities print as the symbol.
+  if crate::functions::predicate_ast::is_directed_infinity(expr) {
+    let negative = matches!(
+      crate::evaluator::evaluate_function_call_ast(
+        "Sign",
+        std::slice::from_ref(expr),
+      ),
+      Ok(Expr::Integer(-1))
+    );
+    return Some(if negative { "-\u{221e}" } else { "\u{221e}" }.to_string());
+  }
+
+  // A complex number shows both parts, the imaginary one always as a real and
+  // its sign carried by the operator: `2 + 3 I` is "2 + 3.0i".
+  if crate::functions::predicate_ast::is_complex_number(expr) {
+    let part = |head: &str| {
+      crate::evaluator::evaluate_function_call_ast(
+        head,
+        std::slice::from_ref(expr),
+      )
+      .ok()
+    };
+    if let (Some(re), Some(im)) = (part("Re"), part("Im"))
+      && let Some(im_value) = text_string_numeric_value(&im).or(match im {
+        Expr::Integer(i) => Some(i as f64),
+        Expr::Real(f) => Some(f),
+        _ => None,
+      })
+      && let Some(re_text) = match (&re, &im) {
+        // An approximate complex prints both parts as reals, so `-1.5 I`
+        // (whose real part is the exact 0 here) shows "0.0 - 1.5i".
+        (Expr::Integer(i), Expr::Real(_)) => Some(text_string_real(*i as f64)),
+        _ => text_string_render(&re),
+      }
+    {
+      let sign = if im_value < 0.0 { "-" } else { "+" };
+      return Some(format!(
+        "{re_text} {sign} {}i",
+        text_string_real(im_value.abs())
+      ));
+    }
+  }
+
+  // Any other exact numeric expression is numericized.
+  text_string_numeric_value(expr).map(text_string_real)
+}
+
+/// The options shared by the `NumberForm` display family (`NumberForm`,
+/// `PaddedForm`, `AccountingForm`). Parsed once by `number_form_options` so
+/// every head applies them the same way.
+pub(crate) struct NumberFormOptions {
+  /// `NumberPoint` — the string standing in for the decimal point.
+  point: String,
+  /// `NumberSeparator[[1]]` — between integer-side digit blocks.
+  int_sep: String,
+  /// `NumberSeparator[[2]]` — between fractional-side digit blocks.
+  frac_sep: String,
+  /// `DigitBlock` — digits per block, `None` for one unbroken run.
+  block: Option<usize>,
+  /// `NumberPadding[[1]]` — fills the integer field to its width.
+  lpad: String,
+  /// `NumberPadding[[2]]` — fills the fraction past its significant digits.
+  rpad: String,
+  /// `NumberSigns -> {neg, pos}`, when given: a prefix replacing the default
+  /// sign (and, for AccountingForm, the parentheses).
+  signs: Option<(String, String)>,
+  /// `SignPadding` — True puts the sign before the padding, False (the
+  /// default) keeps it next to the digits.
+  sign_padding: bool,
+  /// `ExponentFunction -> (Null &)` — an exponent function that returns
+  /// `Null` for every exponent means "never use scientific notation", so
+  /// the number is written out in full.
+  suppress_exponent: bool,
+}
+
+/// Parse the `NumberForm`-family options out of a display-form argument list.
+/// The padding defaults differ per head: `PaddedForm` pads the integer field
+/// with spaces, `NumberForm` does not pad it at all, and `AccountingForm`
+/// pads neither side (so `AccountingForm[12.345, {5, 2}]` is "12.35", not
+/// "12.35" padded out to the field).
+/// Whether an `ExponentFunction` option maps every exponent to `Null` —
+/// Wolfram's way of asking for a number to be written out rather than put
+/// in scientific notation. Probed at two exponents, which tells a
+/// constant `(Null &)` apart from a function that picks one.
+fn exponent_function_suppresses(args: &[Expr]) -> bool {
+  let Some(f) = args.iter().find_map(|a| match a {
+    Expr::Rule {
+      pattern,
+      replacement,
+    } if matches!(pattern.as_ref(), Expr::Identifier(s)
+      if s == "ExponentFunction") =>
+    {
+      Some(replacement.as_ref())
+    }
+    _ => None,
+  }) else {
+    return false;
+  };
+  [0i128, 12].iter().all(|&e| {
+    crate::functions::list_helpers_ast::apply_func_ast(f, &Expr::Integer(e))
+      .ok()
+      .map(|applied| {
+        crate::evaluator::evaluate_expr_to_expr(&applied).unwrap_or(applied)
+      })
+      .is_some_and(|v| matches!(&v, Expr::Identifier(s) if s == "Null"))
+  })
+}
+
+pub(crate) fn number_form_options(
+  head: &str,
+  args: &[Expr],
+) -> NumberFormOptions {
+  let mut opts = NumberFormOptions {
+    point: ".".to_string(),
+    int_sep: ",".to_string(),
+    frac_sep: " ".to_string(),
+    block: None,
+    lpad: if head == "PaddedForm" { " " } else { "" }.to_string(),
+    rpad: if head == "AccountingForm" { "" } else { "0" }.to_string(),
+    signs: None,
+    sign_padding: false,
+    suppress_exponent: exponent_function_suppresses(args),
+  };
+  let text = |e: &Expr| match e {
+    Expr::String(s) => Some(s.clone()),
+    _ => None,
+  };
+  for a in args {
+    let Expr::Rule {
+      pattern,
+      replacement,
+    } = a
+    else {
+      continue;
+    };
+    let Expr::Identifier(opt) = pattern.as_ref() else {
+      continue;
+    };
+    match opt.as_str() {
+      "NumberPoint" => {
+        if let Some(p) = text(replacement) {
+          opts.point = p;
+        }
+      }
+      "NumberSeparator" => match replacement.as_ref() {
+        Expr::String(s) => {
+          opts.int_sep.clone_from(s);
+          opts.frac_sep.clone_from(s);
+        }
+        Expr::List(items) if items.len() == 2 => {
+          if let Some(s) = text(&items[0]) {
+            opts.int_sep = s;
+          }
+          if let Some(s) = text(&items[1]) {
+            opts.frac_sep = s;
+          }
+        }
+        _ => {}
+      },
+      "DigitBlock" => {
+        if let Expr::Integer(n) = replacement.as_ref()
+          && *n >= 1
+        {
+          opts.block = Some(*n as usize);
+        }
+      }
+      // A single string sets the integer-side padding only.
+      "NumberPadding" => match replacement.as_ref() {
+        Expr::String(s) => opts.lpad.clone_from(s),
+        Expr::List(pad) if pad.len() == 2 => {
+          if let Some(s) = text(&pad[0]) {
+            opts.lpad = s;
+          }
+          if let Some(s) = text(&pad[1]) {
+            opts.rpad = s;
+          }
+        }
+        _ => {}
+      },
+      "NumberSigns" => {
+        if let Expr::List(signs) = replacement.as_ref()
+          && signs.len() == 2
+          && let (Some(neg), Some(pos)) = (text(&signs[0]), text(&signs[1]))
+        {
+          opts.signs = Some((neg, pos));
+        }
+      }
+      "SignPadding" => {
+        opts.sign_padding =
+          matches!(replacement.as_ref(), Expr::Identifier(s) if s == "True");
+      }
+      _ => {}
+    }
+  }
+  opts
+}
+
+/// Separators a full digit field of `digits` columns receives at this block
+/// size. They widen the padded field, so `PaddedForm[123456, 8, DigitBlock ->
+/// 3]` reserves 8 digit columns plus the two separators that a full field
+/// would carry.
+fn digit_block_separators(digits: usize, block: Option<usize>) -> usize {
+  match block {
+    Some(b) if b >= 1 && digits >= 1 => (digits - 1) / b,
+    _ => 0,
+  }
+}
+
+/// Render one scalar of the `NumberForm` display family with its options
+/// applied. `spec` is the positional precision argument (`n`, `{n, f}` or
+/// none). Returns None when the value is not a machine number, when the spec
+/// is malformed, or when the number renders in scientific notation and the
+/// caller must fall back to the 2D form.
+fn number_form_family_scalar(
+  head: &str,
+  value: &Expr,
+  spec: Option<&Expr>,
+  opts: &NumberFormOptions,
+) -> Option<String> {
+  let (neg, magnitude) = match value {
+    Expr::Integer(i) => (*i < 0, Expr::Integer(i.abs())),
+    Expr::Real(f) => (*f < 0.0, Expr::Real(f.abs())),
+    _ => return None,
+  };
+  let is_integer = matches!(magnitude, Expr::Integer(_));
+  // The fixed `{n, f}` spec is the only one that pads the fraction; the
+  // significant-figure specs render the value as-is.
+  let fixed = match spec {
+    Some(Expr::List(parts)) if parts.len() == 2 => {
+      match (&parts[0], &parts[1]) {
+        (Expr::Integer(n), Expr::Integer(f)) if *n >= 0 && *f >= 0 => {
+          Some((*n as i64, *f as i64))
+        }
+        _ => return None,
+      }
+    }
+    _ => None,
+  };
+  // Body digits, and the exponent when the value goes to scientific notation.
+  let (body, exp) = match (fixed, spec) {
+    (Some((_, f)), _) => (number_form_fixed_to_string(&magnitude, f)?, None),
+    (None, Some(Expr::Integer(n))) => {
+      if head == "AccountingForm" || opts.suppress_exponent {
+        // AccountingForm never switches to scientific notation.
+        (number_form_to_string(&magnitude, *n as i64)?, None)
+      } else {
+        let (mantissa, exp) = number_form_parts(&magnitude, *n as i64)?;
+        (mantissa, exp)
+      }
+    }
+    (None, None) => {
+      if head == "AccountingForm" || opts.suppress_exponent {
+        match &magnitude {
+          Expr::Integer(i) => (i.to_string(), None),
+          Expr::Real(f) => (decimal_form_default(*f), None),
+          _ => return None,
+        }
+      } else {
+        let (mantissa, exp) = number_form_parts(&magnitude, 6)?;
+        (mantissa, exp)
+      }
+    }
+    (None, Some(_)) => return None,
+  };
+
+  // `had_point` keeps the decimal point in place even when every fractional
+  // digit turns out to be padding (`NumberForm[50., {3, 1}]` is "50.0").
+  let (int_digits, mut frac_digits, had_point) = match body.split_once('.') {
+    Some((ip, fp)) => (ip.to_string(), fp.to_string(), true),
+    None => (body.clone(), String::new(), false),
+  };
+  // AccountingForm brackets a negative value; the closing bracket sits right
+  // after the significant fractional digits, before any padding.
+  let close = if head == "AccountingForm" && neg && opts.signs.is_none() {
+    ")"
+  } else {
+    ""
+  };
+  // Past the value's significant fractional digits the right NumberPadding
+  // string fills the remaining slots, so an empty one suppresses the trailing
+  // zeros that the fixed rendering produced. AccountingForm keeps one extra
+  // slot for the closing bracket.
+  let mut fill = String::new();
+  // An integer ignores the fractional spec entirely: no point, no padding.
+  if let Some((_, f)) = fixed.filter(|_| !is_integer) {
+    let slots = f as usize + usize::from(head == "AccountingForm");
+    let keep = frac_digits.trim_end_matches('0').chars().count();
+    frac_digits = frac_digits.chars().take(keep).collect();
+    if !opts.rpad.is_empty() {
+      let mut used = keep + close.chars().count();
+      while used < slots {
+        fill.push_str(&opts.rpad);
+        used += 1;
+      }
+    }
+  }
+
+  // Digit blocks, then the decimal point stand-in.
+  let int_body = match opts.block {
+    Some(b) => group_digits_from_right(&int_digits, b, &opts.int_sep),
+    None => int_digits.clone(),
+  };
+  if let Some(b) = opts.block
+    && !frac_digits.is_empty()
+  {
+    frac_digits = group_digits_from_left(&frac_digits, b, &opts.frac_sep);
+  }
+
+  let sign = match &opts.signs {
+    Some((n, p)) => {
+      if neg {
+        n.clone()
+      } else {
+        p.clone()
+      }
+    }
+    None => match (head, neg) {
+      ("AccountingForm", true) => "(".to_string(),
+      (_, true) => "-".to_string(),
+      _ => String::new(),
+    },
+  };
+
+  // Scientific notation carries no padded field: the 2D form is assembled
+  // straight from the mantissa.
+  if let Some(e) = exp {
+    let mut mantissa = format!("{sign}{int_body}");
+    if had_point || !frac_digits.is_empty() {
+      mantissa.push_str(&opts.point);
+      mantissa.push_str(&frac_digits);
+    }
+    return Some(sci_parts_to_2d_string(&mantissa, Some(e)));
+  }
+
+  let point = if had_point || !frac_digits.is_empty() {
+    opts.point.clone()
+  } else {
+    String::new()
+  };
+  let tail = format!("{point}{frac_digits}{close}{fill}");
+
+  // Field widths. A significant-figure spec pads the whole rendering to
+  // n digit columns plus a sign column (and a column for the decimal point);
+  // the fixed `{n, f}` spec pads the integer field only, since the fraction
+  // already occupies its f columns. Digit-block separators widen the field by
+  // the number a full field would carry.
+  let (field, padded_part) = match (fixed, spec) {
+    (Some((n, f)), _) => {
+      // The integer field spans the n - f digit columns the fraction leaves
+      // over, plus a sign column; an integer value keeps all n columns.
+      let digits = if is_integer {
+        n.max(0) as usize
+      } else {
+        (n - f).max(0) as usize
+      };
+      (
+        digits + 1 + digit_block_separators(digits, opts.block),
+        int_body.clone(),
+      )
+    }
+    (None, Some(Expr::Integer(n))) => {
+      let digits = (*n).max(0) as usize;
+      let has_point = had_point && !is_integer;
+      (
+        digits
+          + 1
+          + usize::from(has_point)
+          + digit_block_separators(digits, opts.block),
+        format!("{int_body}{tail}"),
+      )
+    }
+    _ => {
+      return Some(format!("{sign}{int_body}{tail}"));
+    }
+  };
+
+  // A value wider than the requested field widens it, but a column is always
+  // reserved for the sign.
+  let field = field.max(padded_part.chars().count() + 1);
+  // With SignPadding the sign leads the padding; by default it stays next to
+  // the digits, so the padding fills the columns before it.
+  let padded = if opts.sign_padding && !sign.is_empty() {
+    let inner = pad_left(
+      &padded_part,
+      field.saturating_sub(sign.chars().count()),
+      &opts.lpad,
+    );
+    format!("{sign}{inner}")
+  } else {
+    pad_left(&format!("{sign}{padded_part}"), field, &opts.lpad)
+  };
+  Some(if fixed.is_some() {
+    format!("{padded}{tail}")
+  } else {
+    padded
+  })
+}
+
+/// Render `NumberForm[…]`, `PaddedForm[…]` or `AccountingForm[…]` (options
+/// included) to its plain-text form. Lists thread element-wise, non-numeric
+/// arguments render as the expression itself (wolframscript shows
+/// `NumberForm[Pi, 5]` as "Pi"), and the `ExponentFunction`/`NumberFormat`
+/// options are left to their dedicated renderers.
+pub(crate) fn number_form_family_to_string(
+  head: &str,
+  inner: &[Expr],
+) -> Option<String> {
+  let positional: Vec<&Expr> = inner
+    .iter()
+    .filter(|a| !matches!(a, Expr::Rule { .. } | Expr::RuleDelayed { .. }))
+    .collect();
+  if positional.is_empty() || positional.len() > 2 {
+    return None;
+  }
+  // A `NumberFormat`, or an `ExponentFunction` that actually chooses an
+  // exponent, is rendered by the dedicated custom-format path. One that
+  // only suppresses the exponent is handled here, since everything else
+  // about the number is formatted as usual.
+  let has_custom_format = inner.iter().any(|a| {
+    matches!(a, Expr::Rule { pattern, .. }
+      if matches!(pattern.as_ref(), Expr::Identifier(s)
+        if s == "NumberFormat"))
+  }) || (inner.iter().any(|a| {
+    matches!(a, Expr::Rule { pattern, .. }
+      if matches!(pattern.as_ref(), Expr::Identifier(s)
+        if s == "ExponentFunction"))
+  }) && !exponent_function_suppresses(inner));
+  if has_custom_format {
+    return None;
+  }
+  let value = positional[0];
+  let spec = positional.get(1).copied();
+  let opts = number_form_options(head, inner);
+
+  // A list renders element-wise; `list_form_2d_string` lifts a 2D exponent
+  // line above the whole list rather than breaking it mid-element.
+  if let Expr::List(_) = value {
+    let options: Vec<Expr> = inner
+      .iter()
+      .filter(|a| matches!(a, Expr::Rule { .. }))
+      .cloned()
+      .collect();
+    return render_form_threaded(value, |e| {
+      let mut one = vec![e.clone()];
+      if let Some(spec) = spec {
+        one.push(spec.clone());
+      }
+      one.extend(options.iter().cloned());
+      number_form_family_to_string(head, &one)
+    });
+  }
+
+  // A `BaseForm` value keeps its own (subscripted) rendering, padded by the
+  // dedicated PaddedForm path.
+  if matches!(value, Expr::FunctionCall { name, .. } if name == "BaseForm") {
+    return None;
+  }
+
+  // Requesting fewer significant figures than the number has integer digits
+  // pads them with zeros, which wolframscript reports.
+  if let Some(Expr::Integer(n)) = spec {
+    let reqsigz = if head == "AccountingForm" {
+      integer_digit_count(value).is_some_and(|d| (*n as i64) < d)
+    } else {
+      number_form_reqsigz(value, *n as i64)
+    };
+    if reqsigz {
+      crate::emit_message(&format!(
+        "{head}::reqsigz: Requested number precision is lower than number of \
+         digits shown; padding with zeros.",
+      ));
+    }
+  }
+
+  if let Some(rendered) = number_form_family_scalar(head, value, spec, &opts) {
+    return Some(rendered);
+  }
+
+  // A complex number is formatted part by part, with the sign of the
+  // imaginary part written as the operator joining them:
+  // `PaddedForm[0.35355 + 0.35355 I, {4, 3}]` is " 0.354 +  0.354 I".
+  if let Some((re, im)) =
+    crate::functions::math_ast::try_extract_complex_float(value)
+    && im != 0.0
+    && !matches!(value, Expr::Integer(_) | Expr::Real(_))
+  {
+    let part = |v: f64| {
+      number_form_family_scalar(head, &Expr::Real(v), spec, &opts)
+        .unwrap_or_else(|| crate::syntax::format_real(v))
+    };
+    return Some(format!(
+      "{} {} {} I",
+      part(re),
+      if im < 0.0 { "-" } else { "+" },
+      part(im.abs())
+    ));
+  }
+  // Anything that is not a machine number renders as itself: wolframscript
+  // shows `NumberForm[Pi, 5]` as "Pi" and `NumberForm[3/4]` as the 2D
+  // fraction, dropping the wrapper.
+  if matches!(
+    value,
+    Expr::Integer(_)
+      | Expr::Real(_)
+      | Expr::BigInteger(_)
+      | Expr::BigFloat(_, _)
+  ) {
+    return None;
+  }
+  // A symbolic expression is formatted number by number: the wrapper applies
+  // to the approximate reals *inside* `expr`, so
+  // `NumberForm[0.370991 x - 0.927478 y, {4, 3}]` reads `0.371 x - 0.927 y`.
+  let formatted = number_form_family_inner(head, spec, &opts, value);
+  match to_string_ast(std::slice::from_ref(&formatted)) {
+    Ok(Expr::String(ref rendered)) => Some(rendered.clone()),
+    _ => None,
+  }
+}
+
+/// Rewrite every machine real inside `expr` as the text the
+/// `NumberForm`/`PaddedForm`/`AccountingForm` wrapper gives it, leaving the
+/// surrounding structure alone so it still prints as an expression. A
+/// negative coefficient becomes an explicit `-1` factor of its product,
+/// which is what the sum printer looks for to write `a - b` rather than
+/// `a + -b`.
+fn number_form_family_inner(
+  head: &str,
+  spec: Option<&Expr>,
+  opts: &NumberFormOptions,
+  expr: &Expr,
+) -> Expr {
+  // The formatted text of a real, as a verbatim token.
+  let formatted = |v: f64| -> Option<Expr> {
+    number_form_family_scalar(head, &Expr::Real(v), spec, opts).map(Expr::Raw)
+  };
+  // Split a product's factors, pulling a negative leading real out as `-1`.
+  let product_factors = |factors: &[Expr]| -> Option<Vec<Expr>> {
+    let Expr::Real(f) = factors.first()? else {
+      return None;
+    };
+    if *f >= 0.0 {
+      return None;
+    }
+    let mut out = vec![Expr::Integer(-1), formatted(-f)?];
+    out.extend(
+      factors[1..]
+        .iter()
+        .map(|a| number_form_family_inner(head, spec, opts, a)),
+    );
+    Some(out)
+  };
+  let recurse = |a: &Expr| number_form_family_inner(head, spec, opts, a);
+  match expr {
+    Expr::Real(f) => formatted(*f).unwrap_or_else(|| expr.clone()),
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let args = product_factors(args)
+        .unwrap_or_else(|| args.iter().map(recurse).collect());
+      Expr::FunctionCall {
+        name: name.clone(),
+        args: args.into(),
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => match product_factors(&[(**left).clone(), (**right).clone()]) {
+      Some(args) => call("Times", args),
+      None => times2(recurse(left), recurse(right)),
+    },
+    Expr::FunctionCall { name, args } => Expr::FunctionCall {
+      name: name.clone(),
+      args: args.iter().map(recurse).collect::<Vec<_>>().into(),
+    },
+    Expr::List(items) => {
+      Expr::List(items.iter().map(recurse).collect::<Vec<_>>().into())
+    }
+    Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+      op: *op,
+      left: Box::new(recurse(left)),
+      right: Box::new(recurse(right)),
+    },
+    Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(recurse(operand)),
+    },
+    _ => expr.clone(),
+  }
+}
+
+/// Render `ScientificForm[…]` / `EngineeringForm[…]`, honoring the shared
+/// `NumberForm` options that apply to a mantissa (`NumberPoint`, `DigitBlock`
+/// and `NumberSeparator`). Both heads take an optional precision argument and
+/// thread over lists.
+fn exponent_form_to_string(head: &str, inner: &[Expr]) -> Option<String> {
+  let positional: Vec<&Expr> = inner
+    .iter()
+    .filter(|a| !matches!(a, Expr::Rule { .. } | Expr::RuleDelayed { .. }))
+    .collect();
+  if positional.is_empty() || positional.len() > 2 {
+    return None;
+  }
+  // The exponent-function renderer has its own path.
+  if inner.iter().any(|a| {
+    matches!(a, Expr::Rule { pattern, .. }
+      if matches!(pattern.as_ref(), Expr::Identifier(s)
+        if s == "ExponentFunction" || s == "NumberFormat"))
+  }) {
+    return None;
+  }
+  let n = match positional.get(1) {
+    None => 6,
+    Some(Expr::Integer(n)) => *n as i64,
+    Some(_) => return None,
+  };
+  let opts = number_form_options(head, inner);
+  render_form_threaded(positional[0], |x| {
+    let (mantissa, exp) = if head == "ScientificForm" {
+      scientific_form_parts(x, n)?
+    } else {
+      engineering_form_parts(x, n)?
+    };
+    let mantissa = apply_mantissa_options(&mantissa, &opts);
+    Some(sci_parts_to_2d_string(&mantissa, exp))
+  })
+}
+
+/// Apply the digit-block and decimal-point options to an already rendered
+/// mantissa string.
+fn apply_mantissa_options(mantissa: &str, opts: &NumberFormOptions) -> String {
+  let (sign, body) = match mantissa.strip_prefix('-') {
+    Some(rest) => ("-", rest),
+    None => ("", mantissa),
+  };
+  let (int_part, frac_part) = match body.split_once('.') {
+    Some((ip, fp)) => (ip.to_string(), Some(fp.to_string())),
+    None => (body.to_string(), None),
+  };
+  let int_part = match opts.block {
+    Some(b) => group_digits_from_right(&int_part, b, &opts.int_sep),
+    None => int_part,
+  };
+  match frac_part {
+    None => format!("{sign}{int_part}"),
+    Some(fp) => {
+      let fp = match opts.block {
+        Some(b) if !fp.is_empty() => {
+          group_digits_from_left(&fp, b, &opts.frac_sep)
+        }
+        _ => fp,
+      };
+      format!("{sign}{int_part}{}{fp}", opts.point)
+    }
+  }
+}
+
+/// Render PaddedForm[value, spec] as wolframscript's padded string.
+/// Integer spec n: right-aligned to width n + 1. List spec {n, f}:
+/// rounded to f decimals (with trailing zeros) and right-aligned to
+/// width n + 2. None for non-numeric values or malformed specs.
+/// The left NumberPadding string of a display-form argument list: the first
+/// element of a `NumberPadding -> {p1, p2}` rule, or " " when absent.
+fn number_padding_left(args: &[Expr]) -> String {
+  for a in args {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = a
+      && matches!(pattern.as_ref(), Expr::Identifier(s) if s == "NumberPadding")
+      && let Expr::List(pad) = replacement.as_ref()
+      && let Some(Expr::String(p1)) = pad.first()
+    {
+      return p1.clone();
+    }
+  }
+  " ".to_string()
+}
+
+/// The right NumberPadding string of a display-form argument list: the second
+/// element of a `NumberPadding -> {p1, p2}` rule, or "0" when absent. This pads
+/// the fractional part past the value's significant digits, so an explicit ""
+/// suppresses trailing zeros (e.g. `PaddedForm[1.5, {4, 2}, NumberPadding ->
+/// {"0", ""}]` -> "001.5" rather than "001.50").
+fn number_padding_right(args: &[Expr]) -> String {
+  for a in args {
+    if let Expr::Rule {
+      pattern,
+      replacement,
+    } = a
+      && matches!(pattern.as_ref(), Expr::Identifier(s) if s == "NumberPadding")
+      && let Expr::List(pad) = replacement.as_ref()
+      && let Some(Expr::String(p2)) = pad.get(1)
+    {
+      return p2.clone();
+    }
+  }
+  "0".to_string()
+}
+
+/// Left-pad `body` to `width` columns with the padding string `lpad`
+/// (one copy per missing column, so an empty `lpad` disables padding).
+fn pad_left(body: &str, width: usize, lpad: &str) -> String {
+  let count = width.saturating_sub(body.chars().count());
+  format!("{}{}", lpad.repeat(count), body)
+}
+
+/// Right-align an integer's digit string into a padded field. A column is always
+/// reserved for the sign (filled by the pad character, matching the verified
+/// NumberForm NumberPadding behavior), and the digit field widens past `n`
+/// when the number has more digits, so e.g. `123` with n=2 renders as ` 123`
+/// (width 4).
+fn pad_integer_body(body: &str, n: usize, lpad: &str) -> String {
+  let num_digits = body.trim_start_matches('-').chars().count();
+  pad_left(body, n.max(num_digits) + 1, lpad)
+}
+
+/// Padded digits of `PaddedForm[BaseForm[x, b], n]`: the base-b digit string
+/// of the integer `x`, left-padded to n + 1 columns with `lpad` exactly like
+/// the decimal integer field. Returns `(padded_digits, base)`; None when the
+/// value is not an integer BaseForm or the spec is malformed. A `{n, f}` spec
+/// pads to its integer part (integers ignore the fractional spec).
+fn padded_base_form_digits(
+  value: &Expr,
+  spec: &Expr,
+  lpad: &str,
+) -> Option<(String, i128)> {
+  let Expr::FunctionCall { name, args } = value else {
+    return None;
+  };
+  if name != "BaseForm" || args.len() != 2 {
+    return None;
+  }
+  let (Expr::Integer(x), Expr::Integer(b)) = (&args[0], &args[1]) else {
+    return None;
+  };
+  if !(2..=36).contains(b) {
+    return None;
+  }
+  let n = match spec {
+    Expr::Integer(n) if *n >= 0 => *n,
+    Expr::List(parts) if parts.len() == 2 => match &parts[0] {
+      Expr::Integer(n) if *n >= 0 => *n,
+      _ => return None,
+    },
+    _ => return None,
+  };
+  let digits = integer_to_base_string(*x, *b);
+  Some((pad_integer_body(&digits, n as usize, lpad), *b))
+}
+
+/// Padded digits of a full `PaddedForm[BaseForm[x, b], spec, opts…]` argument
+/// list, honoring a `NumberPadding` option. Returns `(padded_digits, base)`;
+/// None when the arguments are not the BaseForm-in-PaddedForm shape.
+pub fn padded_form_base_parts(args: &[Expr]) -> Option<(String, i128)> {
+  let positional: Vec<&Expr> = args
+    .iter()
+    .filter(|a| !matches!(a, Expr::Rule { .. }))
+    .collect();
+  if positional.len() != 2 {
+    return None;
+  }
+  let lpad = number_padding_left(args);
+  padded_base_form_digits(positional[0], positional[1], &lpad)
+}
+
+fn padded_form_to_string(
+  value: &Expr,
+  spec: &Expr,
+  lpad: &str,
+  rpad: &str,
+) -> Option<String> {
+  // A list pads each element with the same spec and renders as `{e1, e2, ...}`.
+  if let Expr::List(items) = value {
+    let parts: Option<Vec<String>> = items
+      .iter()
+      .map(|e| padded_form_to_string(e, spec, lpad, rpad))
+      .collect();
+    return Some(format!("{{{}}}", parts?.join(", ")));
+  }
+  match spec {
+    Expr::Integer(n) if *n >= 0 => match value {
+      Expr::Integer(i) => {
+        Some(pad_integer_body(&i.to_string(), *n as usize, lpad))
+      }
+      Expr::BigInteger(i) => {
+        Some(pad_integer_body(&i.to_string(), *n as usize, lpad))
+      }
+      _ => {
+        // Reals/rationals: render via output form, padded to width n+1.
+        crate::functions::math_ast::expr_to_num(value)?;
+        let body = expr_to_output(value);
+        Some(pad_left(&body, (*n as usize) + 1, lpad))
+      }
+    },
+    Expr::List(parts) if parts.len() == 2 => {
+      if let (Expr::Integer(n), Expr::Integer(f)) = (&parts[0], &parts[1])
+        && *n >= 0
+        && *f >= 0
+      {
+        match value {
+          // An integer ignores the fractional spec: it is shown as an integer
+          // padded to width n+1, never with a spurious decimal part.
+          Expr::Integer(i) => {
+            Some(pad_integer_body(&i.to_string(), *n as usize, lpad))
+          }
+          Expr::BigInteger(i) => {
+            Some(pad_integer_body(&i.to_string(), *n as usize, lpad))
+          }
+          _ => {
+            let v = crate::functions::math_ast::expr_to_num(value)?;
+            let f_usize = *f as usize;
+            let n_usize = *n as usize;
+            let rounded = format!("{v:.f_usize$}");
+            if let Some(dot) = rounded.find('.') {
+              let int_str = &rounded[..dot];
+              let frac_str = &rounded[dot + 1..];
+              // Significant fractional digits = the fractional string minus
+              // trailing zeros (which are padding). The remaining slots are
+              // filled with the right NumberPadding string (default "0"), so
+              // an empty `rpad` suppresses trailing zeros entirely. When
+              // `rpad` is "0" this reproduces the plain fixed-precision form.
+              let keep = frac_str.trim_end_matches('0').chars().count();
+              let mut frac_out = frac_str[..keep].to_string();
+              for _ in keep..f_usize {
+                frac_out.push_str(rpad);
+              }
+              // The integer field spans n - f digit columns plus one sign
+              // column, left-padded with `lpad`; the fractional part follows
+              // the decimal point and shrinks as trailing digits are dropped.
+              let int_field = n_usize.saturating_sub(f_usize) + 1;
+              let padded_int = pad_left(int_str, int_field, lpad);
+              Some(format!("{padded_int}.{frac_out}"))
+            } else {
+              Some(pad_left(&rounded, n_usize + 2, lpad))
+            }
+          }
+        }
+      } else {
+        None
+      }
+    }
+    _ => None,
+  }
+}
+
+/// StringExtract[s, n], StringExtract[s, {n1, ...}],
+/// StringExtract[s, "delim" -> n, ...] — extract whitespace-separated
+/// fields, or fields split by the given delimiters with chained rules
+/// drilling into nested fields. Out-of-range positions give
+/// Missing[PartAbsent, n]; invalid specifications emit ::patt.
+enum Pos {
+  One(i64),
+  Many(Vec<i64>),
+  /// A span `i ;; j` of block positions (end `None` means `All`/open).
+  Range(i64, Option<i64>),
+}
+
+pub fn string_extract_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || unevaluated("StringExtract", args);
+  // A list of strings maps the extraction over its elements
+  if let Expr::List(items) = &args[0] {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+      let mut sub_args = args.to_vec();
+      sub_args[0] = item.clone();
+      out.push(string_extract_ast(&sub_args)?);
+    }
+    return Ok(Expr::List(out.into()));
+  }
+  let s = if let Expr::String(s) = &args[0] {
+    s.clone()
+  } else {
+    crate::emit_message(&format!(
+      "StringExtract::strse: A string or list of strings is expected at position 1 in {}.",
+      crate::syntax::format_expr(
+        &unevaluated(),
+        crate::syntax::ExprForm::Output
+      )
+    ));
+    return Ok(unevaluated());
+  };
+  // Parse the spec list: each step is (delimiter, positions)
+  let parse_pos = |e: &Expr| -> Option<Pos> {
+    match e {
+      Expr::Integer(n) if *n != 0 => Some(Pos::One(*n as i64)),
+      Expr::List(items) => {
+        let mut v = Vec::with_capacity(items.len());
+        for i in items {
+          match i {
+            Expr::Integer(n) if *n != 0 => v.push(*n as i64),
+            _ => return None,
+          }
+        }
+        Some(Pos::Many(v))
+      }
+      // A span `i ;; j` selects a contiguous range of blocks. Only the
+      // two-argument form is supported; a stepped span `i ;; j ;; k` is
+      // rejected (matching Wolfram's ::patt behaviour).
+      Expr::FunctionCall { name, args }
+        if name == "Span" && args.len() == 2 =>
+      {
+        let start = match &args[0] {
+          Expr::Integer(n) => *n as i64,
+          Expr::Identifier(a) if a == "All" => 1,
+          _ => return None,
+        };
+        let end = match &args[1] {
+          Expr::Integer(n) => Some(*n as i64),
+          Expr::Identifier(a) if a == "All" => None,
+          _ => return None,
+        };
+        Some(Pos::Range(start, end))
+      }
+      _ => None,
+    }
+  };
+  let mut steps: Vec<(Option<String>, Pos)> = Vec::new();
+  for spec in &args[1..] {
+    match spec {
+      Expr::Rule {
+        pattern,
+        replacement,
+      } => {
+        let delim = if let Expr::String(d) = pattern.as_ref() {
+          d.clone()
+        } else {
+          crate::emit_message(&format!(
+            "StringExtract::patt: {} is not a valid extraction specification.",
+            crate::syntax::format_expr(spec, crate::syntax::ExprForm::Output)
+          ));
+          return Ok(unevaluated());
+        };
+        if let Some(p) = parse_pos(replacement) {
+          steps.push((Some(delim), p));
+        } else {
+          crate::emit_message(&format!(
+            "StringExtract::patt: {} is not a valid extraction specification.",
+            crate::syntax::format_expr(spec, crate::syntax::ExprForm::Output)
+          ));
+          return Ok(unevaluated());
+        }
+      }
+      other => {
+        if let Some(p) = parse_pos(other) {
+          steps.push((None, p));
+        } else {
+          crate::emit_message(&format!(
+            "StringExtract::patt: {} is not a valid extraction specification.",
+            crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+          ));
+          return Ok(unevaluated());
+        }
+      }
+    }
+  }
+
+  // Split into fields (default: whitespace runs; explicit delimiter:
+  // literal split with empty fields dropped, like StringSplit)
+  let split = |text: &str, delim: &Option<String>| -> Vec<String> {
+    match delim {
+      None => text.split_whitespace().map(str::to_string).collect(),
+      Some(d) => text
+        .split(d.as_str())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect(),
+    }
+  };
+  let pick = |fields: &[String], n: i64| -> Result<String, Expr> {
+    let len = fields.len() as i64;
+    let idx = if n > 0 { n - 1 } else { len + n };
+    if idx >= 0 && idx < len {
+      Ok(fields[idx as usize].clone())
+    } else {
+      Err(call(
+        "Missing",
+        vec![
+          Expr::String("PartAbsent".to_string()),
+          Expr::Integer(n as i128),
+        ],
+      ))
+    }
+  };
+
+  // Apply the steps recursively; a list of positions yields a list at
+  // that level, and later steps map over it.
+  fn apply_steps(
+    item: &Expr,
+    steps: &[(Option<String>, Pos)],
+    split: &dyn Fn(&str, &Option<String>) -> Vec<String>,
+    pick: &dyn Fn(&[String], i64) -> Result<String, Expr>,
+  ) -> Expr {
+    let Some((delim, pos)) = steps.first() else {
+      return item.clone();
+    };
+    match item {
+      Expr::List(items) => Expr::List(
+        items
+          .iter()
+          .map(|i| apply_steps(i, steps, split, pick))
+          .collect::<Vec<_>>()
+          .into(),
+      ),
+      Expr::String(text) => {
+        let fields = split(text, delim);
+        let one = |n: i64| match pick(&fields, n) {
+          Ok(f) => apply_steps(&Expr::String(f), &steps[1..], split, pick),
+          Err(m) => m,
+        };
+        match pos {
+          Pos::One(n) => one(*n),
+          Pos::Many(ns) => {
+            Expr::List(ns.iter().map(|&n| one(n)).collect::<Vec<_>>().into())
+          }
+          Pos::Range(start, end) => {
+            // Resolve each endpoint (negatives count from the end) and
+            // clamp both into [1, len]; an empty/reversed range yields {}.
+            let len = fields.len() as i64;
+            let resolve = |n: i64| -> i64 {
+              let r = if n > 0 {
+                n
+              } else if n < 0 {
+                len + n + 1
+              } else {
+                0
+              };
+              r.max(1).min(len)
+            };
+            let lo = resolve(*start);
+            let hi = match end {
+              Some(e) => resolve(*e),
+              None => len,
+            };
+            let mut out = Vec::new();
+            if len > 0 && lo <= hi {
+              for idx in lo..=hi {
+                out.push(one(idx));
+              }
+            }
+            Expr::List(out.into())
+          }
+        }
+      }
+      other => other.clone(),
+    }
+  }
+  Ok(apply_steps(&Expr::String(s), &steps, &split, &pick))
+}
+
+/// Replace every `<* expr *>` expression slot in a template with the rendered
+/// value of `expr`. The template's arguments are available as `#1`, `#2`, …
+/// inside the slot, so `<*#1 + 1*>` sees the first argument. An expression
+/// that fails to parse is left in place.
+fn expand_expression_slots(
+  template: &str,
+  args: &[Expr],
+) -> Result<String, InterpreterError> {
+  let mut out = String::with_capacity(template.len());
+  let mut rest = template;
+  while let Some(start) = rest.find("<*") {
+    let Some(rel_end) = rest[start + 2..].find("*>") else {
+      break;
+    };
+    let end = start + 2 + rel_end;
+    out.push_str(&rest[..start]);
+    let body = rest[start + 2..end].trim();
+    match crate::syntax::string_to_expr(body) {
+      Ok(parsed) => {
+        let substituted = crate::syntax::substitute_slots(&parsed, args);
+        let value = crate::evaluator::evaluate_expr_to_expr(&substituted)?;
+        out.push_str(&match &value {
+          Expr::String(text) => text.clone(),
+          other => expr_to_string(other),
+        });
+      }
+      Err(_) => out.push_str(&rest[start..end + 2]),
+    }
+    rest = &rest[end + 2..];
+  }
+  out.push_str(rest);
+  Ok(out)
+}
+
+/// Expand one node of an expression template into the pieces it contributes.
+/// Most nodes give exactly one piece; `TemplateIf` with a false condition
+/// gives none and `TemplateSequence` gives one per element, which is what lets
+/// them splice into the surrounding list.
+fn expand_template_parts(
+  expr: &Expr,
+  args: &Expr,
+) -> Result<Vec<Expr>, InterpreterError> {
+  let one = |e: Expr| Ok(vec![e]);
+  match expr {
+    Expr::FunctionCall { name, args: parts } => match name.as_str() {
+      "TemplateSlot" if parts.len() == 1 => {
+        match template_slot_value(&parts[0], args) {
+          Some(value) => one(value),
+          None => one(expr.clone()),
+        }
+      }
+      // The body is filled in first, then evaluated.
+      "TemplateExpression" if parts.len() == 1 => {
+        let filled = expand_template_parts(&parts[0], args)?;
+        let Some(body) = filled.into_iter().next() else {
+          return Ok(Vec::new());
+        };
+        one(crate::evaluator::evaluate_expr_to_expr(&body)?)
+      }
+      "TemplateIf" if parts.len() == 2 || parts.len() == 3 => {
+        let condition = expand_template_parts(&parts[0], args)?;
+        let Some(condition) = condition.into_iter().next() else {
+          return Ok(Vec::new());
+        };
+        let holds = matches!(
+          crate::evaluator::evaluate_expr_to_expr(&condition)?,
+          Expr::Identifier(ref b) if b == "True"
+        );
+        match (holds, parts.get(2)) {
+          (true, _) => expand_template_parts(&parts[1], args),
+          (false, Some(otherwise)) => expand_template_parts(otherwise, args),
+          (false, None) => Ok(Vec::new()),
+        }
+      }
+      // Each element of the list becomes the slot-1 argument for one copy of
+      // the body.
+      "TemplateSequence" if parts.len() == 2 => {
+        let Expr::List(items) = &parts[1] else {
+          return one(expr.clone());
+        };
+        let mut out = Vec::new();
+        for item in items {
+          let element = Expr::List(vec![item.clone()].into());
+          out.extend(expand_template_parts(&parts[0], &element)?);
+        }
+        Ok(out)
+      }
+      _ => {
+        let mut expanded = Vec::new();
+        for part in parts {
+          expanded.extend(expand_template_parts(part, args)?);
+        }
+        one(Expr::FunctionCall {
+          name: name.clone(),
+          args: expanded.into(),
+        })
+      }
+    },
+    Expr::List(items) => {
+      let mut expanded = Vec::new();
+      for item in items {
+        expanded.extend(expand_template_parts(item, args)?);
+      }
+      one(Expr::List(expanded.into()))
+    }
+    // Operator forms carry slots too, so a condition like
+    // `TemplateSlot[1] > 3` is filled before it is tested.
+    Expr::Comparison {
+      operands,
+      operators,
+    } => {
+      let mut filled = Vec::with_capacity(operands.len());
+      for operand in operands {
+        filled.extend(expand_template_parts(operand, args)?);
+      }
+      one(Expr::Comparison {
+        operands: filled,
+        operators: operators.clone(),
+      })
+    }
+    Expr::BinaryOp { op, left, right } => one(Expr::BinaryOp {
+      op: *op,
+      left: Box::new(expand_template_one(left, args)?),
+      right: Box::new(expand_template_one(right, args)?),
+    }),
+    Expr::UnaryOp { op, operand } => one(Expr::UnaryOp {
+      op: *op,
+      operand: Box::new(expand_template_one(operand, args)?),
+    }),
+    other => one(other.clone()),
+  }
+}
+
+/// `expand_template_parts` for a position that must hold exactly one
+/// expression (an operand rather than a list element), so a vanishing
+/// `TemplateIf` leaves the original in place instead of collapsing the
+/// surrounding operator.
+fn expand_template_one(
+  expr: &Expr,
+  args: &Expr,
+) -> Result<Expr, InterpreterError> {
+  Ok(
+    expand_template_parts(expr, args)?
+      .into_iter()
+      .next()
+      .unwrap_or_else(|| expr.clone()),
+  )
+}
+
+/// `Snippet[text]` / `Snippet[text, spec]` — the opening lines of a text, each
+/// cut to 80 characters. The spec selects lines the way `Take` selects
+/// elements: a count from the front, a negative count from the end, or a span.
+pub fn snippet_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let original = || unevaluated("Snippet", args);
+  if args.is_empty() || args.len() > 2 {
+    return Ok(original());
+  }
+  let Expr::String(text) = &args[0] else {
+    crate::emit_message(
+      "Snippet::invcnt: Content should be string, File, URL, or valid \
+       ContentObject.",
+    );
+    return Ok(fail_expr());
+  };
+  let lines: Vec<&str> = text.split('\n').collect();
+  let count = lines.len() as i128;
+  let clamp = |i: i128| -> usize { i.clamp(0, count) as usize };
+  // Which lines the spec asks for, as a half-open range.
+  let range: (usize, usize) = match args.get(1) {
+    None => (0, clamp(1)),
+    Some(Expr::Integer(n)) if *n > 0 => (0, clamp(*n)),
+    Some(Expr::Integer(n)) if *n < 0 => (clamp(count + n), clamp(count)),
+    Some(spec) => {
+      let span = match spec {
+        Expr::FunctionCall { name, args: parts }
+          if name == "Span" && parts.len() == 2 =>
+        {
+          Some((parts[0].clone(), parts[1].clone()))
+        }
+        _ => None,
+      };
+      if let Some((from, to)) = span {
+        let start = match &from {
+          Expr::Integer(i) if *i > 0 => clamp(i - 1),
+          Expr::Integer(i) if *i < 0 => clamp(count + i),
+          Expr::Identifier(s) if s == "All" => 0,
+          _ => return Ok(original()),
+        };
+        let end = match &to {
+          Expr::Integer(i) if *i > 0 => clamp(*i),
+          Expr::Integer(i) if *i < 0 => clamp(count + i + 1),
+          Expr::Identifier(s) if s == "All" => clamp(count),
+          _ => return Ok(original()),
+        };
+        (start, end.max(start))
+      } else {
+        if matches!(spec, Expr::Identifier(s) if s == "All") {
+          return Ok(original());
+        }
+        crate::emit_message(&format!(
+          "Snippet::invspec: Specification {} should be an integer or Span.",
+          expr_to_output(spec)
+        ));
+        return Ok(fail_expr());
+      }
+    }
+  };
+  let snippet: Vec<String> = lines[range.0..range.1]
+    .iter()
+    .map(|line| line.chars().take(80).collect())
+    .collect();
+  Ok(Expr::String(snippet.join("\n")))
+}
+
+// ---------------------------------------------------------------------------
+// CharacterNormalize
+// ---------------------------------------------------------------------------
+
+/// The five normalization forms wolframscript accepts, in the order its
+/// messages list them.
+const NORMALIZATION_FORMS: [&str; 5] =
+  ["NFC", "NFD", "NFKC", "NFKCCasefold", "NFKD"];
+
+/// Full case folding of one character (Unicode `CaseFolding.txt`, statuses
+/// `C` + `F`). Characters that fold to themselves are absent from the table.
+fn full_case_fold(c: char) -> Option<&'static str> {
+  let table = crate::functions::unicode_casefold_data::CASE_FOLDING;
+  table
+    .binary_search_by_key(&(c as u32), |(cp, _)| *cp)
+    .ok()
+    .map(|i| table[i].1)
+}
+
+fn is_default_ignorable(c: char) -> bool {
+  let cp = c as u32;
+  crate::functions::unicode_casefold_data::DEFAULT_IGNORABLE
+    .binary_search_by(|(lo, hi)| {
+      if cp < *lo {
+        std::cmp::Ordering::Greater
+      } else if cp > *hi {
+        std::cmp::Ordering::Less
+      } else {
+        std::cmp::Ordering::Equal
+      }
+    })
+    .is_ok()
+}
+
+/// Apply one normalization form to a string. `NFKCCasefold` is the derived
+/// `NFKC_Casefold` mapping: drop the default-ignorable characters, then
+/// `NFKC`, full case fold, and `NFKC` again.
+fn normalize_with(text: &str, form: &str) -> String {
+  use unicode_normalization::UnicodeNormalization;
+  match form {
+    "NFC" => text.nfc().collect(),
+    "NFD" => text.nfd().collect(),
+    "NFKC" => text.nfkc().collect(),
+    "NFKD" => text.nfkd().collect(),
+    "NFKCCasefold" => {
+      let stripped: String =
+        text.chars().filter(|c| !is_default_ignorable(*c)).collect();
+      let compat: String = stripped.nfkc().collect();
+      let folded: String = compat
+        .chars()
+        .flat_map(|c| match full_case_fold(c) {
+          Some(f) => f.chars().collect::<Vec<_>>(),
+          None => vec![c],
+        })
+        .collect();
+      folded.nfkc().collect()
+    }
+    _ => text.to_string(),
+  }
+}
+
+/// Levenshtein distance, used to decide whether a mistyped form name is close
+/// enough to a real one for wolframscript's "Did you mean …" suggestion.
+fn edit_distance(a: &str, b: &str) -> usize {
+  let a: Vec<char> = a.chars().collect();
+  let b: Vec<char> = b.chars().collect();
+  let mut prev: Vec<usize> = (0..=b.len()).collect();
+  let mut cur = vec![0usize; b.len() + 1];
+  for i in 1..=a.len() {
+    cur[0] = i;
+    for j in 1..=b.len() {
+      let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+      cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+    }
+    std::mem::swap(&mut prev, &mut cur);
+  }
+  prev[b.len()]
+}
+
+/// The form wolframscript suggests for an unrecognized specification: the
+/// closest name whose edit distance is within `Ceiling[len / 3]` of the text
+/// the user wrote, ties going to the earlier name in the canonical order.
+fn suggested_form(text: &str) -> Option<&'static str> {
+  let threshold = text.chars().count().div_ceil(3);
+  NORMALIZATION_FORMS
+    .iter()
+    .map(|f| (edit_distance(text, f), *f))
+    .filter(|(d, _)| *d <= threshold)
+    .min_by_key(|(d, _)| *d)
+    .map(|(_, f)| f)
+}
+
+/// CharacterNormalize[string | {strings…}, form] — convert characters to the
+/// given Unicode normalization form ("NFC", "NFD", "NFKC", "NFKD", or
+/// "NFKCCasefold").
+pub fn character_normalize_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  let original = || unevaluated("CharacterNormalize", args);
+
+  // The text is validated first: wolframscript reports only `::nlpstr` when
+  // both arguments are unusable.
+  let texts: Vec<String> = match &args[0] {
+    Expr::String(s) => vec![s.clone()],
+    // A list of strings normalizes elementwise. The empty list is accepted
+    // and returned unchanged, despite what the message below claims.
+    Expr::List(items) if items.iter().all(|e| matches!(e, Expr::String(_))) => {
+      items
+        .iter()
+        .map(|e| match e {
+          Expr::String(s) => s.clone(),
+          _ => unreachable!("checked above"),
+        })
+        .collect()
+    }
+    _ => {
+      crate::emit_message(
+        "CharacterNormalize::nlpstr: String or non-empty list of strings \
+         expected at position 1.",
+      );
+      return Ok(original());
+    }
+  };
+
+  let form = match &args[1] {
+    Expr::String(s) if NORMALIZATION_FORMS.contains(&s.as_str()) => s.clone(),
+    other => {
+      // Strings show quoted in the message; anything else in OutputForm.
+      let shown = match other {
+        Expr::String(s) => format!("\"{s}\""),
+        _ => expr_to_output(other),
+      };
+      let text = match other {
+        Expr::String(s) => s.clone(),
+        _ => expr_to_output(other),
+      };
+      let listing = |skip: Option<&str>| {
+        let names: Vec<String> = NORMALIZATION_FORMS
+          .iter()
+          .filter(|f| Some(**f) != skip)
+          .map(|f| format!("\"{f}\""))
+          .collect();
+        let (last, rest) = names.split_last().expect("five forms");
+        format!("{}, and {}", rest.join(", "), last)
+      };
+      match suggested_form(&text) {
+        Some(best) => crate::emit_message(&format!(
+          "CharacterNormalize::elmntavsl: {} is not an available \
+           normalization type. Did you mean \"{}\" instead? Possible \
+           normalization types also include {}.",
+          shown,
+          best,
+          listing(Some(best))
+        )),
+        None => crate::emit_message(&format!(
+          "CharacterNormalize::elmntavl: {} is not an available \
+           normalization type. Possible normalization types include {}.",
+          shown,
+          listing(None)
+        )),
+      }
+      return Ok(original());
+    }
+  };
+
+  let mut normalized =
+    texts.iter().map(|t| Expr::String(normalize_with(t, &form)));
+  if matches!(&args[0], Expr::String(_)) {
+    return Ok(normalized.next().expect("one string"));
+  }
+  Ok(Expr::List(normalized.collect::<Vec<_>>().into()))
+}

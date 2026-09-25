@@ -1,0 +1,488 @@
+use super::*;
+
+mod element_data_tests {
+  use super::*;
+
+  #[test]
+  fn element_data_by_name_returns_entity() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon"]"#).unwrap(),
+      "Entity[Element, Carbon]"
+    );
+  }
+
+  #[test]
+  fn element_data_by_number_returns_entity() {
+    clear_state();
+    assert_eq!(
+      interpret("ElementData[6]").unwrap(),
+      "Entity[Element, Carbon]"
+    );
+  }
+
+  #[test]
+  fn element_data_tungsten_by_number() {
+    clear_state();
+    assert_eq!(
+      interpret("ElementData[74]").unwrap(),
+      "Entity[Element, Tungsten]"
+    );
+  }
+
+  #[test]
+  fn element_data_no_args_returns_all_elements() {
+    clear_state();
+    let result = interpret("Length[ElementData[]]").unwrap();
+    assert_eq!(result, "118");
+  }
+
+  #[test]
+  fn element_data_all_returns_all_elements() {
+    clear_state();
+    let result = interpret("Length[ElementData[All]]").unwrap();
+    assert_eq!(result, "118");
+  }
+
+  #[test]
+  fn element_data_phase() {
+    clear_state();
+    // Gas / liquid / solid at STP, and Missing for the synthetics (Z >= 100).
+    assert_eq!(
+      interpret(
+        r#"{ElementData["Oxygen", "Phase"], ElementData["Bromine", "Phase"],
+            ElementData["Mercury", "Phase"], ElementData["Iron", "Phase"],
+            ElementData["Fermium", "Phase"], ElementData["Oganesson", "Phase"]}"#
+      )
+      .unwrap(),
+      "{Entity[MatterPhase, Gas], Entity[MatterPhase, Liquid], \
+       Entity[MatterPhase, Liquid], Entity[MatterPhase, Solid], \
+       Missing[NotAvailable], Missing[NotAvailable]}"
+    );
+  }
+
+  #[test]
+  fn element_data_phase_counts() {
+    clear_state();
+    // 11 gases, 2 liquids, 86 solids, 19 not available (Z = 100..118),
+    // matching wolframscript's ElementData[All, "Phase"].
+    assert_eq!(
+      interpret(
+        r#"phases = Map[ElementData[#, "Phase"] &, Range[118]];
+           Map[Count[phases, #] &,
+             {Entity["MatterPhase", "Gas"], Entity["MatterPhase", "Liquid"],
+              Entity["MatterPhase", "Solid"], Missing["NotAvailable"]}]"#
+      )
+      .unwrap(),
+      "{11, 2, 86, 19}"
+    );
+  }
+
+  #[test]
+  fn element_data_atomic_number() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "AtomicNumber"]"#).unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn element_data_name() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "Name"]"#).unwrap(),
+      "carbon"
+    );
+  }
+
+  #[test]
+  fn element_data_standard_name() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "StandardName"]"#).unwrap(),
+      "Carbon"
+    );
+  }
+
+  #[test]
+  fn element_data_abbreviation() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "Abbreviation"]"#).unwrap(),
+      "C"
+    );
+  }
+
+  #[test]
+  fn element_data_atomic_weight() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "AtomicWeight"]"#).unwrap(),
+      "Quantity[12.011`5., AtomicMassUnit]"
+    );
+  }
+
+  #[test]
+  fn element_data_atomic_weight_hydrogen() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Hydrogen", "AtomicWeight"]"#).unwrap(),
+      "Quantity[1.008`5., AtomicMassUnit]"
+    );
+  }
+
+  #[test]
+  fn element_data_group() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "Group"]"#).unwrap(),
+      "14"
+    );
+  }
+
+  #[test]
+  fn element_data_period() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "Period"]"#).unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn element_data_block() {
+    clear_state();
+    assert_eq!(interpret(r#"ElementData["Carbon", "Block"]"#).unwrap(), "p");
+  }
+
+  #[test]
+  fn element_data_electronegativity() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Hydrogen", "Electronegativity"]"#).unwrap(),
+      "2.2`3."
+    );
+  }
+
+  #[test]
+  fn element_data_melting_point() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "MeltingPoint"]"#).unwrap(),
+      "Quantity[3550.`4., DegreesCelsius]"
+    );
+  }
+
+  #[test]
+  fn element_data_boiling_point() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "BoilingPoint"]"#).unwrap(),
+      "Quantity[4027.`4., DegreesCelsius]"
+    );
+  }
+
+  #[test]
+  fn element_data_atomic_radius() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "AtomicRadius"]"#).unwrap(),
+      "Quantity[67.`2., Picometers]"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_configuration() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "ElectronConfiguration"]"#).unwrap(),
+      "{{2}, {2, 2}}"
+    );
+  }
+
+  #[test]
+  fn element_data_lookup_by_abbreviation() {
+    clear_state();
+    assert_eq!(interpret(r#"ElementData["C", "Name"]"#).unwrap(), "carbon");
+  }
+
+  #[test]
+  fn element_data_lookup_by_number() {
+    clear_state();
+    assert_eq!(interpret(r#"ElementData[6, "Name"]"#).unwrap(), "carbon");
+  }
+
+  #[test]
+  fn element_data_iron_atomic_number() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Iron", "AtomicNumber"]"#).unwrap(),
+      "26"
+    );
+  }
+
+  #[test]
+  fn element_data_iron_abbreviation() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Iron", "Abbreviation"]"#).unwrap(),
+      "Fe"
+    );
+  }
+
+  #[test]
+  fn element_data_iron_melting_point() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Iron", "MeltingPoint"]"#).unwrap(),
+      "Quantity[1538.`4., DegreesCelsius]"
+    );
+  }
+
+  #[test]
+  fn element_data_noble_gas_electronegativity() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Helium", "Electronegativity"]"#).unwrap(),
+      r#"Missing[NotApplicable]"#
+    );
+  }
+
+  #[test]
+  fn element_data_lanthanide_group() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Lanthanum", "Group"]"#).unwrap(),
+      r#"Missing[Undefined]"#
+    );
+  }
+
+  #[test]
+  fn element_data_properties_list() {
+    clear_state();
+    let result = interpret(r#"ElementData["Properties"]"#).unwrap();
+    assert!(result.contains("AtomicNumber"));
+    assert!(result.contains("AtomicWeight"));
+    assert!(result.contains("MeltingPoint"));
+  }
+
+  #[test]
+  fn element_data_gold_atomic_weight() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Gold", "AtomicWeight"]"#).unwrap(),
+      "Quantity[196.96657`9., AtomicMassUnit]"
+    );
+  }
+
+  #[test]
+  fn element_data_technetium_atomic_weight() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Technetium", "AtomicWeight"]"#).unwrap(),
+      "Quantity[97.`2., AtomicMassUnit]"
+    );
+  }
+
+  #[test]
+  fn element_data_lookup_by_fe() {
+    clear_state();
+    assert_eq!(interpret(r#"ElementData["Fe", "Name"]"#).unwrap(), "iron");
+  }
+
+  #[test]
+  fn element_data_oganesson() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData[118, "StandardName"]"#).unwrap(),
+      "Oganesson"
+    );
+  }
+
+  #[test]
+  fn element_data_missing_boiling_point() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Astatine", "BoilingPoint"]"#).unwrap(),
+      "Missing[NotAvailable]"
+    );
+  }
+
+  #[test]
+  fn element_data_meitnerium_melting_point_missing() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Meitnerium", "MeltingPoint"]"#).unwrap(),
+      "Missing[NotAvailable]"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_config_tantalum() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData[73, "ElectronConfiguration"]"#).unwrap(),
+      "{{2}, {2, 6}, {2, 6, 10}, {2, 6, 10, 14}, {2, 6, 3}, {2}}"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_config_iron() {
+    clear_state();
+    assert_eq!(
+      interpret(r#"ElementData["Iron", "ElectronConfiguration"]"#).unwrap(),
+      "{{2}, {2, 6}, {2, 6, 6}, {2}}"
+    );
+  }
+
+  #[test]
+  fn element_data_absolute_boiling_point_helium() {
+    // -268.93 °C + 273.15 = 4.22 K. Wolframscript wraps the value in
+    // `Quantity[…, "Kelvins"]` and carries the precision-loss from the
+    // subtraction in the backtick precision marker.
+    assert_eq!(
+      interpret(r#"ElementData["He", "AbsoluteBoilingPoint"]"#).unwrap(),
+      "Quantity[4.22`3.19567319910012, Kelvins]"
+    );
+  }
+
+  #[test]
+  fn element_data_absolute_melting_point_carbon() {
+    assert_eq!(
+      interpret(r#"ElementData["Carbon", "AbsoluteMeltingPoint"]"#).unwrap(),
+      "Quantity[3823.15`4.032192984695641, Kelvins]"
+    );
+  }
+
+  #[test]
+  fn element_data_electronegativity_camelcase_alias() {
+    // Both "Electronegativity" (lowercase n) and "ElectroNegativity"
+    // (capital N) map to the same property.
+    assert_eq!(
+      interpret(r#"ElementData["He", "ElectroNegativity"]"#).unwrap(),
+      "Missing[NotApplicable]"
+    );
+    assert_eq!(
+      interpret(r#"ElementData["He", "Electronegativity"]"#).unwrap(),
+      "Missing[NotApplicable]"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_config_string_sulfur() {
+    // wolframscript renders the configuration as a `Row[…]` whose
+    // default OutputForm concatenates principal-quantum-number
+    // integers and Superscript subshells without separators.
+    assert_eq!(
+      interpret(r#"ElementData[16, "ElectronConfigurationString"]"#).unwrap(),
+      "[Ne]3Superscript[s, 2]3Superscript[p, 4]"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_config_string_iron() {
+    // Shell-major ordering (3d before 4s) — Woxi doesn't yet implement
+    // the Madelung/aufbau ordering wolframscript would print here.
+    assert_eq!(
+      interpret(r#"ElementData["Iron", "ElectronConfigurationString"]"#)
+        .unwrap(),
+      "[Ar]3Superscript[d, 6]4Superscript[s, 2]"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_config_string_hydrogen() {
+    assert_eq!(
+      interpret(r#"ElementData[1, "ElectronConfigurationString"]"#).unwrap(),
+      "1Superscript[s, 1]"
+    );
+  }
+
+  #[test]
+  fn element_data_electron_config_string_helium() {
+    assert_eq!(
+      interpret(r#"ElementData["He", "ElectronConfigurationString"]"#).unwrap(),
+      "1Superscript[s, 2]"
+    );
+  }
+
+  #[test]
+  fn element_data_recognised_property_without_data_returns_not_available() {
+    // SpecificHeat, Density, IonizationEnergies, etc. are recognised by name
+    // but not tabulated — return Missing[NotAvailable] rather than NotFound.
+    assert_eq!(
+      interpret(r#"ElementData["Tc", "SpecificHeat"]"#).unwrap(),
+      "Missing[NotAvailable]"
+    );
+    // `IonizationEnergies` is now tabulated for Hydrogen and Carbon.
+    // Use a still-unimplemented element/property combo for the
+    // not-available assertion.
+    assert_eq!(
+      interpret(r#"ElementData["Helium", "IonizationEnergies"]"#).unwrap(),
+      "Missing[NotAvailable]"
+    );
+  }
+
+  #[test]
+  fn element_data_properties_full_list() {
+    assert_eq!(
+      interpret(r#"ElementData["Properties"]"#).unwrap(),
+      "{Abbreviation, AbsoluteBoilingPoint, AbsoluteMeltingPoint, AtomicNumber, AtomicRadius, AtomicWeight, Block, BoilingPoint, BrinellHardness, BulkModulus, CovalentRadius, CrustAbundance, Density, DiscoveryYear, ElectroNegativity, ElectronAffinity, ElectronConfiguration, ElectronConfigurationString, ElectronShellConfiguration, FusionHeat, Group, IonizationEnergies, LiquidDensity, MeltingPoint, MohsHardness, Name, Period, Phase, PoissonRatio, Series, ShearModulus, SpecificHeat, StandardName, ThermalConductivity, VanDerWaalsRadius, VaporizationHeat, VickersHardness, YoungModulus}"
+    );
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn element_data_1() {
+    assert_case(r#"ElementData[74]"#, r#"Entity["Element", "Tungsten"]"#);
+  }
+  #[test]
+  fn element_data_2() {
+    assert_case(
+      r#"ElementData[74]; ElementData["He", "AbsoluteBoilingPoint"]"#,
+      r#"Quantity[4.22`3.195673199100121, "Kelvins"]"#,
+    );
+  }
+  #[test]
+  fn element_data_3() {
+    assert_case(
+      r#"ElementData[74]; ElementData["He", "AbsoluteBoilingPoint"]; ElementData["Carbon", "IonizationEnergies"]"#,
+      r#"{Quantity[11.260778981528851832`5., "MolarElectronvolts"], Quantity[24.3829807933223900782`5., "MolarElectronvolts"], Quantity[47.8881079467593740356`5., "MolarElectronvolts"], Quantity[64.4937407900226288955`5., "MolarElectronvolts"], Quantity[392.0906853660542969686`5., "MolarElectronvolts"], Quantity[489.9915765391067906686`6., "MolarElectronvolts"]}"#,
+    );
+  }
+  #[test]
+  fn element_data_4() {
+    // The mathics-derived expected was the literal Row[…] InputForm, but
+    // `wolframscript -code` displays Row's elements concatenated and
+    // strips Style[…, Italic] wrappers — Woxi's printer matches.
+    assert_case(
+      r#"ElementData[74]; ElementData["He", "AbsoluteBoilingPoint"]; ElementData["Carbon", "IonizationEnergies"]; ElementData[16, "ElectronConfigurationString"]"#,
+      r#"[Ne]3Superscript[s, 2]3Superscript[p, 4]"#,
+    );
+  }
+  #[test]
+  fn element_data_5() {
+    assert_case(
+      r#"ElementData[74]; ElementData["He", "AbsoluteBoilingPoint"]; ElementData["Carbon", "IonizationEnergies"]; ElementData[16, "ElectronConfigurationString"]; ElementData[73, "ElectronConfiguration"]"#,
+      r#"{{2}, {2, 6}, {2, 6, 10}, {2, 6, 10, 14}, {2, 6, 3}, {2}}"#,
+    );
+  }
+  #[test]
+  fn length() {
+    assert_case(
+      r#"ElementData[74]; ElementData["He", "AbsoluteBoilingPoint"]; ElementData["Carbon", "IonizationEnergies"]; ElementData[16, "ElectronConfigurationString"]; ElementData[73, "ElectronConfiguration"]; Length[ElementData[All]]"#,
+      r#"118"#,
+    );
+  }
+  #[test]
+  fn element_data_6() {
+    assert_case(
+      r#"ElementData["Meitnerium","MeltingPoint"]"#,
+      r#"Missing["NotAvailable"]"#,
+    );
+  }
+}

@@ -1,0 +1,1924 @@
+use super::*;
+use crate::functions::calculus_ast::simplify;
+
+// ─── Expand ─────────────────────────────────────────────────────────
+
+/// Expand[expr] - Expands products and positive integer powers
+/// Expand[expr, Modulus -> n] - Expands and reduces coefficients modulo n
+pub fn expand_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Expand expects 1 or 2 arguments".into(),
+    ));
+  }
+
+  // Parse options from second argument
+  let modulus = if args.len() == 2 {
+    extract_modulus_option(&args[1])
+  } else {
+    None
+  };
+  let trig = if args.len() == 2 {
+    extract_trig_option(&args[1])
+  } else {
+    false
+  };
+  // Two-arg `Expand[expr, pattern]` (where the second arg is not an
+  // option rule like `Modulus -> n` or `Trig -> True`) expands only
+  // sub-expressions containing `pattern` and groups the resulting
+  // Plus terms by ascending power of the pattern variable.
+  // wolframscript:
+  //   Expand[(x+a)^2 + (y+a)^2 + (x+y)*(x+a), y]
+  //     → a^2 + x*(a + x) + (a + x)^2 + 2*a*y + (a + x)*y + y^2
+  if args.len() == 2 && modulus.is_none() && !trig && is_pattern_arg(&args[1]) {
+    let var_name = match &args[1] {
+      Expr::Identifier(n) => Some(n.clone()),
+      _ => None,
+    };
+    let result =
+      expand_with_pattern_top(&args[0], &args[1], var_name.as_deref());
+    return Ok(result);
+  }
+
+  // Thread over Lists
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| {
+        if modulus.is_some() {
+          expand_ast(&[item.clone(), args[1].clone()])
+        } else {
+          expand_ast(std::slice::from_ref(item))
+        }
+      })
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+  // Thread over Rules
+  if let Expr::Rule {
+    pattern,
+    replacement,
+  } = &args[0]
+  {
+    let expanded_pattern = expand_and_combine(pattern);
+    let expanded_replacement = expand_and_combine(replacement);
+    let result = Expr::Rule {
+      pattern: Box::new(expanded_pattern),
+      replacement: Box::new(expanded_replacement),
+    };
+    if let Some(m) = modulus {
+      return Ok(reduce_coefficients_mod(&result, m));
+    }
+    return Ok(result);
+  }
+
+  let mut expanded = fold_term_numerics(&expand_and_combine(&args[0]));
+  if trig {
+    // Apply trig expansion: Sin[a+b] → Sin[a]Cos[b] + Cos[a]Sin[b], etc.
+    expanded = crate::functions::math_ast::trig_expand_ast(&[expanded])
+      .unwrap_or_else(|_| args[0].clone());
+    // Re-expand after trig expansion to distribute products
+    expanded = expand_and_combine(&expanded);
+  }
+  if let Some(m) = modulus {
+    Ok(reduce_coefficients_mod(&expanded, m))
+  } else {
+    Ok(expanded)
+  }
+}
+
+/// Top-level driver for the 2-arg `Expand[expr, pat]` form.
+/// Processes the outermost Plus by separating pat-containing terms
+/// from pat-free ones: each pat-containing term contributes its
+/// expansion to per-pat-power buckets in input order, then the
+/// pat-free terms join the pat-power-0 bucket at the end. This
+/// matches wolframscript's grouping where unchanged (pat-free) terms
+/// sit *after* the expanded contributions inside the y^0 group.
+fn expand_with_pattern_top(expr: &Expr, pat: &Expr, var: Option<&str>) -> Expr {
+  let plus_args: Option<Vec<Expr>> = match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => Some(args.to_vec()),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => Some(vec![*left.clone(), *right.clone()]),
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => Some(vec![
+      *left.clone(),
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand: right.clone(),
+      },
+    ]),
+    _ => None,
+  };
+  let Some(v) = var else {
+    return expand_with_pattern(expr, pat);
+  };
+  let Some(terms) = plus_args else {
+    let exp = expand_with_pattern(expr, pat);
+    return exp;
+  };
+  use std::collections::BTreeMap;
+  let mut buckets: BTreeMap<i128, Vec<Expr>> = BTreeMap::new();
+  let mut pat_free_y0: Vec<Expr> = Vec::new();
+  for t in &terms {
+    if !contains_pattern(t, pat) {
+      pat_free_y0.push(t.clone());
+      continue;
+    }
+    let exp = expand_with_pattern(t, pat);
+    let mut sub: Vec<Expr> = Vec::new();
+    flatten_plus_into(&exp, &mut sub);
+    for st in sub {
+      let mut p = crate::functions::polynomial_ast::coefficient::term_var_power_and_coeff(
+        &st, v,
+      )
+      .0;
+      if p < 0 {
+        p = 0;
+      }
+      buckets.entry(p).or_default().push(st);
+    }
+  }
+  // Append pat-free terms to the y-power-0 bucket so they appear after
+  // the expanded contributions for that power.
+  if !pat_free_y0.is_empty() {
+    buckets.entry(0).or_default().extend(pat_free_y0);
+  }
+  let mut final_terms: Vec<Expr> = Vec::new();
+  for (_, bucket) in buckets {
+    final_terms.extend(bucket);
+  }
+  if final_terms.len() == 1 {
+    return final_terms.remove(0);
+  }
+  call("Plus", final_terms)
+}
+
+/// True when the 2nd argument to `Expand[expr, …]` is a value to match
+/// against (a pattern), not an option rule like `Modulus -> n` or
+/// `Trig -> True`.
+fn is_pattern_arg(e: &Expr) -> bool {
+  if matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. }) {
+    return false;
+  }
+  if let Expr::FunctionCall { name, .. } = e
+    && (name == "Rule" || name == "RuleDelayed")
+  {
+    return false;
+  }
+  true
+}
+
+/// True when `expr` syntactically contains a sub-expression equal to
+/// `pat` (via the canonical string form). Used to decide whether
+/// `Expand[expr, pat]` should distribute a Times/Power over an inner
+/// Plus.
+fn contains_pattern(expr: &Expr, pat: &Expr) -> bool {
+  if expr_to_string(expr) == expr_to_string(pat) {
+    return true;
+  }
+  match expr {
+    Expr::FunctionCall { args, .. } => {
+      args.iter().any(|a| contains_pattern(a, pat))
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      contains_pattern(left, pat) || contains_pattern(right, pat)
+    }
+    Expr::UnaryOp { operand, .. } => contains_pattern(operand, pat),
+    Expr::List(items) => items.iter().any(|a| contains_pattern(a, pat)),
+    _ => false,
+  }
+}
+
+/// Walk `expr` and expand only the sub-expressions that contain `pat`.
+/// Times/Power that don't depend on `pat` are returned untouched; Plus
+/// is processed term-by-term, and a Times that has exactly one Plus
+/// factor with `pat` distributes Times over that Plus while keeping
+/// the other (pat-independent) factors as-is.
+fn expand_with_pattern(expr: &Expr, pat: &Expr) -> Expr {
+  if !contains_pattern(expr, pat) {
+    return expr.clone();
+  }
+  let plus_args: Option<Vec<Expr>> = match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => Some(args.to_vec()),
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => Some(vec![*left.clone(), *right.clone()]),
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => Some(vec![
+      *left.clone(),
+      Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand: right.clone(),
+      },
+    ]),
+    _ => None,
+  };
+  if let Some(terms) = plus_args {
+    let mut flat: Vec<Expr> = Vec::new();
+    for t in &terms {
+      let exp = expand_with_pattern(t, pat);
+      flatten_plus_into(&exp, &mut flat);
+    }
+    return call("Plus", flat);
+  }
+  let times_args: Option<Vec<Expr>> = match expr {
+    Expr::FunctionCall { name, args } if name == "Times" => Some(args.to_vec()),
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => Some(vec![*left.clone(), *right.clone()]),
+    _ => None,
+  };
+  if let Some(factors) = times_args {
+    let plus_idx = factors.iter().position(|f| {
+      contains_pattern(f, pat)
+        && (matches!(f, Expr::FunctionCall { name, .. } if name == "Plus")
+          || matches!(
+            f,
+            Expr::BinaryOp {
+              op: BinaryOperator::Plus | BinaryOperator::Minus,
+              ..
+            }
+          ))
+    });
+    if let Some(idx) = plus_idx {
+      let plus_factor = factors[idx].clone();
+      let other_factors: Vec<Expr> = factors
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, e)| e.clone())
+        .collect();
+      let plus_terms: Vec<Expr> = match &plus_factor {
+        Expr::FunctionCall { name, args } if name == "Plus" => args.to_vec(),
+        Expr::BinaryOp {
+          op: BinaryOperator::Plus,
+          left,
+          right,
+        } => vec![*left.clone(), *right.clone()],
+        Expr::BinaryOp {
+          op: BinaryOperator::Minus,
+          left,
+          right,
+        } => vec![
+          *left.clone(),
+          Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            operand: right.clone(),
+          },
+        ],
+        _ => return expr.clone(),
+      };
+      let mut new_terms: Vec<Expr> = Vec::new();
+      for t in &plus_terms {
+        let mut new_factors = other_factors.clone();
+        new_factors.push(t.clone());
+        let times = call("Times", new_factors);
+        let evaluated =
+          crate::evaluator::evaluate_expr_to_expr(&times).unwrap_or(times);
+        let exp = expand_with_pattern(&evaluated, pat);
+        flatten_plus_into(&exp, &mut new_terms);
+      }
+      return call("Plus", new_terms);
+    }
+    return expr.clone();
+  }
+  let pow_parts: Option<(Expr, Expr)> = match expr {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      Some((args[0].clone(), args[1].clone()))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => Some((*left.clone(), *right.clone())),
+    _ => None,
+  };
+  if let Some((base, exp)) = pow_parts
+    && let Expr::Integer(n) = exp
+    && n > 0
+    && contains_pattern(&base, pat)
+    && (matches!(&base, Expr::FunctionCall { name, .. } if name == "Plus")
+      || matches!(
+        &base,
+        Expr::BinaryOp {
+          op: BinaryOperator::Plus | BinaryOperator::Minus,
+          ..
+        }
+      ))
+  {
+    let fully = expand_and_combine(expr);
+    return expand_with_pattern(&fully, pat);
+  }
+  expr.clone()
+}
+
+/// Flatten a Plus chain into `out`, treating non-Plus expressions as a
+/// single term. Used to preserve input-order during recursion.
+fn flatten_plus_into(expr: &Expr, out: &mut Vec<Expr>) {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      for a in args {
+        flatten_plus_into(a, out);
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      flatten_plus_into(left, out);
+      flatten_plus_into(right, out);
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      flatten_plus_into(left, out);
+      out.push(Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        operand: right.clone(),
+      });
+    }
+    _ => out.push(expr.clone()),
+  }
+}
+
+/// Extract Trig -> True from an option argument
+fn extract_trig_option(opt: &Expr) -> bool {
+  if let Expr::Rule {
+    pattern,
+    replacement,
+  } = opt
+    && let Expr::Identifier(s) = pattern.as_ref()
+    && s == "Trig"
+  {
+    return matches!(replacement.as_ref(), Expr::Identifier(v) if v == "True");
+  }
+  if let Expr::FunctionCall { name, args } = opt
+    && (name == "Rule" || name == "RuleDelayed")
+    && args.len() == 2
+    && let Expr::Identifier(s) = &args[0]
+    && s == "Trig"
+  {
+    return matches!(&args[1], Expr::Identifier(v) if v == "True");
+  }
+  false
+}
+
+/// Extract Modulus -> n from an option argument
+fn extract_modulus_option(opt: &Expr) -> Option<i128> {
+  // Handle Expr::Rule { pattern, replacement } form (from -> syntax)
+  if let Expr::Rule {
+    pattern,
+    replacement,
+  } = opt
+    && let Expr::Identifier(s) = pattern.as_ref()
+    && s == "Modulus"
+  {
+    return crate::functions::math_ast::expr_to_i128(replacement)
+      .filter(|&m| m > 1);
+  }
+  // Handle FunctionCall form (Rule[...])
+  if let Expr::FunctionCall { name, args } = opt
+    && (name == "Rule" || name == "RuleDelayed")
+    && args.len() == 2
+    && let Expr::Identifier(s) = &args[0]
+    && s == "Modulus"
+  {
+    return crate::functions::math_ast::expr_to_i128(&args[1])
+      .filter(|&m| m > 1);
+  }
+  None
+}
+
+/// Reduce all integer coefficients in an expression modulo m,
+/// dropping terms where coefficient becomes 0. Recurses into Times and Power
+/// arguments so `Modulus -> m` also applies to denominator coefficients
+/// (e.g. `ExpandAll[(1+a)^6 / (x+y)^3, Modulus->3]`).
+fn reduce_coefficients_mod(expr: &Expr, m: i128) -> Expr {
+  match expr {
+    Expr::Integer(n) => {
+      let r = n.rem_euclid(m);
+      Expr::Integer(r)
+    }
+    // a + b + ... → reduce each term, drop zeros
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left: _,
+      right: _,
+    } => {
+      // Collect all additive terms
+      let terms = collect_additive_terms(expr);
+      let reduced: Vec<Expr> = terms
+        .into_iter()
+        .map(|t| reduce_term_mod(&t, m))
+        .filter(|t| !is_zero_expr(t))
+        .collect();
+      if reduced.is_empty() {
+        return Expr::Integer(0);
+      }
+      build_mod_sum(reduced)
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      let reduced: Vec<Expr> = args
+        .iter()
+        .map(|t| reduce_term_mod(t, m))
+        .filter(|t| !is_zero_expr(t))
+        .collect();
+      if reduced.is_empty() {
+        return Expr::Integer(0);
+      }
+      build_mod_sum(reduced)
+    }
+    // Times: recurse into each factor so nested Plus subexpressions
+    // (e.g. `(x+y)^3` in a denominator) also get mod-reduced. Collapse to
+    // 0 if any factor reduces to 0.
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let l = reduce_coefficients_mod(left, m);
+      let r = reduce_coefficients_mod(right, m);
+      if is_zero_expr(&l) || is_zero_expr(&r) {
+        return Expr::Integer(0);
+      }
+      times2(l, r)
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let reduced: Vec<Expr> =
+        args.iter().map(|a| reduce_coefficients_mod(a, m)).collect();
+      if reduced.iter().any(is_zero_expr) {
+        return Expr::Integer(0);
+      }
+      call("Times", reduced)
+    }
+    // Power: only reduce the base (the exponent is a structural integer).
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: Box::new(reduce_coefficients_mod(left, m)),
+      right: right.clone(),
+    },
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      pow(reduce_coefficients_mod(&args[0], m), args[1].clone())
+    }
+    _ => reduce_term_mod(expr, m),
+  }
+}
+
+/// Reduce a single term's coefficient mod m
+fn reduce_term_mod(term: &Expr, m: i128) -> Expr {
+  match term {
+    Expr::Integer(n) => {
+      let r = n.rem_euclid(m);
+      Expr::Integer(r)
+    }
+    // c * rest → (c mod m) * (rest with mod reduction applied recursively).
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      if let Expr::Integer(c) = left.as_ref() {
+        let r = c.rem_euclid(m);
+        if r == 0 {
+          return Expr::Integer(0);
+        }
+        let right_reduced = reduce_coefficients_mod(right, m);
+        if is_zero_expr(&right_reduced) {
+          return Expr::Integer(0);
+        }
+        if r == 1 {
+          return right_reduced;
+        }
+        return times2(Expr::Integer(r), right_reduced);
+      }
+      // Non-Integer leading factor: just recurse into both sides.
+      let l = reduce_coefficients_mod(left, m);
+      let r = reduce_coefficients_mod(right, m);
+      if is_zero_expr(&l) || is_zero_expr(&r) {
+        return Expr::Integer(0);
+      }
+      times2(l, r)
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Times" && !args.is_empty() =>
+    {
+      if let Expr::Integer(c) = &args[0] {
+        let r = c.rem_euclid(m);
+        if r == 0 {
+          return Expr::Integer(0);
+        }
+        let mut new_args: Vec<Expr> = args[1..]
+          .iter()
+          .map(|a| reduce_coefficients_mod(a, m))
+          .collect();
+        if new_args.iter().any(is_zero_expr) {
+          return Expr::Integer(0);
+        }
+        if r == 1 {
+          if new_args.len() == 1 {
+            return new_args.into_iter().next().unwrap();
+          }
+          return call("Times", new_args);
+        }
+        new_args.insert(0, Expr::Integer(r));
+        return call("Times", new_args);
+      }
+      // Non-Integer leading factor: recurse into each arg.
+      let reduced: Vec<Expr> =
+        args.iter().map(|a| reduce_coefficients_mod(a, m)).collect();
+      if reduced.iter().any(is_zero_expr) {
+        return Expr::Integer(0);
+      }
+      call("Times", reduced)
+    }
+    // Plus or Power (which can contain integer coefficients in a subtree)
+    // → defer to the recursive mod reducer.
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus | BinaryOperator::Power,
+      ..
+    } => reduce_coefficients_mod(term, m),
+    Expr::FunctionCall { name, .. } if name == "Plus" || name == "Power" => {
+      reduce_coefficients_mod(term, m)
+    }
+    // Atoms and other expression kinds → return unchanged.
+    _ => term.clone(),
+  }
+}
+
+fn is_zero_expr(expr: &Expr) -> bool {
+  matches!(expr, Expr::Integer(0))
+}
+
+fn build_mod_sum(terms: Vec<Expr>) -> Expr {
+  if terms.is_empty() {
+    return Expr::Integer(0);
+  }
+  if terms.len() == 1 {
+    return terms.into_iter().next().unwrap();
+  }
+  let mut iter = terms.into_iter();
+  let first = iter.next().unwrap();
+  iter.fold(first, plus2)
+}
+
+/// Expand an expression and combine like terms.
+pub fn expand_and_combine(expr: &Expr) -> Expr {
+  let expanded = expand_expr(expr);
+  let terms = collect_additive_terms(&expanded);
+  combine_and_build(&terms)
+}
+
+/// Build a sum from distributed terms, collapsing like ones first — but only
+/// once there are enough of them for that to pay for itself.
+///
+/// `distribute_product` multiplies out a product of sums, so a *nested*
+/// product multiplies the term count at every level. Combining only at the
+/// top (in `expand_and_combine`) therefore materializes the product of every
+/// level's term count even when almost all of it cancels immediately after.
+/// Expanding the Newton form `a0 + (x-x0)(a1 + (x-x1)(a2 + …))` that
+/// `InterpolatingPolynomial` returns is the worst case: at degree 10, with a
+/// single symbolic ordinate, it built ~130000 terms for a result with 21 —
+/// 68s, against 11s at degree 9 and 0.8s at 8. Combining after each
+/// multiplication bounds the intermediate by the number of *distinct
+/// monomials* instead, which takes the same expansion to 0.2s.
+///
+/// The threshold keeps small products on the old path verbatim. Combining is
+/// idempotent with the `combine_and_build` the caller already ends with, so
+/// it cannot change the final form, but it does canonically reorder an
+/// intermediate — and for a handful of terms that costs more than the blowup
+/// it avoids.
+fn combine_like_terms(terms: Vec<Expr>) -> Expr {
+  const COMBINE_THRESHOLD: usize = 16;
+  if terms.len() < COMBINE_THRESHOLD {
+    return build_sum(terms);
+  }
+  combine_and_build(&terms)
+}
+
+/// Recursively expand an expression.
+pub fn expand_expr(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Integer(_)
+    | Expr::Real(_)
+    | Expr::String(_)
+    | Expr::Constant(_)
+    | Expr::Identifier(_)
+    | Expr::Slot(_) => expr.clone(),
+
+    // `n/(sum)^k` becomes the canonical `n * (sum)^-k` with the base intact,
+    // instead of a quotient over the EXPANDED power. Expanding the denominator
+    // destroys the shared base `Together` needs to take the LCM of a sum's
+    // denominators: `n1/(x^2+y^2+z^2)^5 + … + n5/(x^2+y^2+z^2)^9` turned into
+    // five *coprime-looking* polynomials, so Together combined over their
+    // PRODUCT (degree 70) instead of their LCM (degree 18) and the numerator
+    // expansion overflowed even the 512 MB interpreter stack (issue #426).
+    // wolframscript leaves the denominator alone as well:
+    // `Expand[(a+b)/(x+y)^2]` is `a/(x+y)^2 + b/(x+y)^2`.
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      let num_exp = expand_expr(left);
+      match sum_power_exponent(right) {
+        Some((base, n)) => {
+          distribute_product(&num_exp, &pow2(base, Expr::Integer(-n)))
+        }
+        None => div2(num_exp, expand_expr(right)),
+      }
+    }
+
+    Expr::BinaryOp { op, left, right } => {
+      let left_exp = expand_expr(left);
+      let right_exp = expand_expr(right);
+      match op {
+        BinaryOperator::Plus => plus2(left_exp, right_exp),
+        BinaryOperator::Minus => minus2(left_exp, right_exp),
+        BinaryOperator::Times => distribute_product(&left_exp, &right_exp),
+        BinaryOperator::Power => {
+          // (sum)^n where n is positive integer
+          if let Expr::Integer(n) = &right_exp
+            && *n >= 2
+            && is_sum(&left_exp)
+          {
+            return expand_power(&left_exp, *n);
+          }
+          // (num/den)^n → expand(num^n) / den^n
+          if let Expr::Integer(n) = &right_exp
+            && *n >= 2
+            && let Expr::BinaryOp {
+              op: BinaryOperator::Divide,
+              left: num,
+              right: den,
+            } = &left_exp
+          {
+            let num_expanded = expand_and_combine(&Expr::BinaryOp {
+              op: BinaryOperator::Power,
+              left: num.clone(),
+              right: Box::new(Expr::Integer(*n)),
+            });
+            let den_power = expand_and_combine(&Expr::BinaryOp {
+              op: BinaryOperator::Power,
+              left: den.clone(),
+              right: Box::new(Expr::Integer(*n)),
+            });
+            return distribute_product(
+              &num_expanded,
+              &pow2(den_power, Expr::Integer(-1)),
+            );
+          }
+          // (product)^n → distribute power to each factor: (a*b)^n → a^n * b^n
+          if let Expr::Integer(n) = &right_exp
+            && *n >= 2
+            && is_product(&left_exp)
+          {
+            let factors = collect_multiplicative_factors(&left_exp);
+            let powered: Vec<Expr> = factors
+              .into_iter()
+              .map(|f| expand_and_combine(&pow2(f, Expr::Integer(*n))))
+              .collect();
+            let mut result = powered[0].clone();
+            for f in &powered[1..] {
+              result = distribute_product(&result, f);
+            }
+            return result;
+          }
+          // Try to simplify Power (e.g. I^2 → -1, Sqrt[x]^2 → x)
+          if let Ok(simplified) = crate::functions::math_ast::power_ast(&[
+            left_exp.clone(),
+            right_exp.clone(),
+          ]) {
+            // Only use simplified result if it actually simplified
+            if !matches!(
+              &simplified,
+              Expr::BinaryOp {
+                op: BinaryOperator::Power,
+                ..
+              }
+            ) {
+              return simplified;
+            }
+          }
+          pow2(left_exp, right_exp)
+        }
+        _ => Expr::BinaryOp {
+          op: *op,
+          left: Box::new(left_exp),
+          right: Box::new(right_exp),
+        },
+      }
+    }
+
+    Expr::UnaryOp { op, operand } => {
+      let operand_exp = expand_expr(operand);
+      match op {
+        UnaryOperator::Minus => {
+          // Distribute minus over sums
+          let terms = collect_additive_terms(&operand_exp);
+          let negated: Vec<Expr> =
+            terms.into_iter().map(|t| negate_term(&t)).collect();
+          build_sum(negated)
+        }
+        UnaryOperator::Not => Expr::UnaryOp {
+          op: *op,
+          operand: Box::new(operand_exp),
+        },
+      }
+    }
+
+    Expr::Comparison {
+      operands,
+      operators,
+    } => {
+      let expanded_operands: Vec<Expr> =
+        operands.iter().map(expand_and_combine).collect();
+      Expr::Comparison {
+        operands: expanded_operands,
+        operators: operators.clone(),
+      }
+    }
+
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Plus" => {
+        let expanded_args: Vec<Expr> = args.iter().map(expand_expr).collect();
+        let mut all_terms = Vec::new();
+        for a in &expanded_args {
+          all_terms.extend(collect_additive_terms(a));
+        }
+        build_sum(all_terms)
+      }
+      "Times" => {
+        let expanded_args: Vec<Expr> = args.iter().map(expand_expr).collect();
+        if expanded_args.is_empty() {
+          return Expr::Integer(1);
+        }
+        let mut result = expanded_args[0].clone();
+        for a in &expanded_args[1..] {
+          result = distribute_product(&result, a);
+        }
+        result
+      }
+      "Power" if args.len() == 2 => {
+        let base = expand_expr(&args[0]);
+        let exp = expand_expr(&args[1]);
+        if let Expr::Integer(n) = &exp
+          && *n >= 2
+          && is_sum(&base)
+        {
+          return expand_power(&base, *n);
+        }
+        // (num/den)^n → expand(num^n) / den^n
+        if let Expr::Integer(n) = &exp
+          && *n >= 2
+          && let Expr::BinaryOp {
+            op: BinaryOperator::Divide,
+            left: num,
+            right: den,
+          } = &base
+        {
+          let num_expanded = expand_and_combine(&Expr::BinaryOp {
+            op: BinaryOperator::Power,
+            left: num.clone(),
+            right: Box::new(Expr::Integer(*n)),
+          });
+          let den_power = expand_and_combine(&Expr::BinaryOp {
+            op: BinaryOperator::Power,
+            left: den.clone(),
+            right: Box::new(Expr::Integer(*n)),
+          });
+          return distribute_product(
+            &num_expanded,
+            &pow2(den_power, Expr::Integer(-1)),
+          );
+        }
+        // (product)^n → distribute power to each factor: (a*b)^n → a^n * b^n
+        if let Expr::Integer(n) = &exp
+          && *n >= 2
+          && is_product(&base)
+        {
+          let factors = collect_multiplicative_factors(&base);
+          let powered: Vec<Expr> = factors
+            .into_iter()
+            .map(|f| expand_and_combine(&pow2(f, Expr::Integer(*n))))
+            .collect();
+          let mut result = powered[0].clone();
+          for f in &powered[1..] {
+            result = distribute_product(&result, f);
+          }
+          return result;
+        }
+        pow(base, exp)
+      }
+      _ => expr.clone(),
+    },
+
+    _ => expr.clone(),
+  }
+}
+
+/// Check if an expression is a product (Times) with multiple factors.
+fn is_product(expr: &Expr) -> bool {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      ..
+    } => true,
+    Expr::FunctionCall { name, args } if name == "Times" && args.len() >= 2 => {
+      true
+    }
+    _ => false,
+  }
+}
+
+/// `(sum)^n` with an explicit integer exponent `n >= 2` → `(sum, n)`. This is
+/// the denominator shape whose base must survive expansion (see the `Divide`
+/// arm of `expand_expr`).
+pub(crate) fn sum_power_exponent(expr: &Expr) -> Option<(Expr, i128)> {
+  let (base, exp) = match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => (left.as_ref(), right.as_ref()),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (args.first()?, args.get(1)?)
+    }
+    _ => return None,
+  };
+  match exp {
+    Expr::Integer(n) if *n >= 2 && is_sum(base) => Some((base.clone(), *n)),
+    _ => None,
+  }
+}
+
+/// Check if an expression is a sum (Plus).
+pub fn is_sum(expr: &Expr) -> bool {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus | BinaryOperator::Minus,
+      ..
+    } => true,
+    Expr::FunctionCall { name, .. } if name == "Plus" => true,
+    _ => false,
+  }
+}
+
+/// Distribute the product of two expanded expressions.
+/// If either is a sum, produce all cross-products.
+fn distribute_product(left: &Expr, right: &Expr) -> Expr {
+  let left_terms = collect_additive_terms(left);
+  let right_terms = collect_additive_terms(right);
+
+  if left_terms.len() == 1 && right_terms.len() == 1 {
+    // Neither is a sum — just multiply
+    return multiply_terms(&left_terms[0], &right_terms[0]);
+  }
+
+  let mut result_terms = Vec::new();
+  for l in &left_terms {
+    for r in &right_terms {
+      result_terms.push(multiply_terms(l, r));
+    }
+  }
+  combine_like_terms(result_terms)
+}
+
+/// Multiply two non-sum terms (individual monomials).
+fn multiply_terms(a: &Expr, b: &Expr) -> Expr {
+  // Handle negation
+  if let Expr::UnaryOp {
+    op: UnaryOperator::Minus,
+    operand,
+  } = a
+  {
+    return negate_term(&multiply_terms(operand, b));
+  }
+  if let Expr::UnaryOp {
+    op: UnaryOperator::Minus,
+    operand,
+  } = b
+  {
+    return negate_term(&multiply_terms(a, operand));
+  }
+
+  match (a, b) {
+    (Expr::Integer(1), _) => b.clone(),
+    (_, Expr::Integer(1)) => a.clone(),
+    (Expr::Integer(0), _) | (_, Expr::Integer(0)) => Expr::Integer(0),
+    // Promote to BigInteger on i128 overflow instead of panicking.
+    (Expr::Integer(x), Expr::Integer(y)) => match x.checked_mul(*y) {
+      Some(p) => Expr::Integer(p),
+      None => Expr::BigInteger(BigInt::from(*x) * BigInt::from(*y)),
+    },
+    (Expr::Real(x), Expr::Real(y)) => Expr::Real(x * y),
+    (Expr::Integer(x), Expr::Real(y)) | (Expr::Real(y), Expr::Integer(x)) => {
+      Expr::Real(*x as f64 * y)
+    }
+    _ => {
+      // Combine like bases: x * x → x^2, x^a * x^b → x^(a+b)
+      let mut a_factors = collect_multiplicative_factors(a);
+      let b_factors = collect_multiplicative_factors(b);
+      a_factors.extend(b_factors);
+      combine_product_factors(&a_factors)
+    }
+  }
+}
+
+/// Combine multiplicative factors, merging like bases into powers.
+/// [x, x, y] → x^2 * y
+/// True for an exact/inexact numeric scalar (Integer, BigInteger, Real, or a
+/// literal Rational).
+fn is_numeric_scalar(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => true,
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      matches!(args[0], Expr::Integer(_) | Expr::BigInteger(_))
+        && matches!(args[1], Expr::Integer(_) | Expr::BigInteger(_))
+    }
+    // A quotient of numeric literals is a number too: expansion builds
+    // `Divide` nodes (e.g. the leading-coefficient ratio in
+    // PolynomialReduce) that never went through the evaluator's
+    // Rational normalization.
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => is_numeric_scalar(left) && is_numeric_scalar(right),
+    _ => false,
+  }
+}
+
+/// Post-process an expanded result: inside each additive term, fold all
+/// numeric scalar factors (Integer/Real/Rational) into one coefficient, so a
+/// value-correct-but-unnormalized monomial like `Times[-2, 15/4, x]` becomes
+/// `-15/2 x`. Only terms with two or more numeric factors are rewritten;
+/// every other term is returned byte-identical, so the canonical forms that
+/// existing Expand output relies on are preserved. This runs ONLY on Expand's
+/// own output, leaving the shared `combine_product_factors` (used by Simplify)
+/// untouched.
+fn fold_term_numerics(expr: &Expr) -> Expr {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      let folded = plus2(fold_term_numerics(left), fold_term_numerics(right));
+      resort_radical_sum(&folded)
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      let folded = Expr::FunctionCall {
+        name: "Plus".to_string(),
+        args: args
+          .iter()
+          .map(fold_term_numerics)
+          .collect::<Vec<_>>()
+          .into(),
+      };
+      resort_radical_sum(&folded)
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => negate_term(&fold_term_numerics(operand)),
+    _ if is_product(expr) => {
+      let factors = collect_multiplicative_factors(expr);
+      // A term carrying numeric radicals re-runs through the Times
+      // evaluator: two radicals merge into one canonical radical
+      // (Sqrt[26]*Sqrt[7] → Sqrt[182]; differential fuzzer, seed
+      // 6493139821400918028), and a radical coefficient takes its
+      // canonical place before symbols (3*Sqrt[2]*x, not 3*x*Sqrt[2]) —
+      // all wolframscript-verified.
+      let radicals = factors.iter().filter(|f| is_numeric_radical(f)).count();
+      if (radicals >= 2 || (radicals == 1 && factors.len() >= 2))
+        && let Ok(merged) =
+          crate::evaluator::evaluate_function_call_ast("Times", &factors)
+      {
+        return merged;
+      }
+      if factors.iter().filter(|f| is_numeric_scalar(f)).count() < 2 {
+        return expr.clone();
+      }
+      let mut coeff = Expr::Integer(1);
+      let mut rest: Vec<Expr> = Vec::new();
+      for f in &factors {
+        if is_numeric_scalar(f) {
+          coeff = multiply_numeric_coeff(&coeff, f);
+        } else {
+          rest.push(f.clone());
+        }
+      }
+      let mut out: Vec<Expr> = Vec::new();
+      if !matches!(coeff, Expr::Integer(1)) {
+        out.push(coeff);
+      }
+      out.extend(rest);
+      build_product(out)
+    }
+    _ => expr.clone(),
+  }
+}
+
+/// Re-sort a sum through the Plus evaluator when any term carries a
+/// numeric radical: Expand's exponent-map term sort doesn't know the
+/// canonical radical order, so Sqrt[2]*(Sqrt[5]+Sqrt[7]) + Sqrt[3]*(…)
+/// would come out as Sqrt[10] + Sqrt[15] + Sqrt[14] + Sqrt[21]
+/// (wolframscript: Sqrt[10] + Sqrt[14] + Sqrt[15] + Sqrt[21]). Sums
+/// without radicals are returned byte-identical.
+fn resort_radical_sum(sum: &Expr) -> Expr {
+  let has_radical = |term: &Expr| {
+    is_numeric_radical(term)
+      || collect_multiplicative_factors(term)
+        .iter()
+        .any(is_numeric_radical)
+  };
+  let terms = collect_additive_terms(sum);
+  if terms.len() < 2 || !terms.iter().any(has_radical) {
+    return sum.clone();
+  }
+  crate::evaluator::evaluate_function_call_ast("Plus", &terms)
+    .unwrap_or_else(|_| sum.clone())
+}
+
+/// A radical over an exact numeric radicand — Sqrt[26], 26^(1/2),
+/// (2/15)^(3/2) — whose product with another such radical merges into one
+/// canonical radical.
+fn is_numeric_radical(e: &Expr) -> bool {
+  let exact_numeric = |x: &Expr| {
+    matches!(x, Expr::Integer(_) | Expr::BigInteger(_))
+      || matches!(x, Expr::FunctionCall { name, args }
+          if name == "Rational" && args.len() == 2)
+  };
+  let rational_exp = |x: &Expr| {
+    matches!(x, Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2)
+  };
+  match e {
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => {
+      exact_numeric(&args[0])
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      exact_numeric(&args[0]) && rational_exp(&args[1])
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => exact_numeric(left) && rational_exp(right),
+    _ => false,
+  }
+}
+
+fn combine_product_factors(factors: &[Expr]) -> Expr {
+  // Group factors by base, sum exponents
+  let mut base_exps: Vec<(String, Expr, Expr)> = Vec::new(); // (sort_key, base, exponent)
+  let mut numeric_coeff = Expr::Integer(1);
+
+  for f in factors {
+    match f {
+      Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => {
+        numeric_coeff = multiply_exprs(&numeric_coeff, f);
+      }
+      _ => {
+        let (base, exp) = extract_base_and_exp(f);
+        let key = expr_to_string(&base);
+        if let Some(entry) = base_exps.iter_mut().find(|(k, _, _)| *k == key) {
+          entry.2 = add_exprs(&entry.2, &exp);
+        } else {
+          base_exps.push((key, base, exp));
+        }
+      }
+    }
+  }
+
+  // Build result
+  let mut result_factors: Vec<Expr> = Vec::new();
+  if !matches!(&numeric_coeff, Expr::Integer(1)) {
+    result_factors.push(numeric_coeff);
+  }
+
+  for (_, base, exp) in base_exps {
+    let exp = simplify(exp);
+    if matches!(&exp, Expr::Integer(0)) {
+      continue; // x^0 = 1, skip
+    }
+    if matches!(&exp, Expr::Integer(1)) {
+      result_factors.push(base);
+    } else {
+      // Try to evaluate the power (e.g. I^2 → -1)
+      if let Ok(simplified) =
+        crate::functions::math_ast::power_ast(&[base.clone(), exp.clone()])
+      {
+        result_factors.push(simplified);
+      } else {
+        result_factors.push(pow2(base, exp));
+      }
+    }
+  }
+
+  if result_factors.is_empty() {
+    Expr::Integer(1)
+  } else {
+    build_product(result_factors)
+  }
+}
+
+/// Extract base and exponent from a factor.
+pub fn extract_base_and_exp(expr: &Expr) -> (Expr, Expr) {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => (*left.clone(), *right.clone()),
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      (args[0].clone(), args[1].clone())
+    }
+    _ => (expr.clone(), Expr::Integer(1)),
+  }
+}
+
+/// Negate a term.
+pub fn negate_term(t: &Expr) -> Expr {
+  match t {
+    Expr::Integer(n) => Expr::Integer(-n),
+    Expr::Real(f) => Expr::Real(-f),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => *operand.clone(),
+    _ => neg1(t.clone()),
+  }
+}
+
+/// Expand (sum)^n by repeated distribution.
+fn expand_power(base: &Expr, n: i128) -> Expr {
+  if n == 0 {
+    return Expr::Integer(1);
+  }
+  if n == 1 {
+    return base.clone();
+  }
+  // Repeated multiplication
+  let mut result = base.clone();
+  for _ in 1..n {
+    result = distribute_product(&result, base);
+    // Combine like terms to keep expression manageable
+    let terms = collect_additive_terms(&result);
+    result = combine_and_build(&terms);
+  }
+  result
+}
+
+/// Build a sum (BinaryOp::Plus chain) from terms.
+pub fn build_sum(terms: Vec<Expr>) -> Expr {
+  if terms.is_empty() {
+    return Expr::Integer(0);
+  }
+  let mut iter = terms.into_iter();
+  let mut result = iter.next().unwrap();
+  for t in iter {
+    // Handle negative terms: a + (-b) stays as BinaryOp::Plus with UnaryOp::Minus
+    result = plus2(result, t);
+  }
+  result
+}
+
+/// Combine like terms and sort, then build the final expression.
+pub fn combine_and_build(terms: &[Expr]) -> Expr {
+  // Represent each term as (key, coefficient) where key identifies the "variable part"
+  let mut term_map: Vec<(String, Vec<Expr>, Expr)> = Vec::new(); // (sort_key, var_factors, coeff)
+  // Side index from sort key to its slot in `term_map`. `term_map` stays a Vec
+  // so first-seen order is preserved for the (stable) sort below; the index
+  // only replaces the linear `find`, which made combining a dense expansion
+  // quadratic — the multi-thousand-monomial intermediates of a `Together` over
+  // high powers spent minutes here.
+  let mut index: std::collections::HashMap<String, usize> =
+    std::collections::HashMap::new();
+
+  for term in terms {
+    let (coeff, var_key, var_factors) = decompose_term(term);
+    if let Some(&i) = index.get(&var_key) {
+      term_map[i].2 = add_exprs(&term_map[i].2, &coeff);
+    } else {
+      index.insert(var_key.clone(), term_map.len());
+      term_map.push((var_key, var_factors, coeff));
+    }
+  }
+
+  // Sort terms using Wolfram's canonical ordering:
+  // Reverse-variable lexicographic ascending — sort by last variable ascending,
+  // then next-to-last ascending, etc. Constants come first naturally (all exponents 0).
+  term_map.sort_by(|(ka, va, _), (kb, vb, _)| {
+    // Constants first
+    match (ka.is_empty(), kb.is_empty()) {
+      (true, true) => return std::cmp::Ordering::Equal,
+      (true, false) => return std::cmp::Ordering::Less,
+      (false, true) => return std::cmp::Ordering::Greater,
+      _ => {}
+    }
+    let ea = extract_exponent_map(va);
+    let eb = extract_exponent_map(vb);
+    // Collect all variable names, sort alphabetically
+    let mut all_vars: Vec<&String> = ea.keys().chain(eb.keys()).collect();
+    all_vars.sort();
+    all_vars.dedup();
+    // Compare from LAST variable ascending, then next-to-last ascending, etc.
+    for var in all_vars.iter().rev() {
+      let pa = ea.get(*var).copied().unwrap_or(0);
+      let pb = eb.get(*var).copied().unwrap_or(0);
+      if pa != pb {
+        return pa.cmp(&pb); // ascending
+      }
+    }
+    std::cmp::Ordering::Equal
+  });
+
+  // Build result terms
+  let mut result_terms: Vec<Expr> = Vec::new();
+  for (_, var_factors, coeff) in term_map {
+    let coeff = simplify(coeff);
+    if matches!(&coeff, Expr::Integer(0)) {
+      continue; // skip zero terms
+    }
+    if var_factors.is_empty() {
+      // Constant term
+      result_terms.push(coeff);
+    } else if matches!(&coeff, Expr::Integer(1)) {
+      // Coefficient is 1, just use the variable part
+      let var_expr = build_product(var_factors);
+      result_terms.push(var_expr);
+    } else if matches!(&coeff, Expr::Integer(-1)) {
+      let var_expr = build_product(var_factors);
+      result_terms.push(negate_term(&var_expr));
+    } else {
+      let var_expr = build_product(var_factors);
+      result_terms.push(multiply_exprs(&coeff, &var_expr));
+    }
+  }
+
+  if result_terms.is_empty() {
+    Expr::Integer(0)
+  } else {
+    // Use plus_ast for canonical Plus ordering (handles non-polynomial terms correctly)
+    crate::functions::math_ast::plus_ast(&result_terms)
+      .unwrap_or_else(|_| build_sum(result_terms))
+  }
+}
+
+/// Sort variable factors using Wolfram canonical Times ordering:
+/// atomic algebraic terms (identifiers, polynomial powers) come before
+/// transcendental function calls (Sin, Cos, etc.). Within each priority
+/// bucket, sort by `expr_to_string` for canonical ordering.
+fn sort_var_factors_canonical(factors: &mut [Expr]) {
+  // Wolfram's canonical Times ordering puts atoms (Identifier, Constant)
+  // before compound function calls within the same priority bucket — so
+  // `x*Derivative[1,1,1][f][…]` rather than `Derivative[…]*x`.
+  fn factor_subpriority(e: &Expr) -> i32 {
+    match e {
+      Expr::Identifier(_) | Expr::Constant(_) => 0,
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        ..
+      } => factor_subpriority(left),
+      Expr::FunctionCall { name, args }
+        if name == "Power" && !args.is_empty() =>
+      {
+        factor_subpriority(&args[0])
+      }
+      _ => 1,
+    }
+  }
+  factors.sort_by(|a, b| {
+    let pa = crate::functions::math_ast::term_priority(a);
+    let pb = crate::functions::math_ast::term_priority(b);
+    pa.cmp(&pb)
+      .then_with(|| factor_subpriority(a).cmp(&factor_subpriority(b)))
+      .then_with(|| expr_to_string(a).cmp(&expr_to_string(b)))
+  });
+}
+
+/// Multiply two numeric coefficients, keeping rationals in normal form.
+/// `multiply_exprs` only folds integers, so `2 * 1/2` would stay an
+/// unevaluated `Times` and two terms that differ only in how their rational
+/// coefficient is spelled would never combine.
+fn multiply_numeric_coeff(a: &Expr, b: &Expr) -> Expr {
+  if matches!(a, Expr::Integer(1)) {
+    return b.clone();
+  }
+  if matches!(b, Expr::Integer(1)) {
+    return a.clone();
+  }
+  crate::evaluator::evaluate_function_call_ast("Times", &[a.clone(), b.clone()])
+    .unwrap_or_else(|_| multiply_exprs(a, b))
+}
+
+/// Decompose a term into (numeric_coefficient, sort_key, variable_factors).
+/// E.g. 3*x^2*y → (3, "x^2*y", [x^2, y])
+///      -x → (-1, "x^1", [x])
+///      5 → (5, "", [])
+pub(super) fn decompose_term(term: &Expr) -> (Expr, String, Vec<Expr>) {
+  // A bare number — including a Rational or a quotient of numeric literals —
+  // is a pure coefficient with an empty variable part, so `1/2` and `-1/2`
+  // land in the same bucket as any other constant.
+  if is_numeric_scalar(term) {
+    return (term.clone(), String::new(), vec![]);
+  }
+  match term {
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => {
+      (term.clone(), String::new(), vec![])
+    }
+    Expr::Identifier(_) => {
+      (Expr::Integer(1), expr_to_string(term), vec![term.clone()])
+    }
+    Expr::Constant(_) => {
+      (Expr::Integer(1), expr_to_string(term), vec![term.clone()])
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let (c, k, v) = decompose_term(operand);
+      (negate_term(&c), k, v)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      ..
+    } => {
+      let factors = collect_multiplicative_factors(term);
+      let mut numeric_coeff = Expr::Integer(1);
+      let mut var_factors: Vec<Expr> = Vec::new();
+
+      for f in &factors {
+        match f {
+          _ if is_numeric_scalar(f) => {
+            numeric_coeff = multiply_numeric_coeff(&numeric_coeff, f);
+          }
+          Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            operand,
+          } => {
+            numeric_coeff = negate_term(&numeric_coeff);
+            if is_numeric_scalar(operand) {
+              numeric_coeff = multiply_numeric_coeff(&numeric_coeff, operand);
+            } else {
+              var_factors.push(*operand.clone());
+            }
+          }
+          _ => var_factors.push(f.clone()),
+        }
+      }
+
+      // Sort variable factors using Wolfram canonical Times ordering:
+      // atomic identifiers come before transcendental function calls.
+      sort_var_factors_canonical(&mut var_factors);
+      let key = var_factors
+        .iter()
+        .map(expr_to_string)
+        .collect::<Vec<_>>()
+        .join("*");
+      (numeric_coeff, key, var_factors)
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      ..
+    } => (Expr::Integer(1), expr_to_string(term), vec![term.clone()]),
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut numeric_coeff = Expr::Integer(1);
+      let mut var_factors: Vec<Expr> = Vec::new();
+
+      for f in args {
+        if is_numeric_scalar(f) {
+          numeric_coeff = multiply_numeric_coeff(&numeric_coeff, f);
+        } else {
+          var_factors.push(f.clone());
+        }
+      }
+
+      sort_var_factors_canonical(&mut var_factors);
+      let key = var_factors
+        .iter()
+        .map(expr_to_string)
+        .collect::<Vec<_>>()
+        .join("*");
+      (numeric_coeff, key, var_factors)
+    }
+    _ => (Expr::Integer(1), expr_to_string(term), vec![term.clone()]),
+  }
+}
+
+/// Collect multiplicative factors from nested Times.
+pub fn collect_multiplicative_factors(expr: &Expr) -> Vec<Expr> {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let mut factors = collect_multiplicative_factors(left);
+      factors.extend(collect_multiplicative_factors(right));
+      factors
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut factors = Vec::new();
+      for a in args {
+        factors.extend(collect_multiplicative_factors(a));
+      }
+      factors
+    }
+    _ => vec![expr.clone()],
+  }
+}
+
+/// Build a product from factors.
+pub fn build_product(factors: Vec<Expr>) -> Expr {
+  // Drop unit factors: Times[1, x] is just x. Keeping the literal 1 leaks
+  // into display forms (e.g. `(1+x)/10` rendering as `1 (1+x)` over 10).
+  let factors: Vec<Expr> = factors
+    .into_iter()
+    .filter(|f| !matches!(f, Expr::Integer(1)))
+    .collect();
+  if factors.is_empty() {
+    return Expr::Integer(1);
+  }
+  // When any factor is the imaginary unit `I` (Identifier or
+  // Complex[0, _]), pull it to the front so the result respects Wolfram's
+  // canonical Times ordering for I-bearing products: `I*Cos[x]*Sinh[y]`
+  // rather than `Cos[x]*I*Sinh[y]`. Other factors keep their relative
+  // order — Expand callers rely on the variable-position ordering.
+  let i_pos = factors.iter().position(|f| {
+    matches!(f, Expr::Identifier(s) if s == "I")
+      || matches!(f, Expr::FunctionCall { name, args }
+        if name == "Complex" && args.len() == 2
+          && (matches!(&args[0], Expr::Integer(0))
+              || matches!(&args[0], Expr::Real(v) if *v == 0.0)))
+  });
+  let factors: Vec<Expr> = if let Some(idx) = i_pos
+    && idx > 0
+  {
+    let mut v = factors;
+    let i_factor = v.remove(idx);
+    let mut out = Vec::with_capacity(v.len() + 1);
+    out.push(i_factor);
+    out.extend(v);
+    out
+  } else {
+    factors
+  };
+  let mut iter = factors.into_iter();
+  let mut result = iter.next().unwrap();
+  for f in iter {
+    result = times2(result, f);
+  }
+  result
+}
+
+// ─── ExpandAll ──────────────────────────────────────────────────────
+
+/// ExpandAll[expr] - Recursively expands all subexpressions
+/// ExpandAll[expr, Modulus -> n] - Expands and reduces integer coefficients
+/// modulo n, like Expand's Modulus option.
+pub fn expand_all_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "ExpandAll expects 1 or 2 arguments".into(),
+    ));
+  }
+  let modulus = if args.len() == 2 {
+    extract_modulus_option(&args[1])
+  } else {
+    None
+  };
+  let trig = if args.len() == 2 {
+    extract_trig_option(&args[1])
+  } else {
+    false
+  };
+  let mut expanded = expand_all_recursive(&args[0]);
+  if trig {
+    // After the recursive Power/Times expansion, apply trig identities
+    // to every Sin/Cos/Tan etc. that survives. Re-expand the result so
+    // any new Sum*Sum products from the addition formulas distribute.
+    expanded = crate::functions::math_ast::trig_expand_ast(&[expanded])
+      .unwrap_or_else(|_| args[0].clone());
+    expanded = expand_all_recursive(&expanded);
+  }
+  if let Some(m) = modulus {
+    // wolframscript keeps the fraction `(num)/(den)` together when a
+    // Modulus is supplied even though the default ExpandAll distributes
+    // each numerator term over the denominator. Recombine via Together
+    // after the modular reduction so the shape matches.
+    let reduced = reduce_coefficients_mod(&expanded, m);
+    Ok(super::together::together_expr(&reduced))
+  } else {
+    Ok(expanded)
+  }
+}
+
+/// Recursively expand all subexpressions, then expand at the top level
+fn expand_all_recursive(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Integer(_)
+    | Expr::Real(_)
+    | Expr::String(_)
+    | Expr::Constant(_)
+    | Expr::Identifier(_)
+    | Expr::Slot(_) => expr.clone(),
+
+    Expr::BinaryOp { op, left, right } => {
+      let left_exp = expand_all_recursive(left);
+      let right_exp = expand_all_recursive(right);
+      // Power[sum, -|n|] with n >= 2: ExpandAll expands denominators too,
+      // so expand sum^|n| and wrap in Power[..., -1]. Regular Expand does
+      // not do this; it's specifically an ExpandAll feature.
+      if matches!(op, BinaryOperator::Power)
+        && matches!(&right_exp, Expr::Integer(n) if *n <= -2)
+        && is_sum(&left_exp)
+      {
+        let pos_exp = match &right_exp {
+          Expr::Integer(n) => -n,
+          _ => unreachable!(),
+        };
+        let expanded = expand_power(&left_exp, pos_exp);
+        return pow(expanded, Expr::Integer(-1));
+      }
+      // After recursively expanding sub-expressions, expand at this level
+      expand_and_combine(&Expr::BinaryOp {
+        op: *op,
+        left: Box::new(left_exp),
+        right: Box::new(right_exp),
+      })
+    }
+
+    Expr::UnaryOp { op, operand } => {
+      let operand_exp = expand_all_recursive(operand);
+      expand_and_combine(&Expr::UnaryOp {
+        op: *op,
+        operand: Box::new(operand_exp),
+      })
+    }
+
+    Expr::Comparison {
+      operands,
+      operators,
+    } => {
+      let expanded_operands: Vec<Expr> = operands
+        .iter()
+        .map(|op| {
+          let expanded = expand_all_recursive(op);
+          expand_and_combine(&expanded)
+        })
+        .collect();
+      Expr::Comparison {
+        operands: expanded_operands,
+        operators: operators.clone(),
+      }
+    }
+
+    Expr::CurriedCall { func, args } => {
+      // ExpandAll[(expr1)[expr2]] expands inside both the head expression
+      // and each curried argument (matches Wolfram, where
+      // `ExpandAll[((1+x)(1+y))[x]]` produces `(1 + x + y + x*y)[x]`).
+      let func_exp = expand_all_recursive(func);
+      let args_exp: Vec<Expr> = args.iter().map(expand_all_recursive).collect();
+      Expr::CurriedCall {
+        func: Box::new(func_exp),
+        args: args_exp,
+      }
+    }
+
+    Expr::List(items) => {
+      Expr::List(items.iter().map(expand_all_recursive).collect())
+    }
+
+    Expr::FunctionCall { name, args } => {
+      let expanded_args: Vec<Expr> =
+        args.iter().map(expand_all_recursive).collect();
+      // After expanding sub-expressions, expand at this level for Plus/Times/Power
+      match name.as_str() {
+        // Power[sum, -|n|] with n >= 1: ExpandAll expands denominators too,
+        // so expand sum^|n| and wrap the result in Power[..., -1]. The
+        // regular Expand never does this. Needed for ExpandAll output like
+        // `(a+b)^2 / (c+d)^2` → `a^2/(c^2+2cd+d^2) + …`.
+        "Power"
+          if expanded_args.len() == 2
+            && matches!(&expanded_args[1], Expr::Integer(n) if *n <= -2)
+            && is_sum(&expanded_args[0]) =>
+        {
+          let pos_exp = match &expanded_args[1] {
+            Expr::Integer(n) => -n,
+            _ => unreachable!(),
+          };
+          let expanded = expand_power(&expanded_args[0], pos_exp);
+          pow(expanded, Expr::Integer(-1))
+        }
+        "Plus" | "Times" | "Power" => expand_and_combine(&Expr::FunctionCall {
+          name: name.clone(),
+          args: expanded_args.into(),
+        }),
+        _ => Expr::FunctionCall {
+          name: name.clone(),
+          args: expanded_args.into(),
+        },
+      }
+    }
+
+    _ => expr.clone(),
+  }
+}
+
+// ─── ExpandNumerator ───────────────────────────────────────────────
+
+/// ExpandNumerator[expr] - Expands the numerator of a rational expression
+/// while leaving the denominator unchanged.
+pub fn expand_numerator_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "ExpandNumerator expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over Lists
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| expand_numerator_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  Ok(expand_numerator_recursive(&args[0]))
+}
+
+/// Recursively expand numerators in an expression.
+fn expand_numerator_recursive(expr: &Expr) -> Expr {
+  match expr {
+    // a + b : expand numerator in each summand
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => plus2(
+      expand_numerator_recursive(left),
+      expand_numerator_recursive(right),
+    ),
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => minus2(
+      expand_numerator_recursive(left),
+      expand_numerator_recursive(right),
+    ),
+    Expr::FunctionCall { name, args } if name == "Plus" => Expr::FunctionCall {
+      name: "Plus".to_string(),
+      args: args.iter().map(expand_numerator_recursive).collect(),
+    },
+
+    // a / b : expand the numerator a
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      let expanded_num = expand_and_combine(left);
+      Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left: Box::new(expanded_num),
+        right: right.clone(),
+      }
+    }
+
+    // a * b : expand factors with positive power
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let left_result = expand_numerator_in_product(left);
+      let right_result = expand_numerator_in_product(right);
+      times2(left_result, right_result)
+    }
+
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let new_args: Vec<Expr> =
+        args.iter().map(expand_numerator_in_product).collect();
+      call("Times", new_args)
+    }
+
+    // base^n where n > 0: expand
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: _base,
+      right: exp,
+    } if matches!(exp.as_ref(), Expr::Integer(n) if *n > 0) => {
+      expand_and_combine(expr)
+    }
+
+    Expr::FunctionCall { name, args }
+      if name == "Power"
+        && args.len() == 2
+        && matches!(&args[1], Expr::Integer(n) if *n > 0) =>
+    {
+      expand_and_combine(expr)
+    }
+
+    _ => expr.clone(),
+  }
+}
+
+/// Expand numerator parts in a product factor.
+fn expand_numerator_in_product(factor: &Expr) -> Expr {
+  match factor {
+    // base^n where n > 0: expand
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: _base,
+      right: exp,
+    } if matches!(exp.as_ref(), Expr::Integer(n) if *n > 0) => {
+      expand_and_combine(factor)
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Power"
+        && args.len() == 2
+        && matches!(&args[1], Expr::Integer(n) if *n > 0) =>
+    {
+      expand_and_combine(factor)
+    }
+    // base^(-n): leave as-is (this is a denominator)
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: _,
+      right: exp,
+    } if is_negative_integer(exp) => factor.clone(),
+    // Nested product
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => times2(
+      expand_numerator_in_product(left),
+      expand_numerator_in_product(right),
+    ),
+    _ => factor.clone(),
+  }
+}
+
+// ─── ExpandDenominator ─────────────────────────────────────────────
+
+/// ExpandDenominator[expr] - Expands the denominator of a rational expression
+/// while leaving the numerator unchanged.
+pub fn expand_denominator_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "ExpandDenominator expects exactly 1 argument".into(),
+    ));
+  }
+  // Thread over Lists
+  if let Expr::List(items) = &args[0] {
+    let results: Result<Vec<Expr>, InterpreterError> = items
+      .iter()
+      .map(|item| expand_denominator_ast(std::slice::from_ref(item)))
+      .collect();
+    return Ok(Expr::List(results?.into()));
+  }
+
+  Ok(expand_denominator_recursive(&args[0]))
+}
+
+/// Recursively expand denominators in an expression.
+fn expand_denominator_recursive(expr: &Expr) -> Expr {
+  match expr {
+    // a + b + ... : expand denominator in each summand
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => plus2(
+      expand_denominator_recursive(left),
+      expand_denominator_recursive(right),
+    ),
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => minus2(
+      expand_denominator_recursive(left),
+      expand_denominator_recursive(right),
+    ),
+    Expr::FunctionCall { name, args } if name == "Plus" => Expr::FunctionCall {
+      name: "Plus".to_string(),
+      args: args.iter().map(expand_denominator_recursive).collect(),
+    },
+
+    // a / b : expand the denominator b
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      left,
+      right,
+    } => {
+      let expanded_den = expand_and_combine(right);
+      Expr::BinaryOp {
+        op: BinaryOperator::Divide,
+        left: left.clone(),
+        right: Box::new(expanded_den),
+      }
+    }
+
+    // Times: split into numerator/denominator, expand the combined
+    // denominator, and rebuild — so that multi-factor denominators like
+    // `(c+d)^2 * (e+f)` fully distribute, matching wolframscript.
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      ..
+    } => expand_denominator_via_split(expr),
+
+    Expr::FunctionCall { name, .. } if name == "Times" => {
+      expand_denominator_via_split(expr)
+    }
+
+    // base^(-n) where n > 0: expand base^n, then take reciprocal
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left: base,
+      right: exp,
+    } if is_negative_integer(exp) => {
+      let pos_exp = negate_expr(exp);
+      let expanded = expand_and_combine(&Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: base.clone(),
+        right: Box::new(pos_exp),
+      });
+      // The expansion absorbs the positive exponent, so always use -1
+      pow(expanded, Expr::Integer(-1))
+    }
+
+    Expr::FunctionCall { name, args }
+      if name == "Power"
+        && args.len() == 2
+        && is_negative_integer(&args[1]) =>
+    {
+      let pos_exp = negate_expr(&args[1]);
+      let expanded = expand_and_combine(&pow(args[0].clone(), pos_exp));
+      // The expansion absorbs the positive exponent, so always use -1
+      pow(expanded, Expr::Integer(-1))
+    }
+
+    _ => expr.clone(),
+  }
+}
+
+/// Extract the denominator of a product (via num/den splitting) and expand
+/// it fully. The numerator is kept unchanged.
+fn expand_denominator_via_split(expr: &Expr) -> Expr {
+  let (num, den) = super::together::extract_num_den(expr);
+  if matches!(&den, Expr::Integer(1)) {
+    return expr.clone();
+  }
+  let expanded_den = expand_and_combine(&den);
+  div2(num, expanded_den)
+}
+
+fn is_negative_integer(expr: &Expr) -> bool {
+  match expr {
+    Expr::Integer(n) => *n < 0,
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => matches!(operand.as_ref(), Expr::Integer(n) if *n > 0),
+    _ => false,
+  }
+}
+
+fn negate_expr(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Integer(n) => Expr::Integer(-n),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => operand.as_ref().clone(),
+    _ => neg1(expr.clone()),
+  }
+}

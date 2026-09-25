@@ -1,0 +1,642 @@
+use super::*;
+use crate::functions::expr_form::{ExprForm, decompose_expr};
+use crate::functions::graphics::graphics_ast;
+use std::collections::HashMap;
+
+/// A node in the expression tree
+struct TreeNode {
+  label: String,
+  children: Vec<Self>,
+}
+
+/// Recursively build a tree from an expression, respecting an optional depth limit.
+fn build_tree(
+  expr: &Expr,
+  max_depth: Option<usize>,
+  current_depth: usize,
+) -> TreeNode {
+  // If we've reached the max depth, show the expression as a leaf
+  if let Some(max) = max_depth
+    && current_depth >= max
+  {
+    return TreeNode {
+      label: expr_to_string(expr),
+      children: vec![],
+    };
+  }
+
+  match decompose_expr(expr) {
+    ExprForm::Atom(label) => TreeNode {
+      label,
+      children: vec![],
+    },
+    ExprForm::Composite { head, children } => TreeNode {
+      label: head,
+      children: children
+        .iter()
+        .map(|c| build_tree(c, max_depth, current_depth + 1))
+        .collect(),
+    },
+  }
+}
+
+/// Positioned node after layout
+struct LayoutNode {
+  x: f64,
+  y: f64,
+  label: String,
+  children_indices: Vec<usize>,
+}
+
+/// Maximum full box width across all nodes in the tree
+fn max_node_box_width(
+  node: &TreeNode,
+  char_width: f64,
+  box_padding: f64,
+) -> f64 {
+  let self_width = node.label.len() as f64 * char_width + 2.0 * box_padding;
+  let child_max = node
+    .children
+    .iter()
+    .map(|c| max_node_box_width(c, char_width, box_padding))
+    .fold(0.0_f64, f64::max);
+  self_width.max(child_max)
+}
+
+/// Perform a simple tree layout using Reingold-Tilford-style centering.
+/// Returns a flat list of positioned nodes.
+fn layout_tree(root: &TreeNode, leaf_step: f64) -> Vec<LayoutNode> {
+  let mut nodes = Vec::new();
+  let y_spacing = 1.0;
+  layout_recursive(root, 0, y_spacing, leaf_step, &mut nodes, &mut 0.0);
+  nodes
+}
+
+/// Recursive layout: returns the index of the placed node.
+/// `next_leaf_x` is advanced for each leaf to ensure no overlap.
+fn layout_recursive(
+  node: &TreeNode,
+  depth: usize,
+  y_spacing: f64,
+  leaf_step: f64,
+  nodes: &mut Vec<LayoutNode>,
+  next_leaf_x: &mut f64,
+) -> usize {
+  let idx = nodes.len();
+  // Reserve a spot
+  nodes.push(LayoutNode {
+    x: 0.0,
+    y: -(depth as f64) * y_spacing,
+    label: node.label.clone(),
+    children_indices: vec![],
+  });
+
+  if node.children.is_empty() {
+    // Leaf node: place at next available x position
+    nodes[idx].x = *next_leaf_x;
+    *next_leaf_x += leaf_step;
+  } else {
+    // Internal node: layout children, then center over them
+    let mut child_indices = Vec::new();
+    for child in &node.children {
+      let child_idx = layout_recursive(
+        child,
+        depth + 1,
+        y_spacing,
+        leaf_step,
+        nodes,
+        next_leaf_x,
+      );
+      child_indices.push(child_idx);
+    }
+
+    // Center parent over children
+    let first_child_x = nodes[child_indices[0]].x;
+    let last_child_x = nodes[child_indices[child_indices.len() - 1]].x;
+    nodes[idx].x = f64::midpoint(first_child_x, last_child_x);
+    nodes[idx].children_indices = child_indices;
+  }
+
+  idx
+}
+
+/// Implementation of TreeForm[expr] and TreeForm[expr, maxDepth].
+/// Generates a tree diagram rendered as Graphics primitives.
+pub fn tree_form_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Ok(call0("TreeForm"));
+  }
+
+  let expr = &args[0];
+
+  // Parse optional max depth
+  let max_depth = if args.len() >= 2 {
+    match &args[1] {
+      Expr::Integer(n) if *n > 0 => Some(*n as usize),
+      _ => None,
+    }
+  } else {
+    None
+  };
+
+  // Build the tree from the expression
+  let tree = build_tree(expr, max_depth, 0);
+
+  // Box sizing constants (in coordinate units)
+  let box_half_height = 0.18;
+  let char_width = 0.09; // approximate width per character
+  let box_padding = 0.08; // horizontal padding around text
+
+  let box_half_width = |label: &str| -> f64 {
+    let text_width = label.len() as f64 * char_width;
+    text_width / 2.0 + box_padding
+  };
+
+  // Compute adaptive leaf spacing: ensure no box overlap at any depth level
+  let max_bw = max_node_box_width(&tree, char_width, box_padding);
+  let leaf_step = (max_bw + 0.1).max(1.0);
+
+  // If it's just a single atom (no children), still show it as a node
+  let layout = layout_tree(&tree, leaf_step);
+
+  if layout.is_empty() {
+    return Ok(unevaluated("TreeForm", args));
+  }
+
+  // Compute coordinate-space bounding box (including box extents)
+  let coord_x_min = layout
+    .iter()
+    .map(|n| n.x - box_half_width(&n.label))
+    .fold(f64::INFINITY, f64::min);
+  let coord_x_max = layout
+    .iter()
+    .map(|n| n.x + box_half_width(&n.label))
+    .fold(f64::NEG_INFINITY, f64::max);
+  let coord_w = (coord_x_max - coord_x_min).max(0.01);
+
+  // graphics_ast adds 4% padding on each side, so effective range is ~1.08x
+  let padded_w = coord_w * 1.08;
+
+  // Compute the font-size that fits within the smallest box at a given image width.
+  // For monospace text: char_pixel_width ≈ 0.6 * font_size
+  // For a label of length L in a box of coordinate width (L*cw + 2*bp):
+  //   text_px = L * 0.6 * fs
+  //   box_px  = (L*cw + 2*bp) * pixels_per_unit
+  //   Need: text_px <= box_px
+  //   => fs <= (cw + 2*bp/L) * ppu / 0.6
+  // The worst case is the longest label (largest L), approaching fs <= cw * ppu / 0.6.
+  let char_px_ratio = 0.6_f64;
+  let max_label_len = layout
+    .iter()
+    .map(|n| n.label.len())
+    .max()
+    .unwrap_or(1)
+    .max(1) as f64;
+  let effective_cw = char_width + 2.0 * box_padding / max_label_len;
+
+  // Determine image width so text at font-size 10-14 fits in boxes
+  let base_width = 360.0_f64;
+  let ppu_at_base = base_width / padded_w;
+  let max_fs_at_base = effective_cw * ppu_at_base / char_px_ratio;
+
+  let min_fs = 10.0_f64;
+  let max_fs = 14.0_f64;
+
+  let (image_width, font_size) = if max_fs_at_base >= max_fs {
+    // At 360px, font-size 14 fits comfortably
+    (360_i64, max_fs)
+  } else if max_fs_at_base >= min_fs {
+    // At 360px, use the largest font-size that fits
+    (360, max_fs_at_base)
+  } else {
+    // Need wider image; scale up so font-size reaches min_fs
+    let scale = min_fs / max_fs_at_base;
+    let needed_w = (base_width * scale).ceil() as i64;
+    let clamped_w = needed_w.min(800);
+    let actual_fs = max_fs_at_base * (clamped_w as f64 / base_width);
+    (clamped_w, actual_fs.min(max_fs))
+  };
+
+  let font_size_int = (font_size.round() as i128).max(8);
+
+  // `VertexLabeling -> False` displays each vertex as a plain point instead
+  // of a labeled box; any other setting (including the default) keeps the
+  // labeled-box rendering.
+  let vertex_labeling = args[1..]
+    .iter()
+    .find_map(|a| match a {
+      Expr::Rule {
+        pattern,
+        replacement,
+      } if matches!(pattern.as_ref(), Expr::Identifier(s) if s == "VertexLabeling") =>
+      {
+        match replacement.as_ref() {
+          Expr::Identifier(s) if s == "False" => Some(false),
+          Expr::Identifier(s) if s == "True" => Some(true),
+          _ => None,
+        }
+      }
+      _ => None,
+    })
+    .unwrap_or(true);
+
+  // Generate Graphics primitives: Lines for edges, then boxes and text
+  let mut primitives: Vec<Expr> = Vec::new();
+
+  // Draw edges first (so they appear behind boxes and text)
+  // Edge color: gray
+  primitives.push(call(
+    "RGBColor",
+    vec![Expr::Real(0.6), Expr::Real(0.6), Expr::Real(0.6)],
+  ));
+
+  for node in &layout {
+    for &child_idx in &node.children_indices {
+      let child = &layout[child_idx];
+      let line = vec![Expr::List(
+        vec![
+          Expr::List(vec![Expr::Real(node.x), Expr::Real(node.y)].into()),
+          Expr::List(vec![Expr::Real(child.x), Expr::Real(child.y)].into()),
+        ]
+        .into(),
+      )];
+      primitives.push(call("Line", line));
+    }
+  }
+
+  if vertex_labeling {
+    // First pass: rectangular boxes for every node (drawn on top of edges)
+    for node in &layout {
+      let is_leaf = node.children_indices.is_empty();
+      let hw = box_half_width(&node.label);
+      let hh = box_half_height;
+
+      if is_leaf {
+        // Leaf nodes: white fill, black border
+        primitives.push(call(
+          "EdgeForm",
+          vec![call(
+            "RGBColor",
+            vec![Expr::Real(0.0), Expr::Real(0.0), Expr::Real(0.0)],
+          )],
+        ));
+        primitives.push(call(
+          "RGBColor",
+          vec![Expr::Real(1.0), Expr::Real(1.0), Expr::Real(1.0)],
+        ));
+      } else {
+        // Internal nodes: light orange fill, orange border
+        primitives.push(call(
+          "EdgeForm",
+          vec![call(
+            "RGBColor",
+            vec![Expr::Real(0.84), Expr::Real(0.48), Expr::Real(0.0)],
+          )],
+        ));
+        primitives.push(call(
+          "RGBColor",
+          vec![Expr::Real(1.0), Expr::Real(0.95), Expr::Real(0.85)],
+        ));
+      }
+
+      primitives.push(Expr::FunctionCall {
+        name: "Rectangle".to_string(),
+        args: vec![
+          Expr::List(
+            vec![Expr::Real(node.x - hw), Expr::Real(node.y - hh)].into(),
+          ),
+          Expr::List(
+            vec![Expr::Real(node.x + hw), Expr::Real(node.y + hh)].into(),
+          ),
+        ]
+        .into(),
+      });
+    }
+
+    // Second pass: text labels for all nodes (on top of boxes)
+    primitives.push(call0("EdgeForm"));
+
+    for node in &layout {
+      let is_leaf = node.children_indices.is_empty();
+
+      if is_leaf {
+        // Leaf nodes: black text
+        primitives.push(call(
+          "RGBColor",
+          vec![Expr::Real(0.0), Expr::Real(0.0), Expr::Real(0.0)],
+        ));
+      } else {
+        // Internal nodes: dark orange text
+        primitives.push(call(
+          "RGBColor",
+          vec![Expr::Real(0.84), Expr::Real(0.48), Expr::Real(0.0)],
+        ));
+      }
+      let style = call(
+        "Style",
+        vec![
+          Expr::String(node.label.clone()),
+          Expr::Integer(font_size_int),
+        ],
+      );
+      let xy = Expr::List(vec![Expr::Real(node.x), Expr::Real(node.y)].into());
+      primitives.push(call("Text", vec![style, xy]));
+    }
+  } else {
+    // VertexLabeling -> False: display each vertex as a plain black point
+    // instead of a labeled box.
+    let dot_radius = box_half_height * 0.35;
+    primitives.push(call0("EdgeForm"));
+    primitives.push(call(
+      "RGBColor",
+      vec![Expr::Real(0.0), Expr::Real(0.0), Expr::Real(0.0)],
+    ));
+    for node in &layout {
+      primitives.push(call(
+        "Disk",
+        vec![
+          Expr::List(vec![Expr::Real(node.x), Expr::Real(node.y)].into()),
+          Expr::Real(dot_radius),
+        ],
+      ));
+    }
+  }
+
+  // Build Graphics[{primitives...}, ImageSize -> width]
+  let content = Expr::List(primitives.into());
+  let image_size_opt = Expr::Rule {
+    pattern: Box::new(id_expr("ImageSize")),
+    replacement: Box::new(Expr::Integer(image_width as i128)),
+  };
+
+  graphics_ast(&[content, image_size_opt])
+}
+
+/// Implementation of TreeGraph[{edges...}, opts...].
+/// Takes a list of DirectedEdge/UndirectedEdge and renders as a tree diagram.
+pub fn tree_graph_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() {
+    return Ok(call0("TreeGraph"));
+  }
+
+  // Extract edges list — could be first arg directly or from Graph[vertices, edges]
+  let edges = match &args[0] {
+    Expr::List(items) => items.clone(),
+    _ => {
+      return Ok(unevaluated("TreeGraph", args));
+    }
+  };
+
+  // Check for VertexLabels -> "Name" option
+  let vertex_labels = args.iter().any(|a| {
+    matches!(a, Expr::Rule { pattern, replacement }
+      if matches!(pattern.as_ref(), Expr::Identifier(s) if s == "VertexLabels")
+      && matches!(replacement.as_ref(), Expr::String(s) if s == "Name"))
+  });
+
+  // Parse edges into (src, dst) pairs
+  let mut edge_pairs: Vec<(Expr, Expr)> = Vec::new();
+  for e in &edges {
+    match e {
+      Expr::FunctionCall { name, args: eargs }
+        if (name == "DirectedEdge" || name == "UndirectedEdge")
+          && eargs.len() == 2 =>
+      {
+        edge_pairs.push((eargs[0].clone(), eargs[1].clone()));
+      }
+      Expr::Rule {
+        pattern,
+        replacement,
+      } => {
+        edge_pairs.push((*pattern.clone(), *replacement.clone()));
+      }
+      _ => {}
+    }
+  }
+
+  if edge_pairs.is_empty() {
+    return Ok(unevaluated("TreeGraph", args));
+  }
+
+  // Build adjacency: find root (node that appears as src but never as dst)
+  let mut all_vertices: Vec<Expr> = Vec::new();
+  let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+  let mut vertex_labels_map: HashMap<String, String> = HashMap::new();
+  let mut has_parent: Vec<String> = Vec::new();
+
+  for (src, dst) in &edge_pairs {
+    let src_key = expr_to_output(src);
+    let dst_key = expr_to_output(dst);
+
+    if !all_vertices.iter().any(|v| expr_to_output(v) == src_key) {
+      all_vertices.push(src.clone());
+    }
+    if !all_vertices.iter().any(|v| expr_to_output(v) == dst_key) {
+      all_vertices.push(dst.clone());
+    }
+
+    children_map
+      .entry(src_key.clone())
+      .or_default()
+      .push(dst_key.clone());
+    has_parent.push(dst_key.clone());
+
+    if vertex_labels {
+      vertex_labels_map.insert(src_key.clone(), src_key.clone());
+      vertex_labels_map.insert(dst_key.clone(), dst_key.clone());
+    }
+  }
+
+  // Find root: vertex that has no parent
+  let root_key = all_vertices
+    .iter()
+    .map(expr_to_output)
+    .find(|k| !has_parent.contains(k))
+    .unwrap_or_else(|| expr_to_output(&all_vertices[0]));
+
+  // Build tree recursively from adjacency
+  fn build_graph_tree(
+    key: &str,
+    children_map: &HashMap<String, Vec<String>>,
+  ) -> TreeNode {
+    let children = children_map.get(key).cloned().unwrap_or_default();
+    TreeNode {
+      label: key.to_string(),
+      children: children
+        .iter()
+        .map(|c| build_graph_tree(c, children_map))
+        .collect(),
+    }
+  }
+
+  let tree = build_graph_tree(&root_key, &children_map);
+
+  // Reuse the same layout and rendering logic as tree_form_ast
+  tree_to_graphics(&tree)
+}
+
+/// Shared rendering logic: take a TreeNode and produce Graphics SVG
+fn tree_to_graphics(tree: &TreeNode) -> Result<Expr, InterpreterError> {
+  let box_half_height = 0.18;
+  let char_width = 0.09;
+  let box_padding = 0.08;
+
+  let box_half_width = |label: &str| -> f64 {
+    let text_width = label.len() as f64 * char_width;
+    text_width / 2.0 + box_padding
+  };
+
+  let max_bw = max_node_box_width(tree, char_width, box_padding);
+  let leaf_step = (max_bw + 0.1).max(1.0);
+
+  let layout = layout_tree(tree, leaf_step);
+
+  if layout.is_empty() {
+    return Ok(call0("TreeGraph"));
+  }
+
+  let coord_x_min = layout
+    .iter()
+    .map(|n| n.x - box_half_width(&n.label))
+    .fold(f64::INFINITY, f64::min);
+  let coord_x_max = layout
+    .iter()
+    .map(|n| n.x + box_half_width(&n.label))
+    .fold(f64::NEG_INFINITY, f64::max);
+  let coord_w = (coord_x_max - coord_x_min).max(0.01);
+
+  let padded_w = coord_w * 1.08;
+
+  let char_px_ratio = 0.6_f64;
+  let max_label_len = layout
+    .iter()
+    .map(|n| n.label.len())
+    .max()
+    .unwrap_or(1)
+    .max(1) as f64;
+  let effective_cw = char_width + 2.0 * box_padding / max_label_len;
+
+  let base_width = 360.0_f64;
+  let ppu_at_base = base_width / padded_w;
+  let max_fs_at_base = effective_cw * ppu_at_base / char_px_ratio;
+
+  let min_fs = 10.0_f64;
+  let max_fs = 14.0_f64;
+
+  let (image_width, font_size) = if max_fs_at_base >= max_fs {
+    (360_i64, max_fs)
+  } else if max_fs_at_base >= min_fs {
+    (360, max_fs_at_base)
+  } else {
+    let scale = min_fs / max_fs_at_base;
+    let needed_w = (base_width * scale).ceil() as i64;
+    let clamped_w = needed_w.min(800);
+    let actual_fs = max_fs_at_base * (clamped_w as f64 / base_width);
+    (clamped_w, actual_fs.min(max_fs))
+  };
+
+  let font_size_int = (font_size.round() as i128).max(8);
+
+  let mut primitives: Vec<Expr> = Vec::new();
+
+  // Edge color: gray
+  primitives.push(call(
+    "RGBColor",
+    vec![Expr::Real(0.6), Expr::Real(0.6), Expr::Real(0.6)],
+  ));
+
+  for node in &layout {
+    for &child_idx in &node.children_indices {
+      let child = &layout[child_idx];
+      let line = vec![Expr::List(
+        vec![
+          Expr::List(vec![Expr::Real(node.x), Expr::Real(node.y)].into()),
+          Expr::List(vec![Expr::Real(child.x), Expr::Real(child.y)].into()),
+        ]
+        .into(),
+      )];
+      primitives.push(call("Line", line));
+    }
+  }
+
+  // Boxes for nodes
+  for node in &layout {
+    let is_leaf = node.children_indices.is_empty();
+    let hw = box_half_width(&node.label);
+    let hh = box_half_height;
+
+    if is_leaf {
+      primitives.push(call(
+        "EdgeForm",
+        vec![call(
+          "RGBColor",
+          vec![Expr::Real(0.0), Expr::Real(0.0), Expr::Real(0.0)],
+        )],
+      ));
+      primitives.push(call(
+        "RGBColor",
+        vec![Expr::Real(1.0), Expr::Real(1.0), Expr::Real(1.0)],
+      ));
+    } else {
+      primitives.push(call(
+        "EdgeForm",
+        vec![call(
+          "RGBColor",
+          vec![Expr::Real(0.84), Expr::Real(0.48), Expr::Real(0.0)],
+        )],
+      ));
+      primitives.push(call(
+        "RGBColor",
+        vec![Expr::Real(1.0), Expr::Real(0.95), Expr::Real(0.85)],
+      ));
+    }
+
+    primitives.push(Expr::FunctionCall {
+      name: "Rectangle".to_string(),
+      args: vec![
+        Expr::List(
+          vec![Expr::Real(node.x - hw), Expr::Real(node.y - hh)].into(),
+        ),
+        Expr::List(
+          vec![Expr::Real(node.x + hw), Expr::Real(node.y + hh)].into(),
+        ),
+      ]
+      .into(),
+    });
+  }
+
+  // Text labels
+  primitives.push(call0("EdgeForm"));
+
+  for node in &layout {
+    let is_leaf = node.children_indices.is_empty();
+    if is_leaf {
+      primitives.push(call(
+        "RGBColor",
+        vec![Expr::Real(0.0), Expr::Real(0.0), Expr::Real(0.0)],
+      ));
+    } else {
+      primitives.push(call(
+        "RGBColor",
+        vec![Expr::Real(0.84), Expr::Real(0.48), Expr::Real(0.0)],
+      ));
+    }
+    let style = call(
+      "Style",
+      vec![
+        Expr::String(node.label.clone()),
+        Expr::Integer(font_size_int),
+      ],
+    );
+    let xy = Expr::List(vec![Expr::Real(node.x), Expr::Real(node.y)].into());
+    primitives.push(call("Text", vec![style, xy]));
+  }
+
+  let content = Expr::List(primitives.into());
+  let image_size_opt = Expr::Rule {
+    pattern: Box::new(id_expr("ImageSize")),
+    replacement: Box::new(Expr::Integer(image_width as i128)),
+  };
+
+  graphics_ast(&[content, image_size_opt])
+}

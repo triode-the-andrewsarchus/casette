@@ -119,6 +119,23 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - **Problem 025 (`a6d4a39`):** Maintained private dup'd file descriptors (`os.dup(1)`, `os.dup(2)`) for JSONL protocol communication, redirecting both Python `sys.stdout` and OS-level fds 1/2 to capture buffers without stream desynchronization. Verified in `kernel_integration_tests.rs`.
       - **Problem 026 (`2888fb4`):** Evaluated preparsed AST and suppressed `None` returns in `_eval_code` to prevent bare prints or assignments from returning `None` values, and verified unordered factor terms. Verified in `kernel_integration_tests.rs`.
     - Removed all 28 individual problem markdown files from `problems/` and updated master `PROBLEMS.md` and `PLAN.md`.
+  - **Phase 11 (Woxi Wolfram Language Math Engine Migration):**
+    - Created branch `feat/woxi-engine` to replace external SageMath dependency with pure Rust in-process Woxi interpreter (`https://github.com/ad-si/Woxi`).
+    - Vendored Woxi into `vendor/woxi` and linked as a path dependency in `crates/casette-kernel/Cargo.toml`.
+    - Implemented missing `UnitSimplify` operation in `vendor/woxi/src/functions/quantity_ast.rs` and dispatched in `quantity_functions.rs`:
+      - Supported dimensionless quantity cancellation to exact rational scalars (e.g. `UnitSimplify[50*km / (32*mi)]` -> `390625/402336`).
+      - Implemented derived SI unit reduction (grouping base SI units into Newtons, Joules, Watts, Pascals, Volts, etc.).
+      - Handled compound unit cancellation and recursive AST traversal over lists, equations, rules, and arithmetic.
+      - Added unit tests in `vendor/woxi/tests/interpreter_tests/quantity.rs: unit_simplify_tests` (all passing).
+    - Implemented [`WoxiKernel`](crates/casette-kernel/src/woxi_kernel.rs) in `crates/casette-kernel`:
+      - Dedicated OS worker thread providing thread-local evaluation isolation, instant startup, and clean `woxi::clear_state()` session restarts.
+      - Preloaded standard calculator variables (`u, v, w, x, y, z...`), unit definitions (`km, mi, hr, mph...`), and conversion shims (`__casette_convert`).
+      - Added syntax normalizer supporting Python/Sage and Wolfram Language call conventions (`factor(...)` -> `Factor[...]`, matrix brackets, tape reference DownValues).
+      - Added SVG image artifact emission for `Plot[...]` routines and LaTeX formula generation via `expr_to_tex`.
+    - Wired `crates/casette-gui/src/main.rs` to launch `WoxiKernel` as the primary math engine.
+    - Added integration test suite [`woxi_kernel_tests.rs`](crates/casette-kernel/tests/woxi_kernel_tests.rs) testing boot, ping, algebra, calculus, matrices, units, precision config, and restarts.
+    - Fixed output artifact classification: Woxi internal `res.output_svg` (text typesetting SVG) was previously being treated as an image plot artifact, triggering `render_plot_card`'s white background frame for every row. Restricting image artifact emission strictly to `res.graphics` (actual `Plot`/`Graphics` output) removed the white squares across all mathematical and unit rows. Also refined `determine_kind` to treat `Solve` rule-lists as lists rather than matrices, and updated `render_matrix_view` to natively parse Wolfram `{{a, b}, {c, d}}` matrix syntax.
+    - All 53 workspace tests passing cleanly across `casette-gui`, `casette-kernel`, and `friendly-compiler`.
 
 
 

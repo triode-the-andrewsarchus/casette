@@ -1,0 +1,785 @@
+use super::together::negate_expr;
+#[allow(unused_imports)]
+use super::*;
+use crate::functions::calculus_ast::{is_constant_wrt, simplify};
+
+/// Eliminate[{eq1, eq2, ...}, var]  or  Eliminate[{eq1, eq2, ...}, {v1, v2, ...}]
+/// Eliminates variables from a system of equations.
+pub fn eliminate_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Eliminate expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // Extract equations
+  let equations: Vec<Expr> = match &args[0] {
+    Expr::List(items) => items.to_vec(),
+    // Single equation
+    eq @ Expr::Comparison { .. } => vec![eq.clone()],
+    eq @ Expr::FunctionCall { name, .. } if name == "Equal" => vec![eq.clone()],
+    _ => {
+      return Ok(unevaluated("Eliminate", args));
+    }
+  };
+
+  // Extract variables to eliminate
+  let vars_to_eliminate: Vec<String> = match &args[1] {
+    Expr::Identifier(name) => vec![name.clone()],
+    Expr::List(items) => {
+      let mut vars = Vec::new();
+      for item in items {
+        if let Expr::Identifier(name) = item {
+          vars.push(name.clone());
+        } else {
+          return Ok(unevaluated("Eliminate", args));
+        }
+      }
+      vars
+    }
+    _ => {
+      return Ok(unevaluated("Eliminate", args));
+    }
+  };
+
+  let mut eqs = equations;
+
+  // Eliminate each variable one at a time
+  for var in &vars_to_eliminate {
+    eqs = eliminate_one_variable(&eqs, var);
+    if eqs.is_empty() {
+      return Ok(bool_expr(true));
+    }
+  }
+
+  // Post-process: normalize result equations
+  let eqs: Vec<Expr> = eqs
+    .into_iter()
+    .map(|eq| normalize_eliminate_result(&eq, &vars_to_eliminate))
+    .collect();
+
+  // Return the result
+  if eqs.len() == 1 {
+    Ok(eqs.into_iter().next().unwrap())
+  } else {
+    // Multiple equations: join with And
+    Ok(call("And", eqs))
+  }
+}
+
+/// Solve an equation for a variable, returning the value expression.
+/// For `lhs == rhs`, rearranges to isolate `var`:
+///   a*var + rest = 0 → var = -rest/a
+fn solve_for_var(eq: &Expr, var: &str) -> Option<Expr> {
+  let (lhs, rhs) = extract_eq_sides(eq)?;
+
+  // Convert to standard form: lhs - rhs = 0
+  let poly = minus2(lhs, rhs);
+  let expanded = expand_and_combine(&poly);
+
+  // Check degree
+  let degree = max_power_int(&expanded, var)?;
+  if degree != 1 {
+    // For non-linear, fall back to Solve
+    let solutions =
+      solve_ast(&[eq.clone(), Expr::Identifier(var.to_string())]).ok()?;
+    if let Expr::List(outer) = &solutions {
+      for item in outer {
+        if let Expr::List(inner) = item {
+          for rule in inner {
+            if let Expr::Rule { replacement, .. } = rule {
+              return Some(simplify(expand_and_combine(replacement)));
+            }
+          }
+        }
+      }
+    }
+    return None;
+  }
+
+  // Linear: extract coefficient of var and constant part
+  let terms = collect_additive_terms(&expanded);
+  let mut coeff = Expr::Integer(0);
+  let mut rest = Expr::Integer(0);
+
+  for term in &terms {
+    if let Some(c) = extract_coefficient_of_power(term, var, 1) {
+      coeff = add_exprs(&coeff, &c);
+    }
+    if let Some(c) = extract_coefficient_of_power(term, var, 0) {
+      rest = add_exprs(&rest, &c);
+    }
+  }
+
+  let coeff = simplify(coeff);
+  let rest = simplify(rest);
+
+  // var = -rest / coeff
+  let neg_rest = negate_expr(&rest);
+  let neg_rest = simplify(expand_and_combine(&neg_rest));
+
+  // Simplify division
+  match &coeff {
+    Expr::Integer(1) => Some(neg_rest),
+    Expr::Integer(-1) => {
+      Some(simplify(expand_and_combine(&negate_expr(&neg_rest))))
+    }
+    _ => Some(simplify(solve_divide(&neg_rest, &coeff))),
+  }
+}
+
+/// Extract (lhs, rhs) from an equation expression
+fn extract_eq_sides(eq: &Expr) -> Option<(Expr, Expr)> {
+  match eq {
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      Some((operands[0].clone(), operands[1].clone()))
+    }
+    Expr::FunctionCall { name, args } if name == "Equal" && args.len() == 2 => {
+      Some((args[0].clone(), args[1].clone()))
+    }
+    _ => None,
+  }
+}
+
+/// Check if an expression contains a variable
+pub fn contains_var(expr: &Expr, var: &str) -> bool {
+  !is_constant_wrt(expr, var)
+}
+
+/// Eliminate one variable from a system of equations
+fn eliminate_one_variable(
+  equations: &[Expr],
+  var: &str,
+) -> std::vec::Vec<Expr> {
+  // Find an equation containing the variable, preferring linear ones
+  let mut solve_idx = None;
+  let mut solve_degree = i128::MAX;
+
+  for (i, eq) in equations.iter().enumerate() {
+    if let Some((lhs, rhs)) = extract_eq_sides(eq) {
+      let diff = minus2(lhs, rhs);
+      let expanded = expand_and_combine(&diff);
+      if contains_var(&expanded, var)
+        && let Some(d) = max_power_int(&expanded, var)
+        && d < solve_degree
+      {
+        solve_degree = d;
+        solve_idx = Some(i);
+        if d == 1 {
+          break; // Prefer linear equations
+        }
+      }
+    }
+  }
+
+  let Some(solve_idx) = solve_idx else {
+    // Variable not found in any equation — return equations unchanged
+    return equations.to_vec();
+  };
+
+  // Solve the chosen equation for the variable directly
+  let chosen_eq = &equations[solve_idx];
+  let Some(val) = solve_for_var(chosen_eq, var) else {
+    return equations.to_vec();
+  };
+
+  // Substitute into all other equations
+  let mut result = Vec::new();
+  for (i, eq) in equations.iter().enumerate() {
+    if i == solve_idx {
+      continue; // Skip the equation we solved
+    }
+    let substituted = crate::syntax::substitute_variable(eq, var, &val);
+    // Simplify the substituted equation
+    let simplified = simplify_equation(&substituted);
+    // Skip trivially true equations (True, or a == a)
+    if is_trivially_true(&simplified) {
+      continue;
+    }
+    result.push(simplified);
+  }
+
+  result
+}
+
+/// Simplify an equation by evaluating both sides
+fn simplify_equation(eq: &Expr) -> Expr {
+  match eq {
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      let lhs = simplify(expand_and_combine(&operands[0]));
+      let rhs = simplify(expand_and_combine(&operands[1]));
+      Expr::Comparison {
+        operands: vec![lhs, rhs],
+        operators: vec![ComparisonOp::Equal],
+      }
+    }
+    Expr::FunctionCall { name, args } if name == "Equal" && args.len() == 2 => {
+      let lhs = simplify(expand_and_combine(&args[0]));
+      let rhs = simplify(expand_and_combine(&args[1]));
+      Expr::Comparison {
+        operands: vec![lhs, rhs],
+        operators: vec![ComparisonOp::Equal],
+      }
+    }
+    other => simplify(expand_and_combine(other)),
+  }
+}
+
+/// Check if an equation is trivially true (e.g., True, or 0 == 0)
+fn is_trivially_true(eq: &Expr) -> bool {
+  match eq {
+    Expr::Identifier(s) if s == "True" => true,
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      expr_to_string(&operands[0]) == expr_to_string(&operands[1])
+    }
+    _ => false,
+  }
+}
+
+/// SolveAlways[eqn, vars] - find conditions on parameters for equation to hold for all values of vars
+pub fn solve_always_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "SolveAlways expects exactly 2 arguments".into(),
+    ));
+  }
+
+  let eqn = &args[0];
+  let vars_arg = &args[1];
+
+  // Extract variables: can be a single symbol or a list
+  let vars: Vec<String> = match vars_arg {
+    Expr::Identifier(s) => vec![s.clone()],
+    Expr::List(items) => items
+      .iter()
+      .filter_map(|e| {
+        if let Expr::Identifier(s) = e {
+          Some(s.clone())
+        } else {
+          None
+        }
+      })
+      .collect(),
+    _ => {
+      return Ok(unevaluated("SolveAlways", args));
+    }
+  };
+
+  if vars.is_empty() {
+    return Ok(unevaluated("SolveAlways", args));
+  }
+
+  // Handle True/False (e.g. 0 == 0 evaluates to True before reaching us)
+  match eqn {
+    Expr::Identifier(s) if s == "True" => {
+      return Ok(Expr::List(vec![Expr::List(vec![].into())].into()));
+    }
+    Expr::Identifier(s) if s == "False" => {
+      return Ok(Expr::List(vec![].into()));
+    }
+    _ => {}
+  }
+
+  // Extract the polynomial expression (LHS - RHS from equation)
+  let poly_expr = match eqn {
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      // lhs == rhs => lhs - rhs
+      let lhs_str = expr_to_string(&operands[0]);
+      let rhs_str = expr_to_string(&operands[1]);
+      format!("Expand[({lhs_str}) - ({rhs_str})]")
+    }
+    _ => {
+      // Treat expression itself as the polynomial = 0
+      let s = expr_to_string(eqn);
+      format!("Expand[{s}]")
+    }
+  };
+
+  // Recursively extract all leaf coefficients by expanding through each variable.
+  // Start with the polynomial expression string, then for each variable extract
+  // CoefficientList and recurse on the remaining variables.
+  let mut leaf_coeffs: Vec<String> = Vec::new();
+  extract_leaf_coefficients(&poly_expr, &vars, 0, &mut leaf_coeffs)?;
+
+  // Filter out zeros
+  leaf_coeffs.retain(|s| s != "0");
+
+  if leaf_coeffs.is_empty() {
+    return Ok(Expr::List(vec![Expr::List(vec![].into())].into()));
+  }
+
+  // Now solve: each leaf coefficient must equal zero.
+  // Process sequentially, substituting already-found solutions.
+  let mut rules: Vec<Expr> = Vec::new();
+  let mut solved_vars = std::collections::HashSet::new();
+
+  for coeff_str in &leaf_coeffs {
+    // Parse the coefficient expression
+    let Ok(coeff_expr) = crate::syntax::string_to_expr(coeff_str) else {
+      continue;
+    };
+
+    // Simple case: coefficient is a single variable
+    if let Expr::Identifier(s) = &coeff_expr {
+      if !solved_vars.contains(s) && !vars.contains(s) {
+        solved_vars.insert(s.clone());
+        rules.push(Expr::Rule {
+          pattern: Box::new(Expr::Identifier(s.clone())),
+          replacement: Box::new(Expr::Integer(0)),
+        });
+      }
+      continue;
+    }
+
+    // Find free variables (parameters, not the quantified vars)
+    let mut free_vars_here = std::collections::BTreeSet::new();
+    collect_free_vars_sa(&coeff_expr, &vars, &mut free_vars_here);
+
+    // Remove already-solved variables
+    for sv in &solved_vars {
+      free_vars_here.remove(sv);
+    }
+
+    if free_vars_here.is_empty() {
+      // No free variables — nonzero constant, impossible
+      // But first substitute solved values and check if it becomes zero
+      let mut sub_code = format!("({coeff_str})");
+      for rule in &rules {
+        if let Expr::Rule {
+          pattern,
+          replacement,
+        } = rule
+        {
+          let p = expr_to_string(pattern);
+          let r = expr_to_string(replacement);
+          sub_code = format!("({sub_code} /. {p} -> ({r}))");
+        }
+      }
+      if let Ok(result) = crate::interpret(&sub_code)
+        && result.trim() == "0"
+      {
+        continue;
+      }
+      return Ok(Expr::List(vec![].into()));
+    } else if free_vars_here.len() == 1 {
+      // Single free variable, try Solve
+      let fv = free_vars_here.iter().next().unwrap().clone();
+      let mut sub_code = format!("({coeff_str})");
+      for rule in &rules {
+        if let Expr::Rule {
+          pattern,
+          replacement,
+        } = rule
+        {
+          let p = expr_to_string(pattern);
+          let r = expr_to_string(replacement);
+          sub_code = format!("({sub_code} /. {p} -> ({r}))");
+        }
+      }
+      let solve_code = format!("Solve[({sub_code}) == 0, {fv}]");
+      if let Ok(solve_result) = crate::interpret(&solve_code)
+        && let Ok(result_expr) = crate::syntax::string_to_expr(&solve_result)
+        && let Expr::List(outer) = &result_expr
+        && let Some(Expr::List(inner)) = outer.first()
+      {
+        for rule_expr in inner {
+          if let Expr::Rule { pattern, .. } = rule_expr
+            && let Expr::Identifier(s) = pattern.as_ref()
+          {
+            solved_vars.insert(s.clone());
+          }
+          rules.push(rule_expr.clone());
+        }
+        continue;
+      }
+      // Fallback: set variable to 0
+      solved_vars.insert(fv.clone());
+      rules.push(Expr::Rule {
+        pattern: Box::new(Expr::Identifier(fv)),
+        replacement: Box::new(Expr::Integer(0)),
+      });
+    } else {
+      // Multiple free variables: solve one at a time
+      // Substitute known solutions first
+      let mut sub_code = format!("({coeff_str})");
+      for rule in &rules {
+        if let Expr::Rule {
+          pattern,
+          replacement,
+        } = rule
+        {
+          let p = expr_to_string(pattern);
+          let r = expr_to_string(replacement);
+          sub_code = format!("({sub_code} /. {p} -> ({r}))");
+        }
+      }
+      // Try to solve for the first free variable
+      let fv = free_vars_here.iter().next().unwrap().clone();
+      let solve_code = format!("Solve[({sub_code}) == 0, {fv}]");
+      if let Ok(solve_result) = crate::interpret(&solve_code)
+        && let Ok(result_expr) = crate::syntax::string_to_expr(&solve_result)
+        && let Expr::List(outer) = &result_expr
+        && let Some(Expr::List(inner)) = outer.first()
+      {
+        for rule_expr in inner {
+          if let Expr::Rule { pattern, .. } = rule_expr
+            && let Expr::Identifier(s) = pattern.as_ref()
+          {
+            solved_vars.insert(s.clone());
+          }
+          rules.push(rule_expr.clone());
+        }
+        continue;
+      }
+      // Fallback: set all free vars to 0
+      for fv in &free_vars_here {
+        if !solved_vars.contains(fv) {
+          solved_vars.insert(fv.clone());
+          rules.push(Expr::Rule {
+            pattern: Box::new(Expr::Identifier(fv.clone())),
+            replacement: Box::new(Expr::Integer(0)),
+          });
+        }
+      }
+    }
+  }
+
+  // Sort rules alphabetically by variable name to match Wolfram's ordering
+  rules.sort_by(|a, b| {
+    let a_name = if let Expr::Rule { pattern, .. } = a {
+      if let Expr::Identifier(s) = pattern.as_ref() {
+        s.as_str()
+      } else {
+        ""
+      }
+    } else {
+      ""
+    };
+    let b_name = if let Expr::Rule { pattern, .. } = b {
+      if let Expr::Identifier(s) = pattern.as_ref() {
+        s.as_str()
+      } else {
+        ""
+      }
+    } else {
+      ""
+    };
+    a_name.cmp(b_name)
+  });
+
+  Ok(Expr::List(vec![Expr::List(rules.into())].into()))
+}
+
+/// Recursively extract leaf coefficients from a polynomial expression.
+/// For each variable in vars (starting at var_idx), extract CoefficientList,
+/// then recurse on remaining variables for each coefficient.
+fn extract_leaf_coefficients(
+  poly_str: &str,
+  vars: &[String],
+  var_idx: usize,
+  result: &mut Vec<String>,
+) -> Result<(), InterpreterError> {
+  if var_idx >= vars.len() {
+    // No more variables to extract — this is a leaf coefficient
+    // Simplify it
+    let simplified = crate::interpret(&format!("Expand[{poly_str}]"))?;
+    result.push(simplified.trim().to_string());
+    return Ok(());
+  }
+
+  let var = &vars[var_idx];
+  let coeffs_code = format!("CoefficientList[{poly_str}, {var}]");
+  let coeffs_str = crate::interpret(&coeffs_code)?;
+  let coeffs_expr = crate::syntax::string_to_expr(&coeffs_str)
+    .unwrap_or(Expr::Identifier(coeffs_str));
+
+  if let Expr::List(coeffs) = &coeffs_expr {
+    for coeff in coeffs {
+      let coeff_s = expr_to_string(coeff);
+      extract_leaf_coefficients(&coeff_s, vars, var_idx + 1, result)?;
+    }
+  } else {
+    let s = expr_to_string(&coeffs_expr);
+    extract_leaf_coefficients(&s, vars, var_idx + 1, result)?;
+  }
+  Ok(())
+}
+
+/// Collect all identifiers from an expression that are NOT in the excluded set
+fn collect_free_vars_sa(
+  expr: &Expr,
+  excluded: &[String],
+  result: &mut std::collections::BTreeSet<String>,
+) {
+  match expr {
+    Expr::Identifier(s)
+      if !excluded.contains(s)
+        && !is_builtin_constant_sa(s)
+        && s.chars().next().is_some_and(char::is_alphabetic) =>
+    {
+      result.insert(s.clone());
+    }
+    Expr::List(items) => {
+      for item in items {
+        collect_free_vars_sa(item, excluded, result);
+      }
+    }
+    Expr::FunctionCall { args, .. } => {
+      for arg in args {
+        collect_free_vars_sa(arg, excluded, result);
+      }
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      collect_free_vars_sa(left, excluded, result);
+      collect_free_vars_sa(right, excluded, result);
+    }
+    Expr::UnaryOp { operand, .. } => {
+      collect_free_vars_sa(operand, excluded, result);
+    }
+    Expr::Comparison { operands, .. } => {
+      for op in operands {
+        collect_free_vars_sa(op, excluded, result);
+      }
+    }
+    _ => {}
+  }
+}
+
+pub fn is_builtin_constant_sa(s: &str) -> bool {
+  matches!(
+    s,
+    "Pi"
+      | "E"
+      | "I"
+      | "Infinity"
+      | "True"
+      | "False"
+      | "Null"
+      | "None"
+      | "All"
+      | "Automatic"
+      | "ComplexInfinity"
+      | "Indeterminate"
+      | "EulerGamma"
+      | "GoldenRatio"
+      | "Degree"
+      | "Catalan"
+  )
+}
+
+/// Normalize an Eliminate result equation to match Wolfram's canonical form.
+/// - Single variable, linear: solve for the variable → var == value
+/// - Multi-variable, linear: isolate alphabetically first variable on RHS
+/// - Non-linear: move everything to LHS → poly == 0
+fn normalize_eliminate_result(eq: &Expr, _eliminated_vars: &[String]) -> Expr {
+  let Some((lhs, rhs)) = extract_eq_sides(eq) else {
+    return eq.clone();
+  };
+
+  // Convert to standard form: lhs - rhs = 0
+  let diff = minus2(lhs.clone(), rhs.clone());
+  let expanded = simplify(expand_and_combine(&diff));
+
+  // Collect free variables in the result
+  let mut vars_in_result = Vec::new();
+  collect_free_vars(&expanded, &mut vars_in_result);
+  vars_in_result.sort();
+  vars_in_result.dedup();
+
+  // Collect additive terms
+  let terms = collect_additive_terms(&expanded);
+
+  // Check if the equation is linear: each term involves at most one variable to power 1
+  let is_linear = terms.iter().all(|term| {
+    let mut term_vars = Vec::new();
+    collect_free_vars(term, &mut term_vars);
+    term_vars.sort();
+    term_vars.dedup();
+    if term_vars.is_empty() {
+      return true; // constant term
+    }
+    if term_vars.len() > 1 {
+      return false; // product of variables
+    }
+    max_power_int(term, &term_vars[0]).is_some_and(|d| d <= 1)
+  });
+
+  // Single variable, linear: solve for it → var == value
+  if vars_in_result.len() == 1 && is_linear {
+    let var = &vars_in_result[0];
+    let mut coeff = Expr::Integer(0);
+    let mut rest = Expr::Integer(0);
+
+    for term in &terms {
+      if let Some(c) = extract_coefficient_of_power(term, var, 1) {
+        coeff = add_exprs(&coeff, &c);
+      }
+      if let Some(c) = extract_coefficient_of_power(term, var, 0) {
+        rest = add_exprs(&rest, &c);
+      }
+    }
+
+    let coeff = simplify(coeff);
+    let rest = simplify(rest);
+
+    // With integer coefficients, Wolfram keeps the eliminated equation as a
+    // primitive polynomial (content-reduced, positive leading coefficient)
+    // rather than solving for the variable: `2 x == 3`, not `x == 3/2`. Only
+    // when the content divides the constant evenly does it become `x == k`.
+    if let (Expr::Integer(c), Expr::Integer(r)) = (&coeff, &rest) {
+      let (r, c) = rat_reduce(*r, *c);
+      // c*var + r == 0  =>  c*var == -r
+      let lhs = if c == 1 {
+        Expr::Identifier(var.clone())
+      } else {
+        times2(Expr::Integer(c), Expr::Identifier(var.clone()))
+      };
+      return Expr::Comparison {
+        operands: vec![lhs, Expr::Integer(-r)],
+        operators: vec![ComparisonOp::Equal],
+      };
+    }
+
+    let neg_rest = simplify(expand_and_combine(&negate_expr(&rest)));
+
+    let val = match &coeff {
+      Expr::Integer(1) => neg_rest,
+      Expr::Integer(-1) => {
+        simplify(expand_and_combine(&negate_expr(&neg_rest)))
+      }
+      _ => simplify(solve_divide(&neg_rest, &coeff)),
+    };
+
+    return Expr::Comparison {
+      operands: vec![Expr::Identifier(var.clone()), val],
+      operators: vec![ComparisonOp::Equal],
+    };
+  }
+
+  // Multi-variable, linear: isolate alphabetically first variable on RHS
+  if is_linear && vars_in_result.len() > 1 {
+    let first_var = vars_in_result[0].clone();
+
+    // Get the coefficient of first_var in the polynomial
+    let mut first_coeff = Expr::Integer(0);
+    for term in &terms {
+      if let Some(c) = extract_coefficient_of_power(term, &first_var, 1) {
+        first_coeff = add_exprs(&first_coeff, &c);
+      }
+    }
+    let first_coeff = simplify(first_coeff);
+
+    // We want the first_var to have a negative coefficient in the polynomial,
+    // so that when we move it to the RHS and negate, it becomes positive.
+    let coeff_is_positive = matches!(&first_coeff, Expr::Integer(n) if *n > 0);
+
+    let final_terms: Vec<Expr> = if coeff_is_positive {
+      terms.iter().map(negate_expr).collect()
+    } else {
+      terms
+    };
+
+    // Split into first_var terms and other terms
+    let mut lhs_terms: Vec<Expr> = Vec::new();
+    let mut rhs_neg_terms: Vec<Expr> = Vec::new();
+
+    for term in &final_terms {
+      if contains_var(term, &first_var) {
+        rhs_neg_terms.push(term.clone());
+      } else {
+        lhs_terms.push(term.clone());
+      }
+    }
+
+    // Build LHS: sum of non-first_var terms
+    let lhs_expr = if lhs_terms.is_empty() {
+      Expr::Integer(0)
+    } else {
+      let mut result = lhs_terms[0].clone();
+      for term in &lhs_terms[1..] {
+        result = plus2(result, term.clone());
+      }
+      simplify(expand_and_combine(&result))
+    };
+
+    // Build RHS: negate the first_var terms (moving from LHS to RHS)
+    let rhs_sum = if rhs_neg_terms.is_empty() {
+      Expr::Integer(0)
+    } else {
+      let mut result = rhs_neg_terms[0].clone();
+      for term in &rhs_neg_terms[1..] {
+        result = plus2(result, term.clone());
+      }
+      result
+    };
+    let rhs_expr = simplify(expand_and_combine(&negate_expr(&rhs_sum)));
+
+    return Expr::Comparison {
+      operands: vec![lhs_expr, rhs_expr],
+      operators: vec![ComparisonOp::Equal],
+    };
+  }
+
+  // Non-linear: (rhs - lhs) == 0
+  let neg_diff = minus2(rhs, lhs);
+  let expanded_neg = simplify(expand_and_combine(&neg_diff));
+
+  Expr::Comparison {
+    operands: vec![expanded_neg, Expr::Integer(0)],
+    operators: vec![ComparisonOp::Equal],
+  }
+}
+
+/// Collect free variable names from an expression
+fn collect_free_vars(expr: &Expr, vars: &mut Vec<String>) {
+  match expr {
+    Expr::Identifier(name) if !is_builtin_constant_sa(name) => {
+      vars.push(name.clone());
+    }
+    Expr::FunctionCall { args, .. } => {
+      for arg in args {
+        collect_free_vars(arg, vars);
+      }
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      collect_free_vars(left, vars);
+      collect_free_vars(right, vars);
+    }
+    Expr::UnaryOp { operand, .. } => collect_free_vars(operand, vars),
+    Expr::List(items) => {
+      for item in items {
+        collect_free_vars(item, vars);
+      }
+    }
+    Expr::CompoundExpr(items) => {
+      for item in items {
+        collect_free_vars(item, vars);
+      }
+    }
+    _ => {}
+  }
+}

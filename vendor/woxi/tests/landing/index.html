@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Woxi Playground</title>
+  <meta name="description"
+        content="Woxi is a Wolfram Language interpreter implemented in Rust.
+          Run code in the browser playground, on the CLI,
+          in Jupyter, or in the Woxi Studio notebook editor.">
+
+  <!-- Social media preview (Open Graph + Twitter Card) -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://woxi.ad-si.com/">
+  <meta property="og:site_name" content="Woxi">
+  <meta property="og:title" content="Woxi &mdash; Wolfram Language interpreter in Rust">
+  <meta property="og:description"
+        content="Run Wolfram Language code in the browser playground,
+          on the CLI, in Jupyter, or in the Woxi Studio notebook editor.">
+  <meta property="og:image" content="https://woxi.ad-si.com/images/social-preview.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt"
+        content="Woxi logo with the tagline
+          'Wolfram Language interpreter implemented in Rust'
+          above a row of example plots">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <div class="status" id="status"></div>
+
+  <div id="wrapper">
+    <nav>
+      <a href="/docs/">Documentation</a>
+      <button id="themeBtn" aria-label="Toggle theme"></button>
+    </nav>
+
+    <main>
+      <h1>Woxi</h1>
+      <p class="subtitle">Wolfram Language interpreter implemented in Rust.</p>
+
+      <hr />
+
+      <div class="examples">
+        <span>Examples:</span>
+        <button class="example-btn" data-code="Map[#^2 &amp;, {1, 2, 3, 4, 5}]">Map</button>
+        <button class="example-btn" data-code="Select[Range[30], PrimeQ]">Primes</button>
+        <button class="example-btn" data-code="FactorInteger[2025]">Factorize</button>
+        <button class="example-btn" data-code="Permutations[{a, b, c}]">Permutations</button>
+        <button class="example-btn" data-code="Table[Factorial[n], {n, 1, 10}]">Factorials</button>
+        <button class="example-btn" data-code="FoldList[Plus, 0, {1, 2, 3, 4, 5}]">FoldList</button>
+        <button class="example-btn" data-code="Transpose[{{1, 2, 3}, {4, 5, 6}}]">Transpose</button>
+        <button class="example-btn" data-code="NestList[# * 2 &amp;, 1, 8]">NestList</button>
+        <button class="example-btn" data-code="Plot[Sin[x], {x, 0, 2 Pi}]">Plot</button>
+      </div>
+
+      <div class="editor-container" id="editor"></div>
+
+      <p class="disclaimer">
+        <small>
+          Everything runs locally in your browser.
+          No data is sent anywhere.
+        </small>
+      </p>
+
+      <div class="controls">
+        <button id="clearBtn">Clear</button>
+        <div class="controls-right">
+          <button id="shareBtn">Share</button>
+          <button id="runBtn" disabled data-tooltip="Run code (&#8679; + Enter)">
+            Run
+            <div class="spinner" id="runSpinner"></div>
+          </button>
+        </div>
+      </div>
+
+      <div class="output-container">
+        <h3>Output</h3>
+        <!-- Pre-rendered output for the default code, so visitors land on
+             a populated page without having to wait for the WebAssembly
+             module to load and evaluate. Replaced as soon as the user
+             runs their own code. Regenerate with:
+               woxi eval 'ExportString[<row>, "SVG"]' -->
+        <div id="outputs">
+          <div class="output-box graphics-box">
+            <img src="default-row1.svg"
+                 alt="Plot of Sin[x], a bar chart, and a number line plot"
+                 loading="eager" decoding="sync" />
+          </div>
+          <div class="output-box graphics-box">
+            <img src="default-row2.svg"
+                 alt="Bubble chart, a small graph, and a tree form of a polynomial"
+                 loading="eager" decoding="sync" />
+          </div>
+        </div>
+      </div>
+
+      <hr class="alt-divider" />
+
+      <section class="alt-uses">
+        <h2>Other ways to use Woxi</h2>
+        <p class="alt-lede">
+          The playground above is one of several Woxi front-ends &mdash;
+          the same interpreter powers a full-screen playground, a
+          command-line tool, a Jupyter kernel (also runnable in the
+          browser via JupyterLite), and a native notebook editor.
+        </p>
+
+        <div class="alt-grid">
+          <a class="alt-card" href="/playground/">
+            <div class="alt-card__image">
+              <img src="images/playground.png"
+                   alt="Extended Woxi playground with side-by-side editor and graphics output"
+                   loading="lazy" />
+            </div>
+            <div class="alt-card__body">
+              <h3>Extended playground</h3>
+              <p>
+                Side-by-side editor and output pane with more room to
+                explore. Great for multi-line expressions and
+                experimenting with graphics.
+              </p>
+              <span class="alt-card__cta">Open the full playground &rarr;</span>
+            </div>
+          </a>
+
+          <a class="alt-card" href="/docs/scripting/">
+            <div class="alt-card__image">
+              <img src="images/cli.png"
+                   alt="Woxi command-line interpreter in a terminal"
+                   loading="lazy" />
+            </div>
+            <div class="alt-card__body">
+              <h3>Command-line tool</h3>
+              <p>
+                Evaluate expressions with <code>woxi eval</code>,
+                run <code>.wls</code> scripts directly, or use Woxi
+                as a shebang interpreter. Faster to start than
+                <code>wolframscript</code>.
+              </p>
+              <span class="alt-card__cta">See the scripting guide &rarr;</span>
+            </div>
+          </a>
+
+          <article class="alt-card">
+            <div class="alt-card__image">
+              <a class="alt-card__image-link"
+                 href="/jupyterlite/lab/index.html?path=showcase.ipynb"
+                 aria-label="Open the JupyterLite showcase notebook">
+                <img src="images/jupyterlite.png"
+                     alt="Jupyter notebook running the Woxi kernel"
+                     loading="lazy" />
+              </a>
+            </div>
+            <div class="alt-card__body">
+              <h3>Jupyter &amp; JupyterLite</h3>
+              <p>
+                Woxi ships as a Jupyter kernel. Install it locally
+                with <code>woxi install-kernel</code>, or run the
+                full notebook experience in your browser via the
+                bundled <a class="alt-card__inline-link"
+                  href="/jupyterlite/lab/index.html?path=showcase.ipynb"
+                  >JupyterLite instance</a>
+                &mdash; no install required.
+              </p>
+              <a class="alt-card__cta alt-card__cta--stretched"
+                 href="/docs/jupyter/">Read the Jupyter guide &rarr;</a>
+            </div>
+          </article>
+
+          <a class="alt-card" href="/docs/studio/">
+            <div class="alt-card__image">
+              <img src="images/woxi-studio.png"
+                   alt="Woxi Studio editing a .nb notebook"
+                   loading="lazy" />
+            </div>
+            <div class="alt-card__body">
+              <h3>Woxi Studio</h3>
+              <p>
+                Native notebook editor for Wolfram Language
+                <code>.nb</code> files. Cell-based editing, inline
+                graphics, and export to <code>.ipynb</code>,
+                Markdown, LaTeX, Typst, and PDF.
+              </p>
+              <span class="alt-card__cta">Read the documentation &rarr;</span>
+            </div>
+          </a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="script.js"></script>
+</body>
+
+</html>

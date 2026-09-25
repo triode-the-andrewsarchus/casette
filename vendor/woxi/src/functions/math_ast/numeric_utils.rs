@@ -1,0 +1,1722 @@
+#[allow(unused_imports)]
+use super::*;
+use num_traits::{Signed, Zero};
+
+/// Helper - constants are kept symbolic, no direct f64 conversion in expr_to_num.
+pub fn constant_to_f64(_name: &str) -> Option<f64> {
+  None
+}
+
+pub fn expr_to_num(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    Expr::Constant(name) => constant_to_f64(name),
+    Expr::Identifier(name) => constant_to_f64(name),
+    // Handle Rational[numer, denom]
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Some(numer), Some(denom)) =
+        (expr_to_num(&args[0]), expr_to_num(&args[1]))
+        && denom != 0.0
+      {
+        return Some(numer / denom);
+      }
+      None
+    }
+    _ => None,
+  }
+}
+
+/// Machine-real `x^n` for an exact `Integer` exponent `n`, reproducing the
+/// multiplication chains wolframscript uses so results agree to the last ULP
+/// (libm `pow` rounds differently, e.g. `7.488095238095239^-2`).
+///
+/// Empirically reverse-engineered from wolframscript by matching the exact
+/// f64 products over thousands of random bases and exponents:
+/// - exponents 2..=15 use a fixed chain table,
+/// - larger exponents peel a base-4 digit while the remaining exponent has
+///   an odd bit length and a binary digit while it has an even bit length
+///   (squaring the half-power when the digit is 0),
+/// - negative exponents are the reciprocal of the positive power.
+pub fn wolfram_powi(x: f64, n: i128) -> f64 {
+  if n == 0 {
+    return 1.0;
+  }
+  let m = n.unsigned_abs();
+  let r = if m == 1 {
+    x
+  } else {
+    wolfram_pow_chain(x, x * x, m, &|a, b| a * b)
+  };
+  if n < 0 { 1.0 / r } else { r }
+}
+
+/// The multiplication chain shared by real and complex machine integer
+/// powers (see `wolfram_powi` for the empirically derived structure).
+fn wolfram_pow_chain<T: Copy>(
+  x: T,
+  x2: T,
+  k: u128,
+  mul: &impl Fn(T, T) -> T,
+) -> T {
+  let chain = |k| wolfram_pow_chain(x, x2, k, mul);
+  match k {
+    1 => x,
+    2 => x2,
+    3 => mul(x, x2),
+    4 => mul(x2, x2),
+    6 => {
+      let x3 = mul(x, x2);
+      mul(x3, x3)
+    }
+    8 => {
+      let x4 = mul(x2, x2);
+      mul(x4, x4)
+    }
+    10 => {
+      let x5 = chain(5);
+      mul(x5, x5)
+    }
+    12 => {
+      let x6 = mul(x2, mul(x2, x2));
+      mul(x6, x6)
+    }
+    14 => {
+      let x7 = mul(mul(x, x2), mul(x2, x2));
+      mul(x7, x7)
+    }
+    5 | 7 | 9 | 11 | 13 | 15 => mul(x, chain(k - 1)),
+    _ => {
+      let odd_bit_length = (128 - k.leading_zeros()) % 2 == 1;
+      if odd_bit_length {
+        match k % 4 {
+          0 => {
+            let h = chain(k / 2);
+            mul(h, h)
+          }
+          1 => mul(x, chain(k - 1)),
+          2 => mul(x2, chain(k - 2)),
+          _ => mul(mul(x, x2), chain(k - 3)),
+        }
+      } else if k.is_multiple_of(2) {
+        let h = chain(k / 2);
+        mul(h, h)
+      } else {
+        mul(x, chain(k - 1))
+      }
+    }
+  }
+}
+
+/// Reciprocal of a machine complex number, `1/(c + d*I)`, as wolframscript
+/// computes it: scale both parts by a power of two (exact) so the squares stay
+/// in range, form the denominator `c*c + d*d` with a single rounding via a
+/// fused multiply-add, then divide.
+///
+/// Smith's algorithm — the usual overflow-safe alternative, and what this used
+/// to do — is a ULP off on more than half of all inputs; the scaled fused form
+/// reproduces wolframscript on every sampled case, including denormal and
+/// near-overflow magnitudes where the unscaled form loses bits outright.
+fn complex_reciprocal(c: f64, d: f64) -> (f64, f64) {
+  let m = c.abs().max(d.abs());
+  if !m.is_finite() || m == 0.0 {
+    let den = c.mul_add(c, d * d);
+    return (c / den, -d / den);
+  }
+  // Put the larger part in [0.5, 1). The scale is a power of two, so applying
+  // and undoing it is exact. Denormals report a biased exponent of 0; the
+  // clamp keeps the resulting factor representable.
+  let biased = ((m.to_bits() >> 52) & 0x7ff) as i32;
+  let scale_exp = (1022 - biased).clamp(-1000, 1000);
+  let s = f64::from_bits(((scale_exp + 1023) as u64) << 52);
+  let (cs, ds) = (c * s, d * s);
+  let den = cs.mul_add(cs, ds * ds);
+  (s * (cs / den), -s * (ds / den))
+}
+
+/// Machine-complex `z^n` for an exact `Integer` exponent: the same
+/// multiplication chains as `wolfram_powi` with complex multiplications,
+/// and — for negative exponents — `complex_reciprocal` of the positive
+/// power, both matching wolframscript bit-for-bit (verified over random
+/// batches by the differential fuzzer). Returns `(re, im)`.
+pub fn wolfram_powi_complex(re: f64, im: f64, n: i128) -> (f64, f64) {
+  if n == 0 {
+    return (1.0, 0.0);
+  }
+  let cmul = |a: (f64, f64), b: (f64, f64)| -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+  };
+  let z = (re, im);
+  let m = n.unsigned_abs();
+  let (c, d) = if m == 1 {
+    z
+  } else {
+    wolfram_pow_chain(z, cmul(z, z), m, &cmul)
+  };
+  if n > 0 {
+    return (c, d);
+  }
+  complex_reciprocal(c, d)
+}
+
+/// Compute the error function erf(x) using the Taylor series.
+/// erf(x) = (2/sqrt(pi)) * sum_{n=0}^{inf} (-1)^n * x^(2n+1) / (n! * (2n+1))
+pub fn erf_f64(x: f64) -> f64 {
+  // erf is an odd function
+  let sign = if x < 0.0 { -1.0 } else { 1.0 };
+  let x = x.abs();
+
+  if x > 4.0 {
+    // For large |x|, erf(x) ≈ 1 - erfc(x) using continued fraction
+    return sign * (1.0 - erfc_cf(x));
+  }
+
+  // Taylor series: erf(x) = (2/sqrt(pi)) * sum_{n=0}^inf (-1)^n * x^(2n+1) / (n! * (2n+1))
+  let mut sum = 0.0;
+  let mut term = x; // first term: x
+  sum += term;
+  for n in 1..100 {
+    term *= -x * x / (n as f64);
+    let contribution = term / (2 * n + 1) as f64;
+    sum += contribution;
+    if contribution.abs() < 1e-16 * sum.abs() {
+      break;
+    }
+  }
+  sign * sum * 2.0 / std::f64::consts::PI.sqrt()
+}
+
+/// Compute erfc(x) for large x using the continued fraction representation.
+/// erfc(x) = exp(-x^2) / (x * sqrt(pi)) * CF
+pub fn erfc_cf(x: f64) -> f64 {
+  // Modified Lentz's method for the continued fraction
+  // erfc(x) = (exp(-x^2)/sqrt(pi)) * 1/(x + 1/(2x + 2/(x + 3/(2x + ...))))
+  // Using the form: a_n / (b_n + ...) where a_1=1, a_n = (n-1)/2, b_n = x
+  let mut f = x;
+  let mut c = x;
+  let mut d = 0.0;
+  let tiny = 1e-30;
+
+  for n in 1..200 {
+    let a_n = n as f64 * 0.5;
+    let b_n = x;
+    d = b_n + a_n * d;
+    if d.abs() < tiny {
+      d = tiny;
+    }
+    c = b_n + a_n / c;
+    if c.abs() < tiny {
+      c = tiny;
+    }
+    d = 1.0 / d;
+    let delta = c * d;
+    f *= delta;
+    if (delta - 1.0).abs() < 1e-15 {
+      break;
+    }
+  }
+
+  (-x * x).exp() / (f * std::f64::consts::PI.sqrt())
+}
+
+/// Complementary error function erfc(x) = 1 - erf(x), accurate for all x >= 0.
+/// For x >= 1 the continued fraction (erfc_cf) is used directly — there
+/// `1 - erf(x)` would lose precision to cancellation since erf(x) is near 1.
+pub fn erfc_f64(x: f64) -> f64 {
+  if x >= 1.0 {
+    erfc_cf(x)
+  } else {
+    1.0 - erf_f64(x)
+  }
+}
+
+/// Compute the inverse error function using a rational approximation
+/// followed by Newton-Raphson refinement.
+/// Uses the approach from J.M. Blair, "Rational Chebyshev approximations
+/// for the inverse of the error function" (1976).
+pub fn inverse_erf_f64(x: f64) -> f64 {
+  if x == 0.0 {
+    return 0.0;
+  }
+  // InverseErf is odd
+  let sign = if x < 0.0 { -1.0 } else { 1.0 };
+  let x = x.abs();
+
+  if x >= 1.0 {
+    return sign * f64::INFINITY;
+  }
+
+  // Initial approximation using rational approximation
+  let mut result = if x <= 0.7 {
+    // Central region: use series around 0
+    let a = x * std::f64::consts::FRAC_PI_2.sqrt();
+    // Approximate: InverseErf(x) ≈ sqrt(pi)/2 * (x + pi/12 * x^3 + ...)
+    let x2 = a * a;
+    a * (1.0 + x2 * (1.0 / 3.0 + x2 * (7.0 / 30.0 + x2 * (127.0 / 630.0))))
+  } else {
+    // Tail region: use asymptotic approximation
+    // InverseErf(x) ≈ sqrt(-ln(1-x^2)) * correction
+    let t = (-((1.0 - x) * (1.0 + x)).ln()).sqrt();
+    // Rational approximation for the tail
+    let p = 0.3275911;
+    t * (1.0 - p * (t - 1.0) / (t + 1.0))
+  };
+
+  // Newton-Raphson refinement: f(y) = erf(y) - x = 0
+  // f'(y) = 2/sqrt(pi) * exp(-y^2)
+  let target = sign * x;
+  for _ in 0..10 {
+    let err = erf_f64(result) - x;
+    let deriv = 2.0 / std::f64::consts::PI.sqrt() * (-result * result).exp();
+    if deriv.abs() < 1e-300 {
+      break;
+    }
+    let correction = err / deriv;
+    result -= correction;
+    if correction.abs() < 1e-15 * result.abs() {
+      break;
+    }
+  }
+
+  if target < 0.0 { -result } else { result }
+}
+
+/// Compute the imaginary error function erfi(x) using the Taylor series.
+/// erfi(x) = (2/sqrt(pi)) * sum_{n=0}^{inf} x^(2n+1) / (n! * (2n+1))
+pub fn erfi_f64(x: f64) -> f64 {
+  // erfi is an odd function
+  let sign = if x < 0.0 { -1.0 } else { 1.0 };
+  let x = x.abs();
+
+  // Taylor series: erfi(x) = (2/sqrt(pi)) * sum_{n=0}^inf x^(2n+1) / (n! * (2n+1))
+  // Note: unlike erf, there is no (-1)^n factor, so all terms are positive for x > 0
+  let mut sum = 0.0;
+  let mut term = x; // first term: x
+  sum += term;
+  for n in 1..200 {
+    term *= x * x / (n as f64);
+    let contribution = term / (2 * n + 1) as f64;
+    sum += contribution;
+    if contribution.abs() < 1e-16 * sum.abs() {
+      break;
+    }
+  }
+  sign * sum * 2.0 / std::f64::consts::PI.sqrt()
+}
+
+/// Compute Dawson's integral F(x) = exp(-x^2) * integral_0^x exp(t^2) dt.
+/// Equivalent to (sqrt(pi)/2) * exp(-x^2) * erfi(x).
+/// For small |x| a Taylor series is used; for larger |x| the stable
+/// product form via erfi is used (erfi grows like exp(x^2), so the
+/// exp(-x^2) factor keeps the result finite). For very large |x| the
+/// asymptotic expansion F(x) ~ 1/(2x) + 1/(4x^3) + ... is used.
+pub fn dawson_f64(x: f64) -> f64 {
+  // Dawson's function is odd.
+  let sign = if x < 0.0 { -1.0 } else { 1.0 };
+  let ax = x.abs();
+
+  if ax < 1.0 {
+    // Taylor series: F(x) = sum_{n=0}^inf (-1)^n 2^n x^(2n+1) / (2n+1)!!
+    // where (2n+1)!! = 1*3*5*...*(2n+1). Converges fast and without
+    // cancellation problems for small |x|.
+    let mut term = ax; // n = 0 term: x / 1!! = x
+    let mut sum = term;
+    let x2 = ax * ax;
+    for n in 0..200 {
+      // term_{n+1} = term_n * (-2 x^2) / (2n+3)
+      term *= -2.0 * x2 / (2 * n + 3) as f64;
+      sum += term;
+      if term.abs() < 1e-17 * sum.abs() {
+        break;
+      }
+    }
+    return sign * sum;
+  }
+
+  if ax < 6.0 {
+    // Stable product form: F(x) = (sqrt(pi)/2) exp(-x^2) erfi(x).
+    // Compute erfi via its series scaled by exp(-x^2) to avoid overflow.
+    // erfi(x) = (2/sqrt(pi)) sum x^(2n+1)/(n!(2n+1)); multiply by
+    // (sqrt(pi)/2) exp(-x^2): F = exp(-x^2) sum x^(2n+1)/(n!(2n+1)).
+    let x2 = ax * ax;
+    let mut term = ax;
+    let mut sum = term;
+    for n in 1..400 {
+      term *= x2 / n as f64;
+      let contribution = term / (2 * n + 1) as f64;
+      sum += contribution;
+      if contribution.abs() < 1e-18 * sum.abs() {
+        break;
+      }
+    }
+    return sign * (-x2).exp() * sum;
+  }
+
+  // Asymptotic expansion for large |x|:
+  // F(x) ~ 1/(2x) [ 1 + 1/(2x^2) + 3/(2x^2)^2 + 15/(2x^2)^3 + ... ]
+  // with coefficient ratio (2k-1)/(2x^2).
+  let inv = 1.0 / (2.0 * ax * ax);
+  let mut term = 1.0;
+  let mut sum = 1.0;
+  for k in 1..40 {
+    term *= (2 * k - 1) as f64 * inv;
+    sum += term;
+    if term.abs() < 1e-17 * sum.abs() {
+      break;
+    }
+  }
+  sign * sum / (2.0 * ax)
+}
+
+/// Recursively try to evaluate any expression to f64.
+/// This handles constants (Pi, E, Degree), arithmetic operations, and known functions.
+/// Used by N[], comparisons, and anywhere a numeric value is needed from a symbolic expression.
+pub fn try_eval_to_f64(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::BigInteger(n) => {
+      use num_traits::ToPrimitive;
+      n.to_f64()
+    }
+    Expr::Real(f) => Some(*f),
+    Expr::BigFloat(digits, _) => digits.parse::<f64>().ok(),
+    Expr::Constant(name) => match name.as_str() {
+      "Pi" => Some(std::f64::consts::PI),
+      "-Pi" => Some(-std::f64::consts::PI),
+      "E" => Some(std::f64::consts::E),
+      "Degree" => Some(std::f64::consts::PI / 180.0),
+      "-Degree" => Some(-std::f64::consts::PI / 180.0),
+      _ => None,
+    },
+    Expr::Identifier(name) => match name.as_str() {
+      "Pi" => Some(std::f64::consts::PI),
+      "E" => Some(std::f64::consts::E),
+      "Degree" => Some(std::f64::consts::PI / 180.0),
+      "EulerGamma" => Some(0.5772156649015329),
+      "Catalan" => Some(0.915_965_594_177_219),
+      "GoldenRatio" => Some(1.618_033_988_749_895),
+      "GoldenAngle" => Some(2.399_963_229_728_653_5),
+      "Glaisher" => Some(1.2824271291006226),
+      "Khinchin" => Some(2.6854520010653064),
+      "MachinePrecision" => Some(15.954589770191003),
+      _ => None,
+    },
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => try_eval_to_f64(operand).map(|v| -v),
+    Expr::BinaryOp { op, left, right } => {
+      let l = try_eval_to_f64(left)?;
+      let r = try_eval_to_f64(right)?;
+      match op {
+        BinaryOperator::Plus => Some(l + r),
+        BinaryOperator::Minus => Some(l - r),
+        BinaryOperator::Times => Some(l * r),
+        BinaryOperator::Divide => {
+          if r == 0.0 {
+            None
+          } else {
+            Some(l / r)
+          }
+        }
+        BinaryOperator::Power => {
+          let result = l.powf(r);
+          if result.is_nan() { None } else { Some(result) }
+        }
+        _ => None,
+      }
+    }
+    Expr::FunctionCall { name, args } => match name.as_str() {
+      "Rational" if args.len() == 2 => {
+        // Prefer a bignum-aware ratio so huge exact rationals whose numerator
+        // and denominator overflow f64 individually still convert correctly.
+        if let (Some(num), Some(den)) =
+          (expr_to_bigint(&args[0]), expr_to_bigint(&args[1]))
+        {
+          return big_rational_to_f64(&num, &den);
+        }
+        let n = try_eval_to_f64(&args[0])?;
+        let d = try_eval_to_f64(&args[1])?;
+        if d == 0.0 { None } else { Some(n / d) }
+      }
+      // `Root[poly &, k]` is an exact algebraic number: it keeps its exact
+      // form when printed, but it counts as a number wherever one is wanted
+      // — a polyhedron's vertex coordinates, say, which is how Wolfram
+      // writes the ones that are not expressible in radicals. Only a real
+      // root has an f64; a complex one has no single value here.
+      "Root" if args.len() == 2 || args.len() == 3 => {
+        match super::numerical::root_n_eval(&args[0], &args[1])? {
+          Expr::Real(v) => Some(v),
+          _ => None,
+        }
+      }
+      // `ZetaZero[k]` is inherently complex (1/2 + i t_k, with no closed
+      // form for t_k), so it can't flow through the generic real-only
+      // NumericFunction fallback below. Handle Re/Im of it directly so
+      // e.g. `t - Im[ZetaZero[1]]` numericalizes when `t` is real, the
+      // same contamination rule that already applies to `Zeta[3] + 1.0`.
+      "Re"
+        if args.len() == 1
+          && matches!(&args[0], Expr::FunctionCall { name, args: fa }
+          if name == "ZetaZero" && fa.len() == 1) =>
+      {
+        match &args[0] {
+          Expr::FunctionCall { args: fa, .. } => {
+            expr_to_i128(&fa[0]).filter(|k| *k != 0).map(|_| 0.5)
+          }
+          _ => None,
+        }
+      }
+      "Im"
+        if args.len() == 1
+          && matches!(&args[0], Expr::FunctionCall { name, args: fa }
+          if name == "ZetaZero" && fa.len() == 1) =>
+      {
+        match &args[0] {
+          Expr::FunctionCall { args: fa, .. } => {
+            expr_to_i128(&fa[0]).and_then(super::zeta_zero_t_for_k)
+          }
+          _ => None,
+        }
+      }
+      // Auxiliary Fresnel moduli: symbolic for exact arguments but
+      // numericizable (so N[FresnelF[1]] works).
+      "FresnelF" | "FresnelG" if args.len() == 1 => {
+        let x = try_eval_to_f64(&args[0])?;
+        Some(fresnel_fg_numeric(name == "FresnelF", x))
+      }
+      // Champernowne constants: numeric (NumericQ True) but symbolic until
+      // numericized.
+      "ChampernowneNumber" if args.len() <= 1 => match args.first() {
+        None => Some(champernowne_f64(10)),
+        Some(Expr::Integer(b)) if *b >= 2 => Some(champernowne_f64(*b)),
+        _ => None,
+      },
+      // Stieltjes constants (machine-precision values from wolframscript)
+      "StieltjesGamma" if args.len() == 1 => match &args[0] {
+        Expr::Integer(0) => Some(0.5772156649015329),
+        Expr::Integer(1) => Some(-0.07281584548367673),
+        Expr::Integer(2) => Some(-0.00969036319287232),
+        Expr::Integer(3) => Some(0.002053834420303346),
+        Expr::Integer(4) => Some(0.0023253700654673),
+        Expr::Integer(5) => Some(0.0007933238173010627),
+        Expr::Integer(6) => Some(-0.0002387693454301996),
+        Expr::Integer(7) => Some(-0.000527289567057751),
+        Expr::Integer(8) => Some(-0.0003521233538030395),
+        Expr::Integer(9) => Some(-0.00003439477441808805),
+        Expr::Integer(10) => Some(0.0002053328149090648),
+        _ => None,
+      },
+      "Sin" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::sin),
+      "Cos" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::cos),
+      "Tan" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::tan),
+      "Sec" if args.len() == 1 => try_eval_to_f64(&args[0]).and_then(|v| {
+        let c = v.cos();
+        if c == 0.0 { None } else { Some(1.0 / c) }
+      }),
+      "Csc" if args.len() == 1 => try_eval_to_f64(&args[0]).and_then(|v| {
+        let s = v.sin();
+        if s == 0.0 { None } else { Some(1.0 / s) }
+      }),
+      "Cot" if args.len() == 1 => try_eval_to_f64(&args[0]).and_then(|v| {
+        let s = v.sin();
+        if s == 0.0 { None } else { Some(v.cos() / s) }
+      }),
+      "ArcSin" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::asin),
+      "ArcCos" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::acos),
+      "ArcTan" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::atan),
+      "Sinh" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::sinh),
+      "Cosh" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::cosh),
+      "Tanh" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::tanh),
+      "Coth" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).map(|v| 1.0 / v.tanh())
+      }
+      "Sech" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).map(|v| 1.0 / v.cosh())
+      }
+      "Csch" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).map(|v| 1.0 / v.sinh())
+      }
+      "ArcSinh" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::asinh),
+      "ArcCosh" if args.len() == 1 => try_eval_to_f64(&args[0])
+        .and_then(|v| if v >= 1.0 { Some(v.acosh()) } else { None }),
+      "ArcTanh" if args.len() == 1 => try_eval_to_f64(&args[0])
+        .and_then(|v| if v.abs() < 1.0 { Some(v.atanh()) } else { None }),
+      // Bessel functions with exact numeric arguments stay symbolic but
+      // must numericize under Real contagion (2.*BesselI[0, 3] is a
+      // machine real in wolframscript).
+      "BesselI" if args.len() == 2 => {
+        let n = try_eval_to_f64(&args[0])?;
+        let z = try_eval_to_f64(&args[1])?;
+        let v = bessel_i(n, z);
+        v.is_finite().then_some(v)
+      }
+      "BesselJ" if args.len() == 2 => {
+        let n = try_eval_to_f64(&args[0])?;
+        let z = try_eval_to_f64(&args[1])?;
+        let v = bessel_j(n, z);
+        v.is_finite().then_some(v)
+      }
+      "BesselK" if args.len() == 2 => {
+        let n = try_eval_to_f64(&args[0])?;
+        let z = try_eval_to_f64(&args[1])?;
+        let v = bessel_k(n, z);
+        v.is_finite().then_some(v)
+      }
+      "BesselY" if args.len() == 2 => {
+        let n = try_eval_to_f64(&args[0])?;
+        let z = try_eval_to_f64(&args[1])?;
+        let v = bessel_y(n, z);
+        v.is_finite().then_some(v)
+      }
+      "Sqrt" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::sqrt),
+      "Abs" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::abs),
+      "Exp" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::exp),
+      "Erf" if args.len() == 1 => try_eval_to_f64(&args[0]).map(erf_f64),
+      "Erfc" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).map(|v| 1.0 - erf_f64(v))
+      }
+      "Erfi" if args.len() == 1 => try_eval_to_f64(&args[0]).map(erfi_f64),
+      "DawsonF" if args.len() == 1 => try_eval_to_f64(&args[0]).map(dawson_f64),
+      "FresnelS" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).map(fresnel_s_numeric)
+      }
+      "FresnelC" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).map(fresnel_c_numeric)
+      }
+      "InverseErf" if args.len() == 1 => {
+        try_eval_to_f64(&args[0]).and_then(|v| {
+          if v > -1.0 && v < 1.0 {
+            Some(inverse_erf_f64(v))
+          } else {
+            None
+          }
+        })
+      }
+      "Log" if args.len() == 1 => try_eval_to_f64(&args[0])
+        .and_then(|v| if v > 0.0 { Some(v.ln()) } else { None }),
+      "Log" if args.len() == 2 => {
+        let base = try_eval_to_f64(&args[0])?;
+        let val = try_eval_to_f64(&args[1])?;
+        if base > 0.0 && base != 1.0 && val > 0.0 {
+          Some(val.ln() / base.ln())
+        } else {
+          None
+        }
+      }
+      "Log10" if args.len() == 1 => try_eval_to_f64(&args[0])
+        .and_then(|v| if v > 0.0 { Some(v.log10()) } else { None }),
+      "Log2" if args.len() == 1 => try_eval_to_f64(&args[0])
+        .and_then(|v| if v > 0.0 { Some(v.log2()) } else { None }),
+      "Power" if args.len() == 2 => {
+        let b = try_eval_to_f64(&args[0])?;
+        let e = try_eval_to_f64(&args[1])?;
+        let result = b.powf(e);
+        if result.is_nan() { None } else { Some(result) }
+      }
+      "Floor" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::floor),
+      "Floor" if args.len() == 2 => {
+        let x = try_eval_to_f64(&args[0])?;
+        let a = try_eval_to_f64(&args[1])?;
+        if a == 0.0 {
+          None
+        } else {
+          Some((x / a).floor() * a)
+        }
+      }
+      "Ceiling" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::ceil),
+      "Ceiling" if args.len() == 2 => {
+        let x = try_eval_to_f64(&args[0])?;
+        let a = try_eval_to_f64(&args[1])?;
+        if a == 0.0 {
+          None
+        } else {
+          Some((x / a).ceil() * a)
+        }
+      }
+      "Round" if args.len() == 1 => try_eval_to_f64(&args[0]).map(f64::round),
+      "Times" => {
+        let mut product = 1.0;
+        for arg in args {
+          product *= try_eval_to_f64(arg)?;
+        }
+        Some(product)
+      }
+      "Plus" => {
+        let mut sum = 0.0;
+        for arg in args {
+          sum += try_eval_to_f64(arg)?;
+        }
+        Some(sum)
+      }
+      "Factorial" if args.len() == 1 => {
+        if let Expr::Integer(n) = &args[0]
+          && *n >= 0
+          && *n <= 170
+        {
+          let mut result = 1.0f64;
+          for i in 2..=(*n as u64) {
+            result *= i as f64;
+          }
+          return Some(result);
+        }
+        None
+      }
+      // Fallback for a NumericQ special function with no hand-rolled case
+      // above (e.g. InverseBetaRegularized, InverseGammaRegularized): the
+      // real numeric implementation lives in the function's own dispatch,
+      // triggered by calling it with machine-Real arguments. Matches how
+      // `n_eval` re-evaluates an unhandled FunctionCall through the full
+      // evaluator. Extracting the result directly (rather than recursing
+      // into `try_eval_to_f64`) avoids looping forever on a user function
+      // tagged `NumericFunction` that has no definition to reduce it.
+      other if crate::functions::predicate_ast::is_numeric_function(other) => {
+        let mut real_args = Vec::with_capacity(args.len());
+        for a in args {
+          real_args.push(Expr::Real(try_eval_to_f64(a)?));
+        }
+        let new_expr = call(other, real_args);
+        match crate::evaluator::evaluate_expr_to_expr(&new_expr) {
+          Ok(Expr::Real(v)) => Some(v),
+          Ok(Expr::Integer(n)) => Some(n as f64),
+          Ok(Expr::BigInteger(ref n)) => {
+            use num_traits::ToPrimitive;
+            n.to_f64()
+          }
+          Ok(Expr::BigFloat(ref digits, _)) => digits.parse::<f64>().ok(),
+          _ => None,
+        }
+      }
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// Helper to create numeric result (Integer if whole, Real otherwise)
+pub fn num_to_expr(n: f64) -> Expr {
+  if n.fract() == 0.0 && n.abs() < i128::MAX as f64 {
+    Expr::Integer(n as i128)
+  } else {
+    Expr::Real(n)
+  }
+}
+
+/// Convert a BigInt to Expr::Integer if it fits in i128, otherwise Expr::BigInteger
+pub fn bigint_to_expr(n: BigInt) -> Expr {
+  use num_traits::ToPrimitive;
+  match n.to_i128() {
+    Some(i) => Expr::Integer(i),
+    None => Expr::BigInteger(n),
+  }
+}
+
+/// Try to extract an i128 from Integer or BigInteger (if it fits).
+pub fn expr_to_i128(e: &Expr) -> Option<i128> {
+  use num_traits::ToPrimitive;
+  match e {
+    Expr::Integer(n) => Some(*n),
+    Expr::BigInteger(n) => n.to_i128(),
+    _ => None,
+  }
+}
+
+/// Extract a BigInt from Integer or BigInteger.
+pub fn expr_to_bigint(e: &Expr) -> Option<BigInt> {
+  match e {
+    Expr::Integer(n) => Some(BigInt::from(*n)),
+    Expr::BigInteger(n) => Some(n.clone()),
+    _ => None,
+  }
+}
+
+/// Converts the rational `num / den` to the nearest f64, staying correct when
+/// the numerator and denominator individually overflow f64's range even though
+/// their ratio is representable (e.g. `2^2000 / 3^1000`). A naive
+/// `num.to_f64() / den.to_f64()` would compute `inf / inf = NaN` there.
+/// Returns None when `den` is zero.
+fn big_rational_to_f64(num: &BigInt, den: &BigInt) -> Option<f64> {
+  use num_traits::ToPrimitive;
+  if den.is_zero() {
+    return None;
+  }
+  if num.is_zero() {
+    return Some(0.0);
+  }
+  let sign = if num.is_negative() ^ den.is_negative() {
+    -1.0
+  } else {
+    1.0
+  };
+  let num_a = num.abs();
+  let den_a = den.abs();
+
+  // Fast path: both magnitudes are comfortably within f64 range.
+  let nb = num_a.bits() as i64;
+  let db = den_a.bits() as i64;
+  if nb < 1000 && db < 1000 {
+    let n = num_a.to_f64()?;
+    let d = den_a.to_f64()?;
+    return Some(sign * n / d);
+  }
+
+  // General path: form q = floor((num << k) / den) so the integer quotient
+  // carries ~64 significant bits (q ≈ (num/den) * 2^k), then scale by 2^-k.
+  // Choosing k = 64 - (nb - db) makes q's bit length ≈ 64 regardless of how
+  // large num and den are, so q.to_f64() never overflows.
+  let k: i64 = 64 - (nb - db);
+  let q = if k >= 0 {
+    (&num_a << (k as usize)) / &den_a
+  } else {
+    &num_a / (&den_a << ((-k) as usize))
+  };
+  let qf = q.to_f64()?;
+  // num/den = q * 2^{-k}; a too-large exponent overflows to +/-inf and a
+  // too-small one underflows to 0, both of which are the correct f64 result.
+  Some(sign * qf * 2.0_f64.powi(-k as i32))
+}
+
+/// Check if an expression requires BigInt arithmetic (exceeds f64 precision).
+/// f64 can only represent integers exactly up to 2^53.
+pub fn needs_bigint_arithmetic(expr: &Expr) -> bool {
+  match expr {
+    Expr::BigInteger(_) => true,
+    Expr::Integer(n) => n.unsigned_abs() > (1u128 << 53),
+    _ => false,
+  }
+}
+
+/// Extract an exact rational (numer, denom) from an Expr.
+/// Integer n → (n, 1), Rational[n, d] → (n, d), otherwise None.
+pub fn expr_to_rational(expr: &Expr) -> Option<(i128, i128)> {
+  match expr {
+    Expr::Integer(n) => Some((*n, 1)),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+        Some((*n, *d))
+      } else {
+        None
+      }
+    }
+    _ => None,
+  }
+}
+
+/// True if the expression tree contains an inexact (Real or BigFloat)
+/// literal anywhere. Used to decide between exact/symbolic and
+/// machine-precision numerical evaluation.
+pub fn contains_inexact_real(expr: &Expr) -> bool {
+  match expr {
+    Expr::Real(_) | Expr::BigFloat(_, _) => true,
+    Expr::List(items) => items.iter().any(contains_inexact_real),
+    Expr::FunctionCall { args, .. } => args.iter().any(contains_inexact_real),
+    Expr::BinaryOp { left, right, .. } => {
+      contains_inexact_real(left) || contains_inexact_real(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_inexact_real(operand),
+    _ => false,
+  }
+}
+
+/// True if the expression tree contains a machine-precision Real literal
+/// (BigFloats do not count). Distinguishes exact directions like
+/// `(1 + 2 I)/Sqrt[5]` from inexact ones like `1. + 2. I`.
+pub fn expr_contains_real(expr: &Expr) -> bool {
+  match expr {
+    Expr::Real(_) => true,
+    Expr::List(items) => items.iter().any(expr_contains_real),
+    Expr::FunctionCall { args, .. } => args.iter().any(expr_contains_real),
+    Expr::BinaryOp { left, right, .. } => {
+      expr_contains_real(left) || expr_contains_real(right)
+    }
+    Expr::UnaryOp { operand, .. } => expr_contains_real(operand),
+    _ => false,
+  }
+}
+
+/// True for a literal concrete number: Integer, Real, BigInteger, BigFloat,
+/// Rational, or a negated concrete number.
+pub fn is_concrete_number(e: &Expr) -> bool {
+  match e {
+    Expr::Integer(_)
+    | Expr::Real(_)
+    | Expr::BigInteger(_)
+    | Expr::BigFloat(_, _) => true,
+    Expr::FunctionCall { name, .. } => name == "Rational",
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => is_concrete_number(operand),
+    _ => false,
+  }
+}
+
+/// Format an f64 value as a BigFloat string with the given number of
+/// significant digits.
+pub fn format_bigfloat_value(value: f64, sig_digits: usize) -> String {
+  if value == 0.0 {
+    return "0.".to_string();
+  }
+  let sign = if value < 0.0 { "-" } else { "" };
+  let abs_val = value.abs();
+  let magnitude = abs_val.log10().floor() as i32;
+  let decimal_places = ((sig_digits as i32) - magnitude - 1).max(0) as usize;
+  let formatted = format!("{sign}{abs_val:.decimal_places$}");
+  if formatted.contains('.') {
+    formatted
+  } else {
+    format!("{formatted}.")
+  }
+}
+
+/// Compute GCD of two integers using Euclidean algorithm
+pub fn gcd_i128(a: i128, b: i128) -> i128 {
+  // Use `unsigned_abs` (u128) so `i128::MIN` (whose `abs()` overflows) is
+  // handled correctly, e.g. gcd(-2^127, 1).
+  let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
+  while b != 0 {
+    (a, b) = (b, a % b);
+  }
+  a as i128
+}
+
+/// Compute GCD of two u64 values using Euclidean algorithm
+pub fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+  while b != 0 {
+    (a, b) = (b, a % b);
+  }
+  a
+}
+
+/// Compute GCD of two unsigned integers using Euclidean algorithm
+pub fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+  while b != 0 {
+    (a, b) = (b, a % b);
+  }
+  a
+}
+
+/// Compute the (non-negative) LCM of two integers; 0 if either is 0.
+pub fn lcm_i128(a: i128, b: i128) -> i128 {
+  if a == 0 || b == 0 {
+    return 0;
+  }
+  (a / gcd_i128(a, b) * b).abs()
+}
+
+/// Compute the (non-negative) GCD of two BigInts.
+pub fn gcd_bigint(a: &BigInt, b: &BigInt) -> BigInt {
+  let (mut a, mut b) = (a.abs(), b.abs());
+  while !b.is_zero() {
+    let r = &a % &b;
+    (a, b) = (b, r);
+  }
+  a
+}
+
+/// Reduce n/d to lowest terms with a positive denominator.
+pub fn rat_reduce(n: i128, d: i128) -> (i128, i128) {
+  let g = gcd_i128(n, d).max(1);
+  let (n, d) = (n / g, d / g);
+  if d < 0 { (-n, -d) } else { (n, d) }
+}
+
+pub fn rat_reduce_bigint(n: &BigInt, d: &BigInt) -> (BigInt, BigInt) {
+  let mut g = gcd_bigint(n, d);
+  if g.is_zero() {
+    g = BigInt::from(1);
+  }
+  let (n, d) = (n / &g, d / g);
+  if d.is_negative() { (-n, -d) } else { (n, d) }
+}
+
+/// Primes up to here are stripped by trial division before anything more
+/// expensive is tried.
+const SQUARE_FACTOR_TRIAL_BOUND: u64 = 100_000;
+
+/// Past this size the leftover cofactor is left inside the radical rather
+/// than handed to the general factoriser: the work Pollard's rho needs grows
+/// as the fourth root of the number, so a bound keeps a stray big radicand
+/// from stalling an evaluation.
+const SQUARE_FACTOR_FACTORISE_BITS: u64 = 80;
+
+/// Extract the largest perfect-square factor from a positive integer:
+/// returns `(outside, inside)` with `n == outside^2 * inside`, so
+/// `Sqrt[n] = outside * Sqrt[inside]`. Small primes come out by trial
+/// division, and whatever survives is factored properly, so a square factor
+/// too large to reach by trial division (`100003^2 * 115` →
+/// `100003 * Sqrt[115]`) still comes out. Only a cofactor past
+/// [`SQUARE_FACTOR_FACTORISE_BITS`] stays in `inside` unexamined.
+///
+/// This is the one place a radical is reduced. Every caller — `Sqrt` of an
+/// integer, of a rational, and the `c * Sqrt[r]` merge in `times_ast` —
+/// goes through it, so they always agree on how far a radical reduces.
+/// While they disagreed the merge rewrote a radical that `Sqrt` promptly
+/// reduced further, and the two rewrote each other forever.
+pub fn extract_square_factor_big(n: &BigInt) -> (BigInt, BigInt) {
+  let one = BigInt::from(1);
+  if n <= &one {
+    return (one, n.clone());
+  }
+  let mut outside = BigInt::from(1);
+  let mut inside = BigInt::from(1);
+  let mut rest = n.clone();
+
+  let mut f: u64 = 2;
+  while f <= SQUARE_FACTOR_TRIAL_BOUND {
+    let fb = BigInt::from(f);
+    if &fb * &fb > rest {
+      break;
+    }
+    let mut count: u32 = 0;
+    while (&rest % &fb).is_zero() {
+      rest /= &fb;
+      count += 1;
+    }
+    if count >= 2 {
+      outside *= fb.pow(count / 2);
+    }
+    if count % 2 == 1 {
+      inside *= &fb;
+    }
+    f += 1;
+  }
+
+  if rest > one {
+    let r = rest.sqrt();
+    if &r * &r == rest {
+      outside *= r;
+    } else if rest.bits() <= SQUARE_FACTOR_FACTORISE_BITS {
+      let Some(rest_uint) = rest.to_biguint() else {
+        return (outside, inside * rest);
+      };
+      for (prime, exponent) in num_prime::nt_funcs::factorize(rest_uint) {
+        let prime = BigInt::from(prime);
+        if exponent >= 2 {
+          outside *= prime.pow(exponent as u32 / 2);
+        }
+        if exponent % 2 == 1 {
+          inside *= &prime;
+        }
+      }
+    } else {
+      inside *= rest;
+    }
+  }
+  (outside, inside)
+}
+
+/// [`extract_square_factor_big`] for an i128 radicand. Non-positive input
+/// has no square factor to give, so it reports `(1, 1)`.
+pub fn extract_square_factor_i128(n: i128) -> (i128, i128) {
+  let (outside, inside) = extract_square_factor_big(&BigInt::from(n.max(1)));
+  // Both factors divide `n`, so both fit wherever `n` did.
+  (
+    i128::try_from(&outside).unwrap_or(1),
+    i128::try_from(&inside).unwrap_or(n.max(1)),
+  )
+}
+
+/// Create a rational or integer result from numerator/denominator
+/// Simplifies the fraction and returns Integer if denominator is 1
+pub fn make_rational(numer: i128, denom: i128) -> Expr {
+  if denom == 0 {
+    // Division by zero - shouldn't reach here but be safe
+    return call("Rational", vec![Expr::Integer(numer), Expr::Integer(denom)]);
+  }
+
+  // Simplify
+  let (numer, denom) = rat_reduce(numer, denom);
+
+  if denom == 1 {
+    Expr::Integer(numer)
+  } else {
+    call("Rational", vec![Expr::Integer(numer), Expr::Integer(denom)])
+  }
+}
+
+/// Create a canonical Sqrt expression: Power[x, Rational[1, 2]]
+/// In Wolfram Language, Sqrt[x] is just syntactic sugar for Power[x, 1/2].
+pub fn make_sqrt(arg: Expr) -> Expr {
+  pow2(arg, make_rational(1, 2))
+}
+
+/// Check if an expression is a Sqrt (i.e. Power[x, Rational[1, 2]])
+/// and return the argument if so.
+pub fn is_sqrt(expr: &Expr) -> Option<&Expr> {
+  match expr {
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      if is_half(right) {
+        Some(left)
+      } else {
+        None
+      }
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Power" && args.len() == 2 && is_half(&args[1]) =>
+    {
+      Some(&args[0])
+    }
+    Expr::FunctionCall { name, args } if name == "Sqrt" && args.len() == 1 => {
+      Some(&args[0])
+    }
+    _ => None,
+  }
+}
+
+/// Check if an expression is Rational[1, 2]
+pub(super) fn is_half(expr: &Expr) -> bool {
+  matches!(
+    expr,
+    Expr::FunctionCall { name, args }
+      if name == "Rational"
+        && args.len() == 2
+        && matches!(&args[0], Expr::Integer(1))
+        && matches!(&args[1], Expr::Integer(2))
+  )
+}
+
+/// Convert complex rational components to an Expr.
+/// Given (re_num/re_den) + (im_num/im_den)*I, produce the canonical expression.
+pub fn complex_rational_to_expr(
+  re_n: i128,
+  re_d: i128,
+  im_n: i128,
+  im_d: i128,
+) -> Expr {
+  let real_part = make_rational(re_n, re_d);
+  let imag_part = make_rational(im_n, im_d);
+
+  // Pure real
+  if im_n == 0 {
+    return real_part;
+  }
+
+  // Pure imaginary
+  let i_expr = id_expr("I");
+  if re_n == 0 {
+    if matches!(&imag_part, Expr::Integer(1)) {
+      return i_expr;
+    }
+    if matches!(&imag_part, Expr::Integer(-1)) {
+      return neg1(i_expr);
+    }
+    return times2(imag_part, i_expr);
+  }
+
+  // General complex: real + imag*I
+  let imag_term = if matches!(&imag_part, Expr::Integer(1)) {
+    i_expr
+  } else if matches!(&imag_part, Expr::Integer(-1)) {
+    neg1(i_expr)
+  } else {
+    times2(imag_part, i_expr)
+  };
+
+  plus2(real_part, imag_term)
+}
+
+/// Multiply a numeric scalar (Integer, Rational, or Real) by an expression.
+/// Handles identity (1 * x = x) and zero (0 * x = 0).
+pub fn multiply_scalar_by_expr(
+  scalar: &Expr,
+  expr: &Expr,
+) -> Result<Expr, InterpreterError> {
+  match scalar {
+    Expr::Integer(0) => Ok(Expr::Integer(0)),
+    Expr::Integer(1) => Ok(expr.clone()),
+    Expr::Integer(-1) => {
+      Ok(call("Times", vec![Expr::Integer(-1), expr.clone()]))
+    }
+    _ => Ok(times2(scalar.clone(), expr.clone())),
+  }
+}
+
+/// Try to extract exact complex parts (re, im) from an expression as rational tuples (num, den).
+/// Returns Some(((re_num, re_den), (im_num, im_den))) if the expression is a numeric complex number.
+/// Handles patterns like: a + b*I, a - b*I, b*I, I, and plain reals.
+pub fn try_extract_complex_exact(
+  expr: &Expr,
+) -> Option<((i128, i128), (i128, i128))> {
+  match expr {
+    // Pure imaginary: I
+    Expr::Identifier(name) if name == "I" => Some(((0, 1), (1, 1))),
+    // Real number (integer or rational)
+    _ if expr_to_rational(expr).is_some() => {
+      let (n, d) = expr_to_rational(expr).unwrap();
+      Some(((n, d), (0, 1)))
+    }
+    // -I or -expr
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let ((rn, rd), (in_, id)) = try_extract_complex_exact(operand)?;
+      Some(((-rn, rd), (-in_, id)))
+    }
+    // Times: n * I, or n * (m * I), etc.
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let lc = try_extract_complex_exact(left)?;
+      let rc = try_extract_complex_exact(right)?;
+      // (a + bi)(c + di) = (ac - bd) + (ad + bc)i
+      let ((an, ad_), (bn, bd_)) = lc;
+      let ((cn, cd), (dn, dd)) = rc;
+      // Real part: (an/ad_)*(cn/cd) - (bn/bd_)*(dn/dd)
+      // = (an*cn)/(ad_*cd) - (bn*dn)/(bd_*dd)
+      let re_n1 = an.checked_mul(cn)?;
+      let re_d1 = ad_.checked_mul(cd)?;
+      let re_n2 = bn.checked_mul(dn)?;
+      let re_d2 = bd_.checked_mul(dd)?;
+      // re = re_n1/re_d1 - re_n2/re_d2 = (re_n1*re_d2 - re_n2*re_d1) / (re_d1*re_d2)
+      let re_num = re_n1.checked_mul(re_d2)? - re_n2.checked_mul(re_d1)?;
+      let re_den = re_d1.checked_mul(re_d2)?;
+      // Imag part: (an/ad_)*(dn/dd) + (bn/bd_)*(cn/cd)
+      let im_n1 = an.checked_mul(dn)?;
+      let im_d1 = ad_.checked_mul(dd)?;
+      let im_n2 = bn.checked_mul(cn)?;
+      let im_d2 = bd_.checked_mul(cd)?;
+      let im_num = im_n1.checked_mul(im_d2)? + im_n2.checked_mul(im_d1)?;
+      let im_den = im_d1.checked_mul(im_d2)?;
+      Some(((re_num, re_den), (im_num, im_den)))
+    }
+    // Plus: a + b*I
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      let ((an, ad_), (bn, bd_)) = try_extract_complex_exact(left)?;
+      let ((cn, cd), (dn, dd)) = try_extract_complex_exact(right)?;
+      // (a + bi) + (c + di) = (a+c) + (b+d)i
+      let re_num = an.checked_mul(cd)? + cn.checked_mul(ad_)?;
+      let re_den = ad_.checked_mul(cd)?;
+      let im_num = bn.checked_mul(dd)? + dn.checked_mul(bd_)?;
+      let im_den = bd_.checked_mul(dd)?;
+      Some(((re_num, re_den), (im_num, im_den)))
+    }
+    // Minus: a - b*I
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      let ((an, ad_), (bn, bd_)) = try_extract_complex_exact(left)?;
+      let ((cn, cd), (dn, dd)) = try_extract_complex_exact(right)?;
+      let re_num = an.checked_mul(cd)? - cn.checked_mul(ad_)?;
+      let re_den = ad_.checked_mul(cd)?;
+      let im_num = bn.checked_mul(dd)? - dn.checked_mul(bd_)?;
+      let im_den = bd_.checked_mul(dd)?;
+      Some(((re_num, re_den), (im_num, im_den)))
+    }
+    // FunctionCall Times[...] - flattened form
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      if args.is_empty() {
+        return None;
+      }
+      let mut result = try_extract_complex_exact(&args[0])?;
+      for arg in &args[1..] {
+        let rhs = try_extract_complex_exact(arg)?;
+        let ((an, ad_), (bn, bd_)) = result;
+        let ((cn, cd), (dn, dd)) = rhs;
+        let re_n1 = an.checked_mul(cn)?;
+        let re_d1 = ad_.checked_mul(cd)?;
+        let re_n2 = bn.checked_mul(dn)?;
+        let re_d2 = bd_.checked_mul(dd)?;
+        let re_num = re_n1.checked_mul(re_d2)? - re_n2.checked_mul(re_d1)?;
+        let re_den = re_d1.checked_mul(re_d2)?;
+        let im_n1 = an.checked_mul(dn)?;
+        let im_d1 = ad_.checked_mul(dd)?;
+        let im_n2 = bn.checked_mul(cn)?;
+        let im_d2 = bd_.checked_mul(cd)?;
+        let im_num = im_n1.checked_mul(im_d2)? + im_n2.checked_mul(im_d1)?;
+        let im_den = im_d1.checked_mul(im_d2)?;
+        result = ((re_num, re_den), (im_num, im_den));
+      }
+      Some(result)
+    }
+    // FunctionCall Plus[...] - flattened form
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      if args.is_empty() {
+        return None;
+      }
+      let mut result = try_extract_complex_exact(&args[0])?;
+      for arg in &args[1..] {
+        let rhs = try_extract_complex_exact(arg)?;
+        let ((an, ad_), (bn, bd_)) = result;
+        let ((cn, cd), (dn, dd)) = rhs;
+        let re_num = an.checked_mul(cd)? + cn.checked_mul(ad_)?;
+        let re_den = ad_.checked_mul(cd)?;
+        let im_num = bn.checked_mul(dd)? + dn.checked_mul(bd_)?;
+        let im_den = bd_.checked_mul(dd)?;
+        result = ((re_num, re_den), (im_num, im_den));
+      }
+      Some(result)
+    }
+    _ => None,
+  }
+}
+
+/// Like [`try_eval_to_f64`], but also accepts a machine `Complex[re, im]`
+/// whose imaginary part is exactly zero as the real number `re`. Scoped to
+/// samplers — a plot's per-point evaluator, say — where an expression that
+/// is mathematically real (e.g. a `SphericalHarmonicY` combination whose
+/// imaginary parts cancel) can still evaluate through complex
+/// intermediates and come out in that shape. `try_eval_to_f64` itself stays
+/// strict: many callers rely on it rejecting a genuine `Complex[…]`.
+pub fn try_eval_to_f64_lenient(expr: &Expr) -> Option<f64> {
+  if let Some(v) = try_eval_to_f64(expr) {
+    return Some(v);
+  }
+  let (re, im) = try_extract_complex_float(expr)?;
+  (im == 0.0).then_some(re)
+}
+
+/// Try to extract float complex parts (re, im) from an expression.
+/// Returns Some((re, im)) if the expression contains float components with I.
+pub fn try_extract_complex_float(expr: &Expr) -> Option<(f64, f64)> {
+  match expr {
+    Expr::Identifier(name) if name == "I" => Some((0.0, 1.0)),
+    Expr::Integer(n) => Some((*n as f64, 0.0)),
+    Expr::Real(f) => Some((*f, 0.0)),
+    Expr::BigFloat(digits, _) => Some((digits.parse::<f64>().ok()?, 0.0)),
+    // `Pi`/`E` surface as `Expr::Constant` when built directly but as a
+    // plain `Expr::Identifier` when they arrive via a symbolic reciprocal
+    // like `Power[Pi, -1]` from dividing by `2 Pi I` — both must extract
+    // the same way, or this fast complex-multiply path silently bails out
+    // (via the `?` below) and falls through to a slower symbolic route.
+    Expr::Constant(name) | Expr::Identifier(name)
+      if name == "Pi" || name == "E" =>
+    {
+      Some((
+        match name.as_str() {
+          "Pi" => std::f64::consts::PI,
+          "E" => std::f64::consts::E,
+          _ => unreachable!(),
+        },
+        0.0,
+      ))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+        Some((*n as f64 / *d as f64, 0.0))
+      } else {
+        None
+      }
+    }
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let (re, im) = try_extract_complex_float(operand)?;
+      Some((-re, -im))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let (a, b) = try_extract_complex_float(left)?;
+      let (c, d) = try_extract_complex_float(right)?;
+      Some((a * c - b * d, a * d + b * c))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      let (a, b) = try_extract_complex_float(left)?;
+      let (c, d) = try_extract_complex_float(right)?;
+      Some((a + c, b + d))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      let (a, b) = try_extract_complex_float(left)?;
+      let (c, d) = try_extract_complex_float(right)?;
+      Some((a - c, b - d))
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      if args.is_empty() {
+        return None;
+      }
+      let mut result = try_extract_complex_float(&args[0])?;
+      for arg in &args[1..] {
+        let (c, d) = try_extract_complex_float(arg)?;
+        let (a, b) = result;
+        result = (a * c - b * d, a * d + b * c);
+      }
+      Some(result)
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      if args.is_empty() {
+        return None;
+      }
+      let mut result = try_extract_complex_float(&args[0])?;
+      for arg in &args[1..] {
+        let (c, d) = try_extract_complex_float(arg)?;
+        result = (result.0 + c, result.1 + d);
+      }
+      Some(result)
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Complex" && args.len() == 2 =>
+    {
+      Some((try_eval_to_f64(&args[0])?, try_eval_to_f64(&args[1])?))
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      let (br, bi) = try_extract_complex_float(&args[0])?;
+      let (er, ei) = try_extract_complex_float(&args[1])?;
+      Some(crate::functions::polynomial_ast::solve::complex_pow(
+        br, bi, er, ei,
+      ))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      let (br, bi) = try_extract_complex_float(left)?;
+      let (er, ei) = try_extract_complex_float(right)?;
+      Some(crate::functions::polynomial_ast::solve::complex_pow(
+        br, bi, er, ei,
+      ))
+    }
+    _ => None,
+  }
+}
+
+/// Build a complex number expression from float parts.
+pub fn build_complex_float_expr(re: f64, im: f64) -> Expr {
+  let i_expr = id_expr("I");
+  let im_abs = im.abs();
+
+  if im == 0.0 {
+    return num_to_expr(re);
+  }
+
+  let im_term = if im_abs == 1.0 {
+    i_expr
+  } else {
+    times2(Expr::Real(im_abs), i_expr)
+  };
+
+  if re == 0.0 {
+    if im > 0.0 { im_term } else { neg1(im_term) }
+  } else {
+    // A machine-complex result keeps its Real head even for an integral real
+    // part: wolframscript prints (1.5 + 2.5 I)^2 as -4. + 7.5*I, not -4 + 7.5*I.
+    let re_expr = Expr::Real(re);
+    if im > 0.0 {
+      plus2(re_expr, im_term)
+    } else {
+      minus2(re_expr, im_term)
+    }
+  }
+}
+
+/// Like `build_complex_float_expr` but always shows the real part as `Real(0.)`
+/// when it's zero. Matches wolframscript's NRoots/N output that prints e.g.
+/// `0. + 1.*I` rather than just `I` for pure imaginary numerics.
+pub fn build_complex_float_expr_keep_real(re: f64, im: f64) -> Expr {
+  let i_expr = id_expr("I");
+  let im_abs = im.abs();
+  // Always materialise the coefficient as `Real * I` so the |coeff|==1 case
+  // prints as `1.*I` rather than bare `I` — wolframscript's numeric form.
+  let im_term = times2(Expr::Real(im_abs), i_expr);
+  let re_expr = Expr::Real(re);
+  if im >= 0.0 {
+    plus2(re_expr, im_term)
+  } else {
+    minus2(re_expr, im_term)
+  }
+}
+
+/// Build a complex number expression from exact rational parts.
+/// Handles special cases: 0 + bi = bi, a + 0i = a, coefficient ±1 elision, etc.
+pub fn build_complex_expr(
+  re_num: i128,
+  re_den: i128,
+  im_num: i128,
+  im_den: i128,
+) -> Expr {
+  let re = make_rational(re_num, re_den);
+  if im_num == 0 {
+    return re; // Pure real
+  }
+
+  let (in_s, id_s) = rat_reduce(im_num, im_den);
+  let i_expr = id_expr("I");
+
+  // Build the imaginary term with correct sign handling
+  let im_abs_num = in_s.abs();
+  let im_positive = in_s > 0;
+
+  // Build |im| * I
+  let im_term = if im_abs_num == 1 && id_s == 1 {
+    i_expr
+  } else {
+    let coeff = make_rational(im_abs_num, id_s);
+    times2(coeff, i_expr)
+  };
+
+  // Check if real part is zero
+  if re_num == 0 {
+    // Pure imaginary
+    return if im_positive {
+      im_term
+    } else if im_abs_num == 1 && id_s == 1 {
+      // -I
+      neg1(im_term)
+    } else {
+      // -n*I: build Times[-n, I] directly
+      let coeff = make_rational(-im_abs_num, id_s);
+      times2(coeff, id_expr("I"))
+    };
+  }
+
+  // Build re ± im*I
+  if im_positive {
+    plus2(re, im_term)
+  } else {
+    minus2(re, im_term)
+  }
+}
+
+/// Try to extract complex parts as (re: f64, im: f64) from an expression.
+/// Handles Real, Integer, I, Plus, Times, Minus, Complex, and FunctionCall variants.
+pub fn try_extract_complex_f64(expr: &Expr) -> Option<(f64, f64)> {
+  match expr {
+    Expr::Identifier(name) if name == "I" => Some((0.0, 1.0)),
+    Expr::UnaryOp {
+      op: UnaryOperator::Minus,
+      operand,
+    } => {
+      let (r, i) = try_extract_complex_f64(operand)?;
+      Some((-r, -i))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Times,
+      left,
+      right,
+    } => {
+      let (ar, ai) = try_extract_complex_f64(left)?;
+      let (br, bi) = try_extract_complex_f64(right)?;
+      Some((ar * br - ai * bi, ar * bi + ai * br))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Plus,
+      left,
+      right,
+    } => {
+      let (ar, ai) = try_extract_complex_f64(left)?;
+      let (br, bi) = try_extract_complex_f64(right)?;
+      Some((ar + br, ai + bi))
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Minus,
+      left,
+      right,
+    } => {
+      let (ar, ai) = try_extract_complex_f64(left)?;
+      let (br, bi) = try_extract_complex_f64(right)?;
+      Some((ar - br, ai - bi))
+    }
+    Expr::FunctionCall { name, args } if name == "Plus" => {
+      let mut re = 0.0;
+      let mut im = 0.0;
+      for arg in args {
+        let (r, i) = try_extract_complex_f64(arg)?;
+        re += r;
+        im += i;
+      }
+      Some((re, im))
+    }
+    Expr::FunctionCall { name, args } if name == "Times" => {
+      let mut re = 1.0;
+      let mut im = 0.0;
+      for arg in args {
+        let (r, i) = try_extract_complex_f64(arg)?;
+        let new_re = re * r - im * i;
+        let new_im = re * i + im * r;
+        re = new_re;
+        im = new_im;
+      }
+      Some((re, im))
+    }
+    Expr::FunctionCall { name, args }
+      if name == "Complex" && args.len() == 2 =>
+    {
+      let r = try_eval_to_f64(&args[0])?;
+      let i = try_eval_to_f64(&args[1])?;
+      Some((r, i))
+    }
+    _ => {
+      // Try as pure real
+      let v = try_eval_to_f64(expr)?;
+      Some((v, 0.0))
+    }
+  }
+}
+
+/// Log of the gamma function using Lanczos approximation.
+pub fn ln_gamma(x: f64) -> f64 {
+  if x < 0.5 {
+    let pi = std::f64::consts::PI;
+    (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x)
+  } else {
+    let x = x - 1.0;
+    let g = 7.0;
+    let c = [
+      0.999_999_999_999_809_9,
+      676.5203681218851,
+      -1259.1392167224028,
+      771.323_428_777_653_1,
+      -176.615_029_162_140_6,
+      12.507343278686905,
+      -0.13857109526572012,
+      9.984_369_578_019_572e-6,
+      1.5056327351493116e-7,
+    ];
+    let mut sum = c[0];
+    for (i, &ci) in c.iter().enumerate().skip(1) {
+      sum += ci / (x + i as f64);
+    }
+    let t = x + g + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+  }
+}
+
+/// Regularized incomplete beta function I_x(a, b) using continued fraction (Lentz's method).
+/// Returns the value of the regularized incomplete beta function.
+pub fn regularized_beta_inc(x: f64, a: f64, b: f64) -> f64 {
+  if x <= 0.0 {
+    return 0.0;
+  }
+  if x >= 1.0 {
+    return 1.0;
+  }
+  // Use symmetry relation when x > (a+1)/(a+b+2) for better convergence
+  if x > (a + 1.0) / (a + b + 2.0) {
+    return 1.0 - regularized_beta_inc(1.0 - x, b, a);
+  }
+  // Compute the log of the prefix: x^a * (1-x)^b / (a * B(a,b))
+  let log_prefix = a * x.ln() + b * (1.0 - x).ln() - ln_gamma(a) - ln_gamma(b)
+    + ln_gamma(a + b)
+    - a.ln();
+  let prefix = log_prefix.exp();
+  // Continued fraction using Lentz's method
+  let mut c = 1.0;
+  let mut f;
+  let mut d = 1.0 - (a + b) * x / (a + 1.0);
+  if d.abs() < 1e-30 {
+    d = 1e-30;
+  }
+  d = 1.0 / d;
+  f = d;
+  for m in 1..=200 {
+    let m_f64 = m as f64;
+    // Even step: d_{2m}
+    let numerator_even =
+      m_f64 * (b - m_f64) * x / ((a + 2.0 * m_f64 - 1.0) * (a + 2.0 * m_f64));
+    d = 1.0 + numerator_even * d;
+    if d.abs() < 1e-30 {
+      d = 1e-30;
+    }
+    c = 1.0 + numerator_even / c;
+    if c.abs() < 1e-30 {
+      c = 1e-30;
+    }
+    d = 1.0 / d;
+    f *= c * d;
+    // Odd step: d_{2m+1}
+    let numerator_odd = -(a + m_f64) * (a + b + m_f64) * x
+      / ((a + 2.0 * m_f64) * (a + 2.0 * m_f64 + 1.0));
+    d = 1.0 + numerator_odd * d;
+    if d.abs() < 1e-30 {
+      d = 1e-30;
+    }
+    c = 1.0 + numerator_odd / c;
+    if c.abs() < 1e-30 {
+      c = 1e-30;
+    }
+    d = 1.0 / d;
+    let delta = c * d;
+    f *= delta;
+    if (delta - 1.0).abs() < 1e-15 {
+      break;
+    }
+  }
+  prefix * f
+}
+
+/// Check if an expression contains Infinity (used for Abs)
+pub fn contains_infinity(expr: &Expr) -> bool {
+  match expr {
+    Expr::Identifier(name)
+      if name == "Infinity" || name == "ComplexInfinity" =>
+    {
+      true
+    }
+    Expr::UnaryOp { operand, .. } => contains_infinity(operand),
+    Expr::BinaryOp { left, right, .. } => {
+      contains_infinity(left) || contains_infinity(right)
+    }
+    Expr::FunctionCall { name, args } if name == "Times" || name == "Plus" => {
+      args.iter().any(contains_infinity)
+    }
+    Expr::FunctionCall { name, args }
+      if name == "DirectedInfinity" && !args.is_empty() =>
+    {
+      true
+    }
+    _ => false,
+  }
+}
+
+/// Check if an expression contains any float (Real or BigFloat) values.
+pub fn contains_float(expr: &Expr) -> bool {
+  match expr {
+    Expr::Real(_) | Expr::BigFloat(_, _) => true,
+    Expr::BinaryOp { left, right, .. } => {
+      contains_float(left) || contains_float(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_float(operand),
+    Expr::FunctionCall { args, .. } => args.iter().any(contains_float),
+    Expr::List(items) => items.iter().any(contains_float),
+    _ => false,
+  }
+}
+
+/// Extract f64 from various numeric expression types
+pub fn expr_to_f64(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Real(f) => Some(*f),
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1]) {
+        Some(*p as f64 / *q as f64)
+      } else {
+        None
+      }
+    }
+    _ => None,
+  }
+}

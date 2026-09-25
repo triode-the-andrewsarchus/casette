@@ -1,0 +1,1123 @@
+//! AST-native association functions.
+//!
+//! These functions work directly with `Expr` AST nodes.
+
+#[allow(unused_imports)]
+use super::*;
+
+/// The value an association entry hands back when it is looked up.
+///
+/// An entry written `key :> value` — which `Expr::Association` marks by
+/// wrapping the value in a `RuleDelayed` whose pattern is the key, see
+/// [`crate::syntax::assoc_marker_matches`] — holds its right-hand side and
+/// evaluates it afresh at every lookup, the way a delayed definition does.
+/// A plain `key -> value` entry hands its value back as it stands.
+pub fn assoc_entry_value(key: &Expr, value: &Expr) -> Expr {
+  match value {
+    Expr::RuleDelayed {
+      pattern,
+      replacement,
+    } if crate::syntax::assoc_marker_matches(key, pattern) => {
+      crate::evaluator::evaluate_expr_to_expr(replacement)
+        .unwrap_or_else(|_| replacement.as_ref().clone())
+    }
+    _ => value.clone(),
+  }
+}
+
+/// Whether an expression is a valid association entry: a single rule, a
+/// list of rules, or an association. Used by AssociationMap to decide when
+/// applying a function yields a result that can't form an association.
+fn is_valid_rule_result(expr: &Expr) -> bool {
+  match expr {
+    Expr::Rule { .. } | Expr::RuleDelayed { .. } | Expr::Association(_) => true,
+    Expr::List(items) => items
+      .iter()
+      .all(|e| matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. })),
+    _ => false,
+  }
+}
+
+/// Emit `<F>::<tag>: The argument <subject> is not a valid <what>.` and
+/// build the unevaluated call, matching wolframscript's message family
+/// for association functions applied to invalid subjects.
+fn invalid_subject_message(
+  fname: &str,
+  tag: &str,
+  what: &str,
+  subject: &Expr,
+  args: &[Expr],
+) -> Expr {
+  crate::emit_message(&format!(
+    "{}::{}: The argument {} is not a valid {}.",
+    fname,
+    tag,
+    crate::syntax::format_expr(subject, crate::syntax::ExprForm::Output),
+    what
+  ));
+  unevaluated(fname, args)
+}
+
+/// Helper to extract key from a rule expression
+fn extract_rule_key(expr: &Expr) -> Option<Expr> {
+  match expr {
+    Expr::Rule { pattern, .. } => Some(*pattern.clone()),
+    Expr::RuleDelayed { pattern, .. } => Some(*pattern.clone()),
+    Expr::FunctionCall { name, args }
+      if (name == "Rule" || name == "RuleDelayed") && args.len() == 2 =>
+    {
+      Some(args[0].clone())
+    }
+    _ => None,
+  }
+}
+
+/// Helper to extract value from a rule expression
+fn extract_rule_value(expr: &Expr) -> Option<Expr> {
+  match expr {
+    Expr::Rule { replacement, .. } => Some(*replacement.clone()),
+    Expr::RuleDelayed { replacement, .. } => Some(*replacement.clone()),
+    Expr::FunctionCall { name, args }
+      if (name == "Rule" || name == "RuleDelayed") && args.len() == 2 =>
+    {
+      Some(args[1].clone())
+    }
+    _ => None,
+  }
+}
+
+/// Recursively extract keys from an expression (handles nested lists/associations)
+fn keys_recursive(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Association(items) => {
+      let keys: Vec<Expr> = items.iter().map(|(k, _)| k.clone()).collect();
+      Expr::List(keys.into())
+    }
+    Expr::List(items) => {
+      let results: Vec<Expr> = items
+        .iter()
+        .map(|item| {
+          if let Some(k) = extract_rule_key(item) {
+            k
+          } else {
+            // Recurse into nested structures
+            keys_recursive(item)
+          }
+        })
+        .collect();
+      Expr::List(results.into())
+    }
+    _ => expr.clone(),
+  }
+}
+
+/// Recursively extract values from an expression (handles nested lists/associations)
+fn values_recursive(expr: &Expr) -> Expr {
+  match expr {
+    Expr::Association(items) => {
+      let values: Vec<Expr> = items.iter().map(|(_, v)| v.clone()).collect();
+      Expr::List(values.into())
+    }
+    Expr::List(items) => {
+      let results: Vec<Expr> = items
+        .iter()
+        .map(|item| {
+          if let Some(v) = extract_rule_value(item) {
+            v
+          } else {
+            // Recurse into nested structures
+            values_recursive(item)
+          }
+        })
+        .collect();
+      Expr::List(results.into())
+    }
+    _ => expr.clone(),
+  }
+}
+
+/// Keys[assoc] - Returns a list of keys from an association or list of rules
+/// Apply an optional head `h` to a single extracted key/value leaf, wrapping it
+/// as `h[leaf]` and evaluating. With no head the leaf is returned unchanged.
+fn apply_optional_head(
+  head: Option<&Expr>,
+  leaf: Expr,
+) -> Result<Expr, InterpreterError> {
+  match head {
+    None => Ok(leaf),
+    Some(Expr::Identifier(name)) => {
+      crate::evaluator::evaluate_expr_to_expr(&Expr::FunctionCall {
+        name: name.clone(),
+        args: vec![leaf].into(),
+      })
+    }
+    Some(h) => crate::evaluator::evaluate_expr_to_expr(&Expr::CurriedCall {
+      func: Box::new(h.clone()),
+      args: vec![leaf],
+    }),
+  }
+}
+
+/// Wrap every leaf of a (possibly nested) extraction result with `head`,
+/// preserving the list nesting produced by `keys_recursive`/`values_recursive`.
+fn wrap_leaves(
+  expr: Expr,
+  head: Option<&Expr>,
+) -> Result<Expr, InterpreterError> {
+  if head.is_none() {
+    return Ok(expr);
+  }
+  if let Expr::List(items) = &expr {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+      out.push(wrap_leaves(item.clone(), head)?);
+    }
+    return Ok(Expr::List(out.into()));
+  }
+  apply_optional_head(head, expr)
+}
+
+/// `Keys`/`Values` of a Dataset act on the wrapped data and hand back a
+/// Dataset, so `Keys[Dataset[{<|a -> 1|>, …}]]` gives the row keys. Returns
+/// `None` when the subject is not a Dataset, or when the inner call does not
+/// reduce (then the ordinary error path reports on the Dataset itself).
+fn try_dataset_subject(
+  head: &str,
+  args: &[Expr],
+) -> Result<Option<Expr>, InterpreterError> {
+  let Some(Expr::FunctionCall { name, args: ds }) = args.first() else {
+    return Ok(None);
+  };
+  if name != "Dataset" || ds.len() != 3 {
+    return Ok(None);
+  }
+  let mut inner = vec![ds[0].clone()];
+  inner.extend(args[1..].iter().cloned());
+  let result = crate::evaluator::evaluate_expr_to_expr(&call(head, inner))?;
+  if matches!(&result, Expr::FunctionCall { name, .. } if name == head) {
+    return Ok(None);
+  }
+  Ok(Some(crate::functions::dataset_ast::dataset_ast(
+    std::slice::from_ref(&result),
+  )))
+}
+
+pub fn keys_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Keys expects 1 or 2 arguments".into(),
+    ));
+  }
+  // Optional second argument: a head wrapped around each key before evaluation.
+  let head = args.get(1);
+  if let Some(result) = try_dataset_subject("Keys", args)? {
+    return Ok(result);
+  }
+  match &args[0] {
+    Expr::Association(items) => {
+      let mut keys = Vec::with_capacity(items.len());
+      for (k, _) in items {
+        keys.push(apply_optional_head(head, k.clone())?);
+      }
+      Ok(Expr::List(keys.into()))
+    }
+    Expr::List(_) => wrap_leaves(keys_recursive(&args[0]), head),
+    // Keys[k -> v] = k, Keys[k :> v] = k
+    Expr::Rule { pattern, .. } | Expr::RuleDelayed { pattern, .. } => {
+      apply_optional_head(head, pattern.as_ref().clone())
+    }
+    Expr::FunctionCall { name, args: rargs }
+      if (name == "Rule" || name == "RuleDelayed") && rargs.len() == 2 =>
+    {
+      apply_optional_head(head, rargs[0].clone())
+    }
+    _ => Ok(invalid_subject_message(
+      "Keys",
+      "invrl",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// Values[assoc] - Returns a list of values from an association or list of rules
+pub fn values_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Values expects 1 or 2 arguments".into(),
+    ));
+  }
+  // Optional second argument: a head wrapped around each value before evaluation.
+  let head = args.get(1);
+  if let Some(result) = try_dataset_subject("Values", args)? {
+    return Ok(result);
+  }
+  match &args[0] {
+    Expr::Association(items) => {
+      let mut values = Vec::with_capacity(items.len());
+      for (k, v) in items {
+        values.push(apply_optional_head(head, assoc_entry_value(k, v))?);
+      }
+      Ok(Expr::List(values.into()))
+    }
+    Expr::List(_) => wrap_leaves(values_recursive(&args[0]), head),
+    Expr::Rule { replacement, .. } | Expr::RuleDelayed { replacement, .. } => {
+      apply_optional_head(head, replacement.as_ref().clone())
+    }
+    Expr::FunctionCall { name, args: rargs }
+      if (name == "Rule" || name == "RuleDelayed") && rargs.len() == 2 =>
+    {
+      apply_optional_head(head, rargs[1].clone())
+    }
+    _ => Ok(invalid_subject_message(
+      "Values",
+      "invrl",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// KeyDropFrom[assoc, key] - Returns a new association with the specified key dropped
+pub fn key_drop_from_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyDropFrom expects exactly 2 arguments".into(),
+    ));
+  }
+  let key_str = expr_to_string(&args[1]);
+  // Compare keys structurally: a string key ("a") must NOT match a symbol
+  // key (a), matching wolframscript (and Woxi's part-access path).
+  let key_cmp = key_str.as_str();
+
+  match &args[0] {
+    Expr::Association(items) => {
+      let filtered: Vec<(Expr, Expr)> = items
+        .iter()
+        .filter(|(k, _)| {
+          let k_str = expr_to_string(k);
+          let k_cmp = k_str.as_str();
+          k_cmp != key_cmp
+        })
+        .cloned()
+        .collect();
+      Ok(Expr::Association(filtered))
+    }
+    Expr::Identifier(sym) => {
+      crate::emit_message(&format!(
+        "KeyDropFrom::blnoval: The symbol {sym} at position 1 should have an immediate value defined."
+      ));
+      Ok(unevaluated("KeyDropFrom", args))
+    }
+    other => {
+      crate::emit_message(&format!(
+        "KeyDropFrom::rvalue: {} is not a variable with a value, so its value cannot be changed.",
+        crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+      ));
+      Ok(unevaluated("KeyDropFrom", args))
+    }
+  }
+}
+
+/// KeyExistsQ[assoc, key] - Returns True if key is present
+pub fn key_exists_q_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyExistsQ expects exactly 2 arguments".into(),
+    ));
+  }
+  let key_str = expr_to_string(&args[1]);
+  // Compare keys structurally: a string key ("a") must NOT match a symbol
+  // key (a), matching wolframscript (and Woxi's part-access path).
+  let key_cmp = key_str.as_str();
+
+  match &args[0] {
+    Expr::Association(items) => {
+      for (k, _) in items {
+        let k_str = expr_to_string(k);
+        let k_cmp = k_str.as_str();
+        if k_cmp == key_cmp {
+          return Ok(bool_expr(true));
+        }
+      }
+      Ok(bool_expr(false))
+    }
+    // A list of rules is also a valid subject.
+    Expr::List(items)
+      if items.iter().all(|e| extract_rule_key(e).is_some()) =>
+    {
+      for item in items {
+        if let Some(k) = extract_rule_key(item) {
+          let k_str = expr_to_string(&k);
+          if k_str.as_str() == key_cmp {
+            return Ok(bool_expr(true));
+          }
+        }
+      }
+      Ok(bool_expr(false))
+    }
+    other => {
+      // Unlike its siblings, KeyExistsQ answers False after the message.
+      invalid_subject_message(
+        "KeyExistsQ",
+        "invrl",
+        "Association or a list of rules",
+        other,
+        args,
+      );
+      Ok(bool_expr(false))
+    }
+  }
+}
+
+/// Lookup[assoc, key] - Returns the value for a key or Missing["KeyAbsent", key]
+pub fn lookup_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() < 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Lookup expects at least 2 arguments".into(),
+    ));
+  }
+
+  match &args[0] {
+    Expr::Association(items) => {
+      // A list of keys looks each one up — once: a key that is itself a
+      // list (`{"c", 3}`) is one key, not a list of keys to thread over.
+      if let Expr::List(keys) = &args[1] {
+        let results: Vec<Expr> = keys
+          .iter()
+          .map(|key| lookup_key(items, key, args.get(2)))
+          .collect();
+        return Ok(Expr::List(results.into()));
+      }
+      Ok(lookup_key(items, &args[1], args.get(2)))
+    }
+    Expr::List(items) => {
+      // Thread Lookup over a list of associations
+      let results: Result<Vec<Expr>, InterpreterError> = items
+        .iter()
+        .map(|item| {
+          let mut new_args = vec![item.clone()];
+          new_args.extend(args[1..].iter().cloned());
+          lookup_ast(&new_args)
+        })
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    _ => Ok(invalid_subject_message(
+      "Lookup",
+      "invrl",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// The value stored under `key`, the given default when there is none, and
+/// `Missing["KeyAbsent", key]` without one. Keys compare structurally: a
+/// string key `"a"` does not match a symbol key `a`, matching wolframscript
+/// (and Woxi's part-access path).
+fn lookup_key(
+  items: &[(Expr, Expr)],
+  key: &Expr,
+  default: Option<&Expr>,
+) -> Expr {
+  let key_str = expr_to_string(key);
+  for (k, v) in items {
+    if expr_to_string(k) == key_str {
+      return assoc_entry_value(k, v);
+    }
+  }
+  match default {
+    Some(d) => d.clone(),
+    None => call(
+      "Missing",
+      vec![Expr::String("KeyAbsent".to_string()), key.clone()],
+    ),
+  }
+}
+
+/// KeySort[assoc] - Sorts an association by its keys
+/// `KeySort[assoc]` orders the entries by key canonically; `KeySort[assoc, p]`
+/// orders them by the comparison function `p` applied to the keys.
+pub fn key_sort_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeySort expects 1 or 2 arguments".into(),
+    ));
+  }
+
+  match &args[0] {
+    Expr::Association(items) => {
+      let mut sorted = items.clone();
+      match args.get(1) {
+        Some(p) => sorted.sort_by(|a, b| {
+          crate::functions::list_helpers_ast::comparator_cmp(p, &a.0, &b.0)
+        }),
+        None => sorted.sort_by(|a, b| {
+          let ka = expr_to_string(&a.0);
+          let kb = expr_to_string(&b.0);
+          if let (Ok(na), Ok(nb)) = (ka.parse::<f64>(), kb.parse::<f64>()) {
+            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+          } else {
+            ka.cmp(&kb)
+          }
+        }),
+      }
+      Ok(Expr::Association(sorted))
+    }
+    _ => Ok(invalid_subject_message(
+      "KeySort",
+      "invrl",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// AssociationMap[f, assoc] - Maps f over each rule in the association
+/// AssociationMap[f, <|a -> 1, b -> 2|>] applies f to each Rule
+pub fn association_map_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "AssociationMap expects exactly 2 arguments".into(),
+    ));
+  }
+
+  let func = &args[0];
+
+  match &args[1] {
+    Expr::Association(items) => {
+      // Apply f once to each key -> value rule.
+      let mut applied: Vec<(Expr, Expr)> = Vec::new(); // (rule, f[rule])
+      for (key, value) in items {
+        let rule = Expr::Rule {
+          pattern: Box::new(key.clone()),
+          replacement: Box::new(value.clone()),
+        };
+        let result = crate::evaluator::apply_function_to_arg(func, &rule)?;
+        applied.push((rule, result));
+      }
+      // If every result is a plain rule, build the association directly.
+      if applied
+        .iter()
+        .all(|(_, r)| matches!(r, Expr::Rule { .. } | Expr::RuleDelayed { .. }))
+      {
+        let new_items: Vec<(Expr, Expr)> = applied
+          .iter()
+          .map(|(_, r)| match r {
+            Expr::Rule {
+              pattern,
+              replacement,
+            }
+            | Expr::RuleDelayed {
+              pattern,
+              replacement,
+            } => ((**pattern).clone(), (**replacement).clone()),
+            _ => unreachable!(),
+          })
+          .collect();
+        return Ok(Expr::Association(new_items));
+      }
+      // Otherwise the results don't form a valid association: emit
+      // AssociationMap::invrlf for each invalid result (matching
+      // wolframscript) and keep the unevaluated `Association[f[…], …]`.
+      let func_str =
+        crate::syntax::format_expr(func, crate::syntax::ExprForm::Output);
+      for (rule, result) in &applied {
+        if !is_valid_rule_result(result) {
+          crate::emit_message(&format!(
+            "AssociationMap::invrlf: Applying {} to {} yields {}, which is not a valid rule, list of rules or association.",
+            func_str,
+            crate::syntax::format_expr(rule, crate::syntax::ExprForm::Output),
+            crate::syntax::format_expr(result, crate::syntax::ExprForm::Output),
+          ));
+        }
+      }
+      Ok(Expr::FunctionCall {
+        name: "Association".to_string(),
+        args: applied
+          .into_iter()
+          .map(|(_, r)| r)
+          .collect::<Vec<_>>()
+          .into(),
+      })
+    }
+    Expr::List(items) => {
+      // AssociationMap[f, {e1, e2, ...}] creates <|e1 -> f[e1], e2 -> f[e2], ...|>
+      let mut new_items = Vec::new();
+      for item in items {
+        let result = crate::evaluator::apply_function_to_arg(func, item)?;
+        new_items.push((item.clone(), result));
+      }
+      Ok(Expr::Association(new_items))
+    }
+    _ => Ok(invalid_subject_message(
+      "AssociationMap",
+      "invrp",
+      "Association or a list",
+      &args[1],
+      args,
+    )),
+  }
+}
+
+/// AssociationThread[keys, values] - Creates an association from lists of keys and values
+/// AssociationThread[keys -> values] - Rule form
+pub fn association_thread_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let (keys_expr, values_expr) = if args.len() == 2 {
+    (&args[0], &args[1])
+  } else if args.len() == 1 {
+    // Rule form: AssociationThread[{keys} -> {values}]
+    match &args[0] {
+      Expr::Rule {
+        pattern,
+        replacement,
+      } => (pattern.as_ref(), replacement.as_ref()),
+      _ => {
+        return Err(InterpreterError::EvaluationError(
+          "AssociationThread expects a rule or two arguments".into(),
+        ));
+      }
+    }
+  } else {
+    return Err(InterpreterError::EvaluationError(
+      "AssociationThread expects 1 or 2 arguments".into(),
+    ));
+  };
+
+  let keys = match keys_expr {
+    Expr::List(items) => items.clone(),
+    // A key specification that is not a list is left for someone else to
+    // make sense of rather than aborting the evaluation.
+    _ => return Ok(unevaluated("AssociationThread", args)),
+  };
+  // A single value is shared by every key, so
+  // `AssociationThread[{1, 2}, 3]` is `<|1 -> 3, 2 -> 3|>`.
+  let values = match values_expr {
+    Expr::List(items) => items.clone(),
+    scalar => vec![scalar.clone(); keys.len()].into(),
+  };
+
+  if keys.len() != values.len() {
+    crate::emit_message(&format!(
+      "AssociationThread::idim: {} and {} must have the same length.",
+      crate::syntax::format_expr(keys_expr, crate::syntax::ExprForm::Output),
+      crate::syntax::format_expr(values_expr, crate::syntax::ExprForm::Output)
+    ));
+    return Ok(unevaluated("AssociationThread", args));
+  }
+
+  let items: Vec<(Expr, Expr)> = keys.into_iter().zip(values).collect();
+  Ok(Expr::Association(items))
+}
+
+/// Merge[{assoc1, assoc2, ...}, f] - Merges associations, applying f to conflicting values
+pub fn merge_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "Merge expects exactly 2 arguments".into(),
+    ));
+  }
+
+  let assocs = match &args[0] {
+    Expr::List(items) => items.clone(),
+    _ => {
+      return Ok(invalid_subject_message(
+        "Merge",
+        "list1",
+        "list of Associations or rules or lists of rules",
+        &args[0],
+        args,
+      ));
+    }
+  };
+  let func = &args[1];
+
+  // Collect all key-value pairs, grouping values by key
+  let mut key_values: Vec<(String, Expr, Vec<Expr>)> = Vec::new(); // (key_str, key_expr, values)
+
+  // Each element may be an Association, a single rule (`k -> v`), or a list
+  // of rules. Collect the (key, value) pairs from all of them, preserving
+  // first-seen key order. wolframscript accepts all three shapes.
+  let push_pair = |key_values: &mut Vec<(String, Expr, Vec<Expr>)>,
+                   k: &Expr,
+                   v: &Expr| {
+    let k_str = expr_to_string(k);
+    if let Some(entry) = key_values.iter_mut().find(|(ks, _, _)| *ks == k_str) {
+      entry.2.push(v.clone());
+    } else {
+      key_values.push((k_str, k.clone(), vec![v.clone()]));
+    }
+  };
+
+  fn rule_parts(item: &Expr) -> Option<(&Expr, &Expr)> {
+    match item {
+      Expr::Rule {
+        pattern,
+        replacement,
+      }
+      | Expr::RuleDelayed {
+        pattern,
+        replacement,
+      } => Some((pattern, replacement)),
+      _ => None,
+    }
+  }
+
+  for item in &assocs {
+    match item {
+      Expr::Association(items) => {
+        for (k, v) in items {
+          push_pair(&mut key_values, k, v);
+        }
+      }
+      _ if rule_parts(item).is_some() => {
+        let (k, v) = rule_parts(item).unwrap();
+        push_pair(&mut key_values, k, v);
+      }
+      Expr::List(items) if items.iter().all(|i| rule_parts(i).is_some()) => {
+        for i in items {
+          let (k, v) = rule_parts(i).unwrap();
+          push_pair(&mut key_values, k, v);
+        }
+      }
+      other => {
+        crate::emit_message(&format!(
+          "Merge::list1: The argument {} is not a valid list of \
+           Associations or rules or lists of rules.",
+          crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+        ));
+        return Ok(unevaluated("Merge", args));
+      }
+    }
+  }
+
+  // Apply the merge function to each group of values
+  let mut result = Vec::new();
+  for (_, key_expr, values) in key_values {
+    let merged_value = crate::evaluator::apply_function_to_arg(
+      func,
+      &Expr::List(values.into()),
+    )?;
+    result.push((key_expr, merged_value));
+  }
+
+  Ok(Expr::Association(result))
+}
+
+/// KeyMap[f, assoc] - Maps f over the keys of an association
+pub fn key_map_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyMap expects exactly 2 arguments".into(),
+    ));
+  }
+
+  let func = &args[0];
+
+  match &args[1] {
+    Expr::Association(items) => {
+      let results: Result<Vec<(Expr, Expr)>, InterpreterError> = items
+        .iter()
+        .map(|(k, v)| {
+          let new_key = crate::evaluator::apply_function_to_arg(func, k)?;
+          Ok((new_key, v.clone()))
+        })
+        .collect();
+      Ok(Expr::Association(results?))
+    }
+    _ => Ok(invalid_subject_message(
+      "KeyMap",
+      "invak",
+      "Association",
+      &args[1],
+      args,
+    )),
+  }
+}
+
+/// KeySelect[assoc, f] - Selects entries where f[key] returns True
+pub fn key_select_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeySelect expects exactly 2 arguments".into(),
+    ));
+  }
+
+  let func = &args[1];
+
+  match &args[0] {
+    Expr::Association(items) => {
+      let mut result = Vec::new();
+      for (k, v) in items {
+        let test = crate::evaluator::apply_function_to_arg(func, k)?;
+        if matches!(&test, Expr::Identifier(s) if s == "True") {
+          result.push((k.clone(), v.clone()));
+        }
+      }
+      Ok(Expr::Association(result))
+    }
+    _ => Ok(invalid_subject_message(
+      "KeySelect",
+      "invru",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// KeyTake[assoc, keys] - Takes only the specified keys
+pub fn key_take_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyTake expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // Keys compare structurally (a string key "a" must not match a symbol a).
+  let keep_keys: Vec<String> = match &args[1] {
+    Expr::List(items) => items.iter().map(expr_to_string).collect(),
+    other => vec![expr_to_string(other)],
+  };
+
+  match &args[0] {
+    Expr::Association(items) => {
+      let mut result = Vec::new();
+      for desired_key in &keep_keys {
+        for (k, v) in items {
+          let k_str = expr_to_string(k);
+          let k_cmp = k_str.as_str();
+          if k_cmp == desired_key {
+            result.push((k.clone(), v.clone()));
+            break;
+          }
+        }
+      }
+      Ok(Expr::Association(result))
+    }
+    _ => Ok(invalid_subject_message(
+      "KeyTake",
+      "invrl",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// KeyDrop[assoc, keys] - Drops the specified keys
+pub fn key_drop_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyDrop expects exactly 2 arguments".into(),
+    ));
+  }
+
+  // Keys compare structurally (a string key "a" must not match a symbol a).
+  let drop_keys: Vec<String> = match &args[1] {
+    Expr::List(items) => items.iter().map(expr_to_string).collect(),
+    other => vec![expr_to_string(other)],
+  };
+
+  match &args[0] {
+    Expr::Association(items) => {
+      let result: Vec<(Expr, Expr)> = items
+        .iter()
+        .filter(|(k, _)| {
+          let k_str = expr_to_string(k);
+          let k_cmp = k_str.as_str();
+          !drop_keys.iter().any(|dk| dk == k_cmp)
+        })
+        .cloned()
+        .collect();
+      Ok(Expr::Association(result))
+    }
+    _ => Ok(invalid_subject_message(
+      "KeyDrop",
+      "invrl",
+      "Association or a list of rules",
+      &args[0],
+      args,
+    )),
+  }
+}
+
+/// KeyValueMap[f, assoc] - Maps a function over key-value pairs, returning a list
+/// KeyValueMap[f, <|a -> 1, b -> 2|>] -> {f[a, 1], f[b, 2]}
+pub fn key_value_map_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyValueMap expects exactly 2 arguments".into(),
+    ));
+  }
+
+  let func = &args[0];
+
+  match &args[1] {
+    Expr::Association(items) => {
+      let results: Result<Vec<Expr>, InterpreterError> = items
+        .iter()
+        .map(|(key, value)| match func {
+          Expr::Identifier(name) if name == "List" => {
+            Ok(Expr::List(vec![key.clone(), value.clone()].into()))
+          }
+          Expr::Identifier(name) => {
+            crate::evaluator::evaluate_function_call_ast(
+              name,
+              &[key.clone(), value.clone()],
+            )
+          }
+          Expr::Function { body } => {
+            let substituted = crate::syntax::substitute_slots(
+              body,
+              &[key.clone(), value.clone()],
+            );
+            crate::evaluator::evaluate_expr_to_expr(&substituted)
+          }
+          Expr::NamedFunction { params, body, .. } => {
+            let mut substituted = (**body).clone();
+            let args_vec = [&key, &value];
+            for (param, arg) in params.iter().zip(args_vec.iter()) {
+              substituted =
+                crate::syntax::substitute_variable(&substituted, param, arg);
+            }
+            crate::evaluator::evaluate_expr_to_expr(&substituted)
+          }
+          Expr::FunctionCall { name, args: fargs } => {
+            let mut new_args = fargs.clone();
+            new_args.push(key.clone());
+            new_args.push(value.clone());
+            crate::evaluator::evaluate_function_call_ast(name, &new_args)
+          }
+          _ => Ok(call(
+            "KeyValueMap",
+            vec![func.clone(), Expr::Association(items.clone())],
+          )),
+        })
+        .collect();
+      Ok(Expr::List(results?.into()))
+    }
+    _ => Ok(invalid_subject_message(
+      "KeyValueMap",
+      "invak",
+      "Association",
+      &args[1],
+      args,
+    )),
+  }
+}
+
+// ─── KeyUnion ───────────────────────────────────────────────────────
+
+/// KeyUnion[{assoc1, assoc2, ...}] - extends each association with Missing values
+/// for keys that appear in other associations but not in that one.
+/// KeyUnion[{assoc1, assoc2, ...}, f] - uses f[key] instead of Missing[KeyAbsent, key].
+pub fn key_union_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.is_empty() || args.len() > 2 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyUnion expects 1 or 2 arguments".into(),
+    ));
+  }
+
+  let Expr::List(assocs) = &args[0] else {
+    return Ok(invalid_subject_message(
+      "KeyUnion",
+      "invar",
+      "list of Associations or rules",
+      &args[0],
+      args,
+    ));
+  };
+
+  let default_fn = if args.len() >= 2 {
+    Some(&args[1])
+  } else {
+    None
+  };
+
+  // Extract all associations as Vec<Vec<(key, value)>>
+  let mut all_assocs: Vec<Vec<(Expr, Expr)>> = Vec::new();
+  for assoc in assocs {
+    match assoc {
+      Expr::Association(items) => {
+        all_assocs.push(items.clone());
+      }
+      other => {
+        crate::emit_message(&format!(
+          "KeyUnion::invas: The argument {} is not a valid Association or \
+           rule.",
+          crate::syntax::format_expr(other, crate::syntax::ExprForm::Output)
+        ));
+        return Ok(unevaluated("KeyUnion", args));
+      }
+    }
+  }
+
+  // Collect all unique keys in order of first appearance
+  let mut all_keys: Vec<Expr> = Vec::new();
+  let mut seen_keys: Vec<String> = Vec::new();
+  for assoc in &all_assocs {
+    for (key, _) in assoc {
+      let key_str = expr_to_string(key);
+      if !seen_keys.contains(&key_str) {
+        seen_keys.push(key_str);
+        all_keys.push(key.clone());
+      }
+    }
+  }
+
+  // Build result: for each association, include all keys
+  let mut result = Vec::new();
+  for assoc in &all_assocs {
+    let mut new_items: Vec<(Expr, Expr)> = Vec::new();
+    for key in &all_keys {
+      let key_str = expr_to_string(key);
+      let value = assoc
+        .iter()
+        .find(|(k, _)| expr_to_string(k) == key_str)
+        .map(|(_, v)| v.clone());
+      if let Some(v) = value {
+        new_items.push((key.clone(), v));
+      } else {
+        let missing = match default_fn {
+          Some(func) => {
+            let call = Expr::FunctionCall {
+              name: expr_to_string(func),
+              args: vec![key.clone()].into(),
+            };
+            crate::evaluator::evaluate_expr_to_expr(&call)?
+          }
+          None => call(
+            "Missing",
+            vec![Expr::String("KeyAbsent".to_string()), key.clone()],
+          ),
+        };
+        new_items.push((key.clone(), missing));
+      }
+    }
+    result.push(Expr::Association(new_items));
+  }
+
+  Ok(Expr::List(result.into()))
+}
+
+/// Extract the inner associations from a `KeyComplement`/`KeyIntersection`
+/// argument: a single list of associations. Returns the `::invar` message form
+/// when the argument is not a list of associations.
+fn key_set_op_assocs(
+  fname: &str,
+  args: &[Expr],
+) -> Result<Vec<Vec<(Expr, Expr)>>, Expr> {
+  let Expr::List(assocs) = &args[0] else {
+    return Err(invalid_subject_message(
+      fname,
+      "invar",
+      "list of Associations or rules",
+      &args[0],
+      args,
+    ));
+  };
+  let mut all_assocs: Vec<Vec<(Expr, Expr)>> = Vec::new();
+  for assoc in assocs {
+    match assoc {
+      Expr::Association(items) => all_assocs.push(items.clone()),
+      _ => {
+        return Err(invalid_subject_message(
+          fname,
+          "invar",
+          "list of Associations or rules",
+          &args[0],
+          args,
+        ));
+      }
+    }
+  }
+  Ok(all_assocs)
+}
+
+/// KeyIntersection[{assoc1, assoc2, ...}] restricts every association to the
+/// keys common to all of them. The common keys are ordered as they appear in
+/// the first association, and each result keeps that association's own values.
+pub fn key_intersection_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyIntersection expects 1 argument".into(),
+    ));
+  }
+  let all_assocs = match key_set_op_assocs("KeyIntersection", args) {
+    Ok(a) => a,
+    Err(e) => return Ok(e),
+  };
+  if all_assocs.is_empty() {
+    return Ok(Expr::List(vec![].into()));
+  }
+
+  // Common keys, ordered by the first association.
+  let common_keys: Vec<Expr> = all_assocs[0]
+    .iter()
+    .map(|(k, _)| k.clone())
+    .filter(|k| {
+      let ks = expr_to_string(k);
+      all_assocs[1..]
+        .iter()
+        .all(|a| a.iter().any(|(k2, _)| expr_to_string(k2) == ks))
+    })
+    .collect();
+
+  let result: Vec<Expr> = all_assocs
+    .iter()
+    .map(|assoc| {
+      let items: Vec<(Expr, Expr)> = common_keys
+        .iter()
+        .map(|k| {
+          let ks = expr_to_string(k);
+          let v = assoc
+            .iter()
+            .find(|(k2, _)| expr_to_string(k2) == ks)
+            .map(|(_, v)| v.clone())
+            .unwrap();
+          (k.clone(), v)
+        })
+        .collect();
+      Expr::Association(items)
+    })
+    .collect();
+
+  Ok(Expr::List(result.into()))
+}
+
+/// KeyComplement[{assoc1, assoc2, ...}] returns the first association
+/// restricted to the keys that appear in none of the others, keeping the first
+/// association's order and values.
+pub fn key_complement_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "KeyComplement expects 1 argument".into(),
+    ));
+  }
+  let all_assocs = match key_set_op_assocs("KeyComplement", args) {
+    Ok(a) => a,
+    Err(e) => return Ok(e),
+  };
+  if all_assocs.is_empty() {
+    return Ok(Expr::Association(vec![]));
+  }
+
+  let other_keys: Vec<String> = all_assocs[1..]
+    .iter()
+    .flat_map(|a| a.iter().map(|(k, _)| expr_to_string(k)))
+    .collect();
+
+  let items: Vec<(Expr, Expr)> = all_assocs[0]
+    .iter()
+    .filter(|(k, _)| !other_keys.contains(&expr_to_string(k)))
+    .cloned()
+    .collect();
+
+  Ok(Expr::Association(items))
+}

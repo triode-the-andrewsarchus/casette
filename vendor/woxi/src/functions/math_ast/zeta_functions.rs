@@ -1,0 +1,2192 @@
+#[allow(unused_imports)]
+use super::*;
+
+/// Check if an expression contains any float-valued components (Real or BigFloat).
+fn contains_float(expr: &Expr) -> bool {
+  match expr {
+    Expr::Real(_) | Expr::BigFloat(_, _) => true,
+    Expr::BinaryOp { left, right, .. } => {
+      contains_float(left) || contains_float(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_float(operand),
+    Expr::FunctionCall { args, .. } => args.iter().any(contains_float),
+    Expr::List(items) => items.iter().any(contains_float),
+    _ => false,
+  }
+}
+
+/// Zeta[s] - Riemann zeta function
+/// Zeta[s, a] - Hurwitz zeta function
+pub fn zeta_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() == 2 {
+    return hurwitz_zeta_ast_inner(&args[0], &args[1], args);
+  }
+
+  // Zeta[ZetaZero[k]] = 0 (by definition of the non-trivial zeros), but only
+  // when k is a concrete positive integer. For symbolic k, Wolfram leaves
+  // Zeta[ZetaZero[k]] unevaluated. Zeta[ZetaZero[k, t]] = 0 still holds even
+  // for symbolic k because the second argument fixes a unique zero.
+  if let Expr::FunctionCall {
+    name,
+    args: zz_args,
+  } = &args[0]
+    && name == "ZetaZero"
+  {
+    let k_is_pos_int =
+      matches!(zz_args.first(), Some(Expr::Integer(n)) if *n > 0);
+    if zz_args.len() >= 2 || k_is_pos_int {
+      return Ok(Expr::Integer(0));
+    }
+  }
+
+  // Limits: as s -> +Infinity the series collapses to its first term, so
+  // Zeta[Infinity] = 1; an undirected ComplexInfinity is Indeterminate.
+  // Zeta[-Infinity] stays unevaluated (matching wolframscript).
+  match &args[0] {
+    Expr::Identifier(s) if s == "Infinity" => return Ok(Expr::Integer(1)),
+    Expr::Identifier(s) if s == "ComplexInfinity" => {
+      return Ok(id_expr("Indeterminate"));
+    }
+    _ => {}
+  }
+
+  match &args[0] {
+    Expr::Integer(n) => {
+      let n = *n;
+      if n == 1 {
+        // Zeta[1] = ComplexInfinity (pole)
+        return Ok(id_expr("ComplexInfinity"));
+      }
+      if n == 0 {
+        // Zeta[0] = -1/2
+        return Ok(make_rational(-1, 2));
+      }
+      if n > 0 && n % 2 == 0 {
+        // Positive even integer: Zeta[2n] = |B_{2n}| * 2^{2n-1} * Pi^{2n} / (2n)!
+        if let Some(expr) = zeta_positive_even(n as usize) {
+          return Ok(expr);
+        }
+      }
+      if n < 0 {
+        let abs_n = (-n) as usize;
+        if abs_n.is_multiple_of(2) {
+          // Negative even integer: Zeta[-2k] = 0 (trivial zeros)
+          return Ok(Expr::Integer(0));
+        }
+        // Negative odd integer: Zeta[-n] = (-1)^n * B_{n+1} / (n+1)
+        if let Some(expr) = zeta_negative_odd(abs_n) {
+          return Ok(expr);
+        }
+      }
+      // Positive odd integer >= 3 or overflow: return unevaluated
+      Ok(unevaluated("Zeta", args))
+    }
+    Expr::Real(f) => {
+      // Zeta has a simple pole at s = 1: Zeta[1.] = ComplexInfinity (like the
+      // exact Zeta[1]), not a real Infinity.
+      if *f == 1.0 {
+        return Ok(id_expr("ComplexInfinity"));
+      }
+      // Numeric evaluation
+      let result = zeta_numeric(*f);
+      Ok(Expr::Real(result))
+    }
+    _ => {
+      // Only evaluate numerically if the argument contains float components
+      // (e.g., Zeta[0.5 + 3.0*I] evaluates, but Zeta[1/2 + 3*I] stays symbolic)
+      if contains_float(&args[0])
+        && let Some((re, im)) = try_extract_complex_float(&args[0])
+      {
+        if im == 0.0 {
+          return Ok(Expr::Real(zeta_numeric(re)));
+        }
+        let (res_re, res_im) = zeta_numeric_complex(re, im);
+        return Ok(build_complex_float_expr(res_re, res_im));
+      }
+      // Symbolic argument: return unevaluated
+      Ok(unevaluated("Zeta", args))
+    }
+  }
+}
+
+/// Hurwitz zeta function Zeta[s, a]
+/// HurwitzZeta[s, a] — the Hurwitz zeta function Sum_{k>=0} 1/(k+a)^s.
+///
+/// It coincides with the two-argument `Zeta[s, a]` everywhere except when `a`
+/// is a non-positive integer: there the defining sum has a pole at k = -a, so
+/// HurwitzZeta diverges (ComplexInfinity) for s > 0, whereas Wolfram's
+/// `Zeta[s, a]` uses an analytic continuation that stays finite. For s <= 0
+/// both reduce to the same Bernoulli-polynomial value, so we delegate to the
+/// existing two-argument Zeta evaluation in every non-pole case.
+pub fn hurwitz_zeta_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let unevaluated = || Ok(unevaluated("HurwitzZeta", args));
+  if args.len() != 2 {
+    return unevaluated();
+  }
+  let s = &args[0];
+  let a = &args[1];
+
+  // Pole: a non-positive integer with s > 0 makes the term 1/(k + a)^s at
+  // k = -a equal to 1/0^s = ComplexInfinity.
+  if let Expr::Integer(a_int) = a
+    && *a_int <= 0
+    && let Some(s_val) = expr_to_f64(s)
+    && s_val > 0.0
+  {
+    return Ok(id_expr("ComplexInfinity"));
+  }
+
+  // Otherwise HurwitzZeta agrees with the two-argument Zeta. Reuse it.
+  let result = zeta_ast(args)?;
+
+  // When Zeta could not simplify it returns the unevaluated head `Zeta[s, a]`;
+  // re-wrap that as HurwitzZeta to preserve the head.
+  if let Expr::FunctionCall { name, args: r } = &result
+    && name == "Zeta"
+    && r.len() == 2
+  {
+    return unevaluated();
+  }
+  Ok(result)
+}
+
+fn hurwitz_zeta_ast_inner(
+  s_expr: &Expr,
+  a_expr: &Expr,
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  // Zeta[s, 1] = Zeta[s]
+  if matches!(a_expr, Expr::Integer(1)) {
+    return zeta_ast(std::slice::from_ref(s_expr));
+  }
+
+  // Zeta[1, a] = ComplexInfinity (pole)
+  if matches!(s_expr, Expr::Integer(1)) {
+    return Ok(id_expr("ComplexInfinity"));
+  }
+
+  // Zeta[s, 1/2] = (-1 + 2^s) * Zeta[s] for all s
+  if matches!(
+    a_expr,
+    Expr::FunctionCall { name, args: rargs }
+      if name == "Rational" && rargs.len() == 2
+        && matches!(&rargs[0], Expr::Integer(1))
+        && matches!(&rargs[1], Expr::Integer(2))
+  ) {
+    // (-1 + 2^s) * Zeta[s]
+    let two_pow_s = pow2(Expr::Integer(2), s_expr.clone());
+    let factor = plus2(Expr::Integer(-1), two_pow_s);
+    let zeta_s = call1("Zeta", s_expr.clone());
+    // Evaluate the product so integer cases simplify fully
+    let product = times2(factor, zeta_s);
+    return crate::evaluator::evaluate_expr_to_expr(&product);
+  }
+
+  // Extract a as rational p/q if possible
+  let a_rational: Option<(i128, i128)> = match a_expr {
+    Expr::Integer(n) => Some((*n, 1)),
+    Expr::FunctionCall { name, args: rargs }
+      if name == "Rational" && rargs.len() == 2 =>
+    {
+      if let (Expr::Integer(p), Expr::Integer(q)) = (&rargs[0], &rargs[1]) {
+        Some((*p, *q))
+      } else {
+        None
+      }
+    }
+    _ => None,
+  };
+
+  // General rational a = p/q > 1 (non-integer): reduce to the fractional
+  // representative r in (0, 1] via the recurrence Zeta[s, a] = Zeta[s, a-1]
+  // - (a-1)^(-s). E.g. Zeta[s, 3/2] -> Zeta[s, 1/2] - (1/2)^(-s), and
+  // Zeta[s, 1/2] has a closed form, so the whole expression evaluates. For
+  // other fractional parts (1/3, 2/3, ...) the reduced base stays symbolic,
+  // matching wolframscript. Works for every s (the reduced base handles s).
+  if let Some((p, q)) = a_rational
+    && q >= 2
+    && p > q
+  {
+    let m = (p - 1) / q; // integer steps down to r in (0, 1]
+    let r_p = p - m * q; // reduced numerator, 1 <= r_p < q
+    let reduced_a = make_rational(r_p, q);
+    let base = hurwitz_zeta_ast_inner(
+      s_expr,
+      &reduced_a,
+      &[s_expr.clone(), reduced_a.clone()],
+    )?;
+    let neg_s = times2(Expr::Integer(-1), s_expr.clone());
+    // base - sum_{j=0}^{m-1} ((r_p + j*q)/q)^(-s)
+    let mut terms = vec![base];
+    for j in 0..m {
+      let term_a = make_rational(r_p + j * q, q);
+      let pow = pow2(term_a, neg_s.clone());
+      terms.push(times2(Expr::Integer(-1), pow));
+    }
+    let sum = call("Plus", terms);
+    return crate::evaluator::evaluate_expr_to_expr(&sum);
+  }
+
+  match s_expr {
+    Expr::Integer(s) => {
+      let s = *s;
+
+      // Zeta[0, a] = 1/2 - a
+      if s == 0 {
+        if let Some((p, q)) = a_rational {
+          // 1/2 - p/q = (q - 2p) / (2q)
+          if let Some(two_p) = 2_i128.checked_mul(p) {
+            let num = q - two_p;
+            let den = 2 * q;
+            return Ok(make_rational(num, den));
+          }
+        }
+        // Symbolic a: return unevaluated
+        return Ok(unevaluated("Zeta", args));
+      }
+
+      // Zeta[-n, a] for non-negative integer n: uses Bernoulli polynomials
+      // Zeta[-n, a] = -B_{n+1}(a) / (n+1)
+      if s < 0 {
+        if let Some((p, q)) = a_rational {
+          let abs_n = (-s) as usize;
+          if let Some((num, den)) =
+            bernoulli_polynomial_rational(abs_n + 1, p, q)
+          {
+            // -B_{n+1}(a) / (n+1)
+            let result_num = -num;
+            let result_den = den.checked_mul((abs_n + 1) as i128);
+            if let Some(result_den) = result_den {
+              return Ok(make_rational(result_num, result_den));
+            }
+          }
+        }
+        return Ok(unevaluated("Zeta", args));
+      }
+
+      // Positive integer s >= 2 with positive integer a:
+      // Zeta[s, n] = Zeta[s] - sum_{k=1}^{n-1} 1/k^s
+      if s >= 2
+        && let Some((a_int, 1)) = a_rational
+        && a_int >= 2
+      {
+        let zeta_s = zeta_ast(&[Expr::Integer(s)])?;
+        // Compute sum_{k=1}^{a-1} 1/k^s as exact rational
+        let mut sum_num: i128 = 0;
+        let mut sum_den: i128 = 1;
+        for k in 1..a_int {
+          // Add 1/k^s to sum
+          let k_pow = k.checked_pow(s as u32);
+          if let Some(k_pow) = k_pow {
+            // sum_num/sum_den + 1/k_pow
+            let new_num = sum_num
+              .checked_mul(k_pow)
+              .and_then(|v| v.checked_add(sum_den));
+            let new_den = sum_den.checked_mul(k_pow);
+            if let (Some(new_num), Some(new_den)) = (new_num, new_den) {
+              (sum_num, sum_den) = rat_reduce(new_num, new_den);
+            } else {
+              return Ok(unevaluated("Zeta", args));
+            }
+          } else {
+            return Ok(unevaluated("Zeta", args));
+          }
+        }
+        let sum_rational = make_rational(sum_num, sum_den);
+        return Ok(plus2(times2(Expr::Integer(-1), sum_rational), zeta_s));
+      }
+
+      // If a is a float, evaluate numerically
+      if let Some(a_f) = expr_to_f64(a_expr)
+        && contains_float(a_expr)
+      {
+        return Ok(Expr::Real(hurwitz_zeta_numeric(s as f64, a_f)));
+      }
+
+      // Return unevaluated
+      Ok(unevaluated("Zeta", args))
+    }
+    Expr::Real(s_f) => {
+      // Numeric evaluation
+      let s = *s_f;
+      match a_expr {
+        Expr::Real(a) => {
+          let result = hurwitz_zeta_numeric(s, *a);
+          Ok(Expr::Real(result))
+        }
+        Expr::Integer(a) => {
+          let result = hurwitz_zeta_numeric(s, *a as f64);
+          Ok(Expr::Real(result))
+        }
+        Expr::FunctionCall { name, args: rargs }
+          if name == "Rational" && rargs.len() == 2 =>
+        {
+          if let (Expr::Integer(p), Expr::Integer(q)) = (&rargs[0], &rargs[1]) {
+            let a = *p as f64 / *q as f64;
+            let result = hurwitz_zeta_numeric(s, a);
+            return Ok(Expr::Real(result));
+          }
+          Ok(unevaluated("Zeta", args))
+        }
+        _ => {
+          if contains_float(a_expr)
+            && let Some((re, _im)) = try_extract_complex_float(a_expr)
+          {
+            let result = hurwitz_zeta_numeric(s, re);
+            return Ok(Expr::Real(result));
+          }
+          Ok(unevaluated("Zeta", args))
+        }
+      }
+    }
+    _ => {
+      // Check for numeric float arguments
+      if (contains_float(s_expr) || contains_float(a_expr))
+        && let Some(s_f) = expr_to_f64(s_expr)
+        && let Some(a_f) = expr_to_f64(a_expr)
+      {
+        let result = hurwitz_zeta_numeric(s_f, a_f);
+        return Ok(Expr::Real(result));
+      }
+      Ok(unevaluated("Zeta", args))
+    }
+  }
+}
+
+/// Evaluate Bernoulli polynomial B_n(x) at rational x = p/q.
+/// Returns the result as (numerator, denominator) or None on overflow.
+fn bernoulli_polynomial_rational(
+  n: usize,
+  p: i128,
+  q: i128,
+) -> Option<(i128, i128)> {
+  // B_n(x) = sum_{k=0}^{n} C(n,k) * B_k * x^{n-k}
+  let (mut sum_num, mut sum_den) = (0i128, 1i128);
+
+  let mut binom: i128 = 1; // C(n, 0) = 1
+  for k in 0..=n {
+    if k > 0 {
+      binom = binom.checked_mul((n + 1 - k) as i128)? / (k as i128);
+    }
+    let (bk_num, bk_den) = bernoulli_number(k)?;
+    if bk_num == 0 {
+      continue;
+    }
+
+    // x^{n-k} = p^{n-k} / q^{n-k}
+    let exp = n - k;
+    let x_num = p.checked_pow(exp as u32)?;
+    let x_den = q.checked_pow(exp as u32)?;
+
+    // term = binom * B_k * x^{n-k}
+    let term_num = binom.checked_mul(bk_num)?.checked_mul(x_num)?;
+    let term_den = bk_den.checked_mul(x_den)?;
+
+    // sum += term
+    let new_num = sum_num
+      .checked_mul(term_den)?
+      .checked_add(term_num.checked_mul(sum_den)?)?;
+    let new_den = sum_den.checked_mul(term_den)?;
+    (sum_num, sum_den) = rat_reduce(new_num, new_den);
+  }
+
+  Some((sum_num, sum_den))
+}
+
+/// Numeric evaluation of the Hurwitz zeta function ζ(s, a)
+/// using Euler-Maclaurin summation.
+fn hurwitz_zeta_numeric(s: f64, a: f64) -> f64 {
+  if (s - 1.0).abs() < 1e-15 {
+    return f64::INFINITY;
+  }
+
+  // For s < 0.5, use the series representation directly with more terms
+  // since the reflection formula is more complex for Hurwitz zeta.
+  // For a = 1, reduce to Riemann zeta
+  if (a - 1.0).abs() < 1e-15 {
+    return zeta_numeric(s);
+  }
+
+  // Euler-Maclaurin summation for Hurwitz zeta
+  // ζ(s, a) = sum_{k=0}^{N-1} (k+a)^{-s} + (N+a)^{1-s}/(s-1)
+  //           + (N+a)^{-s}/2 + Bernoulli corrections
+  let n: usize = 30;
+  let nf = n as f64;
+
+  let mut sum = 0.0;
+  for k in 0..n {
+    let term = k as f64 + a;
+    if term > 0.0 {
+      sum += term.powf(-s);
+    }
+  }
+
+  let na = nf + a;
+  // Integral correction
+  sum += na.powf(1.0 - s) / (s - 1.0);
+  // Endpoint correction
+  sum += 0.5 * na.powf(-s);
+
+  // Bernoulli corrections
+  let bof: [f64; 10] = [
+    1.0 / 12.0,
+    -1.0 / 720.0,
+    1.0 / 30240.0,
+    -1.0 / 1209600.0,
+    1.0 / 47900160.0,
+    -691.0 / 1307674368000.0,
+    7.0 / 523069747200.0,
+    -3617.0 / 10670622842880000.0,
+    43867.0 / 5109094217170944000.0,
+    -174611.0 / 802857662698291200000.0,
+  ];
+
+  for (p_idx, &coeff) in bof.iter().enumerate() {
+    let two_p = 2 * (p_idx + 1);
+    let mut rising = 1.0;
+    for j in 0..(two_p - 1) {
+      rising *= s + j as f64;
+    }
+    sum += coeff * rising * na.powf(-(s + (two_p - 1) as f64));
+  }
+
+  sum
+}
+
+/// Try to extract a float value from an expression
+fn expr_to_f64(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Real(f) => Some(*f),
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::FunctionCall { name, args }
+      if name == "Rational" && args.len() == 2 =>
+    {
+      if let (Expr::Integer(p), Expr::Integer(q)) = (&args[0], &args[1]) {
+        Some(*p as f64 / *q as f64)
+      } else {
+        None
+      }
+    }
+    _ => {
+      if contains_float(expr) {
+        if let Some((re, _im)) = try_extract_complex_float(expr) {
+          Some(re)
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+/// Compute Bernoulli number B_n as (numerator, denominator).
+/// Returns None if overflow occurs during computation.
+pub fn bernoulli_number(n: usize) -> Option<(i128, i128)> {
+  if n == 0 {
+    return Some((1, 1));
+  }
+  if n == 1 {
+    return Some((-1, 2));
+  }
+  if n % 2 == 1 {
+    return Some((0, 1));
+  }
+
+  // Compute all even Bernoulli numbers up to B_n using the recurrence:
+  // B_m = -1/(m+1) * sum_{k=0}^{m-1} C(m+1, k) * B_k
+  let mut b: Vec<(i128, i128)> = vec![(0, 1); n + 1];
+  b[0] = (1, 1);
+  b[1] = (-1, 2);
+
+  for m in (2..=n).step_by(2) {
+    let mut sum_n: i128 = 0;
+    let mut sum_d: i128 = 1;
+    let mut binom: i128 = 1; // C(m+1, 0)
+
+    for k in 0..m {
+      if k > 0 {
+        // C(m+1, k) = C(m+1, k-1) * (m+2-k) / k
+        binom = binom.checked_mul((m + 2 - k) as i128)? / (k as i128);
+      }
+      let (bk_n, bk_d) = b[k];
+      if bk_n == 0 {
+        continue;
+      }
+
+      // Add binom * B_k to sum: sum_n/sum_d + binom*bk_n/bk_d
+      let term_n = binom.checked_mul(bk_n)?;
+      let term_d = bk_d;
+
+      let new_n = sum_n
+        .checked_mul(term_d)?
+        .checked_add(term_n.checked_mul(sum_d)?)?;
+      let new_d = sum_d.checked_mul(term_d)?;
+      (sum_n, sum_d) = rat_reduce(new_n, new_d);
+    }
+
+    // B_m = -sum / (m+1)
+    let bm_n = -sum_n;
+    let bm_d = sum_d.checked_mul((m + 1) as i128)?;
+    b[m] = rat_reduce(bm_n, bm_d);
+  }
+
+  Some(b[n])
+}
+
+/// Compute Zeta[2n] for positive even integer 2n.
+/// Returns the exact expression |B_{2n}| * 2^(2n-1) * Pi^(2n) / (2n)!
+fn zeta_positive_even(two_n: usize) -> Option<Expr> {
+  let (b_num, b_den) = bernoulli_number(two_n)?;
+  if b_num == 0 {
+    return None;
+  }
+
+  // Compute coefficient: |B_{2n}| * 2^(2n-1) / (2n)!
+  let mut num = b_num.abs();
+  let mut den = b_den.abs();
+
+  // Multiply by 2^(2n-1)
+  for _ in 0..(two_n - 1) {
+    num = num.checked_mul(2)?;
+    (num, den) = rat_reduce(num, den);
+  }
+
+  // Divide by (2n)!
+  for k in 1..=two_n {
+    den = den.checked_mul(k as i128)?;
+    (num, den) = rat_reduce(num, den);
+  }
+
+  // Build: num * Pi^(2n) / den
+  let pi_power = pow2(id_expr("Pi"), Expr::Integer(two_n as i128));
+
+  if num == 1 && den == 1 {
+    Some(pi_power)
+  } else if num == 1 {
+    Some(div2(pi_power, Expr::Integer(den)))
+  } else if den == 1 {
+    Some(times2(Expr::Integer(num), pi_power))
+  } else {
+    Some(div2(
+      times2(Expr::Integer(num), pi_power),
+      Expr::Integer(den),
+    ))
+  }
+}
+
+/// Compute Zeta[-n] for negative odd integer -n.
+/// Returns (-1)^n * B_{n+1} / (n+1)
+fn zeta_negative_odd(abs_n: usize) -> Option<Expr> {
+  let (b_num, b_den) = bernoulli_number(abs_n + 1)?;
+  // (-1)^n * B_{n+1} / (n+1)
+  let sign: i128 = if abs_n.is_multiple_of(2) { 1 } else { -1 };
+  let result_num = sign.checked_mul(b_num)?;
+  let result_den = b_den.checked_mul((abs_n + 1) as i128)?;
+  Some(make_rational(result_num, result_den))
+}
+
+/// Compute Zeta(s) numerically for real s using Euler-Maclaurin formula.
+pub fn zeta_numeric(s: f64) -> f64 {
+  use std::f64::consts::PI;
+
+  if (s - 1.0).abs() < 1e-15 {
+    return f64::INFINITY;
+  }
+
+  // Zeta[0] = -1/2. The reflection formula below would otherwise evaluate
+  // sin(0) * zeta(1) = 0 * Infinity = NaN at s = 0.
+  if s == 0.0 {
+    return -0.5;
+  }
+
+  // For s < 0.5, use the reflection formula:
+  // zeta(s) = 2^s * pi^(s-1) * sin(pi*s/2) * Gamma(1-s) * zeta(1-s)
+  if s < 0.5 {
+    return 2.0_f64.powf(s)
+      * PI.powf(s - 1.0)
+      * (PI * s / 2.0).sin()
+      * gamma_fn(1.0 - s)
+      * zeta_numeric(1.0 - s);
+  }
+
+  // For s >= 0.5, use Euler-Maclaurin summation
+  let n: usize = 20;
+  let nf = n as f64;
+
+  // Direct sum: sum_{k=1}^{N-1} k^{-s}
+  let mut sum = 0.0;
+  for k in 1..n {
+    sum += (k as f64).powf(-s);
+  }
+
+  // Integral correction: N^{1-s} / (s-1)
+  sum += nf.powf(1.0 - s) / (s - 1.0);
+  // Endpoint correction: N^{-s} / 2
+  sum += 0.5 * nf.powf(-s);
+
+  // Bernoulli corrections: B_{2p}/(2p)! * prod_{j=0}^{2p-2}(s+j) * N^{-(s+2p-1)}
+  let bof: [f64; 10] = [
+    1.0 / 12.0,                          // B_2/2!
+    -1.0 / 720.0,                        // B_4/4!
+    1.0 / 30240.0,                       // B_6/6!
+    -1.0 / 1209600.0,                    // B_8/8!
+    1.0 / 47900160.0,                    // B_10/10!
+    -691.0 / 1307674368000.0,            // B_12/12!
+    7.0 / 523069747200.0,                // B_14/14!
+    -3617.0 / 10670622842880000.0,       // B_16/16!
+    43867.0 / 5109094217170944000.0,     // B_18/18!
+    -174611.0 / 802857662698291200000.0, // B_20/20!
+  ];
+
+  for (p_idx, &coeff) in bof.iter().enumerate() {
+    let two_p = 2 * (p_idx + 1);
+    // Rising factorial: prod_{j=0}^{2p-2} (s+j)
+    let mut rising = 1.0;
+    for j in 0..(two_p - 1) {
+      rising *= s + j as f64;
+    }
+    sum += coeff * rising * nf.powf(-(s + (two_p - 1) as f64));
+  }
+
+  sum
+}
+
+// ─── Complex arithmetic helpers ──────────────────────────────────────
+
+pub(crate) fn cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+  (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+fn cdiv(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+  let d = b.0 * b.0 + b.1 * b.1;
+  ((a.0 * b.0 + a.1 * b.1) / d, (a.1 * b.0 - a.0 * b.1) / d)
+}
+
+fn cexp(z: (f64, f64)) -> (f64, f64) {
+  let mag = z.0.exp();
+  (mag * z.1.cos(), mag * z.1.sin())
+}
+
+fn cln(z: (f64, f64)) -> (f64, f64) {
+  let r = (z.0 * z.0 + z.1 * z.1).sqrt();
+  (r.ln(), z.1.atan2(z.0))
+}
+
+fn cpow(base: (f64, f64), exp: (f64, f64)) -> (f64, f64) {
+  if base.0 == 0.0 && base.1 == 0.0 {
+    return (0.0, 0.0);
+  }
+  cexp(cmul(exp, cln(base)))
+}
+
+fn csin(z: (f64, f64)) -> (f64, f64) {
+  (z.0.sin() * z.1.cosh(), z.0.cos() * z.1.sinh())
+}
+
+/// Complex Gamma function using the Lanczos approximation.
+pub fn gamma_complex(re: f64, im: f64) -> (f64, f64) {
+  // Reflection for Re(z) < 0.5
+  if re < 0.5 {
+    // Gamma(z) = pi / (sin(pi*z) * Gamma(1-z))
+    let sin_piz = csin((std::f64::consts::PI * re, std::f64::consts::PI * im));
+    let g1z = gamma_complex(1.0 - re, -im);
+    let prod = cmul(sin_piz, g1z);
+    return cdiv((std::f64::consts::PI, 0.0), prod);
+  }
+
+  // Lanczos approximation with g=7, n=9
+  const P: [f64; 9] = [
+    0.999_999_999_999_809_9,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.323_428_777_653_1,
+    -176.615_029_162_140_6,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.984_369_578_019_572e-6,
+    1.5056327351493116e-7,
+  ];
+
+  let z = (re - 1.0, im);
+  let mut x = (P[0], 0.0);
+  for i in 1..P.len() {
+    let denom = (z.0 + i as f64, z.1);
+    let term = cdiv((P[i], 0.0), denom);
+    x.0 += term.0;
+    x.1 += term.1;
+  }
+  let t = (z.0 + 7.5, z.1);
+  let sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt();
+  let pow = cpow(t, (z.0 + 0.5, z.1));
+  let exp_neg_t = cexp((-t.0, -t.1));
+  let r = cmul(cmul(pow, exp_neg_t), x);
+  (sqrt_2pi * r.0, sqrt_2pi * r.1)
+}
+
+/// Complex LogGamma function, matching Wolfram's analytic-continuation
+/// branch (continuous away from 0 and the negative real axis; in
+/// particular `LogGamma[z] − Log[Gamma[z]]` is a multiple of 2πi for z
+/// off the real axis).
+///
+/// Strategy: forward-shift z by enough to make Re(z+n) large, then apply
+/// the complex Stirling series. The recurrence
+/// `LogGamma(z) = LogGamma(z+1) − Log(z)` (with principal-branch Log)
+/// gives the correct continuation.
+pub fn log_gamma_complex(re: f64, im: f64) -> (f64, f64) {
+  use std::f64::consts::PI;
+  let log_2pi = (2.0 * PI).ln();
+  // Forward-shift to |z| ≳ 11 for Stirling accuracy. Skipping the shift
+  // when already large preserves precision for inputs like 12+3I.
+  let mut z = (re, im);
+  let mut acc_log = (0.0_f64, 0.0_f64);
+  while z.0 * z.0 + z.1 * z.1 < 121.0 || z.0 < 11.0 {
+    let lz = cln(z);
+    acc_log = (acc_log.0 + lz.0, acc_log.1 + lz.1);
+    z = (z.0 + 1.0, z.1);
+  }
+  // Stirling: (z - 1/2)*log(z) - z + log(2π)/2 + corrections
+  let lz = cln(z);
+  let z_half = (z.0 - 0.5, z.1);
+  let main = cmul(z_half, lz);
+  let mut result = (main.0 - z.0 + 0.5 * log_2pi, main.1 - z.1);
+  // Correction series in inverse powers of z
+  let inv_z = cdiv((1.0, 0.0), z);
+  let inv_z2 = cmul(inv_z, inv_z);
+  let mut term = inv_z;
+  // 1/(12 z)
+  result = (result.0 + term.0 / 12.0, result.1 + term.1 / 12.0);
+  term = cmul(term, inv_z2);
+  // -1/(360 z^3)
+  result = (result.0 - term.0 / 360.0, result.1 - term.1 / 360.0);
+  term = cmul(term, inv_z2);
+  // 1/(1260 z^5)
+  result = (result.0 + term.0 / 1260.0, result.1 + term.1 / 1260.0);
+  term = cmul(term, inv_z2);
+  // -1/(1680 z^7)
+  result = (result.0 - term.0 / 1680.0, result.1 - term.1 / 1680.0);
+  term = cmul(term, inv_z2);
+  // 1/(1188 z^9)
+  result = (result.0 + term.0 / 1188.0, result.1 + term.1 / 1188.0);
+  term = cmul(term, inv_z2);
+  // -691/(360360 z^11)
+  result = (
+    result.0 - 691.0 * term.0 / 360360.0,
+    result.1 - 691.0 * term.1 / 360360.0,
+  );
+  // Undo the recurrence shift: subtract sum of logs we accumulated.
+  (result.0 - acc_log.0, result.1 - acc_log.1)
+}
+
+/// Compute Zeta(s) numerically for complex s using Euler-Maclaurin formula
+/// with functional equation for Re(s) < 0.5.
+fn zeta_numeric_complex(s_re: f64, s_im: f64) -> (f64, f64) {
+  use std::f64::consts::PI;
+  let s = (s_re, s_im);
+
+  // Check for pole at s=1
+  if (s_re - 1.0).abs() < 1e-15 && s_im.abs() < 1e-15 {
+    return (f64::INFINITY, 0.0);
+  }
+
+  // For Re(s) < 0.5, use the reflection formula:
+  // zeta(s) = 2^s * pi^(s-1) * sin(pi*s/2) * Gamma(1-s) * zeta(1-s)
+  if s_re < 0.5 {
+    let two_s = cpow((2.0, 0.0), s);
+    let pi_s1 = cpow((PI, 0.0), (s_re - 1.0, s_im));
+    let sin_ps2 = csin((PI * s_re / 2.0, PI * s_im / 2.0));
+    let g = gamma_complex(1.0 - s_re, -s_im);
+    let z = zeta_numeric_complex(1.0 - s_re, -s_im);
+    let r = cmul(cmul(cmul(two_s, pi_s1), sin_ps2), cmul(g, z));
+    return r;
+  }
+
+  // Euler-Maclaurin summation for Re(s) >= 0.5
+  let n: usize = 30;
+  let nf = n as f64;
+
+  let mut sum = (0.0, 0.0);
+
+  // Direct sum: sum_{k=1}^{N-1} k^{-s}
+  for k in 1..n {
+    let term = cpow((k as f64, 0.0), (-s_re, -s_im));
+    sum.0 += term.0;
+    sum.1 += term.1;
+  }
+
+  // Integral correction: N^{1-s} / (s-1)
+  let n1s = cpow((nf, 0.0), (1.0 - s_re, -s_im));
+  let int_c = cdiv(n1s, (s_re - 1.0, s_im));
+  sum.0 += int_c.0;
+  sum.1 += int_c.1;
+
+  // Endpoint correction: N^{-s} / 2
+  let ns = cpow((nf, 0.0), (-s_re, -s_im));
+  sum.0 += 0.5 * ns.0;
+  sum.1 += 0.5 * ns.1;
+
+  // Bernoulli corrections
+  let bof: [f64; 10] = [
+    1.0 / 12.0,
+    -1.0 / 720.0,
+    1.0 / 30240.0,
+    -1.0 / 1209600.0,
+    1.0 / 47900160.0,
+    -691.0 / 1307674368000.0,
+    7.0 / 523069747200.0,
+    -3617.0 / 10670622842880000.0,
+    43867.0 / 5109094217170944000.0,
+    -174611.0 / 802857662698291200000.0,
+  ];
+
+  for (p_idx, &coeff) in bof.iter().enumerate() {
+    let two_p = 2 * (p_idx + 1);
+    // Rising factorial: prod_{j=0}^{2p-2} (s+j)
+    let mut rising = (1.0, 0.0);
+    for j in 0..(two_p - 1) {
+      rising = cmul(rising, (s_re + j as f64, s_im));
+    }
+    // N^(-(s + 2p-1))
+    let pow = cpow((nf, 0.0), (-(s_re + (two_p - 1) as f64), -s_im));
+    let term = cmul(rising, pow);
+    sum.0 += coeff * term.0;
+    sum.1 += coeff * term.1;
+  }
+
+  sum
+}
+
+/// PolyGamma[z] - digamma function (equivalent to PolyGamma[0, z])
+/// PolyGamma[n, z] - n-th derivative of the digamma function
+pub fn polygamma_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let (n_val, z_expr) = match args.len() {
+    1 => (0_i128, &args[0]),
+    2 => match &args[0] {
+      Expr::Integer(n) => (*n, &args[1]),
+      Expr::Real(f) => {
+        // Real n: evaluate numerically if z is also numeric
+        if let Some(z) = extract_f64(z_expr_from_args(&args[1])) {
+          return Ok(Expr::Real(polygamma_numeric(*f as usize, z)));
+        }
+        return Ok(unevaluated("PolyGamma", args));
+      }
+      _ => {
+        return Ok(unevaluated("PolyGamma", args));
+      }
+    },
+    _ => {
+      return Err(InterpreterError::EvaluationError(
+        "PolyGamma expects 1 or 2 arguments".into(),
+      ));
+    }
+  };
+
+  if n_val < 0 {
+    return Ok(unevaluated("PolyGamma", args));
+  }
+  let n = n_val as usize;
+
+  // Check for poles: z = 0 or negative integer
+  if let Expr::Integer(z) = z_expr
+    && *z <= 0
+  {
+    return Ok(id_expr("ComplexInfinity"));
+  }
+
+  match z_expr {
+    Expr::Integer(z) if *z > 0 => {
+      let z = *z as usize;
+      if n == 0 {
+        // Digamma at positive integer: psi(z) = H_{z-1} - EulerGamma
+        return Ok(polygamma_digamma_integer(z));
+      }
+      if n % 2 == 1 {
+        // Odd n: exact result via Zeta (n+1 is even)
+        if let Some(expr) = polygamma_odd_integer(n, z) {
+          return Ok(expr);
+        }
+      }
+      // Even n >= 2: return unevaluated (involves odd Zeta values)
+      Ok(call(
+        "PolyGamma",
+        vec![Expr::Integer(n as i128), Expr::Integer(z as i128)],
+      ))
+    }
+    Expr::Real(f) => {
+      // PolyGamma has poles at the non-positive integers (z = 0, -1, -2, ...);
+      // there it is ComplexInfinity, not the real +/-Infinity the numeric
+      // series would diverge to. (A non-integer negative z is finite.)
+      if *f <= 0.0 && f.fract() == 0.0 {
+        return Ok(id_expr("ComplexInfinity"));
+      }
+      Ok(Expr::Real(polygamma_numeric(n, *f)))
+    }
+    // Half-integer z (Rational[odd, 2]) with odd n >= 1: use the
+    // polygamma-Hurwitz relation PolyGamma[n, z] = (-1)^(n+1) n! Zeta[n+1, z].
+    // For odd n, n+1 is even so Zeta[n+1, half-integer] reduces to a closed
+    // pi-power form; (-1)^(n+1) = 1. Even n gives an odd Zeta value (no closed
+    // form), so leave those unevaluated like wolframscript.
+    Expr::FunctionCall { name, args: rargs }
+      if name == "Rational"
+        && rargs.len() == 2
+        && matches!(&rargs[1], Expr::Integer(2))
+        && matches!(&rargs[0], Expr::Integer(p) if p % 2 != 0)
+        && n >= 1
+        && n % 2 == 1 =>
+    {
+      let hz =
+        hurwitz_zeta_ast(&[Expr::Integer((n + 1) as i128), z_expr.clone()])?;
+      // n! (the sign factor is +1 for odd n). Keep the product un-distributed
+      // so e.g. PolyGamma[3, 3/2] prints 6*(-16 + Pi^4/6) like wolframscript.
+      let factorial: i128 = (1..=n as i128).product();
+      let product = times2(Expr::Integer(factorial), hz);
+      crate::evaluator::evaluate_expr_to_expr(&product)
+    }
+    _ => {
+      // Symbolic: return unevaluated in 2-arg form
+      Ok(call(
+        "PolyGamma",
+        if args.len() == 1 {
+          vec![Expr::Integer(0), args[0].clone()]
+        } else {
+          args.to_vec()
+        },
+      ))
+    }
+  }
+}
+
+fn extract_f64(expr: &Expr) -> Option<f64> {
+  match expr {
+    Expr::Integer(n) => Some(*n as f64),
+    Expr::Real(f) => Some(*f),
+    _ => None,
+  }
+}
+
+fn z_expr_from_args(expr: &Expr) -> &Expr {
+  expr
+}
+
+/// Build digamma at positive integer: H_{z-1} - EulerGamma
+fn polygamma_digamma_integer(z: usize) -> Expr {
+  let euler = id_expr("EulerGamma");
+  if z == 1 {
+    // H_0 = 0, so result is -EulerGamma
+    return times2(Expr::Integer(-1), euler);
+  }
+  // Compute H_{z-1} = Σ_{k=1}^{z-1} 1/k as rational
+  let (h_num, h_den) = harmonic_rational(z - 1);
+  let h_expr = make_rational(h_num, h_den);
+  minus2(h_expr, euler)
+}
+
+/// Compute H_n = 1 + 1/2 + ... + 1/n as (numerator, denominator)
+fn harmonic_rational(n: usize) -> (i128, i128) {
+  let mut num: i128 = 0;
+  let mut den: i128 = 1;
+  for k in 1..=n {
+    // num/den + 1/k = (num*k + den) / (den*k)
+    num = num * (k as i128) + den;
+    den *= k as i128;
+    (num, den) = rat_reduce(num, den);
+  }
+  (num, den)
+}
+
+/// Build exact PolyGamma[n, z] for odd n >= 1 and positive integer z.
+/// Returns n! * (zeta(n+1) - partial_sum)
+fn polygamma_odd_integer(n: usize, z: usize) -> Option<Expr> {
+  // Get zeta(n+1) as a symbolic expression (raw, not multiplied by n!)
+  let zeta_expr = zeta_positive_even(n + 1)?;
+
+  // Compute n!
+  let mut nfact: i128 = 1;
+  for i in 2..=n {
+    nfact = nfact.checked_mul(i as i128)?;
+  }
+
+  if z == 1 {
+    // No partial sum. Result = n! * zeta(n+1)
+    // Need to multiply the coefficient of zeta by n!
+    return polygamma_multiply_zeta_by_nfact(n + 1, nfact);
+  }
+
+  // Compute partial sum = Σ_{k=1}^{z-1} 1/k^{n+1}
+  let (ps_num, ps_den) = partial_sum_powers(z - 1, n + 1)?;
+
+  // Inner expression: Plus[-partial_sum, zeta(n+1)]
+  let neg_ps = make_rational(-ps_num, ps_den);
+  let inner = call("Plus", vec![neg_ps, zeta_expr]);
+
+  if nfact == 1 {
+    // n = 1: just the inner expression
+    Some(inner)
+  } else {
+    // n >= 3: Times[n!, inner]
+    Some(times2(Expr::Integer(nfact), inner))
+  }
+}
+
+/// Multiply zeta(2n) coefficient by n! and build the expression
+fn polygamma_multiply_zeta_by_nfact(two_n: usize, nfact: i128) -> Option<Expr> {
+  let (b_num, b_den) = bernoulli_number(two_n)?;
+  if b_num == 0 {
+    return None;
+  }
+
+  // Same as zeta_positive_even but multiply by nfact
+  let mut num = b_num.abs().checked_mul(nfact)?;
+  let mut den = b_den.abs();
+
+  // Multiply by 2^(2n-1)
+  for _ in 0..(two_n - 1) {
+    num = num.checked_mul(2)?;
+    (num, den) = rat_reduce(num, den);
+  }
+
+  // Divide by (2n)!
+  for k in 1..=two_n {
+    den = den.checked_mul(k as i128)?;
+    (num, den) = rat_reduce(num, den);
+  }
+
+  let pi_power = pow2(id_expr("Pi"), Expr::Integer(two_n as i128));
+
+  if num == 1 && den == 1 {
+    Some(pi_power)
+  } else if num == 1 {
+    Some(div2(pi_power, Expr::Integer(den)))
+  } else if den == 1 {
+    Some(times2(Expr::Integer(num), pi_power))
+  } else {
+    Some(div2(
+      times2(Expr::Integer(num), pi_power),
+      Expr::Integer(den),
+    ))
+  }
+}
+
+/// Compute Σ_{k=1}^{n} 1/k^power as (numerator, denominator)
+fn partial_sum_powers(n: usize, power: usize) -> Option<(i128, i128)> {
+  let mut sum_n: i128 = 0;
+  let mut sum_d: i128 = 1;
+  for k in 1..=n {
+    let k_pow = (k as i128).checked_pow(power as u32)?;
+    let new_n = sum_n.checked_mul(k_pow)?.checked_add(sum_d)?;
+    let new_d = sum_d.checked_mul(k_pow)?;
+    (sum_n, sum_d) = rat_reduce(new_n, new_d);
+  }
+  Some((sum_n, sum_d))
+}
+
+/// Compute polygamma function numerically
+fn polygamma_numeric(n: usize, mut z: f64) -> f64 {
+  if n == 0 {
+    return digamma(z);
+  }
+
+  let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 }; // (-1)^{n+1}
+  let mut nfact = 1.0_f64;
+  for i in 2..=n {
+    nfact *= i as f64;
+  }
+
+  // Use recurrence to shift z to a large value
+  let mut shift_sum = 0.0;
+  while z < 20.0 {
+    shift_sum += 1.0 / z.powi((n + 1) as i32);
+    z += 1.0;
+  }
+
+  // Asymptotic expansion for ψ^(n)(z) at large z
+  // ψ^(n)(z) = (-1)^{n-1} * [(n-1)!/z^n + n!/(2z^{n+1})
+  //             + Σ_k B_{2k}/(2k) * prod_{j=0}^{n-1}(2k+j) / z^{n+2k}]
+  let sign_asymp = if n.is_multiple_of(2) { -1.0 } else { 1.0 }; // (-1)^{n-1}
+  let nm1_fact = nfact / n as f64;
+
+  let mut asymp = nm1_fact / z.powi(n as i32);
+  asymp += nfact / (2.0 * z.powi((n + 1) as i32));
+
+  let bernoulli = [
+    1.0 / 6.0,
+    -1.0 / 30.0,
+    1.0 / 42.0,
+    -1.0 / 30.0,
+    5.0 / 66.0,
+    -691.0 / 2730.0,
+    7.0 / 6.0,
+  ];
+  for (ki, &b2k) in bernoulli.iter().enumerate() {
+    let k = ki + 1;
+    let two_k = 2 * k;
+    let mut prod = 1.0;
+    for j in 0..n {
+      prod *= (two_k + j) as f64;
+    }
+    asymp += b2k / (two_k as f64) * prod / z.powi((n + two_k) as i32);
+  }
+
+  asymp *= sign_asymp;
+  asymp + sign * nfact * shift_sum
+}
+
+// ─── Number Theory Functions ─────────────────────────────────────
+
+/// LerchPhi[z, s, a] - Lerch transcendent Φ(z, s, a) = Σ_{k=0}^∞ z^k / (k+a)^s
+pub fn lerch_phi_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 3 {
+    return Err(InterpreterError::EvaluationError(
+      "LerchPhi expects exactly 3 arguments".into(),
+    ));
+  }
+
+  let z = &args[0];
+  let s = &args[1];
+  let a = &args[2];
+
+  // Special case: z = 0 → a^(-s). Numericize only when an argument is inexact
+  // (a machine number); exact arguments give the exact power
+  // (e.g. LerchPhi[0, 2, 3] -> 1/9, LerchPhi[0.0, 2, 3] -> 0.1111...).
+  if is_expr_zero(z) {
+    if (contains_float(z) || contains_float(a) || contains_float(s))
+      && let (Some(af), Some(sf)) = (try_eval_to_f64(a), try_eval_to_f64(s))
+    {
+      return Ok(Expr::Real(af.powf(-sf)));
+    }
+    // Evaluate the full a^(-s) expression so the exponent Times[-1, s] folds
+    // (e.g. 3^(-2) -> 1/9) instead of staying a literal Power.
+    return crate::evaluator::evaluate_expr_to_expr(&pow2(
+      a.clone(),
+      call("Times", vec![Expr::Integer(-1), s.clone()]),
+    ));
+  }
+
+  // LerchPhi[z, 0, a] = 1/(1 - z): the series Σ_k z^k/(k+a)^0 is the geometric
+  // series, independent of a. z = 0 is handled above.
+  if is_expr_zero(s) {
+    return crate::evaluator::evaluate_expr_to_expr(&div2(
+      Expr::Integer(1),
+      minus2(Expr::Integer(1), z.clone()),
+    ));
+  }
+
+  // LerchPhi[z, s, 1] = PolyLog[s, z] / z (for z != 0, which the z = 0 case
+  // above has already handled). Delegating to PolyLog reproduces
+  // wolframscript's exact closed forms — e.g. LerchPhi[1/2, 2, 1] ->
+  // 2 (Pi^2/12 - Log[2]^2/2), LerchPhi[1/3, 2, 1] -> 3 PolyLog[2, 1/3],
+  // LerchPhi[z, s, 1] -> PolyLog[s, z]/z — as well as its numeric values,
+  // instead of always floatifying.
+  if matches!(a, Expr::Integer(1)) {
+    let polylog = crate::evaluator::evaluate_function_call_ast(
+      "PolyLog",
+      &[s.clone(), z.clone()],
+    )?;
+    return crate::evaluator::evaluate_expr_to_expr(&div2(polylog, z.clone()));
+  }
+
+  // z = 1: LerchPhi[1, s, a] == HurwitzZeta[s, a]. Delegate for exact s and a
+  // so the result stays exact (e.g. LerchPhi[1, 2, 1] -> Pi^2/6) instead of
+  // being floatified, matching wolframscript.
+  //
+  // The delegation is restricted to the regime where Woxi's HurwitzZeta closed
+  // form coincides with wolframscript's LerchPhi output: s an even integer
+  // (always a Pi^(2k) closed form) or a in {1, 2} (Zeta[s] / -1 + Zeta[s]).
+  // For odd s with a >= 3 wolframscript keeps a generalized-Zeta form, and
+  // a <= 0 / s <= 1 diverge, so those stay on the existing paths.
+  let is_exact_number = |e: &Expr| -> bool {
+    matches!(e, Expr::Integer(_) | Expr::BigInteger(_))
+      || matches!(e, Expr::FunctionCall { name, args }
+        if name == "Rational" && args.len() == 2)
+  };
+  let s_is_even_int = matches!(s, Expr::Integer(n) if *n % 2 == 0);
+  let a_is_1_or_2 = matches!(a, Expr::Integer(1 | 2));
+  if matches!(z, Expr::Integer(1))
+    && is_exact_number(s)
+    && is_exact_number(a)
+    && try_eval_to_f64(s).is_some_and(|v| v > 1.0)
+    && try_eval_to_f64(a).is_some_and(|v| v > 0.0)
+    && (s_is_even_int || a_is_1_or_2)
+  {
+    let hz = crate::evaluator::evaluate_function_call_ast(
+      "HurwitzZeta",
+      &[s.clone(), a.clone()],
+    )?;
+    // Only use the closed form if HurwitzZeta actually simplified; if it
+    // stayed unevaluated (e.g. a half-integer a Woxi doesn't close-form), fall
+    // through to the existing numeric paths rather than emit HurwitzZeta[...].
+    if !matches!(&hz, Expr::FunctionCall { name, .. } if name == "HurwitzZeta")
+    {
+      return Ok(hz);
+    }
+  }
+
+  // Numeric evaluation.
+  //   |z| < 1: wolframscript keeps exact arguments symbolic (there is no
+  //     elementary closed form), so numericize only when an argument is
+  //     inexact (or N[...] made it so).
+  //   z == 1: wolframscript returns a HurwitzZeta-type closed form; Woxi
+  //     cannot always produce it (e.g. LerchPhi[1, 2, 1/4] = π² + 8 Catalan),
+  //     so fall back to the numeric value even for exact arguments.
+  if let (Some(zf), Some(sf), Some(af)) =
+    (try_eval_to_f64(z), try_eval_to_f64(s), try_eval_to_f64(a))
+  {
+    let inexact = contains_float(z) || contains_float(s) || contains_float(a);
+    let z_is_one = (zf - 1.0).abs() < 1e-16 && sf > 1.0;
+    let in_unit_disc = zf.abs() < 1.0;
+    if z_is_one || (in_unit_disc && inexact) {
+      let result = lerch_phi_numeric(zf, sf, af);
+      if result.is_finite() {
+        return Ok(Expr::Real(result));
+      }
+    }
+  }
+
+  // Analytic continuation for real z > 1, integer s ≥ 1, real a.
+  // The series Σ z^k/(k+a)^s diverges, but the value is well-defined via
+  // PV integral plus the iπ·residue at t = ln z. Wolfram's convention
+  // for the recurrence uses `|a|^(-s)` (rather than `a^(-s)`) so that
+  // both even- and odd-s cases line up with their numerical output.
+  if (contains_float(z) || contains_float(s) || contains_float(a))
+    && let (Some(zf), Some(sf), Some(af)) =
+      (try_eval_to_f64(z), try_eval_to_f64(s), try_eval_to_f64(a))
+    && zf > 1.0
+    && (sf - sf.round()).abs() < 1e-12
+    && (1.0..=30.0).contains(&sf)
+  {
+    let s_int = sf.round() as i32;
+    if let Some((re, im)) = lerch_phi_z_gt_1(zf, s_int, af) {
+      return Ok(complex_real(re, im));
+    }
+  }
+
+  // Symbolic: return unevaluated
+  Ok(unevaluated("LerchPhi", args))
+}
+
+/// HurwitzLerchPhi[z, s, a] - the Hurwitz-Lerch transcendent
+/// Sum_{k=0}^inf z^k / (k + a)^s. It coincides with LerchPhi everywhere except
+/// at a non-positive integer `a`, where the singular k = -a term is included
+/// and the value is ComplexInfinity (LerchPhi instead omits that term).
+pub fn hurwitz_lerch_phi_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let symbolic = || Ok(unevaluated("HurwitzLerchPhi", args));
+  if args.len() != 3 {
+    return symbolic();
+  }
+  // A non-positive integer third argument makes the k = -a term diverge.
+  if let Expr::Integer(a) = &args[2]
+    && *a <= 0
+  {
+    return Ok(id_expr("ComplexInfinity"));
+  }
+  // Otherwise delegate to LerchPhi; keep the HurwitzLerchPhi head when LerchPhi
+  // itself stays unevaluated.
+  let result = lerch_phi_ast(args)?;
+  if matches!(&result, Expr::FunctionCall { name, .. } if name == "LerchPhi") {
+    return symbolic();
+  }
+  Ok(result)
+}
+
+/// Build a `Plus[Real, Times[Real, I]]` for downstream formatting.
+fn complex_real(re: f64, im: f64) -> Expr {
+  if im == 0.0 {
+    return Expr::Real(re);
+  }
+  call(
+    "Plus",
+    vec![
+      Expr::Real(re),
+      call("Times", vec![Expr::Real(im), id_expr("I")]),
+    ],
+  )
+}
+
+/// LerchPhi(z, s, a) for real z > 1, integer s ≥ 1, real a (and a + k
+/// non-zero for all integers k ≥ 0). Returns the (real, imaginary)
+/// pair Wolfram prints.
+fn lerch_phi_z_gt_1(z: f64, s: i32, a: f64) -> Option<(f64, f64)> {
+  if z <= 1.0 || s < 1 {
+    return None;
+  }
+  // Walk a up by integer steps until it lands strictly inside (0, 1].
+  // Each shift contributes `|a + k|^(-s) · z^k` to the boundary sum.
+  let target_a = 1.0 - (1.0 - a).fract();
+  let mut shifts = 0i32;
+  let mut a_shift = a;
+  let mut boundary_real = 0.0_f64;
+  let mut z_pow = 1.0_f64;
+  while a_shift <= 0.0 {
+    if a_shift.fract().abs() < 1e-12 {
+      // Hit a non-positive integer pole — undefined.
+      return None;
+    }
+    boundary_real += z_pow * a_shift.abs().powi(-s);
+    a_shift += 1.0;
+    z_pow *= z;
+    shifts += 1;
+    if shifts > 50 {
+      return None;
+    }
+  }
+  // a_shift is now > 0. Compute LerchPhi(z, s, a_shift) via PV
+  // integral + iπ·residue.
+  let (re_pos, im_pos) = lerch_phi_pv(z, s, a_shift)?;
+  let re = boundary_real + z_pow * re_pos;
+  let im = z_pow * im_pos;
+  // Eat the synthesized variable so rustc doesn't complain about `target_a`.
+  let _ = target_a;
+  Some((re, im))
+}
+
+/// LerchPhi(z, s, a) with a > 0, z > 1 real, integer s. Returns the
+/// principal-value integral as the real part and the residue
+/// contribution as the imaginary part.
+fn lerch_phi_pv(z: f64, s: i32, a: f64) -> Option<(f64, f64)> {
+  if a <= 0.0 || z <= 1.0 || s < 1 {
+    return None;
+  }
+  let ln_z = z.ln();
+  let gamma_s = (1..s).map(|i| i as f64).product::<f64>().max(1.0);
+  // The integrand has a simple pole at t = ln(z) with residue
+  //   h(ln z) = (ln z)^(s−1) · e^(−a·ln z) = (ln z)^(s−1) · z^(−a).
+  let h = |t: f64| t.powi(s - 1) * (-a * t).exp();
+  let h_lnz = h(ln_z);
+  // Subtract the singular part: g(t) = integrand(t) - h(ln z)/(t - ln z).
+  // g is smooth at t = ln z (use Taylor expansion in a small window).
+  let h_prime_lnz =
+    (-a * ln_z).exp() * ln_z.powi(s - 2) * (((s - 1) as f64) - a * ln_z);
+  let g = |t: f64| -> f64 {
+    let delta = t - ln_z;
+    if delta.abs() < 1e-4 {
+      // 1/(1 − z e^(−t)) = 1/[(t − ln z)(1 − (t − ln z)/2 + …)]
+      //                 = 1/(t − ln z) + 1/2 + (t − ln z)/12 + …
+      // ⇒ integrand − h(ln z)/(t − ln z)
+      //   = (h(t) − h(ln z))/(t − ln z) + h(t)·(1/2 + (t − ln z)/12 + …)
+      //   → h'(ln z) + h(ln z)/2 as t → ln z.
+      h_prime_lnz + h_lnz / 2.0
+    } else {
+      let denom = 1.0 - z * (-t).exp();
+      h(t) / denom - h_lnz / delta
+    }
+  };
+  let t_max = (50.0 + 10.0 / a).min(200.0);
+  let int_g = gauss_legendre_integrate_lerch(0.0, t_max, &g);
+  let re = (int_g + h_lnz * ((t_max - ln_z) / ln_z).ln()) / gamma_s;
+  let im = -std::f64::consts::PI * ln_z.powi(s - 1) * z.powf(-a) / gamma_s;
+  Some((re, im))
+}
+
+/// 64-point Gauss-Legendre on `[lo, hi]`, with a fixed local node table.
+fn gauss_legendre_integrate_lerch<F: Fn(f64) -> f64>(
+  lo: f64,
+  hi: f64,
+  f: &F,
+) -> f64 {
+  let nodes = lerch_gl_nodes();
+  let half = (hi - lo) * 0.5;
+  let mid = f64::midpoint(lo, hi);
+  let mut sum = 0.0;
+  for (t, w) in nodes {
+    let x = mid + half * t;
+    sum += w * f(x);
+  }
+  half * sum
+}
+
+fn lerch_gl_nodes() -> &'static [(f64, f64)] {
+  use std::sync::OnceLock;
+  static NODES: OnceLock<Vec<(f64, f64)>> = OnceLock::new();
+  NODES.get_or_init(|| {
+    let n = 64;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+      let mut x =
+        -(std::f64::consts::PI * (4 * i + 3) as f64 / (4 * n + 2) as f64).cos();
+      for _ in 0..100 {
+        let (p, dp) = legendre_p_dp(n, x);
+        let dx = -p / dp;
+        x += dx;
+        if dx.abs() < 1e-16 {
+          break;
+        }
+      }
+      let (_, dp) = legendre_p_dp(n, x);
+      let w = 2.0 / ((1.0 - x * x) * dp * dp);
+      out.push((x, w));
+    }
+    out
+  })
+}
+
+fn legendre_p_dp(n: usize, x: f64) -> (f64, f64) {
+  let mut p0 = 1.0;
+  let mut p1 = x;
+  for k in 1..n {
+    let pk = ((2 * k + 1) as f64 * x * p1 - k as f64 * p0) / ((k + 1) as f64);
+    p0 = p1;
+    p1 = pk;
+  }
+  let dp = (n as f64) * (x * p1 - p0) / (x * x - 1.0);
+  (p1, dp)
+}
+
+/// Compute LerchPhi numerically via series: Σ z^k / (k+a)^s
+fn lerch_phi_numeric(z: f64, s: f64, a: f64) -> f64 {
+  // For z = 1, this is the Hurwitz zeta: Σ 1/(k+a)^s
+  // Use Euler-Maclaurin to add tail correction for better convergence
+  let n_terms = if (z - 1.0).abs() < 1e-14 { 200 } else { 1000 };
+  let mut sum = 0.0;
+  let mut z_pow = 1.0; // z^k
+  for k in 0..n_terms {
+    let denom = (k as f64 + a).powf(s);
+    if denom.abs() > 1e-300 {
+      let term = z_pow / denom;
+      sum += term;
+      if term.abs() < 1e-15 * sum.abs() && k > 5 {
+        return sum;
+      }
+    }
+    z_pow *= z;
+    if z_pow.abs() < 1e-300 {
+      return sum;
+    }
+  }
+
+  // For z=1 (Hurwitz zeta), add Euler-Maclaurin tail to extend the partial sum:
+  //   Σ_{k=N}^∞ f(k) ≈ ∫_N^∞ f + f(N)/2 - f'(N)/12 + f'''(N)/720 - …
+  // with f(t) = 1/(t+a)^s. For 200-term partial sums this brings the residual
+  // below 1e-13 for moderate s, matching wolframscript at machine precision.
+  if (z - 1.0).abs() < 1e-14 && s > 1.0 {
+    let n = n_terms as f64;
+    let na = n + a;
+    let tail = na.powf(1.0 - s) / (s - 1.0);
+    let f_n = 1.0 / na.powf(s);
+    // -f'(N)/12 = s / (12 (N+a)^(s+1))
+    let em2 = s / (12.0 * na.powf(s + 1.0));
+    // f'''(N)/720 = -s(s+1)(s+2) / (720 (N+a)^(s+3))
+    let em3 = -s * (s + 1.0) * (s + 2.0) / (720.0 * na.powf(s + 3.0));
+    sum += tail + f_n / 2.0 + em2 + em3;
+  }
+
+  sum
+}
+
+/// PrimeZetaP[s] - Prime zeta function: P(s) = sum_{p prime} 1/p^s.
+/// Computed via Möbius inversion: P(s) = sum_{k=1}^∞ μ(k)/k * log(ζ(ks)).
+pub fn prime_zeta_p_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Ok(unevaluated("PrimeZetaP", args));
+  }
+
+  // P(1) = sum_{p prime} 1/p diverges (Mertens), so wolframscript returns
+  // ComplexInfinity for both the exact and the machine-real argument.
+  if matches!(&args[0], Expr::Integer(1))
+    || matches!(&args[0], Expr::Real(v) if *v == 1.0)
+  {
+    return Ok(id_expr("ComplexInfinity"));
+  }
+
+  // Only evaluate numerically for Real (approximate) arguments
+  let s = match &args[0] {
+    Expr::Real(v) if *v > 1.0 => *v,
+    _ => {
+      return Ok(unevaluated("PrimeZetaP", args));
+    }
+  };
+
+  // Use Möbius inversion: P(s) = sum_{k=1}^K μ(k)/k * log(ζ(ks))
+  // For s > 1, the series converges very rapidly.
+  let max_k = 60;
+  let mut result = 0.0_f64;
+
+  for k in 1..=max_k {
+    let mu = mobius(k);
+    if mu == 0 {
+      continue;
+    }
+    let ks = (k as f64) * s;
+    // Use the evaluator's Zeta function for accuracy
+    let zeta_expr = crate::evaluator::evaluate_expr_to_expr(&call1(
+      "N",
+      call1("Zeta", Expr::Real(ks)),
+    ));
+    let zeta_val = match zeta_expr {
+      Ok(ref e) => try_eval_to_f64(e).unwrap_or(1.0),
+      Err(_) => 1.0,
+    };
+    if zeta_val <= 1.0 {
+      continue;
+    }
+    let term = (mu as f64) / (k as f64) * zeta_val.ln();
+    result += term;
+    if k > 5 && term.abs() < 1e-16 {
+      break;
+    }
+  }
+
+  Ok(Expr::Real(result))
+}
+
+/// Compute the Möbius function μ(n).
+fn mobius(n: usize) -> i32 {
+  if n == 0 {
+    return 0;
+  }
+  if n == 1 {
+    return 1;
+  }
+  let mut m = n;
+  let mut num_factors = 0;
+  let mut d = 2;
+  while d * d <= m {
+    if m.is_multiple_of(d) {
+      m /= d;
+      if m.is_multiple_of(d) {
+        return 0; // p^2 divides n
+      }
+      num_factors += 1;
+    }
+    d += 1;
+  }
+  if m > 1 {
+    num_factors += 1;
+  }
+  if num_factors % 2 == 0 { 1 } else { -1 }
+}
+
+/// Riemann-Siegel theta function θ(t) for real t:
+///   θ(t) = arg(Γ(1/4 + i t/2)) − (t/2) log(π)
+/// computed as Im(LogGamma(1/4 + i t/2)) − (t/2) log(π).
+fn riemann_siegel_theta_numeric(t: f64) -> f64 {
+  use std::f64::consts::PI;
+  let (_re, im) = log_gamma_complex(0.25, t / 2.0);
+  im - (t / 2.0) * PI.ln()
+}
+
+/// High-accuracy ζ(1/2 + i t) via Euler-Maclaurin summation with the
+/// number of direct terms N scaled with t. For the critical line the
+/// truncation error of the Euler-Maclaurin tail decays like N^{-(2p+1/2)}
+/// while the imaginary part of the argument forces N ≳ t for the direct
+/// sum to dominate the Bernoulli corrections. We pick N = max(30, t) and
+/// include Bernoulli terms up to B_20.
+fn zeta_half_plus_it(t: f64) -> (f64, f64) {
+  let s_re = 0.5_f64;
+  let s_im = t;
+
+  let n: usize = (t.abs().ceil() as usize).max(30);
+  let nf = n as f64;
+
+  let mut sum = (0.0_f64, 0.0_f64);
+  for k in 1..n {
+    let term = cpow((k as f64, 0.0), (-s_re, -s_im));
+    sum.0 += term.0;
+    sum.1 += term.1;
+  }
+
+  // Integral correction: N^{1-s} / (s-1)
+  let n1s = cpow((nf, 0.0), (1.0 - s_re, -s_im));
+  let int_c = cdiv(n1s, (s_re - 1.0, s_im));
+  sum.0 += int_c.0;
+  sum.1 += int_c.1;
+
+  // Endpoint correction: N^{-s} / 2
+  let ns = cpow((nf, 0.0), (-s_re, -s_im));
+  sum.0 += 0.5 * ns.0;
+  sum.1 += 0.5 * ns.1;
+
+  let bof: [f64; 10] = [
+    1.0 / 12.0,
+    -1.0 / 720.0,
+    1.0 / 30240.0,
+    -1.0 / 1209600.0,
+    1.0 / 47900160.0,
+    -691.0 / 1307674368000.0,
+    7.0 / 523069747200.0,
+    -3617.0 / 10670622842880000.0,
+    43867.0 / 5109094217170944000.0,
+    -174611.0 / 802857662698291200000.0,
+  ];
+  for (p_idx, &coeff) in bof.iter().enumerate() {
+    let two_p = 2 * (p_idx + 1);
+    let mut rising = (1.0, 0.0);
+    for j in 0..(two_p - 1) {
+      rising = cmul(rising, (s_re + j as f64, s_im));
+    }
+    let pow = cpow((nf, 0.0), (-(s_re + (two_p - 1) as f64), -s_im));
+    let term = cmul(rising, pow);
+    sum.0 += coeff * term.0;
+    sum.1 += coeff * term.1;
+  }
+
+  sum
+}
+
+/// Riemann-Siegel Z function Z(t) for real t:
+///   Z(t) = e^{i θ(t)} ζ(1/2 + i t)
+/// which is real-valued for real t. Z is even: Z(-t) = Z(t).
+fn riemann_siegel_z_numeric(t: f64) -> f64 {
+  let t = t.abs(); // Z is even
+  let theta = riemann_siegel_theta_numeric(t);
+  let (zre, zim) = zeta_half_plus_it(t);
+  // Re(e^{i θ} ζ) = cos θ · Re(ζ) − sin θ · Im(ζ)
+  theta.cos() * zre - theta.sin() * zim
+}
+
+/// Average spacing between consecutive zeta zeros near height `t`, from the
+/// Riemann-von Mangoldt zero-counting density dN/dT ~ (1/2π) ln(t/2π).
+fn zeta_zero_average_gap(t: f64) -> f64 {
+  let x = (t / (2.0 * std::f64::consts::PI)).max(3.0);
+  2.0 * std::f64::consts::PI / x.ln()
+}
+
+/// Riemann-von Mangoldt zero-counting formula's smooth part,
+/// N(T) ~ θ(T)/π + 1 (the true count N(T) = θ(T)/π + 1 + S(T), where S(T)
+/// is a small fluctuating integer-ish term). `riemann_siegel_theta_numeric`
+/// is a closed-form (LogGamma-based) evaluation, so this is O(1), unlike
+/// `riemann_siegel_z_numeric` which does an O(t) direct summation — cheap
+/// enough to bisect on directly.
+fn zeta_zero_smooth_count(t: f64) -> f64 {
+  riemann_siegel_theta_numeric(t) / std::f64::consts::PI + 1.0
+}
+
+/// Locate the |k|-th positive zero t_k of the Riemann-Siegel Z function
+/// (equivalently, of ζ(1/2 + i t)). Negative k gives the conjugate zero
+/// (t_{-k} = -t_k); k = 0 has no zero.
+///
+/// Two stages: first bisect the cheap smooth counting formula
+/// `zeta_zero_smooth_count` to jump straight to the neighbourhood of t_k
+/// (O(log) calls, each O(1)) rather than linearly scanning from t = 0 —
+/// scanning from 0 with an O(t)-per-call Z evaluation would cost O(t_k²)
+/// overall, impractically slow once k is more than a few thousand. Then
+/// scan a window around that estimate for the exact sign change, with a
+/// step far finer (1/40 of the average gap) than the average-gap-based
+/// step a first version of this used, which could miss closely-spaced
+/// zero pairs (e.g. the Lehmer pair at t≈7005, zeros #6709/#6710, only
+/// ≈0.038 apart against a ≈0.224 average gap there).
+///
+/// This is a best-effort numerical root-finder, not a certified computation:
+/// it trusts that the smooth count rounds to the true zero count at the
+/// window's left edge, which holds throughout the range this is practically
+/// used for but isn't formally guaranteed (a fully certified computation
+/// would use Turing's method / Gram point bracketing to verify the count).
+pub(crate) fn zeta_zero_t_for_k(k: i128) -> Option<f64> {
+  if k == 0 {
+    return None;
+  }
+  let target = k.unsigned_abs();
+
+  // Stage 1: bisect the smooth count to land near t_k. It's within 0 of
+  // g(0) = 1 - target <= 0 for target >= 1, and eventually exceeds it for
+  // large enough t, since the count grows without bound.
+  let g = |t: f64| zeta_zero_smooth_count(t) - target as f64;
+  let mut lo = 0.0f64;
+  let mut hi = 15.0f64;
+  loop {
+    if g(hi) > 0.0 {
+      break;
+    }
+    hi *= 2.0;
+    if hi > 1.0e18 {
+      // Absurdly large k: no realistic zero to find.
+      return None;
+    }
+  }
+  for _ in 0..200 {
+    let mid = f64::midpoint(lo, hi);
+    if g(mid) <= 0.0 { lo = mid } else { hi = mid }
+  }
+  let estimate = f64::midpoint(lo, hi);
+
+  // Stage 2: scan a window around the estimate, wide enough to comfortably
+  // contain t_k even if the smooth count is off by a handful of zeros.
+  let gap = zeta_zero_average_gap(estimate);
+  let margin = 25.0 * gap;
+  let t_left = (estimate - margin).max(0.0);
+  let t_right = estimate + margin;
+  // The smooth formula is only asymptotically accurate; near t = 0 it
+  // reads 1 (θ(0)/π + 1) even though the true count there is 0 (the first
+  // zero sits at t ≈ 14.135). Use the known exact count instead whenever
+  // the window's left edge falls in that zero-free region.
+  let mut count = if t_left < 10.0 {
+    0
+  } else {
+    zeta_zero_smooth_count(t_left).round().max(0.0) as u128
+  };
+  let step = (gap / 40.0).clamp(0.005, 0.25);
+
+  let mut t = t_left;
+  let mut prev = riemann_siegel_z_numeric(t);
+  while t < t_right {
+    let next_t = (t + step).min(t_right);
+    let next = riemann_siegel_z_numeric(next_t);
+    if prev != 0.0 && next != 0.0 && prev.signum() != next.signum() {
+      count += 1;
+      if count == target {
+        let mut lo = t;
+        let mut hi = next_t;
+        let mut flo = prev;
+        for _ in 0..100 {
+          let mid = f64::midpoint(lo, hi);
+          let fmid = riemann_siegel_z_numeric(mid);
+          if fmid == 0.0 {
+            lo = mid;
+            hi = mid;
+            break;
+          }
+          if fmid.signum() == flo.signum() {
+            lo = mid;
+            flo = fmid;
+          } else {
+            hi = mid;
+          }
+        }
+        let root = f64::midpoint(lo, hi);
+        return Some(if k > 0 { root } else { -root });
+      }
+    }
+    t = next_t;
+    prev = next;
+  }
+  None
+}
+
+/// Numeric evaluation of ZetaZero[k] for use by N[] and by automatic
+/// numericalization when ZetaZero appears mixed with an inexact number.
+/// Returns the k-th non-trivial zero 1/2 + i t_k as a machine-complex Expr.
+pub fn zeta_zero_n_eval(k: i128) -> Option<Expr> {
+  zeta_zero_t_for_k(k).map(|t| build_complex_float_expr(0.5, t))
+}
+
+/// ZetaZero[k] — the k-th non-trivial zero of the Riemann zeta function on
+/// the critical line, 1/2 + i t_k. Numeric evaluation triggers only for an
+/// inexact (Real/BigFloat) argument, matching wolframscript's behaviour of
+/// leaving the exact form ZetaZero[1] symbolic until N[] is applied.
+/// ZetaZero[k, t] / ZetaZero[k, t1, t2] (a zero pinned near a starting
+/// point / in a range) stay symbolic — only the plain 1-argument form is
+/// numerically evaluated here.
+pub fn zeta_zero_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() == 1 {
+    // Integer/BigInteger k stays exact-symbolic (matches wolframscript);
+    // only a Real/BigFloat k (as N[] produces) triggers numeric root-finding.
+    let k_from_inexact = match &args[0] {
+      Expr::Real(f) if *f == f.floor() => Some(*f as i128),
+      Expr::BigFloat(digits, _) => digits.parse::<f64>().ok().and_then(|f| {
+        if f == f.floor() {
+          Some(f as i128)
+        } else {
+          None
+        }
+      }),
+      _ => None,
+    };
+    if let Some(k) = k_from_inexact
+      && let Some(result) = zeta_zero_n_eval(k)
+    {
+      return Ok(result);
+    }
+    return Ok(unevaluated("ZetaZero", args));
+  }
+  if args.len() == 2 || args.len() == 3 {
+    return Ok(unevaluated("ZetaZero", args));
+  }
+  Err(InterpreterError::EvaluationError(
+    "ZetaZero expects 1 to 3 arguments".into(),
+  ))
+}
+
+/// RiemannSiegelZ[t] — the Riemann-Siegel Z function.
+pub fn riemann_siegel_z_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "RiemannSiegelZ expects exactly 1 argument".into(),
+    ));
+  }
+
+  // Only evaluate for real numeric (Real) input; keep exact/symbolic
+  // arguments unevaluated to mirror wolframscript.
+  if let Some(t) = match &args[0] {
+    Expr::Real(f) => Some(*f),
+    _ => None,
+  } {
+    return Ok(Expr::Real(riemann_siegel_z_numeric(t)));
+  }
+
+  Ok(unevaluated("RiemannSiegelZ", args))
+}
+
+/// RiemannSiegelTheta[t] — the Riemann-Siegel theta function for real t.
+pub fn riemann_siegel_theta_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "RiemannSiegelTheta expects exactly 1 argument".into(),
+    ));
+  }
+
+  // Only evaluate for real numeric (Real) input; keep exact/symbolic
+  // arguments unevaluated to mirror wolframscript.
+  if let Expr::Real(t) = &args[0] {
+    let v = riemann_siegel_theta_numeric(*t);
+    // Normalise negative zero to positive zero (theta(0) = 0).
+    let v = if v == 0.0 { 0.0 } else { v };
+    return Ok(Expr::Real(v));
+  }
+
+  Ok(unevaluated("RiemannSiegelTheta", args))
+}
+
+/// RamanujanTauTheta[t] — the Riemann-Siegel-style theta function for the
+/// weight-12 Ramanujan tau L-function: arg of its gamma factor on the critical
+/// line, theta(t) = Im(logGamma(6 + i t)) - t log(2 Pi).
+fn ramanujan_tau_theta_numeric(t: f64) -> f64 {
+  use std::f64::consts::PI;
+  let (_re, im) = log_gamma_complex(6.0, t);
+  im - t * (2.0 * PI).ln()
+}
+
+/// Complex Gamma via exp of the complex log-Gamma.
+fn cgamma(a: (f64, f64)) -> (f64, f64) {
+  cexp(log_gamma_complex(a.0, a.1))
+}
+
+/// Upper incomplete gamma Gamma(a, x) for complex `a` and real `x > 0`. Uses the
+/// lower-incomplete series (then Gamma(a) - gamma(a,x)) when `x < Re(a) + 1` to
+/// avoid cancellation, and the continued fraction otherwise.
+fn inc_gamma_upper(a: (f64, f64), x: f64) -> (f64, f64) {
+  let xa = cpow((x, 0.0), a); // x^a
+  let efac = (-x).exp();
+  let pref = (xa.0 * efac, xa.1 * efac); // x^a e^{-x}
+  if x < a.0 + 1.0 {
+    // gamma(a,x) = x^a e^{-x} sum_{n>=0} x^n / (a (a+1) ... (a+n))
+    let mut term = cdiv((1.0, 0.0), a);
+    let mut sum = term;
+    for n in 1..2000 {
+      let denom = (a.0 + n as f64, a.1);
+      term = cdiv((term.0 * x, term.1 * x), denom);
+      sum = (sum.0 + term.0, sum.1 + term.1);
+      if term.0.hypot(term.1) < 1e-18 * sum.0.hypot(sum.1) {
+        break;
+      }
+    }
+    let lower = cmul(pref, sum);
+    let g = cgamma(a);
+    (g.0 - lower.0, g.1 - lower.1)
+  } else {
+    // Continued fraction (modified Lentz):
+    // Gamma(a,x) = x^a e^{-x} / (x+1-a - 1(1-a)/(x+3-a - 2(2-a)/(...)))
+    let tiny = 1e-300;
+    let mut b = (x + 1.0 - a.0, -a.1);
+    let mut c = (1.0 / tiny, 0.0);
+    let mut d = cdiv((1.0, 0.0), b);
+    let mut h = d;
+    for i in 1..2000 {
+      let i = i as f64;
+      let an = (-i * (i - a.0), i * a.1); // -i (i - a)
+      b = (b.0 + 2.0, b.1);
+      let andd = cmul(an, d);
+      d = (andd.0 + b.0, andd.1 + b.1);
+      if d.0.hypot(d.1) < tiny {
+        d = (tiny, 0.0);
+      }
+      let anc = cdiv(an, c);
+      c = (b.0 + anc.0, b.1 + anc.1);
+      if c.0.hypot(c.1) < tiny {
+        c = (tiny, 0.0);
+      }
+      d = cdiv((1.0, 0.0), d);
+      let del = cmul(d, c);
+      h = cmul(h, del);
+      if (del.0 - 1.0).hypot(del.1) < 1e-16 {
+        break;
+      }
+    }
+    cmul(pref, h)
+  }
+}
+
+/// RamanujanTauL[s] = L(s, Delta) for the weight-12 cusp form, via the smoothed
+/// approximate functional equation (valid for all s):
+///   L(s) = sum_n tau(n) [ n^{-s} Gamma(s, 2 pi n)
+///                       + (2 pi)^{2s-12} n^{s-12} Gamma(12-s, 2 pi n) ] / Gamma(s)
+fn ramanujan_tau_l_numeric(s: (f64, f64)) -> (f64, f64) {
+  use std::f64::consts::PI;
+  let twopi = 2.0 * PI;
+  let gamma_s = cgamma(s);
+  let s12 = (12.0 - s.0, -s.1);
+  let twopi_pow = cpow((twopi, 0.0), (2.0 * s.0 - 12.0, 2.0 * s.1));
+  let mut sum = (0.0_f64, 0.0_f64);
+  for n in 1..500 {
+    let tau = ramanujan_tau_compute(n) as f64;
+    let x = twopi * n as f64;
+    // tau * n^{-s} * Gamma(s, x)
+    let n_neg_s = cpow((n as f64, 0.0), (-s.0, -s.1));
+    let t1 = cmul((tau * n_neg_s.0, tau * n_neg_s.1), inc_gamma_upper(s, x));
+    // tau * (2 pi)^{2s-12} * n^{s-12} * Gamma(12-s, x)
+    let n_pow = cpow((n as f64, 0.0), (s.0 - 12.0, s.1));
+    let t2 = cmul(
+      cmul((tau * twopi_pow.0, tau * twopi_pow.1), n_pow),
+      inc_gamma_upper(s12, x),
+    );
+    let term = (t1.0 + t2.0, t1.1 + t2.1);
+    sum = (sum.0 + term.0, sum.1 + term.1);
+    // Terms decay like e^{-2 pi n}; the transition is near n ~ |s|/(2 pi).
+    if n as f64 > s.1.abs() / twopi + 5.0
+      && term.0.hypot(term.1) < 1e-17 * sum.0.hypot(sum.1).max(1.0)
+    {
+      break;
+    }
+  }
+  cdiv(sum, gamma_s)
+}
+
+/// RamanujanTauZ[t] = e^{i theta(t)} L(6 + i t) — real-valued on the critical
+/// line.
+fn ramanujan_tau_z_numeric(t: f64) -> f64 {
+  let theta = ramanujan_tau_theta_numeric(t);
+  let l = ramanujan_tau_l_numeric((6.0, t));
+  let rot = (theta.cos(), theta.sin());
+  cmul(rot, l).0
+}
+
+/// RamanujanTauZ[t] — numeric for real input, symbolic otherwise.
+pub fn ramanujan_tau_z_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "RamanujanTauZ expects exactly 1 argument".into(),
+    ));
+  }
+  if let Expr::Real(t) = &args[0] {
+    return Ok(Expr::Real(ramanujan_tau_z_numeric(*t)));
+  }
+  Ok(unevaluated("RamanujanTauZ", args))
+}
+
+/// RamanujanTauL[s] — numeric for real/complex machine input, symbolic for
+/// exact input.
+pub fn ramanujan_tau_l_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "RamanujanTauL expects exactly 1 argument".into(),
+    ));
+  }
+  // Real machine argument.
+  if let Expr::Real(s) = &args[0] {
+    let v = ramanujan_tau_l_numeric((*s, 0.0));
+    return Ok(Expr::Real(v.0));
+  }
+  // Complex machine argument (re + im I with at least one inexact part).
+  if let Some((re, im)) = try_extract_complex_float(&args[0])
+    && im != 0.0
+  {
+    let v = ramanujan_tau_l_numeric((re, im));
+    return Ok(build_complex_float_expr(v.0, v.1));
+  }
+  Ok(unevaluated("RamanujanTauL", args))
+}
+
+/// RamanujanTauTheta[t] — numeric for real (machine) input, symbolic otherwise.
+pub fn ramanujan_tau_theta_ast(
+  args: &[Expr],
+) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "RamanujanTauTheta expects exactly 1 argument".into(),
+    ));
+  }
+  if let Expr::Real(t) = &args[0] {
+    let v = ramanujan_tau_theta_numeric(*t);
+    let v = if v == 0.0 { 0.0 } else { v };
+    return Ok(Expr::Real(v));
+  }
+  Ok(unevaluated("RamanujanTauTheta", args))
+}
+
+/// DirichletEta[s] — the Dirichlet eta function: (1 - 2^(1-s)) * Zeta[s]
+pub fn dirichlet_eta_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "DirichletEta expects exactly 1 argument".into(),
+    ));
+  }
+
+  // Handle special case s=1: eta(1) = ln(2)
+  if matches!(&args[0], Expr::Integer(1)) {
+    return Ok(call1("Log", Expr::Integer(2)));
+  }
+
+  // For numeric (Real) input, compute directly
+  if let Expr::Real(f) = &args[0] {
+    // Special case: s=1.0 gives ln(2)
+    if *f == 1.0 {
+      return Ok(Expr::Real(2.0_f64.ln()));
+    }
+    let eta = (1.0 - 2.0_f64.powf(1.0 - f)) * zeta_numeric(*f);
+    return Ok(num_to_expr(eta));
+  }
+
+  // For integer and rational inputs, compute the factor (1 - 2^(1-s)) exactly first
+  let factor = {
+    let one_minus_s = crate::evaluator::evaluate_function_call_ast(
+      "Subtract",
+      &[Expr::Integer(1), args[0].clone()],
+    )?;
+    let two_pow = crate::evaluator::evaluate_function_call_ast(
+      "Power",
+      &[Expr::Integer(2), one_minus_s],
+    )?;
+    crate::evaluator::evaluate_function_call_ast(
+      "Subtract",
+      &[Expr::Integer(1), two_pow],
+    )?
+  };
+
+  let zeta =
+    crate::evaluator::evaluate_function_call_ast("Zeta", &[args[0].clone()])?;
+  crate::evaluator::evaluate_function_call_ast("Times", &[factor, zeta])
+}
+
+/// DirichletLambda[s] = sum over odd n of 1/n^s = (1 - 2^(-s)) Zeta[s].
+/// (This is the Dirichlet lambda function, also written lambda(s).)
+pub fn dirichlet_lambda_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "DirichletLambda expects exactly 1 argument".into(),
+    ));
+  }
+
+  // For numeric (Real) input, compute directly.
+  if let Expr::Real(f) = &args[0] {
+    let lambda = (1.0 - 2.0_f64.powf(-f)) * zeta_numeric(*f);
+    return Ok(num_to_expr(lambda));
+  }
+
+  // Otherwise build ((2^s - 1) Zeta[s]) / 2^s. Written with 2^s in the
+  // denominator (rather than the equivalent (1 - 2^(-s)) Zeta[s]) to match
+  // wolframscript's canonical form for symbolic/fractional s, e.g.
+  // DirichletLambda[x] -> ((-1 + 2^x) Zeta[x])/2^x. For integer s the Zeta
+  // closed-forms collapse it to a clean value (DirichletLambda[2] -> Pi^2/8,
+  // DirichletLambda[-1] -> 1/12).
+  let two_pow_s = crate::evaluator::evaluate_function_call_ast(
+    "Power",
+    &[Expr::Integer(2), args[0].clone()],
+  )?;
+  let numer_factor = crate::evaluator::evaluate_function_call_ast(
+    "Subtract",
+    &[two_pow_s.clone(), Expr::Integer(1)],
+  )?;
+  let zeta =
+    crate::evaluator::evaluate_function_call_ast("Zeta", &[args[0].clone()])?;
+  let numer = crate::evaluator::evaluate_function_call_ast(
+    "Times",
+    &[numer_factor, zeta],
+  )?;
+  crate::evaluator::evaluate_function_call_ast("Divide", &[numer, two_pow_s])
+}
+
+/// DirichletBeta[s] — the Dirichlet beta function β(s) = Σ (-1)^n/(2n+1)^s.
+/// Closed forms: odd positive integers via Euler numbers
+/// (β(2k+1) = (-1)^k E_{2k} π^(2k+1) / (4^(k+1)(2k)!)), non-positive integers
+/// β(n) = EulerE[-n]/2, β(2) = Catalan. Everything else (even positive
+/// integers, fractional and symbolic s) uses the Hurwitz-zeta form
+/// β(s) = (Zeta[s,1/4]/2^s − Zeta[s,3/4]/2^s)/2^s, matching wolframscript.
+pub fn dirichlet_beta_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "DirichletBeta expects exactly 1 argument".into(),
+    ));
+  }
+  let s = &args[0];
+
+  // Numeric (Real) argument: β(s) = 4^(-s) (ζ(s,1/4) − ζ(s,3/4)). The Hurwitz
+  // zetas individually diverge at s = 1 (their difference β(1) = π/4 is finite),
+  // so that point is handled directly.
+  if let Expr::Real(f) = s {
+    if *f == 1.0 {
+      return Ok(Expr::Real(std::f64::consts::FRAC_PI_4));
+    }
+    let beta = 4.0_f64.powf(-f)
+      * (hurwitz_zeta_numeric(*f, 0.25) - hurwitz_zeta_numeric(*f, 0.75));
+    return Ok(num_to_expr(beta));
+  }
+
+  // Exact integer argument.
+  if let Some(n) = expr_to_i128(s) {
+    // β(n) = EulerE[-n]/2 for n <= 0.
+    if n <= 0 {
+      let euler = crate::evaluator::evaluate_function_call_ast(
+        "EulerE",
+        &[Expr::Integer(-n)],
+      )?;
+      return crate::evaluator::evaluate_function_call_ast(
+        "Divide",
+        &[euler, Expr::Integer(2)],
+      );
+    }
+    // β(2) is Catalan's constant.
+    if n == 2 {
+      return Ok(id_expr("Catalan"));
+    }
+    // Odd positive integers: β(2k+1) = (-1)^k E_{2k} π^(2k+1) / (4^(k+1)(2k)!).
+    if n % 2 == 1 {
+      let k = (n - 1) / 2;
+      let sign = if k % 2 == 0 { 1 } else { -1 };
+      let euler = crate::evaluator::evaluate_function_call_ast(
+        "EulerE",
+        &[Expr::Integer(2 * k)],
+      )?;
+      let pi_pow = crate::evaluator::evaluate_function_call_ast(
+        "Power",
+        &[id_expr("Pi"), Expr::Integer(n)],
+      )?;
+      let numer = crate::evaluator::evaluate_function_call_ast(
+        "Times",
+        &[Expr::Integer(sign), euler, pi_pow],
+      )?;
+      let four_pow = crate::evaluator::evaluate_function_call_ast(
+        "Power",
+        &[Expr::Integer(4), Expr::Integer(k + 1)],
+      )?;
+      let fact = crate::evaluator::evaluate_function_call_ast(
+        "Factorial",
+        &[Expr::Integer(2 * k)],
+      )?;
+      let denom = crate::evaluator::evaluate_function_call_ast(
+        "Times",
+        &[four_pow, fact],
+      )?;
+      return crate::evaluator::evaluate_function_call_ast(
+        "Divide",
+        &[numer, denom],
+      );
+    }
+    // Even positive integers (>= 4) fall through to the Hurwitz form.
+  }
+
+  // General form: (Zeta[s,1/4]/2^s − Zeta[s,3/4]/2^s)/2^s.
+  let two_pow_s = crate::evaluator::evaluate_function_call_ast(
+    "Power",
+    &[Expr::Integer(2), s.clone()],
+  )?;
+  let z1 = crate::evaluator::evaluate_function_call_ast(
+    "Zeta",
+    &[s.clone(), make_rational(1, 4)],
+  )?;
+  let z3 = crate::evaluator::evaluate_function_call_ast(
+    "Zeta",
+    &[s.clone(), make_rational(3, 4)],
+  )?;
+  let t1 = crate::evaluator::evaluate_function_call_ast(
+    "Divide",
+    &[z1, two_pow_s.clone()],
+  )?;
+  let t3 = crate::evaluator::evaluate_function_call_ast(
+    "Divide",
+    &[z3, two_pow_s.clone()],
+  )?;
+  let diff =
+    crate::evaluator::evaluate_function_call_ast("Subtract", &[t1, t3])?;
+  crate::evaluator::evaluate_function_call_ast("Divide", &[diff, two_pow_s])
+}

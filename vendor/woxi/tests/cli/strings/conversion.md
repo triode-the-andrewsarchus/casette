@@ -1,0 +1,27 @@
+# Conversion and Encoding
+
+Converting between strings and other data types, character codes, and encoded forms.
+
+- [`ToString`](conversion/ToString.md)
+- [`ToExpression`](conversion/ToExpression.md)
+- [`TextString`](conversion/TextString.md)
+- [`TextWords`](conversion/TextWords.md)
+- [`IntegerString`](conversion/IntegerString.md)
+- [`NumericalSort`](conversion/NumericalSort.md)
+- [`ToCharacterCode`](conversion/ToCharacterCode.md)
+- [`FromCharacterCode`](conversion/FromCharacterCode.md)
+- [`StringToByteArray`](conversion/StringToByteArray.md)
+- [`Alphabet`](conversion/Alphabet.md)
+- [`AlphabeticSort`](conversion/AlphabeticSort.md)
+- [`LetterNumber`](conversion/LetterNumber.md)
+- [`FromLetterNumber`](conversion/FromLetterNumber.md)
+- [`CharacterCounts`](conversion/CharacterCounts.md)
+- [`CharacterName`](conversion/CharacterName.md)
+- [`LetterCounts`](conversion/LetterCounts.md)
+- [`WordCount`](conversion/WordCount.md)
+- [`WordCounts`](conversion/WordCounts.md)
+- [`DeleteStopwords`](conversion/DeleteStopwords.md)
+- [`Hash`](conversion/Hash.md)
+- [`Uncompress`](conversion/Uncompress.md)
+- [`URLDecode`](conversion/URLDecode.md)
+- [`URLEncode`](conversion/URLEncode.md)

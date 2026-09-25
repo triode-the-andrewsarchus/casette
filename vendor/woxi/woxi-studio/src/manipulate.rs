@@ -1,0 +1,1691 @@
+//! Woxi Studio helpers for rendering interactive `Manipulate[…]` cells.
+//!
+//! A held `Manipulate` expression is parsed into a `ManipulateState` that
+//! stores the body (as InputForm source), the per-variable controls, the
+//! current value of each control, and the currently rendered output
+//! (SVG or text). On each slider/picklist change the state is updated
+//! in place and the body is re-evaluated inside a `Block[{…}, body]` so
+//! that free control variables are substituted.
+
+use iced::widget::svg;
+pub use woxi::functions::graphics::{ControlOrientation, ControlPlacement};
+use woxi::functions::graphics::{
+  DisplayNode, LabelRun, ManipulateControl, ManipulateSpec,
+  apply_manipulate_mutations, build_manipulate_display, extract_animator_spec,
+  extract_click_pane_spec, extract_control_spec, extract_list_animate_spec,
+  extract_locator_pane_spec, extract_manipulate_spec, read_manipulate_state,
+};
+use woxi::syntax::Expr;
+
+/// Runtime state for a single control inside a Manipulate cell.
+#[derive(Debug, Clone)]
+pub enum ControlState {
+  Continuous {
+    name: String,
+    label: String,
+    /// The label split into styled runs, for rich-text (italic) rendering.
+    label_runs: Vec<LabelRun>,
+    min: f64,
+    max: f64,
+    /// Step size used by the slider. When the spec doesn't specify one
+    /// we pick `(max - min) / 100`.
+    step: f64,
+    current: f64,
+    /// Whether the variable is machine-real by construction (see
+    /// `woxi::functions::graphics::ManipulateControl::Continuous::is_real`).
+    /// A round current value (`0`, `20`) still substitutes as the real `0.`
+    /// rather than the exact integer, matching Wolfram — which matters for
+    /// a caption that formats it with `NumberForm[…, {n, f}]`.
+    is_real: bool,
+    /// `ControlType -> VerticalSlider`: rendered with `vertical_slider`
+    /// instead of the default horizontal `slider`.
+    orientation: ControlOrientation,
+  },
+  Discrete {
+    name: String,
+    label: String,
+    label_runs: Vec<LabelRun>,
+    /// Each entry is an InputForm fragment ready for substitution into the
+    /// variable binding. For a rule-form choice `value -> "label"` this is the
+    /// value (left side), not the whole rule.
+    values: Vec<String>,
+    /// The label shown for each choice, parallel to `values`. Equals `values`
+    /// for plain choices; the rule's right side for rule-form choices.
+    value_labels: Vec<String>,
+    /// A rendered SVG icon per choice for rule labels that are graphics
+    /// (`"+" -> myIcon[2]`), parallel to `values`. `None` = text label.
+    value_label_svgs: Vec<Option<svg::Handle>>,
+    /// Each choice's display label as styled runs, parallel to `values` — a
+    /// rule label's `Style[…, color]`/`Bold`/italic directive (e.g. a
+    /// multi-way selector's `1 -> Style["top", Blue]`) rendered here instead
+    /// of only in `value_labels`' plain text.
+    value_label_runs: Vec<Vec<LabelRun>>,
+    current_index: usize,
+    /// The true current value's InputForm, kept only while it matches none
+    /// of `values` (mirrors `ManipulateControl::Discrete::initial_overflow`
+    /// in `woxi::functions::graphics`): several disjoint SetterBar rows can
+    /// share one variable, and this row's own choices needn't include
+    /// whatever value another row just picked. `current_code` and
+    /// `set_current_from_code` prefer this over `values[current_index]`
+    /// whenever it is set, so the row still hands back the right value even
+    /// though none of its own buttons apply.
+    overflow: Option<String>,
+    /// `ControlType -> PopupMenu`: always render a dropdown, even when the
+    /// choice count is small enough for a SetterBar.
+    popup: bool,
+    /// `ControlType -> SetterBar`: always render the row of buttons, even
+    /// when there are more choices than the automatic split would put in a
+    /// bar.
+    setter_bar: bool,
+    /// `ControlType -> Slider`: render a slider stepping through the
+    /// choices by index rather than a setter bar or dropdown.
+    slider: bool,
+    /// `Appearance -> "Vertical"`: stack the SetterBar/RadioButtonBar
+    /// choices in a column instead of a row. Ignored by the dropdown and
+    /// index-slider layouts.
+    vertical: bool,
+  },
+  /// A 2D slider binding its variable to a `{x, y}` pair.
+  Slider2D {
+    name: String,
+    label: String,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    x: f64,
+    y: f64,
+    /// Write-back function (from `Locator[Dynamic[var, cb], …]` promotion):
+    /// candidate values pass through `(cb)[{x, y}]` — which typically
+    /// rounds, clips, or rejects them — before the variable is read back.
+    write_callback: Option<String>,
+  },
+  /// An interval slider binding its variable to a `{low, high}` pair.
+  IntervalSlider {
+    name: String,
+    label: String,
+    min: f64,
+    max: f64,
+    step: f64,
+    low: f64,
+    high: f64,
+  },
+  /// A `Locator` control binding its variable to a list of 2D points
+  /// (e.g. draggable polygon vertices). Rendered as one X/Y slider pair
+  /// per point; `auto_create` additionally offers add/remove buttons.
+  Locator {
+    name: String,
+    label: String,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    points: Vec<(f64, f64)>,
+    auto_create: bool,
+  },
+  /// A `ControlType -> Trigger` control: a play/pause pair sweeping its
+  /// variable from `min` towards `max` in `step` increments while the
+  /// widget is playing. `max` may be infinite (`{time, 0, Infinity, 1}`),
+  /// in which case the sweep never wraps.
+  Trigger {
+    name: String,
+    label: String,
+    label_runs: Vec<LabelRun>,
+    min: f64,
+    max: f64,
+    step: f64,
+    current: f64,
+  },
+  /// A `Button[label, action]` row. Pressing it runs `action` (InputForm)
+  /// against the live bindings — e.g. `time = 0; {U, V} = {Uinit, Vinit}`
+  /// resets a simulation. Binds no variable.
+  Button {
+    label: String,
+    label_runs: Vec<LabelRun>,
+    action: String,
+  },
+  /// A static heading row between controls (a string or `Style[…]`
+  /// Manipulate argument). Binds no variable.
+  Heading {
+    label: String,
+    label_runs: Vec<LabelRun>,
+  },
+  /// A `Delimiter` argument: a horizontal separator row. Binds no variable.
+  Divider,
+  /// A `ControlType -> ColorSlider`/`ColorSetter` control: a hue-gradient
+  /// bar whose handle position (`0..1`) maps to `Hue[position]` at full
+  /// saturation/value. `ColorSetter` renders and behaves identically —
+  /// Wolfram draws it as the same widget, just click/tap-to-set — so both
+  /// spec forms produce this one control rather than a duplicate.
+  Color {
+    name: String,
+    label: String,
+    label_runs: Vec<LabelRun>,
+    /// The bound variable's current value, as InputForm. Starts as the
+    /// spec's literal initial color (kept exactly even when it isn't on
+    /// the hue gradient at all, e.g. `RGBColor[0, 0, 0]`); dragging the
+    /// slider overwrites it with `Hue[<position>]`.
+    current: String,
+    /// The slider handle's on-screen position in `0.0..=1.0` (the hue
+    /// fraction it was last dragged to). Purely cosmetic — defaults to
+    /// `0.0`, since the spec's initial color is usually not on the
+    /// gradient at all, without affecting `current`.
+    position: f64,
+  },
+}
+
+impl ControlState {
+  pub fn name(&self) -> &str {
+    match self {
+      ControlState::Continuous { name, .. } => name,
+      ControlState::Discrete { name, .. } => name,
+      ControlState::Slider2D { name, .. } => name,
+      ControlState::IntervalSlider { name, .. } => name,
+      ControlState::Trigger { name, .. } => name,
+      ControlState::Locator { name, .. } => name,
+      ControlState::Color { name, .. } => name,
+      ControlState::Button { .. }
+      | ControlState::Heading { .. }
+      | ControlState::Divider => "",
+    }
+  }
+
+  /// Whether this row binds a variable (annotation/button rows don't).
+  pub fn binds_variable(&self) -> bool {
+    !matches!(
+      self,
+      ControlState::Button { .. }
+        | ControlState::Heading { .. }
+        | ControlState::Divider
+    )
+  }
+
+  /// InputForm fragment for the *current* value, for use inside a
+  /// `Block[{name = <value>}, …]` binding.
+  pub fn current_code(&self) -> String {
+    match self {
+      ControlState::Continuous {
+        current, is_real, ..
+      } => {
+        if *is_real {
+          format_f64_real(*current)
+        } else {
+          format_f64(*current)
+        }
+      }
+      ControlState::Trigger { current, .. } => format_f64(*current),
+      ControlState::Discrete {
+        values,
+        current_index,
+        overflow,
+        ..
+      } => overflow.clone().unwrap_or_else(|| {
+        values
+          .get(*current_index)
+          .cloned()
+          .unwrap_or_else(|| "Null".to_string())
+      }),
+      ControlState::Slider2D { x, y, .. } => {
+        format!("{{{}, {}}}", format_f64(*x), format_f64(*y))
+      }
+      ControlState::IntervalSlider { low, high, .. } => {
+        format!("{{{}, {}}}", format_f64(*low), format_f64(*high))
+      }
+      // Locator positions are machine reals (dragging produces fractional
+      // coordinates); delegate so integral values keep their trailing dot.
+      ControlState::Locator { points, .. } => {
+        woxi::functions::graphics::format_point_list_input(points)
+      }
+      ControlState::Color { current, .. } => current.clone(),
+      // Annotation and button rows bind no variable; never substituted.
+      ControlState::Button { .. }
+      | ControlState::Heading { .. }
+      | ControlState::Divider => "Null".to_string(),
+    }
+  }
+
+  /// Update this control's current value from an InputForm fragment — the
+  /// read-back of a button action's write to the bound variable (e.g.
+  /// `time = 0` rewinds the trigger it drives).
+  fn set_current_from_code(&mut self, code: &str) {
+    use woxi::syntax::Expr;
+    fn as_f64(e: &Expr) -> Option<f64> {
+      match e {
+        Expr::Integer(n) => Some(*n as f64),
+        Expr::Real(r) => Some(*r),
+        _ => None,
+      }
+    }
+    fn as_pair(e: &Expr) -> Option<(f64, f64)> {
+      match e {
+        Expr::List(items) if items.len() == 2 => {
+          Some((as_f64(&items[0])?, as_f64(&items[1])?))
+        }
+        _ => None,
+      }
+    }
+    let Ok(expr) = woxi::interpret_to_expr(code) else {
+      return;
+    };
+    match self {
+      ControlState::Continuous { current, .. }
+      | ControlState::Trigger { current, .. } => {
+        if let Some(v) = as_f64(&expr) {
+          *current = v;
+        }
+      }
+      ControlState::Discrete {
+        values,
+        current_index,
+        overflow,
+        ..
+      } => {
+        let form = woxi::syntax::expr_to_input_form(&expr);
+        if let Some(i) = values.iter().position(|v| *v == form) {
+          *current_index = i;
+          *overflow = None;
+        } else {
+          *overflow = Some(form);
+        }
+      }
+      ControlState::Slider2D { x, y, .. } => {
+        if let Some((a, b)) = as_pair(&expr) {
+          *x = a;
+          *y = b;
+        }
+      }
+      ControlState::IntervalSlider { low, high, .. } => {
+        if let Some((a, b)) = as_pair(&expr) {
+          *low = a;
+          *high = b;
+        }
+      }
+      ControlState::Locator { points, .. } => {
+        if let Expr::List(items) = &expr
+          && let Some(new_points) =
+            items.iter().map(as_pair).collect::<Option<Vec<_>>>()
+        {
+          *points = new_points;
+        }
+      }
+      ControlState::Color { current, .. } => {
+        *current = woxi::syntax::expr_to_input_form(&expr);
+      }
+      ControlState::Button { .. }
+      | ControlState::Heading { .. }
+      | ControlState::Divider => {}
+    }
+  }
+}
+
+/// A discrete control's freshly resolved choice list, as
+/// `(control name, (values, labels, rendered labels, styled-label runs))`.
+type ResolvedChoices = (
+  String,
+  (
+    Vec<String>,
+    Vec<String>,
+    Vec<Option<String>>,
+    Vec<Vec<LabelRun>>,
+  ),
+);
+
+/// Full state for a Manipulate cell: the held body plus its rendered
+/// output.
+#[derive(Debug, Clone)]
+pub struct ManipulateState {
+  pub body: String,
+  /// Initialization code from `Initialization :> …`. Run once (in
+  /// [`from_expr`]) before the first render; its definitions persist in
+  /// the interpreter's global environment across re-evaluations.
+  ///
+  /// [`from_expr`]: Self::from_expr
+  pub initialization: Option<String>,
+  pub controls: Vec<ControlState>,
+  /// Mutable `ControlType -> None` state variables, `(name, current value as
+  /// InputForm)`. Passed live in the binding set so interactive displays can
+  /// rewrite them.
+  pub state: Vec<(String, String)>,
+  /// Extra display expressions (InputForm), e.g. a `Dynamic[Panel[Grid[…]]]`
+  /// of checkboxes, rebuilt into `display_trees` on every re-evaluation.
+  pub displays: Vec<String>,
+  /// The rendered widget tree for each display element.
+  pub display_trees: Vec<DisplayNode>,
+  pub graphics_handle: Option<svg::Handle>,
+  pub text_output: Option<String>,
+  pub error: Option<String>,
+  /// Whether this widget auto-plays (from `Animate[…]` / `ListAnimate[…]` /
+  /// `Animator[…]`): a timer advances the first continuous control while
+  /// `playing` is set, and the view shows a play/pause toggle.
+  pub animated: bool,
+  /// Whether the animation is currently running. Starts `true` for animated
+  /// widgets (Wolfram's default `AnimationRunning -> True`).
+  pub playing: bool,
+  /// `Appearance -> None`: hide the control rows (the animation just runs);
+  /// the play/pause toggle stays visible for animated widgets.
+  pub appearance_none: bool,
+  /// `ControlPlacement -> …`: which side of the output the control panel
+  /// sits on. `Top` (Wolfram's default) stacks the controls above it.
+  pub control_placement: ControlPlacement,
+  /// `TrackedSymbols :> {…}`: the variables whose change re-runs the body.
+  /// A control bound to any other variable still moves, but the rendering
+  /// waits for a tracked variable to change. `None` tracks everything.
+  tracked_symbols: Option<Vec<String>>,
+  /// The variable a `ControlType -> Trigger`/`Animator` spec animates.
+  /// `advance_animation` targets this control instead of defaulting to the
+  /// first continuous one.
+  animation_var: Option<String>,
+  /// Per-control `TrackingFunction -> f` callback (InputForm code), as
+  /// `(control name, function code)`. Run against the control's new value
+  /// whenever the user moves it (see [`apply_tracking`]), so a Demonstration
+  /// can reset a companion control the way Wolfram does.
+  ///
+  /// [`apply_tracking`]: Self::apply_tracking
+  tracking: Vec<(String, String)>,
+  /// Continuous-control bounds that reference other control variables, as
+  /// `(control name, min code, max code)`. Re-resolved against the live
+  /// bindings on every re-evaluation so a slider range can follow another
+  /// control (Kepler's time sliders are bounded by the orbital period `P`).
+  dynamic_bounds: Vec<(String, Option<String>, Option<String>)>,
+  /// Per-control choice lists that follow another control's variable
+  /// (InputForm code), re-resolved on every change the way
+  /// `dynamic_bounds` are.
+  dynamic_values: Vec<(String, String)>,
+  /// Per-control `Enabled` condition (InputForm code), parallel to `controls`.
+  /// `None` means the control has no condition and is always enabled.
+  control_enabled: Vec<Option<String>>,
+  /// Whether each control is currently interactive, recomputed on every
+  /// re-evaluation from `control_enabled` against the live bindings. Parallel
+  /// to `controls`; a control indexes in with its position.
+  pub control_is_enabled: Vec<bool>,
+  /// Per-control visibility condition (InputForm code), parallel to
+  /// `controls`. A control that belongs to a `PaneSelector` pane is on
+  /// screen only while the selector holds that pane's value. `None` means
+  /// the control belongs to no pane and is always shown.
+  control_visible: Vec<Option<String>>,
+  /// `(control name, parent variable, 1-based index)` for every control
+  /// that drives one `Part` of a shared list variable rather than the
+  /// whole variable — the widgets `Evaluate[Sequence @@ Table[…]]`
+  /// generates for a bank of per-element sliders (see
+  /// `woxi::functions::graphics::ParsedControl::ListElement`). `bindings`
+  /// groups these by `parent` and reassembles them into one list binding
+  /// instead of colliding same-named ones.
+  list_elements: Vec<(String, String, usize)>,
+  /// `Bookmarks -> {"name" :> assignment, …}`: a menu of named presets,
+  /// `(label, assignment code)`. Selecting one runs [`apply_bookmark`],
+  /// which is [`apply_button_action`] under a different name — the
+  /// assignment code is arbitrary code run against the live bindings, same
+  /// as a `Button`'s action.
+  ///
+  /// [`apply_bookmark`]: Self::apply_bookmark
+  /// [`apply_button_action`]: Self::apply_button_action
+  pub bookmarks: Vec<(String, String)>,
+  /// Whether each control is currently on screen, recomputed on every
+  /// re-evaluation from `control_visible` against the live bindings.
+  pub control_is_visible: Vec<bool>,
+  /// Generation of the most recent control change. Bumped on every
+  /// slider/picklist move so the throttled re-evaluation can tell whether a
+  /// newer change has superseded a queued one.
+  reeval_pending: u64,
+  /// Generation last actually re-evaluated. When it lags `reeval_pending`
+  /// there is fresh input waiting to be rendered.
+  reeval_applied: u64,
+  /// Whether a debounce timer is already in flight. While set, further
+  /// control changes only bump `reeval_pending` instead of arming a second
+  /// timer — this is what coalesces a burst of slider events into a single
+  /// re-evaluation, mirroring the Playground's inflight/pending pipeline.
+  reeval_scheduled: bool,
+}
+
+impl ManipulateState {
+  /// Build a `ManipulateState` from an evaluated expression. Returns
+  /// `None` if `expr` is not a well-formed Manipulate (in which case
+  /// the caller should fall back to the normal text/graphics path).
+  pub fn from_expr(expr: &Expr) -> Option<Self> {
+    // Manipulate/Animate, a standalone Control/Animator, a ListAnimate frame
+    // list, or a LocatorPane/ClickPane all back an interactive widget. The
+    // animated ones (Animate/ListAnimate/Animator) auto-play: the app's
+    // animation-tick subscription advances them while `playing` is set.
+    let spec = extract_manipulate_spec(expr)
+      .or_else(|| extract_control_spec(expr))
+      .or_else(|| extract_list_animate_spec(expr))
+      .or_else(|| extract_animator_spec(expr))
+      .or_else(|| extract_locator_pane_spec(expr))
+      .or_else(|| extract_click_pane_spec(expr))?;
+    let controls = controls_from_spec(&spec);
+    // Line each control up with its `Enabled` condition (if any) by name.
+    let control_enabled: Vec<Option<String>> = controls
+      .iter()
+      .map(|c| {
+        spec
+          .control_enabled
+          .iter()
+          .find(|(n, _)| n == c.name())
+          .map(|(_, cond)| cond.clone())
+      })
+      .collect();
+    let control_is_enabled = vec![true; controls.len()];
+    // …and with the pane it belongs to, for a `PaneSelector` control panel.
+    let control_visible: Vec<Option<String>> = controls
+      .iter()
+      .map(|c| {
+        spec
+          .control_visible
+          .iter()
+          .find(|(n, _)| n == c.name())
+          .map(|(_, cond)| cond.clone())
+      })
+      .collect();
+    let control_is_visible = vec![true; controls.len()];
+    let mut state = ManipulateState {
+      body: spec.body_code,
+      initialization: spec.initialization,
+      controls,
+      state: spec.state,
+      displays: spec.displays,
+      display_trees: Vec::new(),
+      graphics_handle: None,
+      text_output: None,
+      error: None,
+      animated: spec.animated,
+      // Auto-play immediately (Wolfram's default AnimationRunning -> True)
+      // unless the spec was built paused (`AnimationRunning -> False`).
+      playing: spec.animated && spec.animation_running,
+      appearance_none: spec.appearance_none,
+      control_placement: spec.control_placement,
+      tracked_symbols: spec.tracked_symbols,
+      animation_var: spec.animation_var,
+      tracking: spec.tracking,
+      dynamic_bounds: spec.dynamic_bounds,
+      dynamic_values: spec.dynamic_values,
+      control_enabled,
+      control_is_enabled,
+      control_visible,
+      list_elements: spec.list_elements,
+      bookmarks: spec.bookmarks,
+      control_is_visible,
+      reeval_pending: 0,
+      reeval_applied: 0,
+      reeval_scheduled: false,
+    };
+    // Run the `Initialization :> …` code ONCE, before the first render.
+    // Re-running it on every re-evaluation would reset any state the body
+    // mutates (e.g. the U/V concentration fields of a simulation stepping
+    // itself forward), freezing the simulation at its first step. Helper
+    // definitions persist in the interpreter's global environment, so a
+    // single run keeps them in scope for every later re-evaluation.
+    if let Some(init) = state.initialization.as_deref() {
+      let _ = woxi::interpret_with_stdout(init);
+      // A hidden `ControlType -> None` variable the Initialization just
+      // seeded (e.g. `Initialization :> (v = RandomReal[…])` filling the
+      // noise list a Demonstration's body perturbs) must keep that value,
+      // not the spec's placeholder default (`v`'s declared domain, often
+      // `{}`) — `reevaluate` below installs `state.state` as scoped
+      // globals, which would otherwise immediately overwrite what
+      // Initialization just wrote with the stale placeholder.
+      let names: Vec<String> =
+        state.state.iter().map(|(n, _)| n.clone()).collect();
+      for (name, value) in read_manipulate_state(&names) {
+        if let Some(slot) = state.state.iter_mut().find(|(n, _)| *n == name) {
+          slot.1 = value;
+        }
+      }
+    }
+    state.reevaluate();
+    Some(state)
+  }
+
+  /// Apply saved session values — e.g. a Wolfram Demonstration's cached
+  /// `"Variables" :> {…}` dump, see
+  /// [`woxi::notebook::extract_saved_manipulate_variables`] — onto the
+  /// matching controls by name, then re-render.
+  ///
+  /// A notebook saved from the desktop FrontEnd keeps both the original
+  /// `Manipulate[…]` source and this dump, and the two can disagree: the
+  /// source's own spec still carries whatever default the author *wrote*,
+  /// while the dump carries whatever the widget's sliders were actually
+  /// sitting at when the file was last saved. Without this, a widget
+  /// rebuilt straight from the source (as `from_expr` does) would always
+  /// open showing the authored default instead of Wolfram's own saved
+  /// state. A name with no matching control (FrontEnd-only bookkeeping, or
+  /// a control this build doesn't recognize) is silently skipped.
+  pub fn apply_saved_variables(&mut self, saved: &[(String, String)]) {
+    if saved.is_empty() {
+      return;
+    }
+    for (name, code) in saved {
+      if let Some(control) = self.controls.iter_mut().find(|c| c.name() == name)
+      {
+        control.set_current_from_code(code);
+      }
+    }
+    self.reevaluate();
+  }
+
+  /// Run the `idx`-th `Bookmarks` preset's assignment code — the same
+  /// mechanism as [`apply_button_action`], just addressed by position in
+  /// `bookmarks` instead of by an already-known action string. Does nothing
+  /// if `idx` is out of range.
+  ///
+  /// [`apply_button_action`]: Self::apply_button_action
+  pub fn apply_bookmark(&mut self, idx: usize) {
+    if let Some((_, action)) = self.bookmarks.get(idx) {
+      self.apply_button_action(&action.clone());
+    }
+  }
+
+  /// Whether any control row is a `Trigger` (which carries its own
+  /// play/pause toggle, replacing the widget-level one).
+  pub fn has_trigger(&self) -> bool {
+    self
+      .controls
+      .iter()
+      .any(|c| matches!(c, ControlState::Trigger { .. }))
+  }
+
+  /// Run a `Button[…]` control's action: global side effects persist, and
+  /// writes to bound control variables (e.g. `time = 0`) move the
+  /// corresponding widgets. Re-renders afterwards.
+  pub fn apply_button_action(&mut self, action: &str) {
+    let updated = woxi::functions::graphics::apply_manipulate_button_action(
+      &self.bindings(),
+      action,
+    );
+    for (name, value) in updated {
+      if let Some(slot) = self.state.iter_mut().find(|(n, _)| *n == name) {
+        slot.1 = value;
+        continue;
+      }
+      for ctrl in &mut self.controls {
+        if ctrl.name() == name {
+          ctrl.set_current_from_code(&value);
+        }
+      }
+    }
+    self.reevaluate();
+  }
+
+  /// Copy the control at `ctrl_idx`'s just-changed value into every other
+  /// control sharing its variable name. Wolfram lets more than one widget
+  /// row bind the same Manipulate variable — e.g. a coarse and a fine
+  /// `SetterBar` preset row for one count, as in "Polypath Iterations" —
+  /// and moving either must move the other, since both are just different
+  /// views onto the same underlying value.
+  fn sync_named_siblings(&mut self, ctrl_idx: usize) {
+    let Some(control) = self.controls.get(ctrl_idx) else {
+      return;
+    };
+    let name = control.name().to_string();
+    if name.is_empty() {
+      return;
+    }
+    let code = control.current_code();
+    for (i, ctrl) in self.controls.iter_mut().enumerate() {
+      if i != ctrl_idx && ctrl.name() == name {
+        ctrl.set_current_from_code(&code);
+      }
+    }
+  }
+
+  /// Run the control at `ctrl_idx`'s `TrackingFunction -> f` (if it has
+  /// one) against its *new* current value, folding back whatever `f`
+  /// assigns (e.g. a companion control it resets) into state/controls.
+  /// Called right after a control's value is updated, before the caller
+  /// requests a re-evaluation, so the tracking function's writes are
+  /// already part of the binding set the re-render uses. Also keeps any
+  /// sibling row bound to the same variable in sync (see
+  /// `sync_named_siblings`), regardless of whether a tracking function
+  /// is present.
+  pub fn apply_tracking(&mut self, ctrl_idx: usize) {
+    self.sync_named_siblings(ctrl_idx);
+    let Some(control) = self.controls.get(ctrl_idx) else {
+      return;
+    };
+    let Some((_, code)) =
+      self.tracking.iter().find(|(n, _)| n == control.name())
+    else {
+      return;
+    };
+    let action = format!("({code})[{}]", control.current_code());
+    let updated = woxi::functions::graphics::apply_manipulate_button_action(
+      &self.bindings(),
+      &action,
+    );
+    for (name, value) in updated {
+      if let Some(slot) = self.state.iter_mut().find(|(n, _)| *n == name) {
+        slot.1 = value;
+        continue;
+      }
+      for ctrl in &mut self.controls {
+        if ctrl.name() == name {
+          ctrl.set_current_from_code(&value);
+        }
+      }
+    }
+  }
+
+  /// The full binding set (visible controls + mutable state) used to
+  /// re-evaluate the body and render the display elements.
+  ///
+  /// A control that drives one `Part` of a shared list variable (see
+  /// `list_elements`) is reported under a synthesized, internal-only name
+  /// — several such controls sharing the real variable's name would
+  /// collide as duplicate bindings. Those are grouped by parent variable
+  /// here and reassembled into one list literal, with each control's
+  /// current value substituted at its own (1-based) index; an index no
+  /// control covers keeps `0` as a placeholder.
+  ///
+  /// Two disjoint ordinary control rows may also share one variable name
+  /// (see `sync_named_siblings`), and mutable state can track a name that
+  /// also has its own visible control; either way the name must appear at
+  /// most once in the result. `reevaluate_inner` installs these as
+  /// globals, which tolerates a repeated name by just taking the last
+  /// write, but the button/tracking/mutation paths splice this list
+  /// straight into a `Block[{…}, …]` local-variable specification, and
+  /// Wolfram's `Block` rejects a spec that names the same local twice
+  /// (`Block::dup`) — so an un-deduplicated list there silently drops the
+  /// action instead of running it.
+  fn bindings(&self) -> Vec<(String, String)> {
+    let push_or_update = |b: &mut Vec<(String, String)>,
+                          name: String,
+                          code: String| {
+      match b.iter_mut().find(|(n, _)| *n == name) {
+        Some(slot) => slot.1 = code,
+        None => b.push((name, code)),
+      }
+    };
+    let mut b: Vec<(String, String)> = Vec::new();
+    let mut list_groups: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+    for c in self.controls.iter().filter(|c| c.binds_variable()) {
+      match self
+        .list_elements
+        .iter()
+        .find(|(synth, ..)| synth == c.name())
+      {
+        Some((_, parent, index)) => {
+          let group = match list_groups.iter_mut().find(|(p, _)| p == parent) {
+            Some(g) => g,
+            None => {
+              list_groups.push((parent.clone(), Vec::new()));
+              list_groups.last_mut().unwrap()
+            }
+          };
+          group.1.push((*index, c.current_code()));
+        }
+        None => push_or_update(&mut b, c.name().to_string(), c.current_code()),
+      }
+    }
+    for (parent, mut items) in list_groups {
+      items.sort_by_key(|(index, _)| *index);
+      let len = items.iter().map(|(index, _)| *index).max().unwrap_or(0);
+      let mut parts = vec!["0".to_string(); len];
+      for (index, value) in items {
+        parts[index - 1] = value;
+      }
+      push_or_update(&mut b, parent, format!("{{{}}}", parts.join(", ")));
+    }
+    for (name, code) in self.state.iter().cloned() {
+      push_or_update(&mut b, name, code);
+    }
+    b
+  }
+
+  /// Apply an interactive checkbox write-back (e.g. `data[[3, 5]] = 1`),
+  /// update the affected state variable, and re-render.
+  pub fn apply_display_mutation(&mut self, mutation: &str) {
+    let updated =
+      apply_manipulate_mutations(&self.bindings(), &[mutation.to_string()]);
+    for (name, value) in updated {
+      match self.state.iter_mut().find(|(n, _)| *n == name) {
+        Some(slot) => slot.1 = value,
+        None => self.state.push((name, value)),
+      }
+    }
+    self.reevaluate();
+  }
+
+  /// Apply a 2D-slider change to axis 0 (x) or 1 (y). A control promoted
+  /// from an in-body `Locator[Dynamic[var, cb], …]` routes the candidate
+  /// point through `cb` first — evaluated against the *previous* bindings —
+  /// and takes whatever value the callback actually stored (rounded,
+  /// clamped, or unchanged when the callback rejects the move), exactly as
+  /// Wolfram would.
+  pub fn slider2d_change(&mut self, ctrl_idx: usize, axis: u8, value: f64) {
+    let (candidate, callback, name) = {
+      let Some(ControlState::Slider2D {
+        name,
+        x,
+        y,
+        write_callback,
+        ..
+      }) = self.controls.get(ctrl_idx)
+      else {
+        return;
+      };
+      let candidate = if axis == 0 { (value, *y) } else { (*x, value) };
+      (candidate, write_callback.clone(), name.clone())
+    };
+    let accepted = match callback {
+      Some(cb) => {
+        // Bindings still hold the previous point, so the callback's
+        // validation (e.g. a degenerate-triangle check) sees the old state.
+        let bindings = self.bindings();
+        let value_code = format!(
+          "{{{}, {}}}",
+          format_f64(candidate.0),
+          format_f64(candidate.1)
+        );
+        woxi::functions::graphics::apply_manipulate_callback(
+          &bindings,
+          &cb,
+          &value_code,
+          &name,
+        )
+        .and_then(|v| woxi::functions::graphics::parse_manipulate_point(&v))
+        .unwrap_or(candidate)
+      }
+      None => candidate,
+    };
+    if let Some(ControlState::Slider2D { x, y, .. }) =
+      self.controls.get_mut(ctrl_idx)
+    {
+      *x = accepted.0;
+      *y = accepted.1;
+    }
+  }
+
+  /// Move a ColorSlider/ColorSetter handle to a new hue `position`
+  /// (`0.0..=1.0`): updates the cosmetic handle position and rewrites the
+  /// bound variable to `Hue[position]` — the InputForm Wolfram's own color
+  /// control would bind after a drag (full saturation/value). No-op for
+  /// any other control kind at `ctrl_idx`.
+  pub fn color_change(&mut self, ctrl_idx: usize, position: f64) {
+    if let Some(ControlState::Color {
+      current,
+      position: pos,
+      ..
+    }) = self.controls.get_mut(ctrl_idx)
+    {
+      *pos = position;
+      *current = format!("Hue[{}]", format_f64(position));
+    }
+  }
+
+  /// Whether moving the control at `ctrl_idx` re-runs the body. With
+  /// `TrackedSymbols :> {…}` only the listed variables do: Wolfram leaves
+  /// the rendering as it is until one of them changes, so a control outside
+  /// the list moves without re-rendering (and cannot show the body a
+  /// half-updated set of values).
+  fn control_is_tracked(&self, ctrl_idx: usize) -> bool {
+    let Some(tracked) = &self.tracked_symbols else {
+      return true;
+    };
+    match self.controls.get(ctrl_idx) {
+      // A row that binds no variable (a button, a heading) is not a
+      // variable change; its own handler decides whether to re-render.
+      Some(control) if control.binds_variable() => {
+        tracked.iter().any(|n| n == control.name())
+      }
+      _ => true,
+    }
+  }
+
+  /// Register a control change and report whether the caller must arm a
+  /// throttle timer. Re-evaluating the body on *every* slider mouse-move tick
+  /// blocks the UI thread and makes the graphic stutter/flicker while
+  /// dragging. Instead we mark the change here and only re-evaluate once the
+  /// timer fires (see [`run_scheduled_reeval`]), coalescing the whole burst
+  /// into a single render. Returns `true` when no timer is pending yet and the
+  /// caller should spawn one.
+  ///
+  /// [`run_scheduled_reeval`]: Self::run_scheduled_reeval
+  pub fn request_reeval(&mut self, ctrl_idx: usize) -> bool {
+    if !self.control_is_tracked(ctrl_idx) {
+      return false;
+    }
+    self.reeval_pending = self.reeval_pending.wrapping_add(1);
+    if self.reeval_scheduled {
+      false
+    } else {
+      self.reeval_scheduled = true;
+      true
+    }
+  }
+
+  /// Run a throttled re-evaluation when the debounce timer fires. Clears the
+  /// pending-timer flag and re-evaluates only if a control change is still
+  /// waiting to be rendered, so intermediate slider positions dropped during a
+  /// fast drag never trigger a wasted (and UI-blocking) evaluation.
+  pub fn run_scheduled_reeval(&mut self) {
+    self.reeval_scheduled = false;
+    if self.reeval_applied != self.reeval_pending {
+      self.reeval_applied = self.reeval_pending;
+      self.reevaluate();
+    }
+  }
+
+  /// Advance the animated control by one step, wrapping back to the start
+  /// once it passes the end, then re-render. Called from the app's
+  /// animation-tick subscription while `playing` is set. The target is the
+  /// `ControlType -> Trigger`/`Animator` variable when the spec named one
+  /// (always a dedicated `Trigger` row, which wraps for a finite sweep and
+  /// runs forever for an infinite one), else the first continuous control.
+  pub fn advance_animation(&mut self) {
+    let target = self.animation_var.clone();
+    let ctrl = self.controls.iter_mut().find(|c| match &target {
+      Some(name) => matches!(
+        c,
+        ControlState::Continuous { name: n, .. }
+        | ControlState::Trigger { name: n, .. } if n == name
+      ),
+      None => matches!(
+        c,
+        ControlState::Continuous { .. } | ControlState::Trigger { .. }
+      ),
+    });
+    match ctrl {
+      Some(ControlState::Continuous {
+        min,
+        max,
+        step,
+        current,
+        ..
+      })
+      | Some(ControlState::Trigger {
+        min,
+        max,
+        step,
+        current,
+        ..
+      }) => {
+        let mut v = *current + *step;
+        // Loop back to the start once we step past the end (small epsilon
+        // so floating-point drift doesn't skip the final frame). An
+        // infinite end (`{time, 0, Infinity, 1}`) never wraps.
+        if max.is_finite() && v > *max + *step * 1e-6 {
+          v = *min;
+        }
+        *current = v;
+      }
+      _ => return,
+    }
+    self.reevaluate();
+  }
+
+  /// Re-run the body with the current control bindings and update the
+  /// cached SVG / text output. Called on every slider change.
+  ///
+  /// The `Initialization :> …` code deliberately does NOT re-run here: it
+  /// ran once in [`from_expr`], and its helper definitions persist in the
+  /// interpreter's global environment. Re-running it per frame would reset
+  /// any state the body itself mutates (a simulation stepping its fields
+  /// forward would stay frozen on its first step).
+  ///
+  /// [`from_expr`]: Self::from_expr
+  pub fn reevaluate(&mut self) {
+    self.reevaluate_inner(true);
+  }
+
+  /// The body of [`reevaluate`]. `allow_retry` guards the single re-run
+  /// that a re-resolved choice list can trigger: when the new list drops
+  /// the selected value, the output just rendered was for a value the
+  /// control no longer offers, so it is rendered once more for the value
+  /// the control settled on. The re-run cannot cascade — it resolves the
+  /// same lists against bindings that already satisfy them.
+  ///
+  /// [`reevaluate`]: Self::reevaluate
+  fn reevaluate_inner(&mut self, allow_retry: bool) {
+    let bindings = self.bindings();
+    let code = self.body.clone();
+
+    // Install the bindings as globals once so a large `data` matrix is parsed
+    // a single time, then evaluate the body, rebuild the display elements, and
+    // resolve each control's `Enabled` condition against those same globals
+    // (empty local bindings → no matrix re-embed).
+    let displays = self.displays.clone();
+    let control_enabled = self.control_enabled.clone();
+    let control_visible = self.control_visible.clone();
+    let dynamic_bounds = self.dynamic_bounds.clone();
+    let dynamic_values = self.dynamic_values.clone();
+    // Every bound name (visible controls + hidden state), so a body that
+    // reassigns one of its own controls — a common "preset" idiom, e.g.
+    // `If[given > 0, {a, b, c} = presets[[given]]]` — moves that control's
+    // widget too, not just the value used to render this frame.
+    let binding_names: Vec<String> =
+      bindings.iter().map(|(n, _)| n.clone()).collect();
+    let (
+      render,
+      updated_bindings,
+      display_trees,
+      enabled,
+      visible,
+      resolved_bounds,
+      resolved_values,
+    ) = woxi::with_scoped_globals(&bindings, || {
+      // The body runs *before* the captions are built: a Manipulate body
+      // may assign to the widget's own variables (`{v, e} = ve[[n]]`),
+      // and a `Dynamic[…]` caption showing them must display what this
+      // frame computed, not the previous frame's values.
+      let render = woxi::interpret_with_stdout(&code);
+      let updated_bindings = read_manipulate_state(&binding_names);
+      let trees: Vec<_> = displays
+        .iter()
+        .map(|d| build_manipulate_display(d, &[]))
+        .collect();
+      let enabled: Vec<bool> = control_enabled
+        .iter()
+        .map(|c| match c {
+          Some(cond) => {
+            woxi::functions::graphics::manipulate_condition_enabled(cond)
+          }
+          None => true,
+        })
+        .collect();
+      // Which `PaneSelector` pane is on screen, resolved the same way.
+      let visible: Vec<bool> = control_visible
+        .iter()
+        .map(|c| match c {
+          Some(cond) => {
+            woxi::functions::graphics::manipulate_condition_enabled(cond)
+          }
+          None => true,
+        })
+        .collect();
+      // Re-resolve bounds that follow another control's variable (e.g. a
+      // time slider capped by the orbital period) against these bindings.
+      let resolved: Vec<(String, Option<f64>, Option<f64>)> = dynamic_bounds
+        .iter()
+        .map(|(name, min_code, max_code)| {
+          let eval = |c: &Option<String>| {
+            c.as_deref()
+              .and_then(woxi::functions::graphics::manipulate_eval_bound_code)
+          };
+          (name.clone(), eval(min_code), eval(max_code))
+        })
+        .collect();
+      // Likewise for choice lists built from another control's variable
+      // (a level setter offering fewer levels in 3D).
+      let values: Vec<(String, _)> = dynamic_values
+        .iter()
+        .filter_map(|(name, values_code)| {
+          woxi::functions::graphics::manipulate_eval_values_code(values_code)
+            .map(|cols| (name.clone(), cols))
+        })
+        .collect();
+      (
+        render,
+        updated_bindings,
+        trees,
+        enabled,
+        visible,
+        resolved,
+        values,
+      )
+    });
+    // Keep the body's writes to the widget's own variables, so the next
+    // frame (and any caption) builds on them — whether that variable is
+    // hidden state or a visible control's own slider/picker.
+    for (name, value) in updated_bindings {
+      if let Some(slot) = self.state.iter_mut().find(|(n, _)| *n == name) {
+        slot.1 = value.clone();
+      }
+      // Every row bound to this name (a body may reassign a variable that
+      // has more than one widget row, e.g. a shared SetterBar pair) moves
+      // together — not just the first. A variable can also be tracked in
+      // `self.state` at the same time it has its own visible control (a
+      // Demonstration redeclaring its default via a separate
+      // `{{var, default}, None}` spec alongside the row that already
+      // controls it) — sync both, so the widget's own selection never
+      // drifts from the value the body actually bound.
+      for ctrl in &mut self.controls {
+        if ctrl.name() == name {
+          ctrl.set_current_from_code(&value);
+        }
+      }
+    }
+    self.display_trees = display_trees;
+    self.control_is_enabled = enabled;
+    self.control_is_visible = visible;
+    self.apply_dynamic_bounds(&resolved_bounds);
+    // A re-resolved choice list may drop the value the body was just
+    // rendered for; render again for the value the control settled on.
+    if self.apply_dynamic_values(&resolved_values) && allow_retry {
+      self.reevaluate_inner(false);
+      return;
+    }
+
+    // Double-buffer the render: build the new SVG handle in a local and only
+    // swap the cached field once the replacement is ready, rather than nulling
+    // it out before the (potentially slow) re-evaluation. This keeps the old
+    // graphic on screen right up until the new one takes its place. A result
+    // that genuinely produces no output still blanks the frame — the old
+    // rendering is only preserved by being replaced, never by an absent one.
+    //
+    // The graphic is rendered by the iced `svg` widget (see the view layer),
+    // not a pre-rasterized bitmap: iced's raster-image pipeline uploads any
+    // texture larger than 2 MiB asynchronously on a worker thread, leaving the
+    // image blank for a frame or two whenever the (always-unique) handle id
+    // changes — that async upload gap is what made the graphic flicker while
+    // dragging. The `svg` widget uploads synchronously in the same frame, so
+    // the new graphic is drawn the instant it replaces the old one.
+    match render {
+      Ok(result) => {
+        let cleaned = if result.graphics.is_some() || result.result == "\0" {
+          String::new()
+        } else {
+          result
+            .result
+            .replace("-Graphics-", "")
+            .replace("-Graphics3D-", "")
+            .replace("-Image-", "")
+            .trim()
+            .to_string()
+        };
+
+        if let Some(svg) = result.graphics {
+          let handle = svg::Handle::from_memory(svg.as_bytes().to_vec());
+          self.graphics_handle = Some(handle);
+          self.text_output = None;
+          self.error = None;
+        } else {
+          // No graphic: either a textual result or genuinely empty output.
+          // Blank the graphic and show the text (empty text => blank cell).
+          self.graphics_handle = None;
+          self.text_output = if cleaned.is_empty() {
+            None
+          } else {
+            Some(cleaned)
+          };
+          self.error = None;
+        }
+      }
+      Err(e) => {
+        // Surface the evaluation error. The render path shows the error in
+        // place of the graphic, so drop the cached rendering here.
+        self.graphics_handle = None;
+        self.text_output = None;
+        self.error = Some(format!("{e}"));
+      }
+    }
+  }
+
+  /// Move each named continuous control to its freshly resolved bounds and
+  /// clamp its value inside them, so a slider range follows the control it
+  /// references (dragging Kepler's period `P` widens the time sliders).
+  fn apply_dynamic_bounds(
+    &mut self,
+    resolved: &[(String, Option<f64>, Option<f64>)],
+  ) {
+    for (name, new_min, new_max) in resolved {
+      // A dynamic bound may belong to either a Continuous slider or a
+      // Trigger (a projectile's flight Trigger capped by another control's
+      // computed range, e.g. `Dynamic[range[angle, speed]]`, follows that
+      // control the same way a Continuous slider's dynamic bound does).
+      let (min, max, current) = match self.controls.iter_mut().find(|c| {
+        matches!(
+          c,
+          ControlState::Continuous { name: n, .. }
+          | ControlState::Trigger { name: n, .. } if n == name
+        )
+      }) {
+        Some(ControlState::Continuous {
+          min, max, current, ..
+        })
+        | Some(ControlState::Trigger {
+          min, max, current, ..
+        }) => (min, max, current),
+        _ => continue,
+      };
+      if let Some(v) = new_min {
+        *min = *v;
+      }
+      if let Some(v) = new_max {
+        *max = *v;
+      }
+      if *max < *min {
+        std::mem::swap(min, max);
+      }
+      *current = current.clamp(*min, *max);
+    }
+  }
+
+  /// Replace each named discrete control's choices with the freshly
+  /// resolved list, so a setter bar follows the control it references (a
+  /// level setter drops from six choices to three once the 3D view is on).
+  /// The selected value is kept when it survives into the new list;
+  /// otherwise the selection clamps to the last remaining choice, which is
+  /// what Wolfram shows when the current level falls off the end.
+  fn apply_dynamic_values(&mut self, resolved: &[ResolvedChoices]) -> bool {
+    let mut selection_moved = false;
+    for (name, (new_values, new_labels, new_svgs, new_runs)) in resolved {
+      let Some(ControlState::Discrete {
+        values,
+        value_labels,
+        value_label_svgs,
+        value_label_runs,
+        current_index,
+        ..
+      }) = self.controls.iter_mut().find(
+        |c| matches!(c, ControlState::Discrete { name: n, .. } if n == name),
+      )
+      else {
+        continue;
+      };
+      if values == new_values {
+        continue;
+      }
+      let selected = values.get(*current_index).cloned();
+      values.clone_from(new_values);
+      value_labels.clone_from(new_labels);
+      *value_label_svgs = new_svgs
+        .iter()
+        .map(|s| {
+          s.as_ref()
+            .map(|svg| svg::Handle::from_memory(svg.as_bytes().to_vec()))
+        })
+        .collect();
+      value_label_runs.clone_from(new_runs);
+      let kept = selected.and_then(|v| values.iter().position(|nv| *nv == v));
+      *current_index = kept.unwrap_or_else(|| values.len().saturating_sub(1));
+      selection_moved |= kept.is_none();
+    }
+    selection_moved
+  }
+}
+
+fn controls_from_spec(spec: &ManipulateSpec) -> Vec<ControlState> {
+  spec
+    .controls
+    .iter()
+    .map(|c| match c {
+      ManipulateControl::Continuous {
+        name,
+        label,
+        label_runs,
+        min,
+        max,
+        step,
+        initial,
+        is_real,
+        orientation,
+      } => {
+        let step = step.unwrap_or_else(|| {
+          let span = (*max - *min).abs();
+          if span > 0.0 { span / 100.0 } else { 1.0 }
+        });
+        ControlState::Continuous {
+          name: name.clone(),
+          label: label.clone(),
+          label_runs: label_runs.clone(),
+          min: *min,
+          max: *max,
+          step,
+          current: *initial,
+          is_real: *is_real,
+          orientation: *orientation,
+        }
+      }
+      ManipulateControl::Discrete {
+        name,
+        label,
+        label_runs,
+        values,
+        value_labels,
+        value_label_svgs,
+        value_label_runs,
+        initial_index,
+        initial_overflow,
+        popup,
+        setter_bar,
+        slider,
+        vertical,
+      } => ControlState::Discrete {
+        name: name.clone(),
+        label: label.clone(),
+        label_runs: label_runs.clone(),
+        values: values.clone(),
+        value_labels: value_labels.clone(),
+        value_label_svgs: value_label_svgs
+          .iter()
+          .map(|s| {
+            s.as_ref()
+              .map(|svg| svg::Handle::from_memory(svg.as_bytes().to_vec()))
+          })
+          .collect(),
+        value_label_runs: value_label_runs.clone(),
+        current_index: *initial_index,
+        overflow: initial_overflow.clone(),
+        popup: *popup,
+        setter_bar: *setter_bar,
+        slider: *slider,
+        vertical: *vertical,
+      },
+      ManipulateControl::Slider2D {
+        name,
+        label,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        x_initial,
+        y_initial,
+        write_callback,
+      } => ControlState::Slider2D {
+        name: name.clone(),
+        label: label.clone(),
+        x_min: *x_min,
+        x_max: *x_max,
+        y_min: *y_min,
+        y_max: *y_max,
+        x: *x_initial,
+        y: *y_initial,
+        write_callback: write_callback.clone(),
+      },
+      ManipulateControl::IntervalSlider {
+        name,
+        label,
+        min,
+        max,
+        step,
+        low_initial,
+        high_initial,
+      } => {
+        let step = step.unwrap_or_else(|| {
+          let span = (*max - *min).abs();
+          if span > 0.0 { span / 100.0 } else { 1.0 }
+        });
+        ControlState::IntervalSlider {
+          name: name.clone(),
+          label: label.clone(),
+          min: *min,
+          max: *max,
+          step,
+          low: *low_initial,
+          high: *high_initial,
+        }
+      }
+      ManipulateControl::Locator {
+        name,
+        points,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        auto_create,
+        label,
+      } => ControlState::Locator {
+        name: name.clone(),
+        label: label.clone(),
+        x_min: *x_min,
+        x_max: *x_max,
+        y_min: *y_min,
+        y_max: *y_max,
+        points: points.clone(),
+        auto_create: *auto_create,
+      },
+      ManipulateControl::Trigger {
+        name,
+        min,
+        max,
+        step,
+        initial,
+        label,
+        label_runs,
+        ..
+      } => ControlState::Trigger {
+        name: name.clone(),
+        label: label.clone(),
+        label_runs: label_runs.clone(),
+        min: *min,
+        max: *max,
+        step: *step,
+        current: *initial,
+      },
+      ManipulateControl::Button {
+        label,
+        label_runs,
+        action,
+      } => ControlState::Button {
+        label: label.clone(),
+        label_runs: label_runs.clone(),
+        action: action.clone(),
+      },
+      ManipulateControl::Heading { label, label_runs } => {
+        ControlState::Heading {
+          label: label.clone(),
+          label_runs: label_runs.clone(),
+        }
+      }
+      ManipulateControl::Divider => ControlState::Divider,
+      ManipulateControl::Color {
+        name,
+        initial,
+        label,
+        label_runs,
+      } => ControlState::Color {
+        name: name.clone(),
+        label: label.clone(),
+        label_runs: label_runs.clone(),
+        current: initial.clone(),
+        position: 0.0,
+      },
+    })
+    .collect()
+}
+
+/// Format a f64 as Wolfram InputForm. Integers are rendered without a
+/// decimal point so that e.g. `n = 10` substitutes as an Integer.
+fn format_f64(v: f64) -> String {
+  if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
+    format!("{}", v as i64)
+  } else {
+    format!("{}", v)
+  }
+}
+
+/// Format a f64 as a Wolfram machine-real InputForm literal: a whole number
+/// keeps a trailing dot (`0.`, `20.`) so it substitutes as Real rather than
+/// Integer. Used for a continuous control whose spec was written with an
+/// inexact bound/step — Wolfram keeps such a variable real-valued even while
+/// the slider sits at a "round" position, which a caption formatting it with
+/// `NumberForm[…, {n, f}]` depends on (that wrapper pads a real's fraction
+/// but leaves an exact integer unchanged).
+fn format_f64_real(v: f64) -> String {
+  if v.is_finite() && v.fract() == 0.0 && v.abs() < 1e15 {
+    format!("{}.", v as i64)
+  } else {
+    format!("{v}")
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A Demonstrations idiom declares a control's own default
+  /// (`Control[{{n, 2, "n"}, …}]`) and then redeclares the same variable's
+  /// *actual* starting value via a separate, hidden `{{n, 3}, None}` spec —
+  /// so the variable ends up tracked both by its visible control and by
+  /// `ManipulateState::state`. The widget's own selection must still track
+  /// whatever the body actually binds `n` to (3, from the override spec, as
+  /// narrowed by `If[n < from, n = 3]`), not drift to the last entry of its
+  /// choice list the way a stale `current_index` did before the two tracks
+  /// were kept in sync.
+  #[test]
+  fn discrete_control_syncs_with_shadowing_state_override() {
+    let expr = woxi::interpret_to_expr(
+      "Manipulate[
+        from = Switch[gr, 1, 2, 2, 3];
+        upto = Switch[gr, 1, 4, 2, 4];
+        If[n > upto, n = 2];
+        If[n < from, n = 3];
+        {n, gr},
+        Control[{{n, 2, \"n\"}, Dynamic[Range[from, upto]], Setter}],
+        {{from, 2}, None},
+        {{upto, 5}, None},
+        {{n, 3}, None},
+        {{gr, 2}, None}
+      ]",
+    )
+    .expect("parse Manipulate expr");
+    let state =
+      ManipulateState::from_expr(&expr).expect("build Manipulate widget");
+
+    let n_ctrl = state
+      .controls
+      .iter()
+      .find(|c| c.name() == "n")
+      .expect("n control");
+    let n_state = state
+      .state
+      .iter()
+      .find(|(name, _)| name == "n")
+      .map(|(_, v)| v.as_str());
+
+    // The widget's own selection and the shadowing state entry must agree
+    // with each other, and both with the value the body actually bound.
+    assert_eq!(n_ctrl.current_code(), "3");
+    assert_eq!(n_state, Some("3"));
+  }
+
+  /// Checked a randomly-sampled Wolfram Demonstrations Project notebook
+  /// ("Mixing and Infection in a Two-Group SIS Model") whose control panel
+  /// lays its two sliders out as `Row[{Style[…], Spacer[…],
+  /// Column[{Control[…], Control[…]}]}]` instead of bare top-level specs,
+  /// and whose `Initialization`-defined helper calls `NSolve[{eqns…, 0 <
+  /// v1 < 1, 0 < v2 < 1}, Reals]` — the domain-only, *no explicit variable
+  /// list* form of `NSolve`/`Solve` that auto-detects the unknowns from the
+  /// equations. Independently written, not copied from any specific
+  /// Demonstration: different helper name, equations and preset values
+  /// throughout.
+  ///
+  /// Regression coverage for the `NSolve`/`Solve` domain-only form itself
+  /// (see the focused core-level tests in
+  /// `tests/interpreter_tests/algebra.rs`), plus `LineLegend`/
+  /// `LegendFunction`, `Darker`, `Bookmarks`, and `ControlPlacement ->
+  /// Top`, exercised together the way the Demonstration combines them.
+  #[test]
+  fn nested_row_column_layout_with_domain_only_nsolve_helper() {
+    let code = r#"Manipulate[
+      Module[{p1s, p2s},
+        {p1s, p2s} = Transpose[
+          Table[
+            If[a b > 1 || frac < 1 - (1 - a b)/(a + b - 2 a b),
+              EquilibriumFractions[a, b, frac],
+              {0, 0}
+            ],
+            {frac, 2/100, 1, 2/100}
+          ]
+        ];
+        ListPlot[{p2s, (p1s + p2s)/2, p1s},
+          DataRange -> {2, 100},
+          PlotStyle -> {Red, Darker[Green], Blue},
+          PlotLegends -> LineLegend[{"p2", "avg", "p1"},
+            LegendFunction -> (Framed[#, RoundingRadius -> 5] &)],
+          FrameLabel -> {"mixing (%)", None},
+          Frame -> True,
+          PlotLabel -> "equilibrium fractions",
+          ImageSize -> {520, 400}
+        ]
+      ],
+      Row[{
+        Style["rate ", Bold],
+        Spacer[20],
+        Column[{
+          Control[{{a, 0.5, "a"}, 0.01, 5, Appearance -> "Labeled"}],
+          Control[{{b, 2, "b"}, 1.01, 5, Appearance -> "Labeled"}]
+        }]
+      }],
+      ControlPlacement -> Top,
+      SaveDefinitions -> True,
+      Bookmarks -> {
+        "preset1" :> {a = 0.25, b = 2},
+        "preset2" :> {a = 1, b = 4}
+      },
+      Initialization :> (
+        EquilibriumFractions[a_, b_, frac_] := Module[{v1, v2},
+          First[
+            {v1, v2} /. NSolve[
+              {
+                (1 - v1) a (frac v2 + (1 - frac) v1) - v1 == 0,
+                (1 - v2) b (frac v1 + (1 - frac) v2) - v2 == 0,
+                0 < v1 < 1, 0 < v2 < 1
+              },
+              Reals
+            ]
+          ]
+        ]
+      )
+    ]"#;
+    let expr =
+      woxi::interpret_to_expr(code).expect("Manipulate should parse and hold");
+    let state = ManipulateState::from_expr(&expr)
+      .expect("the nested Row/Column layout should build a ManipulateState");
+
+    assert_eq!(
+      state.error, None,
+      "body must evaluate cleanly: {:?}",
+      state.error
+    );
+    assert_eq!(
+      state.control_placement,
+      ControlPlacement::Top,
+      "ControlPlacement -> Top must survive into the widget state"
+    );
+
+    // The Style["rate ", Bold] heading and the two sliders pulled out of
+    // the nested Row/Column layout must all show up as controls.
+    let names: Vec<&str> = state.controls.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["", "a", "b"]);
+
+    assert!(
+      state.graphics_handle.is_some(),
+      "the equilibrium-fraction plot should render"
+    );
+
+    // A `Solve`/`NSolve` call that failed to auto-detect its variables
+    // under the domain-only two-argument form prints Wolfram-style
+    // `Tag::name:` error messages instead of solving, and the body ends up
+    // unable to plot real numbers — re-run the body directly and check its
+    // SVG output carries none of those markers, nor a bare unevaluated
+    // `NSolve[…]`/`Solve[…]` call.
+    let bindings: Vec<(String, String)> = state
+      .controls
+      .iter()
+      .filter(|c| c.binds_variable())
+      .map(|c| (c.name().to_string(), c.current_code()))
+      .chain(state.state.iter().cloned())
+      .collect();
+    let svg = woxi::with_scoped_globals(&bindings, || {
+      woxi::interpret_with_stdout(&state.body)
+    })
+    .expect("body evaluates")
+    .graphics
+    .expect("the equilibrium-fraction plot should render");
+    for marker in [
+      "::svars", "::reps", "::nmtx", "::shape", "NSolve[", "Solve[",
+    ] {
+      assert!(
+        !svg.contains(marker),
+        "the domain-only NSolve inside the Manipulate must actually solve, \
+         not leak an error/unevaluated call into the plot ({marker:?} \
+         found): {svg}"
+      );
+    }
+  }
+
+  /// Checked a randomly-sampled Wolfram Demonstrations Project notebook
+  /// ("Newton's Polynomial Solver") whose control panel is written as
+  /// `Text@Grid[{{header, header}, {Control[…], Control[…]}, …}]` — a
+  /// custom control table rather than bare top-level specs or a plain
+  /// `Row`/`Column` grouping. Independently written, not copied from any
+  /// specific Demonstration: different variables, bounds and headers
+  /// throughout.
+  ///
+  /// Regression coverage for `Text[…]` wrapping a `Grid[…]` of inline
+  /// `Control[…]` cells: `Text[…]` is not itself a `Row`/`Column`/`Grid`
+  /// layout container, so without unwrapping it first, the whole
+  /// `Text[Grid[…]]` argument used to be swallowed whole by the
+  /// static-heading path (`is_manipulate_annotation_head`), stringifying
+  /// every slider into inert label text instead of building a real
+  /// control for it.
+  #[test]
+  fn text_grid_control_table_layout() {
+    let code = r#"Manipulate[
+      Plot[p*x^2 + q*x, {x, -5, 5}],
+      Text@Grid[{
+        {"coefficient", "value"},
+        {Control[{{p, 1, "p"}, -3, 3, 0.5, Appearance -> "Labeled"}],
+         Control[{{q, 0, "q"}, -3, 3, 0.5, Appearance -> "Labeled"}]}
+      }]
+    ]"#;
+    let expr =
+      woxi::interpret_to_expr(code).expect("Manipulate should parse and hold");
+    let state = ManipulateState::from_expr(&expr)
+      .expect("the Text[Grid[…]] control table should build a ManipulateState");
+
+    assert_eq!(
+      state.error, None,
+      "body must evaluate cleanly: {:?}",
+      state.error
+    );
+
+    // The two header strings become heading rows, and the two `Control[…]`
+    // cells become real sliders bound to `p` and `q` — not a single
+    // flattened text heading with no bound variables at all.
+    let names: Vec<&str> = state.controls.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["", "", "p", "q"]);
+    assert!(
+      state.controls[2].binds_variable() && state.controls[3].binds_variable(),
+      "both Grid-embedded Control[…] cells must become real, bound sliders: \
+       {:?}",
+      state.controls
+    );
+
+    assert!(state.graphics_handle.is_some(), "the plot should render");
+  }
+
+  /// Checked a randomly-sampled Wolfram Demonstrations Project notebook
+  /// ("Nonlinear Wave Equations"), whose body is `If[twoD, DensityPlot,
+  /// Plot3D][u[…] /. NDSolve[…], …]` with a `SetterBar` toggling the plot
+  /// type and the space domain's two ends tied together by a periodic
+  /// boundary (`u[t, x_min] == u[t, x_max]`) rather than fixed separately
+  /// — independently reproduced here with a different equation, domain
+  /// and control layout (a cubic nonlinearity in place of the
+  /// Demonstration's own choice, and no equation-selector control).
+  ///
+  /// Regression coverage for `NDSolve`'s hyperbolic (second-order-in-time)
+  /// solver accepting a periodic boundary at all (see the focused
+  /// core-level tests alongside
+  /// `pde_hyperbolic_wave_equation_with_periodic_boundary_matches_standing_wave`
+  /// in `tests/interpreter_tests/calculus.rs`): a periodic equation used
+  /// to be misread as an ordinary one-sided Dirichlet condition whose
+  /// "value" was the other end's own unevaluated call, silently leaving
+  /// the solve one boundary equation short — `NDSolve` returned
+  /// unevaluated with no error message, and the widget's plot never
+  /// rendered at all with the Demonstration's own default control values.
+  #[test]
+  fn nonlinear_wave_pde_with_periodic_boundary_and_setter_bar_plot_type() {
+    let code = r#"Manipulate[
+      If[twoD, DensityPlot, Plot3D][
+        Evaluate[
+          u[t, x] /. Quiet[NDSolve[
+            {D[u[t, x], t, t] ==
+               D[u[t, x], {x, 2}] - u[t, x] + u[t, x]^3/6,
+             u[0, x] == amp*Cos[Pi x],
+             Derivative[1, 0][u][0, x] == 0,
+             u[t, -1] == u[t, 1]},
+            u, {t, 0, tmax}, {x, -1, 1},
+            Method -> {"MethodOfLines",
+              "SpatialDiscretization" -> {"TensorProductGrid",
+                "DifferenceOrder" -> "Pseudospectral",
+                "MinStepSize" -> 0.2}}]]
+        ],
+        {x, -1, 1}, {t, 0, tmax},
+        PlotRange -> All, ImageSize -> {400, 300}
+      ],
+      {{tmax, 1, "duration"}, 0.5, 2},
+      {{amp, 1, "amplitude"}, 0.5, 2},
+      {{twoD, True, "plot type"}, {True -> "2D", False -> "3D"},
+        ControlType -> SetterBar}
+    ]"#;
+    let expr =
+      woxi::interpret_to_expr(code).expect("Manipulate should parse and hold");
+    let state = ManipulateState::from_expr(&expr)
+      .expect("the periodic-boundary PDE Manipulate should build a state");
+
+    assert_eq!(
+      state.error, None,
+      "body must evaluate cleanly: {:?}",
+      state.error
+    );
+    assert!(
+      state.graphics_handle.is_some(),
+      "the density plot should render with the widget's default control \
+       values"
+    );
+
+    let names: Vec<&str> = state.controls.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["tmax", "amp", "twoD"]);
+  }
+}

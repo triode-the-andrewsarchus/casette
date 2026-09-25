@@ -1,0 +1,1071 @@
+#[allow(unused_imports)]
+use super::*;
+use crate::functions::math_ast::make_divide;
+
+// ─── Cancel ─────────────────────────────────────────────────────────
+
+/// Cancel[expr] - Cancels common factors between numerator and denominator
+pub fn cancel_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  if args.len() != 1 {
+    return Err(InterpreterError::EvaluationError(
+      "Cancel expects exactly 1 argument".into(),
+    ));
+  }
+  // A unit numerator has nothing to cancel: wolframscript returns the
+  // fraction unchanged — Cancel[1/(2 - 2*x)] stays (2 - 2*x)^(-1) and
+  // Cancel[1/((x-1)(x+1))] keeps the factored denominator. A denominator
+  // that itself contains a fraction (1/(x + 1/x)) still needs the full
+  // combine-and-cancel machinery.
+  {
+    let (num, den) = super::together::extract_num_den(&args[0]);
+    if matches!(num, Expr::Integer(1))
+      && !matches!(den, Expr::Integer(1))
+      && !contains_inner_fraction(&den)
+    {
+      return Ok(args[0].clone());
+    }
+  }
+  let result = cancel_expr(&args[0]);
+  // wolframscript presents Cancel results with the denominator content
+  // hoisted — Cancel[(x+1)/(4*x+5*x^2)] → (1+x)/(x*(4+5*x)) — and when
+  // nothing actually cancelled it preserves the input's factored
+  // denominator shape: Cancel[(x+1)/((x-1)(x+2))] keeps the product
+  // (differential fuzzer, seed 7037214829039037119; wolframscript-verified).
+  let (rn, rd) = super::together::extract_num_den(&result);
+  let (input_n, input_d) = super::together::extract_num_den(&args[0]);
+  // Only a PRODUCT denominator is worth preserving — a single Plus (or a
+  // power of one) keeps cancel_expr's own normalization, so the sign
+  // canonicalization Cancel[2/(1-2*x)^2] → 2/(-1+2*x)^2 survives.
+  let unchanged = !matches!(&rd, Expr::Integer(1))
+    && super::together::flatten_times_args(std::slice::from_ref(&input_d))
+      .len()
+      >= 2
+    && expr_to_string(&expand_and_combine(&rn))
+      == expr_to_string(&expand_and_combine(&input_n))
+    && expr_to_string(&expand_and_combine(&rd))
+      == expr_to_string(&expand_and_combine(&input_d));
+  let base = if unchanged { args[0].clone() } else { result };
+  Ok(super::together::distribute_unit_negative_numerator(
+    &super::together::hoist_result_denominator_content(&base),
+  ))
+}
+
+/// The base of `Power[base, n]` with an integer exponent n ≥ 2 (either
+/// Expr shape), where the base is a sum.
+fn int_power_base(e: &Expr) -> Option<&Expr> {
+  let (base, n) = match e {
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      match &args[1] {
+        Expr::Integer(n) => (&args[0], *n),
+        _ => return None,
+      }
+    }
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => match right.as_ref() {
+      Expr::Integer(n) => (left.as_ref(), *n),
+      _ => return None,
+    },
+    _ => return None,
+  };
+  if n >= 2 && super::expand::is_sum(base) {
+    Some(base)
+  } else {
+    None
+  }
+}
+
+/// True when the expression contains a division or negative power anywhere
+/// — i.e. a nested fraction that Cancel must still combine.
+fn contains_inner_fraction(e: &Expr) -> bool {
+  match e {
+    Expr::BinaryOp {
+      op: BinaryOperator::Divide,
+      ..
+    } => true,
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      matches!(right.as_ref(), Expr::Integer(n) if *n < 0)
+        || contains_inner_fraction(left)
+        || contains_inner_fraction(right)
+    }
+    Expr::FunctionCall { name, args } if name == "Power" && args.len() == 2 => {
+      matches!(&args[1], Expr::Integer(n) if *n < 0)
+        || args.iter().any(contains_inner_fraction)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      contains_inner_fraction(left) || contains_inner_fraction(right)
+    }
+    Expr::UnaryOp { operand, .. } => contains_inner_fraction(operand),
+    Expr::FunctionCall { args, .. } | Expr::List(args) => {
+      args.iter().any(contains_inner_fraction)
+    }
+    _ => false,
+  }
+}
+
+fn cancel_expr(expr: &Expr) -> Expr {
+  cancel_expr_with_opaque_fallback(expr, true)
+}
+
+/// Like `cancel_expr` but without the wolframscript Cancel quotient-sign
+/// canonicalization, for callers whose WL counterpart keeps the raw
+/// quotient sign (D[ArcCoth[x^2], x] stays (2*x)/(1 - x^4)).
+pub fn cancel_expr_keep_quotient_sign(expr: &Expr) -> Expr {
+  cancel_expr_with_opaque_fallback(expr, false)
+}
+
+/// The direct cancellation, falling back to the opaque-atom abstraction
+/// (see [`cancel_via_opaque_atoms`]) only for a quotient the direct path
+/// leaves exactly as it found it, and only when the fallback genuinely
+/// cancels something.
+///
+/// "Genuinely" is measured by leaf count: the stand-in symbols do not sort
+/// where the subexpressions they replace do, so an abstracted round trip
+/// that cancels *nothing* still comes back with its factors reordered
+/// (`2 a x Hypergeometric1F1[…]` as `2 a Hypergeometric1F1[…] x`). Requiring
+/// the result to be smaller keeps those round trips out.
+fn cancel_expr_with_opaque_fallback(
+  expr: &Expr,
+  canonicalize_sign: bool,
+) -> Expr {
+  // The direct path may reshape a quotient without cancelling anything
+  // (reordering a numerator it could not factor), so the opaque-atom
+  // attempt is always made and the smaller result wins.
+  let direct = cancel_expr_impl(expr, canonicalize_sign);
+  match cancel_via_opaque_atoms(expr, canonicalize_sign) {
+    Some(alt)
+      if super::simplify::leaf_count(&alt)
+        < super::simplify::leaf_count(&direct) =>
+    {
+      alt
+    }
+    _ => direct,
+  }
+}
+
+/// Cancel a quotient whose "variables" are opaque subexpressions the
+/// polynomial engine cannot take directly (`f[1]`, `q[[1]]`, `Sin[a]`, …),
+/// by abstracting each into a fresh symbol, cancelling that, and putting
+/// them back. `(f[1] f[2] - f[2]^2)/(f[1] - f[2])` cancels to `f[2]` the
+/// same way `(a b - b^2)/(a - b)` cancels to `b`.
+///
+/// `None` when there is nothing to abstract or the abstracted attempt
+/// changed nothing, so this is purely a fallback for quotients the direct
+/// path leaves untouched.
+fn cancel_via_opaque_atoms(
+  expr: &Expr,
+  canonicalize_sign: bool,
+) -> Option<Expr> {
+  // An opaque atom on one side only is still a coefficient the polynomial
+  // engine must not choke on: `(-1 + f[a] + z - 2 f[a] z + f[a] z^2)/((z-1) z)`
+  // cancels its `z - 1` just like the version with a plain symbol `a`.
+  let mut atoms = Vec::new();
+  opaque_atoms(expr, &mut atoms);
+  if atoms.is_empty() {
+    return None;
+  }
+  // `$` is not valid in a user-written symbol read from Wolfram source, so
+  // these names cannot collide with anything already in the expression.
+  let names: Vec<Expr> = (0..atoms.len())
+    .map(|i| Expr::Identifier(format!("Woxi$cancel${i}")))
+    .collect();
+  let mut abstracted = expr.clone();
+  for (atom, name) in atoms.iter().zip(&names) {
+    abstracted = super::solve::substitute_expr(&abstracted, atom, name);
+  }
+  let cancelled = cancel_expr_impl(&abstracted, canonicalize_sign);
+  if expr_to_string(&cancelled) == expr_to_string(&abstracted) {
+    return None;
+  }
+  let mut restored = cancelled;
+  for (atom, name) in atoms.iter().zip(&names) {
+    restored = super::solve::substitute_expr(&restored, name, atom);
+  }
+  // Re-evaluate so the products are in canonical order again (`z*f[a]`,
+  // not the `f[a]*z` the placeholder name sorted into).
+  Some(crate::evaluator::evaluate_expr_to_expr(&restored).unwrap_or(restored))
+}
+
+fn cancel_expr_impl(expr: &Expr, canonicalize_sign: bool) -> Expr {
+  // Rationals are already in simplest form
+  if matches!(expr, Expr::FunctionCall { name, args } if name == "Rational" && args.len() == 2)
+  {
+    return expr.clone();
+  }
+  // Look for division (handles both BinaryOp::Divide and Times[..., Power[..., -1]])
+  let (raw_num, raw_den) = super::together::extract_num_den(expr);
+  if !matches!(&raw_den, Expr::Integer(1)) {
+    // A keep-sign caller (D) with a POWER-of-sum denominator keeps the
+    // composed chain-rule shape when only integer content would cancel:
+    // wolframscript's D[3/(2+4x-4x^2), x] stays
+    // (-3*(4 - 8*x))/(2 + 4*x - 4*x^2)^2, never dividing the shared 4
+    // through the squared denominator (differential fuzzer, seed
+    // 15005068122302321648). A genuine polynomial gcd (D[Log[x^2], x] →
+    // 2/x, (x^2+2x+1)/(x+1)^2 → 1) still cancels.
+    if !canonicalize_sign
+      && let Some(pow_base) = int_power_base(&raw_den)
+      && let num_exp = expand_and_combine(&raw_num)
+      && let Some(var) = find_single_variable_both(&num_exp, pow_base)
+      && let (Some(nc), Some(bc)) = (
+        extract_poly_coeffs(&num_exp, &var),
+        extract_poly_coeffs(pow_base, &var),
+      )
+      && poly_gcd(&nc, &bc).is_some_and(|g| g.len() <= 1)
+    {
+      return expr.clone();
+    }
+    {
+      let num = expand_and_combine(&raw_num);
+      let den = expand_and_combine(&raw_den);
+
+      // Try polynomial division
+      if let Some(var) = find_single_variable_both(&num, &den)
+        && let (Some(num_coeffs), Some(den_coeffs)) = (
+          extract_poly_coeffs(&num, &var),
+          extract_poly_coeffs(&den, &var),
+        )
+      {
+        // Find the GCD of the two polynomials
+        if let Some(gcd_coeffs) = poly_gcd(&num_coeffs, &den_coeffs)
+          && (gcd_coeffs.len() > 1
+            || (gcd_coeffs.len() == 1 && gcd_coeffs[0] != 1))
+        {
+          // Divide both by GCD
+          if let (Some(mut new_num), Some(mut new_den)) = (
+            poly_exact_divide(&num_coeffs, &gcd_coeffs),
+            poly_exact_divide(&den_coeffs, &gcd_coeffs),
+          ) {
+            // Also cancel numeric content GCD (poly_gcd normalizes to
+            // primitive, so numeric factors like gcd(2,4)=2 may remain)
+            let num_content = new_num
+              .iter()
+              .copied()
+              .filter(|&c| c != 0)
+              .fold(0i128, gcd_i128);
+            let den_content = new_den
+              .iter()
+              .copied()
+              .filter(|&c| c != 0)
+              .fold(0i128, gcd_i128);
+            if num_content > 1 && den_content > 1 {
+              let content_gcd = gcd_i128(num_content, den_content);
+              if content_gcd > 1 {
+                new_num = new_num.iter().map(|c| c / content_gcd).collect();
+                new_den = new_den.iter().map(|c| c / content_gcd).collect();
+              }
+            }
+            // Normalize sign: keep denominator positive
+            if new_den.last().is_some_and(|&c| c < 0) {
+              new_num = new_num.iter().map(|c| -c).collect();
+              new_den = new_den.iter().map(|c| -c).collect();
+            }
+            let num_expr = coeffs_to_expr(&new_num, &var);
+            let den_expr = coeffs_to_expr(&new_den, &var);
+            // If denominator is 1, just return numerator
+            if new_den == [1] {
+              return num_expr;
+            }
+            return make_divide(num_expr, den_expr);
+          }
+        }
+
+        // No usable polynomial GCD — still cancel the positive integer
+        // content shared by numerator and denominator: wolframscript gives
+        // Cancel[(2-4x)/(2+2x)] → (1-2x)/(1+x) and Cancel[(2-4x)/(-2+2x)]
+        // → (1-2x)/(-1+x). The reduced quotient is then normalized so the
+        // denominator's leading coefficient is positive — except for bare
+        // reciprocals: Cancel[(2-4x)/(2-2x)] → (-1+2x)/(-1+x) but
+        // Cancel[2/(2-2x)] → (1-x)^(-1).
+        let num_content = num_coeffs
+          .iter()
+          .copied()
+          .filter(|&c| c != 0)
+          .fold(0i128, gcd_i128);
+        let den_content = den_coeffs
+          .iter()
+          .copied()
+          .filter(|&c| c != 0)
+          .fold(0i128, gcd_i128);
+        let g = gcd_i128(num_content, den_content);
+        if g > 1 {
+          let mut new_num: Vec<i128> =
+            num_coeffs.iter().map(|c| c / g).collect();
+          let mut new_den: Vec<i128> =
+            den_coeffs.iter().map(|c| c / g).collect();
+          if canonicalize_sign
+            && new_den.last().is_some_and(|&c| c < 0)
+            && new_num != [1]
+          {
+            new_num = new_num.iter().map(|c| -c).collect();
+            new_den = new_den.iter().map(|c| -c).collect();
+          }
+          let num_expr = coeffs_to_expr(&new_num, &var);
+          if new_den == [1] {
+            return num_expr;
+          }
+          return make_divide(num_expr, coeffs_to_expr(&new_den, &var));
+        }
+
+        // A bare negative-constant denominator absorbs its sign into the
+        // expanded numerator: Cancel[(x + x^2)/(-3)] → (-x - x^2)/3, not
+        // -1/3*x*(1+x) (differential fuzzer, seed 1783537668073123846).
+        if canonicalize_sign
+          && den_coeffs.len() == 1
+          && den_coeffs[0] < 0
+          && num_coeffs.len() > 1
+        {
+          let neg_num: Vec<i128> = num_coeffs.iter().map(|c| -c).collect();
+          return make_divide(
+            coeffs_to_expr(&neg_num, &var),
+            Expr::Integer(-den_coeffs[0]),
+          );
+        }
+      }
+
+      // Try multivariate cancellation: extract common monomial factors from
+      // additive terms in the numerator, then cancel with the denominator.
+      // E.g. (a^2*x + a*x^2) / a^2 → factor out a from numerator → a*(a*x + x^2) / a^2 → (a*x + x^2)/a
+      {
+        use super::coefficient::collect_additive_terms;
+        use super::expand::{build_product, collect_multiplicative_factors};
+
+        let terms = collect_additive_terms(&num);
+        if terms.len() >= 2 {
+          // For each term, extract base→exp map of its multiplicative factors
+          type BaseExpMap = Vec<(String, Expr, i128)>;
+          fn term_base_exp(term: &Expr) -> BaseExpMap {
+            let factors = collect_multiplicative_factors(term);
+            let mut map: BaseExpMap = Vec::new();
+            for f in &factors {
+              let (base_str, base, exp) = match f {
+                Expr::BinaryOp {
+                  op: BinaryOperator::Power,
+                  left,
+                  right,
+                } => {
+                  if let Expr::Integer(n) = right.as_ref() {
+                    (expr_to_string(left), *left.clone(), *n)
+                  } else {
+                    (expr_to_string(f), f.clone(), 1)
+                  }
+                }
+                Expr::FunctionCall { name, args }
+                  if name == "Power" && args.len() == 2 =>
+                {
+                  if let Expr::Integer(n) = &args[1] {
+                    (expr_to_string(&args[0]), args[0].clone(), *n)
+                  } else {
+                    (expr_to_string(f), f.clone(), 1)
+                  }
+                }
+                Expr::Integer(_) => continue,
+                _ => (expr_to_string(f), f.clone(), 1),
+              };
+              if let Some(entry) =
+                map.iter_mut().find(|(k, _, _)| *k == base_str)
+              {
+                entry.2 += exp;
+              } else {
+                map.push((base_str, base, exp));
+              }
+            }
+            map
+          }
+
+          // Find common base^exp across all terms (min exponent for each base)
+          let first_map = term_base_exp(&terms[0]);
+          let mut common: BaseExpMap = first_map;
+          for term in &terms[1..] {
+            let tmap = term_base_exp(term);
+            common.retain_mut(|(key, _, exp)| {
+              if let Some(entry) = tmap.iter().find(|(k, _, _)| k == key) {
+                *exp = (*exp).min(entry.2);
+                *exp > 0
+              } else {
+                false
+              }
+            });
+          }
+
+          if !common.is_empty() {
+            // Build the common factor
+            let common_factors: Vec<Expr> = common
+              .iter()
+              .map(|(_, base, exp)| {
+                if *exp == 1 {
+                  base.clone()
+                } else {
+                  pow2(base.clone(), Expr::Integer(*exp))
+                }
+              })
+              .collect();
+            let common_factor = build_product(common_factors);
+
+            // Now cancel common_factor with the denominator using symbolic factor cancellation
+            let den_factors = collect_multiplicative_factors(&den);
+            let cf_factors = collect_multiplicative_factors(&common_factor);
+
+            // Build base→exp maps for common factor and denominator
+            fn factor_base_exp(factors: &[Expr]) -> Vec<(String, Expr, i128)> {
+              let mut map: Vec<(String, Expr, i128)> = Vec::new();
+              for f in factors {
+                let (base_str, base, exp) = match f {
+                  Expr::BinaryOp {
+                    op: BinaryOperator::Power,
+                    left,
+                    right,
+                  } => {
+                    if let Expr::Integer(n) = right.as_ref() {
+                      (expr_to_string(left), *left.clone(), *n)
+                    } else {
+                      (expr_to_string(f), f.clone(), 1)
+                    }
+                  }
+                  Expr::FunctionCall { name, args }
+                    if name == "Power" && args.len() == 2 =>
+                  {
+                    if let Expr::Integer(n) = &args[1] {
+                      (expr_to_string(&args[0]), args[0].clone(), *n)
+                    } else {
+                      (expr_to_string(f), f.clone(), 1)
+                    }
+                  }
+                  Expr::Integer(_) => continue,
+                  _ => (expr_to_string(f), f.clone(), 1),
+                };
+                if let Some(entry) =
+                  map.iter_mut().find(|(k, _, _)| *k == base_str)
+                {
+                  entry.2 += exp;
+                } else {
+                  map.push((base_str, base, exp));
+                }
+              }
+              map
+            }
+
+            let cf_map = factor_base_exp(&cf_factors);
+            let mut den_map = factor_base_exp(&den_factors);
+
+            // Cancel: subtract common factor exponents from denominator
+            let mut cancelled_from_num: Vec<(String, i128)> = Vec::new();
+            for (key, _, cf_exp) in &cf_map {
+              if let Some(den_entry) =
+                den_map.iter_mut().find(|(k, _, _)| k == key)
+              {
+                let cancel_exp = (*cf_exp).min(den_entry.2);
+                if cancel_exp > 0 {
+                  den_entry.2 -= cancel_exp;
+                  cancelled_from_num.push((key.clone(), cancel_exp));
+                }
+              }
+            }
+
+            if !cancelled_from_num.is_empty() {
+              // Rebuild numerator: divide each term by cancelled factors
+              let mut new_terms = Vec::new();
+              for term in &terms {
+                let mut t_factors = collect_multiplicative_factors(term);
+                for (cancel_key, cancel_exp) in &cancelled_from_num {
+                  let mut remaining = *cancel_exp;
+                  let mut new_factors = Vec::new();
+                  for f in t_factors {
+                    if remaining <= 0 {
+                      new_factors.push(f);
+                      continue;
+                    }
+                    let (base_str, base, exp) = match &f {
+                      Expr::BinaryOp {
+                        op: BinaryOperator::Power,
+                        left,
+                        right,
+                      } => {
+                        if let Expr::Integer(n) = right.as_ref() {
+                          (expr_to_string(left), *left.clone(), *n)
+                        } else {
+                          (expr_to_string(&f), f.clone(), 1)
+                        }
+                      }
+                      Expr::FunctionCall { name, args }
+                        if name == "Power" && args.len() == 2 =>
+                      {
+                        if let Expr::Integer(n) = &args[1] {
+                          (expr_to_string(&args[0]), args[0].clone(), *n)
+                        } else {
+                          (expr_to_string(&f), f.clone(), 1)
+                        }
+                      }
+                      Expr::Integer(_) => {
+                        new_factors.push(f);
+                        continue;
+                      }
+                      _ => (expr_to_string(&f), f.clone(), 1),
+                    };
+                    if base_str == *cancel_key {
+                      let reduce = remaining.min(exp);
+                      remaining -= reduce;
+                      let new_exp = exp - reduce;
+                      if new_exp > 1 {
+                        new_factors.push(pow2(base, Expr::Integer(new_exp)));
+                      } else if new_exp == 1 {
+                        new_factors.push(base);
+                      }
+                      // new_exp == 0: factor is gone
+                    } else {
+                      new_factors.push(f);
+                    }
+                  }
+                  t_factors = new_factors;
+                }
+                if t_factors.is_empty() {
+                  new_terms.push(Expr::Integer(1));
+                } else {
+                  new_terms.push(build_product(t_factors));
+                }
+              }
+
+              // Build new numerator as sum
+              let new_num_expr = if new_terms.len() == 1 {
+                expand_and_combine(&new_terms[0])
+              } else {
+                let sum = super::expand::build_sum(new_terms);
+                expand_and_combine(&sum)
+              };
+
+              // Rebuild denominator
+              let mut new_den_factors: Vec<Expr> = Vec::new();
+              // Collect integer factors from original denominator
+              for f in &den_factors {
+                if let Expr::Integer(n) = f {
+                  new_den_factors.push(Expr::Integer(*n));
+                }
+              }
+              for (_, base, exp) in &den_map {
+                if *exp > 1 {
+                  new_den_factors.push(pow2(base.clone(), Expr::Integer(*exp)));
+                } else if *exp == 1 {
+                  new_den_factors.push(base.clone());
+                }
+              }
+              let new_den_expr = if new_den_factors.is_empty() {
+                Expr::Integer(1)
+              } else {
+                build_product(new_den_factors)
+              };
+
+              if matches!(&new_den_expr, Expr::Integer(1)) {
+                return new_num_expr;
+              }
+              // Recursively cancel in case more simplification is possible
+              return cancel_expr_impl(
+                &make_divide(new_num_expr, new_den_expr),
+                canonicalize_sign,
+              );
+            }
+          }
+        }
+      }
+
+      // Try symbolic factor cancellation for products (e.g. (a*b)/(a*c) → b/c)
+      let result = cancel_symbolic_factors(&num, &den);
+      let (res_num, res_den) = super::together::extract_num_den(&result);
+      if matches!(&res_den, Expr::Integer(1)) {
+        // Fully cancelled (not a fraction anymore)
+        return result;
+      }
+      // Still a fraction — only accept if something actually changed
+      if expr_to_string(&res_num) != expr_to_string(&num)
+        || expr_to_string(&res_den) != expr_to_string(&den)
+      {
+        return result;
+      }
+
+      // Fall back to simplify_division; wolframscript's Cancel still
+      // canonicalizes an untouched quotient's denominator sign:
+      // Cancel[(-4-3x^2)/(4+x-4x^2)] → (4+3x^2)/(-4-x+4x^2).
+      // Cancel keeps a negative-content numerator inline —
+      // Cancel[(-5-2x-4x^2)/(3+2x^2+5x^3)] stays put in wolframscript
+      // where Simplify would pull -(...) out front — so the quotient
+      // minus-extraction is disabled here (differential fuzzer, seed
+      // 8887).
+      let fallback = super::simplify::simplify_division_impl(
+        &num,
+        &den,
+        canonicalize_sign,
+        false,
+        false,
+      );
+      if canonicalize_sign {
+        let (fnum, fden) = super::together::extract_num_den(&fallback);
+        if !matches!(&fden, Expr::Integer(1))
+          && let Some(canon) =
+            super::together::canonicalize_quotient_sign(&fnum, &fden, false)
+        {
+          return canon;
+        }
+        return fallback;
+      }
+      // Keep-sign callers (D) keep the input's factored shape when an
+      // integer-coefficient polynomial quotient didn't actually cancel:
+      // simplify_division re-FACTORS the expanded quotient into canonical
+      // factors, which would silently flip 2/(1-2x)^2 into 2/(-1+2x)^2 —
+      // a sign wolframscript's D preserves. Radical/transcendental
+      // quotients keep the fallback's display normalization
+      // (-(1/Sqrt[1-x^2]) etc.), where no re-factoring occurs.
+      let is_int_poly_quotient = find_single_variable_both(&num, &den)
+        .is_some_and(|v| {
+          extract_poly_coeffs(&num, &v).is_some()
+            && extract_poly_coeffs(&den, &v).is_some()
+        });
+      // …and only when the input was already in expanded shape (a power's
+      // base counts): 1/(1+2*(1+n)) must still normalize to (3+2*n)^(-1).
+      fn already_expanded(e: &Expr) -> bool {
+        let base = match e {
+          Expr::BinaryOp {
+            op: BinaryOperator::Power,
+            left,
+            right,
+          } if matches!(right.as_ref(), Expr::Integer(n) if *n > 0) => {
+            left.as_ref()
+          }
+          Expr::FunctionCall { name, args }
+            if name == "Power"
+              && args.len() == 2
+              && matches!(&args[1], Expr::Integer(n) if *n > 0) =>
+          {
+            &args[0]
+          }
+          other => other,
+        };
+        expr_to_string(&expand_and_combine(base)) == expr_to_string(base)
+      }
+      if is_int_poly_quotient
+        && already_expanded(&raw_num)
+        && already_expanded(&raw_den)
+      {
+        let (fnum, fden) = super::together::extract_num_den(&fallback);
+        if expr_to_string(&expand_and_combine(&fnum)) == expr_to_string(&num)
+          && expr_to_string(&expand_and_combine(&fden)) == expr_to_string(&den)
+        {
+          return expr.clone();
+        }
+      }
+      return fallback;
+    }
+  }
+  expand_and_combine(expr)
+}
+
+/// Cancel common symbolic factors between numerator and denominator.
+/// E.g. (a*b)/(a*c) → b/c, (a^2*b)/(a*b^2) → a/b
+/// Supports rational exponents: a^(3/2)/a^(1/2) → a
+pub fn cancel_symbolic_factors(num: &Expr, den: &Expr) -> Expr {
+  // Rational exponent as (numerator, denominator) pair
+  type Rat = (i128, i128);
+
+  // Extract base string and rational exponent from a factor
+  fn base_and_exp(f: &Expr) -> (String, Rat) {
+    match f {
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right: exp,
+      } => {
+        let base_str = expr_to_string(left);
+        match exp.as_ref() {
+          Expr::Integer(n) => (base_str, (*n, 1)),
+          Expr::FunctionCall { name, args }
+            if name == "Rational" && args.len() == 2 =>
+          {
+            if let (Expr::Integer(n), Expr::Integer(d)) = (&args[0], &args[1]) {
+              (base_str, (*n, *d))
+            } else {
+              (expr_to_string(f), (1, 1))
+            }
+          }
+          Expr::BinaryOp {
+            op: BinaryOperator::Divide,
+            left: n,
+            right: d,
+          } => {
+            if let (Expr::Integer(nv), Expr::Integer(dv)) =
+              (n.as_ref(), d.as_ref())
+            {
+              (base_str, (*nv, *dv))
+            } else {
+              (expr_to_string(f), (1, 1))
+            }
+          }
+          _ => (expr_to_string(f), (1, 1)),
+        }
+      }
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        let base_str = expr_to_string(&args[0]);
+        match &args[1] {
+          Expr::Integer(n) => (base_str, (*n, 1)),
+          Expr::FunctionCall {
+            name: rname,
+            args: rargs,
+          } if rname == "Rational" && rargs.len() == 2 => {
+            if let (Expr::Integer(n), Expr::Integer(d)) = (&rargs[0], &rargs[1])
+            {
+              (base_str, (*n, *d))
+            } else {
+              (expr_to_string(f), (1, 1))
+            }
+          }
+          _ => (expr_to_string(f), (1, 1)),
+        }
+      }
+      // Sqrt[x] → base=x, exp=1/2
+      expr if is_sqrt(expr).is_some() => {
+        let sqrt_arg = is_sqrt(expr).unwrap();
+        (expr_to_string(sqrt_arg), (1, 2))
+      }
+      _ => (expr_to_string(f), (1, 1)),
+    }
+  }
+
+  // Extract the base expression (without exponent) from a factor
+  fn base_expr(f: &Expr) -> Expr {
+    match f {
+      Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left,
+        right,
+      } => match right.as_ref() {
+        Expr::Integer(_) => left.as_ref().clone(),
+        Expr::FunctionCall { name, args }
+          if name == "Rational" && args.len() == 2 =>
+        {
+          left.as_ref().clone()
+        }
+        Expr::BinaryOp {
+          op: BinaryOperator::Divide,
+          left: n,
+          right: d,
+        } if matches!(n.as_ref(), Expr::Integer(_))
+          && matches!(d.as_ref(), Expr::Integer(_)) =>
+        {
+          left.as_ref().clone()
+        }
+        _ => f.clone(),
+      },
+      Expr::FunctionCall { name, args }
+        if name == "Power" && args.len() == 2 =>
+      {
+        match &args[1] {
+          Expr::Integer(_) => args[0].clone(),
+          Expr::FunctionCall {
+            name: rname,
+            args: rargs,
+          } if rname == "Rational" && rargs.len() == 2 => args[0].clone(),
+          _ => f.clone(),
+        }
+      }
+      expr if is_sqrt(expr).is_some() => is_sqrt(expr).unwrap().clone(),
+      _ => f.clone(),
+    }
+  }
+
+  // Reconstruct a factor from base expr and rational exponent
+  fn make_factor(base: &Expr, exp: Rat) -> Option<Expr> {
+    let (n, d) = exp;
+    if n == 0 {
+      None
+    } else if d == 1 && n == 1 {
+      Some(base.clone())
+    } else if d == 1 {
+      Some(pow2(base.clone(), Expr::Integer(n)))
+    } else if n == 1 && d == 2 {
+      // exp = 1/2: use Sqrt[base]
+      Some(make_sqrt(base.clone()))
+    } else {
+      // Rational exponent: base^Rational[n, d]
+      Some(Expr::BinaryOp {
+        op: BinaryOperator::Power,
+        left: Box::new(base.clone()),
+        right: Box::new(call(
+          "Rational",
+          vec![Expr::Integer(n), Expr::Integer(d)],
+        )),
+      })
+    }
+  }
+
+  // Subtract two rational exponents: (a/b) - (c/d)
+  fn rat_sub(a: Rat, b: Rat) -> Rat {
+    rat_reduce(a.0 * b.1 - b.0 * a.1, a.1 * b.1)
+  }
+
+  // Check if rational exponent is positive
+  fn rat_positive(r: Rat) -> bool {
+    (r.0 > 0 && r.1 > 0) || (r.0 < 0 && r.1 < 0)
+  }
+
+  // Minimum of two positive rational exponents
+  fn rat_min(a: Rat, b: Rat) -> Rat {
+    // Compare a/b with c/d: a*d vs c*b
+    let lhs = a.0 * b.1;
+    let rhs = b.0 * a.1;
+    if lhs <= rhs { a } else { b }
+  }
+
+  let mut num_factors = collect_multiplicative_factors(num);
+  let mut den_factors = collect_multiplicative_factors(den);
+
+  // Separate numeric coefficients from symbolic factors
+  let mut num_coeff: i128 = 1;
+  let mut den_coeff: i128 = 1;
+  num_factors.retain(|f| {
+    if let Expr::Integer(n) = f {
+      num_coeff *= n;
+      false
+    } else {
+      true
+    }
+  });
+  den_factors.retain(|f| {
+    if let Expr::Integer(n) = f {
+      den_coeff *= n;
+      false
+    } else {
+      true
+    }
+  });
+
+  // Cancel numeric GCD
+  let mut numeric_changed = false;
+  if num_coeff != 0 && den_coeff != 0 {
+    let (n, d) = rat_reduce(num_coeff, den_coeff);
+    if n != num_coeff {
+      numeric_changed = true;
+      (num_coeff, den_coeff) = (n, d);
+    }
+  }
+
+  // Build maps of base → (original_expr, base_str, exponent) for numerator and denominator
+  let mut num_map: Vec<(Expr, String, Rat)> = num_factors
+    .iter()
+    .map(|f| {
+      let (base_str, exp) = base_and_exp(f);
+      let be = base_expr(f);
+      (be, base_str, exp)
+    })
+    .collect();
+
+  let mut den_map: Vec<(Expr, String, Rat)> = den_factors
+    .iter()
+    .map(|f| {
+      let (base_str, exp) = base_and_exp(f);
+      let be = base_expr(f);
+      (be, base_str, exp)
+    })
+    .collect();
+
+  // Cancel common factors
+  let mut changed = false;
+  for (_, num_base_str, num_exp) in &mut num_map {
+    for (_, den_base_str, den_exp) in &mut den_map {
+      if *num_base_str == *den_base_str
+        && rat_positive(*num_exp)
+        && rat_positive(*den_exp)
+      {
+        let common = rat_min(*num_exp, *den_exp);
+        *num_exp = rat_sub(*num_exp, common);
+        *den_exp = rat_sub(*den_exp, common);
+        changed = true;
+      }
+    }
+  }
+
+  if !changed && !numeric_changed {
+    // Nothing was cancelled, return original
+    return make_divide(num.clone(), den.clone());
+  }
+
+  // Rebuild numerator and denominator
+  let mut new_num_factors: Vec<Expr> = Vec::new();
+  if num_coeff != 1 || (num_map.iter().all(|(_, _, e)| e.0 == 0)) {
+    new_num_factors.push(Expr::Integer(num_coeff));
+  }
+  for (be, _, exp) in &num_map {
+    if let Some(f) = make_factor(be, *exp) {
+      new_num_factors.push(f);
+    }
+  }
+
+  let mut new_den_factors: Vec<Expr> = Vec::new();
+  if den_coeff != 1 || (den_map.iter().all(|(_, _, e)| e.0 == 0)) {
+    new_den_factors.push(Expr::Integer(den_coeff));
+  }
+  for (be, _, exp) in &den_map {
+    if let Some(f) = make_factor(be, *exp) {
+      new_den_factors.push(f);
+    }
+  }
+
+  let new_num = build_product(new_num_factors);
+  let new_den = build_product(new_den_factors);
+
+  if let Expr::Integer(1) = &new_den {
+    new_num
+  } else {
+    make_divide(new_num, new_den)
+  }
+}
+
+/// Find the single variable that appears in either or both expressions
+pub(super) fn find_single_variable_both(a: &Expr, b: &Expr) -> Option<String> {
+  let mut vars = std::collections::HashSet::new();
+  collect_variables(a, &mut vars);
+  collect_variables(b, &mut vars);
+  if vars.len() == 1 {
+    vars.into_iter().next()
+  } else {
+    None
+  }
+}
+
+/// Compute GCD of two integer polynomials using Euclidean algorithm
+pub fn poly_gcd(a: &[i128], b: &[i128]) -> Option<Vec<i128>> {
+  if b.iter().all(|&c| c == 0) {
+    return Some(a.to_vec());
+  }
+  if a.iter().all(|&c| c == 0) {
+    return Some(b.to_vec());
+  }
+
+  let mut r0 = a.to_vec();
+  let mut r1 = b.to_vec();
+
+  // Trim trailing zeros
+  while r0.last() == Some(&0) && r0.len() > 1 {
+    r0.pop();
+  }
+  while r1.last() == Some(&0) && r1.len() > 1 {
+    r1.pop();
+  }
+
+  // Euclidean algorithm for polynomials
+  for _ in 0..100 {
+    if r1.iter().all(|&c| c == 0) || r1.is_empty() {
+      // Normalize: make leading coefficient positive and divide by GCD of coefficients
+      let g = r0.iter().copied().filter(|&c| c != 0).fold(0i128, gcd_i128);
+      if g > 0 {
+        let result: Vec<i128> = r0.iter().map(|c| c / g).collect();
+        if result.last().is_some_and(|&c| c < 0) {
+          return Some(result.iter().map(|c| -c).collect());
+        }
+        return Some(result);
+      }
+      return Some(r0);
+    }
+    if r0.len() < r1.len() {
+      std::mem::swap(&mut r0, &mut r1);
+    }
+    // Pseudo-remainder
+    let remainder = poly_pseudo_remainder(&r0, &r1)?;
+    r0 = r1;
+    r1 = remainder;
+  }
+  None
+}
+
+/// Compute pseudo-remainder of polynomial division
+fn poly_pseudo_remainder(a: &[i128], b: &[i128]) -> Option<Vec<i128>> {
+  if b.is_empty() || b.iter().all(|&c| c == 0) {
+    return None;
+  }
+  let mut rem = a.to_vec();
+  let b_lead = *b.last()?;
+  let b_deg = b.len() - 1;
+
+  while rem.len() > b.len()
+    || (rem.len() == b.len() && !rem.iter().all(|&c| c == 0))
+  {
+    while rem.last() == Some(&0) && rem.len() > 1 {
+      rem.pop();
+    }
+    if rem.len() < b.len() {
+      break;
+    }
+    let rem_lead = *rem.last()?;
+    let rem_deg = rem.len() - 1;
+    if rem_deg < b_deg {
+      break;
+    }
+    let shift = rem_deg - b_deg;
+    // Multiply remainder by b_lead and subtract rem_lead * shifted b.
+    // Use checked arithmetic so pathological inputs fall back to "no
+    // pseudo-remainder found" instead of crashing in debug builds.
+    for c in &mut rem {
+      *c = c.checked_mul(b_lead)?;
+    }
+    for (i, &bc) in b.iter().enumerate() {
+      let prod = rem_lead.checked_mul(bc)?;
+      rem[i + shift] = rem[i + shift].checked_sub(prod)?;
+    }
+    // Trim trailing zeros
+    while rem.last() == Some(&0) && rem.len() > 1 {
+      rem.pop();
+    }
+  }
+
+  // Simplify by GCD of coefficients
+  let g = rem
+    .iter()
+    .copied()
+    .filter(|&c| c != 0)
+    .fold(0i128, gcd_i128);
+  if g > 1 {
+    rem = rem.iter().map(|c| c / g).collect();
+  }
+  Some(rem)
+}
+
+/// Exact polynomial division: returns quotient if a is divisible by b
+pub fn poly_exact_divide(a: &[i128], b: &[i128]) -> Option<Vec<i128>> {
+  if b.is_empty() || b.iter().all(|&c| c == 0) {
+    return None;
+  }
+  let a_deg = a.len() as i128 - 1;
+  let b_deg = b.len() as i128 - 1;
+  if a_deg < b_deg {
+    return None;
+  }
+  let mut remainder = a.to_vec();
+  let mut quotient = vec![0i128; (a_deg - b_deg + 1) as usize];
+  let lead_b = *b.last()?;
+  if lead_b == 0 {
+    return None;
+  }
+
+  for i in (0..quotient.len()).rev() {
+    let rem_idx = i + b.len() - 1;
+    if rem_idx >= remainder.len() {
+      continue;
+    }
+    if remainder[rem_idx] % lead_b != 0 {
+      return None;
+    }
+    let q = remainder[rem_idx] / lead_b;
+    quotient[i] = q;
+    for j in 0..b.len() {
+      remainder[i + j] -= q * b[j];
+    }
+  }
+
+  if remainder.iter().any(|&c| c != 0) {
+    return None;
+  }
+  Some(quotient)
+}

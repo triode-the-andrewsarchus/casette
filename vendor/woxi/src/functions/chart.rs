@@ -1,0 +1,4134 @@
+use super::*;
+use crate::evaluator::evaluate_expr_to_expr;
+use crate::functions::graphics::{Color, parse_color};
+use crate::functions::math_ast::try_eval_to_f64;
+use crate::functions::plot::{
+  BinSpec, DEFAULT_HEIGHT, DEFAULT_WIDTH, HistogramHeight, MarginOverrides,
+  PLOT_COLORS, RESOLUTION_SCALE, generate_bar_svg, generate_histogram_svg,
+  html_escape, parse_image_size, plot_label_extra_lines, svg_header,
+};
+
+/// Extract grouped values from the first argument.
+/// Returns a list of groups, where each group is a list of f64 values.
+/// - `{1, 2, 3}` → `[[1], [2], [3]]` (flat: each value is its own group)
+/// - `{{1,2}, {3,4}}` → `[[1,2], [3,4]]` (grouped: sublists are groups)
+fn extract_grouped_values(
+  arg: &Expr,
+) -> Result<Vec<Vec<f64>>, InterpreterError> {
+  let data = evaluate_expr_to_expr(arg)?;
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(
+      "Chart: first argument must be a list".into(),
+    ));
+  };
+
+  if items.is_empty() {
+    return Ok(vec![]);
+  }
+
+  // Check if the first element is a list (grouped mode)
+  let first_eval = evaluate_expr_to_expr(&items[0]).unwrap_or(items[0].clone());
+  if matches!(&first_eval, Expr::List(_)) {
+    // Grouped: each item is a sublist
+    let mut groups = Vec::with_capacity(items.len());
+    for item in items {
+      let ev = evaluate_expr_to_expr(item).unwrap_or(item.clone());
+      if let Expr::List(inner) = &ev {
+        let mut vals = Vec::new();
+        for v in inner {
+          let vv = evaluate_expr_to_expr(v).unwrap_or(v.clone());
+          if let Some(f) = try_eval_to_f64(&vv) {
+            vals.push(f);
+          }
+        }
+        groups.push(vals);
+      }
+    }
+    Ok(groups)
+  } else {
+    // Flat: each value is its own group with one bar
+    let mut groups = Vec::with_capacity(items.len());
+    for item in items {
+      let v = evaluate_expr_to_expr(item).unwrap_or(item.clone());
+      if let Some(f) = try_eval_to_f64(&v) {
+        groups.push(vec![f]);
+      }
+    }
+    Ok(groups)
+  }
+}
+
+/// A label with optional styling (bold, italic, color, font-size).
+#[derive(Clone)]
+pub(crate) struct StyledLabel {
+  pub text: String,
+  /// Pre-typeset SVG markup, for a label whose expression carries
+  /// structure the plain text cannot hold (`Subscript[p, 0]` → a shifted
+  /// tspan). `None` for a plain string, which the renderer typesets from
+  /// its own inline box markers instead.
+  pub markup: Option<String>,
+  /// Typeset markup for the lines *after* the first, for a label that
+  /// stacks (`Grid[{{a}, {b}}]` / `Column[{a, b}]` as a plot title). Empty
+  /// for the ordinary single-line label.
+  pub extra_lines: Vec<String>,
+  pub bold: bool,
+  pub italic: bool,
+  pub color: Option<Color>,
+  pub font_size: Option<f64>,
+}
+
+impl StyledLabel {
+  /// The label as SVG `<text>` content.
+  pub(crate) fn svg(&self) -> String {
+    self.markup.clone().unwrap_or_else(|| {
+      crate::functions::graphics::box_string_to_svg(&self.text)
+    })
+  }
+
+  /// The label as SVG `<text>` content for a picture drawn at `scale`
+  /// render units per nominal point.
+  ///
+  /// A `Style[…, 16]` inside the label typesets to `font-size="16"` in
+  /// nominal points, but the plot renderers draw into a viewBox blown up
+  /// by `RESOLUTION_SCALE`; left alone, the styled run comes out a
+  /// fraction of the size it asked for (in a 3000-unit-wide plot, a
+  /// 16-unit glyph is invisible). Relative sizes — the `70%` of a
+  /// sub/superscript tspan — already follow whatever they inherit.
+  pub(crate) fn svg_scaled(&self, scale: f64) -> String {
+    scale_markup_lengths(&self.svg(), scale)
+  }
+
+  /// The same, with each further line of a stacked label placed below the
+  /// first — centred on `cx` (the anchor the enclosing `<text>` uses) and
+  /// `line_height` render units apart.
+  pub(crate) fn svg_scaled_stacked(
+    &self,
+    scale: f64,
+    cx: f64,
+    line_height: f64,
+  ) -> String {
+    let mut out = self.svg_scaled(scale);
+    for line in &self.extra_lines {
+      out.push_str(&format!(
+        "<tspan x=\"{cx:.1}\" dy=\"{line_height:.1}\">{}</tspan>",
+        scale_markup_lengths(line, scale)
+      ));
+    }
+    out
+  }
+
+  /// How many lines below the first this label occupies.
+  pub(crate) fn extra_line_count(&self) -> usize {
+    self.extra_lines.len()
+  }
+
+  /// The character count of this label's widest line — `text` is every
+  /// line joined together for a stacked label, so a box sized from it (a
+  /// `Framed` background behind the label, say) would come out far too
+  /// wide for anything but a single-line label.
+  pub(crate) fn max_line_chars(&self) -> usize {
+    std::iter::once(self.svg())
+      .chain(self.extra_lines.iter().cloned())
+      .map(|line| svg_markup_visible_text(&line).chars().count())
+      .max()
+      .unwrap_or(0)
+  }
+}
+
+/// Multiply the absolute lengths in SVG markup — `font-size="N"`, the
+/// `letter-spacing:Npx` a lone `Spacer` becomes, and the `dx="N"` a
+/// `Spacer` next to other Row content becomes — by `scale`, leaving
+/// relative ones (`70%`, `1.2em`) as they are.
+fn scale_markup_lengths(markup: &str, scale: f64) -> String {
+  if scale == 1.0 {
+    return markup.to_string();
+  }
+  let mut out = markup.to_string();
+  for (attr, terminator, unit) in [
+    ("font-size=\"", '"', ""),
+    ("letter-spacing:", 'p', "px"),
+    ("dx=\"", '"', ""),
+  ] {
+    out = scale_lengths_after(&out, attr, terminator, unit, scale);
+  }
+  out
+}
+
+/// Rewrite every `{prefix}{number}` in `markup` — the number running up to
+/// `terminator` — with the number multiplied by `scale`, re-emitting `unit`
+/// after it. A run whose value is not a plain number is left alone.
+fn scale_lengths_after(
+  markup: &str,
+  prefix: &str,
+  terminator: char,
+  unit: &str,
+  scale: f64,
+) -> String {
+  if !markup.contains(prefix) {
+    return markup.to_string();
+  }
+  let mut out = String::with_capacity(markup.len());
+  let mut rest = markup;
+  while let Some(pos) = rest.find(prefix) {
+    let (head, tail) = rest.split_at(pos + prefix.len());
+    out.push_str(head);
+    let Some(end) = tail.find(terminator) else {
+      out.push_str(tail);
+      return out;
+    };
+    let (value, tail) = tail.split_at(end);
+    if let Ok(len) = value.parse::<f64>() {
+      out.push_str(&format!("{:.0}{unit}", len * scale));
+      // The unit was re-emitted, so skip the copy still in `tail`.
+      rest = &tail[unit.len()..];
+    } else {
+      out.push_str(value);
+      rest = tail;
+    }
+  }
+  out.push_str(rest);
+  out
+}
+
+/// The visible text of SVG markup: tags dropped, entities decoded. Used so a
+/// pre-typeset label still measures by what the reader sees.
+fn svg_markup_visible_text(markup: &str) -> String {
+  let mut out = String::with_capacity(markup.len());
+  let mut in_tag = false;
+  for c in markup.chars() {
+    match c {
+      '<' => in_tag = true,
+      '>' => in_tag = false,
+      c if !in_tag => out.push(c),
+      _ => {}
+    }
+  }
+  out
+    .replace("&lt;", "<")
+    .replace("&gt;", ">")
+    .replace("&quot;", "\"")
+    .replace("&amp;", "&")
+}
+
+/// The content of a one-argument `Text[…]`, the formatting head a label is
+/// often wrapped in. Two or more arguments is the graphics primitive
+/// (`Text[expr, position]`), which is not a label.
+fn text_wrapper_content(expr: &Expr) -> Option<&Expr> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Text" && args.len() == 1 => {
+      Some(&args[0])
+    }
+    _ => None,
+  }
+}
+
+/// Extract the bold/italic flags, color, and font size from a list of style
+/// directives — `Style[…]`'s trailing arguments, `Directive[…]`'s arguments,
+/// or a bare `LabelStyle -> {…}` list, all of which share this shape.
+pub(crate) fn parse_style_directive_args(
+  args: &[Expr],
+) -> (bool, bool, Option<Color>, Option<f64>) {
+  let mut bold = false;
+  let mut italic = false;
+  let mut color = None;
+  let mut font_size = None;
+  for arg in args {
+    match arg {
+      Expr::Identifier(s) if s == "Bold" => bold = true,
+      Expr::Identifier(s) if s == "Italic" => italic = true,
+      // The same directives may be written as rules instead of bare values
+      // (`Style[expr, FontSize -> 18, FontColor -> Blue]`), the form
+      // `StyleBox`/`expr_to_svg_markup` already accepts.
+      Expr::Rule {
+        pattern,
+        replacement,
+      } => match pattern.as_ref() {
+        Expr::Identifier(n) if n == "FontSize" => {
+          if let Some(f) = try_eval_to_f64(replacement) {
+            font_size = Some(f);
+          }
+        }
+        Expr::Identifier(n) if n == "FontColor" => {
+          if let Some(c) = parse_color(replacement) {
+            color = Some(c);
+          }
+        }
+        Expr::Identifier(n) if n == "FontSlant" => {
+          if matches!(replacement.as_ref(), Expr::Identifier(s) if s == "Italic")
+          {
+            italic = true;
+          }
+        }
+        Expr::Identifier(n) if n == "FontWeight" => {
+          if matches!(replacement.as_ref(), Expr::Identifier(s) if s == "Bold")
+          {
+            bold = true;
+          }
+        }
+        _ => {}
+      },
+      _ => {
+        if let Some(c) = parse_color(arg) {
+          color = Some(c);
+        } else if let Some(f) = try_eval_to_f64(arg) {
+          font_size = Some(f);
+        }
+      }
+    }
+  }
+  (bold, italic, color, font_size)
+}
+
+/// Parse a `LabelStyle -> …` option value into a text color and font size.
+/// Accepts a single style item (`Black`, `17`, `Directive[…]`) or a list of
+/// them (`{17, Black}`) — the same shapes `Style[…]`'s trailing arguments
+/// take.
+pub(crate) fn parse_label_style(expr: &Expr) -> (Option<Color>, Option<f64>) {
+  let items: Vec<Expr> = match expr {
+    Expr::List(items) => items.to_vec(),
+    Expr::FunctionCall { name, args } if name == "Directive" => args.to_vec(),
+    other => vec![other.clone()],
+  };
+  let (_, _, color, font_size) = parse_style_directive_args(&items);
+  (color, font_size)
+}
+
+/// Parse a plain string or `Style["text", Bold, Italic, color, size]` into a `StyledLabel`.
+pub(crate) fn parse_styled_label(expr: &Expr) -> Option<StyledLabel> {
+  // `Text[…]` sets its content in the graphic's own text style, so the font
+  // weight and slant it inherits are reset — `Style[Text["a"], Bold]` is not
+  // bold in Wolfram, while the colour and size still reach through. A
+  // `Style` inside the `Text` applies as written.
+  if let Some(inner) = text_wrapper_content(expr) {
+    return parse_styled_label(inner);
+  }
+  // `Invisible[…]` paints nothing — a Demonstration wraps a `Text[…]`
+  // label in it to hide one item (e.g. a hidden edge's name) while keeping
+  // the surrounding code uniform across all items. Falling through to the
+  // catch-all below would instead typeset the wrapper itself as literal
+  // text ("Invisible[e]"), so peel and drop it here.
+  if crate::functions::graphics::peel_invisible(expr).is_some() {
+    return None;
+  }
+  // A `Grid`/`Column` title stacks: each row becomes its own line. This is
+  // how a Demonstration writes a two-line plot title (the function above,
+  // the transformed one below).
+  if matches!(expr, Expr::FunctionCall { name, args }
+      if (name == "Grid" || name == "Column") && !args.is_empty())
+  {
+    let lines = crate::functions::graphics::expr_to_svg_markup_lines(expr);
+    let (first, rest) = lines.split_first()?;
+    let text = lines
+      .iter()
+      .map(|l| svg_markup_visible_text(l))
+      .collect::<Vec<_>>()
+      .join(" ");
+    return Some(StyledLabel {
+      text,
+      markup: Some(first.clone()),
+      extra_lines: rest.to_vec(),
+      bold: false,
+      italic: false,
+      color: None,
+      font_size: None,
+    });
+  }
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Style"
+    && !args.is_empty()
+    && let Some(inner) = text_wrapper_content(&args[0])
+  {
+    let mut restyled: Vec<Expr> = vec![inner.clone()];
+    restyled.extend(args[1..].iter().cloned());
+    let outer = call("Style", restyled);
+    let inner_label = parse_styled_label(inner)?;
+    let mut label = parse_styled_label(&outer)?;
+    label.bold = inner_label.bold;
+    label.italic = inner_label.italic;
+    return Some(label);
+  }
+  // `Style[Grid[…]/Column[…], …]` — the stacking still applies with the
+  // enclosing `Style`'s weight, slant, color and size layered on top, the
+  // way a Demonstration writes `Style[Column[{…}], "Label"]`.
+  if let Expr::FunctionCall { name, args } = expr
+    && name == "Style"
+    && !args.is_empty()
+    && matches!(&args[0], Expr::FunctionCall { name, args }
+        if (name == "Grid" || name == "Column") && !args.is_empty())
+  {
+    let mut label = parse_styled_label(&args[0])?;
+    let (bold, italic, color, font_size) =
+      parse_style_directive_args(&args[1..]);
+    label.bold = bold;
+    label.italic = italic;
+    label.color = color;
+    label.font_size = font_size;
+    return Some(label);
+  }
+  match expr {
+    Expr::String(s) => Some(StyledLabel {
+      text: s.clone(),
+      markup: None,
+      extra_lines: Vec::new(),
+      bold: false,
+      italic: false,
+      color: None,
+      font_size: None,
+    }),
+    Expr::Identifier(s) => Some(StyledLabel {
+      text: s.clone(),
+      markup: None,
+      extra_lines: Vec::new(),
+      bold: false,
+      italic: false,
+      color: None,
+      font_size: None,
+    }),
+    Expr::FunctionCall { name, args }
+      if name == "Style" && !args.is_empty() =>
+    {
+      let (text, markup) = match &args[0] {
+        Expr::String(s) => (s.clone(), None),
+        Expr::Identifier(s) => (s.clone(), None),
+        // Any other content (`Row[…]`, a number, …) is typeset the way the
+        // rest of the graphic is, so `Subscript[p, 0]` shows as `p₀` and a
+        // machine real keeps 6 significant figures.
+        other => {
+          let markup = crate::functions::graphics::expr_to_svg_markup(other);
+          (svg_markup_visible_text(&markup), Some(markup))
+        }
+      };
+      let (bold, italic, color, font_size) =
+        parse_style_directive_args(&args[1..]);
+      Some(StyledLabel {
+        text,
+        markup,
+        extra_lines: Vec::new(),
+        bold,
+        italic,
+        color,
+        font_size,
+      })
+    }
+    // Any other expression (`Row[{"a: ", val}]`, a number, …) labels the
+    // plot with its OutputForm text, matching wolframscript.
+    other => {
+      let markup = crate::functions::graphics::expr_to_svg_markup(other);
+      let text = svg_markup_visible_text(&markup);
+      if text.is_empty() {
+        None
+      } else {
+        Some(StyledLabel {
+          text,
+          markup: Some(markup),
+          extra_lines: Vec::new(),
+          bold: false,
+          italic: false,
+          color: None,
+          font_size: None,
+        })
+      }
+    }
+  }
+}
+
+/// Position for chart labels placed with `Placed[labels, position]`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LabelPosition {
+  Below,  // Below the bar at the x-axis (default)
+  Above,  // Just above the top of the bar
+  Center, // Vertically centered within the bar
+}
+
+/// Parsed chart options.
+// Each flag is an independent Wolfram option (ImageSize's full-width mode,
+// Ticks, …), not a state machine, so they do not collapse into an enum —
+// matching `PlotOptions`, which has the same shape for the same reason.
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct ChartOptions {
+  pub svg_width: u32,
+  pub svg_height: u32,
+  pub full_width: bool,
+  pub chart_labels: Vec<ChartLabel>,
+  pub chart_label_position: LabelPosition,
+  pub plot_label: Option<StyledLabel>,
+  pub axes_label: Option<(String, String)>,
+  /// `FrameLabel -> {bottom, left}`: centred outside the plot area, where an
+  /// [`Self::axes_label`] sits at the far end of its axis.
+  pub frame_label: Option<(String, String)>,
+  pub chart_style: Vec<Color>,
+  /// Named color scheme (e.g. `"Pastel"`) given via `ChartStyle -> "name"`.
+  /// Resolved to per-element colors once the element count is known.
+  pub chart_style_scheme: Option<String>,
+  pub chart_legends: Vec<String>,
+  /// Set when the user passed `ChartLegends -> Automatic`. Callers that know
+  /// how to derive default labels from the input (e.g. Association keys)
+  /// should populate `chart_legends` themselves when this is true.
+  pub chart_legends_auto: bool,
+  pub plot_range_x: Option<(f64, f64)>,
+  pub plot_range_y: Option<(f64, f64)>,
+  /// `BarOrigin -> Left` (or `Right`) renders horizontal bars.
+  pub bar_origin_left: bool,
+  /// `LabelingFunction -> f` — applied to each bar value to produce a label
+  /// drawn at the bar's end. Stored unevaluated and applied per value.
+  pub labeling_function: Option<Expr>,
+  /// `Ticks -> {xspec, yspec}` with explicit positions: each entry is a
+  /// position and the text drawn at it. `None` = the automatic ticks a
+  /// renderer computes itself. Currently consumed by `Histogram`.
+  pub ticks_x: Option<Vec<(f64, String)>>,
+  pub ticks_y: Option<Vec<(f64, String)>>,
+  /// `Ticks -> None` suppresses tick marks/labels on both axes entirely,
+  /// matching `Plot`'s `Ticks` handling. `Automatic`/`All`/an explicit list
+  /// leave this `true` (the explicit list still overrides individual axes
+  /// via `ticks_x`/`ticks_y` above).
+  pub ticks: bool,
+}
+
+/// A chart label with optional rotation angle (in radians).
+#[derive(Clone)]
+pub(crate) struct ChartLabel {
+  pub text: String,
+  /// Rotation angle in radians (0.0 = no rotation, negative = clockwise).
+  pub rotation: f64,
+}
+
+impl ChartLabel {
+  pub(crate) fn plain(text: String) -> Self {
+    Self {
+      text,
+      rotation: 0.0,
+    }
+  }
+}
+
+/// Extract a string from an Expr suitable for use as a chart label.
+/// Accepts strings, identifiers, and numeric values (so `ChartLabels ->
+/// Range[16]` and similar numeric label lists render correctly).
+pub(crate) fn expr_to_label(e: &Expr) -> Option<String> {
+  match e {
+    Expr::String(s) => Some(s.clone()),
+    // The bare symbol `None` always means "no label" for a label option
+    // (`AxesLabel`, `FrameLabel`, `ChartLabels`, `PlotLegends`, …) — never
+    // the literal text "None". A quoted `"None"` still goes through the
+    // `Expr::String` arm above and prints as-is.
+    Expr::Identifier(s) if s == "None" => None,
+    Expr::Identifier(s) => Some(s.clone()),
+    Expr::Integer(_) | Expr::BigInteger(_) | Expr::Real(_) => {
+      Some(expr_to_string(e))
+    }
+    // A styled label reads as its content — a Demonstration writes its
+    // frame labels as `Style["force (kN)", 12]`. The same holds for the
+    // hover wrappers: `Tooltip[label, hint]` and `Annotation[label, …]`
+    // print as `label`, with the second argument only shown on hover, so a
+    // label written that way must not vanish from the axis.
+    Expr::FunctionCall { name, args }
+      if (name == "Style"
+        || name == "Text"
+        || name == "Tooltip"
+        || name == "Annotation")
+        && !args.is_empty() =>
+    {
+      expr_to_label(&args[0])
+    }
+    // A typesetting wrapper only chooses how its content is set, not what
+    // it says — a Demonstration writes `AxesLabel -> TraditionalForm /@ {t,
+    // y}`, and dropping the wrapper would leave both axes unlabelled.
+    Expr::FunctionCall { name, args }
+      if matches!(
+        name.as_str(),
+        "TraditionalForm"
+          | "StandardForm"
+          | "DisplayForm"
+          | "TextForm"
+          | "HoldForm"
+          | "Defer"
+      ) && args.len() == 1 =>
+    {
+      expr_to_label(&args[0])
+    }
+    // A list label is typeset as the list itself: `AxesLabel -> {t, {a, b}}`
+    // labels the vertical axis `{a, b}`.
+    Expr::List(items) => {
+      let parts: Vec<String> = items
+        .iter()
+        .map(expr_to_label)
+        .collect::<Option<Vec<_>>>()?;
+      Some(format!("{{{}}}", parts.join(", ")))
+    }
+    // A plot label is drawn as plain text, so `Subscript`/`Superscript`
+    // render through the Unicode script characters — the closest a text
+    // label gets to Wolfram's typeset form.
+    Expr::FunctionCall { name, args }
+      if (name == "Subscript" || name == "Superscript") && args.len() >= 2 =>
+    {
+      let base = expr_to_label(&args[0])?;
+      let scripts: String = args[1..]
+        .iter()
+        .filter_map(expr_to_label)
+        .map(|s| {
+          crate::functions::graphics::to_unicode_script_digits(
+            &s,
+            name == "Superscript",
+          )
+        })
+        .collect();
+      Some(format!("{base}{scripts}"))
+    }
+    // `base^exp` (e.g. a `FrameLabel` typesetting `e^(iΩ)` as
+    // `Style["e", Italic]^Row[{Style["i", Italic], "Ω"}]`) reads the same
+    // way `Superscript` above does — the exponent through the Unicode
+    // script-character approximation.
+    Expr::BinaryOp {
+      op: BinaryOperator::Power,
+      left,
+      right,
+    } => {
+      let base = expr_to_label(left)?;
+      let exponent = expr_to_label(right)?;
+      Some(format!(
+        "{base}{}",
+        crate::functions::graphics::to_unicode_script_digits(&exponent, true)
+      ))
+    }
+    // `Subsuperscript[base, sub, sup]` — both scripts in sequence, the same
+    // Unicode-digit approximation `Subscript`/`Superscript` use above (a
+    // Demonstration nesting it, e.g. `Nest[Subsuperscript[#, #, #] &, …]`,
+    // recurses back into this same arm for each level's base).
+    Expr::FunctionCall { name, args }
+      if name == "Subsuperscript" && args.len() == 3 =>
+    {
+      let base = expr_to_label(&args[0])?;
+      let sub = expr_to_label(&args[1])
+        .map(|s| {
+          crate::functions::graphics::to_unicode_script_digits(&s, false)
+        })
+        .unwrap_or_default();
+      let sup = expr_to_label(&args[2])
+        .map(|s| crate::functions::graphics::to_unicode_script_digits(&s, true))
+        .unwrap_or_default();
+      Some(format!("{base}{sub}{sup}"))
+    }
+    // A number written through one of the formatting wrappers reads as
+    // the text that wrapper produces — a Demonstration labels its plot
+    // with `NumberForm[value, {16, 2}, DigitBlock -> 3]`, and dropping it
+    // would leave the caption with a currency sign and no amount.
+    Expr::FunctionCall { name, .. }
+      if matches!(
+        name.as_str(),
+        "NumberForm"
+          | "ScientificForm"
+          | "EngineeringForm"
+          | "AccountingForm"
+          | "PaddedForm"
+      ) =>
+    {
+      match crate::functions::string_ast::to_string_ast(std::slice::from_ref(e))
+      {
+        Ok(Expr::String(ref rendered)) => Some(rendered.clone()),
+        _ => None,
+      }
+    }
+    // `Spacer[n]` is a gap, not something to print.
+    Expr::FunctionCall { name, args } if name == "Spacer" => {
+      let width = args.first().and_then(try_eval_to_f64).unwrap_or(1.0);
+      Some(" ".repeat((width.max(0.0).round() as usize).max(1)))
+    }
+    // `Row[{…}]` joins its parts, with an optional separator.
+    Expr::FunctionCall { name, args } if name == "Row" && !args.is_empty() => {
+      let Expr::List(items) = &args[0] else {
+        return None;
+      };
+      let parts: Vec<String> = items.iter().filter_map(expr_to_label).collect();
+      let sep = args.get(1).and_then(expr_to_label).unwrap_or_default();
+      Some(parts.join(&sep))
+    }
+    // A label written as a function of the plot's variable — a Demonstration
+    // writes `AxesLabel -> {t, y[t]}` and `FrameLabel -> {y[t], y'[t]}` —
+    // typesets the way a graphic's labels do, with the argument in
+    // parentheses and a derivative marked by primes: `y(t)`, `y′(t)`. Only an
+    // unknown head reads as an application; a built-in keeps whatever the
+    // branches above (or the caller) make of it.
+    _ => applied_label(e),
+  }
+}
+
+/// A label for a function application of an unknown head: `y[t]` → `y(t)`,
+/// `y'[t]` → `y′(t)`, `y''` → `y″`. `None` for anything else, including
+/// applications of built-in functions, whose own formatting rules apply.
+fn applied_label(e: &Expr) -> Option<String> {
+  use crate::functions::graphics::{as_derivative_of, derivative_prime_marks};
+  // `Derivative[n][f]`, with or without an argument applied to it.
+  if let Some((func, order)) = as_derivative_of(e) {
+    return Some(format!(
+      "{}{}",
+      expr_to_label(func)?,
+      derivative_prime_marks(order)
+    ));
+  }
+  let (head_label, args): (String, &[Expr]) = match e {
+    // `Derivative[n][f][x]` reaches the evaluator flattened to
+    // `Derivative[n, f, x]`; its head is the curried derivative.
+    Expr::FunctionCall { name, args } if name == "Derivative" => {
+      let (order, rest) = args.split_first()?;
+      let (func, arg) = (rest.first()?, rest.get(1)?);
+      let derivative = Expr::CurriedCall {
+        func: Box::new(call1("Derivative", order.clone())),
+        args: vec![func.clone()],
+      };
+      return Some(format!(
+        "{}({})",
+        applied_label(&derivative)?,
+        expr_to_label(arg)?
+      ));
+    }
+    Expr::CurriedCall { func, args } => (
+      applied_label(func).or_else(|| expr_to_label(func))?,
+      &args[..],
+    ),
+    Expr::FunctionCall { name, args }
+      if crate::evaluator::functions::get_builtin_function_info(name)
+        .is_none() =>
+    {
+      (name.clone(), &args[..])
+    }
+    _ => return None,
+  };
+  if args.is_empty() {
+    return None;
+  }
+  let parts: Vec<String> =
+    args.iter().map(expr_to_label).collect::<Option<Vec<_>>>()?;
+  Some(format!("{head_label}({})", parts.join(", ")))
+}
+
+/// Extract a chart label from an Expr, supporting Rotate[label, angle].
+fn expr_to_chart_label(e: &Expr) -> Option<ChartLabel> {
+  // Rotate["label", angle]
+  if let Expr::FunctionCall { name, args } = e
+    && name == "Rotate"
+    && args.len() >= 2
+  {
+    let text = expr_to_label(&args[0])?;
+    let angle = try_eval_to_f64(
+      &evaluate_expr_to_expr(&args[1]).unwrap_or(args[1].clone()),
+    )
+    .unwrap_or(0.0);
+    return Some(ChartLabel {
+      text,
+      rotation: angle,
+    });
+  }
+  // A sublist inside `ChartLabels` names a whole level of the chart (group
+  // labels, then bar labels), not one label — so it is not a label of its
+  // own the way a list-valued `AxesLabel` is.
+  if matches!(e, Expr::List(_)) {
+    return None;
+  }
+  // Plain label
+  expr_to_label(e).map(ChartLabel::plain)
+}
+
+/// Locate a `Placed[labels, position, ...]` spec inside a `ChartLabels` value.
+/// `ChartLabels` may be the `Placed[...]` directly, or a list in which one
+/// element is a `Placed[...]` (e.g. `{values, Placed[days, Center, fn]}`),
+/// in which case the `Placed` element carries the category labels.
+fn find_placed_spec(e: &Expr) -> Option<&Expr> {
+  match e {
+    Expr::FunctionCall { name, .. } if name == "Placed" => Some(e),
+    Expr::List(items) => items.iter().find(
+      |it| matches!(it, Expr::FunctionCall { name, .. } if name == "Placed"),
+    ),
+    _ => None,
+  }
+}
+
+/// Recursively search an expression for a `Rotate[_, angle]` and return the
+/// angle in radians. Used to pull the rotation out of a `Placed` styling
+/// function such as `Style[Rotate[#, Pi/2], 16, Bold] &`.
+fn find_rotate_angle(e: &Expr) -> Option<f64> {
+  match e {
+    Expr::FunctionCall { name, args } => {
+      if name == "Rotate"
+        && args.len() >= 2
+        && let Some(a) = try_eval_to_f64(
+          &evaluate_expr_to_expr(&args[1]).unwrap_or_else(|_| args[1].clone()),
+        )
+      {
+        return Some(a);
+      }
+      args.iter().find_map(find_rotate_angle)
+    }
+    Expr::Function { body } => find_rotate_angle(body),
+    Expr::NamedFunction { body, .. } => find_rotate_angle(body),
+    Expr::List(items) => items.iter().find_map(find_rotate_angle),
+    _ => None,
+  }
+}
+
+// Control points of Wolfram's named `ColorData` gradient color schemes,
+// evenly spaced over [0, 1]. Sampling one with a linear `Blend`
+// reproduces `ChartStyle -> "<name>"` exactly (each was verified against
+// wolframscript: the RGB-linear Blend matches `ColorData[name]` to <1e-5).
+
+const PASTEL_GRADIENT: [(f64, f64, f64); 12] = [
+  (0.761959, 0.470832, 0.940597),
+  (0.809695, 0.585618, 0.953269),
+  (0.866514, 0.647659, 0.771795),
+  (0.909422, 0.699383, 0.647465),
+  (0.937061, 0.764486, 0.598975),
+  (0.954654, 0.842244, 0.587209),
+  (0.962197, 0.913524, 0.594117),
+  (0.948179, 0.953299, 0.634088),
+  (0.891128, 0.944422, 0.72627),
+  (0.771259, 0.887462, 0.856246),
+  (0.594516, 0.801371, 0.955499),
+  (0.431296, 0.709773, 0.927077),
+];
+
+const RAINBOW_GRADIENT: [(f64, f64, f64); 17] = [
+  (0.471412, 0.108766, 0.527016),
+  (0.31106, 0.11758, 0.664469),
+  (0.250728, 0.225386, 0.769152),
+  (0.24408, 0.361242, 0.816084),
+  (0.266122, 0.486664, 0.802529),
+  (0.305919, 0.585575, 0.739666),
+  (0.36048, 0.655759, 0.645692),
+  (0.429842, 0.701849, 0.540321),
+  (0.513417, 0.72992, 0.440682),
+  (0.607651, 0.743718, 0.358588),
+  (0.705038, 0.742591, 0.299167),
+  (0.794549, 0.721158, 0.260829),
+  (0.863512, 0.670771, 0.236564),
+  (0.901014, 0.582826, 0.216542),
+  (0.902853, 0.453964, 0.192014),
+  (0.878107, 0.293208, 0.160481),
+  (0.857359, 0.131106, 0.132128),
+];
+
+const SOLAR_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.468742, 0., 0.0158236),
+  (0.822129, 0.122225, 0.0039559),
+  (0.969963, 0.376081, 0.0322881),
+  (1., 0.646929, 0.0801709),
+  (1., 0.820127, 0.126955),
+];
+
+const TEMPERATURE_MAP_GRADIENT: [(f64, f64, f64); 13] = [
+  (0.178927, 0.305394, 0.933501),
+  (0.308746, 0.441842, 0.940894),
+  (0.453318, 0.567063, 0.950106),
+  (0.642359, 0.720535, 0.964988),
+  (0.819984, 0.859297, 0.982692),
+  (0.935699, 0.951565, 0.993729),
+  (0.984192, 0.987731, 0.911643),
+  (0.995282, 0.992317, 0.727853),
+  (0.992503, 0.986373, 0.425376),
+  (0.955963, 0.863115, 0.283425),
+  (0.904227, 0.657999, 0.241797),
+  (0.858405, 0.449932, 0.203562),
+  (0.817319, 0.134127, 0.164218),
+];
+
+const THERMOMETER_COLORS_GRADIENT: [(f64, f64, f64); 12] = [
+  (0.163302, 0.119982, 0.79353),
+  (0.254221, 0.313173, 0.892833),
+  (0.407119, 0.543513, 0.938275),
+  (0.572715, 0.73338, 0.95065),
+  (0.720374, 0.855234, 0.928635),
+  (0.831017, 0.903518, 0.868326),
+  (0.894452, 0.880139, 0.77279),
+  (0.907999, 0.789417, 0.652903),
+  (0.874505, 0.639254, 0.522424),
+  (0.79915, 0.446142, 0.391971),
+  (0.685695, 0.242449, 0.268261),
+  (0.534081, 0.0853132, 0.16669),
+];
+
+const DARK_RAINBOW_GRADIENT: [(f64, f64, f64); 11] = [
+  (0.237736, 0.340215, 0.575113),
+  (0.253651, 0.344893, 0.558151),
+  (0.264425, 0.423024, 0.3849),
+  (0.291469, 0.47717, 0.271411),
+  (0.416394, 0.555345, 0.24182),
+  (0.624866, 0.673302, 0.264296),
+  (0.813033, 0.766292, 0.303458),
+  (0.877875, 0.731045, 0.326896),
+  (0.812807, 0.518694, 0.303459),
+  (0.72987, 0.239399, 0.230961),
+  (0.72987, 0.239399, 0.230961),
+];
+
+const AQUAMARINE_GRADIENT: [(f64, f64, f64); 8] = [
+  (0.68069, 0.735561, 0.850004),
+  (0.762233, 0.803087, 0.873397),
+  (0.738044, 0.801736, 0.849202),
+  (0.653851, 0.759285, 0.801252),
+  (0.555381, 0.703512, 0.753383),
+  (0.488359, 0.662194, 0.729431),
+  (0.498514, 0.663109, 0.75323),
+  (0.631571, 0.734035, 0.848615),
+];
+
+const STARRY_NIGHT_COLORS_GRADIENT: [(f64, f64, f64); 9] = [
+  (0.0863508, 0.145602, 0.203418),
+  (0.179449, 0.285129, 0.326534),
+  (0.260705, 0.406664, 0.445423),
+  (0.406613, 0.556979, 0.562914),
+  (0.575819, 0.695886, 0.635552),
+  (0.74555, 0.811361, 0.650903),
+  (0.866077, 0.862389, 0.597576),
+  (0.942459, 0.855345, 0.495749),
+  (0.957885, 0.809857, 0.369177),
+];
+
+const AVOCADO_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0., 0., 0.),
+  (0., 0.442859, 0.0749256),
+  (0.289326, 0.685107, 0.108759),
+  (0.683989, 0.830896, 0.145815),
+  (1., 0.984375, 0.230411),
+];
+
+const SUNSET_COLORS_GRADIENT: [(f64, f64, f64); 7] = [
+  (0., 0., 0.),
+  (0.372793, 0.1358, 0.506503),
+  (0.788287, 0.259816, 0.270778),
+  (0.979377, 0.451467, 0.0511329),
+  (1., 0.682688, 0.129771),
+  (1., 0.882236, 0.491094),
+  (1., 1., 1.),
+];
+
+const FRUIT_PUNCH_COLORS_GRADIENT: [(f64, f64, f64); 8] = [
+  (1., 0.499474, 0.),
+  (0.989146, 0.606517, 0.00227297),
+  (0.89853, 0.670191, 0.038923),
+  (0.80904, 0.658225, 0.163438),
+  (0.769483, 0.571276, 0.370227),
+  (0.79659, 0.442924, 0.594615),
+  (0.875012, 0.339677, 0.712848),
+  (0.957321, 0.360967, 0.542092),
+];
+
+const CHERRY_TONES_GRADIENT: [(f64, f64, f64); 8] = [
+  (0.215686, 0.215686, 0.215686),
+  (0.563899, 0.155919, 0.156577),
+  (0.747389, 0.178584, 0.180272),
+  (0.836168, 0.264453, 0.26819),
+  (0.880144, 0.397868, 0.404399),
+  (0.911942, 0.567676, 0.576412),
+  (0.949724, 0.768164, 0.776002),
+  (1., 1., 1.),
+];
+
+// Control points for the remaining named gradients of
+// `ColorData["Gradients"]`. Unlike the sampled tables above, these are
+// hand-tuned linear approximations of the Wolfram gradients (endpoints and
+// hue progression match; mid-band values can drift by a few percent).
+// Refine any of them by sampling `ColorData[name]` with wolframscript and
+// replacing the control points, as was done for the verified tables.
+
+const ALPINE_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.208, 0.325, 0.212),
+  (0.402, 0.51, 0.345),
+  (0.639, 0.665, 0.512),
+  (0.84, 0.85, 0.8),
+  (1., 1., 1.),
+];
+
+const ARMY_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.44, 0.48, 0.35),
+  (0.56, 0.6, 0.42),
+  (0.67, 0.69, 0.52),
+  (0.78, 0.78, 0.64),
+  (0.87, 0.86, 0.78),
+];
+
+const ATLANTIC_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0., 0.11, 0.19),
+  (0.05, 0.27, 0.38),
+  (0.18, 0.45, 0.53),
+  (0.45, 0.65, 0.68),
+  (0.75, 0.85, 0.85),
+];
+
+const AURORA_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.09, 0.11, 0.23),
+  (0.14, 0.29, 0.4),
+  (0.16, 0.51, 0.42),
+  (0.35, 0.72, 0.34),
+  (0.83, 0.9, 0.31),
+];
+
+const BEACH_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0., 0.44, 0.7),
+  (0.42, 0.68, 0.84),
+  (0.78, 0.86, 0.9),
+  (0.94, 0.87, 0.68),
+  (0.98, 0.78, 0.44),
+];
+
+const BLUE_GREEN_YELLOW_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.09, 0.11, 0.36),
+  (0.09, 0.35, 0.48),
+  (0.16, 0.56, 0.5),
+  (0.44, 0.76, 0.41),
+  (0.85, 0.94, 0.3),
+];
+
+const BRASS_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.2, 0.14, 0.03),
+  (0.53, 0.4, 0.14),
+  (0.82, 0.67, 0.3),
+  (0.95, 0.85, 0.55),
+  (0.98, 0.95, 0.84),
+];
+
+const BRIGHT_BANDS_GRADIENT: [(f64, f64, f64); 6] = [
+  (0.4, 0.2, 0.8),
+  (0.2, 0.5, 0.9),
+  (0.2, 0.8, 0.4),
+  (0.9, 0.9, 0.2),
+  (0.9, 0.5, 0.2),
+  (0.9, 0.2, 0.2),
+];
+
+const BROWN_CYAN_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.36, 0.23, 0.13),
+  (0.63, 0.5, 0.38),
+  (0.87, 0.85, 0.81),
+  (0.55, 0.78, 0.79),
+  (0.2, 0.57, 0.62),
+];
+
+const CANDY_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.87, 0.62, 0.68),
+  (0.92, 0.74, 0.8),
+  (0.86, 0.77, 0.89),
+  (0.7, 0.68, 0.87),
+  (0.51, 0.56, 0.82),
+];
+
+const CMYK_COLORS_GRADIENT: [(f64, f64, f64); 4] = [
+  (0., 0.72, 0.92),
+  (0.9, 0.2, 0.62),
+  (1., 0.95, 0.1),
+  (0.1, 0.1, 0.1),
+];
+
+const COFFEE_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.32, 0.2, 0.13),
+  (0.53, 0.38, 0.25),
+  (0.7, 0.55, 0.41),
+  (0.85, 0.73, 0.6),
+  (0.96, 0.91, 0.84),
+];
+
+const DARK_BANDS_GRADIENT: [(f64, f64, f64); 6] = [
+  (0.43, 0.48, 0.7),
+  (0.35, 0.6, 0.44),
+  (0.6, 0.66, 0.34),
+  (0.78, 0.63, 0.3),
+  (0.78, 0.42, 0.28),
+  (0.72, 0.3, 0.44),
+];
+
+const DARK_TERRAIN_GRADIENT: [(f64, f64, f64); 6] = [
+  (0.13, 0.15, 0.23),
+  (0.26, 0.38, 0.4),
+  (0.45, 0.56, 0.4),
+  (0.7, 0.65, 0.5),
+  (0.9, 0.88, 0.85),
+  (1., 1., 1.),
+];
+
+const DEEP_SEA_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.04, 0.03, 0.11),
+  (0.08, 0.15, 0.36),
+  (0.14, 0.32, 0.6),
+  (0.3, 0.56, 0.8),
+  (0.66, 0.85, 0.94),
+];
+
+const FALL_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.22, 0.23, 0.11),
+  (0.46, 0.37, 0.16),
+  (0.7, 0.45, 0.16),
+  (0.88, 0.59, 0.22),
+  (0.96, 0.79, 0.42),
+];
+
+const FUCHSIA_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.11, 0.08, 0.11),
+  (0.4, 0.2, 0.38),
+  (0.68, 0.35, 0.63),
+  (0.86, 0.6, 0.81),
+  (0.97, 0.88, 0.95),
+];
+
+const GRAY_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.09, 0.09, 0.09),
+  (0.3, 0.3, 0.3),
+  (0.53, 0.53, 0.53),
+  (0.76, 0.76, 0.76),
+  (0.94, 0.94, 0.94),
+];
+
+const GRAY_YELLOW_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.2, 0.21, 0.24),
+  (0.45, 0.44, 0.42),
+  (0.69, 0.64, 0.51),
+  (0.88, 0.8, 0.55),
+  (0.98, 0.93, 0.72),
+];
+
+const GREEN_BROWN_TERRAIN_GRADIENT: [(f64, f64, f64); 6] = [
+  (0., 0.27, 0.09),
+  (0.31, 0.49, 0.22),
+  (0.6, 0.56, 0.33),
+  (0.79, 0.68, 0.51),
+  (0.92, 0.85, 0.76),
+  (1., 1., 1.),
+];
+
+const GREEN_PINK_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.09, 0.35, 0.14),
+  (0.42, 0.7, 0.4),
+  (0.83, 0.9, 0.78),
+  (0.94, 0.72, 0.78),
+  (0.83, 0.35, 0.53),
+];
+
+const ISLAND_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.05, 0.32, 0.58),
+  (0.34, 0.6, 0.74),
+  (0.86, 0.88, 0.71),
+  (0.71, 0.68, 0.32),
+  (0.51, 0.52, 0.19),
+];
+
+const LAKE_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.16, 0.15, 0.36),
+  (0.24, 0.36, 0.6),
+  (0.33, 0.57, 0.74),
+  (0.48, 0.77, 0.81),
+  (0.7, 0.92, 0.87),
+];
+
+const LIGHT_TEMPERATURE_MAP_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.47, 0.6, 0.92),
+  (0.7, 0.79, 0.96),
+  (0.91, 0.91, 0.92),
+  (0.96, 0.72, 0.6),
+  (0.89, 0.44, 0.36),
+];
+
+const LIGHT_TERRAIN_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.55, 0.64, 0.68),
+  (0.7, 0.74, 0.66),
+  (0.83, 0.8, 0.66),
+  (0.92, 0.88, 0.77),
+  (0.98, 0.97, 0.94),
+];
+
+const MINT_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.48, 0.76, 0.55),
+  (0.6, 0.83, 0.65),
+  (0.72, 0.89, 0.75),
+  (0.84, 0.94, 0.85),
+  (0.95, 0.99, 0.95),
+];
+
+const NEON_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.28, 0.75, 0.3),
+  (0.72, 0.86, 0.16),
+  (0.98, 0.79, 0.2),
+  (0.98, 0.5, 0.44),
+  (0.86, 0.35, 0.76),
+];
+
+const PEARL_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.86, 0.77, 0.81),
+  (0.93, 0.87, 0.86),
+  (0.97, 0.95, 0.91),
+  (0.88, 0.9, 0.94),
+  (0.75, 0.79, 0.88),
+];
+
+const PIGEON_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.16, 0.16, 0.2),
+  (0.38, 0.38, 0.44),
+  (0.59, 0.59, 0.65),
+  (0.78, 0.78, 0.82),
+  (0.94, 0.94, 0.95),
+];
+
+const PLUM_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.1, 0.03, 0.11),
+  (0.36, 0.13, 0.36),
+  (0.63, 0.29, 0.5),
+  (0.85, 0.52, 0.5),
+  (0.98, 0.81, 0.62),
+];
+
+const RED_BLUE_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.76, 0.2, 0.19),
+  (0.93, 0.57, 0.44),
+  (0.97, 0.88, 0.77),
+  (0.62, 0.74, 0.85),
+  (0.29, 0.44, 0.71),
+];
+
+const RED_GREEN_SPLIT_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.64, 0.08, 0.08),
+  (0.89, 0.5, 0.44),
+  (0.97, 0.95, 0.94),
+  (0.53, 0.79, 0.44),
+  (0.13, 0.54, 0.13),
+];
+
+const ROSE_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.22, 0.09, 0.13),
+  (0.51, 0.19, 0.28),
+  (0.76, 0.35, 0.44),
+  (0.91, 0.58, 0.62),
+  (0.98, 0.83, 0.83),
+];
+
+const RUST_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.28, 0.11, 0.05),
+  (0.51, 0.22, 0.09),
+  (0.72, 0.35, 0.13),
+  (0.89, 0.51, 0.19),
+  (0.98, 0.7, 0.31),
+];
+
+const SANDY_TERRAIN_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.63, 0.42, 0.24),
+  (0.77, 0.55, 0.33),
+  (0.88, 0.68, 0.44),
+  (0.95, 0.81, 0.58),
+  (0.99, 0.92, 0.75),
+];
+
+const SIENNA_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.34, 0.18, 0.11),
+  (0.54, 0.31, 0.18),
+  (0.72, 0.45, 0.27),
+  (0.86, 0.62, 0.42),
+  (0.96, 0.82, 0.64),
+];
+
+const SOUTHWEST_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.6, 0.32, 0.19),
+  (0.83, 0.5, 0.25),
+  (0.94, 0.72, 0.38),
+  (0.48, 0.62, 0.56),
+  (0.19, 0.41, 0.46),
+];
+
+const VALENTINE_TONES_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.53, 0.09, 0.22),
+  (0.72, 0.25, 0.38),
+  (0.86, 0.44, 0.54),
+  (0.94, 0.65, 0.71),
+  (0.99, 0.86, 0.88),
+];
+
+const WATERMELON_COLORS_GRADIENT: [(f64, f64, f64); 5] = [
+  (0.12, 0.31, 0.14),
+  (0.4, 0.62, 0.35),
+  (0.83, 0.89, 0.71),
+  (0.93, 0.63, 0.57),
+  (0.82, 0.27, 0.3),
+];
+
+/// Resolve a named ChartStyle / `ColorData` color scheme to its gradient
+/// control points. Covers every name in `ColorData["Gradients"]`.
+pub(crate) fn named_color_scheme(
+  name: &str,
+) -> Option<&'static [(f64, f64, f64)]> {
+  let scheme: &'static [(f64, f64, f64)] = match name {
+    "Pastel" => &PASTEL_GRADIENT,
+    "Rainbow" => &RAINBOW_GRADIENT,
+    "SolarColors" => &SOLAR_COLORS_GRADIENT,
+    "TemperatureMap" => &TEMPERATURE_MAP_GRADIENT,
+    "ThermometerColors" => &THERMOMETER_COLORS_GRADIENT,
+    "DarkRainbow" => &DARK_RAINBOW_GRADIENT,
+    "Aquamarine" => &AQUAMARINE_GRADIENT,
+    "StarryNightColors" => &STARRY_NIGHT_COLORS_GRADIENT,
+    "AvocadoColors" => &AVOCADO_COLORS_GRADIENT,
+    "SunsetColors" => &SUNSET_COLORS_GRADIENT,
+    "FruitPunchColors" => &FRUIT_PUNCH_COLORS_GRADIENT,
+    "CherryTones" => &CHERRY_TONES_GRADIENT,
+    "AlpineColors" => &ALPINE_COLORS_GRADIENT,
+    "ArmyColors" => &ARMY_COLORS_GRADIENT,
+    "AtlanticColors" => &ATLANTIC_COLORS_GRADIENT,
+    "AuroraColors" => &AURORA_COLORS_GRADIENT,
+    "BeachColors" => &BEACH_COLORS_GRADIENT,
+    "BlueGreenYellow" => &BLUE_GREEN_YELLOW_GRADIENT,
+    "BrassTones" => &BRASS_TONES_GRADIENT,
+    "BrightBands" => &BRIGHT_BANDS_GRADIENT,
+    "BrownCyanTones" => &BROWN_CYAN_TONES_GRADIENT,
+    "CandyColors" => &CANDY_COLORS_GRADIENT,
+    "CMYKColors" => &CMYK_COLORS_GRADIENT,
+    "CoffeeTones" => &COFFEE_TONES_GRADIENT,
+    "DarkBands" => &DARK_BANDS_GRADIENT,
+    "DarkTerrain" => &DARK_TERRAIN_GRADIENT,
+    "DeepSeaColors" => &DEEP_SEA_COLORS_GRADIENT,
+    "FallColors" => &FALL_COLORS_GRADIENT,
+    "FuchsiaTones" => &FUCHSIA_TONES_GRADIENT,
+    "GrayTones" => &GRAY_TONES_GRADIENT,
+    "GrayYellowTones" => &GRAY_YELLOW_TONES_GRADIENT,
+    "GreenBrownTerrain" => &GREEN_BROWN_TERRAIN_GRADIENT,
+    "GreenPinkTones" => &GREEN_PINK_TONES_GRADIENT,
+    "IslandColors" => &ISLAND_COLORS_GRADIENT,
+    "LakeColors" => &LAKE_COLORS_GRADIENT,
+    "LightTemperatureMap" => &LIGHT_TEMPERATURE_MAP_GRADIENT,
+    "LightTerrain" => &LIGHT_TERRAIN_GRADIENT,
+    "MintColors" => &MINT_COLORS_GRADIENT,
+    "NeonColors" => &NEON_COLORS_GRADIENT,
+    "PearlColors" => &PEARL_COLORS_GRADIENT,
+    "PigeonTones" => &PIGEON_TONES_GRADIENT,
+    "PlumColors" => &PLUM_COLORS_GRADIENT,
+    "RedBlueTones" => &RED_BLUE_TONES_GRADIENT,
+    "RedGreenSplit" => &RED_GREEN_SPLIT_GRADIENT,
+    "RoseColors" => &ROSE_COLORS_GRADIENT,
+    "RustTones" => &RUST_TONES_GRADIENT,
+    "SandyTerrain" => &SANDY_TERRAIN_GRADIENT,
+    "SiennaTones" => &SIENNA_TONES_GRADIENT,
+    "SouthwestColors" => &SOUTHWEST_COLORS_GRADIENT,
+    "ValentineTones" => &VALENTINE_TONES_GRADIENT,
+    "WatermelonColors" => &WATERMELON_COLORS_GRADIENT,
+    _ => return None,
+  };
+  Some(scheme)
+}
+
+/// Extract a scheme name from a `ChartStyle` value: either a bare string
+/// (`"Pastel"`) or `ColorData["Pastel"]`.
+fn scheme_name(val: &Expr) -> Option<String> {
+  match val {
+    Expr::String(s) => Some(s.clone()),
+    Expr::FunctionCall { name, args }
+      if name == "ColorData" && args.len() == 1 =>
+    {
+      match &args[0] {
+        Expr::String(s) => Some(s.clone()),
+        _ => None,
+      }
+    }
+    _ => None,
+  }
+}
+
+/// Evaluate a gradient (linear `Blend` of its evenly spaced control
+/// points) at parameter `t`, clamped to [0, 1] like `ColorData[name]`.
+/// The single canonical gradient interpolation — chart styling,
+/// `ColorData[name, t]`, and `sample_named_gradient` all go through here.
+pub(crate) fn gradient_color_at(
+  controls: &[(f64, f64, f64)],
+  t: f64,
+) -> (f64, f64, f64) {
+  if controls.is_empty() {
+    return (0.0, 0.0, 0.0);
+  }
+  let m = controls.len();
+  let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+  let p = t * (m - 1) as f64;
+  let idx = (p.floor() as usize).min(m - 1);
+  let frac = p - idx as f64;
+  let (r0, g0, b0) = controls[idx];
+  let (r1, g1, b1) = controls[(idx + 1).min(m - 1)];
+  (
+    r0 + frac * (r1 - r0),
+    g0 + frac * (g1 - g0),
+    b0 + frac * (b1 - b0),
+  )
+}
+
+/// Sample a named `ColorData` gradient scheme at parameter `t` (clamped to
+/// [0, 1]) via a linear `Blend` of its control points — the same
+/// interpolation wolframscript applies for `ColorData[name][t]` /
+/// `Blend[name, t]`. Returns `None` for schemes without stored control
+/// points.
+pub(crate) fn sample_named_gradient(
+  name: &str,
+  t: f64,
+) -> Option<(f64, f64, f64)> {
+  let controls = named_color_scheme(name)?;
+  if controls.is_empty() {
+    return None;
+  }
+  Some(gradient_color_at(controls, t))
+}
+
+/// Sample a gradient (linear `Blend` of its control points) at `n` evenly
+/// spaced parameters, returning one color per chart element. Matches
+/// wolframscript's `ChartStyle -> scheme` sampling (`t = i/(n-1)`).
+fn sample_gradient(controls: &[(f64, f64, f64)], n: usize) -> Vec<Color> {
+  if controls.is_empty() || n == 0 {
+    return Vec::new();
+  }
+  (0..n)
+    .map(|i| {
+      let t = if n == 1 {
+        0.0
+      } else {
+        i as f64 / (n - 1) as f64
+      };
+      let (r, g, b) = gradient_color_at(controls, t);
+      Color::new(r, g, b)
+    })
+    .collect()
+}
+
+/// If a named `ChartStyle` scheme was given and no explicit colors were
+/// supplied, fill `chart_style` with `count` colors sampled from the scheme.
+pub(crate) fn apply_color_scheme(opts: &mut ChartOptions, count: usize) {
+  if !opts.chart_style.is_empty() {
+    return;
+  }
+  if let Some(controls) = opts
+    .chart_style_scheme
+    .as_deref()
+    .and_then(named_color_scheme)
+  {
+    opts.chart_style = sample_gradient(controls, count.max(1));
+  }
+}
+
+/// Parse options from chart arguments.
+fn parse_chart_options(args: &[Expr]) -> ChartOptions {
+  let mut opts = ChartOptions {
+    svg_width: DEFAULT_WIDTH,
+    svg_height: DEFAULT_HEIGHT,
+    full_width: false,
+    chart_labels: Vec::new(),
+    chart_label_position: LabelPosition::Below,
+    plot_label: None,
+    axes_label: None,
+    frame_label: None,
+    chart_style: Vec::new(),
+    chart_style_scheme: None,
+    chart_legends: Vec::new(),
+    chart_legends_auto: false,
+    plot_range_x: None,
+    plot_range_y: None,
+    bar_origin_left: false,
+    labeling_function: None,
+    ticks_x: None,
+    ticks_y: None,
+    ticks: true,
+  };
+  for opt in &args[1..] {
+    if let Some((name, replacement)) =
+      crate::functions::graphics::option_name_value(opt)
+    {
+      let replacement = &*replacement;
+      match name {
+        "ImageSize" => {
+          if let Some((w, h, fw)) =
+            parse_image_size(replacement, DEFAULT_WIDTH, DEFAULT_HEIGHT)
+          {
+            opts.svg_width = w;
+            opts.svg_height = h;
+            opts.full_width = fw;
+          }
+        }
+        "ChartLabels" => {
+          // ChartLabels can be `Placed[labels, position]`,
+          // `Placed[labels, position, styleFn]`, or a list containing such a
+          // `Placed[...]` (e.g. `{values, Placed[days, Center, fn]}`). Check
+          // the raw expr first to avoid evaluating `Placed[]` as an unknown
+          // function, and pull a rotation out of the styling function so
+          // vertical labels (`Rotate[#, Pi/2]`) render rotated.
+          let raw = replacement;
+          if let Some(Expr::FunctionCall { args, .. }) = find_placed_spec(raw) {
+            let pos_name = match args.get(1) {
+              Some(Expr::Identifier(s)) => s.as_str(),
+              _ => "",
+            };
+            opts.chart_label_position = match pos_name {
+              "Above" | "Top" => LabelPosition::Above,
+              "Center" => LabelPosition::Center,
+              // Below, Bottom, Right, Left, and any other value → default (Below)
+              _ => LabelPosition::Below,
+            };
+            // A styling function (3rd argument) may rotate the labels.
+            let rotation =
+              args.get(2).and_then(find_rotate_angle).unwrap_or(0.0);
+            let labels_val = args
+              .first()
+              .map(|l| evaluate_expr_to_expr(l).unwrap_or_else(|_| l.clone()));
+            if let Some(Expr::List(items)) = &labels_val {
+              for item in items {
+                if let Some(mut cl) = expr_to_chart_label(item) {
+                  // Labels carry their own rotation only if written as
+                  // `Rotate[...]`; otherwise inherit the Placed styling.
+                  if cl.rotation.abs() < 1e-9 {
+                    cl.rotation = rotation;
+                  }
+                  opts.chart_labels.push(cl);
+                }
+              }
+            }
+          } else {
+            let val = evaluate_expr_to_expr(replacement)
+              .unwrap_or_else(|_| replacement.clone());
+            if let Expr::List(items) = &val {
+              for item in items {
+                if let Some(cl) = expr_to_chart_label(item) {
+                  opts.chart_labels.push(cl);
+                }
+              }
+            }
+          }
+        }
+        "PlotLabel" => {
+          let val = evaluate_expr_to_expr(replacement)
+            .unwrap_or_else(|_| replacement.clone());
+          if let Some(sl) = parse_styled_label(&val) {
+            opts.plot_label = Some(sl);
+          }
+        }
+        // The two differ in placement: a `FrameLabel` sits centred outside
+        // the bottom/left edge, an `AxesLabel` at the far end of its axis.
+        "AxesLabel" | "FrameLabel" => {
+          let val = evaluate_expr_to_expr(replacement)
+            .unwrap_or_else(|_| replacement.clone());
+          if let Expr::List(items) = &val
+            && items.len() >= 2
+          {
+            let x = expr_to_label(&items[0]).unwrap_or_default();
+            let y = expr_to_label(&items[1]).unwrap_or_default();
+            if name == "FrameLabel" {
+              opts.frame_label = Some((x, y));
+            } else {
+              opts.axes_label = Some((x, y));
+            }
+          }
+        }
+        "ChartLegends" => {
+          let val = evaluate_expr_to_expr(replacement)
+            .unwrap_or_else(|_| replacement.clone());
+          match &val {
+            // `ChartLegends -> Automatic` — let the caller fill in legend
+            // labels from the input shape (e.g. Association keys). Fall
+            // through without appending a literal "Automatic" entry.
+            Expr::Identifier(s) if s == "Automatic" => {
+              opts.chart_legends_auto = true;
+            }
+            Expr::List(items) => {
+              for item in items {
+                if let Some(s) = expr_to_label(item) {
+                  opts.chart_legends.push(s);
+                }
+              }
+            }
+            _ => {
+              if let Some(s) = expr_to_label(&val) {
+                opts.chart_legends.push(s);
+              }
+            }
+          }
+        }
+        "PlotRange" => {
+          let (rx, ry) = crate::functions::plot::parse_plot_range(replacement);
+          opts.plot_range_x = rx;
+          opts.plot_range_y = ry;
+        }
+        // `Ticks -> None` suppresses ticks entirely; `Automatic`/`All` leave
+        // the renderer's own automatic ticks in place; an explicit
+        // `{xspec, yspec}` list overrides individual axes (each entry an
+        // optional `{pos, label}` pair) — matching Plot's `Ticks` handling.
+        "Ticks" => match replacement {
+          Expr::Identifier(s) if s == "None" => opts.ticks = false,
+          Expr::Identifier(s) if s == "Automatic" || s == "All" => {
+            opts.ticks = true;
+          }
+          Expr::List(items) if (1..=2).contains(&items.len()) => {
+            opts.ticks_x =
+              crate::functions::plot::parse_explicit_ticks(&items[0]);
+            if let Some(y) = items.get(1) {
+              opts.ticks_y = crate::functions::plot::parse_explicit_ticks(y);
+            }
+          }
+          _ => {}
+        },
+        "BarOrigin" => {
+          // Left/Right give horizontal bars; Bottom/Top stay vertical.
+          if let Expr::Identifier(side) = replacement {
+            opts.bar_origin_left = matches!(side.as_str(), "Left" | "Right");
+          }
+        }
+        "LabelingFunction" => {
+          // Stored unevaluated (it's a pure function applied per value).
+          opts.labeling_function = Some(replacement.clone());
+        }
+        "ChartStyle" => {
+          let val = evaluate_expr_to_expr(replacement)
+            .unwrap_or_else(|_| replacement.clone());
+          match &val {
+            Expr::List(items) => {
+              for item in items {
+                if let Some(c) = parse_color(item) {
+                  opts.chart_style.push(c);
+                }
+              }
+            }
+            // A named color scheme, e.g. `ChartStyle -> "Pastel"` or
+            // `ChartStyle -> ColorData["Pastel"]`. Each chart element gets a
+            // distinct color sampled from the scheme's gradient. The actual
+            // colors are resolved later, once the element count is known.
+            _ if scheme_name(&val)
+              .as_deref()
+              .map(named_color_scheme)
+              .is_some_and(|s| s.is_some()) =>
+            {
+              opts.chart_style_scheme = scheme_name(&val);
+            }
+            _ => {
+              if let Some(c) = parse_color(&val) {
+                opts.chart_style.push(c);
+              }
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+  opts
+}
+
+/// Format a numeric value for display in chart tooltips.
+/// Integers (or values very close to integers) are shown without decimals.
+pub(crate) fn format_chart_value(v: f64) -> String {
+  if (v - v.round()).abs() < 1e-10 {
+    format!("{}", v as i64)
+  } else {
+    format!("{v}")
+  }
+}
+
+/// BarChart[{v1, v2, ...}] or BarChart[{{v1, v2}, {v3, v4}, ...}]
+pub fn bar_chart_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let groups = extract_grouped_values(&args[0])?;
+  if groups.is_empty() {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+  let mut opts = parse_chart_options(args);
+
+  // Resolve a named ChartStyle scheme (e.g. "Pastel") to one color per
+  // bar. With a flat list each value is its own bar (color keyed by group
+  // index); with grouped data colors cycle within each group.
+  let bars_per_group = groups.iter().map(Vec::len).max().unwrap_or(1);
+  let color_count = if bars_per_group > 1 {
+    bars_per_group
+  } else {
+    groups.len()
+  };
+  apply_color_scheme(&mut opts, color_count);
+
+  // LabelingFunction -> f produces a label drawn at each bar's end.
+  let bar_labels: Vec<String> = match &opts.labeling_function {
+    Some(func) => groups
+      .iter()
+      .flat_map(|g| g.iter())
+      .map(|&v| apply_labeling_function(func, v).unwrap_or_default())
+      .collect(),
+    None => Vec::new(),
+  };
+
+  if opts.bar_origin_left {
+    let svg = crate::functions::plot::generate_horizontal_bar_svg(
+      &groups,
+      opts.svg_width,
+      opts.svg_height,
+      opts.full_width,
+      &opts.chart_labels,
+      opts.plot_label.as_ref(),
+      opts
+        .axes_label
+        .as_ref()
+        .map(|(x, y)| (x.as_str(), y.as_str())),
+      &opts.chart_style,
+      &opts.chart_legends,
+      opts.plot_range_x,
+      &bar_labels,
+    );
+    return Ok(crate::graphics_result(svg));
+  }
+
+  let svg = generate_bar_svg(
+    &groups,
+    opts.svg_width,
+    opts.svg_height,
+    opts.full_width,
+    &opts.chart_labels,
+    opts.chart_label_position,
+    opts.plot_label.as_ref(),
+    opts
+      .axes_label
+      .as_ref()
+      .map(|(x, y)| (x.as_str(), y.as_str())),
+    opts
+      .frame_label
+      .as_ref()
+      .map(|(x, y)| (x.as_str(), y.as_str())),
+    &opts.chart_style,
+    &opts.chart_legends,
+    opts.plot_range_x,
+    opts.plot_range_y,
+    &bar_labels,
+  )?;
+  Ok(crate::graphics_result(svg))
+}
+
+/// Apply a `LabelingFunction` to a single bar value, returning the display
+/// string. Handles bare functions (`Round[#, 0.01] &`) and the `Placed[expr,
+/// position]` wrapper (the position only affects placement, which a bar
+/// chart fixes at the bar end, so only `expr` matters here).
+fn apply_labeling_function(func: &Expr, value: f64) -> Option<String> {
+  labeling_function_label(func, value).map(|(text, _)| text)
+}
+
+/// Apply a `LabelingFunction` to a single value, returning the display string
+/// together with the placement named by a `Placed[expr, position]` result
+/// (`None` when the function returns a bare expression). The position is a
+/// string for the named chart placements (`"RadialCallout"`) and a symbol
+/// name for the symbolic ones (`Center`, `Above`).
+fn labeling_function_label(
+  func: &Expr,
+  value: f64,
+) -> Option<(String, Option<String>)> {
+  let call = Expr::CurriedCall {
+    func: Box::new(func.clone()),
+    args: vec![Expr::Real(value)],
+  };
+  let result = evaluate_expr_to_expr(&call).ok()?;
+  let (inner, placement) = match &result {
+    Expr::FunctionCall { name, args }
+      if name == "Placed" && !args.is_empty() =>
+    {
+      let pos = match args.get(1) {
+        Some(Expr::String(s)) => Some(s.clone()),
+        Some(Expr::Identifier(s)) => Some(s.clone()),
+        _ => None,
+      };
+      (&args[0], pos)
+    }
+    other => (other, None),
+  };
+  let text = match inner {
+    Expr::String(s) => s.clone(),
+    // Bar values are carried as f64, so integer data arrives as e.g. `10904.0`.
+    // wolframscript labels it `10904` (no trailing dot), so render an
+    // integer-valued real as an integer.
+    Expr::Real(r) if (r - r.round()).abs() < 1e-10 && r.abs() < 9.0e15 => {
+      format!("{}", *r as i64)
+    }
+    // A structured label — `Row[{NumberForm[100 #, 2], "%"}, " "]` is how a
+    // Demonstration writes a percentage — typesets the same way every other
+    // chart label does, so the number forms inside it are applied.
+    Expr::FunctionCall { .. } | Expr::CurriedCall { .. } => {
+      expr_to_label(inner).unwrap_or_else(|| {
+        crate::functions::string_ast::to_string_default_form(inner)
+      })
+    }
+    // Charts typeset labels in OutputForm: machine-real noise like
+    // `0.47000000000000003` must render as `0.47`, matching wolframscript.
+    _ => crate::functions::string_ast::to_string_default_form(inner),
+  };
+  Some((text, placement))
+}
+
+/// Extract pie-chart rows. A flat list `{v1, v2, ...}` becomes a single
+/// row; a matrix `{{v1, v2, ...}, {w1, w2, ...}, ...}` becomes one row
+/// per sublist and renders as concentric rings (one ring per dataset).
+fn extract_pie_rows(arg: &Expr) -> Result<Vec<Vec<f64>>, InterpreterError> {
+  let data = evaluate_expr_to_expr(arg)?;
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(
+      "Chart: first argument must be a list".into(),
+    ));
+  };
+  if items.is_empty() {
+    return Ok(vec![]);
+  }
+
+  let evaluated: Vec<Expr> = items
+    .iter()
+    .map(|i| evaluate_expr_to_expr(i).unwrap_or_else(|_| i.clone()))
+    .collect();
+
+  // Matrix mode: every item is a sublist → one ring per sublist.
+  if evaluated.iter().all(|e| matches!(e, Expr::List(_))) {
+    let mut rows = Vec::with_capacity(evaluated.len());
+    for e in &evaluated {
+      if let Expr::List(inner) = e {
+        let mut row = Vec::with_capacity(inner.len());
+        for v in inner {
+          let vv = evaluate_expr_to_expr(v).unwrap_or_else(|_| v.clone());
+          if let Some(f) = try_eval_to_f64(&vv) {
+            row.push(f);
+          }
+        }
+        rows.push(row);
+      }
+    }
+    return Ok(rows);
+  }
+
+  // Flat list: single-ring dataset.
+  let mut row = Vec::with_capacity(evaluated.len());
+  for e in &evaluated {
+    if let Some(f) = try_eval_to_f64(e) {
+      row.push(f);
+    }
+  }
+  Ok(vec![row])
+}
+
+/// PieChart[{v1, v2, ...}] or PieChart[{{v1, v2, ...}, ...}]
+///
+/// Flat input renders as a single pie. A list of sublists renders as
+/// concentric rings, one ring per sublist, innermost first — matching
+/// the multi-dataset convention used by Wolfram's PieChart.
+pub fn pie_chart_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let rows = extract_pie_rows(&args[0])?;
+  let has_data = rows.iter().any(|r| r.iter().sum::<f64>() > 0.0);
+  if !has_data {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+  let mut opts = parse_chart_options(args);
+  // Resolve a named ChartStyle scheme (e.g. "Pastel") to one color per slice,
+  // sized to the widest ring.
+  let color_count = rows.iter().map(Vec::len).max().unwrap_or(1);
+  apply_color_scheme(&mut opts, color_count);
+  // wolframscript renders PieChart with AspectRatio 1 (square) — the default
+  // is 360x360 and a single-number `ImageSize -> n` still yields an n x n
+  // frame. Only an explicit `ImageSize -> {w, h}` list produces a non-square
+  // frame, so keep the parsed width/height in that one case.
+  let explicit_dims = args[1..].iter().any(|opt| {
+    matches!(opt, Expr::Rule { pattern, replacement }
+      if matches!(pattern.as_ref(), Expr::Identifier(n) if n == "ImageSize")
+        && matches!(replacement.as_ref(), Expr::List(items) if items.len() == 2))
+  });
+  if !explicit_dims {
+    opts.svg_height = opts.svg_width;
+  }
+  // A `PlotLabel` sits above the pie in extra headroom, matching wolframscript:
+  // the pie itself keeps its size, and the frame grows taller to fit the title.
+  let has_plot_label = opts
+    .plot_label
+    .as_ref()
+    .is_some_and(|sl| !sl.text.is_empty());
+  let title_font_size = 16.0;
+  let top_margin: f64 = if has_plot_label {
+    30.0 + plot_label_extra_lines(opts.plot_label.as_ref()) as f64 * 20.0
+  } else {
+    0.0
+  };
+  let (svg_width, full_width) = (opts.svg_width, opts.full_width);
+  let svg_height = opts.svg_height + top_margin.round() as u32;
+
+  let w = svg_width as f64;
+  let h = opts.svg_height as f64;
+  let cx = w / 2.0;
+  let cy = top_margin + h / 2.0;
+
+  // `LabelingFunction -> f` labels every slice with `f[value]`. The result
+  // may be wrapped in `Placed[…, position]`, which decides how far out along
+  // the slice's mid-angle the text sits.
+  let slice_labels: Vec<Vec<Option<(String, Option<String>)>>> =
+    match &opts.labeling_function {
+      Some(func) => rows
+        .iter()
+        .map(|row| {
+          row
+            .iter()
+            .map(|&v| labeling_function_label(func, v))
+            .collect()
+        })
+        .collect(),
+      None => Vec::new(),
+    };
+  // Callout labels sit outside the pie, so the wedges give up the room the
+  // text needs — the same trade wolframscript makes.
+  let has_callout = slice_labels
+    .iter()
+    .flatten()
+    .flatten()
+    .any(|(_, pos)| pos.as_deref().is_some_and(|p| p.ends_with("Callout")));
+  // wolframscript leaves a margin of ~1/6 of the half-frame around the pie,
+  // so the radius is ~0.82 of the half-frame (147 on a 360x360 frame).
+  let radius =
+    (w.min(h) / 2.0) * (147.0 / 180.0) * if has_callout { 0.72 } else { 1.0 };
+
+  let mut svg = svg_header(svg_width, svg_height, full_width);
+  // Label text is collected separately so it draws on top of every wedge.
+  let mut labels_svg = String::new();
+
+  let n_rings = rows.len();
+  // Split the total radius between `n_rings` equal-width rings and
+  // `n_rings - 1` inter-ring gaps. Every ring ends up with the same
+  // thickness and the outermost ring still reaches the full radius.
+  let ring_gap = if n_rings > 1 {
+    3.0_f64.min(radius / n_rings as f64 * 0.25)
+  } else {
+    0.0
+  };
+  let ring_width =
+    (radius - (n_rings.saturating_sub(1)) as f64 * ring_gap) / n_rings as f64;
+
+  for (ring_idx, row) in rows.iter().enumerate() {
+    let total: f64 = row.iter().sum();
+    if total <= 0.0 {
+      continue;
+    }
+    let r_in = ring_idx as f64 * (ring_width + ring_gap);
+    let r_out = r_in + ring_width;
+
+    // Slices are drawn in the order given by the value array, matching
+    // wolframscript: `PieChart[{v1, v2, ...}]` lays wedges out in input
+    // order (no sorting). This holds for both single- and multi-ring input.
+
+    // Start at π (negative x-axis) so the first slice sits right above it.
+    let mut start_angle = std::f64::consts::PI;
+    // Restart the color cycle at each ring so every row uses the same
+    // palette — the rings themselves carry the "dataset" distinction.
+    for i in 0..row.len() {
+      let val = row[i];
+      // Color and label are keyed by the original data index `i` (not the
+      // draw order), matching wolframscript: `ChartStyle -> {c1, c2, ...}`
+      // and `ChartLabels -> {l1, l2, ...}` align with the input values.
+      let (r, g, b) = if opts.chart_style.is_empty() {
+        PLOT_COLORS[i % PLOT_COLORS.len()]
+      } else {
+        let c = &opts.chart_style[i % opts.chart_style.len()];
+        (
+          (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        )
+      };
+      let sweep = 2.0 * std::f64::consts::PI * val / total;
+      let end_angle = start_angle + sweep;
+      let large_arc = i32::from(sweep > std::f64::consts::PI);
+      let tooltip = opts
+        .chart_labels
+        .get(i)
+        .map_or_else(|| format_chart_value(val), |l| l.text.clone());
+
+      if r_in <= 1e-9 {
+        // Innermost ring with no hole: render as a center-anchored wedge.
+        let x1 = cx + r_out * start_angle.cos();
+        let y1 = cy + r_out * start_angle.sin();
+        let x2 = cx + r_out * end_angle.cos();
+        let y2 = cy + r_out * end_angle.sin();
+        svg.push_str(&format!(
+          "<path d=\"M{cx:.2},{cy:.2} L{x1:.2},{y1:.2} A{r_out:.2},{r_out:.2} 0 {large_arc},1 {x2:.2},{y2:.2} Z\" \
+           fill=\"rgb({r},{g},{b})\" stroke=\"black\" stroke-width=\"1\"><title>{tooltip}</title></path>\n"
+        ));
+      } else {
+        // Outer ring: render as an annulus wedge.
+        let xi1 = cx + r_in * start_angle.cos();
+        let yi1 = cy + r_in * start_angle.sin();
+        let xi2 = cx + r_in * end_angle.cos();
+        let yi2 = cy + r_in * end_angle.sin();
+        let xo1 = cx + r_out * start_angle.cos();
+        let yo1 = cy + r_out * start_angle.sin();
+        let xo2 = cx + r_out * end_angle.cos();
+        let yo2 = cy + r_out * end_angle.sin();
+        svg.push_str(&format!(
+          "<path d=\"M{xi1:.2},{yi1:.2} L{xo1:.2},{yo1:.2} A{r_out:.2},{r_out:.2} 0 {large_arc},1 {xo2:.2},{yo2:.2} L{xi2:.2},{yi2:.2} A{r_in:.2},{r_in:.2} 0 {large_arc},0 {xi1:.2},{yi1:.2} Z\" \
+           fill=\"rgb({r},{g},{b})\" stroke=\"black\" stroke-width=\"1\"><title>{tooltip}</title></path>\n"
+        ));
+      }
+
+      // Draw the ChartLabels text at the wedge centroid.
+      if let Some(label) = opts.chart_labels.get(i) {
+        let mid_angle = start_angle + sweep / 2.0;
+        let r_label = if r_in <= 1e-9 {
+          r_out * 0.6
+        } else {
+          f64::midpoint(r_in, r_out)
+        };
+        let lx = cx + r_label * mid_angle.cos();
+        let ly = cy + r_label * mid_angle.sin();
+        labels_svg.push_str(&format!(
+          "<text x=\"{lx:.2}\" y=\"{ly:.2}\" text-anchor=\"middle\" \
+           dominant-baseline=\"central\" font-family=\"sans-serif\" \
+           font-size=\"12\" fill=\"black\">{}</text>\n",
+          crate::functions::graphics::box_string_to_svg(&label.text)
+        ));
+      }
+
+      // Draw the LabelingFunction text, positioned by its `Placed` spec.
+      if let Some((text, placement)) = slice_labels
+        .get(ring_idx)
+        .and_then(|row| row.get(i))
+        .and_then(Option::as_ref)
+        && !text.is_empty()
+      {
+        let mid_angle = start_angle + sweep / 2.0;
+        labels_svg.push_str(&pie_slice_label_svg(
+          text,
+          placement.as_deref(),
+          (cx, cy),
+          (r_in, r_out),
+          mid_angle,
+        ));
+      }
+
+      start_angle = end_angle;
+    }
+  }
+
+  // PlotLabel: centered above the pie, in the headroom reserved above.
+  if let Some(sl) = &opts.plot_label
+    && !sl.text.is_empty()
+  {
+    let ty = top_margin - title_font_size * 0.5;
+    let fs = sl.font_size.unwrap_or(title_font_size);
+    let fill = sl
+      .color
+      .as_ref()
+      .map_or_else(|| "black".to_string(), |c| c.to_svg_rgb());
+    let mut style_attrs = String::new();
+    if sl.bold {
+      style_attrs.push_str(" font-weight=\"bold\"");
+    }
+    if sl.italic {
+      style_attrs.push_str(" font-style=\"italic\"");
+    }
+    labels_svg.push_str(&format!(
+      "<text x=\"{cx:.1}\" y=\"{ty:.1}\" text-anchor=\"middle\" \
+       font-family=\"sans-serif\" font-size=\"{fs:.0}\" \
+       fill=\"{fill}\"{style_attrs}>{}</text>\n",
+      sl.svg_scaled_stacked(1.0, cx, fs * 1.2)
+    ));
+  }
+
+  svg.push_str(&labels_svg);
+  svg.push_str("</svg>");
+  Ok(crate::graphics_result(svg))
+}
+
+/// SVG for one pie-slice label, placed along the slice's mid-angle according
+/// to its `Placed` position. The radial positions name a fraction of the
+/// slice's own band (`"RadialInner"` hugs the inner edge, `"RadialOuter"` the
+/// outer one); the callout positions put the text outside the pie and draw a
+/// leader line out to it.
+fn pie_slice_label_svg(
+  text: &str,
+  placement: Option<&str>,
+  (cx, cy): (f64, f64),
+  (r_in, r_out): (f64, f64),
+  mid_angle: f64,
+) -> String {
+  // Where along the slice's radial band the text sits. A solid wedge has no
+  // inner edge, so its band starts at the centre and the centred label pulls
+  // in to 0.6 of the radius — far enough out that neighbouring labels don't
+  // collide at the hub.
+  let band = |f: f64| {
+    if r_in <= 1e-9 {
+      r_out * f
+    } else {
+      r_in + (r_out - r_in) * f
+    }
+  };
+  let callout = placement.is_some_and(|p| p.ends_with("Callout"));
+  let r_label = match placement {
+    Some("RadialInner") => band(0.25),
+    Some("RadialOuter") => band(0.85),
+    _ if callout => r_out * 1.06,
+    // "RadialCenter" and every other placement centre the label in its band.
+    _ => {
+      if r_in <= 1e-9 {
+        r_out * 0.6
+      } else {
+        f64::midpoint(r_in, r_out)
+      }
+    }
+  };
+  let (dx, dy) = (mid_angle.cos(), mid_angle.sin());
+  let lx = cx + r_label * dx;
+  let ly = cy + r_label * dy;
+  // A callout's text grows away from the pie, so it anchors on the side
+  // facing the centre; an inside label is centred on its point.
+  let anchor = if !callout {
+    "middle"
+  } else if dx >= 0.0 {
+    "start"
+  } else {
+    "end"
+  };
+  let mut out = String::new();
+  if callout {
+    let (x1, y1) = (cx + r_out * dx, cy + r_out * dy);
+    out.push_str(&format!(
+      "<line x1=\"{x1:.2}\" y1=\"{y1:.2}\" x2=\"{lx:.2}\" y2=\"{ly:.2}\" \
+       stroke=\"black\" stroke-width=\"0.5\"/>\n"
+    ));
+  }
+  out.push_str(&format!(
+    "<text x=\"{lx:.2}\" y=\"{ly:.2}\" text-anchor=\"{anchor}\" \
+     dominant-baseline=\"central\" font-family=\"sans-serif\" \
+     font-size=\"12\" fill=\"black\">{}</text>\n",
+    crate::functions::graphics::box_string_to_svg(text)
+  ));
+  out
+}
+
+/// BarChart3D[{v1, v2, ...}] or BarChart3D[{{v1, v2}, {v3, v4}, ...}]
+/// Renders a 3D bar chart with each bar drawn as a colored cuboid.
+pub fn bar_chart_3d_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  use crate::functions::plot3d::{
+    Point3D, Triangle, apply_lighting, depth, project, tessellate_cuboid,
+    triangle_normal,
+  };
+
+  let Ok(groups) = extract_grouped_values(&args[0]) else {
+    // Return unevaluated for invalid (non-list) input, matching wolframscript.
+    return Ok(unevaluated("BarChart3D", args));
+  };
+  if groups.is_empty() {
+    return Ok(crate::graphics3d_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+  let opts = parse_chart_options(args);
+  let (svg_width, svg_height, full_width) =
+    (opts.svg_width, opts.svg_height, opts.full_width);
+
+  // Determine value range across all bars
+  let mut v_max = f64::NEG_INFINITY;
+  let mut v_min = f64::INFINITY;
+  for group in &groups {
+    for &v in group {
+      v_max = v_max.max(v);
+      v_min = v_min.min(v);
+    }
+  }
+  if !v_max.is_finite() {
+    return Ok(crate::graphics3d_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+  let z_lo = v_min.min(0.0);
+  let z_hi = v_max.max(0.0);
+  let z_range = if (z_hi - z_lo).abs() < 1e-15 {
+    1.0
+  } else {
+    z_hi - z_lo
+  };
+
+  // Map a value to normalized z in [-Z_SCALE, Z_SCALE].
+  // Z_SCALE matches the default BoxRatios used by plot3d.
+  const Z_SCALE: f64 = 0.4;
+  let nz = |v: f64| -> f64 { ((v - z_lo) / z_range) * 2.0 * Z_SCALE - Z_SCALE };
+  let z_base = nz(0.0);
+
+  // Layout: each group occupies a "slot" along x; bars within a group are
+  // positioned side by side along y.
+  let n_groups = groups.len();
+  let max_bars_per_group =
+    groups.iter().map(std::vec::Vec::len).max().unwrap_or(1);
+
+  // Normalized box spans x in [-1, 1]. Bars are centered in y with a
+  // total depth proportional to the per-group x width so they look thin
+  // rather than stretched far into the back.
+  let group_step = 2.0 / n_groups as f64;
+  let group_pad = group_step * 0.15;
+  // Total y-extent used by bars (shared across all groups). Tying this
+  // to group_step keeps each bar's footprint close to square, and the
+  // 0.75 factor keeps bars noticeably thinner than their visible width.
+  let total_y_span = group_step * 0.75;
+  let y_origin = -total_y_span / 2.0;
+  let bar_y_step = total_y_span / max_bars_per_group as f64;
+  let bar_y_pad = bar_y_step * 0.15;
+
+  let camera = chart_3d_camera();
+  let mut all_triangles: Vec<Triangle> = Vec::new();
+
+  for (gi, group) in groups.iter().enumerate() {
+    let x_lo = -1.0 + gi as f64 * group_step + group_pad;
+    let x_hi = -1.0 + (gi as f64 + 1.0) * group_step - group_pad;
+    for (bi, &v) in group.iter().enumerate() {
+      let y_lo = y_origin + bi as f64 * bar_y_step + bar_y_pad;
+      let y_hi = y_origin + (bi as f64 + 1.0) * bar_y_step - bar_y_pad;
+      let z_top = nz(v);
+      // Build cuboid from base (z_base) to top (z_top).
+      let (zmin, zmax) = if z_top >= z_base {
+        (z_base, z_top)
+      } else {
+        (z_top, z_base)
+      };
+      let p_min = Point3D {
+        x: x_lo,
+        y: y_lo,
+        z: zmin,
+      };
+      let p_max = Point3D {
+        x: x_hi,
+        y: y_hi,
+        z: zmax,
+      };
+
+      // Choose color: ChartStyle overrides; otherwise cycle PLOT_COLORS by
+      // group index (single-bar) or by bar index within group.
+      let color_index = if max_bars_per_group > 1 { bi } else { gi };
+      let base_color = if opts.chart_style.is_empty() {
+        PLOT_COLORS[color_index % PLOT_COLORS.len()]
+      } else {
+        let c = &opts.chart_style[color_index % opts.chart_style.len()];
+        (
+          (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        )
+      };
+
+      for (v0, v1, v2) in tessellate_cuboid(&p_min, &p_max) {
+        let normal = triangle_normal(v0, v1, v2);
+        let color = apply_lighting(base_color, normal);
+        let center = Point3D {
+          x: (v0.x + v1.x + v2.x) / 3.0,
+          y: (v0.y + v1.y + v2.y) / 3.0,
+          z: (v0.z + v1.z + v2.z) / 3.0,
+        };
+        all_triangles.push(Triangle {
+          boundary: [true; 3],
+          edge_color: None,
+          projected: [
+            project(v0, &camera),
+            project(v1, &camera),
+            project(v2, &camera),
+          ],
+          depth: depth(center, &camera),
+          color,
+          opacity: 1.0,
+        });
+      }
+    }
+  }
+
+  // Painter's algorithm: draw farthest first.
+  all_triangles.sort_by(|a, b| {
+    b.depth
+      .partial_cmp(&a.depth)
+      .unwrap_or(std::cmp::Ordering::Equal)
+  });
+
+  let svg =
+    render_3d_triangles(&all_triangles, svg_width, svg_height, full_width);
+  Ok(crate::graphics3d_result(svg))
+}
+
+/// PieChart3D[{v1, v2, ...}] or PieChart3D[{{v1, v2, ...}, ...}]
+///
+/// Flat input renders as a short cylinder split into colored wedges.
+/// A list of sublists renders as concentric cylindrical rings — one
+/// ring per sublist, innermost first — matching Wolfram's multi-dataset
+/// PieChart3D convention.
+pub fn pie_chart_3d_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  use crate::functions::plot3d::{
+    Point3D, Triangle, apply_lighting, depth, project, triangle_normal,
+  };
+
+  let Ok(rows) = extract_pie_rows(&args[0]) else {
+    return Ok(unevaluated("PieChart3D", args));
+  };
+  let has_data = rows.iter().any(|r| r.iter().sum::<f64>() > 0.0);
+  if !has_data {
+    return Ok(crate::graphics3d_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+  let opts = parse_chart_options(args);
+  let (svg_width, svg_height, full_width) =
+    (opts.svg_width, opts.svg_height, opts.full_width);
+
+  // Geometry constants in normalized world space.
+  let max_radius = 0.95_f64;
+  let half_thickness = 0.12_f64;
+  let z_top = half_thickness;
+  let z_bot = -half_thickness;
+
+  let n_rings = rows.len();
+  // Split `max_radius` between `n_rings` equal-width rings and
+  // `n_rings - 1` inter-ring gaps (normalized world units).
+  let ring_gap = if n_rings > 1 {
+    0.015_f64.min(max_radius / n_rings as f64 * 0.25)
+  } else {
+    0.0
+  };
+  let ring_width = (max_radius - (n_rings.saturating_sub(1)) as f64 * ring_gap)
+    / n_rings as f64;
+
+  let camera = chart_3d_camera();
+  let mut all_triangles: Vec<Triangle> = Vec::new();
+  // Number of segments per full circle for tessellating arcs.
+  const SEG_PER_TURN: usize = 64;
+
+  for (ring_idx, row) in rows.iter().enumerate() {
+    let total: f64 = row.iter().sum();
+    if total <= 0.0 {
+      continue;
+    }
+    let r_in = ring_idx as f64 * (ring_width + ring_gap);
+    let r_out = r_in + ring_width;
+
+    // Single-ring input sorts slices smallest-to-largest, matching the
+    // long-standing 3D layout. Multi-ring input preserves insertion
+    // order per row so rings stay easy to compare.
+    let order: Vec<usize> = if n_rings == 1 {
+      let mut idx: Vec<(usize, f64)> =
+        row.iter().copied().enumerate().collect();
+      idx.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+      });
+      idx.iter().map(|(i, _)| *i).collect()
+    } else {
+      (0..row.len()).collect()
+    };
+
+    let mut start_angle = std::f64::consts::PI;
+    // Restart the color cycle at each ring so every row uses the same
+    // palette — the rings themselves carry the "dataset" distinction.
+    for (slot_color_idx, &i) in order.iter().enumerate() {
+      let val = row[i];
+      let sweep = 2.0 * std::f64::consts::PI * val / total;
+      if sweep <= 0.0 {
+        continue;
+      }
+      let end_angle = start_angle + sweep;
+
+      let base_color = if opts.chart_style.is_empty() {
+        PLOT_COLORS[slot_color_idx % PLOT_COLORS.len()]
+      } else {
+        let c = &opts.chart_style[slot_color_idx % opts.chart_style.len()];
+        (
+          (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        )
+      };
+
+      let n_seg = ((sweep / (2.0 * std::f64::consts::PI) * SEG_PER_TURN as f64)
+        .ceil() as usize)
+        .max(1);
+
+      let push_tri =
+        |v0: Point3D, v1: Point3D, v2: Point3D, all: &mut Vec<Triangle>| {
+          let normal = triangle_normal(v0, v1, v2);
+          let color = apply_lighting(base_color, normal);
+          let center = Point3D {
+            x: (v0.x + v1.x + v2.x) / 3.0,
+            y: (v0.y + v1.y + v2.y) / 3.0,
+            z: (v0.z + v1.z + v2.z) / 3.0,
+          };
+          all.push(Triangle {
+            boundary: [true; 3],
+            edge_color: None,
+            projected: [
+              project(v0, &camera),
+              project(v1, &camera),
+              project(v2, &camera),
+            ],
+            depth: depth(center, &camera),
+            color,
+            opacity: 1.0,
+          });
+        };
+
+      let pt = |r: f64, a: f64, z: f64| Point3D {
+        x: r * a.cos(),
+        y: r * a.sin(),
+        z,
+      };
+      let is_innermost = r_in <= 1e-9;
+
+      for s in 0..n_seg {
+        let t0 = s as f64 / n_seg as f64;
+        let t1 = (s + 1) as f64 / n_seg as f64;
+        let a0 = start_angle + t0 * sweep;
+        let a1 = start_angle + t1 * sweep;
+
+        let o_top_0 = pt(r_out, a0, z_top);
+        let o_top_1 = pt(r_out, a1, z_top);
+        let o_bot_0 = pt(r_out, a0, z_bot);
+        let o_bot_1 = pt(r_out, a1, z_bot);
+
+        if is_innermost {
+          // Innermost ring: top/bottom faces are triangle fans from
+          // the central axis; there's no inner cylindrical wall.
+          let center_top = pt(0.0, 0.0, z_top);
+          let center_bot = pt(0.0, 0.0, z_bot);
+          push_tri(center_top, o_top_0, o_top_1, &mut all_triangles);
+          push_tri(center_bot, o_bot_1, o_bot_0, &mut all_triangles);
+        } else {
+          let i_top_0 = pt(r_in, a0, z_top);
+          let i_top_1 = pt(r_in, a1, z_top);
+          let i_bot_0 = pt(r_in, a0, z_bot);
+          let i_bot_1 = pt(r_in, a1, z_bot);
+
+          // Top annular face (quad → two triangles).
+          push_tri(i_top_0, o_top_0, o_top_1, &mut all_triangles);
+          push_tri(i_top_0, o_top_1, i_top_1, &mut all_triangles);
+          // Bottom annular face (reverse winding so the normal points down).
+          push_tri(i_bot_0, o_bot_1, o_bot_0, &mut all_triangles);
+          push_tri(i_bot_0, i_bot_1, o_bot_1, &mut all_triangles);
+
+          // Inner cylindrical wall (normal points inward).
+          push_tri(i_top_0, i_top_1, i_bot_1, &mut all_triangles);
+          push_tri(i_top_0, i_bot_1, i_bot_0, &mut all_triangles);
+        }
+
+        // Outer cylindrical wall: two triangles per quad.
+        push_tri(o_top_0, o_bot_0, o_bot_1, &mut all_triangles);
+        push_tri(o_top_0, o_bot_1, o_top_1, &mut all_triangles);
+      }
+
+      // Two flat side walls (one for each radial edge of the slice).
+      let edge0_out_top = pt(r_out, start_angle, z_top);
+      let edge0_out_bot = pt(r_out, start_angle, z_bot);
+      let edge1_out_top = pt(r_out, end_angle, z_top);
+      let edge1_out_bot = pt(r_out, end_angle, z_bot);
+
+      if is_innermost {
+        let center_top = pt(0.0, 0.0, z_top);
+        let center_bot = pt(0.0, 0.0, z_bot);
+        // Side at start_angle.
+        push_tri(center_top, center_bot, edge0_out_bot, &mut all_triangles);
+        push_tri(center_top, edge0_out_bot, edge0_out_top, &mut all_triangles);
+        // Side at end_angle (reverse winding for the opposing face).
+        push_tri(center_top, edge1_out_top, edge1_out_bot, &mut all_triangles);
+        push_tri(center_top, edge1_out_bot, center_bot, &mut all_triangles);
+      } else {
+        let edge0_in_top = pt(r_in, start_angle, z_top);
+        let edge0_in_bot = pt(r_in, start_angle, z_bot);
+        let edge1_in_top = pt(r_in, end_angle, z_top);
+        let edge1_in_bot = pt(r_in, end_angle, z_bot);
+        // Side at start_angle.
+        push_tri(
+          edge0_in_top,
+          edge0_in_bot,
+          edge0_out_bot,
+          &mut all_triangles,
+        );
+        push_tri(
+          edge0_in_top,
+          edge0_out_bot,
+          edge0_out_top,
+          &mut all_triangles,
+        );
+        // Side at end_angle (reverse winding for the opposing face).
+        push_tri(
+          edge1_in_top,
+          edge1_out_top,
+          edge1_out_bot,
+          &mut all_triangles,
+        );
+        push_tri(
+          edge1_in_top,
+          edge1_out_bot,
+          edge1_in_bot,
+          &mut all_triangles,
+        );
+      }
+
+      start_angle = end_angle;
+    }
+  }
+
+  // Painter's algorithm
+  all_triangles.sort_by(|a, b| {
+    b.depth
+      .partial_cmp(&a.depth)
+      .unwrap_or(std::cmp::Ordering::Equal)
+  });
+
+  let svg =
+    render_3d_triangles(&all_triangles, svg_width, svg_height, full_width);
+  Ok(crate::graphics3d_result(svg))
+}
+
+/// Camera angle used by the 3D chart functions. Pulled back from the
+/// default Plot3D viewpoint so bars/slices are viewed more from the front
+/// and less from above, giving a flatter, more front-facing look.
+/// `azimuth` closer to -π/2 ≈ -1.5708 places the viewer directly in front
+/// (along -y); values closer to 0 move it toward the right (+x).
+fn chart_3d_camera() -> crate::functions::plot3d::Camera {
+  crate::functions::plot3d::Camera {
+    azimuth: -1.35, // ~-77° — only ~13° offset from a direct front view
+    elevation: 0.32, // ~18°
+  }
+}
+
+/// Render a list of depth-sorted projected triangles into an SVG string.
+fn render_3d_triangles(
+  triangles: &[crate::functions::plot3d::Triangle],
+  svg_width: u32,
+  svg_height: u32,
+  full_width: bool,
+) -> String {
+  // Find bounding box of all projected points
+  let mut px_min = f64::INFINITY;
+  let mut px_max = f64::NEG_INFINITY;
+  let mut py_min = f64::INFINITY;
+  let mut py_max = f64::NEG_INFINITY;
+  for tri in triangles {
+    for &(px, py) in &tri.projected {
+      px_min = px_min.min(px);
+      px_max = px_max.max(px);
+      py_min = py_min.min(py);
+      py_max = py_max.max(py);
+    }
+  }
+  if !px_min.is_finite() {
+    px_min = -1.0;
+    px_max = 1.0;
+    py_min = -1.0;
+    py_max = 1.0;
+  }
+  let p_width = (px_max - px_min).max(1e-15);
+  let p_height = (py_max - py_min).max(1e-15);
+
+  let margin = 25.0;
+  let draw_w = svg_width as f64 - 2.0 * margin;
+  let draw_h = svg_height as f64 - 2.0 * margin;
+  let scale = (draw_w / p_width).min(draw_h / p_height);
+  let cx = margin + draw_w / 2.0;
+  let cy = margin + draw_h / 2.0;
+  let p_cx = f64::midpoint(px_min, px_max);
+  let p_cy = f64::midpoint(py_min, py_max);
+
+  let to_svg = |px: f64, py: f64| -> (f64, f64) {
+    (cx + (px - p_cx) * scale, cy - (py - p_cy) * scale)
+  };
+
+  let mut svg = String::with_capacity(triangles.len() * 120 + 1000);
+  if full_width {
+    svg.push_str(&format!(
+      "<svg width=\"100%\" viewBox=\"0 0 {svg_width} {svg_height}\" preserveAspectRatio=\"xMidYMid meet\" xmlns=\"http://www.w3.org/2000/svg\">\n"
+    ));
+  } else {
+    svg.push_str(&format!(
+      "<svg width=\"{svg_width}\" height=\"{svg_height}\" viewBox=\"0 0 {svg_width} {svg_height}\" xmlns=\"http://www.w3.org/2000/svg\">\n"
+    ));
+  }
+  let (bg, _, _, _, _) = crate::functions::plot::plot_theme();
+  svg.push_str(&format!(
+    "<rect width=\"{svg_width}\" height=\"{svg_height}\" fill=\"rgb({},{},{})\"/>\n",
+    bg.0, bg.1, bg.2
+  ));
+
+  for tri in triangles {
+    let (x0, y0) = to_svg(tri.projected[0].0, tri.projected[0].1);
+    let (x1, y1) = to_svg(tri.projected[1].0, tri.projected[1].1);
+    let (x2, y2) = to_svg(tri.projected[2].0, tri.projected[2].1);
+    let (r, g, b) = tri.color;
+    svg.push_str(&format!(
+      "<polygon points=\"{x0:.1},{y0:.1} {x1:.1},{y1:.1} {x2:.1},{y2:.1}\" fill=\"rgb({r},{g},{b})\" stroke=\"rgb({r},{g},{b})\" stroke-width=\"0.5\"/>\n"
+    ));
+  }
+
+  svg.push_str("</svg>");
+  svg
+}
+
+/// Histogram[{d1, d2, ...}] or Histogram[{d1, d2, ...}, nbins]
+/// or Histogram[{d1, d2, ...}, {{e1, e2, ...}}]
+pub fn histogram_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  // A flat list `{v1, v2, ...}` is one dataset; a list of lists
+  // `{{...}, {...}}` is several datasets drawn overlaid.
+  let datasets = parse_datasets(&args[0])?;
+  if datasets.is_empty() || datasets.iter().all(std::vec::Vec::is_empty) {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+
+  // Positional (non-option) args after the data: `bspec` then `hspec`.
+  let positional: Vec<&Expr> = args[1..]
+    .iter()
+    .filter(|a| !matches!(a, Expr::Rule { .. }))
+    .collect();
+
+  let bin_spec = positional.first().and_then(|e| parse_bin_spec(e));
+  let height = positional
+    .get(1)
+    .and_then(|e| parse_histogram_height(e))
+    .unwrap_or(HistogramHeight::Count);
+
+  let mut opts = parse_chart_options(args);
+  let svg = generate_histogram_svg(
+    &datasets,
+    bin_spec.clone().as_ref(),
+    height,
+    &mut opts,
+  )?;
+
+  // Per-dataset colors matching the rendered bars, used to build a PlotSource
+  // so `Show[Histogram[...], Plot[...]]` overlays the bars with the curves.
+  let colors: Vec<(u8, u8, u8)> = (0..datasets.len())
+    .map(|di| {
+      if opts.chart_style.is_empty() {
+        PLOT_COLORS[di % PLOT_COLORS.len()]
+      } else {
+        let c = &opts.chart_style[di % opts.chart_style.len()];
+        (
+          (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+          (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        )
+      }
+    })
+    .collect();
+
+  match crate::functions::plot::histogram_plot_source(
+    &datasets,
+    bin_spec.as_ref(),
+    height,
+    &colors,
+    (opts.svg_width, opts.svg_height),
+  ) {
+    Some(src) => Ok(crate::graphics_result_with_source(svg, src)),
+    None => Ok(crate::graphics_result(svg)),
+  }
+}
+
+/// Parse a Histogram bin specification (`bspec`): an integer bin count,
+/// `{w}` (bin width), or `{{e1, e2, ...}}` (explicit bin edges). Anything
+/// else (e.g. `Automatic`) yields `None` (automatic binning).
+fn parse_bin_spec(arg: &Expr) -> Option<BinSpec> {
+  let evaluated = evaluate_expr_to_expr(arg).unwrap_or_else(|_| arg.clone());
+  if let Expr::List(outer) = &evaluated {
+    // {{e1, e2, ...}} — a list wrapping the explicit bin edges.
+    if outer.len() == 1
+      && let Expr::List(inner) = &outer[0]
+    {
+      let edges: Vec<f64> = inner.iter().filter_map(try_eval_to_f64).collect();
+      return (edges.len() >= 2).then_some(BinSpec::Edges(edges));
+    }
+    // {w} — a bin width.
+    if outer.len() == 1
+      && let Some(w) = try_eval_to_f64(&outer[0])
+    {
+      return (w > 0.0).then_some(BinSpec::Width(w));
+    }
+    // {min, max, w} — width w over an explicit range: use the width and
+    // let the shared edge builder align to it.
+    if outer.len() == 3
+      && let Some(w) = try_eval_to_f64(&outer[2])
+    {
+      return (w > 0.0).then_some(BinSpec::Width(w));
+    }
+    None
+  } else {
+    let f = try_eval_to_f64(&evaluated)?;
+    let n = f as usize;
+    (n > 0).then_some(BinSpec::Count(n))
+  }
+}
+
+/// Parse a Histogram height specification (`hspec`) string into a
+/// `HistogramHeight`. Unknown specs fall back to plain counts.
+fn parse_histogram_height(arg: &Expr) -> Option<HistogramHeight> {
+  let s = match arg {
+    Expr::String(s) => s.as_str(),
+    Expr::Identifier(s) => s.as_str(),
+    _ => return None,
+  };
+  Some(match s {
+    "Count" => HistogramHeight::Count,
+    "CumulativeCount" => HistogramHeight::CumulativeCount,
+    "Probability" | "Relative" | "Fraction" | "PMF" => {
+      HistogramHeight::Probability
+    }
+    "PDF" => HistogramHeight::Pdf,
+    "CDF" => HistogramHeight::Cdf,
+    _ => return None,
+  })
+}
+
+/// Compute box-whisker statistics for a sorted dataset.
+/// Uses Mathematica's quartile interpolation:
+///   Q1 at position (n+2)/4, Q2 at (n+1)/2, Q3 at (3n+2)/4 (1-indexed).
+fn box_stats(sorted: &[f64]) -> (f64, f64, f64, f64, f64) {
+  let n = sorted.len() as f64;
+  let interp = |pos: f64| -> f64 {
+    let idx = pos - 1.0; // convert to 0-indexed
+    let lo = idx.floor() as usize;
+    let hi = (idx.ceil() as usize).min(sorted.len() - 1);
+    let frac = idx - lo as f64;
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+  };
+  let q1 = interp((n + 2.0) / 4.0);
+  let median = interp(f64::midpoint(n, 1.0));
+  let q3 = interp((3.0 * n + 2.0) / 4.0);
+  (sorted[0], q1, median, q3, sorted[sorted.len() - 1])
+}
+
+/// Parse the first argument into one or more datasets (Vec<Vec<f64>>).
+/// Supports:
+/// - `{d1, d2, ...}` → single dataset
+/// - `{{d1, d2, ...}, {d3, d4, ...}}` → multiple datasets
+fn parse_datasets(arg: &Expr) -> Result<Vec<Vec<f64>>, InterpreterError> {
+  let data = evaluate_expr_to_expr(arg)?;
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(
+      "Chart: first argument must be a list".into(),
+    ));
+  };
+
+  if items.is_empty() {
+    return Ok(vec![]);
+  }
+
+  // Check if the first element is a list (multiple datasets)
+  if let Expr::List(_) = &items[0] {
+    let mut datasets = Vec::new();
+    for item in items {
+      if let Expr::List(inner) = item {
+        let mut vals = Vec::new();
+        for v in inner {
+          let ev = evaluate_expr_to_expr(v).unwrap_or(v.clone());
+          if let Some(f) = try_eval_to_f64(&ev) {
+            vals.push(f);
+          }
+        }
+        if !vals.is_empty() {
+          datasets.push(vals);
+        }
+      }
+    }
+    Ok(datasets)
+  } else {
+    // Flat list: single dataset
+    let mut vals = Vec::new();
+    for item in items {
+      let ev = evaluate_expr_to_expr(item).unwrap_or(item.clone());
+      if let Some(f) = try_eval_to_f64(&ev) {
+        vals.push(f);
+      }
+    }
+    if vals.is_empty() {
+      Ok(vec![])
+    } else {
+      Ok(vec![vals])
+    }
+  }
+}
+
+/// BoxWhiskerChart[{d1, d2, ...}] or BoxWhiskerChart[{{d1,...}, {d2,...}, ...}]
+pub fn box_whisker_chart_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let mut datasets = parse_datasets(&args[0])?;
+  if datasets.is_empty() {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+  let opts = parse_chart_options(args);
+  let (svg_width, svg_height, full_width) =
+    (opts.svg_width, opts.svg_height, opts.full_width);
+
+  // Sort each dataset and compute stats
+  let mut all_stats = Vec::new();
+  let mut global_min = f64::INFINITY;
+  let mut global_max = f64::NEG_INFINITY;
+  for ds in &mut datasets {
+    ds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let (lo, q1, med, q3, hi) = box_stats(ds);
+    global_min = global_min.min(lo);
+    global_max = global_max.max(hi);
+    all_stats.push((lo, q1, med, q3, hi));
+  }
+
+  let v_range = global_max - global_min;
+  let v_pad = if v_range.abs() < f64::EPSILON {
+    1.0
+  } else {
+    v_range * 0.08
+  };
+  let v_min = global_min - v_pad;
+  let v_max = global_max + v_pad;
+
+  // Use plotters for axes
+  let n = datasets.len();
+
+  // Calculate margins based on label presence
+  let s = RESOLUTION_SCALE as i32;
+  let sf = RESOLUTION_SCALE as f64;
+  let has_chart_labels = !opts.chart_labels.is_empty();
+  // A `FrameLabel` takes room below/left; an `AxesLabel` sits at the far end
+  // of its axis, so it takes room above instead.
+  let has_x_frame_label = opts
+    .frame_label
+    .as_ref()
+    .is_some_and(|(x, _)| !x.is_empty());
+  let has_y_axes_label =
+    opts.axes_label.as_ref().is_some_and(|(_, y)| !y.is_empty());
+  let has_plot_label = opts
+    .plot_label
+    .as_ref()
+    .is_some_and(|sl| !sl.text.is_empty());
+
+  let top_margin = if has_plot_label {
+    25 * s as u32
+  } else {
+    10 * s as u32
+  } + if has_y_axes_label { 18 * s as u32 } else { 0 };
+  let has_rotated_labels =
+    opts.chart_labels.iter().any(|l| l.rotation.abs() > 0.01);
+  let label_extra = if has_rotated_labels {
+    30.0 * sf
+  } else if has_chart_labels {
+    15.0 * sf
+  } else {
+    0.0
+  };
+  let bottom_extra =
+    label_extra + if has_x_frame_label { 16.0 * sf } else { 0.0 };
+  let x_label_area = 8 * RESOLUTION_SCALE + bottom_extra as u32;
+  let y_label_area = 40 * RESOLUTION_SCALE;
+
+  let margin_overrides = MarginOverrides {
+    top_margin,
+    x_label_area,
+    y_label_area,
+  };
+
+  // One tick mark per box (centered), no labels — matches Mathematica
+  let x_tick_positions: Vec<f64> = (0..n).map(|i| i as f64 + 0.5).collect();
+  let area = crate::functions::plot::generate_axes_only_opts(
+    (0.0, n as f64),
+    (v_min, v_max),
+    svg_width,
+    svg_height,
+    full_width,
+    Some(&x_tick_positions),
+    Some(&margin_overrides),
+  )?;
+
+  let plot_x0 = area.plot_x0;
+  let plot_y0 = area.plot_y0;
+  let plot_w = area.plot_w;
+  let plot_h = area.plot_h;
+
+  let mut svg = area.svg;
+  if let Some(pos) = svg.rfind("</svg>") {
+    svg.truncate(pos);
+  }
+
+  let map_y =
+    |v: f64| -> f64 { plot_y0 + (v_max - v) / (v_max - v_min) * plot_h };
+  let slot_w = plot_w / n as f64;
+  let stroke_w = (area.render_width as f64 / 1000.0 * 1.5).max(1.0);
+
+  for (i, &(lo, q1, med, q3, hi)) in all_stats.iter().enumerate() {
+    let (r, g, b) = if opts.chart_style.is_empty() {
+      PLOT_COLORS[0]
+    } else {
+      let c = &opts.chart_style[i % opts.chart_style.len()];
+      (
+        (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+      )
+    };
+    let cx = plot_x0 + (i as f64 + 0.5) * slot_w;
+    let box_half_w = slot_w * 0.3;
+    let cap_half_w = box_half_w * 0.5;
+
+    let (_bg, _dg, _lg, whisker_fill, _tf) =
+      crate::functions::plot::plot_theme();
+    let whisker_color = whisker_fill;
+    // Whisker line (vertical)
+    svg.push_str(&format!(
+      "<line x1=\"{cx:.1}\" y1=\"{:.1}\" x2=\"{cx:.1}\" y2=\"{:.1}\" stroke=\"{whisker_color}\" stroke-width=\"{stroke_w:.1}\"/>\n",
+      map_y(hi), map_y(lo)
+    ));
+    // Top whisker cap
+    svg.push_str(&format!(
+      "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{whisker_color}\" stroke-width=\"{stroke_w:.1}\"/>\n",
+      cx - cap_half_w, map_y(hi), cx + cap_half_w, map_y(hi)
+    ));
+    // Bottom whisker cap
+    svg.push_str(&format!(
+      "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{whisker_color}\" stroke-width=\"{stroke_w:.1}\"/>\n",
+      cx - cap_half_w, map_y(lo), cx + cap_half_w, map_y(lo)
+    ));
+    // Box (Q1 to Q3)
+    let box_top = map_y(q3);
+    let box_bot = map_y(q1);
+    let box_h = box_bot - box_top;
+    svg.push_str(&format!(
+      "<rect x=\"{:.1}\" y=\"{box_top:.1}\" width=\"{:.1}\" height=\"{box_h:.1}\" fill=\"rgb({r},{g},{b})\" stroke=\"{whisker_color}\" stroke-width=\"{stroke_w:.1}\"/>\n",
+      cx - box_half_w, box_half_w * 2.0
+    ));
+    // Median line
+    svg.push_str(&format!(
+      "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"white\" stroke-width=\"{:.1}\"/>\n",
+      cx - box_half_w, map_y(med), cx + box_half_w, map_y(med), stroke_w * 1.5
+    ));
+  }
+
+  // Insert label SVG elements before </svg>
+  let axis_y = plot_y0 + plot_h;
+  let font_size = sf * 11.0;
+  let title_font_size = sf * 13.0;
+  let margin_left = 10.0 * sf;
+  let mut labels_svg = String::new();
+
+  let (_bg, _dg, _lg, chart_label_fill, chart_title_fill) =
+    crate::functions::plot::plot_theme();
+
+  // ChartLabels: centered below each box
+  if has_chart_labels {
+    for (i, label) in opts.chart_labels.iter().enumerate().take(n) {
+      let cx = plot_x0 + (i as f64 + 0.5) * slot_w;
+      // Mathematica Rotate is counterclockwise-positive; SVG is clockwise-positive
+      let svg_rotation_deg = -label.rotation.to_degrees();
+      let is_rotated = svg_rotation_deg.abs() > 0.01;
+      if is_rotated {
+        let char_width_estimate = font_size * 0.6;
+        let half_text_w =
+          crate::functions::graphics::box_string_visible_len(&label.text)
+            as f64
+            * char_width_estimate
+            / 2.0;
+        let sin_a = svg_rotation_deg.to_radians().sin().abs();
+        let offset = half_text_w * sin_a + font_size * 0.5;
+        let ay = axis_y + offset;
+        labels_svg.push_str(&format!(
+          "<text x=\"{cx:.1}\" y=\"{ay:.1}\" text-anchor=\"middle\" \
+           font-family=\"sans-serif\" font-size=\"{font_size:.0}\" \
+           fill=\"{chart_label_fill}\" transform=\"rotate({svg_rotation_deg:.1},{cx:.1},{ay:.1})\">{}</text>\n",
+          crate::functions::graphics::box_string_to_svg(&label.text)
+        ));
+      } else {
+        let ly = axis_y + font_size * 1.5;
+        labels_svg.push_str(&format!(
+          "<text x=\"{cx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" \
+           font-family=\"sans-serif\" font-size=\"{font_size:.0}\" \
+           fill=\"{chart_label_fill}\">{}</text>\n",
+          crate::functions::graphics::box_string_to_svg(&label.text)
+        ));
+      }
+    }
+  }
+
+  // FrameLabel: x-axis label centered below, y-axis label rotated on left.
+  if let Some((x_label, y_label)) = &opts.frame_label {
+    if !x_label.is_empty() {
+      let cx = plot_x0 + plot_w / 2.0;
+      let base_y = axis_y
+        + if has_chart_labels {
+          font_size * 1.5 + font_size * 1.3
+        } else {
+          font_size * 1.5
+        };
+      labels_svg.push_str(&format!(
+        "<text x=\"{cx:.1}\" y=\"{base_y:.1}\" text-anchor=\"middle\" \
+         font-family=\"sans-serif\" font-size=\"{font_size:.0}\" \
+         fill=\"{chart_label_fill}\">{}</text>\n",
+        crate::functions::graphics::box_string_to_svg(x_label)
+      ));
+    }
+    if !y_label.is_empty() {
+      let cy = plot_y0 + plot_h / 2.0;
+      let lx = margin_left + font_size * 0.8;
+      labels_svg.push_str(&format!(
+        "<text x=\"{lx:.1}\" y=\"{cy:.1}\" text-anchor=\"middle\" \
+         font-family=\"sans-serif\" font-size=\"{font_size:.0}\" \
+         fill=\"{chart_label_fill}\" transform=\"rotate(-90,{lx:.1},{cy:.1})\">{}</text>\n",
+        crate::functions::graphics::box_string_to_svg(y_label)
+      ));
+    }
+  }
+
+  // AxesLabel: at the far end of each axis.
+  labels_svg.push_str(&crate::functions::plot::axes_label_svg(
+    opts.axes_label.as_ref(),
+    (plot_x0, plot_y0, plot_w, plot_h),
+    (0.0, n as f64, v_min, v_max),
+    (true, true),
+    font_size,
+    chart_label_fill,
+  ));
+
+  // PlotLabel: centered above the chart
+  if let Some(sl) = &opts.plot_label
+    && !sl.text.is_empty()
+  {
+    let cx = plot_x0 + plot_w / 2.0;
+    let ty = top_margin as f64 - title_font_size * 0.5;
+    let fs = sl.font_size.map_or(title_font_size, |f| f * sf);
+    let fill = sl
+      .color
+      .as_ref()
+      .map_or_else(|| chart_title_fill.to_string(), |c| c.to_svg_rgb());
+    let mut style_attrs = String::new();
+    if sl.bold {
+      style_attrs.push_str(" font-weight=\"bold\"");
+    }
+    if sl.italic {
+      style_attrs.push_str(" font-style=\"italic\"");
+    }
+    labels_svg.push_str(&format!(
+      "<text x=\"{cx:.1}\" y=\"{ty:.1}\" text-anchor=\"middle\" \
+         font-family=\"sans-serif\" font-size=\"{fs:.0}\" \
+         fill=\"{fill}\"{style_attrs}>{}</text>\n",
+      sl.svg_scaled(sf)
+    ));
+  }
+
+  svg.push_str(&labels_svg);
+  svg.push_str("</svg>");
+  Ok(crate::graphics_result(svg))
+}
+
+/// BubbleChart[{{x,y,z}, ...}], BubbleChart[{{{x,y,z},...}, ...}],
+/// or BubbleChart[<| label -> {x,y,z}, ... |>] /
+/// BubbleChart[<| label -> {{x,y,z},...}, ... |>]
+pub fn bubble_chart_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let data = evaluate_expr_to_expr(&args[0])?;
+
+  // Helper: parse a single {x,y,z} triple from an expression.
+  fn parse_triple(item: &Expr) -> Option<(f64, f64, f64)> {
+    if let Expr::List(inner) = item
+      && inner.len() >= 3
+    {
+      let x = try_eval_to_f64(
+        &evaluate_expr_to_expr(&inner[0]).unwrap_or(inner[0].clone()),
+      )?;
+      let y = try_eval_to_f64(
+        &evaluate_expr_to_expr(&inner[1]).unwrap_or(inner[1].clone()),
+      )?;
+      let z = try_eval_to_f64(
+        &evaluate_expr_to_expr(&inner[2]).unwrap_or(inner[2].clone()),
+      )?;
+      return Some((x, y, z));
+    }
+    None
+  }
+
+  // Parse a value that is either a single triple `{x,y,z}` or a list of
+  // triples `{{x,y,z},...}` into a dataset. Alongside the parsed triples,
+  // records the flat input position of each successfully parsed point in
+  // `kept` (using the provided `cursor`). Non-list values and lists whose
+  // shape can't be recognized produce an empty dataset, and still advance
+  // the cursor by one so that labels line up with subsequent valid points.
+  fn parse_dataset(
+    val: &Expr,
+    cursor: &mut usize,
+    kept: &mut Vec<usize>,
+  ) -> Vec<(f64, f64, f64)> {
+    let ev = evaluate_expr_to_expr(val).unwrap_or(val.clone());
+    if let Expr::List(inner) = &ev {
+      if inner.is_empty() {
+        *cursor += 1;
+        return Vec::new();
+      }
+      if matches!(inner[0], Expr::List(_)) {
+        // List of triples — each entry is its own flat position.
+        let mut out = Vec::with_capacity(inner.len());
+        for item in inner {
+          let pos = *cursor;
+          *cursor += 1;
+          if let Some(t) = parse_triple(item) {
+            out.push(t);
+            kept.push(pos);
+          }
+        }
+        out
+      } else {
+        // Single triple — counts as one flat position.
+        let pos = *cursor;
+        *cursor += 1;
+        if let Some(t) = parse_triple(&ev) {
+          kept.push(pos);
+          vec![t]
+        } else {
+          Vec::new()
+        }
+      }
+    } else {
+      *cursor += 1;
+      Vec::new()
+    }
+  }
+
+  // `kept_flat_indices[i]` is the original flat input position of the i-th
+  // successfully parsed point (in the order points appear in `groups`).
+  // It's used below to filter `ChartLabels` so that an invalid input
+  // position drops its data *and* its label together.
+  let mut kept_flat_indices: Vec<usize> = Vec::new();
+
+  // Association input: each key becomes a dataset label, each value is
+  // either a single triple or a list of triples.
+  let (groups, assoc_labels) = if let Expr::Association(pairs) = &data {
+    let mut gs: Vec<Vec<(f64, f64, f64)>> = Vec::with_capacity(pairs.len());
+    let mut labels: Vec<String> = Vec::with_capacity(pairs.len());
+    let mut cursor = 0usize;
+    for (k, v) in pairs {
+      let key_eval = evaluate_expr_to_expr(k).unwrap_or(k.clone());
+      let label = expr_to_label(&key_eval).unwrap_or_default();
+      gs.push(parse_dataset(v, &mut cursor, &mut kept_flat_indices));
+      labels.push(label);
+    }
+    (gs, Some(labels))
+  } else {
+    let Expr::List(items) = &data else {
+      return Err(InterpreterError::EvaluationError(
+        "BubbleChart: first argument must be a list of {x, y, z} triples \
+             or an Association"
+          .into(),
+      ));
+    };
+
+    // Detect shape: if every top-level item is itself a list of triples
+    // (i.e., none of its entries are numeric), treat as multi-dataset.
+    // Otherwise treat as a single flat dataset.
+    let is_multi_dataset = !items.is_empty()
+      && items.iter().all(|item| {
+        if let Expr::List(inner) = item {
+          // A triple has >=3 entries, at least one of which is numeric.
+          // A dataset is a list of such triples — its first entry is
+          // itself a list. Use that to disambiguate.
+          !inner.is_empty() && matches!(inner[0], Expr::List(_))
+        } else {
+          false
+        }
+      });
+
+    let gs: Vec<Vec<(f64, f64, f64)>> = if is_multi_dataset {
+      let mut cursor = 0usize;
+      items
+        .iter()
+        .map(|ds| {
+          if let Expr::List(inner) = ds {
+            let mut out = Vec::with_capacity(inner.len());
+            for item in inner {
+              let pos = cursor;
+              cursor += 1;
+              if let Some(t) = parse_triple(item) {
+                out.push(t);
+                kept_flat_indices.push(pos);
+              }
+            }
+            out
+          } else {
+            cursor += 1;
+            Vec::new()
+          }
+        })
+        .collect()
+    } else {
+      let mut out = Vec::with_capacity(items.len());
+      for (i, item) in items.iter().enumerate() {
+        if let Some(t) = parse_triple(item) {
+          out.push(t);
+          kept_flat_indices.push(i);
+        }
+      }
+      vec![out]
+    };
+    (gs, None)
+  };
+
+  let total_points: usize = groups.iter().map(std::vec::Vec::len).sum();
+  if total_points == 0 {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+
+  let mut opts = parse_chart_options(args);
+  // `ChartLegends -> Automatic` with Association input pulls the legend
+  // labels straight from the association's keys.
+  if opts.chart_legends_auto
+    && opts.chart_legends.is_empty()
+    && let Some(labels) = &assoc_labels
+  {
+    opts.chart_legends.clone_from(labels);
+  }
+  // BubbleChart's plot area is square by default — override the generic
+  // (non-square) DEFAULT_HEIGHT unless the caller provided an explicit
+  // ImageSize. The y-axis label column (~65 px) is wider than the x-axis
+  // label row (~40 px), so the outer SVG has to be 25 px shorter than it
+  // is wide for the inner cartesian area to come out square.
+  let user_set_image_size = args[1..].iter().any(|opt| {
+    matches!(
+      opt,
+      Expr::Rule { pattern, .. }
+        if matches!(pattern.as_ref(), Expr::Identifier(n) if n == "ImageSize")
+    )
+  });
+  if !user_set_image_size {
+    opts.svg_height = opts.svg_width.saturating_sub(25);
+  }
+  // Align ChartLabels with the surviving points: labels at positions whose
+  // input failed to parse (e.g. Missing[], complex numbers, symbols) are
+  // dropped along with their data, so the i-th surviving point keeps the
+  // label that was originally at its flat input position.
+  let filtered_labels: Vec<ChartLabel> = if opts.chart_labels.is_empty() {
+    Vec::new()
+  } else {
+    kept_flat_indices
+      .iter()
+      .map(|&i| {
+        opts
+          .chart_labels
+          .get(i)
+          .cloned()
+          .unwrap_or_else(|| ChartLabel::plain(String::new()))
+      })
+      .collect()
+  };
+  let svg = crate::functions::plot::generate_bubble_chart_svg(
+    &groups,
+    opts.svg_width,
+    opts.svg_height,
+    opts.full_width,
+    opts.plot_label.as_ref(),
+    opts
+      .axes_label
+      .as_ref()
+      .map(|(x, y)| (x.as_str(), y.as_str())),
+    &opts.chart_style,
+    &opts.chart_legends,
+    &filtered_labels,
+    opts.plot_range_x,
+    opts.plot_range_y,
+    None,
+    None,
+    None,
+  )?;
+  Ok(crate::graphics_result(svg))
+}
+
+/// BubbleHistogram[{{x1,y1}, {x2,y2}, ...}] bins the two-dimensional data
+/// into a rectangular grid and draws a bubble at the center of every
+/// non-empty bin, its size encoding the number of points that fell in it.
+///
+/// An optional second argument controls the binning, mirroring `Histogram`:
+///   - `n`    — use `n` equal-width bins along each axis
+///   - `{dx}` — use bins of width `dx` along each axis
+///     When omitted, each axis is binned like `HistogramList` (Freedman-Diaconis
+///     width rounded to a nice number, edges aligned to multiples of the width,
+///     bins centered on commensurate data).
+///
+/// Each bubble is colored by its bin count via Wolfram's
+/// "WL12DefaultVectorGradient" and drawn without an edge, matching
+/// wolframscript.
+pub fn bubble_histogram_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let data = evaluate_expr_to_expr(&args[0])?;
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(
+      "BubbleHistogram: first argument must be a list of {x, y} pairs".into(),
+    ));
+  };
+
+  // Parse the {x, y} pairs, silently skipping entries that aren't numeric
+  // pairs (mirrors how the other charts treat unparseable points).
+  let mut points: Vec<(f64, f64)> = Vec::with_capacity(items.len());
+  for item in items {
+    if let Expr::List(inner) = item
+      && inner.len() >= 2
+    {
+      let x = try_eval_to_f64(
+        &evaluate_expr_to_expr(&inner[0]).unwrap_or(inner[0].clone()),
+      );
+      let y = try_eval_to_f64(
+        &evaluate_expr_to_expr(&inner[1]).unwrap_or(inner[1].clone()),
+      );
+      if let (Some(x), Some(y)) = (x, y) {
+        points.push((x, y));
+      }
+    }
+  }
+
+  if points.is_empty() {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+
+  // Optional binning specification. `None` requests per-axis auto-binning.
+  enum BinReq {
+    Count(usize),
+    Width(f64),
+  }
+  let bin_req = if args.len() > 1 {
+    let evaluated = evaluate_expr_to_expr(&args[1])?;
+    match &evaluated {
+      Expr::List(inner) if inner.len() == 1 => try_eval_to_f64(&inner[0])
+        .filter(|dx| *dx > 0.0)
+        .map(BinReq::Width),
+      other => try_eval_to_f64(other)
+        .map(|n| n as usize)
+        .filter(|n| *n > 0)
+        .map(BinReq::Count),
+    }
+  } else {
+    None
+  };
+
+  // Determine bin edges for one axis from its values and the binning request.
+  // Returns `(min_edge, bin_width, num_bins)`. The width and auto cases use
+  // HistogramList's Wolfram-compatible placement (Freedman-Diaconis width,
+  // dx-aligned edges, bins centered on commensurate data).
+  let axis_bins = |vals: &[f64]| -> (f64, f64, usize) {
+    if let Some(BinReq::Count(n)) = &bin_req {
+      let d_min = vals.iter().copied().fold(f64::INFINITY, f64::min);
+      let d_max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+      let range = d_max - d_min;
+      let bw = if range.abs() < f64::EPSILON {
+        1.0
+      } else {
+        range / *n as f64
+      };
+      return (d_min, bw, *n);
+    }
+    let width = match &bin_req {
+      Some(BinReq::Width(dx)) => Some(*dx),
+      _ => None,
+    };
+    let (min_edge, max_edge, dx, _) =
+      crate::functions::list_helpers_ast::wl_bin_spec(vals, width);
+    let num_bins =
+      (((max_edge - min_edge) / dx + 1e-9).floor() as usize).max(1);
+    (min_edge, dx, num_bins)
+  };
+
+  let xs: Vec<f64> = points.iter().map(|p| p.0).collect();
+  let ys: Vec<f64> = points.iter().map(|p| p.1).collect();
+  let (x_min, x_bw, x_bins) = axis_bins(&xs);
+  let (y_min, y_bw, y_bins) = axis_bins(&ys);
+
+  // Accumulate counts per (ix, iy) bin.
+  let mut counts = vec![0usize; x_bins * y_bins];
+  for &(x, y) in &points {
+    let ix = (((x - x_min) / x_bw).floor() as usize).min(x_bins - 1);
+    let iy = (((y - y_min) / y_bw).floor() as usize).min(y_bins - 1);
+    counts[iy * x_bins + ix] += 1;
+  }
+
+  // One bubble per non-empty bin, positioned at the bin center. The count
+  // becomes the bubble's size coordinate, exactly like `BubbleChart`.
+  let mut bubbles: Vec<(f64, f64, f64)> = Vec::new();
+  for iy in 0..y_bins {
+    for ix in 0..x_bins {
+      let c = counts[iy * x_bins + ix];
+      if c > 0 {
+        let cx = x_min + (ix as f64 + 0.5) * x_bw;
+        let cy = y_min + (iy as f64 + 0.5) * y_bw;
+        bubbles.push((cx, cy, c as f64));
+      }
+    }
+  }
+
+  // Wolfram colors each bubble by its bin count with the
+  // "WL12DefaultVectorGradient" blend, normalized from the smallest to the
+  // largest count (all-equal counts collapse to the gradient start). The
+  // gradient always applies — wolframscript ignores even an explicit
+  // ChartStyle here.
+  let c_min = bubbles.iter().map(|b| b.2).fold(f64::INFINITY, f64::min);
+  let c_max = bubbles
+    .iter()
+    .map(|b| b.2)
+    .fold(f64::NEG_INFINITY, f64::max);
+  let colors: Vec<(u8, u8, u8)> = bubbles
+    .iter()
+    .map(|b| {
+      let t = if c_max > c_min {
+        (b.2 - c_min) / (c_max - c_min)
+      } else {
+        0.0
+      };
+      crate::functions::plot::wl_default_vector_gradient(t)
+    })
+    .collect();
+
+  // PlotLegends -> Automatic adds a count-gradient bar legend (Wolfram's
+  // BarLegend) right of the plot.
+  let wants_legend = args[1..].iter().any(|opt| {
+    matches!(
+      opt,
+      Expr::Rule { pattern, replacement }
+        if matches!(pattern.as_ref(), Expr::Identifier(n) if n == "PlotLegends")
+          && matches!(replacement.as_ref(), Expr::Identifier(v) if v == "Automatic")
+    )
+  });
+
+  let mut opts = parse_chart_options(args);
+  // Match BubbleChart's square plot area unless the caller set ImageSize.
+  let user_set_image_size = args[1..].iter().any(|opt| {
+    matches!(
+      opt,
+      Expr::Rule { pattern, .. }
+        if matches!(pattern.as_ref(), Expr::Identifier(n) if n == "ImageSize")
+    )
+  });
+  if !user_set_image_size {
+    opts.svg_height = opts.svg_width.saturating_sub(25);
+    if wants_legend {
+      // The legend strip widens the image rather than shrinking the plot,
+      // exactly like wolframscript (360 → 413 pt at the default size).
+      opts.svg_width += 53;
+    }
+  }
+
+  let groups = vec![bubbles];
+  let svg = crate::functions::plot::generate_bubble_chart_svg(
+    &groups,
+    opts.svg_width,
+    opts.svg_height,
+    opts.full_width,
+    opts.plot_label.as_ref(),
+    opts
+      .axes_label
+      .as_ref()
+      .map(|(x, y)| (x.as_str(), y.as_str())),
+    &opts.chart_style,
+    &opts.chart_legends,
+    &[],
+    opts.plot_range_x,
+    opts.plot_range_y,
+    // Bins are x_bw × y_bw rectangles — cap bubble radii so bubbles in
+    // adjacent bins never overlap.
+    Some((x_bw, y_bw)),
+    Some(&colors),
+    if wants_legend {
+      Some((c_min, c_max))
+    } else {
+      None
+    },
+  )?;
+  Ok(crate::graphics_result(svg))
+}
+
+/// SectorChart[{{angle, radius}, ...}] - like PieChart but with variable radius
+pub fn sector_chart_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  let data = evaluate_expr_to_expr(&args[0])?;
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(
+      "SectorChart: first argument must be a list".into(),
+    ));
+  };
+
+  let mut sectors: Vec<(f64, f64)> = Vec::new();
+  for item in items {
+    if let Expr::List(pair) = item {
+      if pair.len() >= 2 {
+        let a = try_eval_to_f64(
+          &evaluate_expr_to_expr(&pair[0]).unwrap_or(pair[0].clone()),
+        );
+        let r = try_eval_to_f64(
+          &evaluate_expr_to_expr(&pair[1]).unwrap_or(pair[1].clone()),
+        );
+        if let (Some(a), Some(r)) = (a, r) {
+          sectors.push((a, r));
+        }
+      }
+    } else if let Some(v) =
+      try_eval_to_f64(&evaluate_expr_to_expr(item).unwrap_or(item.clone()))
+    {
+      sectors.push((v, 1.0));
+    }
+  }
+
+  if sectors.is_empty() {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+
+  let opts = parse_chart_options(args);
+  let (svg_width, svg_height, full_width) =
+    (opts.svg_width, opts.svg_height, opts.full_width);
+  let w = svg_width as f64;
+  let h = svg_height as f64;
+  let cx = w / 2.0;
+  let cy = h / 2.0;
+  let max_radius = (w.min(h) / 2.0) * 0.85;
+  let total_angle: f64 = sectors.iter().map(|s| s.0).sum();
+  let r_max = sectors.iter().map(|s| s.1).fold(0.0_f64, f64::max);
+  let r_max = if r_max <= 0.0 { 1.0 } else { r_max };
+
+  let mut svg = svg_header(svg_width, svg_height, full_width);
+
+  // Sort sectors smallest-to-largest by their angular weight, drawn
+  // clockwise starting at π so the smallest slice sits right above the
+  // negative x-axis — same convention as PieChart.
+  let mut order: Vec<usize> = (0..sectors.len()).collect();
+  order.sort_by(|&a, &b| {
+    sectors[a]
+      .0
+      .partial_cmp(&sectors[b].0)
+      .unwrap_or(std::cmp::Ordering::Equal)
+  });
+
+  let mut start_angle = std::f64::consts::PI;
+  for (slice_idx, &i) in order.iter().enumerate() {
+    let (angle_val, radius_val) = sectors[i];
+    let (r, g, b) = PLOT_COLORS[slice_idx % PLOT_COLORS.len()];
+    let sweep = 2.0 * std::f64::consts::PI * angle_val / total_angle;
+    let sector_r = (radius_val / r_max) * max_radius;
+    let end_angle = start_angle + sweep;
+
+    let x1 = cx + sector_r * start_angle.cos();
+    let y1 = cy + sector_r * start_angle.sin();
+    let x2 = cx + sector_r * end_angle.cos();
+    let y2 = cy + sector_r * end_angle.sin();
+    let large_arc = i32::from(sweep > std::f64::consts::PI);
+
+    let tooltip = format!(
+      "{{{}, {}}}",
+      format_chart_value(angle_val),
+      format_chart_value(radius_val)
+    );
+    svg.push_str(&format!(
+      "<path d=\"M{cx:.2},{cy:.2} L{x1:.2},{y1:.2} A{sector_r:.2},{sector_r:.2} 0 {large_arc},1 {x2:.2},{y2:.2} Z\" \
+       fill=\"rgb({r},{g},{b})\" stroke=\"white\" stroke-width=\"1\"><title>{tooltip}</title></path>\n"
+    ));
+
+    start_angle = end_angle;
+  }
+
+  svg.push_str("</svg>");
+  Ok(crate::graphics_result(svg))
+}
+
+/// Convert a date expression to AbsoluteTime (seconds since 1900-01-01).
+/// Handles: date lists ({y}, {y,m}, {y,m,d}, {y,m,d,h,min,sec}),
+/// DateObject[{...}], and raw numeric AbsoluteTime values.
+fn date_expr_to_absolute_time(expr: &Expr) -> Option<f64> {
+  let evaluated = evaluate_expr_to_expr(expr).unwrap_or(expr.clone());
+
+  // Try as a raw numeric value (already AbsoluteTime)
+  if let Some(t) = try_eval_to_f64(&evaluated) {
+    return Some(t);
+  }
+
+  // Try extracting date components from list or DateObject
+  if let Some(components) =
+    crate::functions::datetime_ast::extract_date_components(&evaluated)
+  {
+    if components.is_empty() {
+      return None;
+    }
+    let year = components[0] as i64;
+    let month = if components.len() > 1 {
+      components[1] as i64
+    } else {
+      1
+    };
+    let day = if components.len() > 2 {
+      components[2] as i64
+    } else {
+      1
+    };
+    let hour = if components.len() > 3 {
+      components[3] as i64
+    } else {
+      0
+    };
+    let minute = if components.len() > 4 {
+      components[4] as i64
+    } else {
+      0
+    };
+    let second = if components.len() > 5 {
+      components[5]
+    } else {
+      0.0
+    };
+    return Some(crate::functions::datetime_ast::date_to_absolute_seconds(
+      year, month, day, hour, minute, second,
+    ));
+  }
+
+  None
+}
+
+/// DateListPlot[{{date, y}, ...}] - plots data with date-valued x-axis.
+/// Dates can be date lists ({y,m,d}), DateObject[{...}], or AbsoluteTime values.
+/// Multiple datasets are supported: DateListPlot[{data1, data2, ...}].
+pub fn date_list_plot_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  date_list_plot_ast_impl(args, false)
+}
+
+/// DateListLogPlot[{{date, y}, ...}] - like [`date_list_plot_ast`] but with
+/// a logarithmic y-axis, matching how `ListLogPlot` relates to `ListPlot`.
+/// Non-positive y values are dropped since they have no log-space position.
+pub fn date_list_log_plot_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  date_list_plot_ast_impl(args, true)
+}
+
+fn date_list_plot_ast_impl(
+  args: &[Expr],
+  log_y: bool,
+) -> Result<Expr, InterpreterError> {
+  let data = evaluate_expr_to_expr(&args[0])?;
+  // A TimeSeries plots as its {date, value} path.
+  let data = match crate::functions::timeseries_ast::time_series_pairs(&data) {
+    Some(pairs) => Expr::List(
+      pairs
+        .into_iter()
+        .map(|(d, v)| Expr::List(vec![d, v].into()))
+        .collect(),
+    ),
+    None => data,
+  };
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(format!(
+      "{}: first argument must be a list",
+      if log_y {
+        "DateListLogPlot"
+      } else {
+        "DateListPlot"
+      }
+    )));
+  };
+
+  // `DateListPlot[{y1, y2, …}, datespec]` — plain values plus a starting
+  // date. Pair each y_i with start_date + i·step, where the step is
+  // inferred from datespec's granularity (year, month, day, …).
+  if args.len() >= 2
+    && !items.is_empty()
+    && items
+      .iter()
+      .all(|i| matches!(i, Expr::Integer(_) | Expr::Real(_)))
+    && let Some(start) = date_expr_to_absolute_time(&args[1])
+  {
+    let granularity = if let Expr::List(spec_items) = &args[1] {
+      spec_items.len()
+    } else {
+      3
+    };
+    let step_seconds = match granularity {
+      0 | 1 => 365.25 * 86400.0,
+      2 => 30.4375 * 86400.0,
+      3 => 86400.0,
+      4 => 3600.0,
+      5 => 60.0,
+      _ => 1.0,
+    };
+    let pair_items: Vec<Expr> = items
+      .iter()
+      .enumerate()
+      .map(|(i, v)| {
+        let t = start + i as f64 * step_seconds;
+        Expr::List(vec![Expr::Real(t), v.clone()].into())
+      })
+      .collect();
+    let mut new_args = vec![Expr::List(pair_items.into())];
+    new_args.extend(args[2..].iter().cloned());
+    return date_list_plot_ast_impl(&new_args, log_y);
+  }
+
+  // Detect whether this is multiple datasets or a single dataset.
+  // Multiple datasets: {{pair1, pair2, ...}, {pair3, pair4, ...}}
+  // Single dataset: {{date1, y1}, {date2, y2}, ...}
+  let datasets: Vec<&[Expr]> = if !items.is_empty()
+    && items.iter().all(|item| {
+      if let Expr::List(inner) = item {
+        // A dataset is a list of pairs (each pair is a list of length 2
+        // where first element is a date)
+        !inner.is_empty()
+          && inner
+            .iter()
+            .all(|sub| matches!(sub, Expr::List(p) if p.len() >= 2))
+      } else {
+        false
+      }
+    }) {
+    // Multiple datasets
+    items
+      .iter()
+      .map(|item| {
+        if let Expr::List(inner) = item {
+          inner.as_slice()
+        } else {
+          unreachable!()
+        }
+      })
+      .collect()
+  } else {
+    // Single dataset
+    vec![items.as_slice()]
+  };
+
+  let mut all_series = Vec::new();
+  for dataset in &datasets {
+    let mut points = Vec::new();
+    for item in *dataset {
+      if let Expr::List(pair) = item
+        && pair.len() >= 2
+      {
+        let x = date_expr_to_absolute_time(&pair[0]);
+        let y = try_eval_to_f64(
+          &evaluate_expr_to_expr(&pair[1]).unwrap_or(pair[1].clone()),
+        );
+        if let (Some(x), Some(y)) = (x, y)
+          && (!log_y || y > 0.0)
+        {
+          points.push((x, y));
+        }
+      }
+    }
+    if !points.is_empty() {
+      all_series.push(points);
+    }
+  }
+
+  if all_series.is_empty() {
+    // Return unevaluated (like Wolfram does for invalid data)
+    return Ok(unevaluated(
+      if log_y {
+        "DateListLogPlot"
+      } else {
+        "DateListPlot"
+      },
+      args,
+    ));
+  }
+
+  let chart_opts = parse_chart_options(args);
+
+  // Compute ranges across all series
+  let mut x_min = f64::INFINITY;
+  let mut x_max = f64::NEG_INFINITY;
+  let mut y_min = f64::INFINITY;
+  let mut y_max = f64::NEG_INFINITY;
+  for series in &all_series {
+    for &(x, y) in series {
+      x_min = x_min.min(x);
+      x_max = x_max.max(x);
+      y_min = y_min.min(y);
+      y_max = y_max.max(y);
+    }
+  }
+
+  // Compute x range with padding
+  let xp = (x_max - x_min) * 0.04;
+  let xp = if xp.abs() < f64::EPSILON { 86400.0 } else { xp };
+  let x_range_min = x_min - xp;
+  let x_range_max = x_max + xp;
+
+  // Compute y range with padding: multiplicatively in log space for
+  // DateListLogPlot (matching ListLogPlot), additively otherwise.
+  let (y_range_min, y_range_max) = if log_y {
+    let log_range = (y_max / y_min).ln();
+    let factor = if log_range.abs() < f64::EPSILON {
+      std::f64::consts::E
+    } else {
+      (log_range * 0.04).exp()
+    };
+    (y_min / factor, y_max * factor)
+  } else {
+    let yp = (y_max - y_min) * 0.04;
+    let yp = if yp.abs() < f64::EPSILON { 1.0 } else { yp };
+    (y_min - yp, y_max + yp)
+  };
+
+  // Compute nice date tick positions
+  let date_ticks =
+    crate::functions::plot::generate_date_ticks(x_range_min, x_range_max);
+
+  // Use date_axis mode which suppresses x labels from plotters;
+  // we inject our own date labels afterwards.
+  let plot_opts = crate::functions::plot::PlotOptions {
+    svg_width: chart_opts.svg_width,
+    svg_height: chart_opts.svg_height,
+    full_width: chart_opts.full_width,
+    date_axis: true,
+    log_y,
+    ..Default::default()
+  };
+
+  let svg = crate::functions::plot::generate_svg_with_filling(
+    &all_series,
+    (x_range_min, x_range_max),
+    (y_range_min, y_range_max),
+    &plot_opts,
+  )?;
+
+  // Inject date tick labels into the SVG
+  let svg =
+    inject_date_labels(&svg, &date_ticks, x_range_min, x_range_max, &plot_opts);
+
+  Ok(crate::graphics_result(svg))
+}
+
+/// Inject date tick labels and tick marks into an SVG generated by plotters.
+/// Since plotters can't place ticks at exact date boundaries, we add them manually.
+fn inject_date_labels(
+  svg: &str,
+  date_ticks: &[f64],
+  x_min: f64,
+  x_max: f64,
+  opts: &crate::functions::plot::PlotOptions,
+) -> String {
+  use crate::functions::plot::{RESOLUTION_SCALE, format_date_tick};
+
+  if date_ticks.is_empty() {
+    return svg.to_string();
+  }
+
+  let sf = RESOLUTION_SCALE as f64;
+  let render_width = opts.svg_width as f64 * sf;
+  let render_height = opts.svg_height as f64 * sf;
+
+  // Estimate plot area margins (matching generate_svg_with_options logic)
+  // y_label_area = 65 * RESOLUTION_SCALE, margin_left = 10 * RESOLUTION_SCALE
+  let margin_left = 10.0 * sf;
+  let y_label_area = 65.0 * sf;
+  let margin_right = 10.0 * sf;
+  let margin_bottom = 10.0 * sf;
+  let x_label_area = 40.0 * sf;
+
+  let plot_left = margin_left + y_label_area;
+  let plot_right = render_width - margin_right;
+  let plot_bottom = render_height - margin_bottom - x_label_area;
+  let plot_width = plot_right - plot_left;
+
+  let font_size = sf * 18.0;
+  let tick_len = 4.0 * sf;
+
+  let mut extra = String::new();
+  for &t in date_ticks {
+    let frac = (t - x_min) / (x_max - x_min);
+    let px = plot_left + frac * plot_width;
+    let label = html_escape(&format_date_tick(t));
+
+    // Tick mark
+    extra.push_str(&format!(
+      "<polyline fill=\"none\" opacity=\"1\" stroke=\"#666666\" \
+       stroke-width=\"{}\" points=\"{:.0},{:.0} {:.0},{:.0}\"/>",
+      RESOLUTION_SCALE,
+      px,
+      plot_bottom,
+      px,
+      plot_bottom + tick_len,
+    ));
+
+    // Label
+    extra.push_str(&format!(
+      "<text x=\"{:.0}\" y=\"{:.0}\" dy=\"0.76em\" text-anchor=\"middle\" \
+       font-family=\"sans-serif\" font-size=\"{font_size}\" \
+       opacity=\"1\" fill=\"#666666\">{label}</text>",
+      px,
+      plot_bottom + tick_len + 2.0,
+    ));
+  }
+
+  // Insert before closing </svg> tag
+  if let Some(pos) = svg.rfind("</svg>") {
+    let mut result = svg[..pos].to_string();
+    result.push_str(&extra);
+    result.push_str("</svg>");
+    result
+  } else {
+    svg.to_string()
+  }
+}
+
+/// WordCloud[{"word1", "word2", ...}] or WordCloud[{1, 2, 3, ...}]
+pub fn word_cloud_ast(args: &[Expr]) -> Result<Expr, InterpreterError> {
+  use std::collections::HashMap;
+
+  // Extract list of strings from first argument
+  let data = evaluate_expr_to_expr(&args[0])?;
+  let Expr::List(items) = &data else {
+    return Err(InterpreterError::EvaluationError(
+      "WordCloud: first argument must be a list".into(),
+    ));
+  };
+
+  let mut words: Vec<String> = Vec::new();
+  for item in items {
+    let ev = evaluate_expr_to_expr(item).unwrap_or(item.clone());
+    match &ev {
+      Expr::String(s) => words.push(s.clone()),
+      _ => words.push(expr_to_string(&ev)),
+    }
+  }
+
+  if words.is_empty() {
+    return Ok(crate::graphics_result(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string(),
+    ));
+  }
+
+  // Count word frequencies
+  let mut freq: HashMap<String, usize> = HashMap::new();
+  for w in &words {
+    *freq.entry(w.clone()).or_insert(0) += 1;
+  }
+
+  // Sort by frequency (descending), then alphabetically for stability
+  let mut sorted_words: Vec<(String, usize)> = freq.into_iter().collect();
+  sorted_words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+  // Parse options (ImageSize)
+  let opts = parse_chart_options(args);
+  let (svg_width, svg_height, full_width) =
+    (opts.svg_width, opts.svg_height, opts.full_width);
+  let w = svg_width as f64;
+  let h = svg_height as f64;
+  let cx = w / 2.0;
+  let cy = h / 2.0;
+
+  // Map frequencies to font sizes (linear scaling)
+  let max_freq = sorted_words[0].1 as f64;
+  let min_freq = sorted_words.last().unwrap().1 as f64;
+  let min_font = 12.0_f64;
+  let max_font = (h * 0.2).min(60.0);
+
+  let font_size_for = |count: usize| -> f64 {
+    if (max_freq - min_freq).abs() < f64::EPSILON {
+      f64::midpoint(min_font, max_font)
+    } else {
+      min_font
+        + (count as f64 - min_freq) / (max_freq - min_freq)
+          * (max_font - min_font)
+    }
+  };
+
+  // Placed word bounding boxes: (x_min, y_min, x_max, y_max)
+  let mut placed: Vec<(f64, f64, f64, f64)> = Vec::new();
+
+  struct PlacedWord {
+    x: f64,
+    y: f64,
+    font_size: f64,
+    text: String,
+    color_idx: usize,
+    rotated: bool,
+  }
+  let mut placed_words: Vec<PlacedWord> = Vec::new();
+
+  let char_width_factor = 0.6;
+
+  for (i, (word, count)) in sorted_words.iter().enumerate() {
+    let font_size = font_size_for(*count);
+    let rotated = i % 3 == 1; // every third word rotated
+
+    // Estimate bounding box dimensions
+    let text_w = word.len() as f64 * char_width_factor * font_size;
+    let text_h = font_size;
+    let (box_w, box_h) = if rotated {
+      (text_h, text_w) // swap for rotation
+    } else {
+      (text_w, text_h)
+    };
+
+    // Try placing using Archimedean spiral from center
+    let max_steps = 10000;
+    let a = 1.5; // spiral spacing
+
+    for s in 0..max_steps {
+      let t = s as f64 * 0.04;
+      let x = cx + a * t * t.cos();
+      let y = cy + a * t * t.sin() * 0.6; // compress vertically to fit aspect ratio
+
+      // Bounding box centered at (x, y)
+      let x_min = x - box_w / 2.0;
+      let y_min = y - box_h / 2.0;
+      let x_max = x + box_w / 2.0;
+      let y_max = y + box_h / 2.0;
+
+      // Check bounds
+      if x_min < 2.0 || y_min < 2.0 || x_max > w - 2.0 || y_max > h - 2.0 {
+        continue;
+      }
+
+      // Check collision with already placed words
+      let collides = placed.iter().any(|&(px_min, py_min, px_max, py_max)| {
+        x_min < px_max && x_max > px_min && y_min < py_max && y_max > py_min
+      });
+
+      if !collides {
+        placed.push((x_min, y_min, x_max, y_max));
+        placed_words.push(PlacedWord {
+          x,
+          y,
+          font_size,
+          text: word.clone(),
+          color_idx: i,
+          rotated,
+        });
+        break;
+      }
+    }
+
+    // Words that can't be placed are simply skipped.
+  }
+
+  // Generate SVG
+  let mut svg = svg_header(svg_width, svg_height, full_width);
+
+  for pw in &placed_words {
+    let (r, g, b) = PLOT_COLORS[pw.color_idx % PLOT_COLORS.len()];
+    let transform = if pw.rotated {
+      format!(
+        " transform=\"translate({:.1},{:.1}) rotate(-90)\"",
+        pw.x, pw.y
+      )
+    } else {
+      format!(" transform=\"translate({:.1},{:.1})\"", pw.x, pw.y)
+    };
+    svg.push_str(&format!(
+      "<text{transform} font-size=\"{:.1}\" fill=\"rgb({r},{g},{b})\" \
+       font-family=\"sans-serif\" text-anchor=\"middle\" \
+       dominant-baseline=\"central\">{}</text>\n",
+      pw.font_size,
+      html_escape(&pw.text)
+    ));
+  }
+
+  svg.push_str("</svg>");
+  Ok(crate::graphics_result(svg))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Round a `Color`'s channels the same way SVG output does.
+  fn rgb_u8(c: &Color) -> (u8, u8, u8) {
+    (
+      (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+      (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+      (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+  }
+
+  #[test]
+  fn expr_to_label_treats_bare_none_as_no_label() {
+    // The bare symbol `None` in a label option (`AxesLabel -> {"t", None}`)
+    // must suppress the label, not print the literal text "None".
+    assert_eq!(expr_to_label(&Expr::Identifier("None".to_string())), None);
+    // A quoted string "None" is a real label and must still print as-is.
+    assert_eq!(
+      expr_to_label(&Expr::String("None".to_string())),
+      Some("None".to_string())
+    );
+  }
+
+  #[test]
+  fn pastel_sampling_matches_wolfram_for_ten_bars() {
+    // Exact per-bar colors wolframscript produces for
+    // `BarChart[Range[10], ChartStyle -> "Pastel"]`
+    // (ColorData["Pastel"] sampled at t = i/9).
+    let expected = [
+      (194, 120, 240),
+      (210, 153, 233),
+      (226, 171, 183),
+      (237, 189, 157),
+      (243, 213, 150),
+      (245, 234, 153),
+      (237, 242, 170),
+      (210, 233, 204),
+      (162, 209, 238),
+      (110, 181, 236),
+    ];
+    let colors = sample_gradient(&PASTEL_GRADIENT, 10);
+    assert_eq!(colors.len(), 10);
+    for (i, c) in colors.iter().enumerate() {
+      assert_eq!(rgb_u8(c), expected[i], "bar {i} color mismatch");
+    }
+  }
+
+  #[test]
+  fn pastel_endpoints_are_exact() {
+    let one = sample_gradient(&PASTEL_GRADIENT, 1);
+    assert_eq!(rgb_u8(&one[0]), (194, 120, 240)); // t = 0
+    let two = sample_gradient(&PASTEL_GRADIENT, 2);
+    assert_eq!(rgb_u8(&two[0]), (194, 120, 240)); // t = 0
+    assert_eq!(rgb_u8(&two[1]), (110, 181, 236)); // t = 1
+  }
+
+  #[test]
+  fn rainbow_sampling_matches_wolfram_for_four_bars() {
+    // wolframscript `BarChart[Range[4], ChartStyle -> "Rainbow"]` colors.
+    let expected = [
+      (120, 28, 134),
+      (83, 155, 181),
+      (195, 186, 70),
+      (219, 33, 34),
+    ];
+    let colors = sample_gradient(named_color_scheme("Rainbow").unwrap(), 4);
+    for (i, c) in colors.iter().enumerate() {
+      assert_eq!(rgb_u8(c), expected[i], "rainbow bar {i} mismatch");
+    }
+  }
+
+  #[test]
+  fn all_named_schemes_resolve_and_sample() {
+    for name in [
+      "Pastel",
+      "Rainbow",
+      "SolarColors",
+      "TemperatureMap",
+      "ThermometerColors",
+      "DarkRainbow",
+      "Aquamarine",
+      "StarryNightColors",
+      "AvocadoColors",
+      "SunsetColors",
+      "FruitPunchColors",
+      "CherryTones",
+    ] {
+      let scheme = named_color_scheme(name)
+        .unwrap_or_else(|| panic!("scheme {name} should resolve"));
+      assert!(scheme.len() >= 2, "{name} needs >= 2 control points");
+      // Sampling N>1 must yield distinct first/last colors and the
+      // endpoints must equal the gradient's endpoints.
+      let n = 6;
+      let colors = sample_gradient(scheme, n);
+      assert_eq!(colors.len(), n);
+      let first = scheme.first().unwrap();
+      let last = scheme.last().unwrap();
+      assert_eq!(
+        rgb_u8(&colors[0]),
+        rgb_u8(&Color::new(first.0, first.1, first.2))
+      );
+      assert_eq!(
+        rgb_u8(&colors[n - 1]),
+        rgb_u8(&Color::new(last.0, last.1, last.2))
+      );
+    }
+    // Previously unimplemented gradients (like BrightBands) now resolve
+    // too; only genuinely unknown names stay unresolved.
+    assert!(named_color_scheme("BrightBands").is_some());
+    assert!(named_color_scheme("NoSuchGradient").is_none());
+  }
+
+  #[test]
+  fn named_scheme_accepts_string_and_colordata() {
+    assert!(named_color_scheme("Pastel").is_some());
+    assert!(named_color_scheme("Nonexistent").is_none());
+    assert_eq!(
+      scheme_name(&Expr::String("Pastel".into())).as_deref(),
+      Some("Pastel")
+    );
+    assert_eq!(
+      scheme_name(&call1("ColorData", Expr::String("Pastel".into())))
+        .as_deref(),
+      Some("Pastel")
+    );
+  }
+}

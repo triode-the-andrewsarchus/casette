@@ -1,0 +1,61 @@
+(* Content-type: application/vnd.wolfram.mathematica *)
+
+(*** Wolfram Notebook File ***)
+(* http://www.wolfram.com/nb *)
+
+(* CreatedBy='Wolfram 14.3' *)
+
+(*CacheID: 234*)
+(* Internal cache information:
+NotebookFileLineBreakTest
+NotebookFileLineBreakTest
+NotebookDataPosition[       154,          7]
+NotebookDataLength[      1641,         53]
+NotebookOptionsPosition[      1168,         36]
+NotebookOutlinePosition[      1562,         52]
+CellTagsIndexPosition[      1519,         49]
+WindowFrame->Normal*)
+
+(* Beginning of Notebook Content *)
+Notebook[{
+
+Cell[CellGroupData[{
+Cell[BoxData[
+ RowBox[{"StringJoin", "[", 
+  RowBox[{"\"\<Hello\>\"", ",", " ", "\"\< \>\"", ",", 
+   " ", "\"\<World!\>\""}], "]"}]], "Input",
+ CellChangeTimes->{{3.979539634998089*^9, 3.979539634999322*^9}, {
+  3.979539927309093*^9, 3.979539929150152*^9}, {3.98542855710907*^9, 
+  3.985428567921555*^9}},
+ CellLabel->"In[1]:=",ExpressionUUID->"036b8a36-c26c-422e-8935-92fbb0c5b2d0"],
+
+Cell[BoxData["\<\"Hello World!\"\>"], "Output",
+ CellChangeTimes->{3.979616855730513*^9, 3.985428570642437*^9},
+ CellLabel->"Out[1]=",ExpressionUUID->"ebdac650-4101-40e4-a070-a9a564c141c4"]
+}, Open  ]]
+},
+WindowSize->{808, 911},
+WindowMargins->{{Automatic, 347}, {163, Automatic}},
+FrontEndVersion->"14.3 for Mac OS X ARM (64-bit) (July 8, 2025)",
+StyleDefinitions->"Default.nb",
+ExpressionUUID->"54cdf3dc-d593-420e-b1f3-1ccb303531e3"
+]
+(* End of Notebook Content *)
+
+(* Internal cache information *)
+(*CellTagsOutline
+CellTagsIndex->{}
+*)
+(*CellTagsIndex
+CellTagsIndex->{}
+*)
+(*NotebookFileOutline
+Notebook[{
+Cell[CellGroupData[{
+Cell[576, 22, 384, 7, 29, "Input",ExpressionUUID->"036b8a36-c26c-422e-8935-92fbb0c5b2d0"],
+Cell[963, 31, 189, 2, 33, "Output",ExpressionUUID->"ebdac650-4101-40e4-a070-a9a564c141c4"]
+}, Open  ]]
+}
+]
+*)
+

@@ -1,0 +1,12820 @@
+use super::*;
+
+mod errors {
+  use super::*;
+
+  #[test]
+  fn invalid_input() {
+    match interpret("1 + ") {
+      Err(woxi::InterpreterError::ParseError(_)) => (),
+      _ => panic!("Expected a ParseError"),
+    }
+  }
+}
+
+mod dollar_in_symbol_names {
+  use super::*;
+
+  #[test]
+  fn dollar_sign_inside_symbol() {
+    // Wolfram allows `$` anywhere in a symbol name, not just at the start:
+    // `a$b` is one symbol (the form Module's renamed locals and Manipulate's
+    // synthesized control variables take).
+    assert_eq!(interpret("a$b = 7; a$b * 2").unwrap(), "14");
+  }
+
+  #[test]
+  fn dollar_sign_with_trailing_digits() {
+    assert_eq!(interpret("signal$1 = 5; signal$1 + 1").unwrap(), "6");
+  }
+
+  #[test]
+  fn dollar_symbol_used_as_function() {
+    assert_eq!(interpret("f$1[x_] := x^2; f$1[3]").unwrap(), "9");
+  }
+
+  #[test]
+  fn dollar_symbol_stays_symbolic() {
+    // An undefined `a$b` is a single symbol, not `a * $b`.
+    assert_eq!(interpret("Head[a$b]").unwrap(), "Symbol");
+    assert_eq!(interpret("a$b").unwrap(), "a$b");
+  }
+}
+
+mod char_escapes {
+  use super::*;
+
+  #[test]
+  fn hex_2digit_outside_string() {
+    assert_eq!(interpret(r#"\.78\.79\.7A"#).unwrap(), "xyz");
+  }
+
+  #[test]
+  fn hex_4digit_outside_string() {
+    assert_eq!(interpret(r#"\:0078\:0079\:007A"#).unwrap(), "xyz");
+  }
+
+  #[test]
+  fn octal_3digit_outside_string() {
+    assert_eq!(interpret(r#"\101\102\103\061\062\063"#).unwrap(), "ABC123");
+  }
+
+  #[test]
+  fn hex_2digit_inside_string() {
+    assert_eq!(interpret(r#""\.78""#).unwrap(), "x");
+  }
+
+  #[test]
+  fn double_backslash_preserves_literal() {
+    assert_eq!(
+      interpret(r#"StringLength["\\.78"]"#).unwrap(),
+      "4",
+      "literal-backslash escape should not consume the following \\.78",
+    );
+  }
+}
+
+mod postfix_application {
+  use super::*;
+
+  #[test]
+  fn postfix_with_identifier() {
+    // x // f is equivalent to f[x]
+    assert_eq!(interpret("4 // Sqrt").unwrap(), "2");
+    assert_eq!(interpret("16 // Sqrt").unwrap(), "4");
+  }
+
+  #[test]
+  fn postfix_with_list() {
+    assert_eq!(interpret("{1, 2, 3} // Length").unwrap(), "3");
+    assert_eq!(interpret("{1, 2, 3} // First").unwrap(), "1");
+    assert_eq!(interpret("{1, 2, 3} // Last").unwrap(), "3");
+  }
+
+  #[test]
+  fn postfix_with_function_call() {
+    // x // Map[f] is equivalent to Map[f][x] which is Map[f, x]
+    assert_eq!(interpret("{1, 4, 9} // Map[Sqrt]").unwrap(), "{1, 2, 3}");
+  }
+
+  #[test]
+  fn chained_postfix() {
+    // x // f // g is equivalent to g[f[x]]
+    assert_eq!(interpret("16 // Sqrt // Sqrt").unwrap(), "2");
+  }
+
+  #[test]
+  fn postfix_after_replace_all() {
+    // (expr /. rules) // f
+    assert_eq!(
+      interpret("{1, 2, 3} /. x_ /; x > 1 :> 0 // Length").unwrap(),
+      "3"
+    );
+  }
+
+  #[test]
+  fn postfix_after_operator_chain() {
+    // (1 + 2) // ToString is ToString[Plus[1, 2]]
+    assert_eq!(interpret("1 + 2 // ToString").unwrap(), "3");
+    // Map operator followed by postfix
+    assert_eq!(interpret("Sqrt /@ {1, 4, 9} // Length").unwrap(), "3");
+  }
+
+  #[test]
+  fn postfix_after_map_with_anonymous_function() {
+    // Which[...]& /@ Range[1, 5] // Map[Print] - pattern from fizzbuzz_5
+    assert_eq!(interpret("(# + 1)& /@ {1, 2, 3} // Length").unwrap(), "3");
+  }
+
+  #[test]
+  fn postfix_with_trailing_ampersand() {
+    // In Wolfram, & binds tighter than //, so "x // f &" means "(f &)[x]"
+    // (f &) is Function[f] which always returns f regardless of argument
+    assert_eq!(interpret("5 // Sqrt &").unwrap(), "Sqrt");
+    // Chained postfix where only last has &
+    assert_eq!(
+      interpret("{3, 1, 2} // Sort // Length &").unwrap(),
+      "Length"
+    );
+  }
+
+  #[test]
+  fn postfix_ampersand_with_function_call() {
+    // "x // f[#, 2] &" means "(f[#, 2] &)[x]" = f[x, 2]
+    assert_eq!(interpret("5 // Power[#, 2] &").unwrap(), "25");
+  }
+
+  #[test]
+  fn nestlist_with_postfix_ampersand() {
+    // Original bug: NestList[... // Flatten &, {10}, 10] should give constant {10}
+    // because (Flatten &) is Function[Flatten] which always returns Flatten
+    assert_eq!(
+      interpret(
+        "NestList[# /. x_ /; x > 1 :> {x - 1, x - 2} // Flatten &, {10}, 10] // Last // Total"
+      )
+      .unwrap(),
+      "10"
+    );
+  }
+}
+
+mod prefix_apply_assignment {
+  use super::*;
+
+  #[test]
+  fn at_form_as_downvalue_lhs() {
+    // `f @ x = rhs` must parse the LHS as `f[x]` (FunctionCall) so the
+    // downvalue assignment path accepts it. Previously the `@` infix branch
+    // built an `Expr::PrefixApply` that Set didn't recognise, erroring with
+    // "First argument of Set must be an identifier, part extract, or function
+    // call".
+    assert_eq!(interpret(r#"del2@banana = "phone""#).unwrap(), "phone");
+    assert_eq!(
+      interpret(r#"del2@banana = "phone"; del2[banana]"#).unwrap(),
+      "phone"
+    );
+    assert_eq!(
+      interpret(r#"del2@banana = "phone"; del2@banana"#).unwrap(),
+      "phone"
+    );
+  }
+
+  #[test]
+  fn at_form_threads_through_replaceall() {
+    // `f @ x /. rule` must evaluate as `f[x] /. rule`, i.e. with `f[x]` as
+    // the ReplaceAll target. (The original failure mode here was the LHS
+    // becoming `Set[f, Function[x]] [args]` style nonsense.)
+    assert_eq!(
+      interpret("Piecewise @ {{1, True}, {2, False}}").unwrap(),
+      "1"
+    );
+  }
+}
+
+mod assignment_with_anon_call {
+  use super::*;
+
+  #[test]
+  fn assign_anon_function_application() {
+    // `a = (#+1)&[5]` should parse as `Set[a, CurriedCall[Function[#+1], [5]]]`,
+    // i.e. the `[5]` belongs to the RHS, not wrapped around the whole Set.
+    // Regression: previously stored the Function instead of 6.
+    assert_eq!(interpret("a = (#+1)&[5]; a").unwrap(), "6");
+    assert_eq!(
+      interpret("a = (#+1)&[5]; FullForm[a]").unwrap(),
+      "FullForm[6]"
+    );
+  }
+
+  #[test]
+  fn assign_anon_function_chained_application() {
+    assert_eq!(interpret("a = (#*#)&[7]; a + 1").unwrap(), "50");
+  }
+}
+
+mod assign_rule_of_strings {
+  use super::*;
+
+  #[test]
+  fn assign_rule_with_string_endpoints() {
+    // `r = "a"->"n"` was round-tripped through StoredValue::Raw and the
+    // re-parser misread `"a" -> "n"` as a single quoted literal because it
+    // started and ended with `"`.
+    assert_eq!(interpret(r#"r = "a"->"n"; Head[r]"#).unwrap(), "Rule");
+    assert_eq!(
+      interpret(r#"r = "a"->"n"; StringReplace["abc", r]"#).unwrap(),
+      "nbc"
+    );
+  }
+
+  #[test]
+  fn assign_list_of_string_rules() {
+    // ROT-13 idiom: build a rules list from CharacterRange and use with
+    // StringReplace. Bug was that the rules became a string after assignment.
+    assert_eq!(
+      interpret(
+        r#"
+          rules = Thread[#-> RotateLeft[#, 13]]&[CharacterRange["a", "z"]];
+          StringReplace["abc", rules]
+        "#
+      )
+      .unwrap(),
+      "nop"
+    );
+  }
+}
+
+mod trailing_semicolon {
+  use super::*;
+
+  #[test]
+  fn trailing_semicolon_returns_null() {
+    // expr; is CompoundExpression[expr, Null] — result is Null
+    assert_eq!(interpret("1 + 2;").unwrap(), "\0");
+  }
+
+  #[test]
+  fn trailing_semicolon_with_print() {
+    // Print[1]; should still execute Print, result is Null
+    assert_eq!(interpret("Print[1];").unwrap(), "\0");
+  }
+
+  #[test]
+  fn trailing_semicolon_with_postfix() {
+    // {1,2,3} // Map[Print]; should print and return Null
+    assert_eq!(interpret("{1,2,3} // Map[Print];").unwrap(), "\0");
+  }
+
+  #[test]
+  fn no_trailing_semicolon_shows_result() {
+    // Without trailing ;, result should be shown
+    assert_eq!(interpret("1 + 2").unwrap(), "3");
+  }
+
+  #[test]
+  fn compound_expression_with_trailing_semicolon() {
+    // x = 5; x + 1; should return Null
+    assert_eq!(interpret("x = 5; x + 1;").unwrap(), "\0");
+  }
+
+  #[test]
+  fn compound_expression_without_trailing_semicolon() {
+    // x = 5; x + 1 should show the final result
+    assert_eq!(interpret("x = 5; x + 1").unwrap(), "6");
+  }
+
+  #[test]
+  fn consecutive_semicolons_insert_nulls() {
+    // `a ; ; c` is CompoundExpression[a, Null, c] in Wolfram — an omitted
+    // expression between two `;` separators is Null. Regression for
+    // mathics test_control.py:107.
+    assert_eq!(
+      interpret("FullForm[Hold[a ; ; c]]").unwrap(),
+      "FullForm[Hold[a; Null; c]]"
+    );
+    assert_eq!(
+      interpret("FullForm[Hold[a ; ;]]").unwrap(),
+      "FullForm[Hold[a; Null; ]]"
+    );
+    assert_eq!(
+      interpret("FullForm[Hold[a ; ; ; b]]").unwrap(),
+      "FullForm[Hold[a; Null; Null; b]]"
+    );
+  }
+
+  /// `Divide`, `Subtract`, `Minus` and `List` are the call spellings of
+  /// `/`, `-`, unary `-` and `{…}`. Evaluation rewrites them away, so they
+  /// only survive under `Hold` — where wolframscript still prints the
+  /// operator. Found by the differential fuzzer on `Hold[Divide[0, 0]]`.
+  #[test]
+  fn held_operator_call_spellings_print_as_operators() {
+    assert_eq!(interpret("Hold[Divide[0, 0]]").unwrap(), "Hold[0/0]");
+    assert_eq!(interpret("Hold[Divide[a, b]]").unwrap(), "Hold[a/b]");
+    assert_eq!(interpret("Hold[Subtract[5, 2]]").unwrap(), "Hold[5 - 2]");
+    assert_eq!(interpret("Hold[Minus[a]]").unwrap(), "Hold[-a]");
+    assert_eq!(interpret("Hold[List[1, 2]]").unwrap(), "Hold[{1, 2}]");
+    assert_eq!(interpret("Hold[List[]]").unwrap(), "Hold[{}]");
+  }
+
+  /// Only the arities wolframscript itself treats as the operator are
+  /// rewritten — `Divide` and `Subtract` are binary there, so a third
+  /// argument keeps the call form on both engines.
+  #[test]
+  fn held_operator_call_spellings_keep_other_arities() {
+    assert_eq!(
+      interpret("Hold[Divide[a, b, c]]").unwrap(),
+      "Hold[Divide[a, b, c]]"
+    );
+    assert_eq!(
+      interpret("Hold[Subtract[a, b, c]]").unwrap(),
+      "Hold[Subtract[a, b, c]]"
+    );
+  }
+
+  /// Printing the operator is only correct with the operator's
+  /// parenthesisation: `Divide[Subtract[a, b], c]` as `a - b/c` would
+  /// re-parse as something else entirely.
+  #[test]
+  fn held_operator_call_spellings_parenthesise() {
+    assert_eq!(
+      interpret("Hold[Power[Divide[a, b], 2]]").unwrap(),
+      "Hold[(a/b)^2]"
+    );
+    assert_eq!(
+      interpret("Hold[Power[Subtract[a, b], 2]]").unwrap(),
+      "Hold[(a - b)^2]"
+    );
+    assert_eq!(
+      interpret("Hold[Power[Minus[a], 2]]").unwrap(),
+      "Hold[(-a)^2]"
+    );
+    assert_eq!(
+      interpret("Hold[Power[a, Minus[b]]]").unwrap(),
+      "Hold[a^(-b)]"
+    );
+    assert_eq!(
+      interpret("Hold[Divide[Subtract[a, b], c]]").unwrap(),
+      "Hold[(a - b)/c]"
+    );
+    assert_eq!(
+      interpret("Hold[Divide[a, Subtract[b, c]]]").unwrap(),
+      "Hold[a/(b - c)]"
+    );
+    assert_eq!(
+      interpret("Hold[Divide[a, Divide[b, c]]]").unwrap(),
+      "Hold[a/(b/c)]"
+    );
+    assert_eq!(
+      interpret("Hold[Times[Subtract[a, b], c]]").unwrap(),
+      "Hold[(a - b)*c]"
+    );
+    assert_eq!(
+      interpret("Hold[Subtract[a, Subtract[b, c]]]").unwrap(),
+      "Hold[a - (b - c)]"
+    );
+    // `--a` would not parse back.
+    assert_eq!(interpret("Hold[Minus[Minus[a]]]").unwrap(), "Hold[-(-a)]");
+  }
+
+  /// `Minus` is left in call form inside a parent's argument list: `Plus`
+  /// folds a unary minus into a subtraction and `Times` into a `-1` factor,
+  /// which is right for an evaluated `Plus[a, Times[-1, b]]` but not for a
+  /// held `Plus[a, Minus[b]]`.
+  #[test]
+  fn held_minus_is_not_folded_into_its_parent() {
+    assert_eq!(
+      interpret("Hold[Plus[a, Minus[b]]]").unwrap(),
+      "Hold[a + -b]"
+    );
+    assert_eq!(interpret("Hold[Times[a, Minus[b]]]").unwrap(), "Hold[a*-b]");
+  }
+
+  /// `ToString[_, InputForm]` is a *second* renderer, and it used to print
+  /// the call spellings verbatim while the bare echo printed the operator —
+  /// `Hold[Divide[0, 0]]` echoed as `Hold[0/0]` but stringified as
+  /// `Hold[Divide[0, 0]]`. Both say the operator, as wolframscript does.
+  #[test]
+  fn held_operator_call_spellings_print_as_operators_in_input_form() {
+    let to_string =
+      |src: &str| interpret(&format!("ToString[{src}, InputForm]")).unwrap();
+    assert_eq!(to_string("Hold[Divide[0, 0]]"), "Hold[0/0]");
+    assert_eq!(to_string("Hold[Subtract[5, 2]]"), "Hold[5 - 2]");
+    assert_eq!(to_string("Hold[Minus[a]]"), "Hold[-a]");
+    assert_eq!(to_string("Hold[List[1, 2]]"), "Hold[{1, 2}]");
+    assert_eq!(to_string("Hold[List[]]"), "Hold[{}]");
+    // The parenthesisation comes from the operator nodes too.
+    assert_eq!(to_string("Hold[Power[Divide[a, b], 2]]"), "Hold[(a/b)^2]");
+    assert_eq!(
+      to_string("Hold[Divide[Subtract[a, b], c]]"),
+      "Hold[(a - b)/c]"
+    );
+    assert_eq!(to_string("Hold[Divide[a, Divide[b, c]]]"), "Hold[a/(b/c)]");
+    assert_eq!(
+      to_string("Hold[Subtract[a, Subtract[b, c]]]"),
+      "Hold[a - (b - c)]"
+    );
+    // Arities wolframscript does not treat as the operator keep the call.
+    assert_eq!(to_string("Hold[Divide[a, b, c]]"), "Hold[Divide[a, b, c]]");
+  }
+
+  #[test]
+  fn null_symbol_uses_sentinel() {
+    // The Null symbol should use the "\0" sentinel so visual contexts
+    // (Studio, JupyterLite) can suppress it without confusing it
+    // with the string "Null".
+    assert_eq!(interpret("Clear[x]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn string_null_is_not_suppressed() {
+    // The string "Null" must remain as "Null", not be suppressed
+    assert_eq!(interpret(r#""Null""#).unwrap(), "Null");
+  }
+}
+
+mod unary_minus_parsing {
+  use super::*;
+
+  #[test]
+  fn negative_identifier_in_parens() {
+    assert_eq!(interpret("(-x)").unwrap(), "-x");
+  }
+
+  #[test]
+  fn negative_power_in_parens() {
+    // (-x^2) should be -(x^2), not (-x)^2
+    assert_eq!(interpret("(-x^2)").unwrap(), "-x^2");
+  }
+
+  // A leading minus on a real (or scientific) literal followed by `^` binds
+  // looser than the power, exactly like the integer case: -10.0^2 = -(10.0^2).
+  // The minus must not be absorbed into the literal as (-10.0)^2.
+  #[test]
+  fn negative_real_literal_power() {
+    assert_eq!(interpret("-10.0^2").unwrap(), "-100.");
+    assert_eq!(interpret("-2.5^2").unwrap(), "-6.25");
+    assert_eq!(interpret("-3.0^3").unwrap(), "-27.");
+    assert_eq!(interpret("-0.5^2").unwrap(), "-0.25");
+    // Scientific-notation literals behave the same.
+    assert_eq!(interpret("-1.5*^3^2").unwrap(), "-2.25*^6");
+    // Matches the long-standing integer behaviour.
+    assert_eq!(interpret("-10^2").unwrap(), "-100");
+    // A negative real literal NOT before `^` is still a signed literal.
+    assert_eq!(interpret("-10.0").unwrap(), "-10.");
+    assert_eq!(interpret("{-1.5, -2.5}").unwrap(), "{-1.5, -2.5}");
+  }
+
+  #[test]
+  fn negative_expr_plus_constant() {
+    assert_eq!(interpret("(-x + 3)").unwrap(), "3 - x");
+  }
+
+  #[test]
+  fn e_to_negative_x_squared() {
+    assert_eq!(interpret("E^(-x^2)").unwrap(), "E^(-x^2)");
+  }
+
+  #[test]
+  fn negative_power_exponent() {
+    assert_eq!(interpret("x^(-2)").unwrap(), "x^(-2)");
+  }
+
+  #[test]
+  fn power_with_negated_symbol_exponent() {
+    // Regression: `a^-x` was parsed as `(a^0) - x` instead of `a^(-x)`
+    // because Power had higher precedence than NEGATE in the climbing
+    // algorithm. Now `^-` emits the synthetic `^_NEG` operator.
+    assert_eq!(interpret("a^-x").unwrap(), "a^(-x)");
+    assert_eq!(interpret("Hold[a^-x]").unwrap(), "Hold[a^(-x)]");
+  }
+
+  #[test]
+  fn power_with_negated_function_call_exponent() {
+    // `I^-PrimePi[Range[5]]` should parse as `Power[I, -PrimePi[Range[5]]]`.
+    assert_eq!(
+      interpret("Hold[I^-PrimePi[Range[5]]]").unwrap(),
+      "Hold[I^(-PrimePi[Range[5]])]"
+    );
+  }
+
+  #[test]
+  fn power_with_negated_chained_power() {
+    // `a^-b^c` must parse as `a^(-(b^c))`, matching Wolfram's `Power[a,
+    // -Power[b, c]]` semantics.
+    assert_eq!(interpret("Hold[a^-b^c]").unwrap(), "Hold[a^(-b^c)]");
+  }
+
+  #[test]
+  fn implicit_times_power_with_part_exponent() {
+    // Regression: `a I^-#2[[1]]` failed to parse because the
+    // `ImplicitPowerSuffix` rule did not allow a `PartIndexSuffix` after
+    // the exponent term.
+    assert_eq!(
+      interpret("MapIndexed[# I^-#2[[1]]&, {a, b, c}]").unwrap(),
+      "{-I*a, -b, I*c}"
+    );
+  }
+
+  // Regression: `-Plus @@ list` parsed as `(-Plus) @@ list` instead of
+  // `-(Plus @@ list)` because NEGATE had higher precedence than Apply/Map in
+  // the climbing algorithm. This is a common Wolfram idiom for negating a
+  // sum or mapped result — e.g. the "Stress Distribution in a Circular
+  // Plate with Concentrated Radial Loadings" Demonstration computes a force
+  // resultant as `-Plus @@ (component & /@ points)`, which silently
+  // produced an unevaluated `(-Plus)[…]` head instead of the negated sum.
+  #[test]
+  fn negated_apply_and_map_bind_outside_the_shorthand() {
+    assert_eq!(interpret("-Plus @@ {1, 2, 3}").unwrap(), "-6");
+    assert_eq!(interpret("-Times @@ {2, 3, 4}").unwrap(), "-24");
+    assert_eq!(interpret("-(#*2) & /@ {1, 2, 3}").unwrap(), "{-2, -4, -6}");
+    assert_eq!(
+      interpret("Hold[-Plus @@ {1, 2, 3}]").unwrap(),
+      "Hold[-Plus @@ {1, 2, 3}]"
+    );
+    assert_eq!(
+      interpret("Hold[-f @@@ {{1, 2}}]").unwrap(),
+      "Hold[-f @@@ {{1, 2}}]"
+    );
+    // Still combines correctly with other operators: the minus binds the
+    // whole shorthand before multiplying.
+    assert_eq!(interpret("2 * -Plus @@ {1, 2, 3}").unwrap(), "-12");
+    // `Precedence[Apply]` (620) is above `Precedence[Power]` (590), so the
+    // Apply runs *first* and the sum is what gets squared: `(1 + 2)^2`.
+    assert_eq!(interpret("-Plus @@ {1, 2}^2").unwrap(), "-9");
+  }
+}
+
+/// `Precedence` ranks `StringJoin` (600), `Power` (590), `Apply`/`Map`/
+/// `MapApply` (620), the tilde infix (630) and prefix `@` (640) in an order
+/// Woxi used to get wrong in three places: `Map` sat above `Apply` instead of
+/// beside it, both sat *below* `Power`, and `StringJoin` sat down at `Plus`.
+mod map_apply_stringjoin_precedence {
+  use super::*;
+
+  #[test]
+  fn map_and_apply_share_one_level_and_group_to_the_right() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a @@ b /@ c]]]").unwrap(),
+      "Hold[Apply[a, Map[b, c]]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a /@ b @@ c]]]").unwrap(),
+      "Hold[Map[a, Apply[b, c]]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a @@@ b /@ c]]]").unwrap(),
+      "Hold[MapApply[a, Map[b, c]]]"
+    );
+  }
+
+  #[test]
+  fn map_and_apply_bind_tighter_than_power() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[Plus @@ {1, 2}^2]]]").unwrap(),
+      "Hold[Power[Apply[Plus, List[1, 2]], 2]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[f /@ x^2]]]").unwrap(),
+      "Hold[Power[Map[f, x], 2]]"
+    );
+    assert_eq!(interpret("Plus @@ {1, 2}^2").unwrap(), "9");
+  }
+
+  #[test]
+  fn string_join_binds_tighter_than_power_times_and_plus() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a <> b^c]]]").unwrap(),
+      "Hold[Power[StringJoin[a, b], c]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a <> b*c]]]").unwrap(),
+      "Hold[Times[StringJoin[a, b], c]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a <> b + c]]]").unwrap(),
+      "Hold[Plus[StringJoin[a, b], c]]"
+    );
+  }
+
+  #[test]
+  fn string_join_binds_looser_than_map_and_apply() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a /@ b <> c]]]").unwrap(),
+      "Hold[StringJoin[Map[a, b], c]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_and_prefix_at_bind_tighter_than_map_and_power() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a ~f~ b /@ c]]]").unwrap(),
+      "Hold[Map[f[a, b], c]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a ~f~ b^2]]]").unwrap(),
+      "Hold[Power[f[a, b], 2]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[a@b^2]]]").unwrap(),
+      "Hold[Power[a[b], 2]]"
+    );
+  }
+}
+
+mod implicit_times_with_strings {
+  use super::*;
+
+  // A string literal can be a factor in implicit (juxtaposition)
+  // multiplication. Previously the parser silently dropped the non-string
+  // factor (e.g. `2 "x"` returned just `"x"`), or failed to parse a held form.
+  #[test]
+  fn string_factor_multiplies() {
+    assert_eq!(interpret(r#"2 "x""#).unwrap(), "2*x");
+    assert_eq!(interpret(r#""x" 3"#).unwrap(), "3*x");
+    assert_eq!(interpret(r#"x "y""#).unwrap(), "y*x");
+  }
+
+  // Adjacent string literals (compound units) multiply, so a kilowatt-hour
+  // converts to joules.
+  #[test]
+  fn compound_unit_string_product() {
+    assert_eq!(
+      interpret(r#"UnitConvert[Quantity[1, "Kilowatts" "Hours"], "Joules"]"#)
+        .unwrap(),
+      "Quantity[3600000, Joules]"
+    );
+  }
+
+  // OutputForm (the bare echo) drops string quotes everywhere, including for
+  // string operands of a held Plus/Times. Previously the held BinaryOp render
+  // re-entered via the InputForm path and quoted them (`Hold["a" + "b"]`),
+  // diverging from wolframscript's `Hold[a + b]`.
+  #[test]
+  fn held_string_plus_times_output_form_unquoted() {
+    assert_eq!(interpret(r#"Hold["a" + "b"]"#).unwrap(), "Hold[a + b]");
+    assert_eq!(interpret(r#"Hold["abc" "def"]"#).unwrap(), "Hold[abc*def]");
+    assert_eq!(interpret(r#"Hold[2 "x"]"#).unwrap(), "Hold[2*x]");
+  }
+
+  // Genuine InputForm (via ToString[_, InputForm]) must still quote the string
+  // operands so the text round-trips, matching wolframscript.
+  #[test]
+  fn held_string_plus_input_form_quoted() {
+    assert_eq!(
+      interpret(r#"ToString[Hold["a" + "b"], InputForm]"#).unwrap(),
+      r#"Hold["a" + "b"]"#
+    );
+  }
+
+  // A held `<>` renders as `StringJoin[a, b]` with the operands unquoted in
+  // OutputForm but quoted in genuine InputForm — Woxi Studio re-evaluates
+  // Manipulate bodies from their InputForm, and an unquoted operand
+  // (`StringJoin[z = , ToString[z]]`) doesn't re-parse (regression from the
+  // "Area of a Normal Distribution" Demonstration).
+  #[test]
+  fn held_string_join_input_form_quoted() {
+    assert_eq!(
+      interpret(r#"Hold["z = " <> ToString[z]]"#).unwrap(),
+      "Hold[StringJoin[z = , ToString[z]]]"
+    );
+    assert_eq!(
+      interpret(r#"ToString[Hold["z = " <> ToString[z]], InputForm]"#).unwrap(),
+      r#"Hold[StringJoin["z = ", ToString[z]]]"#
+    );
+  }
+
+  // A `CompoundExpression` inside a held expression used to force its
+  // statements back into InputForm even while the surrounding render was
+  // OutputForm, so a string compared deeper in the same held tree (e.g. an
+  // `If` condition that can't resolve) kept its quotes only when it
+  // happened to sit after a `;`, and lost them everywhere else — the same
+  // `dim == "1D"` condition printed as `dim == 1D` in one spot and
+  // `dim == "1D"` in another within a single Diffusion-Limited-Aggregation
+  // Demonstration's `Manipulate`. OutputForm must drop every nested string's
+  // quotes uniformly, `;` or not.
+  #[test]
+  fn held_if_condition_string_output_form_unquoted_consistently() {
+    assert_eq!(
+      interpret(r#"HoldForm[dim == "1D"]"#).unwrap(),
+      "HoldForm[dim == 1D]"
+    );
+    assert_eq!(
+      interpret(r#"a; If[dim == "1D", x, y]"#).unwrap(),
+      "If[dim == 1D, x, y]"
+    );
+  }
+
+  // The `CompoundExpression`-forces-InputForm hack above was masking a
+  // second bug: fixing it naively (just propagating OutputForm through
+  // `CompoundExpr`) broke genuine InputForm rendering (`ToString[_,
+  // InputForm]`), because a bare `CompoundExpr` node falls through to the
+  // OutputForm renderer internally and then inherited its `is_output`
+  // shortcuts — dropping string quotes, replacing `Graphics[…]` with the
+  // `-Graphics-` display placeholder, and concatenating a `Row[{"…", x}]`
+  // without an operator (`"…"x`, invalid syntax) — even though the
+  // surrounding render was meant to be fully re-parseable. Woxi Studio's
+  // Manipulate re-evaluates exactly this InputForm text on every control
+  // change, so any of these breaks every Demonstration whose body is a
+  // `;`-joined sequence (regression while fixing the
+  // Diffusion-Limited-Aggregation Demonstration above; the `Row` case is
+  // from the Center-of-Mass Demonstration's `PlotLabel -> Row[{"center of
+  // mass: ", CM}]`).
+  #[test]
+  fn compound_expr_input_form_keeps_full_graphics_and_quotes() {
+    assert_eq!(
+      interpret(r#"ToString[Hold[a; If[dim == "1D", x, y]], InputForm]"#)
+        .unwrap(),
+      r#"Hold[a; If[dim == "1D", x, y]]"#
+    );
+    assert_eq!(
+      interpret(r#"ToString[Hold[a; Graphics[{Circle[]}]], InputForm]"#)
+        .unwrap(),
+      "Hold[a; Graphics[{Circle[]}]]"
+    );
+    assert_eq!(
+      interpret(r#"ToString[Hold[a; Row[{"x: ", z}]], InputForm]"#).unwrap(),
+      r#"Hold[a; Row[{"x: ", z}]]"#
+    );
+  }
+
+  // `TraditionalForm[expr]` serializes into InputForm as a `\!\(\*boxes\)`
+  // escape, so the boxes have to read back as the very expression they were
+  // built from — Woxi Studio re-evaluates a Manipulate body from that text on
+  // every control change. Two ways they did not: a list's boxes doubled its
+  // braces, so `{1, 2}` came back as `{{1, 2}}`; and a string-literal box was
+  // unescaped a second time, so `"For each such pair, "` came back as bare
+  // source that re-parsed as the product `each*For*pair*such` and a lone
+  // `","` came back as `Null`. (Regressions from the "Twin Pythagorean
+  // Triples" Demonstration, whose whole body is one
+  // `Text@TraditionalForm@Column[…]` of styled `Row`s.)
+  #[test]
+  fn traditional_form_box_escape_reparses_to_the_same_expression() {
+    for src in [
+      "{1, 2}",
+      "{{1, 2}, {3, 4}}",
+      r#"Column[{Row[{"a", 1}], Row[{"b", 2}]}]"#,
+      r#"Row[{"For each such pair, ", 1}]"#,
+      r#"Row[{"x", ","}]"#,
+      r#"Row[{Style["sum: ", 12, RGBColor[0.25, 0.43, 0.82], Bold], 1 + 2}]"#,
+      r#"Row[{"a", "b"}, ", "]"#,
+      "Row[{1, 2}, x]",
+      "Row[{}]",
+      "f[Row[{1, 2}]]",
+      "ArcTan[N[4/3]]*180/Pi",
+    ] {
+      let printed = interpret(&format!(
+        "ToString[Hold[TraditionalForm[{src}]], InputForm]"
+      ))
+      .unwrap();
+      // The escape yields the expression the boxes typeset, with the
+      // display-only `TraditionalForm` wrapper gone — so the target is the
+      // bare expression, held.
+      let same = interpret(&format!("{printed} === Hold[{src}]")).unwrap();
+      assert_eq!(
+        same, "True",
+        "box escape of `{src}` re-parses differently: `{printed}`"
+      );
+    }
+  }
+
+  // A list's box form uses single braces. The doubled-brace spelling that
+  // used to come out (`"{{"` … `"}}"`, a `format!` escape written into a
+  // plain string literal) re-read as one extra level of nesting.
+  #[test]
+  fn list_box_form_uses_single_braces() {
+    assert_eq!(
+      interpret("ToString[Hold[TraditionalForm[{1, 2}]], InputForm]").unwrap(),
+      r#"Hold[\!\(\*FormBox[RowBox[{"{", RowBox[{"1", ",", "2"}], "}"}], TraditionalForm]\)]"#
+    );
+  }
+
+  // A string-literal box keeps its `\"` quoting in the escape, which is what
+  // marks it as content rather than source text.
+  #[test]
+  fn string_box_in_escape_keeps_its_quoting() {
+    assert_eq!(
+      interpret(r#"ToString[Hold[TraditionalForm[Row[{"a, b"}]]], InputForm]"#)
+        .unwrap(),
+      r#"Hold[\!\(\*FormBox[TemplateBox[List["\"a, b\""], "RowDefault"], TraditionalForm]\)]"#
+    );
+  }
+
+  // `Row` typesets through the FrontEnd's row templates, not as a function
+  // call: `RowDefault` for the plain form, and one of two separator variants
+  // — the plural one carries a string separator twice, as the text it draws
+  // and as the literal it was written as.
+  #[test]
+  fn row_typesets_as_a_row_template() {
+    assert_eq!(
+      interpret(r#"ToString[Hold[TraditionalForm[Row[{"a", 1}]]], InputForm]"#)
+        .unwrap(),
+      r#"Hold[\!\(\*FormBox[TemplateBox[List["\"a\"", "1"], "RowDefault"], TraditionalForm]\)]"#
+    );
+    assert_eq!(
+      interpret(
+        r#"ToString[Hold[TraditionalForm[Row[{"a", "b"}, ", "]]], InputForm]"#
+      )
+      .unwrap(),
+      r#"Hold[\!\(\*FormBox[TemplateBox[List[", ", "\", \"", "\"a\"", "\"b\""], "RowWithSeparators"], TraditionalForm]\)]"#
+    );
+    assert_eq!(
+      interpret(
+        r#"ToString[Hold[TraditionalForm[Row[{1, 2}, x]]], InputForm]"#
+      )
+      .unwrap(),
+      r#"Hold[\!\(\*FormBox[TemplateBox[List["x", "1", "2"], "RowWithSeparator"], TraditionalForm]\)]"#
+    );
+    assert_eq!(
+      interpret(r#"ToString[Hold[TraditionalForm[Row[{}]]], InputForm]"#)
+        .unwrap(),
+      r#"Hold[\!\(\*FormBox[TemplateBox[List[], "RowDefault"], TraditionalForm]\)]"#
+    );
+  }
+
+  // Writing the escape out as the InputForm of a *string* escapes its quotes
+  // a second time — the box delimiters included, which leaves text that is no
+  // longer box syntax. The escape is read along with the source around it, so
+  // that spelling is a syntax error rather than the boxes it came from.
+  #[test]
+  fn box_escape_reads_back_only_at_its_own_escaping_depth() {
+    assert_eq!(
+      interpret(
+        r#"ToExpression[ToString[InputForm[TraditionalForm[Row[{"a, b", 1}]]]]]"#
+      )
+      .unwrap(),
+      "a, b1"
+    );
+    assert_eq!(
+      interpret(
+        r#"Head[ToExpression[ToString[InputForm[TraditionalForm[Row[{"a, b", 1}]]]]]]"#
+      )
+      .unwrap(),
+      "Row"
+    );
+    assert_eq!(
+      interpret(
+        r#"ToExpression[StringTrim[ToString[ToString[InputForm[TraditionalForm[Row[{"a, b", 1}]]]], InputForm], "\""]]"#
+      )
+      .unwrap(),
+      "$Failed"
+    );
+  }
+}
+
+mod operator_shorthand_parens {
+  use super::*;
+
+  // `@@`, `/@`, `@@@`, and `.` bind tighter than arithmetic; an operand
+  // that prints with a looser operator must keep its parens or the printed
+  // form re-parses to a different expression. (Woxi Studio re-evaluates
+  // Manipulate bodies from their InputForm, so a paren lost here silently
+  // changes the math — e.g. the polygon-area formula of the "Center of
+  // Mass of a Polygon" Demonstration.)
+  #[test]
+  fn held_apply_map_dot_keep_operand_parens() {
+    assert_eq!(interpret("Hold[a . (b - c)]").unwrap(), "Hold[a . (b - c)]");
+    assert_eq!(
+      interpret("Hold[f @@ (a + b)]").unwrap(),
+      "Hold[f @@ (a + b)]"
+    );
+    assert_eq!(
+      interpret("Hold[f @@@ (a + b)]").unwrap(),
+      "Hold[f @@@ (a + b)]"
+    );
+    assert_eq!(interpret("Hold[f /@ (a*b)]").unwrap(), "Hold[f /@ (a*b)]");
+    assert_eq!(
+      interpret("Hold[Plus @@ (x*y)/2]").unwrap(),
+      "Hold[Plus @@ (x*y)/2]"
+    );
+    // Higher-precedence operands stay unparenthesized.
+    assert_eq!(interpret("Hold[f /@ a + b]").unwrap(), "Hold[f /@ a + b]");
+    assert_eq!(interpret("Hold[f @@ a^2]").unwrap(), "Hold[f @@ a^2]");
+  }
+
+  // A leading unary minus binds looser than `@@`/`@@@`/`/@` (see
+  // `negated_apply_and_map_bind_outside_the_shorthand`), so a negated
+  // *function head* needs explicit parens to round-trip, while a negated
+  // whole-shorthand doesn't.
+  #[test]
+  fn held_negated_apply_map_round_trips() {
+    assert_eq!(
+      interpret("Hold[(-f) @@ {1, 2}]").unwrap(),
+      "Hold[(-f) @@ {1, 2}]"
+    );
+    assert_eq!(
+      interpret("Hold[(-f) /@ {1, 2}]").unwrap(),
+      "Hold[(-f) /@ {1, 2}]"
+    );
+    assert_eq!(
+      interpret("Hold[-f @@ {1, 2}]").unwrap(),
+      "Hold[-f @@ {1, 2}]"
+    );
+    assert_eq!(
+      interpret("Hold[-f /@ {1, 2}]").unwrap(),
+      "Hold[-f /@ {1, 2}]"
+    );
+  }
+
+  // An implicit product (`2 f`) is `Times` at multiplicative precedence, so
+  // an operator that binds tighter reaches its adjacent *factor*, not the
+  // whole product. Regression: `lcm^n Times @@ Table[…]` — the
+  // Demonstrations idiom for building a polynomial from its roots — parsed
+  // as `(lcm^n Times) @@ Table[…]`, which applies the wrong head and yields
+  // an unevaluable expression instead of the product.
+  #[test]
+  fn implicit_product_yields_to_tighter_operators() {
+    // Apply / MapApply / Map (precedence 620) over Times (400).
+    assert_eq!(interpret("2 Times @@ {3, 4}").unwrap(), "24");
+    assert_eq!(interpret("2 Plus @@ {3, 4}").unwrap(), "14");
+    // `3 (List @@@ {{1}})` is `3 {{1}}`, and Times threads over the list.
+    assert_eq!(interpret("3 List @@@ {{1}}").unwrap(), "{{3}}");
+    assert_eq!(interpret("2 f /@ {a, b}").unwrap(), "{2*f[a], 2*f[b]}");
+    // The product on the *right* of a tighter operator splits too:
+    // `(List @@ 2) x` is `2 x`, not `List @@ (2 x)`.
+    assert_eq!(interpret("List @@ 2 x").unwrap(), "2*x");
+    // Dot (490) over Times.
+    assert_eq!(interpret("2 {1, 2} . {3, 4}").unwrap(), "22");
+    assert_eq!(interpret("{1, 2} . {3, 4} 2").unwrap(), "22");
+    // Power (590) over Times: `2 x ^ 3` is `2 (x^3)`.
+    assert_eq!(interpret("2 x^3 /. x -> 2").unwrap(), "16");
+    // A product with no tighter neighbour is untouched.
+    assert_eq!(interpret("2 x + 1 /. x -> 3").unwrap(), "7");
+    assert_eq!(interpret("-2 x /. x -> 3").unwrap(), "-6");
+  }
+
+  // The left factor of an implicit product may itself be a function call
+  // (`Sum[…] Times @@ dp`), which the grammar reaches through
+  // `FunctionCallExtended`'s implicit suffix rather than `ImplicitTimes`.
+  // Regression: that path did not split, so the tighter operator swallowed
+  // the whole product — `Sum[i, {i, 0, 2}] Times @@ {3, 4}` parsed as
+  // `(3 Times) @@ {3, 4}`, applying a list as a head instead of scaling the
+  // product.
+  #[test]
+  fn function_call_implicit_product_yields_to_tighter_operators() {
+    assert_eq!(
+      interpret("Sum[i, {i, 0, 2}] Times @@ {3, 4}").unwrap(),
+      "36"
+    );
+    assert_eq!(interpret("Length[{a, b}] Plus @@ {3, 4}").unwrap(), "14");
+    assert_eq!(
+      interpret("Hold[f[1] Times @@ {3, 4}]").unwrap(),
+      "Hold[f[1]*Times @@ {3, 4}]"
+    );
+    assert_eq!(
+      interpret("Length[{a}] f /@ {x, y}").unwrap(),
+      "{f[x], f[y]}"
+    );
+    assert_eq!(interpret("Length[{a, b}] List @@@ {{1}}").unwrap(), "{{2}}");
+    // Dot and Power reach the adjacent factor through a call head too.
+    assert_eq!(interpret("Length[{a, b}] {1, 2} . {3, 4}").unwrap(), "22");
+    assert_eq!(interpret("Length[{a, b}] x^3 /. x -> 2").unwrap(), "16");
+    // A power on the call itself still belongs to the call, not the product.
+    assert_eq!(
+      interpret("f[2]^2 Times @@ {3, 4} /. f -> Identity").unwrap(),
+      "48"
+    );
+    // Without a tighter neighbour the product is unchanged.
+    assert_eq!(interpret("Length[{a, b}] x /. x -> 5").unwrap(), "10");
+  }
+
+  #[test]
+  fn held_subtraction_keeps_additive_operand_parens() {
+    // Subtraction is left-associative, so a parenthesized additive right
+    // operand must keep its parens: `a - b + c` is a different value.
+    assert_eq!(interpret("Hold[a - (b + c)]").unwrap(), "Hold[a - (b + c)]");
+    assert_eq!(interpret("Hold[a - (b - c)]").unwrap(), "Hold[a - (b - c)]");
+    // Left-nested chains stay flat.
+    assert_eq!(interpret("Hold[a - b + c]").unwrap(), "Hold[a - b + c]");
+    assert_eq!(interpret("Hold[a - b - c]").unwrap(), "Hold[a - b - c]");
+  }
+
+  // The InputForm of a held expression must re-parse to the very same
+  // expression (checked via FullForm equality).
+  #[test]
+  fn input_form_reparses_to_the_same_expression() {
+    for src in [
+      "Plus @@ (x*y)/2",
+      "a . (b - c)",
+      "Plus @@ ((#1^2 + #1*#2 + #2^2 & ) @@ x*y)",
+      "x /. p:{_?NumericQ, _?NumericQ} :> c + RotationMatrix[Pi/4] . (p - c)",
+      "(f & ) @@ (a + b)",
+      "f /@ a + b",
+      // Subtraction is left-associative: a held additive right operand
+      // must keep its parentheses (regression: the Gray-Scott notebook's
+      // `(# - (2*(#/10) + 2))/2 &` pad width printed as `#1 - 2*#1/10 + 2`,
+      // silently changing 7 into 9).
+      "a - (b + c)",
+      "a - (b - c)",
+      "(#1 - (2*#1/10 + 2))/2 & ",
+      // `&` binds tighter than `;` and than `=`, so a compound or
+      // assignment body must keep its parentheses. Regression: the
+      // Demonstrations idiom `Map[(u = f[#]; g[u]) &, names]` printed as
+      // `Map[u = f[#1]; g[u] & , names]`, which re-parses as
+      // `CompoundExpression[Set[u, f[#1]], Function[g[u]]]` — the slot is
+      // never substituted and every list entry comes back symbolic.
+      "(u = #1^2; {u, u + 1}) & ",
+      "(a = 1) & ",
+      "(a += 1) & ",
+      "Map[(u = #1^2; u + 1) & , x]",
+      // A body that binds tighter than `&` still prints bare.
+      "a -> #1 & ",
+      "a /. b & ",
+    ] {
+      let full = interpret(&format!("FullForm[Hold[{src}]]")).unwrap();
+      let printed =
+        interpret(&format!("ToString[InputForm[Hold[{src}]]]")).unwrap();
+      let reparsed_full = interpret(&format!("FullForm[{printed}]")).unwrap();
+      assert_eq!(
+        full, reparsed_full,
+        "InputForm of `{src}` re-parses differently: `{printed}`"
+      );
+    }
+  }
+}
+
+mod plus_formatting {
+  use super::*;
+
+  #[test]
+  fn plus_with_negative_term() {
+    // a + (-b) should format as a - b
+    let result = interpret("Integrate[Sin[x], x]").unwrap();
+    assert_eq!(result, "-Cos[x]");
+  }
+
+  #[test]
+  fn integrate_sum_formatting() {
+    // Integrate[x^2 + Sin[x], x] should format nicely
+    let result = interpret("Integrate[x^2 + Sin[x], x]").unwrap();
+    assert_eq!(result, "x^3/3 - Cos[x]");
+  }
+
+  #[test]
+  fn plus_term_ordering_polynomial_first() {
+    // Polynomial terms should come before transcendental functions
+    let result = interpret("x^2 + Sin[x]").unwrap();
+    assert_eq!(result, "x^2 + Sin[x]");
+  }
+
+  #[test]
+  fn plus_term_ordering_alphabetical() {
+    // Same priority terms should be alphabetical
+    let result = interpret("c + a + b").unwrap();
+    assert_eq!(result, "a + b + c");
+  }
+
+  #[test]
+  fn plus_times_before_identifier() {
+    // Times[a, b] should come before c alphabetically (a < c).
+    // wolframscript keeps the FullForm wrapper at the top level; the
+    // bare head form is reachable via `ToString[…]`.
+    assert_eq!(interpret("FullForm[a b + c]").unwrap(), "FullForm[a*b + c]");
+    assert_eq!(
+      interpret("ToString[FullForm[a b + c]]").unwrap(),
+      "Plus[Times[a, b], c]"
+    );
+  }
+
+  #[test]
+  fn plus_term_ordering_reverse_lex() {
+    // Wolfram sorts polynomial terms by reverse-lex variable ordering
+    assert_eq!(interpret("x^2 + 2*b*x + b^2").unwrap(), "b^2 + 2*b*x + x^2");
+  }
+
+  #[test]
+  fn plus_term_ordering_ascending_degree() {
+    // For single-variable polynomials, ascending degree order
+    assert_eq!(interpret("3*x^2 + 6*x + 2").unwrap(), "2 + 6*x + 3*x^2");
+  }
+
+  #[test]
+  fn plus_term_ordering_multivar() {
+    // Multi-variable terms: reverse-lex order
+    assert_eq!(
+      interpret("a*c + b*c + a*d + b*d").unwrap(),
+      "a*c + b*c + a*d + b*d"
+    );
+  }
+
+  #[test]
+  fn plus_term_ordering_with_division() {
+    // Terms with 1/z should sort by the variable z
+    assert_eq!(
+      interpret("x/Sqrt[5] + y^2 + 1/z").unwrap(),
+      "x/Sqrt[5] + y^2 + z^(-1)"
+    );
+  }
+}
+
+mod subtraction_without_spaces {
+  use super::*;
+
+  #[test]
+  fn n_minus_1_in_function_body() {
+    // Regression: n-1 (without spaces) was parsed as implicit multiplication n*(-1)
+    clear_state();
+    assert_eq!(interpret("f[n_] := n-1; f[99]").unwrap(), "98");
+  }
+
+  #[test]
+  fn subtraction_in_nested_function_call() {
+    // Regression: ToString[n-1] was evaluating n-1 as -(n) instead of n minus 1
+    clear_state();
+    assert_eq!(interpret("f[n_] := ToString[n-1]; f[99]").unwrap(), "98");
+  }
+
+  #[test]
+  fn subtraction_in_string_join() {
+    clear_state();
+    assert_eq!(
+      interpret(
+        r#"f[n_] := ToString[n] <> " minus 1 is " <> ToString[n-1]; f[10]"#
+      )
+      .unwrap(),
+      "10 minus 1 is 9"
+    );
+  }
+
+  #[test]
+  fn divide_then_implicit_times_keeps_multiplicative_precedence() {
+    // Regression: `a/b c` must parse as `(a*c)/b`, not `a/(b*c)`. The
+    // ImplicitTimes term following `/` was being consumed wholesale as a
+    // single divisor, putting later factors into the denominator.
+    assert_eq!(interpret("6/2 3").unwrap(), "9");
+    assert_eq!(interpret("FullForm[a/b c]").unwrap(), "FullForm[(a*c)/b]");
+    assert_eq!(
+      interpret("ToString[FullForm[a/b c]]").unwrap(),
+      "Times[a, Power[b, -1], c]"
+    );
+    assert_eq!(
+      interpret("FullForm[a/b c d]").unwrap(),
+      "FullForm[(a*c*d)/b]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[a/b c d]]").unwrap(),
+      "Times[a, Power[b, -1], c, d]"
+    );
+  }
+
+  #[test]
+  fn divide_then_implicit_times_with_negated_power() {
+    // Regression for case 1095: the trailing `c^-d` after implicit
+    // multiplication caused the precedence chain to invert several
+    // factors.
+    assert_eq!(
+      interpret("5/7 (x - 1)^2/(x - 2)^3 a^b c^-d").unwrap(),
+      "(5*a^b*(-1 + x)^2)/(7*c^d*(-2 + x)^3)"
+    );
+  }
+
+  #[test]
+  fn implicit_times_then_minus_constant_fraction() {
+    // Regression: `2 Pi - Pi/4` must parse as subtraction, not implicit multiplication by -Pi.
+    // The result is simplified: 2*Pi - Pi/4 = (8*Pi - Pi)/4 = 7*Pi/4
+    assert_eq!(
+      interpret("FullForm[2 Pi - Pi/4]").unwrap(),
+      "FullForm[(7*Pi)/4]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[2 Pi - Pi/4]]").unwrap(),
+      "Times[Rational[7, 4], Pi]"
+    );
+  }
+
+  #[test]
+  fn tostring_input_form() {
+    // ToString[expr, InputForm] — strings are quoted, fractions single-line
+    assert_eq!(
+      interpret(r#"ToString["hello", InputForm]"#).unwrap(),
+      r#""hello""#
+    );
+    assert_eq!(interpret("ToString[1/3, InputForm]").unwrap(), "1/3");
+    assert_eq!(
+      interpret(r#"ToString[{1, "a", x^2}, InputForm]"#).unwrap(),
+      r#"{1, "a", x^2}"#
+    );
+    assert_eq!(interpret("ToString[x + y, InputForm]").unwrap(), "x + y");
+    // Without InputForm, strings are unquoted
+    assert_eq!(interpret(r#"ToString["hello"]"#).unwrap(), "hello");
+    // In InputForm, Inequality always uses the head form (even with same operators)
+    assert_eq!(
+      interpret(
+        "ToString[Inequality[0, LessEqual, x, LessEqual, 1], InputForm]"
+      )
+      .unwrap(),
+      "Inequality[0, LessEqual, x, LessEqual, 1]"
+    );
+    assert_eq!(
+      interpret("ToString[Inequality[a, Less, b, Less, c], InputForm]")
+        .unwrap(),
+      "Inequality[a, Less, b, Less, c]"
+    );
+    // Mixed operators also use Inequality[] head in InputForm
+    assert_eq!(
+      interpret("ToString[Inequality[a, LessEqual, b, Less, c], InputForm]")
+        .unwrap(),
+      "Inequality[a, LessEqual, b, Less, c]"
+    );
+    // Chained comparison with same operators uses infix in InputForm
+    assert_eq!(
+      interpret("ToString[0 <= x <= 1, InputForm]").unwrap(),
+      "0 <= x <= 1"
+    );
+    assert_eq!(
+      interpret("ToString[a < b < c, InputForm]").unwrap(),
+      "a < b < c"
+    );
+    // Chained comparison with mixed operators uses Inequality head in InputForm
+    assert_eq!(
+      interpret("ToString[Inequality[a, LessEqual, b, Less, c], InputForm]")
+        .unwrap(),
+      "Inequality[a, LessEqual, b, Less, c]"
+    );
+  }
+
+  #[test]
+  fn tostring_input_form_negative_coefficients() {
+    // Negative coefficients in Plus should render as "- N*..." not "+ -N*..."
+    assert_eq!(
+      interpret("ToString[Expand[Resultant[x^2 + a*x + b, x^2 + c*x + d, x]], InputForm]").unwrap(),
+      "b^2 - a*b*c + b*c^2 + a^2*d - 2*b*d - a*c*d + d^2"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[Expand[InterpolatingPolynomial[{0, 1, 8, 27}, x]], InputForm]"
+      )
+      .unwrap(),
+      "-1 + 3*x - 3*x^2 + x^3"
+    );
+    assert_eq!(
+      interpret("ToString[Discriminant[x^2 + b*x + c, x], InputForm]").unwrap(),
+      "b^2 - 4*c"
+    );
+    assert_eq!(
+      interpret("ToString[Discriminant[a*x^2 + b*x + c, x], InputForm]")
+        .unwrap(),
+      "b^2 - 4*a*c"
+    );
+    assert_eq!(
+      interpret("ToString[Discriminant[x^3 + p*x + q, x], InputForm]").unwrap(),
+      "-4*p^3 - 27*q^2"
+    );
+  }
+
+  #[test]
+  fn negative_numbers_still_work() {
+    assert_eq!(interpret("{-1, -2, -3}").unwrap(), "{-1, -2, -3}");
+    assert_eq!(interpret("-1 + 3").unwrap(), "2");
+  }
+}
+
+mod newline_statements {
+  use super::*;
+
+  #[test]
+  fn multiline_assignments() {
+    clear_state();
+    assert_eq!(interpret("x = 5\ny = 10\nx + y").unwrap(), "15");
+  }
+
+  #[test]
+  fn multiline_with_blank_lines() {
+    clear_state();
+    assert_eq!(interpret("x = 42\n\nx").unwrap(), "42");
+  }
+
+  #[test]
+  fn multiline_preserves_continuation() {
+    clear_state();
+    // A function definition spanning lines should still work
+    assert_eq!(interpret("f[x_] :=\n  x + 1\nf[5]").unwrap(), "6");
+  }
+
+  // Newlines inside function-call brackets are ignored by the parser, so
+  // `Sin[ \n 0 ]` parses as `Sin[0]` regardless of where the newlines are.
+  #[test]
+  fn function_call_leading_newline() {
+    assert_eq!(
+      interpret("Hold[Sin[\n0]] // FullForm").unwrap(),
+      "FullForm[Hold[Sin[0]]]"
+    );
+  }
+
+  #[test]
+  fn function_call_multiple_leading_newlines() {
+    assert_eq!(
+      interpret("Hold[Sin[\n\n0]] // FullForm").unwrap(),
+      "FullForm[Hold[Sin[0]]]"
+    );
+  }
+
+  #[test]
+  fn function_call_trailing_newline() {
+    assert_eq!(
+      interpret("Hold[Sin[0\n]] // FullForm").unwrap(),
+      "FullForm[Hold[Sin[0]]]"
+    );
+  }
+
+  // A CompoundExpression separator followed by a newline-separated tail
+  // parses as `CompoundExpression[a, b]` inside the surrounding call.
+  #[test]
+  fn function_call_compound_expression_across_newlines() {
+    assert_eq!(
+      interpret("Hold[f[a;\nb]] // FullForm").unwrap(),
+      "FullForm[Hold[f[a; b]]]"
+    );
+  }
+
+  // Regression (mathics test_util.py:98): a trailing `;` inside a
+  // function-call's CompoundExpression introduces a final `Null`.
+  #[test]
+  fn function_call_compound_expression_trailing_semicolon() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[f[a;\nb;\nc;]]]]").unwrap(),
+      "Hold[f[CompoundExpression[a, b, c, Null]]]"
+    );
+  }
+
+  // Regression (mathics test_util.py:99): same as above with an extra
+  // trailing newline before the closing bracket.
+  #[test]
+  fn function_call_compound_expression_trailing_semicolon_newline() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[f[a;\nb;\nc;\n]]]]").unwrap(),
+      "Hold[f[CompoundExpression[a, b, c, Null]]]"
+    );
+  }
+}
+
+mod full_form {
+  use super::*;
+
+  #[test]
+  fn full_form_plus() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around `Plus`
+    // expressions; the bare head form is reachable via `ToString[…]`.
+    assert_eq!(
+      interpret("FullForm[x + y + z]").unwrap(),
+      "FullForm[x + y + z]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[x + y + z]]").unwrap(),
+      "Plus[x, y, z]"
+    );
+  }
+
+  #[test]
+  fn full_form_times() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around `Times`
+    // expressions; the bare head form is reachable via `ToString[…]`.
+    assert_eq!(interpret("FullForm[x y z]").unwrap(), "FullForm[x*y*z]");
+    assert_eq!(
+      interpret("ToString[FullForm[x y z]]").unwrap(),
+      "Times[x, y, z]"
+    );
+  }
+
+  #[test]
+  fn full_form_times_with_number() {
+    // Regression test for https://github.com/ad-si/Woxi/issues/71
+    assert_eq!(interpret("FullForm[5*x]").unwrap(), "FullForm[5*x]");
+    assert_eq!(interpret("ToString[FullForm[5*x]]").unwrap(), "Times[5, x]");
+  }
+
+  // Regression (mathics test_basic.py:309): a machine-precision
+  // complex number, even when both components are zero, renders as
+  // `Complex[0.\`, 0.\`]` in FullForm (matches wolframscript).
+  #[test]
+  fn full_form_zero_complex_machine() {
+    assert_eq!(
+      interpret("ToString[FullForm[0. + 0. I]]").unwrap(),
+      "Complex[0.`, 0.`]"
+    );
+  }
+
+  #[test]
+  fn full_form_nonzero_complex_machine() {
+    assert_eq!(
+      interpret("ToString[FullForm[1.0 + 2.0 I]]").unwrap(),
+      "Complex[1.`, 2.`]"
+    );
+  }
+
+  // A pure machine Real keeps its bare `1.\`` form (no Complex wrap).
+  #[test]
+  fn full_form_pure_real_keeps_real_form() {
+    assert_eq!(interpret("ToString[FullForm[1.0]]").unwrap(), "1.`");
+  }
+
+  // Exact-rational complex still routes through the integer
+  // `try_extract_complex_exact` path.
+  #[test]
+  fn full_form_exact_complex_unchanged() {
+    assert_eq!(
+      interpret("ToString[FullForm[1 + 2 I]]").unwrap(),
+      "Complex[1, 2]"
+    );
+  }
+
+  // Regression (mathics test_basic.py:313): a machine-precision
+  // complex number with zero imaginary part renders in OutputForm as
+  // `1. + 0. I` (space-separated, no `*`).
+  #[test]
+  fn output_form_one_plus_zero_i() {
+    assert_eq!(
+      interpret("ToString[1. + 0. I, OutputForm]").unwrap(),
+      "1. + 0. I"
+    );
+  }
+
+  // Regression (mathics test_basic.py:314): a machine-precision
+  // complex number with zero *real* part keeps the leading `0. +` in
+  // OutputForm (so the result is `0. + 1. I`, not the bare `1. I`).
+  #[test]
+  fn output_form_zero_plus_one_i() {
+    assert_eq!(
+      interpret("ToString[0. + 1. I, OutputForm]").unwrap(),
+      "0. + 1. I"
+    );
+  }
+
+  #[test]
+  fn output_form_two_plus_three_i() {
+    assert_eq!(
+      interpret("ToString[2. + 3. I, OutputForm]").unwrap(),
+      "2. + 3. I"
+    );
+  }
+
+  #[test]
+  fn full_form_list() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around lists
+    // and shows them with `{…}` braces; the bare `List[…]` head form is
+    // reachable via `ToString[…]`.
+    assert_eq!(
+      interpret("FullForm[{1, 2, 3}]").unwrap(),
+      "FullForm[{1, 2, 3}]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[{1, 2, 3}]]").unwrap(),
+      "List[1, 2, 3]"
+    );
+  }
+
+  #[test]
+  fn full_form_power() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around `Power`
+    // expressions; the bare head form is reachable via `ToString[…]`.
+    assert_eq!(interpret("FullForm[x^2]").unwrap(), "FullForm[x^2]");
+    assert_eq!(interpret("ToString[FullForm[x^2]]").unwrap(), "Power[x, 2]");
+  }
+
+  #[test]
+  fn full_form_complex() {
+    assert_eq!(interpret("FullForm[a b + c]").unwrap(), "FullForm[a*b + c]");
+    assert_eq!(
+      interpret("ToString[FullForm[a b + c]]").unwrap(),
+      "Plus[Times[a, b], c]"
+    );
+  }
+
+  #[test]
+  fn full_form_complex_number() {
+    assert_eq!(interpret("FullForm[2 + 3*I]").unwrap(), "FullForm[2 + 3*I]");
+    assert_eq!(
+      interpret("ToString[FullForm[2 + 3*I]]").unwrap(),
+      "Complex[2, 3]"
+    );
+  }
+
+  #[test]
+  fn full_form_imaginary_unit() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around atomic
+    // arguments and shows the inner symbol in InputForm. The raw
+    // `Complex[0, 1]` representation is reachable via `ToString[…]`.
+    assert_eq!(interpret("FullForm[I]").unwrap(), "FullForm[I]");
+    assert_eq!(interpret("ToString[FullForm[I]]").unwrap(), "Complex[0, 1]");
+  }
+
+  #[test]
+  fn full_form_complex_rational() {
+    assert_eq!(
+      interpret("FullForm[1/2 + 3/4*I]").unwrap(),
+      "FullForm[1/2 + (3*I)/4]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[1/2 + 3/4*I]]").unwrap(),
+      "Complex[Rational[1, 2], Rational[3, 4]]"
+    );
+  }
+
+  #[test]
+  fn full_form_division() {
+    assert_eq!(interpret("FullForm[a/b]").unwrap(), "FullForm[a/b]");
+    assert_eq!(
+      interpret("ToString[FullForm[a/b]]").unwrap(),
+      "Times[a, Power[b, -1]]"
+    );
+  }
+
+  #[test]
+  fn full_form_reciprocal() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around `1/z`
+    // (canonicalized to `Power[z, -1]`); use `ToString[…]` for the bare
+    // head form.
+    assert_eq!(interpret("FullForm[1/z]").unwrap(), "FullForm[z^(-1)]");
+    assert_eq!(
+      interpret("ToString[FullForm[1/z]]").unwrap(),
+      "Power[z, -1]"
+    );
+  }
+
+  /// Division is canonicalized to Times[a, Power[b, -1]]
+  #[test]
+  fn full_form_division_canonical() {
+    assert_eq!(interpret("FullForm[x/y]").unwrap(), "FullForm[x/y]");
+    assert_eq!(
+      interpret("ToString[FullForm[x/y]]").unwrap(),
+      "Times[x, Power[y, -1]]"
+    );
+  }
+
+  #[test]
+  fn full_form_sqrt() {
+    // wolframscript's REPL keeps the `FullForm[…]` wrapper around `Sqrt[…]`
+    // (which is `Power[…, 1/2]`); the bare head form is reachable via
+    // `ToString[…]`.
+    assert_eq!(interpret("FullForm[Sqrt[5]]").unwrap(), "FullForm[Sqrt[5]]");
+    assert_eq!(
+      interpret("ToString[FullForm[Sqrt[5]]]").unwrap(),
+      "Power[5, Rational[1, 2]]"
+    );
+  }
+
+  #[test]
+  fn full_form_complex_expression() {
+    // x/Sqrt[5] canonicalizes to Times[Power[5, Rational[-1, 2]], x]
+    assert_eq!(
+      interpret("FullForm[x/Sqrt[5] + y^2 + 1/z]").unwrap(),
+      "FullForm[x/Sqrt[5] + y^2 + z^(-1)]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[x/Sqrt[5] + y^2 + 1/z]]").unwrap(),
+      "Plus[Times[Power[5, Rational[-1, 2]], x], Power[y, 2], Power[z, -1]]"
+    );
+  }
+
+  // Issue #97: Sqrt[x] should canonicalize to Power[x, Rational[1, 2]]
+  #[test]
+  fn head_of_sqrt() {
+    assert_eq!(interpret("Head[Sqrt[x]]").unwrap(), "Power");
+  }
+
+  #[test]
+  fn sqrt_identical_to_power_half() {
+    assert_eq!(interpret("Sqrt[x] === Power[x, 1/2]").unwrap(), "True");
+  }
+
+  #[test]
+  fn sqrt_parts() {
+    assert_eq!(
+      interpret("{Sqrt[x][[0]], Sqrt[x][[1]], Sqrt[x][[2]]}").unwrap(),
+      "{Power, x, 1/2}"
+    );
+  }
+
+  #[test]
+  fn sqrt_of_triply_nested_reciprocal() {
+    assert_eq!(
+      interpret("Sqrt[1/(1+1/(1+1/a))]").unwrap(),
+      "Sqrt[(1 + (1 + a^(-1))^(-1))^(-1)]"
+    );
+  }
+
+  // Log[b, x] should canonicalize to Log[x]/Log[b]
+  #[test]
+  fn head_of_log_two_arg() {
+    assert_eq!(interpret("Head[Log[2, x]]").unwrap(), "Times");
+  }
+
+  #[test]
+  fn log_two_arg_identical_to_quotient() {
+    assert_eq!(interpret("Log[2, x] === Log[x]/Log[2]").unwrap(), "True");
+  }
+
+  // CubeRoot[x] should canonicalize to Surd[x, 3]
+  #[test]
+  fn head_of_cube_root() {
+    assert_eq!(interpret("Head[CubeRoot[x]]").unwrap(), "Surd");
+  }
+
+  #[test]
+  fn cube_root_identical_to_surd() {
+    assert_eq!(interpret("CubeRoot[x] === Surd[x, 3]").unwrap(), "True");
+  }
+
+  #[test]
+  fn full_form_no_canonicalization_regression() {
+    // Regression test for issue #91: FullForm must not canonicalize Divide.
+    // Pasting the canonical full-form text (via `ToString[…]`) back should
+    // give the same behavior as the original. wolframscript's REPL keeps
+    // the `FullForm[…]` wrapper, so we read the bare full-form via
+    // `ToString[…]` and re-evaluate that.
+    let full_form =
+      interpret("ToString[FullForm[1/((1 + x) (5 + x))]]").unwrap();
+    let apart_original = interpret("Apart[1/((1 + x) (5 + x))]").unwrap();
+    let apart_from_full_form =
+      interpret(&format!("Apart[{full_form}]")).unwrap();
+    assert_eq!(
+      apart_original, apart_from_full_form,
+      "Apart of FullForm output should match Apart of original"
+    );
+  }
+
+  #[test]
+  fn full_form_no_svg_output() {
+    // Regression: FullForm results must be plain text (no SVG) in the playground
+    use woxi::interpret_with_stdout;
+    let result = interpret_with_stdout("FullForm[1/z]").unwrap();
+    assert!(
+      result.output_svg.is_none(),
+      "FullForm should not produce SVG output"
+    );
+    assert_eq!(result.result, "FullForm[z^(-1)]");
+  }
+}
+
+mod tree_form {
+  use super::*;
+
+  #[test]
+  fn tree_form_simple() {
+    // TreeForm stays as wrapper in OutputForm (matching wolframscript)
+    assert_eq!(interpret("TreeForm[f[x, y]]").unwrap(), "TreeForm[f[x, y]]");
+  }
+
+  #[test]
+  fn tree_form_expression() {
+    assert_eq!(
+      interpret("TreeForm[a + b^2 + c^3 + d]").unwrap(),
+      "TreeForm[a + b^2 + c^3 + d]"
+    );
+  }
+
+  #[test]
+  fn tree_form_evaluates_argument() {
+    // 1 + 2 evaluates to 3, then wrapped
+    assert_eq!(interpret("TreeForm[1 + 2]").unwrap(), "TreeForm[3]");
+  }
+
+  #[test]
+  fn tree_form_with_depth() {
+    assert_eq!(interpret("TreeForm[f[x], 2]").unwrap(), "TreeForm[f[x], 2]");
+  }
+
+  #[test]
+  fn tree_form_no_args() {
+    assert_eq!(interpret("TreeForm[]").unwrap(), "TreeForm[]");
+  }
+
+  #[test]
+  fn tree_form_head() {
+    assert_eq!(interpret("Head[TreeForm[f[x]]]").unwrap(), "TreeForm");
+  }
+
+  #[test]
+  fn tree_form_in_list() {
+    assert_eq!(
+      interpret("{TreeForm[f[x]], TreeForm[g[y]]}").unwrap(),
+      "{TreeForm[f[x]], TreeForm[g[y]]}"
+    );
+  }
+}
+
+mod digit_block {
+  use super::*;
+
+  #[test]
+  fn digit_block_standalone() {
+    assert_eq!(interpret("DigitBlock").unwrap(), "DigitBlock");
+  }
+
+  #[test]
+  fn digit_block_head() {
+    assert_eq!(interpret("Head[DigitBlock]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn digit_block_as_option() {
+    assert_eq!(
+      interpret("NumberForm[123, DigitBlock -> 3]").unwrap(),
+      "NumberForm[123, DigitBlock -> 3]"
+    );
+  }
+}
+
+mod cubics {
+  use super::*;
+
+  #[test]
+  fn cubics_standalone() {
+    assert_eq!(interpret("Cubics").unwrap(), "Cubics");
+  }
+
+  #[test]
+  fn cubics_head() {
+    assert_eq!(interpret("Head[Cubics]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn cubics_as_option() {
+    // Cubics used as an option value in a rule
+    assert_eq!(interpret("Cubics -> True").unwrap(), "Cubics -> True");
+  }
+}
+
+mod page_width {
+  use super::*;
+
+  #[test]
+  fn page_width_standalone() {
+    assert_eq!(interpret("PageWidth").unwrap(), "PageWidth");
+  }
+
+  #[test]
+  fn page_width_head() {
+    assert_eq!(interpret("Head[PageWidth]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn page_width_as_option() {
+    assert_eq!(interpret("PageWidth -> 80").unwrap(), "PageWidth -> 80");
+  }
+}
+
+mod constant {
+  use super::*;
+
+  #[test]
+  fn constant_standalone() {
+    assert_eq!(interpret("Constant").unwrap(), "Constant");
+  }
+
+  #[test]
+  fn constant_head() {
+    assert_eq!(interpret("Head[Constant]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn constant_as_attribute() {
+    // Pi has the Constant attribute
+    assert_eq!(
+      interpret("MemberQ[Attributes[Pi], Constant]").unwrap(),
+      "True"
+    );
+  }
+}
+
+mod catalan_constant {
+  use super::*;
+
+  #[test]
+  fn catalan_standalone() {
+    assert_eq!(interpret("Catalan").unwrap(), "Catalan");
+  }
+
+  #[test]
+  fn catalan_numeric() {
+    let result: f64 = interpret("N[Catalan]").unwrap().parse().unwrap();
+    assert!((result - 0.915965594177219).abs() < 1e-10);
+  }
+
+  #[test]
+  fn catalan_head() {
+    assert_eq!(interpret("Head[Catalan]").unwrap(), "Symbol");
+  }
+}
+
+mod construct {
+  use super::*;
+
+  #[test]
+  fn construct_basic() {
+    assert_eq!(interpret("Construct[f, a, b, c]").unwrap(), "f[a, b, c]");
+  }
+
+  #[test]
+  fn construct_single_arg() {
+    assert_eq!(interpret("Construct[f, a]").unwrap(), "f[a]");
+  }
+
+  #[test]
+  fn construct_with_fold() {
+    assert_eq!(
+      interpret("Fold[Construct, f, {a, b, c}]").unwrap(),
+      "f[a][b][c]"
+    );
+  }
+}
+
+mod rule_display {
+  use super::*;
+
+  #[test]
+  fn rule_display() {
+    assert_eq!(interpret("Rule[a, b]").unwrap(), "a -> b");
+  }
+
+  #[test]
+  fn rule_arrow_syntax() {
+    assert_eq!(interpret("a -> b").unwrap(), "a -> b");
+  }
+
+  #[test]
+  fn rule_evaluates_arguments() {
+    assert_eq!(interpret("Rule[1 + 2, 3 + 4]").unwrap(), "3 -> 7");
+  }
+
+  #[test]
+  fn rule_head() {
+    assert_eq!(interpret("Head[Rule[x, y]]").unwrap(), "Rule");
+    assert_eq!(interpret("Head[x -> y]").unwrap(), "Rule");
+  }
+
+  #[test]
+  fn rule_function_form_equals_arrow() {
+    assert_eq!(interpret("Rule[a, b] === (a -> b)").unwrap(), "True");
+  }
+
+  // `->` is right-associative: a -> b -> c parses as a -> (b -> c).
+  #[test]
+  fn rule_right_associative() {
+    assert_eq!(
+      interpret("ToString[FullForm[a -> b -> c]]").unwrap(),
+      "Rule[a, Rule[b, c]]"
+    );
+    assert_eq!(interpret("a -> b -> c").unwrap(), "a -> b -> c");
+  }
+
+  // A rule whose LHS is itself a rule keeps its parentheses on display.
+  #[test]
+  fn rule_lhs_rule_parenthesized() {
+    assert_eq!(
+      interpret("ToString[FullForm[(a -> b) -> c]]").unwrap(),
+      "Rule[Rule[a, b], c]"
+    );
+    assert_eq!(interpret("(a -> b) -> c").unwrap(), "(a -> b) -> c");
+    assert_eq!(interpret("(a :> b) -> c").unwrap(), "(a :> b) -> c");
+  }
+
+  // A pure function on the LHS of a rule is parenthesized (`&` binds looser
+  // than `->`), matching wolframscript.
+  #[test]
+  fn rule_lhs_pure_function_parenthesized() {
+    assert_eq!(interpret("(#^2 &) -> x").unwrap(), "(#1^2 & ) -> x");
+    assert_eq!(interpret("Rule[# &, x]").unwrap(), "(#1 & ) -> x");
+    assert_eq!(interpret("(# &) :> 5").unwrap(), "(#1 & ) :> 5");
+    // RHS pure function is also parenthesized (unchanged).
+    assert_eq!(interpret("x -> (#^2 &)").unwrap(), "x -> (#1^2 & )");
+  }
+
+  // The same parenthesization applies to rule-valued association keys.
+  #[test]
+  fn rule_keyed_association_parenthesized() {
+    assert_eq!(interpret("<|(a -> b) -> 1|>").unwrap(), "<|(a -> b) -> 1|>");
+    assert_eq!(
+      interpret("Normal[<|(a -> b) -> 1|>]").unwrap(),
+      "{(a -> b) -> 1}"
+    );
+  }
+
+  #[test]
+  fn rule_function_call_in_replace_all() {
+    assert_eq!(interpret("f[a, b] /. Rule[a, 1]").unwrap(), "f[1, b]");
+  }
+
+  // Same CompoundExpression-precedence guard as RuleDelayed (see
+  // `rule_delayed_compound_expression_rhs_keeps_parens`), checked through
+  // `Hold` since a bare `->` evaluates its RHS immediately and would
+  // collapse `(a = 1; b = 2)` to `2` before there was anything to print.
+  #[test]
+  fn rule_compound_expression_rhs_keeps_parens() {
+    assert_eq!(
+      interpret("ToString[Hold[x -> (a = 1; b = 2)], InputForm]").unwrap(),
+      "Hold[x -> (a = 1; b = 2)]"
+    );
+    assert_eq!(
+      interpret(
+        "Clear[a, b]; \
+         printed = ToString[Hold[x -> (a = 1; b = 2)], InputForm]; \
+         held = ToExpression[printed]; \
+         held[[1, 2]]; \
+         {a, b}"
+      )
+      .unwrap(),
+      "{1, 2}"
+    );
+  }
+
+  #[test]
+  fn replace_all_function_form_reevaluates_result() {
+    // ReplaceAll[...] (function-call form) should re-evaluate the result
+    // after substitution so e.g. 1 + 2 becomes 3. Regression: previously
+    // only the /. operator did this, while the function form returned
+    // "{2, 1 + 2, 2 + 2}" unchanged.
+    assert_eq!(
+      interpret("ReplaceAll[{x, x + 1, x + 2}, x -> 2]").unwrap(),
+      "{2, 3, 4}"
+    );
+  }
+
+  #[test]
+  fn rule_sequence_hold() {
+    // Rule has SequenceHold: Sequence should not be spliced
+    assert_eq!(
+      interpret("Rule[Sequence[a, b], c]").unwrap(),
+      "Sequence[a, b] -> c"
+    );
+  }
+
+  #[test]
+  fn rule_in_list() {
+    assert_eq!(interpret("{a -> 1, b -> 2}").unwrap(), "{a -> 1, b -> 2}");
+  }
+
+  #[test]
+  fn rule_replace_all_with_list() {
+    assert_eq!(interpret("f[x, y] /. {x -> 1, y -> 2}").unwrap(), "f[1, 2]");
+  }
+
+  #[test]
+  fn replace_all_head_list_to_sequence() {
+    // List -> Sequence should flatten nested lists into function args
+    assert_eq!(
+      interpret("f[{{a, b}, {c, d}, {a}}] /. List -> Sequence").unwrap(),
+      "f[a, b, c, d, a]"
+    );
+  }
+
+  #[test]
+  fn replace_all_head_list_to_function() {
+    // List -> f should turn {a, b} into f[a, b]
+    assert_eq!(interpret("{a, b} /. List -> g").unwrap(), "g[a, b]");
+  }
+
+  #[test]
+  fn replace_all_head_list_to_plus() {
+    // List -> Plus should sum the elements
+    assert_eq!(interpret("{1, 2, 3} /. List -> Plus").unwrap(), "6");
+  }
+
+  #[test]
+  fn replace_all_head_function_call() {
+    // f -> g should replace function head
+    assert_eq!(interpret("f[a, b] /. f -> g").unwrap(), "g[a, b]");
+  }
+
+  #[test]
+  fn replace_all_list_as_argument() {
+    // List as a symbol argument should be replaced
+    assert_eq!(interpret("g[List, a] /. List -> f").unwrap(), "g[f, a]");
+  }
+
+  #[test]
+  fn replace_all_multi_rule_with_head() {
+    // Multi-rule should replace both args and head
+    assert_eq!(
+      interpret("{a, b} /. {a -> 1, List -> f}").unwrap(),
+      "f[1, b]"
+    );
+    assert_eq!(interpret("f[a] /. {a -> 1, f -> g}").unwrap(), "g[1]");
+  }
+
+  #[test]
+  fn replace_all_nested_list_to_sequence() {
+    // Nested lists should all be replaced
+    assert_eq!(
+      interpret("f[{a, b}] /. List -> Sequence").unwrap(),
+      "f[a, b]"
+    );
+  }
+
+  #[test]
+  fn rule_with_patterns() {
+    assert_eq!(
+      interpret("{1, 2, 3} /. x_Integer -> x^2").unwrap(),
+      "{1, 4, 9}"
+    );
+  }
+
+  #[test]
+  fn blank_type_replace_list() {
+    // Multiple typed-Blank rules applied to a list with mixed types.
+    // Matches wolframscript.
+    assert_eq!(
+      interpret(r#"{42, 1.0, x} /. {_Integer -> "integer", _Real -> "real"} // InputForm"#)
+        .unwrap(),
+      "InputForm[{integer, real, x}]"
+    );
+  }
+
+  #[test]
+  fn rule_map() {
+    assert_eq!(
+      interpret("Map[Rule[#, #^2] &, {1, 2, 3}]").unwrap(),
+      "{1 -> 1, 2 -> 4, 3 -> 9}"
+    );
+  }
+
+  #[test]
+  fn rule_attributes() {
+    assert_eq!(
+      interpret("Attributes[Rule]").unwrap(),
+      "{Protected, SequenceHold}"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_display() {
+    assert_eq!(interpret("RuleDelayed[a, b]").unwrap(), "a :> b");
+  }
+
+  // Regression test for https://github.com/ad-si/Woxi/issues/96
+  // Pattern variable names must not leak across bindings in rules.
+  #[test]
+  fn rule_pattern_variable_no_leak() {
+    assert_eq!(
+      interpret("f[a + 1, b + 2] /. f[u_, a_] -> {u, a}").unwrap(),
+      "{1 + a, 2 + b}"
+    );
+  }
+
+  #[test]
+  fn rule_pattern_variable_no_leak_single_rule() {
+    assert_eq!(interpret("{a + 1} /. {a_} -> a^2").unwrap(), "(1 + a)^2");
+  }
+}
+
+mod blank_function {
+  use super::*;
+
+  #[test]
+  fn blank_no_args_displays_as_underscore() {
+    assert_eq!(interpret("Blank[]").unwrap(), "_");
+  }
+
+  #[test]
+  fn blank_with_head_displays_as_underscore_head() {
+    assert_eq!(interpret("Blank[Integer]").unwrap(), "_Integer");
+    assert_eq!(interpret("Blank[String]").unwrap(), "_String");
+    assert_eq!(interpret("Blank[List]").unwrap(), "_List");
+    assert_eq!(interpret("Blank[Symbol]").unwrap(), "_Symbol");
+  }
+
+  #[test]
+  fn blank_head_is_blank() {
+    assert_eq!(interpret("Head[Blank[]]").unwrap(), "Blank");
+    assert_eq!(interpret("Head[Blank[Integer]]").unwrap(), "Blank");
+  }
+
+  #[test]
+  fn blank_matchq_any() {
+    assert_eq!(interpret("MatchQ[42, Blank[]]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[\"hello\", Blank[]]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[{1, 2}, Blank[]]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[f[x], Blank[]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn blank_matchq_with_head() {
+    assert_eq!(interpret("MatchQ[42, Blank[Integer]]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[42, Blank[String]]").unwrap(), "False");
+    assert_eq!(
+      interpret("MatchQ[\"hello\", Blank[String]]").unwrap(),
+      "True"
+    );
+    assert_eq!(interpret("MatchQ[symbol, Blank[Symbol]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn blank_in_cases() {
+    assert_eq!(
+      interpret("Cases[{1, \"a\", 2, \"b\"}, Blank[Integer]]").unwrap(),
+      "{1, 2}"
+    );
+    assert_eq!(
+      interpret("Cases[{1, \"a\", 2, \"b\"}, Blank[String]]").unwrap(),
+      "{a, b}"
+    );
+  }
+
+  #[test]
+  fn blank_in_replace_all() {
+    assert_eq!(
+      interpret("{1, x, 2.5, \"hello\"} /. Blank[Integer] -> 0").unwrap(),
+      "{0, x, 2.5, hello}"
+    );
+  }
+}
+
+mod pattern_function {
+  use super::*;
+
+  #[test]
+  fn pattern_blank_displays_as_name_underscore() {
+    assert_eq!(interpret("Pattern[x, Blank[]]").unwrap(), "x_");
+  }
+
+  #[test]
+  fn pattern_blank_head_displays_as_name_underscore_head() {
+    assert_eq!(
+      interpret("Pattern[x, Blank[Integer]]").unwrap(),
+      "x_Integer"
+    );
+    assert_eq!(interpret("Pattern[y, Blank[String]]").unwrap(), "y_String");
+  }
+
+  #[test]
+  fn pattern_head_is_pattern() {
+    assert_eq!(interpret("Head[Pattern[x, Blank[]]]").unwrap(), "Pattern");
+  }
+
+  #[test]
+  fn pattern_matchq() {
+    assert_eq!(
+      interpret("MatchQ[42, Pattern[x, Blank[Integer]]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("MatchQ[\"hi\", Pattern[x, Blank[Integer]]]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn pattern_equals_shorthand() {
+    assert_eq!(interpret("Pattern[x, Blank[]] === x_").unwrap(), "True");
+  }
+
+  #[test]
+  fn pattern_in_replace_all() {
+    assert_eq!(
+      interpret("f[a, b] /. Pattern[x, Blank[]] -> x^2").unwrap(),
+      "f[a, b]^2"
+    );
+  }
+
+  #[test]
+  fn pattern_variable_binding_consistency() {
+    // Same named pattern variable must bind to the same value
+    // f[x_, x_] should match f[a, a] but not f[a, b]
+    assert_eq!(interpret("f[a, a] /. f[x_, x_] -> yes").unwrap(), "yes");
+    assert_eq!(interpret("f[a, b] /. f[x_, x_] -> yes").unwrap(), "f[a, b]");
+  }
+
+  #[test]
+  fn pattern_variable_no_match_sqrt_vs_symbol() {
+    // Regression test for issue #65:
+    // x_ bound to Symbol x should not match Sqrt[x]
+    assert_eq!(
+      interpret(
+        "Int[1/(x_*(a_+b_.*x_)),x_Symbol] := \
+         -Log[(a+b*x)/x]/a /; FreeQ[{a,b},x]; \
+         Int[1/(Sqrt[x]*(a + b*x)), x]"
+      )
+      .unwrap(),
+      "Int[1/(Sqrt[x]*(a + b*x)), x]"
+    );
+    // But it should still match when x_ consistently binds to x
+    assert_eq!(
+      interpret(
+        "Int[1/(x_*(a_+b_.*x_)),x_Symbol] := \
+         -Log[(a+b*x)/x]/a /; FreeQ[{a,b},x]; \
+         Int[1/(x*(a + b*x)), x]"
+      )
+      .unwrap(),
+      "-(Log[(a + b*x)/x]/a)"
+    );
+  }
+}
+
+mod none_symbol {
+  use super::*;
+
+  #[test]
+  fn none_evaluates_to_itself() {
+    assert_eq!(interpret("None").unwrap(), "None");
+  }
+
+  #[test]
+  fn none_head_is_symbol() {
+    assert_eq!(interpret("Head[None]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn none_is_protected() {
+    assert_eq!(interpret("Attributes[None]").unwrap(), "{Protected}");
+  }
+}
+
+mod rule_delayed {
+  use super::*;
+
+  #[test]
+  fn rule_delayed_display() {
+    assert_eq!(interpret("x :> x^2").unwrap(), "x :> x^2");
+  }
+
+  #[test]
+  fn rule_delayed_function_call_form() {
+    assert_eq!(interpret("RuleDelayed[x, x^2]").unwrap(), "x :> x^2");
+  }
+
+  #[test]
+  fn rule_delayed_head() {
+    assert_eq!(interpret("Head[x :> x^2]").unwrap(), "RuleDelayed");
+    assert_eq!(
+      interpret("Head[RuleDelayed[x, x^2]]").unwrap(),
+      "RuleDelayed"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_attributes() {
+    assert_eq!(
+      interpret("Attributes[RuleDelayed]").unwrap(),
+      "{HoldRest, Protected, SequenceHold}"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_with_replace_all() {
+    assert_eq!(
+      interpret("{1, 2, 3} /. x_Integer :> x^2").unwrap(),
+      "{1, 4, 9}"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_function_call_with_replace_all() {
+    assert_eq!(
+      interpret("{1, 2, 3} /. RuleDelayed[x_Integer, x^2]").unwrap(),
+      "{1, 4, 9}"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_holds_rhs() {
+    // RuleDelayed should not evaluate the RHS prematurely
+    assert_eq!(interpret("RuleDelayed[x, 1 + 1]").unwrap(), "x :> 1 + 1");
+  }
+
+  // CompoundExpression has the lowest precedence of any operator, so a
+  // `;`-sequence on the right of `:>` needs explicit parentheses to stay one
+  // replacement: `cond :> a = 1; b = 2` is `(cond :> a = 1); b = 2` without
+  // them. Regression for a Wolfram Demonstrations idiom — an EventHandler
+  // action with more than one statement, `"event" :> (a = 1; b = 2)` — whose
+  // printed InputForm silently dropped the parens and lost every statement
+  // after the first once re-parsed.
+  #[test]
+  fn rule_delayed_compound_expression_rhs_keeps_parens() {
+    assert_eq!(
+      interpret("x :> (a = 1; b = 2)").unwrap(),
+      "x :> (a = 1; b = 2)"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_compound_expression_rhs_round_trips_through_input_form() {
+    // Print the rule, re-parse the text, then run the replacement pulled
+    // back out with Part -- both statements must still fire.
+    assert_eq!(
+      interpret(
+        "Clear[a, b]; \
+         printed = ToString[Hold[x :> (a = 1; b = 2)], InputForm]; \
+         held = ToExpression[printed]; \
+         held[[1, 2]]; \
+         {a, b}"
+      )
+      .unwrap(),
+      "{1, 2}"
+    );
+  }
+}
+
+mod false_symbol {
+  use super::*;
+
+  #[test]
+  fn false_evaluates_to_itself() {
+    assert_eq!(interpret("False").unwrap(), "False");
+  }
+
+  #[test]
+  fn false_head_is_symbol() {
+    assert_eq!(interpret("Head[False]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn false_is_protected() {
+    assert_eq!(
+      interpret("Attributes[False]").unwrap(),
+      "{Locked, Protected}"
+    );
+  }
+
+  #[test]
+  fn not_false_is_true() {
+    assert_eq!(interpret("Not[False]").unwrap(), "True");
+  }
+
+  #[test]
+  fn not_prefix_after_and_operator() {
+    // !q must parse correctly after &&
+    assert_eq!(interpret("True && !False").unwrap(), "True");
+  }
+
+  #[test]
+  fn not_prefix_after_or_operator() {
+    // !q must parse correctly after ||
+    assert_eq!(interpret("False || !False").unwrap(), "True");
+  }
+
+  #[test]
+  fn not_prefix_symbolic_after_and() {
+    assert_eq!(interpret("p && !q").unwrap(), "p &&  !q");
+  }
+
+  #[test]
+  fn boolean_minimize_with_not_prefix() {
+    // p && q || p && !q simplifies to p
+    assert_eq!(
+      interpret("BooleanMinimize[p && q || p && !q]").unwrap(),
+      "p"
+    );
+  }
+
+  #[test]
+  fn false_in_list() {
+    assert_eq!(
+      interpret("{False, True, False}").unwrap(),
+      "{False, True, False}"
+    );
+  }
+}
+
+mod plot_range_symbol {
+  use super::*;
+
+  #[test]
+  fn plot_range_evaluates_to_itself() {
+    assert_eq!(interpret("PlotRange").unwrap(), "PlotRange");
+  }
+
+  #[test]
+  fn plot_range_head_is_symbol() {
+    assert_eq!(interpret("Head[PlotRange]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn plot_range_attributes() {
+    assert_eq!(
+      interpret("Attributes[PlotRange]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+}
+
+mod all_symbol {
+  use super::*;
+
+  #[test]
+  fn all_evaluates_to_itself() {
+    assert_eq!(interpret("All").unwrap(), "All");
+  }
+
+  #[test]
+  fn all_head_is_symbol() {
+    assert_eq!(interpret("Head[All]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn all_is_protected() {
+    assert_eq!(interpret("Attributes[All]").unwrap(), "{Protected}");
+  }
+}
+
+mod plot_style_symbol {
+  use super::*;
+
+  #[test]
+  fn plot_style_evaluates_to_itself() {
+    assert_eq!(interpret("PlotStyle").unwrap(), "PlotStyle");
+  }
+
+  #[test]
+  fn plot_style_head_is_symbol() {
+    assert_eq!(interpret("Head[PlotStyle]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn plot_style_is_protected() {
+    assert_eq!(interpret("Attributes[PlotStyle]").unwrap(), "{Protected}");
+  }
+}
+
+mod condition_function {
+  use super::*;
+
+  #[test]
+  fn condition_display() {
+    assert_eq!(interpret("Condition[x_, x > 0]").unwrap(), "x_ /; x > 0");
+  }
+
+  #[test]
+  fn condition_head() {
+    assert_eq!(
+      interpret("Head[Condition[x_, x > 0]]").unwrap(),
+      "Condition"
+    );
+  }
+
+  #[test]
+  fn condition_attributes() {
+    assert_eq!(
+      interpret("Attributes[Condition]").unwrap(),
+      "{HoldAll, Protected}"
+    );
+  }
+
+  #[test]
+  fn condition_holds_args() {
+    // Condition should not evaluate its arguments
+    assert_eq!(
+      interpret("Condition[x_, 1 + 1 == 2]").unwrap(),
+      "x_ /; 1 + 1 == 2"
+    );
+  }
+}
+
+mod condition_pattern_matching {
+  use super::*;
+
+  #[test]
+  fn matchq_with_condition_true() {
+    assert_eq!(interpret("MatchQ[4, x_ /; x > 3]").unwrap(), "True");
+  }
+
+  #[test]
+  fn setdelayed_with_condition_applies_when_true() {
+    // f[x_] := p[x] /; x>0 — conditional definition applies for positive x.
+    clear_state();
+    assert_eq!(interpret("f[x_] := p[x] /; x>0; f[3]").unwrap(), "p[3]");
+  }
+
+  #[test]
+  fn matchq_with_condition_false() {
+    assert_eq!(interpret("MatchQ[2, x_ /; x > 3]").unwrap(), "False");
+  }
+
+  #[test]
+  fn matchq_with_trivial_condition() {
+    assert_eq!(interpret("MatchQ[4, _ /; True]").unwrap(), "True");
+  }
+
+  #[test]
+  fn matchq_with_false_condition() {
+    assert_eq!(interpret("MatchQ[4, _ /; False]").unwrap(), "False");
+  }
+
+  #[test]
+  fn matchq_with_evenq_condition() {
+    assert_eq!(interpret("MatchQ[4, x_ /; EvenQ[x]]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[3, x_ /; EvenQ[x]]").unwrap(), "False");
+  }
+
+  #[test]
+  fn cases_with_condition() {
+    assert_eq!(
+      interpret("Cases[{1, 2, 3, 4, 5}, x_ /; x > 3]").unwrap(),
+      "{4, 5}"
+    );
+  }
+
+  #[test]
+  fn cases_with_condition_and_rule_delayed() {
+    assert_eq!(
+      interpret("Cases[{1, 2, 3, 4, 5}, x_ /; x > 3 :> x^2]").unwrap(),
+      "{16, 25}"
+    );
+  }
+
+  #[test]
+  fn cases_with_condition_evenq_rule() {
+    assert_eq!(
+      interpret("Cases[{1, 2, 3, 4, 5}, x_ /; EvenQ[x] :> x^2]").unwrap(),
+      "{4, 16}"
+    );
+  }
+
+  #[test]
+  fn matchq_blank_sequence_with_condition() {
+    // BlankSequence with Condition: x__ /; test should work with multiple matched elements
+    assert_eq!(
+      interpret("MatchQ[f[1, 2, 3], f[x__Integer /; Total[{x}] > 5]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("MatchQ[f[1, 2, 3], f[x__Integer /; Total[{x}] > 10]]")
+        .unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("MatchQ[f[1, 2, 3], f[x__ /; Length[{x}] > 2]]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("MatchQ[f[1, 2, 3], f[x__ /; Length[{x}] > 5]]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn cases_blank_sequence_with_condition() {
+    assert_eq!(
+      interpret(
+        "Cases[{f[1, 2, 3], f[4, 5, 6]}, f[x__Integer /; Total[{x}] > 10]]"
+      )
+      .unwrap(),
+      "{f[4, 5, 6]}"
+    );
+  }
+
+  #[test]
+  fn replace_all_blank_sequence_with_condition() {
+    assert_eq!(
+      interpret("f[1, 2, 3] /. f[x__Integer /; Total[{x}] > 5] :> Total[{x}]")
+        .unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("f[1, 2, 3] /. f[x__Integer /; Total[{x}] > 10] :> Total[{x}]")
+        .unwrap(),
+      "f[1, 2, 3]"
+    );
+  }
+
+  #[test]
+  fn replace_all_with_condition() {
+    assert_eq!(
+      interpret("{1, 2, 3, 4, 5} /. x_ /; x > 3 :> x^2").unwrap(),
+      "{1, 2, 3, 16, 25}"
+    );
+  }
+
+  #[test]
+  fn replace_all_with_condition_in_list() {
+    assert_eq!(
+      interpret("ReplaceAll[{1, 2, 3, 4, 5}, {x_ /; EvenQ[x] :> x^2}]")
+        .unwrap(),
+      "{1, 4, 3, 16, 5}"
+    );
+  }
+
+  #[test]
+  fn condition_with_head_constraint() {
+    assert_eq!(
+      interpret("MatchQ[42, x_Integer /; x > 10]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("MatchQ[5, x_Integer /; x > 10]").unwrap(),
+      "False"
+    );
+    assert_eq!(
+      interpret("MatchQ[\"hello\", x_Integer /; x > 10]").unwrap(),
+      "False"
+    );
+  }
+}
+
+mod axes_label_symbol {
+  use super::*;
+
+  #[test]
+  fn axes_label_evaluates_to_itself() {
+    assert_eq!(interpret("AxesLabel").unwrap(), "AxesLabel");
+  }
+
+  #[test]
+  fn axes_label_head_is_symbol() {
+    assert_eq!(interpret("Head[AxesLabel]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn axes_label_is_protected() {
+    assert_eq!(interpret("Attributes[AxesLabel]").unwrap(), "{Protected}");
+  }
+}
+
+mod show_function {
+  use super::*;
+
+  #[test]
+  fn show_evaluates_to_itself() {
+    assert_eq!(interpret("Show").unwrap(), "Show");
+  }
+
+  #[test]
+  fn show_head_is_symbol() {
+    assert_eq!(interpret("Head[Show]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn show_attributes() {
+    assert_eq!(
+      interpret("Attributes[Show]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn show_head_with_arg() {
+    assert_eq!(interpret("Head[Show[1]]").unwrap(), "Show");
+  }
+}
+
+mod pattern_test_function {
+  use super::*;
+
+  #[test]
+  fn pattern_test_display_named() {
+    assert_eq!(
+      interpret("PatternTest[x_, IntegerQ]").unwrap(),
+      "(x_)?IntegerQ"
+    );
+  }
+
+  #[test]
+  fn pattern_test_display_blank() {
+    assert_eq!(
+      interpret("PatternTest[Blank[], IntegerQ]").unwrap(),
+      "_?IntegerQ"
+    );
+  }
+
+  #[test]
+  fn pattern_test_head() {
+    assert_eq!(
+      interpret("Head[PatternTest[x_, IntegerQ]]").unwrap(),
+      "PatternTest"
+    );
+  }
+
+  #[test]
+  fn pattern_test_attributes() {
+    assert_eq!(
+      interpret("Attributes[PatternTest]").unwrap(),
+      "{HoldRest, Protected}"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_cases() {
+    assert_eq!(
+      interpret("Cases[{1, 2.5, 3, \"a\"}, _?IntegerQ]").unwrap(),
+      "{1, 3}"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_match_q() {
+    assert_eq!(
+      interpret("MatchQ[3, _Integer?NonNegative]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_no_match_head() {
+    // 3.5 is Real, not Integer — head doesn't match
+    assert_eq!(
+      interpret("MatchQ[3.5, _Integer?NonNegative]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_no_match_test() {
+    // -3 is Integer but not NonNegative — test fails
+    assert_eq!(
+      interpret("MatchQ[-3, _Integer?NonNegative]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_in_function_def() {
+    assert_eq!(
+      interpret("f[n_Integer?NonNegative] := n + 1; f[3]").unwrap(),
+      "4"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_function_no_match() {
+    assert_eq!(
+      interpret("g[n_Integer?NonNegative] := n + 1; g[-1]").unwrap(),
+      "g[-1]"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_display() {
+    // wolframscript wraps the pattern in parens when it carries a name
+    // or head constraint: `(n_Integer)?NonNegative`.
+    assert_eq!(
+      interpret("Hold[n_Integer?NonNegative]").unwrap(),
+      "Hold[(n_Integer)?NonNegative]"
+    );
+  }
+
+  #[test]
+  fn pattern_test_with_head_fullform() {
+    assert_eq!(
+      interpret("FullForm[Hold[_Integer?NonNegative]]").unwrap(),
+      "FullForm[Hold[_Integer?NonNegative]]"
+    );
+  }
+}
+
+mod blank_null_sequence {
+  use super::*;
+
+  #[test]
+  fn blank_null_sequence_display() {
+    assert_eq!(interpret("BlankNullSequence[]").unwrap(), "___");
+  }
+
+  #[test]
+  fn blank_null_sequence_with_head() {
+    assert_eq!(
+      interpret("BlankNullSequence[Integer]").unwrap(),
+      "___Integer"
+    );
+  }
+
+  #[test]
+  fn blank_null_sequence_head() {
+    assert_eq!(
+      interpret("Head[BlankNullSequence[]]").unwrap(),
+      "BlankNullSequence"
+    );
+  }
+
+  #[test]
+  fn blank_null_sequence_is_protected() {
+    assert_eq!(
+      interpret("Attributes[BlankNullSequence]").unwrap(),
+      "{Protected}"
+    );
+  }
+
+  #[test]
+  fn blank_null_sequence_syntax() {
+    assert_eq!(interpret("___").unwrap(), "___");
+  }
+
+  #[test]
+  fn blank_sequence_display() {
+    assert_eq!(interpret("BlankSequence[]").unwrap(), "__");
+  }
+
+  #[test]
+  fn blank_sequence_with_head() {
+    assert_eq!(interpret("BlankSequence[Integer]").unwrap(), "__Integer");
+  }
+
+  #[test]
+  fn blank_sequence_head() {
+    assert_eq!(interpret("Head[BlankSequence[]]").unwrap(), "BlankSequence");
+  }
+
+  #[test]
+  fn blank_sequence_syntax() {
+    assert_eq!(interpret("__").unwrap(), "__");
+  }
+
+  #[test]
+  fn anonymous_blank_with_head_syntax() {
+    assert_eq!(interpret("_Integer").unwrap(), "_Integer");
+    assert_eq!(interpret("__Integer").unwrap(), "__Integer");
+    assert_eq!(interpret("___Integer").unwrap(), "___Integer");
+  }
+
+  #[test]
+  fn head_of_anonymous_blanks() {
+    assert_eq!(interpret("Head[_]").unwrap(), "Blank");
+    assert_eq!(interpret("Head[__]").unwrap(), "BlankSequence");
+    assert_eq!(interpret("Head[___]").unwrap(), "BlankNullSequence");
+  }
+}
+
+mod plot_label_symbol {
+  use super::*;
+
+  #[test]
+  fn plot_label_evaluates_to_itself() {
+    assert_eq!(interpret("PlotLabel").unwrap(), "PlotLabel");
+  }
+
+  #[test]
+  fn plot_label_is_protected() {
+    assert_eq!(interpret("Attributes[PlotLabel]").unwrap(), "{Protected}");
+  }
+}
+
+mod axes_symbol {
+  use super::*;
+
+  #[test]
+  fn axes_evaluates_to_itself() {
+    assert_eq!(interpret("Axes").unwrap(), "Axes");
+  }
+
+  #[test]
+  fn axes_is_protected() {
+    assert_eq!(interpret("Attributes[Axes]").unwrap(), "{Protected}");
+  }
+}
+
+mod aspect_ratio_symbol {
+  use super::*;
+
+  #[test]
+  fn aspect_ratio_evaluates_to_itself() {
+    assert_eq!(interpret("AspectRatio").unwrap(), "AspectRatio");
+  }
+
+  #[test]
+  fn aspect_ratio_is_protected() {
+    assert_eq!(interpret("Attributes[AspectRatio]").unwrap(), "{Protected}");
+  }
+}
+
+mod message_name_function {
+  use super::*;
+
+  #[test]
+  fn message_name_basic() {
+    assert_eq!(
+      interpret("MessageName[f, \"usage\"]").unwrap(),
+      "MessageName[f, usage]"
+    );
+  }
+
+  #[test]
+  fn message_name_head() {
+    assert_eq!(
+      interpret("Head[MessageName[f, \"usage\"]]").unwrap(),
+      "MessageName"
+    );
+  }
+
+  #[test]
+  fn message_name_attributes() {
+    assert_eq!(
+      interpret("Attributes[MessageName]").unwrap(),
+      "{HoldFirst, Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn message_name_double_colon_syntax() {
+    // `a::b` parses as MessageName[a, "b"].
+    assert_eq!(interpret("a::b").unwrap(), "MessageName[a, b]");
+  }
+
+  // `ToString` prints the short `f::usage`, but the bare script-mode echo
+  // keeps the long head form — wolframscript makes the same split:
+  // `Solve[Abs[x] == 2, x, Complexes]; $MessageList` echoes
+  // `{HoldForm[MessageName[Solve, ifun]]}` while
+  // `ToString[$MessageList, InputForm]` is `{HoldForm[Solve::ifun]}`.
+  #[test]
+  fn message_name_prints_short_under_to_string() {
+    assert_eq!(interpret("ToString[a::b]").unwrap(), "a::b");
+    assert_eq!(interpret("ToString[a::b, InputForm]").unwrap(), "a::b");
+    assert_eq!(interpret("ToString[{a::b, 1}]").unwrap(), "{a::b, 1}");
+    assert_eq!(interpret("ToString[Hold[a::b]]").unwrap(), "Hold[a::b]");
+    assert_eq!(interpret("StringLength[ToString[a::b]]").unwrap(), "4");
+    // The echo either side of a ToString is unaffected.
+    assert_eq!(
+      interpret("ToString[a::b]; a::b").unwrap(),
+      "MessageName[a, b]"
+    );
+  }
+
+  #[test]
+  fn message_name_set_returns_rhs() {
+    clear_state();
+    assert_eq!(interpret("freshMsgA::usage = \"hello\"").unwrap(), "hello");
+  }
+
+  #[test]
+  fn message_name_lookup_after_set() {
+    clear_state();
+    assert_eq!(
+      interpret("freshMsgB::tag = \"val\"; freshMsgB::tag").unwrap(),
+      "val"
+    );
+  }
+}
+
+mod plot3d_function {
+  use super::*;
+
+  #[test]
+  fn plot3d_evaluates_to_itself() {
+    assert_eq!(interpret("Plot3D").unwrap(), "Plot3D");
+  }
+
+  #[test]
+  fn plot3d_attributes() {
+    // Wolfram: Plot3D has HoldAll (like Plot, ListPlot, etc.).
+    // (A fresh kernel shows only {Protected, ReadProtected}, but the
+    // symbol auto-upgrades to HoldAll on first mention.)
+    assert_eq!(
+      interpret("Attributes[Plot3D]").unwrap(),
+      "{HoldAll, Protected, ReadProtected}"
+    );
+  }
+}
+
+mod increment_function {
+  use super::*;
+
+  #[test]
+  fn increment_postfix_returns_old_value() {
+    assert_eq!(interpret("x = 5; x++").unwrap(), "5");
+  }
+
+  #[test]
+  fn increment_postfix_modifies_variable() {
+    assert_eq!(interpret("x = 5; x++; x").unwrap(), "6");
+  }
+
+  #[test]
+  fn increment_function_call() {
+    assert_eq!(interpret("x = 10; Increment[x]").unwrap(), "10");
+    assert_eq!(interpret("x = 10; Increment[x]; x").unwrap(), "11");
+  }
+
+  #[test]
+  fn increment_attributes() {
+    assert_eq!(
+      interpret("Attributes[Increment]").unwrap(),
+      "{HoldFirst, Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn increment_symbolic_expression() {
+    // y holds `2 x`; y++ adds 1 to it, yielding `1 + 2*x`.
+    assert_eq!(interpret("y = 2 x; y++; y").unwrap(), "1 + 2*x");
+  }
+
+  #[test]
+  fn increment_multiple_times() {
+    assert_eq!(interpret("x = 0; x++; x++; x++; x").unwrap(), "3");
+  }
+
+  #[test]
+  fn postfix_increment_unset_returns_unevaluated() {
+    clear_state();
+    assert_eq!(interpret("freshIncA++").unwrap(), "freshIncA++");
+  }
+
+  #[test]
+  fn prefix_increment_unset_returns_unevaluated() {
+    clear_state();
+    assert_eq!(interpret("++freshPreIncA").unwrap(), "++freshPreIncA");
+  }
+
+  #[test]
+  fn postfix_decrement_unset_returns_unevaluated() {
+    clear_state();
+    assert_eq!(interpret("freshDecA--").unwrap(), "freshDecA--");
+  }
+}
+
+mod decrement_function {
+  use super::*;
+
+  #[test]
+  fn decrement_postfix_returns_old_value() {
+    assert_eq!(interpret("x = 5; x--").unwrap(), "5");
+  }
+
+  #[test]
+  fn decrement_postfix_modifies_variable() {
+    assert_eq!(interpret("x = 5; x--; x").unwrap(), "4");
+  }
+
+  #[test]
+  fn decrement_function_call() {
+    assert_eq!(interpret("x = 10; Decrement[x]").unwrap(), "10");
+    assert_eq!(interpret("x = 10; Decrement[x]; x").unwrap(), "9");
+  }
+
+  #[test]
+  fn decrement_attributes() {
+    assert_eq!(
+      interpret("Attributes[Decrement]").unwrap(),
+      "{HoldFirst, Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn decrement_real_value_matches_machine_precision() {
+    // 1.6 - 1 in IEEE double is 0.6000000000000001 (matches wolframscript).
+    assert_eq!(interpret("a = 1.6; a--; a").unwrap(), "0.6000000000000001");
+  }
+}
+
+mod pre_increment_function {
+  use super::*;
+
+  #[test]
+  fn pre_increment_returns_new_value() {
+    assert_eq!(interpret("x = 5; ++x").unwrap(), "6");
+  }
+
+  #[test]
+  fn pre_increment_symbolic_expression() {
+    // y holds `x`; ++y adds 1 to it, yielding `1 + x`.
+    assert_eq!(interpret("y = x; ++y").unwrap(), "1 + x");
+  }
+
+  #[test]
+  fn pre_increment_real_then_add() {
+    // a = 2.; after ++a, a holds 3.; 3. + 1.6 = 4.6.
+    assert_eq!(interpret("a = 2.; ++a; a + 1.6").unwrap(), "4.6");
+  }
+
+  #[test]
+  fn pre_increment_modifies_variable() {
+    assert_eq!(interpret("x = 5; ++x; x").unwrap(), "6");
+  }
+
+  #[test]
+  fn pre_increment_function_call() {
+    assert_eq!(interpret("x = 10; PreIncrement[x]").unwrap(), "11");
+    assert_eq!(interpret("x = 10; PreIncrement[x]; x").unwrap(), "11");
+  }
+
+  #[test]
+  fn pre_increment_attributes() {
+    assert_eq!(
+      interpret("Attributes[PreIncrement]").unwrap(),
+      "{HoldFirst, Protected, ReadProtected}"
+    );
+  }
+}
+
+mod pre_decrement_function {
+  use super::*;
+
+  #[test]
+  fn pre_decrement_returns_new_value() {
+    assert_eq!(interpret("x = 5; --x").unwrap(), "4");
+  }
+
+  #[test]
+  fn pre_decrement_modifies_variable() {
+    assert_eq!(interpret("x = 5; --x; x").unwrap(), "4");
+  }
+
+  #[test]
+  fn pre_decrement_function_call() {
+    assert_eq!(interpret("x = 10; PreDecrement[x]").unwrap(), "9");
+    assert_eq!(interpret("x = 10; PreDecrement[x]; x").unwrap(), "9");
+  }
+
+  #[test]
+  fn pre_decrement_attributes() {
+    assert_eq!(
+      interpret("Attributes[PreDecrement]").unwrap(),
+      "{HoldFirst, Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn pre_decrement_part() {
+    assert_eq!(interpret("pos = {1, 2}; --pos[[1]]").unwrap(), "0");
+    assert_eq!(interpret("pos = {10, 20}; --pos[[2]]").unwrap(), "19");
+  }
+
+  #[test]
+  fn pre_decrement_numeric_literal_unevaluated() {
+    // `--5` parses as PreDecrement[5] (matching wolframscript). Since 5 isn't
+    // an assignable variable, it stays unevaluated and emits an rvalue
+    // message. Regression for mathics assign_binaryop.py:30.
+    assert_eq!(interpret("--5").unwrap(), "--5");
+    assert_eq!(interpret("++5").unwrap(), "++5");
+  }
+
+  #[test]
+  fn leading_minus_still_works_with_space() {
+    // A leading `-` followed by whitespace and then a signed literal should
+    // still parse as unary minus applied to the literal — i.e. not eaten by
+    // the PreDecrement lookahead.
+    assert_eq!(interpret("- -5").unwrap(), "5");
+  }
+
+  #[test]
+  fn pre_increment_part() {
+    assert_eq!(interpret("pos = {1, 2}; ++pos[[1]]").unwrap(), "2");
+    assert_eq!(interpret("pos = {10, 20}; ++pos[[2]]").unwrap(), "21");
+  }
+
+  #[test]
+  fn post_increment_part() {
+    // Post-increment returns old value
+    assert_eq!(interpret("pos = {1, 2}; pos[[1]]++").unwrap(), "1");
+    assert_eq!(
+      interpret("pos = {1, 2}; pos[[1]]++; pos").unwrap(),
+      "{2, 2}"
+    );
+  }
+
+  #[test]
+  fn post_decrement_part() {
+    // Post-decrement returns old value
+    assert_eq!(interpret("pos = {1, 2}; pos[[1]]--").unwrap(), "1");
+    assert_eq!(
+      interpret("pos = {1, 2}; pos[[1]]--; pos").unwrap(),
+      "{0, 2}"
+    );
+  }
+}
+
+mod max_iterations_symbol {
+  use super::*;
+
+  #[test]
+  fn max_iterations_attributes() {
+    assert_eq!(
+      interpret("Attributes[MaxIterations]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod accuracy_goal_symbol {
+  use super::*;
+
+  #[test]
+  fn accuracy_goal_attributes() {
+    assert_eq!(
+      interpret("Attributes[AccuracyGoal]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod general_symbol {
+  use super::*;
+
+  #[test]
+  fn general_attributes() {
+    assert_eq!(interpret("Attributes[General]").unwrap(), "{Protected}");
+  }
+}
+
+mod default_symbol {
+  use super::*;
+
+  #[test]
+  fn default_attributes() {
+    assert_eq!(interpret("Attributes[Default]").unwrap(), "{Protected}");
+  }
+}
+
+mod number_symbol {
+  use super::*;
+
+  #[test]
+  fn number_attributes() {
+    assert_eq!(interpret("Attributes[Number]").unwrap(), "{Protected}");
+  }
+}
+
+mod flat_symbol {
+  use super::*;
+
+  #[test]
+  fn flat_attributes() {
+    assert_eq!(interpret("Attributes[Flat]").unwrap(), "{Protected}");
+  }
+}
+
+mod read_protected_symbol {
+  use super::*;
+
+  #[test]
+  fn read_protected_attributes() {
+    assert_eq!(
+      interpret("Attributes[ReadProtected]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod protected_symbol {
+  use super::*;
+
+  #[test]
+  fn protected_attributes() {
+    assert_eq!(interpret("Attributes[Protected]").unwrap(), "{Protected}");
+  }
+}
+
+mod hold_rest_symbol {
+  use super::*;
+
+  #[test]
+  fn hold_rest_attributes() {
+    assert_eq!(interpret("Attributes[HoldRest]").unwrap(), "{Protected}");
+  }
+}
+
+mod traditional_form {
+  use super::*;
+
+  #[test]
+  fn wraps_expression() {
+    assert_eq!(
+      interpret("TraditionalForm[x + y]").unwrap(),
+      "TraditionalForm[x + y]"
+    );
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(
+      interpret("Head[TraditionalForm[x]]").unwrap(),
+      "TraditionalForm"
+    );
+  }
+
+  #[test]
+  fn evaluates_argument() {
+    assert_eq!(
+      interpret("TraditionalForm[1 + 2]").unwrap(),
+      "TraditionalForm[3]"
+    );
+  }
+
+  #[test]
+  fn nested_expression() {
+    assert_eq!(
+      interpret("TraditionalForm[Sin[Pi/4]]").unwrap(),
+      "TraditionalForm[1/Sqrt[2]]"
+    );
+  }
+
+  #[test]
+  fn to_string() {
+    assert_eq!(
+      interpret("ToString[TraditionalForm[x + y]]").unwrap(),
+      "DisplayForm[FormBox[RowBox[{x, +, y}], TraditionalForm]]"
+    );
+  }
+
+  #[test]
+  fn to_string_evaluates() {
+    assert_eq!(
+      interpret("ToString[TraditionalForm[1 + 2]]").unwrap(),
+      "DisplayForm[FormBox[3, TraditionalForm]]"
+    );
+  }
+
+  #[test]
+  fn polynomial() {
+    assert_eq!(
+      interpret("TraditionalForm[6 + 6 x^2 - 12 x]").unwrap(),
+      "TraditionalForm[6 - 12*x + 6*x^2]"
+    );
+  }
+
+  // `InputForm` writes a typeset expression as the FrontEnd's
+  // `\!\(\*boxes\)` escape, so reading that back has to land on the same
+  // expression. Woxi Studio serializes a Manipulate body through InputForm
+  // and re-parses it on every frame; without the read side a
+  // `TraditionalForm[…]` in the body came back as an opaque `HoldComplete`
+  // of its own source and printed as that.
+  //
+  // What comes back is the expression the boxes *typeset*: `FormBox` is a
+  // display-only wrapper and does not survive the read, the same way the
+  // `StyleBox` in `\!\(\*StyleBox["x", Bold]\)` does not.
+  //
+  // Note the displayed part is always *boxes*, never plain source —
+  // Wolfram's `\*` reader only accepts box heads, so `\!\(\*FormBox[x + y,
+  // TraditionalForm]\)` is a `Syntax::sntxi` error there and must not be
+  // used as a conformance case.
+  #[test]
+  fn input_form_box_escape_round_trips() {
+    // A 2-D box head, and the `RowBox` a flat run of source typesets to.
+    assert_eq!(
+      interpret(r#"\!\(\*FormBox[SqrtBox["x"], TraditionalForm]\)"#).unwrap(),
+      "Sqrt[x]"
+    );
+    assert_eq!(
+      interpret(
+        r#"\!\(\*FormBox[RowBox[{"ArcSin[", "y", "]"}], TraditionalForm]\)"#
+      )
+      .unwrap(),
+      "ArcSin[y]"
+    );
+    // `StandardForm` reads the same way, and a bare string atom is a box
+    // in its own right.
+    assert_eq!(
+      interpret(r#"\!\(\*FormBox[SqrtBox["x"], StandardForm]\)"#).unwrap(),
+      "Sqrt[x]"
+    );
+    // A bare string box is source text, so its content is read as an
+    // expression: the box `"3"` is the number 3, and only a box whose text
+    // is itself quoted is the string "3".
+    assert_eq!(
+      interpret(r#"Head[\!\(\*FormBox["3", TraditionalForm]\)]"#).unwrap(),
+      "Integer"
+    );
+    assert_eq!(
+      interpret(r#"\!\(\*FormBox["x + 1", TraditionalForm]\)"#).unwrap(),
+      "1 + x"
+    );
+    assert_eq!(
+      interpret(r#"Head[\!\(\*FormBox["\"3\"", TraditionalForm]\)]"#).unwrap(),
+      "String"
+    );
+    // Inside a layout the item becomes that expression instead of
+    // degrading to a line of source text.
+    assert_eq!(
+      interpret(
+        r#"Column[{"a", \!\(\*FormBox[RowBox[{"x", "+", "y"}], TraditionalForm]\)}]"#
+      )
+      .unwrap(),
+      "Column[{a, x + y}]"
+    );
+  }
+
+  // Only a `$BoxForms` member is a box formatting type; `OutputForm` is
+  // not one, so Wolfram answers `MakeExpression::boxfmt` and then fails to
+  // parse the line at all. Woxi has no parse-time messages, so it keeps
+  // the escape as the literal source it could not interpret rather than
+  // inventing an `OutputForm[…]` wrapper for it.
+  //
+  // Written through a binding on purpose: an unparseable line has no
+  // reference output, so this must not be lifted into a conformance case.
+  #[test]
+  fn input_form_box_escape_rejects_non_box_form() {
+    let src = r#"\!\(\*FormBox[SqrtBox["x"], OutputForm]\)"#;
+    assert_eq!(interpret(src).unwrap(), format!("HoldComplete[{src}]"));
+  }
+
+  // A `TraditionalForm` of a symbolic product typesets to a `RowBox` of
+  // *string* atoms ("Pi", " ", "p", …). Writing that box segment out as the
+  // InputForm of a *string* `\"`-escapes those quotes — the box delimiters
+  // included — and what is left is no longer box syntax: Wolfram answers
+  // `ToExpression::sntx` and reads nothing. Woxi has no parse-time messages,
+  // so the escape stays the literal source it could not interpret; the
+  // `ToExpression` spelling of the same text does report the error and
+  // answer `$Failed` (see
+  // `box_escape_reads_back_only_at_its_own_escaping_depth`).
+  //
+  // Written through a binding on purpose: an unparseable line has no
+  // reference output, so this must not be lifted into a conformance case.
+  #[test]
+  fn input_form_box_escape_does_not_read_escaped_box_delimiters() {
+    let quoted = interpret(
+      "ToString[ToString[InputForm[TraditionalForm[Pi*p*q]]], InputForm]",
+    )
+    .unwrap();
+    assert!(
+      quoted.contains("\\\"Pi\\\""),
+      "expected escaped string atoms in: {quoted}"
+    );
+    // Drop the `"` delimiters `InputForm` put around the string to get
+    // back at the source text itself.
+    let src = quoted.trim_matches('"');
+    assert_eq!(interpret(src).unwrap(), format!("HoldComplete[{src}]"));
+  }
+
+  // The other spelling of the same segment: `ToString[InputForm[…]]` is
+  // the private-use marker form, and that text has to read back too —
+  // Woxi Studio serializes a Manipulate body that way and re-parses it on
+  // every frame, so a `TraditionalForm[…]` inside it used to come back as
+  // an opaque `HoldComplete` of its own source and print as that.
+  #[test]
+  fn input_form_box_markers_round_trip() {
+    assert_eq!(
+      interpret("ToExpression[ToString[InputForm[TraditionalForm[x + y]]]]")
+        .unwrap(),
+      "x + y"
+    );
+    assert_eq!(
+      interpret("ToExpression[ToString[InputForm[TraditionalForm[Pi*p*q]]]]")
+        .unwrap(),
+      "p*Pi*q"
+    );
+  }
+
+  // `InputForm` of a typeset expression is the box segment in its marker
+  // spelling: 53 characters starting U+F7C1 U+F7C9 U+F7C8, not the
+  // 63-character backslash escape. The escape is what the *string*
+  // `InputForm` renderer writes for those markers, so producing it here
+  // as well escaped the segment twice over.
+  #[test]
+  fn input_form_of_traditional_form_is_the_marker_segment() {
+    assert_eq!(
+      interpret("StringLength[ToString[InputForm[TraditionalForm[x + y]]]]")
+        .unwrap(),
+      "53"
+    );
+    assert_eq!(
+      interpret(
+        "Take[ToCharacterCode[ToString[InputForm[TraditionalForm[x + y]]]], 3]"
+      )
+      .unwrap(),
+      "{63425, 63433, 63432}"
+    );
+    // Displaying that string renders the segment, so the printed form is
+    // the `DisplayForm` Wolfram shows in a terminal.
+    assert_eq!(
+      interpret("ToString[InputForm[TraditionalForm[x + y]]]").unwrap(),
+      "DisplayForm[FormBox[RowBox[{x, +, y}], TraditionalForm]]"
+    );
+  }
+
+  // A box segment is box *source*, and what it displays is the box
+  // expression that source parses into — so the `List[…]` a template's slots
+  // are written as shows up as `{…}`. A box holding *text* is not source,
+  // and keeps whatever it says.
+  #[test]
+  fn box_segment_displays_its_slot_list_as_braces() {
+    assert_eq!(
+      interpret(r#"ToString[InputForm[TraditionalForm[Row[{"a", 1}]]]]"#)
+        .unwrap(),
+      r#"DisplayForm[FormBox[TemplateBox[{"a", 1}, RowDefault], TraditionalForm]]"#
+    );
+    assert_eq!(
+      interpret(r#"ToString[InputForm[TraditionalForm[Row[{"List[1]", 2}]]]]"#)
+        .unwrap(),
+      r#"DisplayForm[FormBox[TemplateBox[{"List[1]", 2}, RowDefault], TraditionalForm]]"#
+    );
+  }
+}
+
+mod batch_symbols {
+  use super::*;
+
+  #[test]
+  fn vertex_labels() {
+    assert_eq!(interpret("VertexLabels").unwrap(), "VertexLabels");
+  }
+
+  #[test]
+  fn plot_theme() {
+    assert_eq!(interpret("PlotTheme").unwrap(), "PlotTheme");
+  }
+
+  #[test]
+  fn exclusions() {
+    assert_eq!(interpret("Exclusions").unwrap(), "Exclusions");
+  }
+
+  #[test]
+  fn center_dot() {
+    assert_eq!(interpret("CenterDot").unwrap(), "CenterDot");
+  }
+
+  #[test]
+  fn spacer() {
+    assert_eq!(interpret("Spacer[10]").unwrap(), "Spacer[10]");
+  }
+
+  #[test]
+  fn control_placement() {
+    assert_eq!(interpret("ControlPlacement").unwrap(), "ControlPlacement");
+  }
+
+  #[test]
+  fn item_size() {
+    assert_eq!(interpret("ItemSize").unwrap(), "ItemSize");
+  }
+
+  #[test]
+  fn tracked_symbols() {
+    assert_eq!(interpret("TrackedSymbols").unwrap(), "TrackedSymbols");
+  }
+
+  #[test]
+  fn plot_markers() {
+    assert_eq!(interpret("PlotMarkers").unwrap(), "PlotMarkers");
+  }
+
+  #[test]
+  fn mesh_functions() {
+    assert_eq!(interpret("MeshFunctions").unwrap(), "MeshFunctions");
+  }
+
+  #[test]
+  fn baseline() {
+    assert_eq!(interpret("Baseline").unwrap(), "Baseline");
+  }
+
+  #[test]
+  fn ticks_style() {
+    assert_eq!(interpret("TicksStyle").unwrap(), "TicksStyle");
+  }
+}
+
+mod thin_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_thickness_tiny() {
+    assert_eq!(interpret("Thin").unwrap(), "Thickness[Tiny]");
+  }
+}
+
+mod unit_system_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("UnitSystem").unwrap(), "UnitSystem");
+  }
+}
+
+mod filling_style_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("FillingStyle").unwrap(), "FillingStyle");
+  }
+}
+
+mod color_space_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("ColorSpace").unwrap(), "ColorSpace");
+  }
+}
+
+mod image_padding_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("ImagePadding").unwrap(), "ImagePadding");
+  }
+}
+
+mod quantity_variable_function {
+  use super::*;
+
+  #[test]
+  fn symbolic() {
+    assert_eq!(
+      interpret("QuantityVariable[\"x\", \"Length\"]").unwrap(),
+      "QuantityVariable[x, Length]"
+    );
+  }
+}
+
+mod interleaving_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("Interleaving").unwrap(), "Interleaving");
+  }
+}
+
+mod interpolation_order_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(
+      interpret("InterpolationOrder").unwrap(),
+      "InterpolationOrder"
+    );
+  }
+}
+
+mod plot_range_padding_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("PlotRangePadding").unwrap(), "PlotRangePadding");
+  }
+}
+
+mod plain_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("Plain").unwrap(), "Plain");
+  }
+}
+
+mod distributed_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("Distributed").unwrap(), "Distributed");
+  }
+}
+
+mod entity_property_function {
+  use super::*;
+
+  #[test]
+  fn symbolic() {
+    assert_eq!(
+      interpret("EntityProperty[\"Country\", \"Population\"]").unwrap(),
+      "EntityProperty[Country, Population]"
+    );
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(
+      interpret("Head[EntityProperty[x, y]]").unwrap(),
+      "EntityProperty"
+    );
+  }
+}
+
+mod font_weight_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("FontWeight").unwrap(), "FontWeight");
+  }
+}
+
+mod control_type_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("ControlType").unwrap(), "ControlType");
+  }
+}
+
+mod labeled_function {
+  use super::*;
+
+  #[test]
+  fn wraps_expression() {
+    assert_eq!(
+      interpret("Labeled[x, \"label\"]").unwrap(),
+      "Labeled[x, label]"
+    );
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[Labeled[x, y]]").unwrap(), "Labeled");
+  }
+}
+
+mod entity_value_function {
+  use super::*;
+
+  #[test]
+  fn symbolic() {
+    assert_eq!(interpret("EntityValue[x, y]").unwrap(), "EntityValue[x, y]");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[EntityValue[x, y]]").unwrap(), "EntityValue");
+  }
+}
+
+mod item_function {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(interpret("Item[x]").unwrap(), "Item[x]");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[Item[x]]").unwrap(), "Item");
+  }
+
+  #[test]
+  fn with_options() {
+    assert_eq!(
+      interpret("Item[\"hello\", Background -> Red]").unwrap(),
+      "Item[hello, Background -> RGBColor[1, 0, 0]]"
+    );
+  }
+}
+
+mod cell_function {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(interpret("Cell[\"hello\"]").unwrap(), "Cell[hello]");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[Cell[\"hello\"]]").unwrap(), "Cell");
+  }
+
+  #[test]
+  fn with_style() {
+    assert_eq!(
+      interpret("Cell[TextData[\"test\"], \"Input\"]").unwrap(),
+      "Cell[TextData[test], Input]"
+    );
+  }
+}
+
+mod test_id_symbol {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_itself() {
+    assert_eq!(interpret("TestID").unwrap(), "TestID");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[TestID]").unwrap(), "Symbol");
+  }
+}
+
+mod inherited_symbol {
+  use super::*;
+
+  #[test]
+  fn inherited_evaluates_to_itself() {
+    assert_eq!(interpret("Inherited").unwrap(), "Inherited");
+  }
+
+  #[test]
+  fn inherited_head() {
+    assert_eq!(interpret("Head[Inherited]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn inherited_identity() {
+    assert_eq!(interpret("Inherited === Inherited").unwrap(), "True");
+  }
+}
+
+mod off_function {
+  use super::*;
+
+  #[test]
+  fn off_returns_null() {
+    assert_eq!(interpret("Off[f]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn off_attributes() {
+    assert_eq!(
+      interpret("Attributes[Off]").unwrap(),
+      "{HoldAll, Protected}"
+    );
+  }
+}
+
+mod remove_function {
+  use super::*;
+
+  #[test]
+  fn remove_returns_null() {
+    assert_eq!(interpret("Remove[x]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn remove_attributes() {
+    assert_eq!(
+      interpret("Attributes[Remove]").unwrap(),
+      "{HoldAll, Locked, Protected}"
+    );
+  }
+}
+
+mod set_options_function {
+  use super::*;
+
+  #[test]
+  fn set_options_returns_unevaluated() {
+    // SetOptions is not implemented - returns unevaluated (matching wolframscript)
+    assert_eq!(
+      interpret("SetOptions[f, a -> 1]").unwrap(),
+      "SetOptions[f, a -> 1]"
+    );
+  }
+
+  #[test]
+  fn set_options_attributes() {
+    assert_eq!(interpret("Attributes[SetOptions]").unwrap(), "{Protected}");
+  }
+}
+
+mod clear_attributes_function {
+  use super::*;
+
+  #[test]
+  fn clear_attributes_works() {
+    assert_eq!(
+      interpret("SetAttributes[g, Listable]; ClearAttributes[g, Listable]; Attributes[g]")
+        .unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn clear_attributes_attributes() {
+    assert_eq!(
+      interpret("Attributes[ClearAttributes]").unwrap(),
+      "{HoldFirst, Protected}"
+    );
+  }
+}
+
+mod list_plot_3d_function {
+  use super::*;
+
+  #[test]
+  fn list_plot_3d_attributes() {
+    assert_eq!(
+      interpret("Attributes[ListPlot3D]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+}
+
+mod input_function {
+  use super::*;
+
+  #[test]
+  fn input_attributes() {
+    assert_eq!(
+      interpret("Attributes[Input]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+}
+
+mod add_to_function {
+  use super::*;
+
+  #[test]
+  fn add_to_works() {
+    assert_eq!(interpret("x = 5; x += 3; x").unwrap(), "8");
+  }
+
+  #[test]
+  fn add_to_attributes() {
+    assert_eq!(
+      interpret("Attributes[AddTo]").unwrap(),
+      "{HoldFirst, Protected}"
+    );
+  }
+
+  #[test]
+  fn add_to_part() {
+    clear_state();
+    assert_eq!(
+      interpret("x = {1, 2, 3}; x[[2]] += 9; x").unwrap(),
+      "{1, 11, 3}"
+    );
+  }
+
+  #[test]
+  fn subtract_from_part() {
+    clear_state();
+    assert_eq!(
+      interpret("x = {10, 20, 30}; x[[1]] -= 3; x").unwrap(),
+      "{7, 20, 30}"
+    );
+  }
+
+  #[test]
+  fn times_by_part() {
+    clear_state();
+    assert_eq!(
+      interpret("x = {2, 3, 4}; x[[3]] *= 5; x").unwrap(),
+      "{2, 3, 20}"
+    );
+  }
+
+  #[test]
+  fn divide_by_part() {
+    clear_state();
+    assert_eq!(
+      interpret("x = {10, 20, 30}; x[[2]] /= 4; x").unwrap(),
+      "{10, 5, 30}"
+    );
+  }
+
+  #[test]
+  fn add_to_part_in_function_def() {
+    // Parsing test: F[x_] := x[[2]] += 9 should parse without error
+    clear_state();
+    // FunctionDefinition returns "\0" (suppressed Null)
+    assert!(interpret("F[x_] := x[[2]] += 9").is_ok());
+  }
+
+  #[test]
+  fn add_to_rvalue_error() {
+    // AddTo on uninitialized variable should return the variable unchanged
+    clear_state();
+    assert_eq!(
+      interpret("AddTo[freshAddVar, 3]; freshAddVar").unwrap(),
+      "freshAddVar"
+    );
+  }
+
+  #[test]
+  fn add_to_uninitialized_returns_unevaluated() {
+    // Matches Mathematica: `a += 2` with unset `a` keeps the AddTo form.
+    clear_state();
+    assert_eq!(interpret("freshAddToA += 2").unwrap(), "freshAddToA += 2");
+  }
+}
+
+mod subtract_from_function {
+  use super::*;
+
+  #[test]
+  fn subtract_from_attributes() {
+    assert_eq!(
+      interpret("Attributes[SubtractFrom]").unwrap(),
+      "{HoldFirst, Protected}"
+    );
+  }
+
+  #[test]
+  fn subtract_from_rvalue_error() {
+    clear_state();
+    assert_eq!(
+      interpret("SubtractFrom[freshSubVar, 2]; freshSubVar").unwrap(),
+      "freshSubVar"
+    );
+  }
+
+  #[test]
+  fn subtract_from_uninitialized_returns_unevaluated() {
+    clear_state();
+    assert_eq!(interpret("freshSubA -= 2").unwrap(), "freshSubA -= 2");
+  }
+}
+
+mod times_by_function {
+  use super::*;
+
+  #[test]
+  fn times_by_attributes() {
+    assert_eq!(
+      interpret("Attributes[TimesBy]").unwrap(),
+      "{HoldFirst, Protected}"
+    );
+  }
+
+  #[test]
+  fn times_by_rvalue_error() {
+    clear_state();
+    assert_eq!(
+      interpret("TimesBy[freshTimVar, 3]; freshTimVar").unwrap(),
+      "freshTimVar"
+    );
+  }
+
+  #[test]
+  fn times_by_uninitialized_returns_unevaluated() {
+    clear_state();
+    assert_eq!(interpret("freshTimA *= 3").unwrap(), "freshTimA *= 3");
+  }
+}
+
+mod divide_by_function {
+  use super::*;
+
+  #[test]
+  fn divide_by_attributes() {
+    assert_eq!(
+      interpret("Attributes[DivideBy]").unwrap(),
+      "{HoldFirst, Protected}"
+    );
+  }
+
+  #[test]
+  fn divide_by_rvalue_error() {
+    clear_state();
+    assert_eq!(
+      interpret("DivideBy[freshDivVar, 2]; freshDivVar").unwrap(),
+      "freshDivVar"
+    );
+  }
+
+  #[test]
+  fn divide_by_uninitialized_returns_unevaluated() {
+    clear_state();
+    assert_eq!(interpret("freshDivA /= 2").unwrap(), "freshDivA /= 2");
+  }
+}
+
+mod golden_ratio_symbol {
+  use super::*;
+
+  #[test]
+  fn golden_ratio_evaluates_to_itself() {
+    assert_eq!(interpret("GoldenRatio").unwrap(), "GoldenRatio");
+  }
+
+  #[test]
+  fn golden_ratio_numeric() {
+    assert!(interpret("N[GoldenRatio]").unwrap().starts_with("1.61803"));
+  }
+}
+
+mod complex_symbol {
+  use super::*;
+
+  #[test]
+  fn complex_function_call() {
+    assert_eq!(interpret("Complex[3, 4]").unwrap(), "3 + 4*I");
+  }
+
+  #[test]
+  fn complex_is_head() {
+    assert_eq!(interpret("Head[3 + 4 I]").unwrap(), "Complex");
+  }
+
+  #[test]
+  fn complex_attributes() {
+    assert_eq!(interpret("Attributes[Complex]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn match_complex_pattern() {
+    assert_eq!(interpret("MatchQ[2I, _Complex]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[4 - I, _Complex]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[I, _Complex]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[3 + 2I, _Complex]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[5, _Complex]").unwrap(), "False");
+    assert_eq!(interpret("MatchQ[3.14, _Complex]").unwrap(), "False");
+  }
+
+  #[test]
+  fn cases_complex_pattern() {
+    assert_eq!(
+      interpret("Cases[{1, 2I, 3, 4 - I, 5}, _Complex]").unwrap(),
+      "{2*I, 4 - I}"
+    );
+  }
+
+  #[test]
+  fn depth_complex_is_atom() {
+    assert_eq!(interpret("Depth[1 + 2 I]").unwrap(), "1");
+    assert_eq!(interpret("Depth[3 + 4I]").unwrap(), "1");
+    assert_eq!(interpret("Depth[I]").unwrap(), "1");
+    assert_eq!(interpret("Depth[2I]").unwrap(), "1");
+  }
+
+  #[test]
+  fn atom_q_complex() {
+    assert_eq!(interpret("AtomQ[2 + I]").unwrap(), "True");
+    assert_eq!(interpret("AtomQ[3 + 4I]").unwrap(), "True");
+    assert_eq!(interpret("AtomQ[I]").unwrap(), "True");
+    assert_eq!(
+      interpret("Map[AtomQ, {2, 2.1, 1/2, 2 + I}]").unwrap(),
+      "{True, True, True, True}"
+    );
+  }
+
+  #[test]
+  fn atom_q_with_base_literal() {
+    // 2^^101 is the binary literal 5, which is an atom.
+    assert_eq!(
+      interpret("Map[AtomQ, {2, 2.1, 1/2, 2 + I, 2^^101}]").unwrap(),
+      "{True, True, True, True, True}"
+    );
+  }
+}
+
+mod hold_all_symbol {
+  use super::*;
+
+  #[test]
+  fn hold_all_attributes() {
+    assert_eq!(interpret("Attributes[HoldAll]").unwrap(), "{Protected}");
+  }
+}
+
+mod listable_symbol {
+  use super::*;
+
+  #[test]
+  fn listable_attributes() {
+    assert_eq!(interpret("Attributes[Listable]").unwrap(), "{Protected}");
+  }
+}
+
+mod hold_first_symbol {
+  use super::*;
+
+  #[test]
+  fn hold_first_attributes() {
+    assert_eq!(interpret("Attributes[HoldFirst]").unwrap(), "{Protected}");
+  }
+}
+
+mod begin_end_package {
+  use super::*;
+
+  #[test]
+  fn begin_returns_context() {
+    // Begin returns the context string (matching wolframscript)
+    assert_eq!(interpret("Begin[\"Private`\"]").unwrap(), "Private`");
+  }
+
+  #[test]
+  fn end_returns_context() {
+    // End[] returns the context that was set by Begin[]
+    assert_eq!(interpret("Begin[\"Private`\"]; End[]").unwrap(), "Private`");
+  }
+
+  #[test]
+  fn begin_package_returns_context() {
+    assert_eq!(interpret("BeginPackage[\"MyPkg`\"]").unwrap(), "MyPkg`");
+  }
+
+  #[test]
+  fn end_package_without_begin_returns_null() {
+    // Without a prior BeginPackage[], wolframscript emits
+    // EndPackage::noctx and still returns Null (the call evaluates,
+    // it just doesn't have a stacked context to pop). Interpret renders
+    // Null as the "\0" sentinel.
+    assert_eq!(interpret("EndPackage[]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn end_package_after_begin_returns_null() {
+    assert_eq!(
+      interpret("BeginPackage[\"MyPkg`\"]; EndPackage[]").unwrap(),
+      "\0"
+    );
+  }
+}
+
+mod break_function {
+  use super::*;
+
+  #[test]
+  fn break_attributes() {
+    assert_eq!(interpret("Attributes[Break]").unwrap(), "{Protected}");
+  }
+}
+
+mod lighting_symbol {
+  use super::*;
+
+  #[test]
+  fn lighting_attributes() {
+    assert_eq!(interpret("Attributes[Lighting]").unwrap(), "{Protected}");
+  }
+}
+
+mod modulus_symbol {
+  use super::*;
+
+  #[test]
+  fn modulus_attributes() {
+    assert_eq!(interpret("Attributes[Modulus]").unwrap(), "{Protected}");
+  }
+}
+
+mod unset_function {
+  use super::*;
+
+  #[test]
+  fn unset_removes_variable() {
+    assert_eq!(interpret("x = 5; Unset[x]; x").unwrap(), "x");
+  }
+
+  #[test]
+  fn unset_syntax() {
+    assert_eq!(interpret("x = 5; x =.; x").unwrap(), "x");
+  }
+
+  #[test]
+  fn unset_returns_null() {
+    assert_eq!(interpret("x = 5; Unset[x]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn unset_removes_function_definition() {
+    assert_eq!(interpret("f[x_] := x^2; f[3]").unwrap(), "9");
+    // After unset, f should no longer be defined
+    // (this tests function call form)
+  }
+
+  #[test]
+  fn unset_attributes() {
+    assert_eq!(
+      interpret("Attributes[Unset]").unwrap(),
+      "{HoldFirst, Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn unset_pattern_without_prior_def_returns_failed() {
+    // Mathematica: 'f[x_] =.' with no prior definition emits an
+    // Unset::norep warning and returns $Failed.
+    clear_state();
+    assert_eq!(interpret("freshUnsetF[x_] =.").unwrap(), "$Failed");
+  }
+
+  #[test]
+  fn unset_pattern_after_set_delayed_returns_null() {
+    clear_state();
+    assert_eq!(
+      interpret("freshUnsetG[x_] := x^2; freshUnsetG[x_] =.").unwrap(),
+      "\0"
+    );
+  }
+
+  #[test]
+  fn unset_pattern_removes_definition() {
+    // After 'f[x_] =.' the downvalue is gone and f[5] stays symbolic.
+    clear_state();
+    assert_eq!(
+      interpret("freshUnsetH[x_] := x^2; freshUnsetH[x_] =.; freshUnsetH[5]")
+        .unwrap(),
+      "freshUnsetH[5]"
+    );
+  }
+
+  #[test]
+  fn unset_threads_over_list() {
+    // '{a, {b}} =.' should thread, returning {Null, {Null}}.
+    clear_state();
+    assert_eq!(interpret("{a, {b}} =.").unwrap(), "{Null, {Null}}");
+  }
+
+  #[test]
+  fn unset_threads_removes_each_ownvalue() {
+    clear_state();
+    assert_eq!(
+      interpret("a = 1; b = 2; {a, {b}} =.; {a, b}").unwrap(),
+      "{a, b}"
+    );
+  }
+}
+
+mod repeated_null_function {
+  use super::*;
+
+  #[test]
+  fn repeated_null_is_inert() {
+    assert_eq!(
+      interpret("RepeatedNull[x_, 3]").unwrap(),
+      "RepeatedNull[x_, 3]"
+    );
+  }
+
+  #[test]
+  fn repeated_null_attributes() {
+    assert_eq!(
+      interpret("Attributes[RepeatedNull]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod view_point_symbol {
+  use super::*;
+
+  #[test]
+  fn view_point_attributes() {
+    assert_eq!(interpret("Attributes[ViewPoint]").unwrap(), "{Protected}");
+  }
+}
+
+mod box_ratios_symbol {
+  use super::*;
+
+  #[test]
+  fn box_ratios_attributes() {
+    assert_eq!(interpret("Attributes[BoxRatios]").unwrap(), "{Protected}");
+  }
+}
+
+mod display_function_symbol {
+  use super::*;
+
+  #[test]
+  fn display_function_attributes() {
+    assert_eq!(
+      interpret("Attributes[DisplayFunction]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod right_symbol {
+  use super::*;
+
+  #[test]
+  fn right_evaluates_to_itself() {
+    assert_eq!(interpret("Right").unwrap(), "Right");
+  }
+
+  #[test]
+  fn right_attributes() {
+    assert_eq!(interpret("Attributes[Right]").unwrap(), "{Protected}");
+  }
+}
+
+mod top_symbol {
+  use super::*;
+
+  #[test]
+  fn top_evaluates_to_itself() {
+    assert_eq!(interpret("Top").unwrap(), "Top");
+  }
+
+  #[test]
+  fn top_attributes() {
+    assert_eq!(interpret("Attributes[Top]").unwrap(), "{Protected}");
+  }
+}
+
+mod bottom_symbol {
+  use super::*;
+
+  #[test]
+  fn bottom_evaluates_to_itself() {
+    assert_eq!(interpret("Bottom").unwrap(), "Bottom");
+  }
+
+  #[test]
+  fn bottom_attributes() {
+    assert_eq!(interpret("Attributes[Bottom]").unwrap(), "{Protected}");
+  }
+}
+
+mod above_symbol {
+  use super::*;
+
+  #[test]
+  fn above_evaluates_to_itself() {
+    assert_eq!(interpret("Above").unwrap(), "Above");
+  }
+
+  #[test]
+  fn above_attributes() {
+    assert_eq!(interpret("Attributes[Above]").unwrap(), "{Protected}");
+  }
+}
+
+mod working_precision_symbol {
+  use super::*;
+
+  #[test]
+  fn working_precision_attributes() {
+    assert_eq!(
+      interpret("Attributes[WorkingPrecision]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod information_function {
+  use super::*;
+
+  #[test]
+  fn information_attributes() {
+    assert_eq!(
+      interpret("Attributes[Information]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn double_question_mark_parses() {
+    clear_state();
+    let result = interpret("??Sin").unwrap();
+    // ??symbol parses as Information[symbol, LongForm -> True] which
+    // includes attributes
+    assert!(result.contains("Attributes"));
+    assert!(result.contains("FullName -> System`Sin"));
+    assert!(result.ends_with("|>]"));
+  }
+
+  #[test]
+  fn double_question_mark_parses_as_long_form_rule() {
+    // `??a + b` → `Information[Unevaluated[a], LongForm -> True] + b`.
+    // Wolfram itself parses `??a` to `Information[a, LongForm -> True]` and
+    // implements the symbol-hold semantics in the REPL. Woxi has no separate
+    // REPL layer, so it folds the hold into the parsed AST via Unevaluated;
+    // the Information dispatcher unwraps it before classifying the argument.
+    clear_state();
+    assert_eq!(
+      interpret("Hold[??a + b]").unwrap(),
+      "Hold[Information[Unevaluated[a], LongForm -> True] + b]"
+    );
+  }
+
+  #[test]
+  fn single_question_mark_parses() {
+    clear_state();
+    let result = interpret("?Sin").unwrap();
+    assert!(result.contains("Name -> Sin"));
+    assert!(result.ends_with("|>]"));
+  }
+}
+
+mod message_function {
+  use super::*;
+
+  #[test]
+  fn message_returns_unevaluated() {
+    assert_eq!(
+      interpret("Message[f, \"test\"]").unwrap(),
+      "Message[f, test]"
+    );
+  }
+
+  #[test]
+  fn message_with_message_name_returns_null() {
+    clear_state();
+    assert_eq!(interpret("Message[freshMsgA::tag]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn message_with_defined_text_returns_null() {
+    clear_state();
+    assert_eq!(
+      interpret("freshMsgB::tag = \"hi\"; Message[freshMsgB::tag]").unwrap(),
+      "\0"
+    );
+  }
+
+  #[test]
+  fn message_attributes() {
+    assert_eq!(
+      interpret("Attributes[Message]").unwrap(),
+      "{HoldFirst, Protected}"
+    );
+  }
+}
+
+mod non_commutative_multiply {
+  use super::*;
+
+  #[test]
+  fn ncm_function_call() {
+    assert_eq!(
+      interpret("NonCommutativeMultiply[a, b, c]").unwrap(),
+      "a**b**c"
+    );
+  }
+
+  #[test]
+  fn ncm_attributes() {
+    assert_eq!(
+      interpret("Attributes[NonCommutativeMultiply]").unwrap(),
+      "{Flat, OneIdentity, Protected}"
+    );
+  }
+
+  #[test]
+  fn ncm_two_args() {
+    assert_eq!(interpret("NonCommutativeMultiply[x, y]").unwrap(), "x**y");
+  }
+}
+
+mod superscript_function {
+  use super::*;
+
+  #[test]
+  fn superscript_is_inert() {
+    assert_eq!(interpret("Superscript[x, 2]").unwrap(), "Superscript[x, 2]");
+  }
+
+  #[test]
+  fn superscript_attributes() {
+    assert_eq!(
+      interpret("Attributes[Superscript]").unwrap(),
+      "{NHoldRest, ReadProtected}"
+    );
+  }
+}
+
+mod repeated_function {
+  use super::*;
+
+  #[test]
+  fn repeated_is_inert() {
+    assert_eq!(interpret("Repeated[x_, 3]").unwrap(), "Repeated[x_, 3]");
+  }
+
+  #[test]
+  fn repeated_attributes() {
+    assert_eq!(interpret("Attributes[Repeated]").unwrap(), "{Protected}");
+  }
+}
+
+mod number_form {
+  use super::*;
+
+  #[test]
+  fn number_form_is_inert() {
+    assert_eq!(
+      interpret("NumberForm[3.14159, 4]").unwrap(),
+      "NumberForm[3.14159, 4]"
+    );
+  }
+
+  #[test]
+  fn number_form_attributes() {
+    assert_eq!(
+      interpret("Attributes[NumberForm]").unwrap(),
+      "{NHoldRest, Protected}"
+    );
+  }
+
+  // `ExponentFunction -> (Null &)` is Wolfram's way of saying "never use
+  // scientific notation": the number is written out in full, with the
+  // rest of the formatting (the `{n, f}` spec, `DigitBlock`) unchanged.
+  // Regression: the option threw the spec away, so a Demonstration's
+  // money captions came out as one significant figure.
+  #[test]
+  fn to_string_number_form_null_exponent_function() {
+    let null_fn = "ExponentFunction -> (Null &)";
+    assert_eq!(
+      interpret(&format!(
+        "ToString[NumberForm[48153.52875, {{16, 2}}, DigitBlock -> 3, \
+         {null_fn}]]"
+      ))
+      .unwrap(),
+      "48,153.53"
+    );
+    assert_eq!(
+      interpret(&format!("ToString[NumberForm[4.0, {{16, 7}}, {null_fn}]]"))
+        .unwrap(),
+      "4.0000000"
+    );
+    // A number big enough to go scientific is written out instead.
+    assert_eq!(
+      interpret(&format!("ToString[NumberForm[1.234*10^12, 5, {null_fn}]]"))
+        .unwrap(),
+      "1234000000000."
+    );
+    assert_eq!(
+      interpret(&format!(
+        "ToString[NumberForm[1.234*10^12, {{16, 2}}, DigitBlock -> 3, \
+         {null_fn}]]"
+      ))
+      .unwrap(),
+      "1,234,000,000,000.00"
+    );
+    // Without the option nothing changes.
+    assert_eq!(
+      interpret("ToString[NumberForm[48153.52875, {16, 2}, DigitBlock -> 3]]")
+        .unwrap(),
+      "48,153.53"
+    );
+  }
+
+  // ToString[NumberForm[x, n, NumberPadding -> {p1, p2}]] left-pads the
+  // rendered number (sign and decimal point included) with p1 to n+1 digit
+  // positions.
+  #[test]
+  fn to_string_number_padding() {
+    assert_eq!(
+      interpret(
+        "ToString[NumberForm[1.5, 3, NumberPadding -> {\"0\", \" \"}]]"
+      )
+      .unwrap(),
+      "001.5"
+    );
+    assert_eq!(
+      interpret("ToString[NumberForm[42, 5, NumberPadding -> {\"0\", \" \"}]]")
+        .unwrap(),
+      "000042"
+    );
+    assert_eq!(
+      interpret(
+        "ToString[NumberForm[12.5, 3, NumberPadding -> {\"0\", \" \"}]]"
+      )
+      .unwrap(),
+      "012.5"
+    );
+    // The sign occupies a pad slot.
+    assert_eq!(
+      interpret(
+        "ToString[NumberForm[-1.5, 3, NumberPadding -> {\"0\", \" \"}]]"
+      )
+      .unwrap(),
+      "0-1.5"
+    );
+    // A non-"0" pad character is honored.
+    assert_eq!(
+      interpret(
+        "ToString[NumberForm[3.14159, 3, NumberPadding -> {\"x\", \"y\"}]]"
+      )
+      .unwrap(),
+      "x3.14"
+    );
+  }
+}
+
+mod percent_form {
+  use super::*;
+
+  // A non-negative machine real renders as x*100 with a "%" suffix and the
+  // trailing decimal point dropped (0.25 -> 25%, not 25.%).
+  #[test]
+  fn real_renders_as_percentage() {
+    assert_eq!(interpret("PercentForm[0.25]").unwrap(), "25%");
+    assert_eq!(interpret("PercentForm[0.5]").unwrap(), "50%");
+    assert_eq!(interpret("PercentForm[2.5]").unwrap(), "250%");
+    assert_eq!(interpret("PercentForm[100.0]").unwrap(), "10000%");
+  }
+
+  #[test]
+  fn fractional_percentages_keep_digits() {
+    assert_eq!(interpret("PercentForm[0.123]").unwrap(), "12.3%");
+    assert_eq!(interpret("PercentForm[0.999]").unwrap(), "99.9%");
+    assert_eq!(
+      interpret("PercentForm[N[1/3]]").unwrap(),
+      "33.33333333333333%"
+    );
+    assert_eq!(
+      interpret("PercentForm[0.1 + 0.2]").unwrap(),
+      "30.000000000000004%"
+    );
+  }
+
+  #[test]
+  fn zero_real() {
+    assert_eq!(interpret("PercentForm[0.0]").unwrap(), "0%");
+  }
+
+  // Integers, rationals, negative reals, and symbolic values are unchanged.
+  #[test]
+  fn non_real_values_unchanged() {
+    assert_eq!(interpret("PercentForm[1/4]").unwrap(), "1/4");
+    assert_eq!(interpret("PercentForm[3/8]").unwrap(), "3/8");
+    assert_eq!(interpret("PercentForm[1]").unwrap(), "1");
+    assert_eq!(interpret("PercentForm[-0.5]").unwrap(), "-0.5");
+  }
+
+  // PercentForm is not Listable; the renderer recurses into list structure,
+  // percent-formatting only the non-negative real leaves.
+  #[test]
+  fn renders_list_structure() {
+    assert_eq!(
+      interpret("PercentForm[{0.1, 0.25, 0.5}]").unwrap(),
+      "{10%, 25%, 50%}"
+    );
+    assert_eq!(
+      interpret("PercentForm[{0.1, {0.2, 0.3}}]").unwrap(),
+      "{10%, {20%, 30%}}"
+    );
+    assert_eq!(
+      interpret("PercentForm[{1/4, 0.5, 2}]").unwrap(),
+      "{1/4, 50%, 2}"
+    );
+  }
+
+  #[test]
+  fn head_is_preserved() {
+    assert_eq!(interpret("Head[PercentForm[0.25]]").unwrap(), "PercentForm");
+    assert_eq!(
+      interpret("Head[PercentForm[{0.1, 0.25}]]").unwrap(),
+      "PercentForm"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[PercentForm]").unwrap(),
+      "{NHoldRest, Protected}"
+    );
+  }
+}
+
+mod slot_sequence {
+  use super::*;
+
+  #[test]
+  fn slot_sequence_display() {
+    assert_eq!(interpret("##").unwrap(), "##1");
+    assert_eq!(interpret("##2").unwrap(), "##2");
+  }
+
+  #[test]
+  fn slot_sequence_function_call_form() {
+    assert_eq!(interpret("SlotSequence[1]").unwrap(), "##1");
+    assert_eq!(interpret("SlotSequence[2]").unwrap(), "##2");
+  }
+
+  #[test]
+  fn slot_sequence_in_plus() {
+    assert_eq!(interpret("f = Plus[##] &; f[1, 2, 3]").unwrap(), "6");
+  }
+
+  #[test]
+  fn slot_sequence_in_list() {
+    assert_eq!(interpret("g = {##} &; g[a, b, c]").unwrap(), "{a, b, c}");
+  }
+
+  #[test]
+  fn slot_sequence_from_position() {
+    assert_eq!(
+      interpret("h = {##2} &; h[a, b, c, d]").unwrap(),
+      "{b, c, d}"
+    );
+  }
+
+  #[test]
+  fn slot_sequence_attributes() {
+    assert_eq!(
+      interpret("Attributes[SlotSequence]").unwrap(),
+      "{NHoldAll, Protected}"
+    );
+  }
+
+  #[test]
+  fn slot_sequence_with_slot() {
+    assert_eq!(
+      interpret("f = {#1, ##2} &; f[x, y, z]").unwrap(),
+      "{x, y, z}"
+    );
+  }
+}
+
+mod left_symbol {
+  use super::*;
+
+  #[test]
+  fn left_evaluates_to_itself() {
+    assert_eq!(interpret("Left").unwrap(), "Left");
+  }
+
+  #[test]
+  fn left_attributes() {
+    assert_eq!(interpret("Attributes[Left]").unwrap(), "{Protected}");
+  }
+}
+
+mod real_symbol {
+  use super::*;
+
+  #[test]
+  fn real_evaluates_to_itself() {
+    assert_eq!(interpret("Real").unwrap(), "Real");
+  }
+
+  #[test]
+  fn real_attributes() {
+    assert_eq!(interpret("Attributes[Real]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn real_is_head_of_floats() {
+    assert_eq!(interpret("Head[3.14]").unwrap(), "Real");
+    assert_eq!(interpret("Head[0.0]").unwrap(), "Real");
+  }
+
+  #[test]
+  fn match_real_pattern() {
+    assert_eq!(interpret("MatchQ[3.14, _Real]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[5, _Real]").unwrap(), "False");
+  }
+}
+
+mod ticks_symbol {
+  use super::*;
+
+  #[test]
+  fn ticks_evaluates_to_itself() {
+    assert_eq!(interpret("Ticks").unwrap(), "Ticks");
+  }
+
+  #[test]
+  fn ticks_attributes() {
+    assert_eq!(interpret("Attributes[Ticks]").unwrap(), "{Protected}");
+  }
+}
+
+mod boxed_symbol {
+  use super::*;
+
+  #[test]
+  fn boxed_evaluates_to_itself() {
+    assert_eq!(interpret("Boxed").unwrap(), "Boxed");
+  }
+
+  #[test]
+  fn boxed_attributes() {
+    assert_eq!(interpret("Attributes[Boxed]").unwrap(), "{Protected}");
+  }
+}
+
+mod scaled_function {
+  use super::*;
+
+  #[test]
+  fn scaled_evaluates_to_itself() {
+    assert_eq!(interpret("Scaled").unwrap(), "Scaled");
+  }
+
+  #[test]
+  fn scaled_function_call_is_inert() {
+    assert_eq!(
+      interpret("Scaled[{0.5, 0.5}]").unwrap(),
+      "Scaled[{0.5, 0.5}]"
+    );
+  }
+
+  #[test]
+  fn scaled_attributes() {
+    assert_eq!(interpret("Attributes[Scaled]").unwrap(), "{Protected}");
+  }
+}
+
+mod plot_points_symbol {
+  use super::*;
+
+  #[test]
+  fn plot_points_evaluates_to_itself() {
+    assert_eq!(interpret("PlotPoints").unwrap(), "PlotPoints");
+  }
+
+  #[test]
+  fn plot_points_attributes() {
+    assert_eq!(interpret("Attributes[PlotPoints]").unwrap(), "{Protected}");
+  }
+}
+
+mod needs_function {
+  use super::*;
+
+  #[test]
+  fn needs_returns_failed() {
+    // Needs returns $Failed when package is not found (matching wolframscript)
+    assert_eq!(interpret("Needs[\"SomePackage`\"]").unwrap(), "$Failed");
+  }
+
+  #[test]
+  fn needs_attributes() {
+    assert_eq!(interpret("Attributes[Needs]").unwrap(), "{Protected}");
+  }
+
+  // A package that ships with the Wolfram Language always loads there, so
+  // it loads here too — as a no-op, since Woxi keeps every built-in it
+  // implements in one namespace. Demonstrations reach for these in their
+  // `Initialization` option (`Get["DifferentialEquations`NDSolveUtilities`"]`),
+  // where a `$Failed` would surface as a broken cell.
+  #[test]
+  fn standard_distribution_packages_load_as_no_ops() {
+    // `Null` prints nothing, which `interpret` reports as "\0".
+    assert_eq!(
+      interpret("Get[\"DifferentialEquations`NDSolveUtilities`\"]").unwrap(),
+      "\0"
+    );
+    assert_eq!(interpret("Needs[\"Combinatorica`\"]").unwrap(), "\0");
+    assert_eq!(interpret("Get[\"Units`\"]").unwrap(), "\0");
+    // `VectorFieldPlots` is the legacy package Demonstrations load via
+    // `Get["VectorFieldPlots`"]` before calling `ListVectorFieldPlot`.
+    assert_eq!(interpret("Get[\"VectorFieldPlots`\"]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn an_unknown_package_still_fails() {
+    assert_eq!(interpret("Get[\"NoSuchPackageXyz`\"]").unwrap(), "$Failed");
+    assert_eq!(
+      interpret("Needs[\"NoSuchPackageXyz`\"]").unwrap(),
+      "$Failed"
+    );
+    // A file path that merely starts with a standard context name is read
+    // from disk as usual, so it fails when it does not exist.
+    assert_eq!(interpret("Get[\"Units.m\"]").unwrap(), "$Failed");
+  }
+}
+
+mod center_symbol {
+  use super::*;
+
+  #[test]
+  fn center_evaluates_to_itself() {
+    assert_eq!(interpret("Center").unwrap(), "Center");
+  }
+
+  #[test]
+  fn center_attributes() {
+    assert_eq!(interpret("Attributes[Center]").unwrap(), "{Protected}");
+  }
+}
+
+mod rational_symbol {
+  use super::*;
+
+  #[test]
+  fn rational_evaluates_to_itself() {
+    assert_eq!(interpret("Rational").unwrap(), "Rational");
+  }
+
+  #[test]
+  fn rational_attributes() {
+    assert_eq!(interpret("Attributes[Rational]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn rational_is_head_of_fractions() {
+    assert_eq!(interpret("Head[1/3]").unwrap(), "Rational");
+    assert_eq!(interpret("Head[2/5]").unwrap(), "Rational");
+  }
+
+  #[test]
+  fn rational_function_call_creates_fraction() {
+    assert_eq!(interpret("Rational[1, 3]").unwrap(), "1/3");
+    assert_eq!(interpret("Rational[2, 4]").unwrap(), "1/2");
+    assert_eq!(interpret("Rational[3, 1]").unwrap(), "3");
+  }
+
+  #[test]
+  fn match_rational_pattern() {
+    assert_eq!(interpret("MatchQ[1/2, _Rational]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[5, _Rational]").unwrap(), "False");
+  }
+
+  // Regression tests for https://github.com/ad-si/Woxi/issues/83
+  #[test]
+  fn head_of_reciprocal_is_power() {
+    assert_eq!(interpret("Head[1/x]").unwrap(), "Power");
+    assert_eq!(interpret("Head[1/(2*x - 3)]").unwrap(), "Power");
+  }
+
+  #[test]
+  fn head_of_reciprocal_via_variable() {
+    clear_state();
+    assert_eq!(interpret("y = 1/(2*x - 3); Head[y]").unwrap(), "Power");
+  }
+
+  #[test]
+  fn head_of_symbolic_division_is_times() {
+    assert_eq!(interpret("Head[2/x]").unwrap(), "Times");
+    assert_eq!(interpret("Head[x/(2*y)]").unwrap(), "Times");
+  }
+}
+
+mod mesh_symbol {
+  use super::*;
+
+  #[test]
+  fn mesh_evaluates_to_itself() {
+    assert_eq!(interpret("Mesh").unwrap(), "Mesh");
+  }
+
+  #[test]
+  fn mesh_attributes() {
+    assert_eq!(interpret("Attributes[Mesh]").unwrap(), "{Protected}");
+  }
+}
+
+mod string_symbol {
+  use super::*;
+
+  #[test]
+  fn string_evaluates_to_itself() {
+    assert_eq!(interpret("String").unwrap(), "String");
+  }
+
+  #[test]
+  fn string_attributes() {
+    assert_eq!(interpret("Attributes[String]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn string_is_head_of_strings() {
+    assert_eq!(interpret("Head[\"hello\"]").unwrap(), "String");
+  }
+
+  #[test]
+  fn string_function_call_is_inert() {
+    assert_eq!(interpret("String[1, 2]").unwrap(), "String[1, 2]");
+  }
+
+  #[test]
+  fn match_string_pattern() {
+    assert_eq!(interpret("MatchQ[\"hello\", _String]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[5, _String]").unwrap(), "False");
+  }
+}
+
+mod optional_function {
+  use super::*;
+
+  #[test]
+  fn optional_with_default() {
+    assert_eq!(interpret("Optional[x_, 0]").unwrap(), "x_:0");
+  }
+
+  #[test]
+  fn optional_with_head_and_default() {
+    assert_eq!(interpret("Optional[x_Integer, 5]").unwrap(), "x_Integer:5");
+  }
+
+  #[test]
+  fn optional_without_default() {
+    assert_eq!(interpret("Optional[x_]").unwrap(), "x_.");
+  }
+
+  #[test]
+  fn optional_attributes() {
+    assert_eq!(interpret("Attributes[Optional]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn optional_syntax_with_colon() {
+    assert_eq!(interpret("f[x_ : 0] := x; f[]").unwrap(), "0");
+    assert_eq!(interpret("f[x_ : 0] := x; f[5]").unwrap(), "5");
+  }
+
+  #[test]
+  fn optional_default_dot_syntax_parses() {
+    // x_. is Optional[Pattern[x, Blank[]]] — system-determined default
+    assert_eq!(interpret("x_.").unwrap(), "x_.");
+  }
+
+  #[test]
+  fn optional_default_dot_with_head_is_syntax_error() {
+    // x_Integer. is a syntax error in Wolfram Language (only x_. and _. are valid)
+    assert!(interpret("x_Integer.").is_err());
+  }
+
+  #[test]
+  fn optional_default_dot_anonymous_parses() {
+    // _. is Optional[Blank[]] — anonymous system-determined default
+    assert_eq!(interpret("_.").unwrap(), "_.");
+  }
+
+  #[test]
+  fn optional_default_dot_in_expression() {
+    // m_. can appear in expressions like Power patterns
+    assert_eq!(interpret("x_^m_.").unwrap(), "(x_)^(m_.)");
+  }
+
+  #[test]
+  fn optional_default_dot_in_function_definition() {
+    // The original failing expression should parse without error
+    assert_eq!(
+      interpret(
+        "Int[x_^m_., x_Symbol] := x^(m + 1)/(m + 1) /; FreeQ[m, x] && NeQ[m, -1]"
+      )
+      .unwrap(),
+      "\0"
+    );
+  }
+}
+
+mod condition_operator {
+  use super::*;
+
+  #[test]
+  fn condition_in_set_delayed() {
+    // f[x_] := body /; condition
+    assert_eq!(interpret("g[x_] := x^2 /; x > 0; g[3]").unwrap(), "9");
+  }
+
+  #[test]
+  fn condition_in_set_delayed_rejects_when_false() {
+    // When condition is false, definition should not match
+    assert_eq!(interpret("g[x_] := x^2 /; x > 0; g[-3]").unwrap(), "g[-3]");
+  }
+
+  #[test]
+  fn condition_with_multiple_conditions() {
+    // Multiple conditions via &&
+    assert_eq!(
+      interpret("h[x_] := x + 1 /; x > 0 && x < 10; h[5]").unwrap(),
+      "6"
+    );
+    assert_eq!(
+      interpret("h[x_] := x + 1 /; x > 0 && x < 10; h[15]").unwrap(),
+      "h[15]"
+    );
+  }
+
+  #[test]
+  fn chained_conditions_with_fallback() {
+    // Chained /; with later unconditional definition — when the first
+    // condition fails (3 < 2 is false), the fallback applies: y/x = 2/3.
+    clear_state();
+    assert_eq!(
+      interpret(
+        "F[x_, y_] /; x < y /; x>0 := x / y; \
+         F[x_, y_] := y / x; \
+         F[3, 2]"
+      )
+      .unwrap(),
+      "2/3"
+    );
+  }
+
+  #[test]
+  fn chained_conditions_fallback_negative_arg() {
+    // For F[-3, 2], first condition x>0 fails so fallback y/x = 2/-3 = -2/3.
+    clear_state();
+    assert_eq!(
+      interpret(
+        "F[x_, y_] /; x < y /; x>0 := x / y; \
+         F[x_, y_] := y / x; \
+         F[-3, 2]"
+      )
+      .unwrap(),
+      "-2/3"
+    );
+  }
+}
+
+mod integer_symbol {
+  use super::*;
+
+  #[test]
+  fn integer_evaluates_to_itself() {
+    assert_eq!(interpret("Integer").unwrap(), "Integer");
+  }
+
+  #[test]
+  fn integer_attributes() {
+    assert_eq!(interpret("Attributes[Integer]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn integer_is_head_of_integers() {
+    assert_eq!(interpret("Head[5]").unwrap(), "Integer");
+    assert_eq!(interpret("Head[0]").unwrap(), "Integer");
+    assert_eq!(interpret("Head[-3]").unwrap(), "Integer");
+  }
+
+  #[test]
+  fn integer_function_call_is_inert() {
+    assert_eq!(interpret("Integer[3]").unwrap(), "Integer[3]");
+    assert_eq!(interpret("Integer[x]").unwrap(), "Integer[x]");
+  }
+
+  #[test]
+  fn match_integer_pattern() {
+    assert_eq!(interpret("MatchQ[5, _Integer]").unwrap(), "True");
+    assert_eq!(interpret("MatchQ[1/2, _Integer]").unwrap(), "False");
+    assert_eq!(interpret("MatchQ[3.0, _Integer]").unwrap(), "False");
+  }
+}
+
+mod matrix_form {
+  use super::*;
+
+  #[test]
+  fn matrix_form_basic() {
+    assert_eq!(
+      interpret("MatrixForm[{{1, 2}, {3, 4}}]").unwrap(),
+      "MatrixForm[{{1, 2}, {3, 4}}]"
+    );
+  }
+
+  #[test]
+  fn matrix_form_head() {
+    assert_eq!(
+      interpret("Head[MatrixForm[{{1, 2}, {3, 4}}]]").unwrap(),
+      "MatrixForm"
+    );
+  }
+
+  #[test]
+  fn matrix_form_attributes() {
+    assert_eq!(
+      interpret("Attributes[MatrixForm]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+
+  #[test]
+  fn matrix_form_single_list() {
+    assert_eq!(
+      interpret("MatrixForm[{1, 2, 3}]").unwrap(),
+      "MatrixForm[{1, 2, 3}]"
+    );
+  }
+
+  #[test]
+  fn matrix_form_from_array_4x3() {
+    assert_eq!(
+      interpret("Array[a,{4,3}]//MatrixForm").unwrap(),
+      "MatrixForm[{{a[1, 1], a[1, 2], a[1, 3]}, {a[2, 1], a[2, 2], a[2, 3]}, {a[3, 1], a[3, 2], a[3, 3]}, {a[4, 1], a[4, 2], a[4, 3]}}]"
+    );
+  }
+
+  #[test]
+  fn matrix_form_2x2_symbols() {
+    assert_eq!(
+      interpret("MatrixForm[{{a,b},{c,d}}]").unwrap(),
+      "MatrixForm[{{a, b}, {c, d}}]"
+    );
+  }
+}
+
+mod out_function {
+  use super::*;
+
+  #[test]
+  fn out_evaluates_to_itself() {
+    assert_eq!(interpret("Out").unwrap(), "Out");
+  }
+
+  #[test]
+  fn out_head_is_symbol() {
+    assert_eq!(interpret("Head[Out]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn out_attributes() {
+    assert_eq!(
+      interpret("Attributes[Out]").unwrap(),
+      "{Listable, NHoldFirst, Protected}"
+    );
+  }
+
+  #[test]
+  fn out_with_index_is_inert() {
+    assert_eq!(interpret("Out[1]").unwrap(), "Out[1]");
+  }
+}
+
+mod subscript_function {
+  use super::*;
+
+  #[test]
+  fn subscript_basic() {
+    assert_eq!(interpret("Subscript[x, 1]").unwrap(), "Subscript[x, 1]");
+  }
+
+  #[test]
+  fn subscript_head() {
+    assert_eq!(interpret("Head[Subscript[x, 1]]").unwrap(), "Subscript");
+  }
+
+  #[test]
+  fn subscript_attributes() {
+    assert_eq!(interpret("Attributes[Subscript]").unwrap(), "{NHoldRest}");
+  }
+
+  #[test]
+  fn subscript_multi_index() {
+    assert_eq!(
+      interpret("Subscript[x, 1, 2]").unwrap(),
+      "Subscript[x, 1, 2]"
+    );
+  }
+
+  #[test]
+  fn subscript_fullform() {
+    assert_eq!(
+      interpret("FullForm[Subscript[x, 1]]").unwrap(),
+      "FullForm[Subscript[x, 1]]"
+    );
+  }
+
+  #[test]
+  fn subsuperscript_stays_symbolic() {
+    assert_eq!(
+      interpret("Subsuperscript[a, p, q]").unwrap(),
+      "Subsuperscript[a, p, q]"
+    );
+  }
+}
+
+mod automatic_symbol {
+  use super::*;
+
+  #[test]
+  fn automatic_evaluates_to_itself() {
+    assert_eq!(interpret("Automatic").unwrap(), "Automatic");
+  }
+
+  #[test]
+  fn automatic_head_is_symbol() {
+    assert_eq!(interpret("Head[Automatic]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn automatic_is_protected() {
+    assert_eq!(interpret("Attributes[Automatic]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn undefined_is_protected() {
+    assert_eq!(interpret("Attributes[Undefined]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn composition_attributes() {
+    assert_eq!(
+      interpret("Attributes[Composition]").unwrap(),
+      "{Flat, OneIdentity, Protected}"
+    );
+  }
+
+  #[test]
+  fn hold_pattern_attributes() {
+    assert_eq!(
+      interpret("Attributes[HoldPattern]").unwrap(),
+      "{HoldAll, Protected}"
+    );
+  }
+
+  #[test]
+  fn make_boxes_attributes() {
+    assert_eq!(
+      interpret("Attributes[MakeBoxes]").unwrap(),
+      "{HoldAllComplete}"
+    );
+  }
+
+  #[test]
+  fn level_is_protected() {
+    assert_eq!(interpret("Attributes[Level]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn automatic_in_list() {
+    assert_eq!(interpret("{Automatic, None}").unwrap(), "{Automatic, None}");
+  }
+}
+
+mod true_symbol {
+  use super::*;
+
+  #[test]
+  fn true_evaluates_to_itself() {
+    assert_eq!(interpret("True").unwrap(), "True");
+  }
+
+  #[test]
+  fn true_head_is_symbol() {
+    assert_eq!(interpret("Head[True]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn true_is_protected() {
+    assert_eq!(
+      interpret("Attributes[True]").unwrap(),
+      "{Locked, Protected}"
+    );
+  }
+
+  #[test]
+  fn not_true_is_false() {
+    assert_eq!(interpret("Not[True]").unwrap(), "False");
+  }
+
+  #[test]
+  fn true_in_list() {
+    assert_eq!(
+      interpret("{True, False, True}").unwrap(),
+      "{True, False, True}"
+    );
+  }
+}
+
+mod slot_function {
+  use super::*;
+
+  #[test]
+  fn slot_displays_as_hash() {
+    assert_eq!(interpret("Slot[1]").unwrap(), "#1");
+    assert_eq!(interpret("Slot[2]").unwrap(), "#2");
+  }
+
+  #[test]
+  fn slot_head() {
+    assert_eq!(interpret("Head[Slot[1]]").unwrap(), "Slot");
+    assert_eq!(interpret("Head[#]").unwrap(), "Slot");
+  }
+
+  #[test]
+  fn slot_equals_hash() {
+    assert_eq!(interpret("Slot[1] === #").unwrap(), "True");
+  }
+
+  #[test]
+  fn slot_in_function() {
+    assert_eq!(interpret("Function[Slot[1]^2][5]").unwrap(), "25");
+  }
+
+  #[test]
+  fn slot_multi_arg_function() {
+    assert_eq!(interpret("Function[Slot[1] + Slot[2]][3, 4]").unwrap(), "7");
+  }
+
+  #[test]
+  fn slot_hash_syntax() {
+    assert_eq!(interpret("#^2 &[3]").unwrap(), "9");
+  }
+
+  // Regression tests for `&` precedence: `&` is 90 in Wolfram, which is
+  // tighter than Set (40) but looser than Equal (290) and all arithmetic
+  // infix operators, so both of these bindings must be preserved.
+
+  #[test]
+  fn amp_binds_whole_equality_with_function_call_operands() {
+    // Function call on both sides of == followed by `&`: the whole
+    // equality must become the Function body.
+    assert_eq!(
+      interpret("Head[Mod[#1, 3] == Mod[#2, 3] &]").unwrap(),
+      "Function"
+    );
+    assert_eq!(
+      interpret("(Mod[#1, 3] == Mod[#2, 3] &)[1, 4]").unwrap(),
+      "True"
+    );
+    assert_eq!(
+      interpret("(Mod[#1, 3] == Mod[#2, 3] &)[1, 5]").unwrap(),
+      "False"
+    );
+  }
+
+  #[test]
+  fn amp_binds_whole_inequality_with_function_call_operands() {
+    assert_eq!(
+      interpret("(Sort[#1] == Sort[#2] &)[{1, 2}, {2, 1}]").unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn amp_binds_tighter_than_set_on_plain_body() {
+    // `f = body &` must parse as Set[f, Function[body]], not
+    // Function[Set[f, body]].
+    assert_eq!(interpret("f = Sqrt[#] &; f[16]").unwrap(), "4");
+  }
+
+  #[test]
+  fn amp_binds_tighter_than_set_delayed_on_plain_body() {
+    assert_eq!(interpret("g := #^2 &; g[7]").unwrap(), "49");
+  }
+
+  #[test]
+  fn amp_binds_tighter_than_set_with_function_call_body() {
+    assert_eq!(interpret("h = Plus[##] &; h[1, 2, 3, 4]").unwrap(), "10");
+  }
+
+  #[test]
+  fn destructuring_assignment() {
+    assert_eq!(
+      interpret("Clear[a, b, c]; {a, b, c} = {10, 2, 3}").unwrap(),
+      "{10, 2, 3}"
+    );
+    assert_eq!(
+      interpret("Clear[a, b, c]; {a, b, c} = {10, 2, 3}; {a, b, c}").unwrap(),
+      "{10, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn destructuring_assignment_nested() {
+    assert_eq!(
+      interpret(
+        "Clear[a, b, c, d]; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {3}}}; {a, b, c, d}"
+      )
+      .unwrap(),
+      "{1, 2, {c1, c2}, 3}"
+    );
+  }
+
+  #[test]
+  fn destructuring_assignment_returns_post_assign_value() {
+    // Wolfram returns the RHS re-evaluated in the post-assignment
+    // environment: the trailing `{a}` becomes `{1}` because `a` was
+    // just bound to 1 by the destructuring.
+    assert_eq!(
+      interpret(
+        "Clear[a, b, c, d]; {a, b, {c, {d}}} = {1, 2, {{c1, c2}, {a}}}"
+      )
+      .unwrap(),
+      "{1, 2, {{c1, c2}, {1}}}"
+    );
+  }
+}
+
+mod set_delayed {
+  use super::*;
+
+  #[test]
+  fn function_form_defines_function() {
+    assert_eq!(interpret("SetDelayed[h[x_], x^3]; h[4]").unwrap(), "64");
+  }
+
+  #[test]
+  fn colon_equals_syntax() {
+    assert_eq!(interpret("f[x_] := x^2; f[3]").unwrap(), "9");
+  }
+
+  #[test]
+  fn function_form_simple_variable() {
+    assert_eq!(
+      interpret("Clear[myvar]; SetDelayed[myvar, 42]; myvar").unwrap(),
+      "42"
+    );
+  }
+
+  #[test]
+  fn delayed_evaluation() {
+    // SetDelayed evaluates the RHS each time
+    assert_eq!(
+      interpret("n = 0; f[x_] := (n = n + 1; x + n); {f[10], f[10]}").unwrap(),
+      "{11, 12}"
+    );
+  }
+
+  #[test]
+  fn set_delayed_own_value_evaluates_on_access() {
+    // `x := 2 + 3; x` must evaluate the body on lookup, not return the
+    // stored `Plus[2, 3]` form. Regression: previously the lookup heuristic
+    // only re-evaluated when the body contained a free Identifier in ENV.
+    assert_eq!(interpret("x := 2 + 3; x").unwrap(), "5");
+  }
+
+  #[test]
+  fn set_delayed_function_call_body_evaluates_on_access() {
+    // `x := ToString[5^4^3^2]` references no other identifiers, so the old
+    // `needs_reevaluation` check returned false and `x` came back as the
+    // unevaluated FunctionCall. Verify the body actually runs.
+    assert_eq!(
+      interpret("s := ToString[5^4^3^2]; StringTake[s, 20]").unwrap(),
+      "62060698786608744707"
+    );
+  }
+}
+
+mod compound_expression {
+  use super::*;
+
+  #[test]
+  fn function_form_returns_last() {
+    assert_eq!(interpret("CompoundExpression[1, 2, 3]").unwrap(), "3");
+  }
+
+  #[test]
+  fn function_form_single_arg() {
+    assert_eq!(interpret("CompoundExpression[42]").unwrap(), "42");
+  }
+
+  #[test]
+  fn function_form_no_args_returns_null() {
+    assert_eq!(interpret("CompoundExpression[]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn function_form_with_assignments() {
+    assert_eq!(
+      interpret("CompoundExpression[a = 2, b = 3, a + b]").unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn semicolon_syntax() {
+    assert_eq!(interpret("a = 2; b = 3; a + b").unwrap(), "5");
+  }
+
+  #[test]
+  fn compound_expression_inside_list_element() {
+    // Wolfram allows `;` inside a list element: each comma-separated
+    // slot can be a CompoundExpression. The list value is the last
+    // expression of each slot, side effects run left-to-right.
+    clear_state();
+    assert_eq!(interpret("{a; b, c}").unwrap(), "{b, c}");
+    assert_eq!(
+      interpret("{F[a, b], F = Q; F[a, b], Clear[F]; F[a, b]}").unwrap(),
+      "{F[a, b], Q[a, b], F[a, b]}"
+    );
+  }
+
+  #[test]
+  fn function_form_with_side_effects() {
+    // Side effects execute sequentially
+    assert_eq!(
+      interpret("CompoundExpression[x = 10, x = x + 1, x]").unwrap(),
+      "11"
+    );
+  }
+}
+
+mod hold_form {
+  use super::*;
+
+  #[test]
+  fn hold_form_unevaluated() {
+    // HoldForm prevents evaluation; at the top level the wrapper is kept
+    // (matching `wolframscript -code 'HoldForm[1 + 1]'` → `HoldForm[1 + 1]`).
+    // Nested HoldForm still strips its wrapper.
+    assert_eq!(interpret("HoldForm[1 + 1]").unwrap(), "HoldForm[1 + 1]");
+  }
+}
+
+mod numerator {
+  use super::*;
+
+  #[test]
+  fn rational() {
+    assert_eq!(interpret("Numerator[3/4]").unwrap(), "3");
+  }
+
+  #[test]
+  fn integer() {
+    assert_eq!(interpret("Numerator[5]").unwrap(), "5");
+  }
+
+  #[test]
+  fn negative_rational() {
+    assert_eq!(interpret("Numerator[-3/4]").unwrap(), "-3");
+  }
+
+  #[test]
+  fn whole_number_rational() {
+    assert_eq!(interpret("Numerator[6/3]").unwrap(), "2");
+  }
+
+  #[test]
+  fn symbolic_fraction() {
+    assert_eq!(interpret("Numerator[x/y]").unwrap(), "x");
+  }
+
+  #[test]
+  fn multi_factor_fraction() {
+    assert_eq!(interpret("Numerator[(a*b)/(c*d)]").unwrap(), "a*b");
+  }
+
+  #[test]
+  fn mixed_rational_symbolic_fraction() {
+    assert_eq!(interpret("Numerator[(3*x^2)/(7*y)]").unwrap(), "3*x^2");
+  }
+
+  #[test]
+  fn fraction_with_power_in_denom() {
+    assert_eq!(interpret("Numerator[a/b^2]").unwrap(), "a");
+  }
+
+  #[test]
+  fn product_without_denominator() {
+    assert_eq!(interpret("Numerator[a*b*c]").unwrap(), "a*b*c");
+  }
+
+  // Power[Rational, fractional] splits: Numerator[Sqrt[3/11]] → Sqrt[3]
+  // (differential fuzzer, seed 1783631489573774000; wolframscript-verified)
+  #[test]
+  fn sqrt_of_rational_splits() {
+    assert_eq!(interpret("Numerator[Sqrt[3/11]]").unwrap(), "Sqrt[3]");
+  }
+
+  #[test]
+  fn sqrt_of_rational_in_product() {
+    assert_eq!(interpret("Numerator[x*Sqrt[3/11]]").unwrap(), "Sqrt[3]*x");
+  }
+
+  #[test]
+  fn rational_power_symbolic_exponent_stays_whole() {
+    assert_eq!(interpret("Numerator[(3/11)^x]").unwrap(), "(3/11)^x");
+  }
+
+  #[test]
+  fn radical_quotient_regression() {
+    // fuzzer divergence: Sqrt[2]/Sqrt[22]*Sqrt[27] evaluates to 3*Sqrt[3/11]
+    assert_eq!(
+      interpret(
+        "Numerator[Times[Divide[Sqrt[2], Sqrt[22]], Plus[Sqrt[27], Times[0, Sqrt[20]]]]]"
+      )
+      .unwrap(),
+      "3*Sqrt[3]"
+    );
+  }
+}
+
+mod denominator {
+  use super::*;
+
+  #[test]
+  fn rational() {
+    assert_eq!(interpret("Denominator[3/4]").unwrap(), "4");
+  }
+
+  #[test]
+  fn integer() {
+    assert_eq!(interpret("Denominator[5]").unwrap(), "1");
+  }
+
+  #[test]
+  fn negative_rational() {
+    assert_eq!(interpret("Denominator[-3/4]").unwrap(), "4");
+  }
+
+  #[test]
+  fn reduced_form() {
+    assert_eq!(interpret("Denominator[6/4]").unwrap(), "2");
+  }
+
+  #[test]
+  fn symbolic_fraction() {
+    assert_eq!(interpret("Denominator[x/y]").unwrap(), "y");
+  }
+
+  #[test]
+  fn multi_factor_fraction() {
+    assert_eq!(interpret("Denominator[(a*b)/(c*d)]").unwrap(), "c*d");
+  }
+
+  #[test]
+  fn mixed_rational_symbolic_fraction() {
+    assert_eq!(interpret("Denominator[(3*x^2)/(7*y)]").unwrap(), "7*y");
+  }
+
+  #[test]
+  fn fraction_with_power_in_denom() {
+    assert_eq!(interpret("Denominator[a/b^2]").unwrap(), "b^2");
+  }
+
+  #[test]
+  fn product_without_denominator() {
+    assert_eq!(interpret("Denominator[a*b*c]").unwrap(), "1");
+  }
+
+  // wolframscript-verified: Denominator[Sqrt[3/11]] → Sqrt[11],
+  // Denominator[5*(3/11)^(2/3)] → 11^(2/3)
+  #[test]
+  fn sqrt_of_rational_splits() {
+    assert_eq!(interpret("Denominator[Sqrt[3/11]]").unwrap(), "Sqrt[11]");
+  }
+
+  #[test]
+  fn rational_power_in_product() {
+    assert_eq!(
+      interpret("Denominator[5*(3/11)^(2/3)]").unwrap(),
+      "11^(2/3)"
+    );
+  }
+}
+
+mod unknown_function_no_args {
+  use super::*;
+
+  #[test]
+  fn undefined_symbol_called_with_no_args_stays_symbolic() {
+    assert_eq!(interpret("A[]").unwrap(), "A[]");
+  }
+
+  #[test]
+  fn undefined_symbol_with_blank_and_symbol_args_stays_symbolic() {
+    assert_eq!(interpret("A[p_, q]").unwrap(), "A[p_, q]");
+  }
+
+  #[test]
+  fn undefined_curried_subvalue_call_stays_symbolic() {
+    assert_eq!(interpret("A[x][t]").unwrap(), "A[x][t]");
+  }
+
+  #[test]
+  fn undefined_symbol_with_blank_arg_and_symbol_tag_stays_symbolic() {
+    assert_eq!(interpret("S[x_, A]").unwrap(), "S[x_, A]");
+  }
+
+  #[test]
+  fn undefined_symbol_with_blank_and_typed_blank_arg_stays_symbolic() {
+    assert_eq!(interpret("S[x_, _A]").unwrap(), "S[x_, _A]");
+  }
+
+  #[test]
+  fn typed_blank_called_with_no_args_stays_symbolic() {
+    assert_eq!(interpret("_A[]").unwrap(), "_A[]");
+  }
+
+  #[test]
+  fn typed_blank_stays_symbolic() {
+    assert_eq!(interpret("_A").unwrap(), "_A");
+  }
+
+  #[test]
+  fn bare_condition_on_undefined_symbol_stays_symbolic() {
+    assert_eq!(interpret("A/;A>0").unwrap(), "A /; A > 0");
+  }
+
+  #[test]
+  fn condition_on_undefined_function_call_stays_symbolic() {
+    assert_eq!(interpret("A[p_, q]/;q>0").unwrap(), "A[p_, q] /; q > 0");
+  }
+
+  #[test]
+  fn display_form_with_interpretation_box_pattern_stays_symbolic() {
+    assert_eq!(
+      interpret("DisplayForm[boxexpr_InterpretationBox]").unwrap(),
+      "DisplayForm[boxexpr_InterpretationBox]"
+    );
+  }
+
+  #[test]
+  fn n_of_undefined_function_with_pattern_unwraps_n() {
+    assert_eq!(interpret("N[A[s_]]").unwrap(), "A[s_]");
+  }
+
+  #[test]
+  fn exponential_e_named_char_evaluates_to_e() {
+    assert_eq!(interpret("\\[ExponentialE]").unwrap(), "E");
+  }
+
+  #[test]
+  fn imaginary_j_named_char_evaluates_to_i() {
+    assert_eq!(interpret("\\[ImaginaryJ]").unwrap(), "I");
+  }
+
+  #[test]
+  fn imaginary_i_named_char_evaluates_to_i() {
+    assert_eq!(interpret("\\[ImaginaryI]").unwrap(), "I");
+  }
+
+  /// `\[LeftBracketingBar]`/`\[RightBracketingBar]` (the bars `Abs`/`Norm`
+  /// typeset with) and their double-bar counterparts have no public
+  /// Unicode code point, so like `\[Rule]` they live in Wolfram's private
+  /// use area. Regression: they were missing from the parse table
+  /// entirely, so a string built with them kept the literal `\[...]`
+  /// escape text instead of resolving to a private-use code point.
+  #[test]
+  fn bracketing_bar_named_chars_parse_to_private_use_code_points() {
+    assert_eq!(
+      interpret(
+        "ToCharacterCode[\"\\[LeftBracketingBar]a\\[RightBracketingBar]\"]"
+      )
+      .unwrap(),
+      "{62979, 97, 62980}"
+    );
+    assert_eq!(
+      interpret(
+        "ToCharacterCode[\"\\[LeftDoubleBracketingBar]a\\[RightDoubleBracketingBar]\"]"
+      )
+      .unwrap(),
+      "{62981, 97, 62982}"
+    );
+  }
+
+  /// A named character that is a letter spells a symbol with that letter,
+  /// not with its own name: `\[AAcute]` is `á`, and `\[ScriptX]` is the
+  /// letter of Wolfram's private-use script alphabet (U+F6C9). Regression:
+  /// the letters outside the Greek block fell back to their names, so a
+  /// definition made with one could not be used through the other spelling.
+  #[test]
+  fn letter_named_chars_spell_symbols_with_the_letter() {
+    assert_eq!(
+      interpret("ToCharacterCode[ToString[Hold[\\[AAcute] + 1], InputForm]]")
+        .unwrap(),
+      "{72, 111, 108, 100, 91, 225, 32, 43, 32, 49, 93}"
+    );
+    assert_eq!(
+      interpret("ToCharacterCode[ToString[Hold[\\[ScriptX] + 1], InputForm]]")
+        .unwrap(),
+      "{72, 111, 108, 100, 91, 63177, 32, 43, 32, 49, 93}"
+    );
+    // The same symbol, so a definition written with the escape is found by
+    // the pattern written with it.
+    assert_eq!(
+      interpret("f[\\[ScriptX]_] := \\[ScriptX] + 1; f[2]").unwrap(),
+      "3"
+    );
+    // Wolfram's script letters are private-use characters, so they can be
+    // written literally too.
+    assert_eq!(interpret("\u{F773} = 3; \u{F773}^2").unwrap(), "9");
+  }
+
+  #[test]
+  fn function_with_trailing_semicolon_evaluates_to_null_arg() {
+    assert_eq!(interpret("f[a;]").unwrap(), "f[Null]");
+  }
+
+  #[test]
+  fn double_question_on_undefined_symbol_yields_missing_unknown_symbol() {
+    assert_eq!(
+      interpret("a + ?? b").unwrap(),
+      "a + Missing[UnknownSymbol, b]"
+    );
+  }
+
+  #[test]
+  fn tag_set_delayed_installs_upvalue_and_applies() {
+    assert_eq!(
+      interpret("f /: f[x_] + f[y_] := x + y; f[a] + f[b]").unwrap(),
+      "a + b"
+    );
+  }
+
+  #[test]
+  fn undefined_function_called_with_real_stays_symbolic() {
+    assert_eq!(interpret("F[3.]").unwrap(), "F[3.]");
+  }
+
+  #[test]
+  fn bare_undefined_symbol_stays_itself() {
+    assert_eq!(interpret("b").unwrap(), "b");
+  }
+}
+
+mod symbolic_ordering {
+  use super::*;
+
+  #[test]
+  fn numbers_before_symbols() {
+    assert_eq!(interpret("cow + 5").unwrap(), "5 + cow");
+  }
+
+  #[test]
+  fn numeric_terms_combined() {
+    assert_eq!(interpret("cow + 5 + 10").unwrap(), "15 + cow");
+  }
+
+  #[test]
+  fn multiple_symbolic_terms_sorted() {
+    assert_eq!(interpret("z + a + 3").unwrap(), "3 + a + z");
+  }
+}
+
+mod power_formatting {
+  use super::*;
+
+  #[test]
+  fn power_exponent_with_plus_gets_parens() {
+    // D[x^n, x] = n*x^(-1 + n)
+    assert_eq!(interpret("D[x^n, x]").unwrap(), "n*x^(-1 + n)");
+  }
+
+  #[test]
+  fn power_plus_base_gets_parens() {
+    assert_eq!(interpret("(1 + x)^(-1)").unwrap(), "(1 + x)^(-1)");
+    assert_eq!(interpret("(-1 + x)^(-1)").unwrap(), "(-1 + x)^(-1)");
+    assert_eq!(interpret("(2 + x)^3").unwrap(), "(2 + x)^3");
+  }
+}
+
+mod table_form {
+  use super::*;
+
+  #[test]
+  fn returns_unevaluated() {
+    // TableForm is a display wrapper — returns unevaluated in text mode
+    // (matches wolframscript behavior)
+    assert_eq!(
+      interpret("TableForm[{1, 2, 3}]").unwrap(),
+      "TableForm[{1, 2, 3}]"
+    );
+    assert_eq!(
+      interpret("TableForm[{{1, 2, 3}, {4, 5, 6}}]").unwrap(),
+      "TableForm[{{1, 2, 3}, {4, 5, 6}}]"
+    );
+    assert_eq!(interpret("TableForm[5]").unwrap(), "TableForm[5]");
+    assert_eq!(interpret("TableForm[x]").unwrap(), "TableForm[x]");
+  }
+
+  #[test]
+  fn evaluates_arguments() {
+    // Arguments are evaluated, but TableForm wrapper remains
+    assert_eq!(
+      interpret("TableForm[Table[i^2, {i, 3}]]").unwrap(),
+      "TableForm[{1, 4, 9}]"
+    );
+    assert_eq!(
+      interpret("TableForm[{1 + 1, 2 + 2}]").unwrap(),
+      "TableForm[{2, 4}]"
+    );
+  }
+
+  #[test]
+  fn postfix_notation() {
+    assert_eq!(
+      interpret("{1, 2, 3} // TableForm").unwrap(),
+      "TableForm[{1, 2, 3}]"
+    );
+  }
+}
+
+mod row {
+  use super::*;
+
+  #[test]
+  fn no_separator() {
+    // Row[{exprs...}] concatenates elements with no separator
+    assert_eq!(interpret("Row[{1, 2, 3}]").unwrap(), "123");
+    assert_eq!(interpret("Row[{a, b, c}]").unwrap(), "abc");
+  }
+
+  #[test]
+  fn with_separator() {
+    // Row[{exprs...}, sep] joins elements with sep between them
+    assert_eq!(interpret(r#"Row[{1, 2, 3}, ", "]"#).unwrap(), "1, 2, 3");
+    assert_eq!(interpret(r#"Row[{a, b, c}, "+"]"#).unwrap(), "a+b+c");
+    assert_eq!(interpret(r#"Row[{x, y, z}, " | "]"#).unwrap(), "x | y | z");
+  }
+
+  #[test]
+  fn evaluates_arguments() {
+    // Arguments inside the list are evaluated before display
+    assert_eq!(interpret("Row[{1 + 1, 2 + 2}]").unwrap(), "24");
+    assert_eq!(interpret(r#"Row[{1 + 1, 2 + 2}, " "]"#).unwrap(), "2 4");
+  }
+
+  #[test]
+  fn single_element() {
+    assert_eq!(interpret("Row[{42}]").unwrap(), "42");
+    assert_eq!(interpret(r#"Row[{42}, ", "]"#).unwrap(), "42");
+  }
+
+  #[test]
+  fn empty_list() {
+    assert_eq!(interpret("Row[{}]").unwrap(), "");
+    // Row[{}, sep] prints as {} in wolframscript.
+    assert_eq!(interpret(r#"Row[{}, ", "]"#).unwrap(), "{}");
+  }
+
+  #[test]
+  fn with_strings() {
+    assert_eq!(
+      interpret(r#"Row[{"Hello", " ", "World"}]"#).unwrap(),
+      "Hello World"
+    );
+  }
+
+  #[test]
+  fn postfix_notation() {
+    assert_eq!(interpret("{1, 2, 3} // Row").unwrap(), "123");
+  }
+
+  #[test]
+  fn non_list_arg_stays_symbolic() {
+    // Row[x] where x is not a list stays unevaluated
+    assert_eq!(interpret("Row[x]").unwrap(), "Row[x]");
+    assert_eq!(interpret("Row[5]").unwrap(), "Row[5]");
+  }
+}
+
+mod sequence {
+  use super::*;
+
+  #[test]
+  fn basic_flattening() {
+    assert_eq!(interpret("f[Sequence[a, b]]").unwrap(), "f[a, b]");
+  }
+
+  #[test]
+  fn in_middle_of_args() {
+    assert_eq!(
+      interpret("f[x, Sequence[a, b], y]").unwrap(),
+      "f[x, a, b, y]"
+    );
+  }
+
+  #[test]
+  fn in_list() {
+    assert_eq!(interpret("{a, Sequence[b, c], d}").unwrap(), "{a, b, c, d}");
+  }
+
+  #[test]
+  fn empty_sequence() {
+    assert_eq!(interpret("f[a, Sequence[], b]").unwrap(), "f[a, b]");
+  }
+
+  #[test]
+  fn hold_flattens_sequence() {
+    assert_eq!(
+      interpret("Hold[a, Sequence[b, c], d]").unwrap(),
+      "Hold[a, b, c, d]"
+    );
+  }
+}
+
+mod hold {
+  use super::*;
+
+  #[test]
+  fn hold_prevents_evaluation() {
+    assert_eq!(interpret("Hold[1 + 2]").unwrap(), "Hold[1 + 2]");
+  }
+
+  #[test]
+  fn hold_form_prevents_evaluation() {
+    // HoldForm prevents evaluation; at the top level the wrapper is kept
+    // (`wolframscript -code 'HoldForm[1 + 2 + 3]'` → `HoldForm[1 + 2 + 3]`).
+    assert_eq!(
+      interpret("HoldForm[1 + 2 + 3]").unwrap(),
+      "HoldForm[1 + 2 + 3]"
+    );
+  }
+
+  #[test]
+  fn hold_complete_prevents_evaluation() {
+    assert_eq!(
+      interpret("HoldComplete[Evaluate[1 + 2]]").unwrap(),
+      "HoldComplete[Evaluate[1 + 2]]"
+    );
+  }
+
+  #[test]
+  fn release_hold_basic() {
+    assert_eq!(interpret("ReleaseHold[Hold[1 + 2]]").unwrap(), "3");
+  }
+
+  #[test]
+  fn release_hold_form() {
+    assert_eq!(interpret("ReleaseHold[HoldForm[1 + 2]]").unwrap(), "3");
+  }
+
+  #[test]
+  fn release_hold_non_hold() {
+    assert_eq!(interpret("ReleaseHold[5]").unwrap(), "5");
+    assert_eq!(interpret("ReleaseHold[x]").unwrap(), "x");
+  }
+
+  // ReleaseHold removes Hold-family wrappers wherever they appear, not just at
+  // the top level (one top-down pass, like ReplaceAll).
+  #[test]
+  fn release_hold_recursive() {
+    assert_eq!(
+      interpret("ReleaseHold[{Hold[1 + 1], HoldForm[2 + 2]}]").unwrap(),
+      "{2, 4}"
+    );
+    assert_eq!(interpret("ReleaseHold[f[Hold[1 + 1]]]").unwrap(), "f[2]");
+    assert_eq!(
+      interpret("ReleaseHold[Hold[1 + 1] + Hold[2 + 2]]").unwrap(),
+      "6"
+    );
+    assert_eq!(interpret("ReleaseHold[Hold[1 + 1]^2]").unwrap(), "4");
+    assert_eq!(
+      interpret("ReleaseHold[g[HoldPattern[2 + 3]]]").unwrap(),
+      "g[5]"
+    );
+    assert_eq!(interpret("ReleaseHold[HoldComplete[1 + 1]]").unwrap(), "2");
+  }
+
+  // Releasing does not descend into the content it just released: the inner
+  // Hold survives.
+  #[test]
+  fn release_hold_nested_inner_kept() {
+    assert_eq!(
+      interpret("ReleaseHold[Hold[Hold[1 + 1]]]").unwrap(),
+      "Hold[1 + 1]"
+    );
+  }
+
+  // Defer is not a held wrapper that ReleaseHold removes.
+  #[test]
+  fn release_hold_defer_unchanged() {
+    assert_eq!(
+      interpret("ReleaseHold[Defer[1 + 1]]").unwrap(),
+      "Defer[1 + 1]"
+    );
+  }
+}
+
+mod deeply_nested_lists {
+  use super::*;
+
+  #[test]
+  fn nested_list_in_function_in_list() {
+    // Regression test: deeply nested lists inside function calls inside lists
+    // previously caused exponential backtracking in the PEG parser
+    assert_eq!(interpret("{f[{1, {{{1}}}}]}").unwrap(), "{f[{1, {{{1}}}}]}");
+  }
+
+  #[test]
+  fn deeply_nested_braces() {
+    // pest's recursive-descent parser grows ~stack-frames-per-bracket
+    // with the input, so 6 nested braces overflow a thread with a small
+    // stack. `interpret` must move itself onto a large stack segment rather
+    // than depend on the caller's thread size (the CLI's worker has 512 MiB,
+    // a library host's thread may have far less). Run on a 1 MiB thread.
+    std::thread::Builder::new()
+      .stack_size(1024 * 1024)
+      .spawn(|| {
+        assert_eq!(
+          interpret("{f[{1, {{{{{{1}}}}}}}]}").unwrap(),
+          "{f[{1, {{{{{{1}}}}}}}]}"
+        );
+      })
+      .unwrap()
+      .join()
+      .unwrap();
+  }
+
+  #[test]
+  fn default_thread_stack_does_not_slow_evaluation() {
+    // The evaluator calls `stacker::maybe_grow` with a 2 MiB red zone on every
+    // recursive step. When a hot loop runs right at that boundary of the
+    // caller's stack, each iteration crossing it mmaps and munmaps a fresh
+    // segment. On a 2 MiB thread — Rust's default, and libtest's — NSum over
+    // two infinite ranges hit exactly that and took 7s instead of 0.5s
+    // (timing out under full-suite load). `interpret` now moves onto a large
+    // segment once at entry, so the caller's thread size no longer matters.
+    // Where the boundary falls depends on frame sizes, so this pins the
+    // configuration that regressed rather than proving the general case.
+    fn time_on_stack(stack_size: usize) -> std::time::Duration {
+      std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(|| {
+          let start = std::time::Instant::now();
+          let v: f64 =
+            interpret("NSum[1/(i^2 j^2), {i, 1, Infinity}, {j, 1, Infinity}]")
+              .unwrap()
+              .parse()
+              .unwrap();
+          assert!((v - 2.705808084277845).abs() < 1e-6, "got {v}");
+          start.elapsed()
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+    }
+    let large = time_on_stack(512 * 1024 * 1024);
+    let default = time_on_stack(2 * 1024 * 1024);
+    assert!(
+      default < large * 4,
+      "2 MiB thread took {default:?}, 512 MiB thread took {large:?}"
+    );
+  }
+
+  #[test]
+  fn nested_lists_still_evaluate() {
+    // Ensure lists still evaluate correctly after grammar optimization
+    assert_eq!(interpret("{1 + 1, {2 + 2}}").unwrap(), "{2, {4}}");
+    assert_eq!(interpret("{{1, 2}, {3, 4}}[[1]]").unwrap(), "{1, 2}");
+    assert_eq!(interpret("{#, #^2}&[3]").unwrap(), "{3, 9}");
+  }
+
+  #[test]
+  fn replacement_rules_in_lists() {
+    // Ensure replacement rules still work in lists after grammar optimization
+    assert_eq!(interpret("{x -> 1, y -> 2}").unwrap(), "{x -> 1, y -> 2}");
+    assert_eq!(interpret("x /. {x -> 5}").unwrap(), "5");
+  }
+}
+
+mod grid {
+  use super::*;
+
+  #[test]
+  fn basic_2x2() {
+    clear_state();
+    let svg =
+      interpret("ExportString[Grid[{{a, b}, {c, d}}], \"SVG\"]").unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">a</text>"));
+    assert!(svg.contains(">d</text>"));
+  }
+
+  #[test]
+  fn one_dimensional_list() {
+    clear_state();
+    let svg = interpret("ExportString[Grid[{a, b, c}], \"SVG\"]").unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">a</text>"));
+    assert!(svg.contains(">c</text>"));
+  }
+
+  #[test]
+  fn arguments_are_evaluated() {
+    clear_state();
+    let svg =
+      interpret("ExportString[Grid[{{1+1, 2+2}, {3+3, 4+4}}], \"SVG\"]")
+        .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">2</text>"));
+    assert!(svg.contains(">8</text>"));
+  }
+
+  #[test]
+  fn with_options() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{1, 2}, {3, 4}}, Alignment -> Center], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+  }
+
+  #[test]
+  fn single_element() {
+    clear_state();
+    let svg = interpret("ExportString[Grid[{{x}}], \"SVG\"]").unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">x</text>"));
+  }
+
+  #[test]
+  fn postfix_form() {
+    clear_state();
+    let svg =
+      interpret("ExportString[{{a, b}, {c, d}} // Grid, \"SVG\"]").unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">a</text>"));
+  }
+
+  #[test]
+  fn frame_all() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{a, b, c}, {x, y^2, z^3}}, Frame -> All], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains("<line"), "Frame -> All should produce lines");
+  }
+
+  #[test]
+  fn frame_all_with_other_options() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[Grid[{{1, 2}, {3, 4}}, Alignment -> Center, Frame -> All], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains("<line"), "Frame -> All should produce lines");
+  }
+
+  #[test]
+  fn traditional_form_grid() {
+    clear_state();
+    // CLI mode keeps TraditionalForm[Grid[...]] symbolic to match
+    // wolframscript; the SVG render only happens in visual mode.
+    assert_eq!(
+      interpret("TraditionalForm[Grid[{{1, 2}, {3, 4}}, Frame -> All]]")
+        .unwrap(),
+      "TraditionalForm[Grid[{{1, 2}, {3, 4}}, Frame -> All]]"
+    );
+  }
+
+  #[test]
+  fn traditional_form_grid_svg_content() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[TraditionalForm[Grid[{{a, b}, {c, d}}, Frame -> All]], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">a</text>"));
+    assert!(svg.contains(">d</text>"));
+    assert!(svg.contains("<line"), "Frame -> All should produce lines");
+  }
+
+  #[test]
+  fn traditional_form_grid_with_table() {
+    clear_state();
+    // CLI mode keeps TraditionalForm[Grid[...]] symbolic to match
+    // wolframscript; the SVG render only happens in visual mode.
+    let out = interpret(
+      "f[x_] := x^2; values = Table[{i, f[i]}, {i, 1, 10, 1}]; PrependTo[values, {\"x\", \"x^2\"}]; TraditionalForm[Grid[values, Frame -> All]]"
+    )
+    .unwrap();
+    assert!(out.starts_with("TraditionalForm[Grid["), "got: {out}");
+    assert!(out.contains("x^2"));
+  }
+
+  #[test]
+  fn traditional_form_list_renders_as_matrix() {
+    clear_state();
+    let result =
+      interpret_with_stdout("TraditionalForm[{{1, 2}, {3, 4}}]").unwrap();
+    assert_eq!(result.result, "-Graphics-");
+    let svg = result.graphics.unwrap();
+    // Should render all elements
+    for val in ["1", "2", "3", "4"] {
+      assert!(
+        svg.contains(&format!(">{val}</text>")),
+        "Missing value {val} in TraditionalForm matrix SVG"
+      );
+    }
+  }
+
+  #[test]
+  fn traditional_form_1d_list_renders_as_column_vector() {
+    clear_state();
+    let result = interpret_with_stdout("TraditionalForm[{a, b, c}]").unwrap();
+    assert_eq!(result.result, "-Graphics-");
+    let svg = result.graphics.unwrap();
+    for val in ["a", "b", "c"] {
+      assert!(
+        svg.contains(&format!(">{val}</text>")),
+        "Missing value {val} in TraditionalForm column SVG"
+      );
+    }
+  }
+}
+
+mod text_grid {
+  use super::*;
+
+  #[test]
+  fn basic_2x2() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[TextGrid[{{\"item 1\", \"item 2\"}, {\"item 3\", \"item 4\"}}], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">item 1</text>"));
+    assert!(svg.contains(">item 4</text>"));
+  }
+
+  #[test]
+  fn renders_as_graphics() {
+    clear_state();
+    // CLI mode keeps TextGrid symbolic to match wolframscript; the SVG
+    // render only happens in visual mode.
+    let out = interpret(
+      "TextGrid[{{\"item 1\", \"item 2\"}, {\"item 3\", \"item 4\"}}, Frame -> All]",
+    )
+    .unwrap();
+    assert!(out.starts_with("TextGrid["), "got: {out}");
+  }
+
+  #[test]
+  fn frame_all() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[TextGrid[{{\"a\", \"b\"}, {\"c\", \"d\"}}, Frame -> All], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains("<line"), "Frame -> All should produce lines");
+  }
+
+  #[test]
+  fn with_numeric_data() {
+    clear_state();
+    let svg = interpret(
+      "ExportString[TextGrid[{{1, 2}, {3, 4}}, Frame -> All], \"SVG\"]",
+    )
+    .unwrap();
+    assert!(svg.starts_with("<svg"));
+    assert!(svg.contains(">1</text>"));
+    assert!(svg.contains(">4</text>"));
+  }
+}
+
+mod tag_set_delayed {
+  use super::*;
+
+  #[test]
+  fn basic_upvalue() {
+    // g /: f[g[x_]] := fg[x] — defines an upvalue for g
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := fg[x]; {f[g[2]], f[h[2]]}").unwrap(),
+      "{fg[2], f[h[2]]}"
+    );
+  }
+
+  #[test]
+  fn multi_arg_upvalue() {
+    // Upvalue with multiple arguments
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_], y_] := fg[x, y]; f[g[2], 3]").unwrap(),
+      "fg[2, 3]"
+    );
+  }
+
+  #[test]
+  fn multiple_upvalues_same_tag() {
+    // Multiple upvalue definitions for the same tag
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := fg[x]; g /: h[g[x_]] := hg[x]; {f[g[3]], h[g[5]], f[5]}").unwrap(),
+      "{fg[3], hg[5], f[5]}"
+    );
+  }
+
+  #[test]
+  fn overwrite_upvalue() {
+    // Later definitions take priority
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := fg[x]; g /: f[g[x_]] := fg2[x]; {f[g[2]]}")
+        .unwrap(),
+      "{fg2[2]}"
+    );
+  }
+
+  #[test]
+  fn tag_set_evaluated_rhs() {
+    // TagSet (=) evaluates the RHS
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] = fg[x]; {f[g[2]], f[h[2]]}").unwrap(),
+      "{fg[2], f[h[2]]}"
+    );
+  }
+
+  #[test]
+  fn tag_set_returns_rhs() {
+    // TagSet returns the evaluated RHS (unlike TagSetDelayed which returns Null)
+    clear_state();
+    assert_eq!(interpret("g /: f[g[x_]] = 1 + 2").unwrap(), "3");
+  }
+
+  #[test]
+  fn tag_set_functional_form_returns_rhs() {
+    // TagSet[tag, lhs, rhs] also returns evaluated RHS
+    clear_state();
+    assert_eq!(interpret("TagSet[g, f[g[x_]], 1 + 2]").unwrap(), "3");
+  }
+
+  #[test]
+  fn tag_set_attributes() {
+    assert_eq!(
+      interpret("Attributes[TagSet]").unwrap(),
+      "{HoldAll, Protected, SequenceHold}"
+    );
+  }
+
+  #[test]
+  fn tag_set_delayed_attributes() {
+    assert_eq!(
+      interpret("Attributes[TagSetDelayed]").unwrap(),
+      "{HoldAll, Protected, SequenceHold}"
+    );
+  }
+
+  #[test]
+  fn functional_form() {
+    // TagSetDelayed[tag, lhs, rhs] as function call
+    clear_state();
+    assert_eq!(
+      interpret("TagSetDelayed[g, f[g[x_]], fg[x]]; {f[g[2]], f[h[2]]}")
+        .unwrap(),
+      "{fg[2], f[h[2]]}"
+    );
+  }
+
+  #[test]
+  fn upvalue_non_matching_head() {
+    // The upvalue should not fire when the argument head doesn't match
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := fg[x]; f[h[2]]").unwrap(),
+      "f[h[2]]"
+    );
+  }
+
+  #[test]
+  fn upvalue_with_computation() {
+    // Upvalue body performs computation
+    clear_state();
+    assert_eq!(
+      interpret("myType /: combine[myType[x_], myType[y_]] := myType[x + y]; combine[myType[3], myType[5]]").unwrap(),
+      "myType[8]"
+    );
+  }
+
+  #[test]
+  fn upvalue_returns_null() {
+    // TagSetDelayed returns Null
+    clear_state();
+    assert_eq!(interpret("g /: f[g[x_]] := fg[x]").unwrap(), "\0");
+  }
+
+  #[test]
+  fn clear_all_removes_upvalues() {
+    // ClearAll should remove upvalues
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := fg[x]; ClearAll[g]; f[g[2]]").unwrap(),
+      "f[g[2]]"
+    );
+  }
+
+  #[test]
+  fn binary_op_plus_upvalue() {
+    // Dist /: Dist[u_,v_]+Dist[w_,v_] := Dist[u+w,v]
+    // LHS is a BinaryOp (Plus), not a FunctionCall
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Dist /: Dist[u_,v_]+Dist[w_,v_] := Dist[u+w,v]; Dist[a,b]+Dist[c,b]"
+      )
+      .unwrap(),
+      "Dist[a + c, b]"
+    );
+  }
+
+  #[test]
+  fn binary_op_plus_upvalue_no_match() {
+    // When the repeated pattern variable doesn't match, the rule should not fire
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Dist /: Dist[u_,v_]+Dist[w_,v_] := Dist[u+w,v]; Dist[a,b]+Dist[c,d]"
+      )
+      .unwrap(),
+      "Dist[a, b] + Dist[c, d]"
+    );
+  }
+
+  #[test]
+  fn binary_op_plus_upvalue_numeric() {
+    // Numeric arguments should also work with upvalue on Plus
+    clear_state();
+    assert_eq!(
+      interpret(
+        "Dist /: Dist[u_,v_]+Dist[w_,v_] := Dist[u+w,v]; Dist[1,x]+Dist[2,x]"
+      )
+      .unwrap(),
+      "Dist[3, x]"
+    );
+  }
+
+  #[test]
+  fn binary_op_times_upvalue() {
+    // Upvalue on Times (BinaryOp::Times)
+    clear_state();
+    assert_eq!(
+      interpret("Foo /: Foo[x_] * Foo[y_] := Foo[x * y]; Foo[a] * Foo[b]")
+        .unwrap(),
+      "Foo[a*b]"
+    );
+  }
+
+  #[test]
+  fn binary_op_upvalue_normal_arith_unaffected() {
+    // Normal arithmetic should not be affected by upvalue definitions
+    clear_state();
+    assert_eq!(
+      interpret("Dist /: Dist[u_,v_]+Dist[w_,v_] := Dist[u+w,v]; 2 + 3")
+        .unwrap(),
+      "5"
+    );
+  }
+
+  #[test]
+  fn upvalues_display_basic() {
+    // UpValues should display the original pattern and body
+    clear_state();
+    assert_eq!(
+      interpret("f /: g[f[x_]] := x^2; UpValues[f]").unwrap(),
+      "{HoldPattern[g[f[x_]]] :> x^2}"
+    );
+  }
+
+  #[test]
+  fn upvalues_display_multi_arg() {
+    clear_state();
+    assert_eq!(
+      interpret("f /: g[f[x_], y_] := x^2 + y; UpValues[f]").unwrap(),
+      "{HoldPattern[g[f[x_], y_]] :> x^2 + y}"
+    );
+  }
+
+  #[test]
+  fn upvalues_display_multiple_rules() {
+    clear_state();
+    assert_eq!(
+      interpret("f /: g[f[x_]] := x^2; f /: h[f[y_]] := y + 1; UpValues[f]")
+        .unwrap(),
+      "{HoldPattern[g[f[x_]]] :> x^2, HoldPattern[h[f[y_]]] :> y + 1}"
+    );
+  }
+
+  #[test]
+  fn upvalues_display_binary_op() {
+    clear_state();
+    assert_eq!(
+      interpret("f /: f + g := fg; UpValues[f]").unwrap(),
+      "{HoldPattern[f + g] :> fg}"
+    );
+  }
+
+  #[test]
+  fn upvalues_empty() {
+    clear_state();
+    assert_eq!(interpret("UpValues[x]").unwrap(), "{}");
+  }
+
+  #[test]
+  fn tag_set_does_not_populate_downvalues() {
+    // `Real /: F[x_Real] := x` attaches an upvalue to `Real`, not a
+    // downvalue on `F`. `DownValues[F]` must stay empty even though Woxi
+    // also stores the rule in FUNC_DEFS[F] for dispatch. Regression for
+    // mathics test_evaluation.py:333.
+    clear_state();
+    assert_eq!(
+      interpret("Unprotect[Real]; Real/:F[x_Real]:=x; DownValues[F]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn tag_set_still_dispatches() {
+    // The upvalue should still fire when F[3.5] is evaluated — the
+    // FUNC_DEFS entry is there for dispatch even though DownValues hides
+    // it.
+    clear_state();
+    assert_eq!(
+      interpret("Unprotect[Real]; Real/:F[x_Real]:=x; F[3.5]").unwrap(),
+      "3.5"
+    );
+  }
+
+  #[test]
+  fn upvalue_literal_symbol_plus() {
+    // x /: x + y_ := f[y] — x is a literal symbol, y_ is a pattern
+    clear_state();
+    assert_eq!(
+      interpret("ClearAll[x,y,f]; x /: x + y_ := f[y]; x + 1").unwrap(),
+      "f[1]"
+    );
+  }
+
+  #[test]
+  fn upvalue_literal_symbol_plus_symbolic() {
+    // Symbolic argument should also work
+    clear_state();
+    assert_eq!(
+      interpret("ClearAll[x,y,f,a]; x /: x + y_ := f[y]; x + a").unwrap(),
+      "f[a]"
+    );
+  }
+
+  #[test]
+  fn upvalue_with_condition_on_lhs() {
+    // x /: x + y_ /; y > -2 := f[y] — condition on the LHS
+    clear_state();
+    assert_eq!(
+      interpret("ClearAll[x,y,f]; x /: x + y_ /; y > -2 := f[y]; x + 1")
+        .unwrap(),
+      "f[1]"
+    );
+  }
+
+  #[test]
+  fn upvalue_with_condition_no_match() {
+    // Condition not satisfied — rule should not fire
+    clear_state();
+    assert_eq!(
+      interpret("ClearAll[x,y,f]; x /: x + y_ /; y > 5 := f[y]; x + 1")
+        .unwrap(),
+      "1 + x"
+    );
+  }
+
+  #[test]
+  fn upvalue_multiple_conditions_ordering() {
+    // Multiple upvalue rules with conditions — first matching rule wins
+    clear_state();
+    assert_eq!(
+      interpret(
+        "x /: x + y_ /; y > -2 := f[y]; \
+         x /: x + y_ /; y < 2 := g[y]; \
+         {x + 1, x + (-3), x + 5}"
+      )
+      .unwrap(),
+      "{f[1], g[-3], f[5]}"
+    );
+  }
+
+  #[test]
+  fn upvalue_condition_on_body() {
+    // Condition can also be on the body side (rhs /;)
+    clear_state();
+    assert_eq!(
+      interpret(
+        "ClearAll[x,y,f]; x /: x + y_ := f[y] /; y > 0; {x + 1, x + (-1)}"
+      )
+      .unwrap(),
+      "{f[1], -1 + x}"
+    );
+  }
+
+  #[test]
+  fn upvalues_display_with_condition() {
+    // UpValues display should include the condition
+    clear_state();
+    assert_eq!(
+      interpret("ClearAll[x,y,f]; x /: x + y_ /; y > -2 := f[y]; UpValues[x]")
+        .unwrap(),
+      "{HoldPattern[x + (y_) /; y > -2] :> f[y]}"
+    );
+  }
+
+  #[test]
+  fn upvalue_redefinition_replaces() {
+    // Redefining an upvalue with the same LHS should replace, not duplicate
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := x^2; g /: f[g[x_]] := x^3; UpValues[g]")
+        .unwrap(),
+      "{HoldPattern[f[g[x_]]] :> x^3}"
+    );
+    // The new definition should be used for evaluation
+    assert_eq!(interpret("f[g[3]]").unwrap(), "27");
+  }
+
+  #[test]
+  fn hold_pattern_prevents_plus_evaluation() {
+    // HoldPattern keeps `x + x` from evaluating to `2*x`.
+    assert_eq!(
+      interpret("HoldPattern[x + x]").unwrap(),
+      "HoldPattern[x + x]"
+    );
+  }
+
+  #[test]
+  fn hold_pattern_is_transparent_for_matching() {
+    // ReplaceAll should treat HoldPattern[x] -> t identically to x -> t.
+    assert_eq!(interpret("x /. HoldPattern[x] -> t").unwrap(), "t");
+  }
+}
+
+mod tag_unset {
+  use super::*;
+
+  #[test]
+  fn basic_tag_unset_syntax() {
+    // g /: f[g[x_]] =. removes the upvalue
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := x^2; g /: f[g[x_]] =.; f[g[3]]").unwrap(),
+      "f[g[3]]"
+    );
+  }
+
+  #[test]
+  fn tag_unset_clears_upvalues() {
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := x^2; g /: f[g[x_]] =.; UpValues[g]").unwrap(),
+      "{}"
+    );
+  }
+
+  #[test]
+  fn tag_unset_functional_form() {
+    // TagUnset[g, f[g[x_]]] as functional form
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := x^2; TagUnset[g, f[g[x_]]]; f[g[3]]")
+        .unwrap(),
+      "f[g[3]]"
+    );
+  }
+
+  #[test]
+  fn tag_unset_preserves_other_upvalues() {
+    // Removing one upvalue should not affect others
+    clear_state();
+    assert_eq!(
+      interpret(
+        "g /: f[g[x_]] := x^2; g /: h[g[x_]] := x + 1; g /: f[g[x_]] =.; h[g[5]]"
+      )
+      .unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn tag_unset_with_tag_set() {
+    // TagUnset should also remove TagSet (not just TagSetDelayed) definitions
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] = x^2; g /: f[g[x_]] =.; f[g[3]]").unwrap(),
+      "f[g[3]]"
+    );
+  }
+
+  #[test]
+  fn tag_unset_returns_null() {
+    // TagUnset should suppress output (return Null)
+    clear_state();
+    assert_eq!(
+      interpret("g /: f[g[x_]] := x^2; g /: f[g[x_]] =.").unwrap(),
+      "\0"
+    );
+  }
+}
+
+mod upset {
+  use super::*;
+
+  #[test]
+  fn basic_upset() {
+    clear_state();
+    assert_eq!(interpret("f[g] ^= 5; f[g]").unwrap(), "5");
+  }
+
+  #[test]
+  fn upset_returns_value() {
+    // UpSet returns the evaluated RHS
+    clear_state();
+    assert_eq!(interpret("f[g] ^= 1 + 2").unwrap(), "3");
+  }
+
+  #[test]
+  fn upset_evaluates_rhs() {
+    // RHS is evaluated before storing
+    clear_state();
+    assert_eq!(interpret("f[g] ^= 2 + 3; f[g]").unwrap(), "5");
+  }
+
+  #[test]
+  fn upset_multiple_symbols() {
+    // UpSet stores for all symbols in arguments
+    clear_state();
+    assert_eq!(interpret("f[g, h] ^= 10; f[g, h]").unwrap(), "10");
+  }
+
+  #[test]
+  fn upset_with_nested_function() {
+    // Tag is extracted from the head of nested function call
+    clear_state();
+    assert_eq!(interpret("f[g[x_]] ^= x^2; f[g[3]]").unwrap(), "9");
+  }
+
+  #[test]
+  fn upset_stores_upvalue() {
+    // UpValues should contain a definition
+    clear_state();
+    let result = interpret("f[g] ^= 5; UpValues[g]").unwrap();
+    assert!(result.contains(":> 5"));
+  }
+
+  #[test]
+  fn upset_with_binary_op_lhs_returns_rhs() {
+    // 'a + b ^= 2' parses as UpSet[a+b, 2]; the Plus LHS should normalize
+    // to Plus[a, b] and UpSet should return 2.
+    clear_state();
+    assert_eq!(interpret("a + b ^= 2").unwrap(), "2");
+  }
+
+  #[test]
+  fn upset_with_binary_op_lhs_applies_rule() {
+    clear_state();
+    assert_eq!(interpret("a + b ^= 2; a + b").unwrap(), "2");
+  }
+
+  #[test]
+  fn upset_with_binary_op_lhs_stores_upvalue_on_a() {
+    clear_state();
+    assert_eq!(
+      interpret("a + b ^= 2; UpValues[a]").unwrap(),
+      "{HoldPattern[a + b] :> 2}"
+    );
+  }
+
+  #[test]
+  fn upset_attributes() {
+    assert_eq!(
+      interpret("Attributes[UpSet]").unwrap(),
+      "{HoldFirst, Protected, SequenceHold}"
+    );
+  }
+
+  #[test]
+  fn upset_atomic_lhs_stays_unevaluated() {
+    // `a ^= 3` (atomic LHS) should emit UpSet::normal and return the
+    // unevaluated `UpSet[a, 3]`, matching wolframscript. Previously Woxi
+    // raised an InterpreterError. Regression for mathics
+    // test_assignment.py:21.
+    clear_state();
+    assert_eq!(interpret("a ^= 3").unwrap(), "a ^= 3");
+  }
+}
+
+mod upset_delayed {
+  use super::*;
+
+  #[test]
+  fn upset_delayed_basic() {
+    clear_state();
+    assert_eq!(interpret("f[g] ^:= 5; f[g]").unwrap(), "5");
+  }
+
+  #[test]
+  fn upset_delayed_returns_null() {
+    // UpSetDelayed returns Null (unlike UpSet which returns evaluated RHS)
+    clear_state();
+    assert_eq!(interpret("f[g] ^:= 1 + 2").unwrap(), "\0");
+  }
+
+  #[test]
+  fn upset_delayed_does_not_evaluate_rhs() {
+    // RHS is not evaluated at definition time, but at use time
+    clear_state();
+    assert_eq!(
+      interpret("n = 0; f[g] ^:= (n = n + 1); f[g]; f[g]; n").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn upset_delayed_with_pattern() {
+    clear_state();
+    assert_eq!(interpret("f[g[x_]] ^:= x^2; f[g[4]]").unwrap(), "16");
+  }
+
+  #[test]
+  fn upset_delayed_multiple_symbols() {
+    clear_state();
+    assert_eq!(interpret("f[g, h] ^:= 10; f[g, h]").unwrap(), "10");
+  }
+
+  #[test]
+  fn upset_delayed_stores_upvalue() {
+    clear_state();
+    let result = interpret("f[g] ^:= 5; UpValues[g]").unwrap();
+    assert!(result.contains(":> 5"));
+  }
+
+  #[test]
+  fn upset_delayed_attributes() {
+    assert_eq!(
+      interpret("Attributes[UpSetDelayed]").unwrap(),
+      "{HoldAll, Protected, SequenceHold}"
+    );
+  }
+}
+
+mod name_q {
+  use super::*;
+
+  #[test]
+  fn builtin_symbol() {
+    assert_eq!(interpret("NameQ[\"Plus\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn undefined_symbol() {
+    assert_eq!(interpret("NameQ[\"asdfNotDefined\"]").unwrap(), "False");
+  }
+
+  #[test]
+  fn user_defined() {
+    assert_eq!(interpret("x = 5; NameQ[\"x\"]").unwrap(), "True");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(interpret("Attributes[NameQ]").unwrap(), "{Protected}");
+  }
+}
+
+mod share {
+  use super::*;
+
+  #[test]
+  fn returns_zero() {
+    assert_eq!(interpret("Share[x]").unwrap(), "0");
+  }
+
+  #[test]
+  fn no_args_returns_zero() {
+    assert_eq!(interpret("Share[]").unwrap(), "0");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(interpret("Attributes[Share]").unwrap(), "{Protected}");
+  }
+}
+
+mod delimiters {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_self() {
+    assert_eq!(interpret("Delimiters").unwrap(), "Delimiters");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(interpret("Attributes[Delimiters]").unwrap(), "{Protected}");
+  }
+}
+
+mod precedence_form {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_self() {
+    assert_eq!(
+      interpret("PrecedenceForm[x + y, 10]").unwrap(),
+      "PrecedenceForm[x + y, 10]"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[PrecedenceForm]").unwrap(),
+      "{Protected}"
+    );
+  }
+}
+
+mod skeleton {
+  use super::*;
+
+  #[test]
+  fn displays_as_angle_brackets() {
+    assert_eq!(interpret("Skeleton[5]").unwrap(), "<<5>>");
+  }
+
+  #[test]
+  fn displays_with_one() {
+    assert_eq!(interpret("Skeleton[1]").unwrap(), "<<1>>");
+  }
+
+  #[test]
+  fn displays_with_ten() {
+    assert_eq!(interpret("Skeleton[10]").unwrap(), "<<10>>");
+  }
+
+  #[test]
+  fn no_args_returns_unevaluated() {
+    assert_eq!(interpret("Skeleton[]").unwrap(), "Skeleton[]");
+  }
+
+  #[test]
+  fn attributes() {
+    // Wolfram leaves Skeleton unprotected
+    assert_eq!(interpret("Attributes[Skeleton]").unwrap(), "{}");
+  }
+}
+
+mod string_skeleton {
+  use super::*;
+
+  #[test]
+  fn displays_as_angle_brackets() {
+    assert_eq!(interpret("StringSkeleton[5]").unwrap(), "<<5>>");
+  }
+
+  #[test]
+  fn displays_with_string() {
+    assert_eq!(interpret("StringSkeleton[\"abc\"]").unwrap(), "<<abc>>");
+  }
+
+  #[test]
+  fn no_args_returns_unevaluated() {
+    assert_eq!(interpret("StringSkeleton[]").unwrap(), "StringSkeleton[]");
+  }
+
+  #[test]
+  fn attributes() {
+    // Wolfram leaves StringSkeleton unprotected
+    assert_eq!(interpret("Attributes[StringSkeleton]").unwrap(), "{}");
+  }
+}
+
+mod total_width {
+  use super::*;
+
+  #[test]
+  fn evaluates_to_self() {
+    assert_eq!(interpret("TotalWidth").unwrap(), "TotalWidth");
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(interpret("Attributes[TotalWidth]").unwrap(), "{Protected}");
+  }
+}
+
+mod unevaluated {
+  use super::*;
+
+  #[test]
+  fn holds_argument() {
+    assert_eq!(
+      interpret("Unevaluated[1 + 2]").unwrap(),
+      "Unevaluated[1 + 2]"
+    );
+  }
+
+  #[test]
+  fn attributes() {
+    assert_eq!(
+      interpret("Attributes[Unevaluated]").unwrap(),
+      "{HoldAllComplete, Protected}"
+    );
+  }
+
+  // Regression: a pure function whose body wraps a Sequence in Unevaluated
+  // (the standard Demonstrations idiom for conditionally splicing several
+  // items into a list) must substitute its Slot without prematurely
+  // splicing the Sequence into Unevaluated's own argument list — that would
+  // turn `Unevaluated[Sequence[3, 9]]` into the wrong `Unevaluated[3, 9]`.
+  #[test]
+  fn pure_function_keeps_sequence_as_single_argument() {
+    assert_eq!(
+      interpret("(Unevaluated[Sequence[#, #^2]]) & [3]").unwrap(),
+      "Unevaluated[Sequence[3, 3^2]]"
+    );
+  }
+
+  // A pure function whose body *is* `Unevaluated[…]` answers with the
+  // wrapper intact, exactly as a literal `Unevaluated[…]` argument would —
+  // so the Sequence does NOT splice into the enclosing list. Only a
+  // wrapper produced by some other evaluation (an `If` branch, a
+  // downvalue, `Identity`) gets stripped; see
+  // `pure_function_conditional_splice_via_if` right below.
+  #[test]
+  fn pure_function_body_keeps_its_unevaluated_wrapper() {
+    assert_eq!(
+      interpret("{0, (Unevaluated[Sequence[#, #^2]]) & [3], 9}").unwrap(),
+      "{0, Unevaluated[Sequence[3, 3^2]], 9}"
+    );
+    assert_eq!(
+      interpret("Length[{0, (Unevaluated[Sequence[#, #^2]]) & [3], 9}]")
+        .unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret("{0, Function[u, Unevaluated[Sequence[1, 2]]][7], 9}").unwrap(),
+      "{0, Unevaluated[Sequence[1, 2]], 9}"
+    );
+    // A slot standing in for an argument that was already `Unevaluated`
+    // is a different body, and still splices.
+    assert_eq!(
+      interpret("{0, (# &)[Unevaluated[Sequence[1, 2]]], 9}").unwrap(),
+      "{0, 1, 2, 9}"
+    );
+  }
+
+  #[test]
+  fn pure_function_conditional_splice_via_if() {
+    assert_eq!(
+      interpret("{0, (If[# > 0, Unevaluated[Sequence[#, #^2]], {}]) & [3], 9}")
+        .unwrap(),
+      "{0, 3, 9, 9}"
+    );
+    assert_eq!(
+      interpret(
+        "{0, (If[# > 0, Unevaluated[Sequence[#, #^2]], {}]) & [-3], 9}"
+      )
+      .unwrap(),
+      "{0, {}, 9}"
+    );
+  }
+
+  // A literal `Unevaluated[...]` written directly as a list element keeps
+  // its wrapper (Wolfram only strips/splices the wrapper when it is
+  // produced by evaluation, not when written as-is).
+  #[test]
+  fn literal_in_list_keeps_wrapper() {
+    assert_eq!(
+      interpret("{0, Unevaluated[1 + 1], 9}").unwrap(),
+      "{0, Unevaluated[1 + 1], 9}"
+    );
+  }
+
+  #[test]
+  fn if_producing_unevaluated_still_splices() {
+    assert_eq!(
+      interpret("{0, If[True, Unevaluated[Sequence[1, 2 + 3]], {}], 9}")
+        .unwrap(),
+      "{0, 1, 5, 9}"
+    );
+  }
+}
+
+mod v2_option_symbols {
+  use super::*;
+
+  #[test]
+  fn word_attributes() {
+    assert_eq!(interpret("Attributes[Word]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn frame_attributes() {
+    assert_eq!(interpret("Attributes[Frame]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn background_attributes() {
+    assert_eq!(interpret("Attributes[Background]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn axes_style_attributes() {
+    assert_eq!(interpret("Attributes[AxesStyle]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn color_function_attributes() {
+    assert_eq!(
+      interpret("Attributes[ColorFunction]").unwrap(),
+      "{Protected}"
+    );
+  }
+
+  #[test]
+  fn axes_origin_attributes() {
+    assert_eq!(interpret("Attributes[AxesOrigin]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn frame_style_attributes() {
+    assert_eq!(interpret("Attributes[FrameStyle]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn grid_lines_attributes() {
+    assert_eq!(interpret("Attributes[GridLines]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn epilog_attributes() {
+    assert_eq!(interpret("Attributes[Epilog]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn frame_ticks_attributes() {
+    assert_eq!(interpret("Attributes[FrameTicks]").unwrap(), "{Protected}");
+  }
+
+  #[test]
+  fn absolute_point_size_attributes() {
+    assert_eq!(
+      interpret("Attributes[AbsolutePointSize]").unwrap(),
+      "{Protected, ReadProtected}"
+    );
+  }
+}
+
+mod tableform_headings {
+  use super::*;
+
+  #[test]
+  fn tableform_with_options_stays_symbolic() {
+    // In text mode, TableForm with options stays symbolic (evaluated args)
+    assert_eq!(
+      interpret("TableForm[{{1, 2}, {3, 4}}, TableHeadings -> {{\"a\", \"b\"}, {\"x\", \"y\"}}]").unwrap(),
+      "TableForm[{{1, 2}, {3, 4}}, TableHeadings -> {{a, b}, {x, y}}]"
+    );
+  }
+
+  #[test]
+  fn tableform_single_arg_stays_symbolic() {
+    // TableForm with just data stays symbolic in text mode
+    assert_eq!(
+      interpret("TableForm[{{1, 2}, {3, 4}}]").unwrap(),
+      "TableForm[{{1, 2}, {3, 4}}]"
+    );
+  }
+}
+
+mod boolean_table {
+  use super::*;
+
+  #[test]
+  fn or_two_vars() {
+    assert_eq!(
+      interpret("BooleanTable[p || q, {p, q}]").unwrap(),
+      "{True, True, True, False}"
+    );
+  }
+
+  #[test]
+  fn and_two_vars() {
+    assert_eq!(
+      interpret("BooleanTable[p && q, {p, q}]").unwrap(),
+      "{True, False, False, False}"
+    );
+  }
+
+  #[test]
+  fn not_single_var() {
+    assert_eq!(
+      interpret("BooleanTable[Not[p], {p}]").unwrap(),
+      "{False, True}"
+    );
+  }
+
+  #[test]
+  fn implies_two_vars() {
+    assert_eq!(
+      interpret("BooleanTable[Implies[p, q], {p, q}]").unwrap(),
+      "{True, False, True, True}"
+    );
+  }
+
+  #[test]
+  fn xor_two_vars() {
+    assert_eq!(
+      interpret("BooleanTable[Xor[p, q], {p, q}]").unwrap(),
+      "{False, True, True, False}"
+    );
+  }
+
+  #[test]
+  fn equivalent_two_vars() {
+    assert_eq!(
+      interpret("BooleanTable[Equivalent[p, q], {p, q}]").unwrap(),
+      "{True, False, False, True}"
+    );
+  }
+
+  #[test]
+  fn and_three_vars() {
+    assert_eq!(
+      interpret("BooleanTable[p && q && r, {p, q, r}]").unwrap(),
+      "{True, False, False, False, False, False, False, False}"
+    );
+  }
+
+  #[test]
+  fn constant_true() {
+    assert_eq!(
+      interpret("BooleanTable[True, {p, q}]").unwrap(),
+      "{True, True, True, True}"
+    );
+  }
+
+  #[test]
+  fn one_argument_form_uses_the_expressions_own_variables() {
+    assert_eq!(
+      interpret("BooleanTable[a && b]").unwrap(),
+      "{True, False, False, False}"
+    );
+    assert_eq!(
+      interpret("BooleanTable[Implies[p, q]]").unwrap(),
+      "{True, False, True, True}"
+    );
+    assert_eq!(interpret("BooleanTable[!p]").unwrap(), "{False, True}");
+    assert_eq!(
+      interpret("BooleanTable[Xor[p, q, r]]").unwrap(),
+      "{True, False, False, True, False, True, True, False}"
+    );
+  }
+
+  #[test]
+  fn one_argument_form_orders_variables_canonically() {
+    // The variables are taken in BooleanVariables order, not in the order
+    // they happen to appear in the expression.
+    assert_eq!(
+      interpret("BooleanTable[b && a]").unwrap(),
+      "{True, False, False, False}"
+    );
+    assert_eq!(
+      interpret("BooleanTable[b && a] === BooleanTable[b && a, {a, b}]")
+        .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn one_argument_form_without_variables_gives_a_single_value() {
+    assert_eq!(interpret("BooleanTable[True]").unwrap(), "{True}");
+  }
+
+  #[test]
+  fn several_variable_groups_nest_one_level_each() {
+    assert_eq!(
+      interpret("BooleanTable[p || q, {p}, {q}]").unwrap(),
+      "{{True, True}, {True, False}}"
+    );
+    assert_eq!(
+      interpret("BooleanTable[p && q || r, {p}, {q, r}]").unwrap(),
+      "{{True, True, True, False}, {True, False, True, False}}"
+    );
+  }
+
+  #[test]
+  fn an_empty_variable_group_still_adds_a_level() {
+    assert_eq!(
+      interpret("BooleanTable[p && q, {p, q}, {}]").unwrap(),
+      "{{True}, {False}, {False}, {False}}"
+    );
+  }
+
+  #[test]
+  fn a_bare_symbol_is_a_one_variable_group() {
+    assert_eq!(interpret("BooleanTable[p, p]").unwrap(), "{True, False}");
+    assert_eq!(
+      interpret("BooleanTable[p && q, {p}, q]").unwrap(),
+      "{{True, False}, {False, False}}"
+    );
+  }
+
+  #[test]
+  fn no_arguments_emits_argm() {
+    assert_eq!(interpret("BooleanTable[]").unwrap(), "BooleanTable[]");
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      msgs.iter().any(|m| m.contains(
+        "BooleanTable::argm: BooleanTable called with 0 arguments; 2 or more arguments are expected."
+      )),
+      "expected argm message, got {msgs:?}"
+    );
+  }
+}
+
+mod framed {
+  use super::*;
+
+  #[test]
+  fn framed_symbolic() {
+    assert_eq!(interpret("Framed[x]").unwrap(), "Framed[x]");
+  }
+
+  #[test]
+  fn framed_evaluates_args() {
+    assert_eq!(interpret("Framed[1 + 2]").unwrap(), "Framed[3]");
+  }
+
+  #[test]
+  fn nestlist_framed() {
+    assert_eq!(
+      interpret("NestList[Framed, x, 3]").unwrap(),
+      "{x, Framed[x], Framed[Framed[x]], Framed[Framed[Framed[x]]]}"
+    );
+  }
+}
+
+mod plus_rendering {
+  use super::*;
+
+  #[test]
+  fn negative_times_coefficient() {
+    // Regression test: Plus with negative Times coefficient should use " - "
+    assert_eq!(
+      interpret("Plus[1, Times[-2, x], Power[x, 2]]").unwrap(),
+      "1 - 2*x + x^2"
+    );
+  }
+
+  #[test]
+  fn negative_integer_term() {
+    assert_eq!(interpret("1 + (-3) + x").unwrap(), "-2 + x");
+  }
+
+  #[test]
+  fn multiple_negative_terms() {
+    assert_eq!(interpret("a - 3*b - 5*c").unwrap(), "a - 3*b - 5*c");
+  }
+
+  // Regression: `/.` (ReplaceAll) binds looser than `+`/`-` (Wolfram
+  // precedence 110 vs. 310), so a `ReplaceAll` term printed as an operand
+  // of `Plus`/`Minus` must keep its parentheses, or the printed form
+  // re-parses to a different expression — `x /. sol - 0.05` regroups as
+  // `x /. (sol - 0.05)`, not `(x /. sol) - 0.05`. This once broke Woxi
+  // Studio's Manipulate handling for a Wolfram Demonstrations notebook:
+  // the body is re-serialized through `expr_to_input_form` to re-evaluate
+  // it per slider change, and the missing parens silently dropped a Plot
+  // curve from the render.
+  #[test]
+  fn replace_all_keeps_parens_as_leading_plus_term() {
+    assert_eq!(
+      interpret("Hold[(x /. {x -> 5}) - 0.05]").unwrap(),
+      "Hold[(x /. {x -> 5}) - 0.05]"
+    );
+  }
+
+  #[test]
+  fn replace_all_keeps_parens_as_trailing_plus_term() {
+    assert_eq!(
+      interpret("Hold[1 + (x /. {x -> 5})]").unwrap(),
+      "Hold[1 + (x /. {x -> 5})]"
+    );
+    assert_eq!(
+      interpret("Hold[(x /. {x -> 5}) + 1]").unwrap(),
+      "Hold[(x /. {x -> 5}) + 1]"
+    );
+  }
+
+  #[test]
+  fn replace_all_keeps_parens_in_input_form() {
+    // The InputForm formatter (`ToString[_, InputForm]`, used to rebuild a
+    // Manipulate body's source) must preserve the same parens as the
+    // direct-eval formatter.
+    assert_eq!(
+      interpret("ToString[Hold[(x /. {x -> 5}) - 0.05], InputForm]").unwrap(),
+      "Hold[(x /. {x -> 5}) - 0.05]"
+    );
+  }
+
+  #[test]
+  fn replace_all_then_subtract_evaluates_correctly() {
+    // With the parens honored, this evaluates numerically instead of
+    // triggering ReplaceAll::reps on `sol - 0.05`.
+    assert_eq!(interpret("(x /. {x -> 5}) - 0.05").unwrap(), "4.95");
+  }
+
+  // ReplaceRepeated (`//.`) binds exactly as loose as ReplaceAll and shares
+  // the same fix path, but had no direct test coverage.
+  #[test]
+  fn replace_repeated_keeps_parens_as_leading_plus_term() {
+    assert_eq!(
+      interpret("Hold[(x //. {x -> 5}) - 0.05]").unwrap(),
+      "Hold[(x //. {x -> 5}) - 0.05]"
+    );
+  }
+
+  // A non-leading `Plus`/`Minus`-shaped term (precedence exactly 30, the
+  // same as `Plus`/`Minus` themselves) must also be parenthesized — unlike
+  // a leading term, which round-trips bare because text re-parses `+`/`-`
+  // left-associatively. Printing the negated group bare would silently flip
+  // the sign of every term after the first: `a - b + c` re-parses as
+  // `Plus[a, -b, c]`, not the original `Plus[a, -b, -c]`.
+  #[test]
+  fn negated_plus_group_keeps_parens() {
+    assert_eq!(
+      interpret("ToString[Hold[Plus[a, -(b + c)]], InputForm]").unwrap(),
+      "Hold[a - (b + c)]"
+    );
+  }
+
+  // The same non-leading-term parenthesization must apply on the
+  // negative-`Times`-coefficient path (`input_form_subtracted_term`), which
+  // is reachable from ordinary (non-`Hold`) evaluation: `Times[-1, ...]`
+  // folds into a subtraction here, not just via a literal `Plus[..., -(...)]`
+  // call. Regression: `0.05 - (x /. sol)` with `sol` unbound evaluates to
+  // `Plus[0.05, Times[-1, ReplaceAll[x, sol]]]`, which must print with the
+  // `ReplaceAll` parenthesized or it re-parses as `(0.05 - x) /. sol`.
+  #[test]
+  fn subtracted_replace_all_keeps_parens_via_times_coefficient_path() {
+    assert_eq!(
+      interpret("ToString[0.05 - (x /. sol), InputForm]").unwrap(),
+      "0.05 - (x /. sol)"
+    );
+  }
+}
+
+mod tilde_infix {
+  use super::*;
+
+  #[test]
+  fn basic_tilde_infix() {
+    // a ~f~ b means f[a, b]
+    assert_eq!(interpret("a ~f~ b").unwrap(), "f[a, b]");
+  }
+
+  #[test]
+  fn tilde_infix_evaluates() {
+    assert_eq!(interpret("1 ~Plus~ 2").unwrap(), "3");
+  }
+
+  #[test]
+  fn tilde_infix_join() {
+    assert_eq!(
+      interpret("{1, 2, 3} ~Join~ {4, 5}").unwrap(),
+      "{1, 2, 3, 4, 5}"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_left_associative() {
+    // a ~f~ b ~g~ c means g[f[a, b], c]
+    assert_eq!(
+      interpret("FullForm[Hold[a ~f~ b ~g~ c]]").unwrap(),
+      "FullForm[Hold[g[f[a, b], c]]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_precedence_plus() {
+    // ~f~ binds tighter than +
+    assert_eq!(
+      interpret("FullForm[Hold[a + b ~f~ c]]").unwrap(),
+      "FullForm[Hold[a + f[b, c]]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_precedence_times() {
+    // ~f~ binds tighter than *
+    assert_eq!(
+      interpret("FullForm[Hold[a * b ~f~ c]]").unwrap(),
+      "FullForm[Hold[a*f[b, c]]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_precedence_power() {
+    // ~f~ binds tighter than ^ (right-associative)
+    assert_eq!(
+      interpret("FullForm[Hold[a^2 ~f~ c]]").unwrap(),
+      "FullForm[Hold[a^f[2, c]]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_precedence_prefix_at() {
+    // @ binds tighter than ~f~
+    assert_eq!(
+      interpret("FullForm[Hold[g @ a ~f~ b]]").unwrap(),
+      "FullForm[Hold[f[g[a], b]]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_precedence_apply() {
+    // ~f~ binds tighter than @@
+    assert_eq!(
+      interpret("FullForm[Hold[g @@ a ~f~ b]]").unwrap(),
+      "FullForm[Hold[g @@ f[a, b]]]"
+    );
+  }
+
+  #[test]
+  fn tilde_infix_does_not_conflict_with_string_expression() {
+    // ~~ (StringExpression) should still work
+    assert_eq!(
+      interpret(r#"FullForm[Hold["a" ~~ "b"]]"#).unwrap(),
+      r#"FullForm[Hold["a"~~"b"]]"#
+    );
+  }
+
+  #[test]
+  fn tilde_infix_caesar_cipher() {
+    // End-to-end test from the issue file
+    assert_eq!(
+      interpret(r#"caesarDecode[text_, n_] := StringReplace[text, Thread[CharacterRange["A","Z"] -> RotateLeft[CharacterRange["A","Z"], -n]] ~Join~ Thread[CharacterRange["a","z"] -> RotateLeft[CharacterRange["a","z"], -n]]]; caesarDecode["Khoor Zruog", 3]"#).unwrap(),
+      "Hello World"
+    );
+  }
+}
+
+mod line_continuation {
+  use super::*;
+
+  #[test]
+  fn backslash_newline_in_definition() {
+    // Backslash at end of line continues the expression on the next line
+    assert_eq!(interpret("f[x_] :=\\\n  x^2\nf[5]").unwrap(), "25");
+  }
+
+  #[test]
+  fn backslash_newline_in_expression() {
+    assert_eq!(interpret("1 +\\\n2 +\\\n3").unwrap(), "6");
+  }
+
+  #[test]
+  fn backslash_newline_preserves_function_def() {
+    assert_eq!(
+      interpret(
+        "ImaginaryQ[u_] :=\\\n  Head[u]===Complex && Re[u]===0\nImaginaryQ[3 I]"
+      )
+      .unwrap(),
+      "True"
+    );
+  }
+
+  #[test]
+  fn backslash_newline_not_in_strings() {
+    // Backslash inside strings should NOT be treated as line continuation
+    assert_eq!(interpret(r#""hello\nworld""#).unwrap(), r#"hello\nworld"#);
+  }
+
+  #[test]
+  fn string_join_across_newline() {
+    // Regression: a line ending with `<>` (StringJoin) must continue on the
+    // next line. Previously insert_statement_separators only treated `>`
+    // as a continuation when preceded by `-`, `:`, or `>` (for ->, :>, >>,
+    // >>>), so `<>` got a spurious `;` inserted after it.
+    assert_eq!(interpret("\"a\" <>\n\"b\"").unwrap(), "ab");
+  }
+
+  #[test]
+  fn greater_across_newline() {
+    // Regression: `>` at end of line (Greater operator) must continue on
+    // the next line, matching wolframscript.
+    assert_eq!(interpret("If[1 >\n2, \"yes\", \"no\"]").unwrap(), "no");
+  }
+
+  #[test]
+  fn multiline_string_join_in_function_def() {
+    // Real-world case from RosettaCode `egyptian_fractions`: a multi-line
+    // `:=` body using `<>` across newlines.
+    assert_eq!(
+      interpret(
+        "disp[f_] :=\n  ToString[f] <> \" = \" <>\n   ToString[2*f];\ndisp[3]"
+      )
+      .unwrap(),
+      "3 = 6"
+    );
+  }
+
+  #[test]
+  fn a_line_ending_in_a_span_separator_is_its_own_statement() {
+    // Regression: `;;` and `;` are both spelled with `;`, and the statement
+    // splitter took any trailing `;` for a separator that was already
+    // there — so `x = 3;;` ran into the next line and the following
+    // statement became the Span's end operand.
+    assert_eq!(interpret("x = 3;;\nRange[6][[x]]").unwrap(), "{3, 4, 5, 6}");
+    assert_eq!(interpret("1 ;;\n2 ;;").unwrap(), "Span[2, All]");
+    // An odd run of `;` still ends with a genuine separator.
+    assert_eq!(
+      interpret("x = 3;;;\nRange[6][[x]]").unwrap(),
+      "{3, 4, 5, 6}"
+    );
+    assert_eq!(interpret("x = 3;\nRange[6][[x ;; 4]]").unwrap(), "{3, 4}");
+  }
+
+  #[test]
+  fn replace_all_across_newline() {
+    // Regression: `/.` (ReplaceAll) at end of line must continue on the
+    // next line. Previously insert_statement_separators didn't recognise
+    // `.` as a continuation char when preceded by `/`.
+    assert_eq!(interpret("{1, 2, 3} /.\n  1 -> 10").unwrap(), "{10, 2, 3}");
+  }
+
+  #[test]
+  fn replace_repeated_across_newline() {
+    // Same regression for `//.` (ReplaceRepeated).
+    assert_eq!(interpret("f[g[a]] //.\n  f[x_] :> x").unwrap(), "g[a]");
+  }
+
+  // Regression: a named-character operator at end of line must continue on the
+  // next line, exactly like a trailing `+`. The statement splitter only looked
+  // at the last code character, which for `\[Star]` is `]` — indistinguishable
+  // from a closing bracket — so it inserted a spurious `;`. Rubi writes its
+  // distribution operator this way 6583 times, which broke 76 of its 200 rule
+  // files at parse time.
+  #[test]
+  fn named_operator_across_newline() {
+    assert_eq!(interpret("a \\[Star]\n  b").unwrap(), "a ⋆ b");
+    assert_eq!(interpret("a \\[CircleDot]\n  b").unwrap(), "a ⊙ b");
+    assert_eq!(interpret("a \\[CirclePlus]\n  b").unwrap(), "a ⊕ b");
+    assert_eq!(interpret("True \\[And]\n  False").unwrap(), "False");
+    assert_eq!(
+      interpret("Cross[a, b]").unwrap(),
+      interpret("a \\[Cross]\n  b").unwrap()
+    );
+    // The bare character spells the same operator and continues the same way.
+    assert_eq!(interpret("a \u{22C6}\n  b").unwrap(), "a ⋆ b");
+  }
+
+  #[test]
+  fn named_operator_across_newline_in_a_definition() {
+    // The shape Rubi's rule files use: a `:=` body split across lines at the
+    // Star operator, with the condition on the line after.
+    assert_eq!(
+      interpret(
+        "dist[u_, v_] := u \\[Star]\n  v;\nStar[p_, q_] := p*q;\ndist[2, 3]"
+      )
+      .unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn postfix_named_operator_ends_the_line() {
+    // `\[Transpose]` completes an expression, so it must NOT swallow the next
+    // line the way an infix operator does.
+    assert_eq!(
+      interpret("{{1, 2}, {3, 4}}\\[Transpose]\n{5, 6}").unwrap(),
+      "{5, 6}"
+    );
+    // A named character that is not an operator likewise ends the statement.
+    assert_eq!(interpret("\\[Alpha]\n{5, 6}").unwrap(), "{5, 6}");
+  }
+}
+
+/// `\[Rule]`, `\[RuleDelayed]`, `\[Equal]`, `\[NotEqual]`, `\[LessEqual]`,
+/// and `\[GreaterEqual]` are legitimate ASCII spellings of the same
+/// operators as `->`, `:>`, `==`, `!=`, `<=`, `>=`: Wolfram-authored source
+/// (`.wl`/`.wls` files, `ToExpression["..."]`, literal REPL input) may use
+/// either. Previously only some named-character operators (`\[Element]`,
+/// `\[And]`, …) were recognised by the grammar; this comparison/rule family
+/// fell through to `NamedCharIdentifier`, so `Mesh \[Rule] None` parsed as
+/// implicit multiplication `Mesh * None * Rule` instead of `Rule[Mesh,
+/// None]`. (Note this never affected `.nb` notebook loading, which
+/// flattens box-form names to ASCII operators before the code reaches the
+/// parser.)
+mod comparison_and_rule_named_char_operators {
+  use super::*;
+
+  #[test]
+  fn rule_escape_matches_ascii_infix() {
+    assert_eq!(
+      interpret("Mesh \\[Rule] None").unwrap(),
+      interpret("Mesh -> None").unwrap()
+    );
+  }
+
+  #[test]
+  fn rule_escape_matches_ascii_prefix() {
+    assert_eq!(
+      interpret("a \\[Rule] b").unwrap(),
+      interpret("Rule[a, b]").unwrap()
+    );
+  }
+
+  #[test]
+  fn rule_delayed_escape_matches_ascii_infix() {
+    assert_eq!(
+      interpret("Head[a \\[RuleDelayed] b]").unwrap(),
+      interpret("Head[a :> b]").unwrap()
+    );
+    assert_eq!(
+      interpret("Head[a \\[RuleDelayed] b]").unwrap(),
+      "RuleDelayed"
+    );
+  }
+
+  #[test]
+  fn rule_delayed_escape_matches_ascii_prefix() {
+    assert_eq!(
+      interpret("a \\[RuleDelayed] b").unwrap(),
+      interpret("RuleDelayed[a, b]").unwrap()
+    );
+  }
+
+  #[test]
+  fn equal_escape_matches_ascii_infix() {
+    assert_eq!(interpret("3 \\[Equal] 3").unwrap(), "True");
+    assert_eq!(
+      interpret("3 \\[Equal] 3").unwrap(),
+      interpret("3 == 3").unwrap()
+    );
+    assert_eq!(interpret("3 \\[Equal] 4").unwrap(), "False");
+  }
+
+  #[test]
+  fn equal_escape_matches_ascii_prefix() {
+    assert_eq!(
+      interpret("a \\[Equal] b").unwrap(),
+      interpret("Equal[a, b]").unwrap()
+    );
+  }
+
+  #[test]
+  fn not_equal_escape_matches_ascii_infix() {
+    assert_eq!(interpret("3 \\[NotEqual] 4").unwrap(), "True");
+    assert_eq!(
+      interpret("3 \\[NotEqual] 4").unwrap(),
+      interpret("3 != 4").unwrap()
+    );
+    assert_eq!(interpret("3 \\[NotEqual] 3").unwrap(), "False");
+  }
+
+  #[test]
+  fn less_equal_escape_matches_ascii_infix() {
+    assert_eq!(interpret("3 \\[LessEqual] 4").unwrap(), "True");
+    assert_eq!(
+      interpret("3 \\[LessEqual] 4").unwrap(),
+      interpret("3 <= 4").unwrap()
+    );
+    assert_eq!(interpret("4 \\[LessEqual] 3").unwrap(), "False");
+  }
+
+  #[test]
+  fn greater_equal_escape_matches_ascii_infix() {
+    assert_eq!(interpret("4 \\[GreaterEqual] 3").unwrap(), "True");
+    assert_eq!(
+      interpret("4 \\[GreaterEqual] 3").unwrap(),
+      interpret("4 >= 3").unwrap()
+    );
+    assert_eq!(interpret("3 \\[GreaterEqual] 4").unwrap(), "False");
+  }
+
+  /// A chained comparison spelled with the escape form must build the same
+  /// flat `Comparison` chain as the ASCII spelling, not a nested one.
+  #[test]
+  fn chained_comparison_escape_matches_ascii() {
+    assert_eq!(
+      interpret("1 \\[LessEqual] x \\[LessEqual] 10 /. x -> 5").unwrap(),
+      interpret("1 <= x <= 10 /. x -> 5").unwrap()
+    );
+  }
+
+  /// `\[Rule]`/`\[RuleDelayed]` must not be swallowed as bare identifiers
+  /// named `Rule`/`RuleDelayed` — the regression this whole family guards
+  /// against (`Mesh \[Rule] None` used to become `Mesh*None*Rule`).
+  #[test]
+  fn escape_forms_are_not_parsed_as_identifiers() {
+    assert_eq!(interpret("Head[Mesh \\[Rule] None]").unwrap(), "Rule");
+    assert_eq!(interpret("Head[3 \\[Equal] 3]").unwrap(), "Symbol");
+  }
+}
+
+mod structural_pattern_consistency {
+  use super::*;
+
+  #[test]
+  fn structural_binding_must_not_conflict_with_positional() {
+    // Issue #73: x_ in structural pattern matched -1, but x positionally is Symbol x.
+    // The pattern should NOT match because of the inconsistent binding for x.
+    assert_eq!(
+      interpret(
+        "f[g_^(a_.+b_.*x_), x_Symbol] := {g,a,b,x} /; FreeQ[{a,b,g},x]; f[y^-1, x]"
+      )
+      .unwrap(),
+      "f[y^(-1), x]"
+    );
+  }
+
+  #[test]
+  fn structural_binding_consistent_with_positional() {
+    // When structural pattern variables don't conflict with positional params,
+    // the match should succeed normally.
+    assert_eq!(
+      interpret(
+        "g[f_^(a_.+b_.*y_), x_Symbol] := {f,a,b,y,x} /; FreeQ[{a,b,f,y},x]; g[z^(2+3*w), x]"
+      )
+      .unwrap(),
+      "{z, 3*w, 1, 2, x}"
+    );
+  }
+
+  #[test]
+  fn integrate_pattern_no_false_match() {
+    // The original issue case: Int[1/(Sqrt[x]*(a+b*x)), x] should not match
+    // a rule where x in the structural pattern binds to -1.
+    assert_eq!(
+      interpret(
+        "Int[f_^(a_.+b_.*x_), x_Symbol] := {f,a,b,x} /; FreeQ[{a,b,f},x]; Int[1/(Sqrt[x]*(a+b*x)), x]"
+      )
+      .unwrap(),
+      "Int[1/(Sqrt[x]*(a + b*x)), x]"
+    );
+  }
+}
+
+mod two_way_rule {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(interpret("TwoWayRule[a, b]").unwrap(), "a <-> b");
+  }
+
+  #[test]
+  fn numeric() {
+    assert_eq!(interpret("TwoWayRule[1, 2]").unwrap(), "1 <-> 2");
+  }
+
+  #[test]
+  fn head() {
+    assert_eq!(interpret("Head[TwoWayRule[a, b]]").unwrap(), "TwoWayRule");
+  }
+}
+
+mod batch_inert_symbols_2 {
+  use super::*;
+
+  #[test]
+  fn dividers() {
+    assert_eq!(interpret("Dividers[x]").unwrap(), "Dividers[x]");
+  }
+
+  #[test]
+  fn locator() {
+    assert_eq!(interpret("Locator[x]").unwrap(), "Locator[x]");
+  }
+
+  #[test]
+  fn input_field() {
+    assert_eq!(interpret("InputField[x]").unwrap(), "InputField[x]");
+  }
+
+  #[test]
+  fn region_function() {
+    assert_eq!(interpret("RegionFunction[x]").unwrap(), "RegionFunction[x]");
+  }
+
+  #[test]
+  fn color_function_scaling() {
+    assert_eq!(
+      interpret("ColorFunctionScaling[x]").unwrap(),
+      "ColorFunctionScaling[x]"
+    );
+  }
+
+  #[test]
+  fn initialization() {
+    assert_eq!(interpret("Initialization[x]").unwrap(), "Initialization[x]");
+  }
+
+  #[test]
+  fn save_definitions() {
+    assert_eq!(
+      interpret("SaveDefinitions[x]").unwrap(),
+      "SaveDefinitions[x]"
+    );
+  }
+
+  #[test]
+  fn around() {
+    assert_eq!(interpret("Around[5, 0.3]").unwrap(), "Around[5., 0.3]");
+  }
+
+  // Exact numbers are promoted to machine reals, rationals included.
+  #[test]
+  fn around_promotes_rationals() {
+    assert_eq!(
+      interpret("Around[3/4, 1/8]").unwrap(),
+      "Around[0.75, 0.125]"
+    );
+    assert_eq!(interpret("Around[1/2, 0.1]").unwrap(), "Around[0.5, 0.1]");
+  }
+
+  // Around[x, {δ₋, δ₊}] holds asymmetric uncertainties; exact components are
+  // promoted to reals and a vanishing {0, 0} collapses to the bare value.
+  #[test]
+  fn around_asymmetric_construction() {
+    assert_eq!(
+      interpret("Around[5, {0.1, 0.2}]").unwrap(),
+      "Around[5., {0.1, 0.2}]"
+    );
+    assert_eq!(
+      interpret("Around[5, {1, 2}]").unwrap(),
+      "Around[5., {1., 2.}]"
+    );
+    assert_eq!(
+      interpret("Around[5, {1/4, 1/2}]").unwrap(),
+      "Around[5., {0.25, 0.5}]"
+    );
+    assert_eq!(interpret("Around[5, {0, 0}]").unwrap(), "5");
+  }
+
+  // Asymmetric uncertainties propagate per side, in quadrature.
+  #[test]
+  fn around_asymmetric_plus() {
+    assert_eq!(
+      interpret("Around[5, {0.3, 0.4}] + Around[3, {0.4, 0.3}]").unwrap(),
+      "Around[8., {0.5, 0.5}]"
+    );
+    // A constant shifts the value but not the uncertainties.
+    assert_eq!(
+      interpret("Around[5, {0.1, 0.2}] + 1").unwrap(),
+      "Around[6., {0.1, 0.2}]"
+    );
+    // Mixing with a symmetric Around keeps the result asymmetric.
+    assert_eq!(
+      interpret("Around[5, {3, 4}] + Around[3, 0]").unwrap(),
+      "Around[8., {3., 4.}]"
+    );
+  }
+
+  // A negative coefficient swaps the two sides: the value's downward
+  // excursion pushes the result upward.
+  #[test]
+  fn around_asymmetric_negation_swaps_sides() {
+    assert_eq!(
+      interpret("-Around[5, {0.1, 0.2}]").unwrap(),
+      "Around[-5., {0.2, 0.1}]"
+    );
+    assert_eq!(
+      interpret("2 * Around[5, {0.1, 0.2}]").unwrap(),
+      "Around[10., {0.2, 0.4}]"
+    );
+    assert_eq!(
+      interpret("Around[10, 0] - Around[5, {0.1, 0.2}]").unwrap(),
+      "Around[5., {0.2, 0.1}]"
+    );
+  }
+
+  #[test]
+  fn around_asymmetric_power() {
+    assert_eq!(
+      interpret("Around[2, {0.1, 0.2}]^2").unwrap(),
+      "Around[4., {0.4, 0.8}]"
+    );
+    // Power keeps the {minus, plus} order (wolframscript does not swap the
+    // sides for a negative derivative here, unlike Plus/Times).
+    assert_eq!(
+      interpret("Around[2, {0.1, 0.2}]^-1").unwrap(),
+      "Around[0.5, {0.025, 0.05}]"
+    );
+  }
+
+  #[test]
+  fn around_asymmetric_unary_functions() {
+    assert_eq!(
+      interpret("Sqrt[Around[4, {1, 2}]]").unwrap(),
+      "Around[2., {0.25, 0.5}]"
+    );
+    // Exp'(0) = 1 keeps the sides aligned.
+    assert_eq!(
+      interpret("Exp[Around[0, {0.1, 0.2}]]").unwrap(),
+      "Around[1., {0.1, 0.2}]"
+    );
+  }
+
+  // Around[dist] gives Around[N[Mean[dist]], N[StandardDeviation[dist]]].
+  #[test]
+  fn around_from_distribution() {
+    assert_eq!(
+      interpret("Around[NormalDistribution[3, 2]]").unwrap(),
+      "Around[3., 2.]"
+    );
+    assert_eq!(
+      interpret("Around[UniformDistribution[{0, 1}]]").unwrap(),
+      "Around[0.5, 0.28867513459481287]"
+    );
+    assert_eq!(
+      interpret("Around[PoissonDistribution[4]]").unwrap(),
+      "Around[4., 2.]"
+    );
+  }
+
+  // Around[Interval[{a, b}]] treats the interval as a uniform distribution:
+  // Around[(a+b)/2, (b-a)/2] — uncertainty is the interval half-width.
+  #[test]
+  fn around_from_interval() {
+    assert_eq!(
+      interpret("Around[Interval[{2, 4}]]").unwrap(),
+      "Around[3., 1.]"
+    );
+    // A degenerate interval collapses to its exact point value.
+    assert_eq!(interpret("Around[Interval[{3, 3}]]").unwrap(), "3");
+  }
+
+  // A non-distribution argument leaves the 1-argument form unevaluated.
+  #[test]
+  fn around_one_arg_symbolic_stays() {
+    assert_eq!(interpret("Around[x]").unwrap(), "Around[x]");
+  }
+
+  // around["Value"] / around["Uncertainty"] extract the stored components.
+  #[test]
+  fn around_properties() {
+    assert_eq!(interpret("Around[5, 0.3][\"Value\"]").unwrap(), "5.");
+    assert_eq!(interpret("Around[5, 0.3][\"Uncertainty\"]").unwrap(), "0.3");
+    assert_eq!(
+      interpret("Around[5, {0.1, 0.2}][\"Uncertainty\"]").unwrap(),
+      "{0.1, 0.2}"
+    );
+  }
+
+  // Around[{v1, …}, u] threads over the central values, giving each the same
+  // uncertainty.
+  #[test]
+  fn around_threads_over_values() {
+    assert_eq!(
+      interpret("Around[{1, 2, 3}, 0.1]").unwrap(),
+      "{Around[1., 0.1], Around[2., 0.1], Around[3., 0.1]}"
+    );
+    assert_eq!(
+      interpret("Around[{5.0, 10.0}, 0.5]").unwrap(),
+      "{Around[5., 0.5], Around[10., 0.5]}"
+    );
+    // A zero uncertainty collapses each element to its bare value.
+    assert_eq!(interpret("Around[{1, 2, 3}, 0]").unwrap(), "{1, 2, 3}");
+  }
+
+  #[test]
+  fn around_scaled() {
+    // Around[x, Scaled[s]] becomes Around[x, |x|*s].
+    assert_eq!(
+      interpret("Around[4.1836, Scaled[0.05]]").unwrap(),
+      "Around[4.1836, 0.20918000000000003]"
+    );
+  }
+
+  #[test]
+  fn around_scaled_integer_value() {
+    // Around[10, Scaled[0.1]] → Around[10., 1.].
+    assert_eq!(
+      interpret("Around[10, Scaled[0.1]]").unwrap(),
+      "Around[10., 1.]"
+    );
+  }
+
+  #[test]
+  fn around_scaled_negative_value() {
+    // |x| is used so the uncertainty is non-negative.
+    assert_eq!(
+      interpret("Around[-2.0, Scaled[0.25]]").unwrap(),
+      "Around[-2., 0.5]"
+    );
+  }
+
+  #[test]
+  fn around_scaled_symbolic_stays() {
+    // Non-numeric value: Scaled isn't reduced.
+    assert_eq!(
+      interpret("Around[x, Scaled[0.1]]").unwrap(),
+      "Around[x, Scaled[0.1]]"
+    );
+  }
+
+  // Around arithmetic propagates uncertainty (independent first-order):
+  // sums add variances, products add absolute partials in quadrature.
+  #[test]
+  fn around_plus() {
+    assert_eq!(
+      interpret("Around[5, 1] + Around[3, 1]").unwrap(),
+      "Around[8., 1.4142135623730951]"
+    );
+    assert_eq!(
+      interpret("Around[5, 1] + Around[3, 2]").unwrap(),
+      "Around[8., 2.23606797749979]"
+    );
+    // A constant shifts the value but not the uncertainty.
+    assert_eq!(interpret("Around[5, 1] + 10").unwrap(), "Around[15., 1.]");
+    // Subtraction goes through Times[-1, …] + Plus.
+    assert_eq!(
+      interpret("Around[5, 1] - Around[3, 1]").unwrap(),
+      "Around[2., 1.4142135623730951]"
+    );
+  }
+
+  #[test]
+  fn around_times() {
+    assert_eq!(interpret("Around[10, 2] * 2").unwrap(), "Around[20., 4.]");
+    assert_eq!(
+      interpret("Around[5, 1] * Around[3, 1]").unwrap(),
+      "Around[15., 5.830951894845301]"
+    );
+    assert_eq!(interpret("-Around[5, 1]").unwrap(), "Around[-5., 1.]");
+  }
+
+  #[test]
+  fn around_power() {
+    assert_eq!(interpret("Around[5, 1]^2").unwrap(), "Around[25., 10.]");
+  }
+
+  // A symbolic term leaves the sum unevaluated (no propagation possible).
+  #[test]
+  fn around_plus_symbolic_stays() {
+    assert_eq!(interpret("Around[5, 1] + x").unwrap(), "x + Around[5., 1.]");
+  }
+
+  // Elementary unary functions propagate: f[Around[a,d]] = Around[f[a],|f'[a]|d].
+  #[test]
+  fn around_unary_functions() {
+    assert_eq!(interpret("Sqrt[Around[4, 1]]").unwrap(), "Around[2., 0.25]");
+    assert_eq!(interpret("Exp[Around[0, 0.1]]").unwrap(), "Around[1., 0.1]");
+    assert_eq!(
+      interpret("Log[Around[2, 0.1]]").unwrap(),
+      "Around[0.6931471805599453, 0.05]"
+    );
+    assert_eq!(interpret("Sin[Around[0, 0.1]]").unwrap(), "Around[0., 0.1]");
+    assert_eq!(
+      interpret("ArcTan[Around[1, 0.1]]").unwrap(),
+      "Around[0.7853981633974483, 0.05]"
+    );
+  }
+
+  // Abs propagates via Sign: Abs[Around[a, d]] = Around[|a|, d] for a != 0.
+  #[test]
+  fn around_abs() {
+    assert_eq!(interpret("Abs[Around[-5, 1]]").unwrap(), "Around[5., 1.]");
+    assert_eq!(interpret("Abs[Around[5, 1]]").unwrap(), "Around[5., 1.]");
+    assert_eq!(
+      interpret("RealAbs[Around[-4, 1]]").unwrap(),
+      "Around[4., 1.]"
+    );
+    // At the origin Sign is 0, so the uncertainty collapses to a bare 0.
+    assert_eq!(interpret("Abs[Around[0, 2]]").unwrap(), "0.");
+    // A negative center flips the asymmetric uncertainty sides.
+    assert_eq!(
+      interpret("Abs[Around[-5, {1, 2}]]").unwrap(),
+      "Around[5., {2., 1.}]"
+    );
+  }
+
+  // A zero (propagated or given) uncertainty collapses to the bare value.
+  #[test]
+  fn around_zero_uncertainty_collapses() {
+    assert_eq!(interpret("Around[5, 0]").unwrap(), "5");
+    assert_eq!(interpret("Around[5., 0.]").unwrap(), "5.");
+    // Cos'(0) = 0, so the propagated uncertainty vanishes.
+    assert_eq!(interpret("Cos[Around[0, 0.1]]").unwrap(), "1.");
+    assert_eq!(interpret("Sin[Around[0, 0]]").unwrap(), "0");
+  }
+
+  #[test]
+  fn specularity() {
+    assert_eq!(
+      interpret("Specularity[White, 10]").unwrap(),
+      "Specularity[GrayLevel[1], 10]"
+    );
+  }
+
+  #[test]
+  fn status_area() {
+    assert_eq!(interpret("StatusArea[x, y]").unwrap(), "StatusArea[x, y]");
+  }
+
+  #[test]
+  fn pane() {
+    assert_eq!(interpret("Pane[x]").unwrap(), "Pane[x]");
+  }
+
+  #[test]
+  fn plot_labels() {
+    assert_eq!(interpret("PlotLabels[x]").unwrap(), "PlotLabels[x]");
+  }
+
+  #[test]
+  fn inactive() {
+    assert_eq!(
+      interpret("Inactive[Plus][2, 3]").unwrap(),
+      "Inactive[Plus][2, 3]"
+    );
+  }
+
+  // Inactivate[expr] wraps every head with Inactive[...] (holding its
+  // argument); operators map to their full-form heads.
+  #[test]
+  fn inactivate_basic() {
+    assert_eq!(
+      interpret("Inactivate[1 + 1]").unwrap(),
+      "Inactive[Plus][1, 1]"
+    );
+    assert_eq!(
+      interpret("Inactivate[a + b*c]").unwrap(),
+      "Inactive[Plus][a, Inactive[Times][b, c]]"
+    );
+    assert_eq!(
+      interpret("Inactivate[x^2 + 1]").unwrap(),
+      "Inactive[Plus][Inactive[Power][x, 2], 1]"
+    );
+    assert_eq!(
+      interpret("Inactivate[f[g[x]]]").unwrap(),
+      "Inactive[f][Inactive[g][x]]"
+    );
+    // List stays structural; elements are still inactivated.
+    assert_eq!(
+      interpret("Inactivate[{Sin[x], a + b}]").unwrap(),
+      "{Inactive[Sin][x], Inactive[Plus][a, b]}"
+    );
+  }
+
+  // Subtraction, division, and negation desugar to their full forms before
+  // being inactivated, and Plus/Minus chains flatten.
+  #[test]
+  fn inactivate_operators() {
+    assert_eq!(
+      interpret("Inactivate[a - b]").unwrap(),
+      "Inactive[Plus][a, Inactive[Times][-1, b]]"
+    );
+    assert_eq!(
+      interpret("Inactivate[a - b - c]").unwrap(),
+      "Inactive[Plus][a, Inactive[Times][-1, b], Inactive[Times][-1, c]]"
+    );
+    assert_eq!(
+      interpret("Inactivate[-a]").unwrap(),
+      "Inactive[Times][-1, a]"
+    );
+    assert_eq!(
+      interpret("Inactivate[a/b]").unwrap(),
+      "Inactive[Times][a, Inactive[Power][b, -1]]"
+    );
+    assert_eq!(
+      interpret("Inactivate[a == b]").unwrap(),
+      "Inactive[Equal][a, b]"
+    );
+  }
+
+  // The two-argument form only inactivates the named head; Activate inverts.
+  #[test]
+  fn inactivate_filter_and_roundtrip() {
+    assert_eq!(
+      interpret("Inactivate[Sin[x] + 1, Plus]").unwrap(),
+      "Inactive[Plus][Sin[x], 1]"
+    );
+    assert_eq!(interpret("Inactivate[a + b, Times]").unwrap(), "a + b");
+    assert_eq!(
+      interpret("Activate[Inactivate[a + b*c]]").unwrap(),
+      "a + b*c"
+    );
+  }
+
+  #[test]
+  fn geo_position() {
+    assert_eq!(
+      interpret("GeoPosition[{40, -74}]").unwrap(),
+      "GeoPosition[{40, -74}]"
+    );
+  }
+
+  #[test]
+  fn baseline_position() {
+    assert_eq!(
+      interpret("BaselinePosition[x]").unwrap(),
+      "BaselinePosition[x]"
+    );
+  }
+
+  #[test]
+  fn image_scaled() {
+    assert_eq!(
+      interpret("ImageScaled[{0.5, 0.5}]").unwrap(),
+      "ImageScaled[{0.5, 0.5}]"
+    );
+  }
+
+  #[test]
+  fn dirichlet_condition() {
+    assert_eq!(
+      interpret("DirichletCondition[u[x] == 0, x == 0]").unwrap(),
+      "DirichletCondition[u[x] == 0, x == 0]"
+    );
+  }
+
+  #[test]
+  fn boundary_style() {
+    assert_eq!(interpret("BoundaryStyle[x]").unwrap(), "BoundaryStyle[x]");
+  }
+
+  #[test]
+  fn entity_class() {
+    assert_eq!(interpret("EntityClass[x, y]").unwrap(), "EntityClass[x, y]");
+  }
+
+  #[test]
+  fn default_label_style() {
+    assert_eq!(
+      interpret("DefaultLabelStyle[x]").unwrap(),
+      "DefaultLabelStyle[x]"
+    );
+  }
+}
+
+mod rotation_matrix {
+  use super::*;
+
+  #[test]
+  fn symbolic_2d() {
+    assert_eq!(
+      interpret("RotationMatrix[theta]").unwrap(),
+      "{{Cos[theta], -Sin[theta]}, {Sin[theta], Cos[theta]}}"
+    );
+  }
+
+  #[test]
+  fn pi_over_4() {
+    assert_eq!(
+      interpret("RotationMatrix[Pi/4]").unwrap(),
+      "{{1/Sqrt[2], -(1/Sqrt[2])}, {1/Sqrt[2], 1/Sqrt[2]}}"
+    );
+  }
+
+  #[test]
+  fn pi_over_2_3d() {
+    assert_eq!(
+      interpret("RotationMatrix[Pi/2, {0, 0, 1}]").unwrap(),
+      "{{0, -1, 0}, {1, 0, 0}, {0, 0, 1}}"
+    );
+  }
+
+  // RotationMatrix[{u, v}] is the 2D rotation taking u to the direction of v.
+  #[test]
+  fn vector_pair_2d() {
+    // Orthonormal axes: a quarter turn (magnitudes are irrelevant).
+    assert_eq!(
+      interpret("RotationMatrix[{{1, 0}, {0, 1}}]").unwrap(),
+      "{{0, -1}, {1, 0}}"
+    );
+    assert_eq!(
+      interpret("RotationMatrix[{{2, 0}, {0, 3}}]").unwrap(),
+      "{{0, -1}, {1, 0}}"
+    );
+    // 45 degrees from the x-axis to {1, 1}.
+    assert_eq!(
+      interpret("RotationMatrix[{{1, 0}, {1, 1}}]").unwrap(),
+      "{{1/Sqrt[2], -(1/Sqrt[2])}, {1/Sqrt[2], 1/Sqrt[2]}}"
+    );
+    // A general (non-unit, non-orthogonal) pair keeps exact radicals.
+    assert_eq!(
+      interpret("RotationMatrix[{{1, 2}, {3, 4}}]").unwrap(),
+      "{{11/(5*Sqrt[5]), 2/(5*Sqrt[5])}, {-2/(5*Sqrt[5]), 11/(5*Sqrt[5])}}"
+    );
+  }
+}
+
+mod batch_inert_symbols_3 {
+  use super::*;
+
+  #[test]
+  fn performance_goal() {
+    assert_eq!(
+      interpret("PerformanceGoal[x]").unwrap(),
+      "PerformanceGoal[x]"
+    );
+  }
+
+  #[test]
+  fn vertex_list() {
+    assert_eq!(interpret("VertexList[x]").unwrap(), "VertexList[x]");
+  }
+
+  #[test]
+  fn chart_labels() {
+    assert_eq!(interpret("ChartLabels[x]").unwrap(), "ChartLabels[x]");
+  }
+
+  #[test]
+  fn text_cell() {
+    assert_eq!(interpret("TextCell[x]").unwrap(), "TextCell[x]");
+  }
+
+  #[test]
+  fn plot_range_clipping() {
+    assert_eq!(
+      interpret("PlotRangeClipping[x]").unwrap(),
+      "PlotRangeClipping[x]"
+    );
+  }
+
+  #[test]
+  fn rotation_transform() {
+    assert_eq!(
+      interpret("RotationTransform[x]").unwrap(),
+      "TransformationFunction[{{Cos[x], -Sin[x], 0}, {Sin[x], Cos[x], 0}, {0, 0, 1}}]"
+    );
+  }
+
+  #[test]
+  fn data_range() {
+    assert_eq!(interpret("DataRange[x]").unwrap(), "DataRange[x]");
+  }
+
+  #[test]
+  fn cell_baseline() {
+    assert_eq!(interpret("CellBaseline[x]").unwrap(), "CellBaseline[x]");
+  }
+
+  #[test]
+  fn animation_running() {
+    assert_eq!(
+      interpret("AnimationRunning[x]").unwrap(),
+      "AnimationRunning[x]"
+    );
+  }
+
+  #[test]
+  fn selected_notebook() {
+    assert_eq!(
+      interpret("SelectedNotebook[x]").unwrap(),
+      "SelectedNotebook[x]"
+    );
+  }
+
+  #[test]
+  fn geometric_transformation() {
+    assert_eq!(
+      interpret("GeometricTransformation[x, y]").unwrap(),
+      "GeometricTransformation[x, y]"
+    );
+  }
+
+  #[test]
+  fn cloud_export() {
+    assert_eq!(interpret("CloudExport[x]").unwrap(), "CloudExport[x]");
+  }
+
+  #[test]
+  fn cloud_export_with_image_and_format() {
+    // Audit case: CloudExport requires a Wolfram Cloud auth + network
+    // round trip that Woxi cannot perform, so we keep the call
+    // symbolic. The image collapses to the standard `-Image-` summary
+    // so the result must not hang on large literals.
+    assert_eq!(
+      interpret(
+        "CloudExport[Image[{{{0.5, 0.5, 0.5}, {0.6, 0.6, 0.6}}}], \"JPEG\"]"
+      )
+      .unwrap(),
+      "CloudExport[-Image-, JPEG]"
+    );
+  }
+
+  #[test]
+  fn cloud_export_with_uri() {
+    // Three-argument form: an explicit destination URI must be carried
+    // through the unevaluated wrapper.
+    assert_eq!(
+      interpret("CloudExport[Image[{{0.5}}], \"PNG\", \"obj/foo\"]").unwrap(),
+      "CloudExport[-Image-, PNG, obj/foo]"
+    );
+  }
+}
+
+mod right_composition {
+  use super::*;
+
+  #[test]
+  fn display_two_args() {
+    assert_eq!(interpret("RightComposition[f, g]").unwrap(), "f /* g");
+  }
+
+  #[test]
+  fn display_three_args() {
+    assert_eq!(
+      interpret("RightComposition[f, g, h]").unwrap(),
+      "f /* g /* h"
+    );
+  }
+
+  #[test]
+  fn apply_two_functions() {
+    assert_eq!(interpret("RightComposition[f, g][x]").unwrap(), "g[f[x]]");
+  }
+
+  #[test]
+  fn apply_three_functions() {
+    assert_eq!(
+      interpret("RightComposition[f, g, h][x]").unwrap(),
+      "h[g[f[x]]]"
+    );
+  }
+
+  #[test]
+  fn single_function() {
+    assert_eq!(interpret("RightComposition[f][x]").unwrap(), "f[x]");
+  }
+
+  #[test]
+  fn empty_composition() {
+    assert_eq!(interpret("RightComposition[][x]").unwrap(), "x");
+  }
+
+  #[test]
+  fn with_numeric_values() {
+    assert_eq!(
+      interpret("RightComposition[# + 1 &, #^2 &][3]").unwrap(),
+      "16"
+    );
+  }
+}
+
+mod composition_operator_parsing {
+  use super::*;
+
+  #[test]
+  fn at_star_basic() {
+    assert_eq!(interpret("f @* g").unwrap(), "f @* g");
+  }
+
+  #[test]
+  fn at_star_apply() {
+    assert_eq!(interpret("(f @* g)[x]").unwrap(), "f[g[x]]");
+  }
+
+  #[test]
+  fn at_star_three_functions() {
+    assert_eq!(interpret("(f @* g @* h)[x]").unwrap(), "f[g[h[x]]]");
+  }
+
+  #[test]
+  fn at_star_with_builtins() {
+    assert_eq!(interpret("(StringLength @* ToString)[12345]").unwrap(), "5");
+  }
+
+  #[test]
+  fn slash_star_basic() {
+    assert_eq!(interpret("f /* g").unwrap(), "f /* g");
+  }
+
+  #[test]
+  fn slash_star_apply() {
+    assert_eq!(interpret("(f /* g)[x]").unwrap(), "g[f[x]]");
+  }
+
+  #[test]
+  fn slash_star_three_functions() {
+    assert_eq!(interpret("(f /* g /* h)[x]").unwrap(), "h[g[f[x]]]");
+  }
+
+  #[test]
+  fn slash_star_with_pure_functions() {
+    assert_eq!(interpret("((# + 1 &) /* (#^2 &))[3]").unwrap(), "16");
+  }
+}
+
+mod parallel_table {
+  use super::*;
+
+  #[test]
+  fn basic() {
+    assert_eq!(
+      interpret("ParallelTable[i^2, {i, 5}]").unwrap(),
+      "{1, 4, 9, 16, 25}"
+    );
+  }
+
+  #[test]
+  fn multi_dim() {
+    assert_eq!(
+      interpret("ParallelTable[i + j, {i, 2}, {j, 2}]").unwrap(),
+      "{{2, 3}, {3, 4}}"
+    );
+  }
+}
+
+mod sinc {
+  use super::*;
+
+  #[test]
+  fn sinc_zero() {
+    assert_eq!(interpret("Sinc[0]").unwrap(), "1");
+  }
+
+  #[test]
+  fn sinc_pi_half() {
+    assert_eq!(interpret("Sinc[Pi/2]").unwrap(), "2/Pi");
+  }
+
+  #[test]
+  fn sinc_pi() {
+    assert_eq!(interpret("Sinc[Pi]").unwrap(), "0");
+  }
+
+  #[test]
+  fn sinc_symbolic() {
+    assert_eq!(interpret("Sinc[x]").unwrap(), "Sinc[x]");
+  }
+
+  #[test]
+  fn sinc_numeric() {
+    assert_eq!(interpret("Sinc[1.0]").unwrap(), "0.8414709848078965");
+  }
+
+  // Sin is bounded while the denominator diverges, so Sinc[±Infinity] = 0;
+  // an undirected ComplexInfinity gives Indeterminate. Per wolframscript.
+  #[test]
+  fn sinc_infinite_limits() {
+    assert_eq!(interpret("Sinc[Infinity]").unwrap(), "0");
+    assert_eq!(interpret("Sinc[-Infinity]").unwrap(), "0");
+    assert_eq!(interpret("Sinc[ComplexInfinity]").unwrap(), "Indeterminate");
+  }
+}
+
+mod reim {
+  use super::*;
+
+  #[test]
+  fn reim_complex() {
+    assert_eq!(interpret("ReIm[3 + 4 I]").unwrap(), "{3, 4}");
+  }
+
+  #[test]
+  fn reim_real() {
+    assert_eq!(interpret("ReIm[5]").unwrap(), "{5, 0}");
+  }
+
+  #[test]
+  fn reim_pure_imaginary() {
+    assert_eq!(interpret("ReIm[3 I]").unwrap(), "{0, 3}");
+  }
+
+  #[test]
+  fn reim_threads_over_list() {
+    // ReIm is Listable, so it should thread over a list of complex numbers,
+    // returning a list of `{Re, Im}` pairs (rather than `{Re[list], Im[list]}`).
+    assert_eq!(
+      interpret("ReIm[{1 + I, 2 + 3 I}]").unwrap(),
+      "{{1, 1}, {2, 3}}"
+    );
+  }
+
+  #[test]
+  fn prime_pi_threads_over_list() {
+    // PrimePi is Listable in Wolfram (Attributes[PrimePi] = {Listable, Protected}).
+    assert_eq!(
+      interpret("PrimePi[{1, 2, 3, 4, 5}]").unwrap(),
+      "{0, 1, 2, 2, 3}"
+    );
+  }
+}
+
+mod complex_expand {
+  use super::*;
+
+  // ComplexExpand assumes every symbol is real, so Re/Im/Conjugate of a bare
+  // symbol (and of a symbolic complex) collapse. Verified against wolframscript.
+  #[test]
+  fn re_im_conjugate_real_symbol() {
+    assert_eq!(interpret("ComplexExpand[Re[a]]").unwrap(), "a");
+    assert_eq!(interpret("ComplexExpand[Im[a]]").unwrap(), "0");
+    assert_eq!(interpret("ComplexExpand[Conjugate[a]]").unwrap(), "a");
+  }
+
+  #[test]
+  fn re_im_conjugate_symbolic_complex() {
+    assert_eq!(interpret("ComplexExpand[Re[a + b I]]").unwrap(), "a");
+    assert_eq!(interpret("ComplexExpand[Im[a + b I]]").unwrap(), "b");
+    assert_eq!(
+      interpret("ComplexExpand[Conjugate[a + b I]]").unwrap(),
+      "a - I*b"
+    );
+  }
+
+  // Regression: the Pi/4 result of ComplexExpand[Arg[1 + I]] must render as a
+  // division, not `Pi*1/4`. The final Expand pass leaves the 1/4 rational as a
+  // trailing Times factor, which the formatter now renders as `Pi/4`.
+  #[test]
+  fn arg_of_numeric_complex_renders_as_division() {
+    assert_eq!(interpret("ComplexExpand[Arg[1 + I]]").unwrap(), "Pi/4");
+    assert_eq!(interpret("ComplexExpand[Arg[3 + 3 I]]").unwrap(), "Pi/4");
+    assert_eq!(
+      interpret("ComplexExpand[Arg[-1 - I]]").unwrap(),
+      "(-3*Pi)/4"
+    );
+  }
+
+  #[test]
+  fn re_im_of_power() {
+    assert_eq!(
+      interpret("ComplexExpand[Re[(a + b I)^2]]").unwrap(),
+      "a^2 - b^2"
+    );
+    assert_eq!(
+      interpret("ComplexExpand[Im[(a + b I)^2]]").unwrap(),
+      "2*a*b"
+    );
+  }
+
+  #[test]
+  fn sin_complex() {
+    // ComplexExpand[Sin[x + I*y]] = Cosh[y]*Sin[x] + I*Cos[x]*Sinh[y]
+    let result = interpret("ComplexExpand[Sin[x + I*y]]").unwrap();
+    // Both term orderings are valid
+    assert!(
+      result == "Cosh[y]*Sin[x] + I*Cos[x]*Sinh[y]"
+        || result == "I*Cos[x]*Sinh[y] + Cosh[y]*Sin[x]",
+      "Got: {result}"
+    );
+  }
+
+  #[test]
+  fn cos_complex() {
+    assert_eq!(
+      interpret("ComplexExpand[Cos[x + I*y]]").unwrap(),
+      "Cos[x]*Cosh[y] - I*Sin[x]*Sinh[y]"
+    );
+  }
+
+  #[test]
+  fn exp_complex() {
+    assert_eq!(
+      interpret("ComplexExpand[Exp[x + I*y]]").unwrap(),
+      "E^x*Cos[y] + I*E^x*Sin[y]"
+    );
+  }
+
+  #[test]
+  fn abs_complex() {
+    assert_eq!(
+      interpret("ComplexExpand[Abs[x + I*y]]").unwrap(),
+      "Sqrt[x^2 + y^2]"
+    );
+  }
+
+  // For a real symbol Abs[x] = Sqrt[x^2]; powers follow from that.
+  #[test]
+  fn abs_real_symbol() {
+    assert_eq!(interpret("ComplexExpand[Abs[x]]").unwrap(), "Sqrt[x^2]");
+    assert_eq!(interpret("ComplexExpand[Abs[I x]]").unwrap(), "Sqrt[x^2]");
+    assert_eq!(interpret("ComplexExpand[Abs[x]^3]").unwrap(), "(x^2)^(3/2)");
+  }
+
+  // Even powers of Abs[real] collapse to plain powers.
+  #[test]
+  fn abs_even_power_collapses() {
+    assert_eq!(interpret("ComplexExpand[Abs[x]^2]").unwrap(), "x^2");
+    assert_eq!(interpret("ComplexExpand[Abs[x]^4]").unwrap(), "x^4");
+    assert_eq!(interpret("ComplexExpand[Abs[x*y]^2]").unwrap(), "x^2*y^2");
+    assert_eq!(interpret("ComplexExpand[Abs[2 x]^2]").unwrap(), "4*x^2");
+  }
+
+  // Abs[x+1]^2 expands like any polynomial: 1 + 2 x + x^2.
+  #[test]
+  fn abs_squared_expands_polynomial() {
+    assert_eq!(
+      interpret("ComplexExpand[Abs[x + 1]^2]").unwrap(),
+      "1 + 2*x + x^2"
+    );
+  }
+
+  // The single-argument form distributes products and integer powers.
+  #[test]
+  fn single_arg_expands_products() {
+    assert_eq!(
+      interpret("ComplexExpand[(x + 1)^2]").unwrap(),
+      "1 + 2*x + x^2"
+    );
+  }
+
+  // Re/Im/Conjugate of Abs[real]^2 reduce through the Sqrt[x^2] rewrite.
+  #[test]
+  fn re_conjugate_of_abs_squared() {
+    assert_eq!(interpret("ComplexExpand[Re[Abs[x]^2]]").unwrap(), "x^2");
+    assert_eq!(interpret("ComplexExpand[Im[Abs[x]^2]]").unwrap(), "0");
+    assert_eq!(
+      interpret("ComplexExpand[Conjugate[Abs[x]^2]]").unwrap(),
+      "x^2"
+    );
+  }
+
+  // Log[z] = Log[Re[z]^2 + Im[z]^2]/2 + I Arg[z].
+  #[test]
+  fn log_complex() {
+    assert_eq!(
+      interpret("ComplexExpand[Log[x + I y]]").unwrap(),
+      "I*Arg[x + I*y] + Log[x^2 + y^2]/2"
+    );
+  }
+
+  // A real symbol is still split: Log[x] = I Arg[x] + Log[x^2]/2.
+  #[test]
+  fn log_real_symbol() {
+    assert_eq!(
+      interpret("ComplexExpand[Log[x]]").unwrap(),
+      "I*Arg[x] + Log[x^2]/2"
+    );
+    assert_eq!(
+      interpret("ComplexExpand[Log[a]]").unwrap(),
+      "I*Arg[a] + Log[a^2]/2"
+    );
+  }
+
+  // The two-argument form treats named variables as complex.
+  #[test]
+  fn log_complex_variable() {
+    assert_eq!(
+      interpret("ComplexExpand[Log[z], {z}]").unwrap(),
+      "I*Arg[z] + Log[Im[z]^2 + Re[z]^2]/2"
+    );
+  }
+}
+
+mod abs_arg {
+  use super::*;
+
+  #[test]
+  fn abs_arg_complex() {
+    assert_eq!(interpret("AbsArg[1 + I]").unwrap(), "{Sqrt[2], Pi/4}");
+  }
+
+  #[test]
+  fn abs_arg_positive_real() {
+    assert_eq!(interpret("AbsArg[2]").unwrap(), "{2, 0}");
+  }
+
+  #[test]
+  fn abs_arg_negative_real() {
+    assert_eq!(interpret("AbsArg[-3]").unwrap(), "{3, Pi}");
+  }
+
+  #[test]
+  fn abs_arg_pure_imaginary() {
+    assert_eq!(interpret("AbsArg[I]").unwrap(), "{1, Pi/2}");
+  }
+
+  #[test]
+  fn abs_arg_negative_imaginary() {
+    assert_eq!(interpret("AbsArg[-I]").unwrap(), "{1, -1/2*Pi}");
+  }
+
+  #[test]
+  fn abs_arg_zero() {
+    assert_eq!(interpret("AbsArg[0]").unwrap(), "{0, 0}");
+  }
+
+  #[test]
+  fn abs_arg_float() {
+    assert_eq!(interpret("AbsArg[3.5]").unwrap(), "{3.5, 0}");
+    assert_eq!(interpret("AbsArg[-2.5]").unwrap(), "{2.5, Pi}");
+  }
+}
+
+mod characteristic_polynomial {
+  use super::*;
+
+  #[test]
+  fn two_by_two() {
+    assert_eq!(
+      interpret("CharacteristicPolynomial[{{a, b}, {c, d}}, x]").unwrap(),
+      "-(b*c) + a*d - a*x - d*x + x^2"
+    );
+  }
+
+  #[test]
+  fn identity_matrix() {
+    assert_eq!(
+      interpret("CharacteristicPolynomial[{{1, 0}, {0, 1}}, x]").unwrap(),
+      "1 - 2*x + x^2"
+    );
+  }
+
+  #[test]
+  fn numeric() {
+    assert_eq!(
+      interpret("CharacteristicPolynomial[{{2, 1}, {0, 3}}, x]").unwrap(),
+      "6 - 5*x + x^2"
+    );
+  }
+
+  #[test]
+  fn large_integer_matrix_is_fast() {
+    // Regression: CharacteristicPolynomial built the symbolic Det[A - x I],
+    // which used O(n!) cofactor expansion and hung for n >= ~13. The
+    // Faddeev-LeVerrier path computes it in O(n^3). Matches wolframscript;
+    // {i + j} has rank 2 so only the top three coefficients are nonzero.
+    assert_eq!(
+      interpret("CharacteristicPolynomial[Table[i + j, {i, 15}, {j, 15}], x]")
+        .unwrap(),
+      "4200*x^13 + 240*x^14 - x^15"
+    );
+    // Odd order flips the overall sign (det[A - xI] = (-1)^n det[xI - A]).
+    assert_eq!(
+      interpret(
+        "CharacteristicPolynomial[{{2, 1, 0}, {1, 2, 1}, {0, 1, 2}}, x]"
+      )
+      .unwrap(),
+      "4 - 10*x + 6*x^2 - x^3"
+    );
+  }
+}
+
+mod boolean_minimize {
+  use super::*;
+
+  #[test]
+  fn minimize_true() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[True]").unwrap(), "True");
+  }
+
+  #[test]
+  fn minimize_false() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[False]").unwrap(), "False");
+  }
+
+  #[test]
+  fn minimize_tautology() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[a || Not[a]]").unwrap(), "True");
+  }
+
+  #[test]
+  fn minimize_contradiction() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[a && Not[a]]").unwrap(), "False");
+  }
+
+  #[test]
+  fn minimize_absorption() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[a || (a && b)]").unwrap(), "a");
+  }
+
+  #[test]
+  fn minimize_complementary() {
+    clear_state();
+    // (a && b) || (a && !b) → a
+    assert_eq!(
+      interpret("BooleanMinimize[And[a, b] || And[a, Not[b]]]").unwrap(),
+      "a"
+    );
+  }
+
+  #[test]
+  fn minimize_extract_b() {
+    clear_state();
+    // (a && b) || (!a && b) → b
+    assert_eq!(
+      interpret("BooleanMinimize[And[a, b] || And[Not[a], b]]").unwrap(),
+      "b"
+    );
+  }
+
+  #[test]
+  fn minimize_identity() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[a && b]").unwrap(), "a && b");
+  }
+
+  #[test]
+  fn minimize_implies() {
+    clear_state();
+    // Implies[a, b] → !a || b
+    let result = interpret("BooleanMinimize[Implies[a, b]]").unwrap();
+    assert!(
+      result == " !a || b" || result == "b ||  !a",
+      "Got: {result}"
+    );
+  }
+
+  #[test]
+  fn minimize_xor() {
+    clear_state();
+    // Xor[a, b] → (a && !b) || (!a && b)
+    let result = interpret("BooleanMinimize[Xor[a, b]]").unwrap();
+    assert!(result.contains("&&"), "Got: {result}");
+    assert!(result.contains("||"), "Got: {result}");
+  }
+
+  #[test]
+  fn minimize_single_var() {
+    clear_state();
+    assert_eq!(interpret("BooleanMinimize[a || a]").unwrap(), "a");
+  }
+
+  #[test]
+  fn minimize_single_not_var() {
+    clear_state();
+    assert_eq!(
+      interpret("BooleanMinimize[Not[a] || Not[a]]").unwrap(),
+      " !a"
+    );
+  }
+}
+
+mod recursion_limit {
+  use super::*;
+
+  #[test]
+  fn mutually_recursive_protected_symbol_rules_no_stack_overflow() {
+    // Regression test for https://github.com/ad-si/Woxi/issues/99
+    // Mutually recursive rules on protected symbols caused stack overflow
+    clear_state();
+    let result = interpret(
+      "Unprotect[ArcSec, ArcCos]; \
+       ArcCos[1/u_] := ArcSec[u]; \
+       ArcSec[1/u_] := ArcCos[u]; \
+       f[ArcSec[x_]] := 0",
+    );
+    // Should not stack overflow — returns Null from SetDelayed
+    assert!(result.is_ok());
+  }
+
+  #[test]
+  fn mutually_recursive_rules_symbolic_arg() {
+    // ArcSec[y] with mutual recursion should not stack overflow
+    clear_state();
+    let result = interpret(
+      "Unprotect[ArcSec, ArcCos]; \
+       ArcCos[1/u_] := ArcSec[u]; \
+       ArcSec[1/u_] := ArcCos[u]; \
+       ArcSec[y]",
+    );
+    assert!(result.is_ok());
+    // Should return ArcSec[y] unevaluated (recursion limit prevents infinite loop)
+    assert_eq!(result.unwrap(), "ArcSec[y]");
+  }
+
+  #[test]
+  fn concrete_value_still_works_with_recursive_rules() {
+    // Concrete numeric values should still evaluate correctly
+    clear_state();
+    let result = interpret(
+      "Unprotect[ArcSec, ArcCos]; \
+       ArcCos[1/u_] := ArcSec[u]; \
+       ArcSec[1/u_] := ArcCos[u]; \
+       ArcSec[2]",
+    );
+    assert_eq!(result.unwrap(), "Pi/3");
+  }
+}
+
+mod unicode_operators {
+  use super::*;
+
+  #[test]
+  fn less_equal() {
+    assert_eq!(interpret("3 ≤ 5").unwrap(), "True");
+    assert_eq!(interpret("5 ≤ 3").unwrap(), "False");
+    assert_eq!(interpret("3 ≤ 3").unwrap(), "True");
+    assert_eq!(interpret("x ≤ 5").unwrap(), "x <= 5");
+  }
+
+  #[test]
+  fn greater_equal() {
+    assert_eq!(interpret("5 ≥ 3").unwrap(), "True");
+    assert_eq!(interpret("3 ≥ 5").unwrap(), "False");
+    assert_eq!(interpret("3 ≥ 3").unwrap(), "True");
+    assert_eq!(interpret("x ≥ 5").unwrap(), "x >= 5");
+  }
+
+  #[test]
+  fn equal_unicode() {
+    assert_eq!(interpret("1 ⩵ 1").unwrap(), "True");
+    assert_eq!(interpret("1 ⩵ 2").unwrap(), "False");
+    assert_eq!(interpret("x ⩵ 5").unwrap(), "x == 5");
+  }
+
+  #[test]
+  fn not_equal() {
+    assert_eq!(interpret("3 ≠ 5").unwrap(), "True");
+    assert_eq!(interpret("3 ≠ 3").unwrap(), "False");
+    assert_eq!(interpret("x ≠ 5").unwrap(), "x != 5");
+  }
+
+  #[test]
+  fn rule_arrow() {
+    assert_eq!(interpret("{1, 2, 3} /. x_ → x^2").unwrap(), "{1, 4, 9}");
+    assert_eq!(interpret("a → b").unwrap(), "a -> b");
+  }
+
+  #[test]
+  fn infinity_symbol() {
+    assert_eq!(interpret("∞").unwrap(), "Infinity");
+    assert_eq!(interpret("∞ + 1").unwrap(), "Infinity");
+    assert_eq!(interpret("-∞").unwrap(), "-Infinity");
+  }
+
+  #[test]
+  fn rule_in_association() {
+    assert_eq!(interpret("<|\"a\" → 1, \"b\" → 2|>[\"a\"]").unwrap(), "1");
+  }
+
+  #[test]
+  fn comparison_chain() {
+    assert_eq!(interpret("1 ≤ 2 ≤ 3").unwrap(), "True");
+    assert_eq!(interpret("1 ≤ 3 ≥ 2").unwrap(), "True");
+  }
+}
+
+// Wolfram treats geometric-shape, pictograph, astronomical and musical
+// glyphs as ordinary (letterlike) symbol names, even though Unicode files
+// them under `So`/`Sm` rather than `L` — `Head[■]` is `Symbol`, not a
+// syntax error. A Demonstration's box form stores these as the bare
+// character rather than the `\[Name]` escape (e.g. a grid-cell marker),
+// so the raw glyph must parse as an identifier on its own.
+mod letterlike_symbol_characters {
+  use super::*;
+
+  #[test]
+  fn geometric_shape_is_a_symbol() {
+    assert_eq!(interpret("Head[■]").unwrap(), "Symbol");
+    assert_eq!(interpret("Head[□]").unwrap(), "Symbol");
+    assert_eq!(interpret("Head[●]").unwrap(), "Symbol");
+    assert_eq!(interpret("Head[○]").unwrap(), "Symbol");
+    assert_eq!(interpret("Head[◆]").unwrap(), "Symbol");
+    assert_eq!(interpret("Head[▲]").unwrap(), "Symbol");
+  }
+
+  #[test]
+  fn geometric_shape_used_as_array_fill_value() {
+    assert_eq!(interpret("ConstantArray[■, 3]").unwrap(), "{■, ■, ■}");
+  }
+
+  #[test]
+  fn geometric_shape_raw_char_matches_named_escape() {
+    assert_eq!(interpret("■ === \\[FilledSquare]").unwrap(), "True");
+  }
+
+  #[test]
+  fn astronomical_and_musical_symbols_are_symbols() {
+    assert_eq!(interpret("Head[♄]").unwrap(), "Symbol"); // Saturn
+    assert_eq!(interpret("Head[♯]").unwrap(), "Symbol"); // Sharp
+    assert_eq!(interpret("Head[☉]").unwrap(), "Symbol"); // Sun
+  }
+
+  #[test]
+  fn geometric_shape_inside_nested_function_call() {
+    // The bare glyph must survive being nested inside further function
+    // calls and control flow, not just as a lone top-level expression.
+    assert_eq!(
+      interpret("If[True, ConstantArray[■, 2], ConstantArray[□, 2]]").unwrap(),
+      "{■, ■}"
+    );
+  }
+}
+
+// Regression tests for `&` (Function) precedence. `&` has very low precedence
+// in Wolfram — it binds looser than any infix operator. Inner-term rules must
+// not consume the `&` greedily when there are preceding operators, otherwise
+// `a + b &` would mis-parse as `a + (b &)` instead of `(a + b) &`.
+mod anonymous_function_precedence {
+  use super::*;
+
+  #[test]
+  fn amp_after_function_call_with_logical_operator() {
+    // `# > 10 && PrimeQ[#] &[11]` should parse as
+    // `Function[And[Greater[#, 10], PrimeQ[#]]][11]` = True.
+    assert_eq!(interpret("# > 10 && PrimeQ[#] &[11]").unwrap(), "True");
+    assert_eq!(
+      interpret("FullForm[Hold[# > 10 && PrimeQ[#] &[11]]]").unwrap(),
+      "FullForm[Hold[(#1 > 10 && PrimeQ[#1] & )[11]]]"
+    );
+  }
+
+  #[test]
+  fn amp_after_function_call_with_plus() {
+    // `a + PrimeQ[#] &[11]` should parse as `Function[a + PrimeQ[#]][11]`.
+    assert_eq!(
+      interpret("FullForm[Hold[a + PrimeQ[#] &[11]]]").unwrap(),
+      "FullForm[Hold[(a + PrimeQ[#1] & )[11]]]"
+    );
+  }
+
+  #[test]
+  fn amp_after_list_with_plus() {
+    // `a + {1, 2} &[5]` should parse as `Function[a + {1, 2}][5]`.
+    assert_eq!(
+      interpret("FullForm[Hold[a + {1, 2} &[5]]]").unwrap(),
+      "FullForm[Hold[(a + {1, 2} & )[5]]]"
+    );
+  }
+
+  #[test]
+  fn amp_after_parenthesized_with_plus() {
+    // `a + (b) &[5]` should parse as `Function[a + b][5]`.
+    assert_eq!(
+      interpret("FullForm[Hold[a + (b) &[5]]]").unwrap(),
+      "FullForm[Hold[(a + b & )[5]]]"
+    );
+  }
+
+  #[test]
+  fn amp_after_part_extract_with_plus() {
+    // `a + f[{1,2,3}][[1]] &[5]` should wrap the whole Plus.
+    assert_eq!(
+      interpret("FullForm[Hold[a + f[{1,2,3}][[1]] &[5]]]").unwrap(),
+      "FullForm[Hold[(a + f[{1, 2, 3}][[1]] & )[5]]]"
+    );
+  }
+
+  #[test]
+  fn amp_after_slot_part_extract_with_plus() {
+    // `a + #[[1]] &[{5, 6}]` should wrap the whole Plus.
+    assert_eq!(
+      interpret("FullForm[Hold[a + #[[1]] &[{5, 6}]]]").unwrap(),
+      "FullForm[Hold[(a + #1[[1]] & )[{5, 6}]]]"
+    );
+  }
+
+  #[test]
+  fn simple_direct_call_forms_still_work() {
+    // Standalone `f[x] &[y]` cases (no preceding operator) still work.
+    assert_eq!(interpret("PrimeQ[#] &[11]").unwrap(), "True");
+    assert_eq!(interpret("(# + 1 &)[5]").unwrap(), "6");
+    assert_eq!(interpret("{#, #^2} &[3]").unwrap(), "{3, 9}");
+  }
+
+  #[test]
+  fn amp_inside_select() {
+    // The predicate form used with Select: full function body wrapped.
+    assert_eq!(
+      interpret("Select[Range[20], # > 10 && PrimeQ[#] &]").unwrap(),
+      "{11, 13, 17, 19}"
+    );
+  }
+
+  #[test]
+  fn amp_after_trailing_semicolon_wraps_whole_compound_expression() {
+    // A trailing `;` with no statement between it and `&` wraps the whole
+    // preceding statement sequence in a Function — the idiom
+    // `TrackingFunction -> (a = #; b = 0; &)` needs for a multi-statement
+    // callback (used by Manipulate's `TrackingFunction` option to reset a
+    // companion control). Without a statement following the last `;`, `&`
+    // cannot bind to it the way `a; b &` binds to just `b`, so it must
+    // instead close out the whole `CompoundExpression` built so far.
+    assert_eq!(
+      interpret("FullForm[Hold[(a = #; b = 0; &)]]").unwrap(),
+      "FullForm[Hold[(a = #1; b = 0; ) & ]]"
+    );
+    // The trailing `;` before `&` also appends an implicit `Null` as the
+    // function's own last statement (same as any other trailing `;`), so
+    // calling it returns `Null` — what matters is that both assignments
+    // ran, in order, as side effects.
+    let _ = interpret("(trackPrecA = #; trackPrecB = 0; &)[5]").unwrap();
+    assert_eq!(interpret("{trackPrecA, trackPrecB}").unwrap(), "{5, 0}");
+  }
+}
+
+mod out_shortcut {
+  use super::*;
+
+  // `%` parses as Out[$Line - 1]; in script mode `$Line` is always 1, so
+  // `%` collapses to Out[0]. `%%` and longer `%`-runs reach further back
+  // and also fall through to Out[0] because no history is cached.
+  #[test]
+  fn percent_alone() {
+    assert_eq!(interpret("%").unwrap(), "Out[0]");
+  }
+
+  #[test]
+  fn double_and_triple_percent_collapse_to_out_zero() {
+    assert_eq!(interpret("%%").unwrap(), "Out[0]");
+    assert_eq!(interpret("%%%").unwrap(), "Out[0]");
+  }
+
+  #[test]
+  fn percent_with_digits_keeps_index() {
+    assert_eq!(interpret("%5").unwrap(), "Out[5]");
+    assert_eq!(interpret("%1").unwrap(), "Out[1]");
+    assert_eq!(interpret("%100").unwrap(), "Out[100]");
+  }
+
+  #[test]
+  fn out_negative_or_zero_normalises_to_out_zero() {
+    assert_eq!(interpret("Out[-1]").unwrap(), "Out[0]");
+    assert_eq!(interpret("Out[-5]").unwrap(), "Out[0]");
+    assert_eq!(interpret("Out[0]").unwrap(), "Out[0]");
+  }
+
+  #[test]
+  fn out_positive_stays_symbolic() {
+    assert_eq!(interpret("Out[1]").unwrap(), "Out[1]");
+    assert_eq!(interpret("Out[42]").unwrap(), "Out[42]");
+  }
+
+  #[test]
+  fn percent_inside_compound_expression() {
+    // `42; %` — the Out[0] reference comes after a leading expression
+    // and remains the visible value of the chained statement list.
+    assert_eq!(interpret("42; %").unwrap(), "Out[0]");
+    // Inside an arbitrary head — the wrapper is preserved around Out[0].
+    assert_eq!(
+      interpret("square = {{1, 2}, {3, 4}}; Transpose[square]; MatrixForm[%]")
+        .unwrap(),
+      "MatrixForm[Out[0]]"
+    );
+  }
+
+  // Adjacency tests — wolframscript treats `%%5` as `%% * 5` and `%5%`
+  // as `%5 * %`, so the parser must split runs of `%` from following
+  // digits or following `%`-runs cleanly.
+  #[test]
+  fn percent_runs_split_from_digits() {
+    assert_eq!(interpret("%%5").unwrap(), "5*Out[0]");
+    assert_eq!(interpret("%5%").unwrap(), "Out[0]*Out[5]");
+  }
+
+  // `Out[-k]` only surfaces when wrapped in a held context — the
+  // standalone evaluator collapses non-positive arguments to `Out[0]`.
+  // When it does surface, wolframscript renders it back as the `%`
+  // shortcut: `Out[-1]` → `%`, `Out[-2]` → `%%`, etc. `Out[0]` and
+  // positive indices keep the literal `Out[k]` form.
+  #[test]
+  fn held_negative_out_renders_as_percent_run() {
+    assert_eq!(interpret("Hold[Out[-1]]").unwrap(), "Hold[%]");
+    assert_eq!(interpret("Hold[Out[-2]]").unwrap(), "Hold[%%]");
+    assert_eq!(interpret("Hold[Out[-3]]").unwrap(), "Hold[%%%]");
+  }
+
+  #[test]
+  fn held_zero_or_positive_out_keeps_literal_form() {
+    assert_eq!(interpret("Hold[Out[0]]").unwrap(), "Hold[Out[0]]");
+    assert_eq!(interpret("Hold[Out[1]]").unwrap(), "Hold[Out[1]]");
+    assert_eq!(interpret("Hold[Out[42]]").unwrap(), "Hold[Out[42]]");
+  }
+
+  #[test]
+  fn bare_percent_run_parses_as_a_relative_out() {
+    // The offset stays relative in the parse tree — resolving it against
+    // `$Line` is the evaluator's job — which is also why a held `%%` prints
+    // back as `%%` rather than as a resolved index.
+    assert_eq!(interpret("Hold[%]").unwrap(), "Hold[%]");
+    assert_eq!(interpret("Hold[%%]").unwrap(), "Hold[%%]");
+    assert_eq!(interpret("Hold[%%%]").unwrap(), "Hold[%%%]");
+  }
+}
+
+// Numbered `In[]` / `Out[]` history (issue #765). Script mode keeps none —
+// covered by `out_shortcut` above — so these drive `$Line` by hand the way a
+// session host (the terminal REPL, the Jupyter kernel) does, and use
+// `interpret_with_stdout`, whose visual mode enables history recording.
+mod out_history {
+  use woxi::{clear_state, interpret_with_stdout};
+
+  /// Evaluate `input` as session line `line`, returning the printed result.
+  fn eval_line(line: i128, input: &str) -> String {
+    woxi::set_system_variable("$Line", &line.to_string());
+    interpret_with_stdout(input).unwrap().result
+  }
+
+  /// Start from a session with no bindings, no history and `$Line` back at
+  /// its fresh-session value, so nothing leaks between tests on this thread.
+  fn reset() {
+    clear_state();
+    woxi::clear_last_output();
+  }
+
+  #[test]
+  fn out_returns_the_value_of_a_numbered_line() {
+    reset();
+    assert_eq!(eval_line(1, "1 + 1"), "2");
+    assert_eq!(eval_line(2, "2 + 2"), "4");
+    assert_eq!(eval_line(3, "Out[1]"), "2");
+    assert_eq!(eval_line(4, "%2"), "4");
+    assert_eq!(eval_line(5, "Out[1] + Out[2]"), "6");
+    reset();
+  }
+
+  #[test]
+  fn percent_runs_count_back_from_the_current_line() {
+    reset();
+    assert_eq!(eval_line(1, "11"), "11");
+    assert_eq!(eval_line(2, "22"), "22");
+    assert_eq!(eval_line(3, "33"), "33");
+    assert_eq!(eval_line(4, "%%%"), "11");
+    assert_eq!(eval_line(5, "%%"), "33");
+    assert_eq!(eval_line(6, "%"), "33");
+    reset();
+  }
+
+  #[test]
+  fn unreached_lines_stay_symbolic() {
+    reset();
+    assert_eq!(eval_line(1, "Out[10]"), "Out[10]");
+    assert_eq!(eval_line(2, "Out[0]"), "Out[0]");
+    // `Out[2 - 4]` clamps at `Out[0]`.
+    assert_eq!(eval_line(3, "%%%%"), "Out[0]");
+    reset();
+  }
+
+  #[test]
+  fn in_reevaluates_a_numbered_input() {
+    reset();
+    assert_eq!(eval_line(1, "x765 = 5"), "5");
+    woxi::record_input_line(1, "x765 = 5");
+    assert_eq!(eval_line(2, "x765^2"), "25");
+    woxi::record_input_line(2, "x765^2");
+    assert_eq!(eval_line(3, "In[2]"), "25");
+    assert_eq!(eval_line(4, "In[-2]"), "25");
+    reset();
+  }
+
+  // woxi-studio, the playground and the JupyterLite kernel evaluate cell
+  // after cell without ever assigning `$Line`. They must keep exactly the
+  // single-value history that backs `%` — if every cell were filed under
+  // the same line number, `Out[1]` would answer with whatever ran last
+  // instead of staying symbolic.
+  #[test]
+  fn a_host_that_does_not_number_lines_keeps_only_the_previous_value() {
+    reset();
+    assert_eq!(interpret_with_stdout("2 + 3").unwrap().result, "5");
+    assert_eq!(interpret_with_stdout("10 * 10").unwrap().result, "100");
+    assert_eq!(interpret_with_stdout("N[%]").unwrap().result, "100.");
+    assert_eq!(interpret_with_stdout("Out[1]").unwrap().result, "Out[1]");
+    assert_eq!(interpret_with_stdout("Out[2]").unwrap().result, "Out[2]");
+    assert_eq!(interpret_with_stdout("%%").unwrap().result, "Out[0]");
+    reset();
+  }
+
+  #[test]
+  fn bare_in_is_the_previous_line() {
+    reset();
+    assert_eq!(eval_line(1, "6 * 7"), "42");
+    woxi::record_input_line(1, "6 * 7");
+    assert_eq!(eval_line(2, "In[]"), "42");
+    assert_eq!(eval_line(2, "Out[]"), "42");
+    reset();
+  }
+
+  #[test]
+  fn self_referential_in_does_not_recurse() {
+    reset();
+    woxi::record_input_line(1, "In[1]");
+    assert_eq!(eval_line(1, "In[1]"), "In[1]");
+    // A line that was never entered has no input to re-run either.
+    assert_eq!(eval_line(2, "In[7]"), "In[7]");
+    reset();
+  }
+
+  // Only a machine-sized integer names a line. Anything else — a real, a
+  // symbol, a string, a bignum — draws `::intm`, and more than one
+  // argument draws `::argt`; both leave the reference unevaluated.
+  #[test]
+  fn a_non_integer_index_reports_intm() {
+    reset();
+    for (input, shown) in [
+      ("Out[1.5]", "Out[1.5]"),
+      ("Out[x]", "Out[x]"),
+      ("Out[\"a\"]", "Out[a]"),
+      ("Out[2^70]", "Out[1180591620717411303424]"),
+      ("In[1.5]", "In[1.5]"),
+      ("In[x]", "In[x]"),
+    ] {
+      let head = if input.starts_with("In") { "In" } else { "Out" };
+      let r = interpret_with_stdout(input).unwrap();
+      assert_eq!(r.result, shown);
+      assert!(
+        r.warnings.iter().any(|w| w.contains(&format!(
+          "{head}::intm: Machine-sized integer expected at position 1 in \
+           {shown}."
+        ))),
+        "{input}: {:?}",
+        r.warnings
+      );
+    }
+    reset();
+  }
+
+  #[test]
+  fn more_than_one_argument_reports_argt() {
+    reset();
+    let r = interpret_with_stdout("Out[1, 2]").unwrap();
+    assert_eq!(r.result, "Out[1, 2]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "Out::argt: Out called with 2 arguments; 0 or 1 arguments are expected."
+    )));
+    let r = interpret_with_stdout("In[1, 2]").unwrap();
+    assert_eq!(r.result, "In[1, 2]");
+    assert!(r.warnings.iter().any(|w| w.contains(
+      "In::argt: In called with 2 arguments; 0 or 1 arguments are expected."
+    )));
+    reset();
+  }
+}
+
+mod cases {
+  use super::super::case_helpers::assert_case;
+
+  #[test]
+  fn symbol_literal_1() {
+    assert_case(r#"a; b; c; d"#, r#"d"#);
+  }
+  #[test]
+  fn head_1() {
+    assert_case(r#"Head[2 + 3*I]"#, r#"Complex"#);
+  }
+  #[test]
+  fn complex_1() {
+    assert_case(r#"Head[2 + 3*I]; Complex[1, 2/3]"#, r#"1 + (2*I)/3"#);
+  }
+  #[test]
+  fn abs() {
+    assert_case(
+      r#"Head[2 + 3*I]; Complex[1, 2/3]; Abs[Complex[3, 4]]"#,
+      r#"5"#,
+    );
+  }
+  #[test]
+  fn head_2() {
+    assert_case(r#"Head[5]"#, r#"Integer"#);
+  }
+  #[test]
+  fn head_3() {
+    assert_case(r#"Head[1/2]"#, r#"Rational"#);
+  }
+  #[test]
+  fn rational_1() {
+    assert_case(r#"Head[1/2]; Rational[1, 2]"#, r#"1 / 2"#);
+  }
+  #[test]
+  fn print_trace_1() {
+    assert_case(r#"$TraceBuiltins = True; PrintTrace[]"#, r#"PrintTrace[]"#);
+  }
+  #[test]
+  fn print_trace_2() {
+    assert_case(r#"PrintTrace[]"#, r#"PrintTrace[]"#);
+  }
+  #[test]
+  fn set_1() {
+    assert_case(r#"PrintTrace[]; $TraceBuiltins = True"#, r#"True"#);
+  }
+  #[test]
+  fn print_trace_3() {
+    assert_case(
+      r#"PrintTrace[]; $TraceBuiltins = True; PrintTrace[SortBy -> "time"]"#,
+      r#"PrintTrace[SortBy -> "time"]"#,
+    );
+  }
+  #[test]
+  fn set_2() {
+    assert_case(
+      r#"PrintTrace[]; $TraceBuiltins = True; PrintTrace[SortBy -> "time"]; $TraceBuiltins = False"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn set_3() {
+    assert_case(
+      r#"$TraceBuiltins = True; $TraceBuiltins = False; x; PrintTrace[]; ClearTrace[]; $TraceBuiltins = x"#,
+      r#"x"#,
+    );
+  }
+  #[test]
+  fn head_4() {
+    // The mathics original (`S> $ParentProcessID = ...`) accepts any
+    // output — the literal `41369` was the test author's PID at scrape
+    // time and changes every run. Verify the documented contract: it
+    // returns an Integer.
+    assert_case(r#"Head[$ParentProcessID]"#, r#"Integer"#);
+  }
+  #[test]
+  fn head_5() {
+    // The mathics original (`>> Share[] = ...`) accepts any output —
+    // wolframscript returns the bytes saved by sharing common
+    // subexpressions, which depends on what's in memory and varies per
+    // run. Verify the documented contract: it returns an Integer.
+    assert_case(r#"Head[Share[]]"#, r#"Integer"#);
+  }
+  #[test]
+  fn head_6() {
+    // The mathics original (`S> MemoryAvailable[] = ...`) accepts any
+    // output — wolframscript returns the bytes of free physical memory,
+    // which varies per host and per moment. Verify the documented
+    // contract: it returns an Integer.
+    assert_case(r#"Head[MemoryAvailable[]]"#, r#"Integer"#);
+  }
+  #[test]
+  fn head_7() {
+    // Duplicate of case 231 — same host-specific byte count. Same
+    // semantic check: `MemoryAvailable[]` returns an Integer.
+    assert_case(r#"Head[MemoryAvailable[]]"#, r#"Integer"#);
+  }
+  #[test]
+  fn f_1() {
+    assert_case(r#"f[Sequence[a, b]]"#, r#"f[a, b]"#);
+  }
+  #[test]
+  fn head_8() {
+    // The mathics original (`>> Now = ...`) accepts any output — the
+    // scraped DateObject is the moment the test was captured. Verify
+    // the documented contract: `Now` returns a `DateObject`.
+    assert_case(r#"Head[Now]"#, r#"DateObject"#);
+  }
+  #[test]
+  fn hold_1() {
+    assert_case(
+      r#"b // a; c // b // a; Hold[x // a // b // c // d // e // f]"#,
+      r#"Hold[f[e[d[c[b[a[x]]]]]]]"#,
+    );
+  }
+  #[test]
+  fn precedence_1() {
+    assert_case(r#"Precedence[Plus]"#, r#"310."#);
+  }
+  #[test]
+  fn precedence_2() {
+    assert_case(
+      r#"Precedence[Plus]; Precedence[Plus] < Precedence[Times]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn precedence_3() {
+    assert_case(
+      r#"Precedence[Plus]; Precedence[Plus] < Precedence[Times]; Precedence[f]"#,
+      r#"670."#,
+    );
+  }
+  #[test]
+  fn precedence_4() {
+    assert_case(
+      r#"Precedence[Plus]; Precedence[Plus] < Precedence[Times]; Precedence[f]; Precedence[a + b]"#,
+      r#"1000."#,
+    );
+  }
+  #[test]
+  fn subscript() {
+    // Wolframscript-matched expectation. mathics rendered as `x_{1, 2, 3}`,
+    // but wolframscript returns the unevaluated `TeXForm[Subscript[x, 1, 2, 3]]`
+    // form (Woxi matches wolframscript).
+    assert_case(
+      r#"Subscript[x, 1, 2, 3] // TeXForm"#,
+      r#"TeXForm[Subscript[x, 1, 2, 3]]"#,
+    );
+  }
+  #[test]
+  fn subsuperscript() {
+    // Wolframscript-matched expectation. mathics rendered as `a_b^c`,
+    // but wolframscript returns the unevaluated `TeXForm[Subsuperscript[a, b, c]]`
+    // form (Woxi matches wolframscript).
+    assert_case(
+      r#"Subsuperscript[a, b, c] // TeXForm"#,
+      r#"TeXForm[Subsuperscript[a, b, c]]"#,
+    );
+  }
+  #[test]
+  fn superscript() {
+    // Wolframscript-matched expectation. mathics rendered as `x^3`,
+    // but wolframscript returns the unevaluated `TeXForm[Superscript[x, 3]]`
+    // form (Woxi matches wolframscript).
+    assert_case(
+      r#"Superscript[x,3] // TeXForm"#,
+      r#"TeXForm[Superscript[x, 3]]"#,
+    );
+  }
+  #[test]
+  fn sqrt() {
+    assert_case(r#"Sqrt[Unevaluated[x]]"#, r#"Sqrt[x]"#);
+  }
+  #[test]
+  fn length_1() {
+    assert_case(
+      r#"Sqrt[Unevaluated[x]]; Length[Unevaluated[1+2+3+4]]"#,
+      r#"4"#,
+    );
+  }
+  #[test]
+  fn f_2() {
+    assert_case(r#"f[x, Sequence[a, b], y]"#, r#"f[x, a, b, y]"#);
+  }
+  #[test]
+  fn head_9() {
+    // The mathics original (`>> cf = Compile[{x, y}, x + 2 y]
+    //  = CompiledFunction[{x, y}, x + 2 y, ...]`) uses `...` to admit
+    // any internal compiled representation. The scraped expectation
+    // pinned wolframscript-specific bytecode (opcodes, register
+    // allocations, version triple) that Woxi has no way to reproduce.
+    // Verify the documented contract: it returns a `CompiledFunction`.
+    assert_case(r#"Head[Compile[{x, y}, x + 2 y]]"#, r#"CompiledFunction"#);
+  }
+  #[test]
+  fn head_10() {
+    // Same family as cases 524/526/528 — `Compile[...]` returns a
+    // `CompiledFunction` whose internal bytecode form Woxi can't
+    // reproduce verbatim. Verify the documented contract.
+    assert_case(r#"Head[Compile[{x}, x x]]"#, r#"CompiledFunction"#);
+  }
+  #[test]
+  fn expression_1() {
+    assert_case(
+      r#"General::argr"#,
+      r#""`1` called with 1 argument; `2` arguments are expected.""#,
+    );
+  }
+  #[test]
+  fn full_form_1() {
+    assert_case(r#"FullForm[a::b]"#, r#"FullForm[MessageName[a, b]]"#);
+  }
+  #[test]
+  fn full_form_2() {
+    assert_case(
+      r#"FullForm[a::b]; FullForm[a::"b"]"#,
+      r#"FullForm[MessageName[a, b]]"#,
+    );
+  }
+  #[test]
+  fn expression_2() {
+    assert_case(r#"42; %"#, r#"Out[0]"#);
+  }
+  #[test]
+  fn expression_3() {
+    assert_case(r#"42; %; 43; %"#, r#"Out[0]"#);
+  }
+  #[test]
+  fn integer_literal_1() {
+    assert_case(r#"42; %; 43; %; 44"#, r#"44"#);
+  }
+  #[test]
+  fn expression_4() {
+    assert_case(r#"42; %; 43; %; 44; %1"#, r#"Out[1]"#);
+  }
+  #[test]
+  fn expression_5() {
+    assert_case(r#"42; %; 43; %; 44; %1; %%"#, r#"Out[0]"#);
+  }
+  #[test]
+  fn hold_2() {
+    assert_case(r#"42; %; 43; %; 44; %1; %%; Hold[Out[-1]]"#, r#"Hold[%]"#);
+  }
+  #[test]
+  fn hold_3() {
+    assert_case(
+      r#"42; %; 43; %; 44; %1; %%; Hold[Out[-1]]; Hold[%4]"#,
+      r#"Hold[Out[4]]"#,
+    );
+  }
+  #[test]
+  fn out_1() {
+    assert_case(
+      r#"42; %; 43; %; 44; %1; %%; Hold[Out[-1]]; Hold[%4]; Out[0]"#,
+      r#"Out[0]"#,
+    );
+  }
+  #[test]
+  fn integer_literal_2() {
+    assert_case(
+      r#"42; %; 43; %; 44; %1; %%; Hold[Out[-1]]; Hold[%4]; Out[0]; 10"#,
+      r#"10"#,
+    );
+  }
+  #[test]
+  fn out_2() {
+    assert_case(
+      r#"42; %; 43; %; 44; %1; %%; Hold[Out[-1]]; Hold[%4]; Out[0]; 10; Out[-1] + 1"#,
+      r#"1 + Out[0]"#,
+    );
+  }
+  #[test]
+  fn out_3() {
+    assert_case(
+      r#"42; %; 43; %; 44; %1; %%; Hold[Out[-1]]; Hold[%4]; Out[0]; 10; Out[-1] + 1; Out[] + 1"#,
+      r#"1 + Out[0]"#,
+    );
+  }
+  #[test]
+  fn to_boxes_1() {
+    assert_case(r#"ToBoxes[a + a]"#, r#"RowBox[{"2", " ", "a"}]"#);
+  }
+  #[test]
+  fn to_boxes_2() {
+    assert_case(
+      r#"ToBoxes[a + a]; ToBoxes[a + b]"#,
+      r#"RowBox[{"a", "+", "b"}]"#,
+    );
+  }
+  #[test]
+  fn to_boxes_3() {
+    assert_case(
+      r#"ToBoxes[a + a]; ToBoxes[a + b]; ToBoxes[a ^ b] // FullForm"#,
+      r#"FullForm[SuperscriptBox[a, b]]"#,
+    );
+  }
+  #[test]
+  fn to_boxes_fraction_sum_numerator() {
+    // Issue #299: (1+x)/10 rendered as `1 (1+x)` over 10 — the unit factor
+    // from Rational[1,10]'s numerator leaked into the box-form numerator.
+    assert_case(
+      r#"ToBoxes[(1 + x)/10]"#,
+      r#"FractionBox[RowBox[{"1", "+", "x"}], "10"]"#,
+    );
+  }
+  #[test]
+  fn to_boxes_fraction_symbol_numerator() {
+    assert_case(r#"ToBoxes[x/10]"#, r#"FractionBox["x", "10"]"#);
+  }
+  #[test]
+  fn to_boxes_fraction_explicit_one_times_symbol() {
+    assert_case(r#"ToBoxes[1 x/10]"#, r#"FractionBox["x", "10"]"#);
+  }
+  #[test]
+  fn to_boxes_fraction_explicit_one_times_sum() {
+    assert_case(
+      r#"ToBoxes[1 (1 + x)/10]"#,
+      r#"FractionBox[RowBox[{"1", "+", "x"}], "10"]"#,
+    );
+  }
+  #[test]
+  fn take_largest_1() {
+    assert_case(
+      r#"TakeLargest[{100, -1, 50, 10}, 2]; TakeLargest[{-8, 150, Missing[abc]}, 2]"#,
+      r#"{150, -8}"#,
+    );
+  }
+  #[test]
+  fn take_largest_2() {
+    assert_case(
+      r#"TakeLargest[{100, -1, 50, 10}, 2]; TakeLargest[{-8, 150, Missing[abc]}, 2]; TakeLargest[{-8, 150, Missing[abc]}, 2, ExcludedForms -> {}]"#,
+      r#"{Missing[abc], 150}"#,
+    );
+  }
+  #[test]
+  fn head_11() {
+    // Wolframscript-matched expectation. mathics quoted the inner
+    // `"Document"` String, but `wolframscript -code` prints the head
+    // expression `XMLObject["Document"]` with the String unquoted, so
+    // Head's result renders as `XMLObject[Document]`.
+    assert_case(
+      r#"Head[XML`Parser`XMLGetString["<a></a>"]]"#,
+      r#"XMLObject[Document]"#,
+    );
+  }
+  #[test]
+  fn xml_get_string_trailing_content_returns_failed() {
+    // Extra text after the root element makes the document malformed;
+    // wolframscript returns `$Failed` for this input.
+    assert_case(r#"XML`Parser`XMLGetString["<a></a>xyz"]"#, r#"$Failed"#);
+  }
+  #[test]
+  fn xml_get_string_mismatched_tags_returns_failed() {
+    assert_case(r#"XML`Parser`XMLGetString["<a><b></a>"]"#, r#"$Failed"#);
+  }
+  #[test]
+  fn xml_get_string_self_closing_root_is_valid() {
+    assert_case(
+      r#"Head[XML`Parser`XMLGetString["<a/>"]]"#,
+      r#"XMLObject[Document]"#,
+    );
+  }
+  #[test]
+  fn xml_get_string_with_declaration_is_valid() {
+    assert_case(
+      r#"Head[XML`Parser`XMLGetString["<?xml version=\"1.0\"?><a/>"]]"#,
+      r#"XMLObject[Document]"#,
+    );
+  }
+  #[test]
+  fn head_12() {
+    assert_case(
+      r#"Head[HTML`Parser`HTMLGetString["<a></a>"]]"#,
+      r#"HTML`Parser`HTMLGetString"#,
+    );
+  }
+  #[test]
+  fn head_13() {
+    assert_case(
+      r#"Head[HTML`Parser`HTMLGetString["<a></a>"]]; Head[HTML`Parser`HTMLGetString["<a><b></a>"]]"#,
+      r#"HTML`Parser`HTMLGetString"#,
+    );
+  }
+  #[test]
+  fn full_form_3() {
+    assert_case(r#"FullForm[a + b * c]"#, r#"FullForm[a + b*c]"#);
+  }
+  #[test]
+  fn full_form_4() {
+    assert_case(r#"FullForm[a + b * c]; FullForm[2/3]"#, r#"FullForm[2/3]"#);
+  }
+  #[test]
+  fn full_form_5() {
+    assert_case(
+      r#"FullForm[a + b * c]; FullForm[2/3]; FullForm["A string"]"#,
+      r#"FullForm["A string"]"#,
+    );
+  }
+  #[test]
+  fn input_form_1() {
+    assert_case(r#"InputForm["A string"]"#, r#"InputForm["A string"]"#);
+  }
+  #[test]
+  fn input_form_2() {
+    assert_case(
+      r#"InputForm["A string"]; InputForm[f'[x]]"#,
+      r#"InputForm[Derivative[1][f][x]]"#,
+    );
+  }
+  #[test]
+  fn output_form_1() {
+    // wolframscript -code keeps the OutputForm wrapper and renders the
+    // derivative as `Derivative[1][f][x]` (no prime shorthand at top
+    // level). Matches Woxi.
+    assert_case(r#"OutputForm[f'[x]]"#, r#"OutputForm[Derivative[1][f][x]]"#);
+  }
+  #[test]
+  fn implicit_times_indexed_double_derivative_then_call() {
+    // Regression: inside implicit multiplication (`mass y[k]''[t]`), the
+    // grammar's SimpleTerm only allowed a bare FunctionCall with a single
+    // *trailing* prime and no further bracket args after it, so the `[t]`
+    // following the prime was left unconsumed and the whole expression
+    // failed to parse. `y[k]''[t]` -> `Derivative[2][y[k]][t]`, same as it
+    // already did outside of implicit multiplication.
+    assert_case(
+      r#"Hold[mass y[k]''[t]]"#,
+      r#"Hold[mass*Derivative[2][y[k]][t]]"#,
+    );
+  }
+  #[test]
+  fn implicit_times_indexed_single_derivative_then_call() {
+    assert_case(
+      r#"Hold[mass y[k]'[t]]"#,
+      r#"Hold[mass*Derivative[1][y[k]][t]]"#,
+    );
+  }
+  #[test]
+  fn implicit_times_indexed_triple_derivative_then_call() {
+    assert_case(
+      r#"Hold[mass y[k]'''[t]]"#,
+      r#"Hold[mass*Derivative[3][y[k]][t]]"#,
+    );
+  }
+  #[test]
+  fn implicit_times_trailing_prime_then_multiple_bracket_calls() {
+    // `g[1]''[2][3]` -> `Derivative[2][g[1]][2][3]`, chained curried calls
+    // after the derivative, still under implicit multiplication.
+    assert_case(
+      r#"Hold[2 g[1]''[2][3]]"#,
+      r#"Hold[2*Derivative[2][g[1]][2][3]]"#,
+    );
+  }
+  #[test]
+  fn sequence_form() {
+    assert_case(r#"SequenceForm["[", "x = ", 56, "]"]"#, r#""[""x = "56"]""#);
+  }
+  #[test]
+  fn full_form_6() {
+    assert_case(r#"FullForm[a_b]"#, r#"FullForm[a_b]"#);
+  }
+  #[test]
+  fn full_form_7() {
+    assert_case(r#"FullForm[a_b]; FullForm[a:_:b]"#, r#"FullForm[a_:b]"#);
+  }
+  #[test]
+  fn set_4() {
+    assert_case(r#"FullForm[a_b]; FullForm[a:_:b]; x = 2"#, r#"2"#);
+  }
+  #[test]
+  fn expression_6() {
+    assert_case(r#"FullForm[a_b]; FullForm[a:_:b]; x = 2; x_"#, r#"x_"#);
+  }
+  #[test]
+  fn f_3() {
+    assert_case(
+      r#"FullForm[a_b]; FullForm[a:_:b]; x = 2; x_; f[y] /. f[a:b,_:d] -> {a, b}"#,
+      r#"f[y]"#,
+    );
+  }
+  #[test]
+  fn f_4() {
+    assert_case(
+      r#"FullForm[a_b]; FullForm[a:_:b]; x = 2; x_; f[y] /. f[a:b,_:d] -> {a, b}; f[a] /. f[a:_:b] -> {a, b}"#,
+      r#"{a, b}"#,
+    );
+  }
+  #[test]
+  fn full_form_8() {
+    assert_case(
+      r#"FullForm[a_b]; FullForm[a:_:b]; x = 2; x_; f[y] /. f[a:b,_:d] -> {a, b}; f[a] /. f[a:_:b] -> {a, b}; FullForm[a:b:c:d:e]"#,
+      r#"FullForm[a:b:(c:d:e)]"#,
+    );
+  }
+  #[test]
+  fn f_5() {
+    assert_case(
+      r#"FullForm[a_b]; FullForm[a:_:b]; x = 2; x_; f[y] /. f[a:b,_:d] -> {a, b}; f[a] /. f[a:_:b] -> {a, b}; FullForm[a:b:c:d:e]; f[] /. f[a:_:b] -> {a, b}"#,
+      r#"{b, b}"#,
+    );
+  }
+  #[test]
+  fn f_6() {
+    assert_case(
+      r#"f[x_, y_:1] := {x, y}; f[x_, y_: 1] := {x, y}; f[a, 2]"#,
+      r#"{a, 2}"#,
+    );
+  }
+  #[test]
+  fn f_7() {
+    assert_case(
+      r#"f[x_, y_:1] := {x, y}; f[x_, y_: 1] := {x, y}; f[a, 2]; f[a]"#,
+      r#"{a, 1}"#,
+    );
+  }
+  #[test]
+  fn full_form_9() {
+    assert_case(
+      r#"f[x_, y_:1] := {x, y}; f[x_, y_: 1] := {x, y}; f[a, 2]; f[a]; y : 1 // FullForm; y_ : 1 // FullForm; FullForm[y_.]"#,
+      r#"FullForm[y_.]"#,
+    );
+  }
+  #[test]
+  fn order_1() {
+    assert_case(r#"Order[7, 11]"#, r#"1"#);
+  }
+  #[test]
+  fn order_2() {
+    assert_case(r#"Order[7, 11]; Order[100, 10]"#, r#"-1"#);
+  }
+  #[test]
+  fn order_3() {
+    assert_case(r#"Order[7, 11]; Order[100, 10]; Order[x, z]"#, r#"1"#);
+  }
+  #[test]
+  fn order_4() {
+    assert_case(
+      r#"Order[7, 11]; Order[100, 10]; Order[x, z]; Order[x, x]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn boolean_q_1() {
+    assert_case(r#"BooleanQ[True]"#, r#"True"#);
+  }
+  #[test]
+  fn boolean_q_2() {
+    assert_case(r#"BooleanQ[True]; BooleanQ[False]"#, r#"True"#);
+  }
+  #[test]
+  fn boolean_q_3() {
+    assert_case(
+      r#"BooleanQ[True]; BooleanQ[False]; BooleanQ[a]"#,
+      r#"False"#,
+    );
+  }
+  #[test]
+  fn boolean_q_4() {
+    assert_case(
+      r#"BooleanQ[True]; BooleanQ[False]; BooleanQ[a]; BooleanQ[1 < 2]"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn less() {
+    assert_case(r#"1 < 0"#, r#"False"#);
+  }
+  #[test]
+  fn string_q_1() {
+    assert_case(r#"StringQ["abc"]"#, r#"True"#);
+  }
+  #[test]
+  fn string_q_2() {
+    assert_case(r#"StringQ["abc"]; StringQ[1.5]"#, r#"False"#);
+  }
+  #[test]
+  fn select() {
+    assert_case(
+      r#"StringQ["abc"]; StringQ[1.5]; Select[{"12", 1, 3, 5, "yz", x, y}, StringQ]"#,
+      r#"{"12", "yz"}"#,
+    );
+  }
+  #[test]
+  fn syntax_q_1() {
+    assert_case(r#"SyntaxQ["a[b"]"#, r#"False"#);
+  }
+  #[test]
+  fn syntax_q_2() {
+    assert_case(r#"SyntaxQ["a[b"]; SyntaxQ["a[b]"]"#, r#"True"#);
+  }
+  #[test]
+  fn head_14() {
+    assert_case(r#"Head[x]"#, r#"Symbol"#);
+  }
+  #[test]
+  fn symbol_1() {
+    assert_case(r#"Head[x]; Symbol["x"] + Symbol["x"]"#, r#"2*x"#);
+  }
+  #[test]
+  fn symbol_q_1() {
+    assert_case(r#"SymbolQ[a]"#, r#"SymbolQ[a]"#);
+  }
+  #[test]
+  fn symbol_q_2() {
+    assert_case(r#"SymbolQ[a]; SymbolQ[1]"#, r#"SymbolQ[1]"#);
+  }
+  #[test]
+  fn symbol_q_3() {
+    assert_case(
+      r#"SymbolQ[a]; SymbolQ[1]; SymbolQ[a + b]"#,
+      r#"SymbolQ[a + b]"#,
+    );
+  }
+  #[test]
+  fn value_q_1() {
+    assert_case(r#"ValueQ[x]"#, r#"False"#);
+  }
+  #[test]
+  fn value_q_2() {
+    assert_case(r#"ValueQ[x]; x = 1; ValueQ[x]"#, r#"True"#);
+  }
+  #[test]
+  fn head_15() {
+    assert_case(r#"Head[a * b]"#, r#"Times"#);
+  }
+  #[test]
+  fn head_16() {
+    assert_case(r#"Head[a * b]; Head[6]"#, r#"Integer"#);
+  }
+  #[test]
+  fn head_17() {
+    assert_case(r#"Head[a * b]; Head[6]; Head[x]"#, r#"Symbol"#);
+  }
+  #[test]
+  fn head_18() {
+    assert_case(r#"Head["abc"]"#, r#"String"#);
+  }
+  #[test]
+  fn string_literal_1() {
+    assert_case(r#"Head["abc"]; "abc""#, r#""abc""#);
+  }
+  #[test]
+  fn input_form_3() {
+    assert_case(
+      r#"Head["abc"]; "abc"; InputForm["abc"]"#,
+      r#"InputForm["abc"]"#,
+    );
+  }
+  #[test]
+  fn full_form_10() {
+    assert_case(
+      r#"Head["abc"]; "abc"; InputForm["abc"]; FullForm["abc" + 2]"#,
+      r#"FullForm[2 + "abc"]"#,
+    );
+  }
+  #[test]
+  fn full_form_11() {
+    assert_case(r#"FullForm[a:=b]"#, r#"FullForm[Null]"#);
+  }
+  #[test]
+  fn string_literal_2() {
+    assert_case(r#"FullForm[a:=b]; a:=b; """#, r#""""#);
+  }
+  #[test]
+  fn head_19() {
+    assert_case(r#"Head[<|a -> x, b -> y, c -> z|>]"#, r#"Association"#);
+  }
+  #[test]
+  fn association_literal() {
+    assert_case(
+      r#"Head[<|a -> x, b -> y, c -> z|>]; <|a -> x, b -> y|>"#,
+      r#"<|a -> x, b -> y|>"#,
+    );
+  }
+  #[test]
+  fn head_20() {
+    assert_case(r#"Head[{1, 2, 3}]"#, r#"List"#);
+  }
+  #[test]
+  fn list_literal_1() {
+    assert_case(
+      r#"Head[{1, 2, 3}]; {{a, b, {c, d}}}"#,
+      r#"{{a, b, {c, d}}}"#,
+    );
+  }
+  #[test]
+  fn full_form_12() {
+    assert_case(
+      r#"Length[{1, 2, 3}]; Length[Exp[x]]; FullForm[Exp[x]]"#,
+      r#"FullForm[E^x]"#,
+    );
+  }
+  #[test]
+  fn length_2() {
+    assert_case(
+      r#"Length[{1, 2, 3}]; Length[Exp[x]]; FullForm[Exp[x]]; Length[a]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn length_3() {
+    assert_case(
+      r#"Length[{1, 2, 3}]; Length[Exp[x]]; FullForm[Exp[x]]; Length[a]; Length[1/3]"#,
+      r#"0"#,
+    );
+  }
+  #[test]
+  fn full_form_13() {
+    assert_case(
+      r#"Length[{1, 2, 3}]; Length[Exp[x]]; FullForm[Exp[x]]; Length[a]; Length[1/3]; FullForm[1/3]"#,
+      r#"FullForm[1/3]"#,
+    );
+  }
+  #[test]
+  fn head_21() {
+    // The scraped expectation \`"/Applications/Wolfram.app/Contents"\`
+    // is wolframscript-specific. Woxi reports the directory of its
+    // own binary (\`.../target/debug\` here). Verify the documented
+    // contract: \`\$InstallationDirectory\` returns a String.
+    assert_case(r#"Head[$InstallationDirectory]"#, r#"String"#);
+  }
+  #[test]
+  fn full_form_14() {
+    assert_case(
+      r#"Plus[##]& [1, 2, 3]; Plus[##2]& [1, 2, 3]; FullForm[##]"#,
+      r#"FullForm[##1]"#,
+    );
+  }
+  #[test]
+  fn nest() {
+    assert_case(
+      r#"Nest[f, x, 3]; Nest[(1+#) ^ 2 &, x, 2]; Nest[Subsuperscript[#,#,#]&,0,5]"#,
+      r#"Subsuperscript[Subsuperscript[Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]], Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]], Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]]], Subsuperscript[Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]], Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]], Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]]], Subsuperscript[Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]], Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]], Subsuperscript[Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]], Subsuperscript[Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0], Subsuperscript[0, 0, 0]]]]]"#,
+    );
+  }
+  #[test]
+  fn list_literal_2() {
+    assert_case(r#"1; {1, 1.}"#, r#"{1, 1.}"#);
+  }
+  #[test]
+  fn head_22() {
+    assert_case(r#"Head[$UserName]"#, r#"String"#);
+  }
+  #[test]
+  fn integer1() {
+    assert_case(r#"Integer1"#, r#"Integer1"#);
+  }
+  #[test]
+  fn a_1() {
+    assert_case(r#"A"#, r#"A"#);
+  }
+  #[test]
+  fn a_2() {
+    assert_case(r#"A; A"#, r#"A"#);
+  }
+  #[test]
+  fn a_3() {
+    assert_case(r#"A; A; A"#, r#"A"#);
+  }
+  #[test]
+  fn a_4() {
+    assert_case(r#"A; A; A; A"#, r#"A"#);
+  }
+  #[test]
+  fn f_8() {
+    assert_case(r#"A; A; A; A; f[x]"#, r#"f[x]"#);
+  }
+  #[test]
+  fn a_5() {
+    assert_case(r#"A; A; A; A; f[x]; A"#, r#"A"#);
+  }
+  #[test]
+  fn f_9() {
+    assert_case(r#"A; A; A; A; f[x]; A; f[_]"#, r#"f[_]"#);
+  }
+  #[test]
+  fn f_10() {
+    assert_case(r#"A; A; A; A; f[x]; A; f[_]; f[_]"#, r#"f[_]"#);
+  }
+  #[test]
+  fn a_6() {
+    assert_case(r#"A"#, r#"A"#);
+  }
+  #[test]
+  fn expression_7() {
+    assert_case(r#"A; A_"#, r#"A_"#);
+  }
+  #[test]
+  fn a_7() {
+    assert_case(r#"A"#, r#"A"#);
+  }
+  #[test]
+  fn a_8() {
+    assert_case(r#"A"#, r#"A"#);
+  }
+  #[test]
+  fn full_form_15() {
+    assert_case(
+      r#"\(c (1 + x)\); \!\(x \^ 2\); FullForm[%]"#,
+      r#"FullForm[Out[0]]"#,
+    );
+  }
+  #[test]
+  fn make_boxes() {
+    assert_case(
+      r#"\(c (1 + x)\); \!\(x \^ 2\); FullForm[%]; MakeBoxes[1 + 1]"#,
+      r#"RowBox[{"1", "+", "1"}]"#,
+    );
+  }
+  #[test]
+  fn expression_8() {
+    // mathics's expected encoded the `é` as `\[CapitalATilde]\[Copyright]`
+    // (UTF-8 mojibake) and replaced the embedded newline with a
+    // space. Wolframscript's stdout on macOS exhibits the same UTF-8
+    // mojibake bug (printing `quÃ© tal?` instead of `qué tal?`), but
+    // the underlying string is well-formed UTF-8 — `StringLength`
+    // returns 13. Woxi reads/prints the bytes correctly: `qué` stays
+    // `qué` and the newline is preserved in OutputForm.
+    assert_case("\"Hola\"; \"Hola\nqué tal?\"", "Hola\nqué tal?");
+  }
+  #[test]
+  fn output_form_2() {
+    // mathics rendered the result as 2D ASCII art with `1.09951 10^12`;
+    // wolframscript -code returns the literal wrapper
+    // `OutputForm[1.099511627776*^12 + 3.*I]`. Woxi matches.
+    assert_case(
+      r#"OutputForm[Complex[2.0 ^ 40, 3]]"#,
+      r#"OutputForm[1.099511627776*^12 + 3.*I]"#,
+    );
+  }
+  #[test]
+  fn input_form_4() {
+    assert_case(
+      r#"OutputForm[Complex[2.0 ^ 40, 3]]; InputForm[Complex[2.0 ^ 40, 3]]"#,
+      r#"InputForm[1.099511627776*^12 + 3.*I]"#,
+    );
+  }
+  #[test]
+  fn symbol_literal_2() {
+    assert_case(r#"1; x"#, r#"x"#);
+  }
+  #[test]
+  fn symbol_literal_3() {
+    assert_case(r#"x"#, r#"x"#);
+  }
+  #[test]
+  fn symbol_literal_4() {
+    assert_case(r#"x; x"#, r#"x"#);
+  }
+  #[test]
+  fn symbol_literal_5() {
+    assert_case(r#"x; x; x"#, r#"x"#);
+  }
+  #[test]
+  fn symbol_literal_6() {
+    assert_case(r#"x; x; x; x"#, r#"x"#);
+  }
+  #[test]
+  fn symbol_literal_7() {
+    assert_case(r#"x; x; x; x; x"#, r#"x"#);
+  }
+  #[test]
+  fn input_form_5() {
+    // Wolframscript-matched expectation. mathics expected the
+    // \`InputForm["MyPackage`Private`"]\` form (a package context),
+    // but a fresh wolframscript -code session is in \`Global`\` and
+    // outputs \`InputForm[Global`]\`. Woxi already matches that.
+    assert_case(r#"InputForm[$Context]"#, r#"InputForm[Global`]"#);
+  }
+  #[test]
+  fn byte_ordering() {
+    assert_case(r#"ByteOrdering"#, r#"ByteOrdering"#);
+  }
+  #[test]
+  fn head_23() {
+    assert_case(
+      r#"MemberQ[$Packages, "System`"]; Head[$ParentProcessID] == Integer"#,
+      r#"True"#,
+    );
+  }
+  #[test]
+  fn between() {
+    assert_case(r#"Between"#, r#"Between"#);
+  }
+  #[test]
+  fn boolean_q_5() {
+    assert_case(r#"Between; BooleanQ"#, r#"BooleanQ"#);
+  }
+  #[test]
+  fn true_q() {
+    assert_case(r#"Between; BooleanQ; TrueQ"#, r#"TrueQ"#);
+  }
+  #[test]
+  fn boolean_q_6() {
+    assert_case(r#"BooleanQ["string"]"#, r#"False"#);
+  }
+  #[test]
+  fn order_5() {
+    assert_case(r#"Order["c", "d"]"#, r#"1"#);
+  }
+  #[test]
+  fn order_6() {
+    assert_case(r#"Order["c", "d"]; Order["d", "c"]"#, r#"-1"#);
+  }
+  #[test]
+  fn digit_q() {
+    assert_case(r#"DigitQ"#, r#"DigitQ"#);
+  }
+  #[test]
+  fn letter_q() {
+    assert_case(r#"DigitQ; LetterQ"#, r#"LetterQ"#);
+  }
+  #[test]
+  fn string_match_q() {
+    assert_case(r#"DigitQ; LetterQ; StringMatchQ"#, r#"StringMatchQ"#);
+  }
+  #[test]
+  fn string_q_3() {
+    assert_case(r#"DigitQ; LetterQ; StringMatchQ; StringQ"#, r#"StringQ"#);
+  }
+  #[test]
+  fn subset_q() {
+    assert_case(
+      r#"DigitQ; LetterQ; StringMatchQ; StringQ; SubsetQ"#,
+      r#"SubsetQ"#,
+    );
+  }
+  #[test]
+  fn syntax_q_3() {
+    assert_case(
+      r#"DigitQ; LetterQ; StringMatchQ; StringQ; SubsetQ; SyntaxQ"#,
+      r#"SyntaxQ"#,
+    );
+  }
+  #[test]
+  fn expression_9() {
+    assert_case(r#"\.78\.79\.7A"#, r#"xyz"#);
+  }
+  #[test]
+  fn expression_10() {
+    assert_case(r#"\.78\.79\.7A; \:0078\:0079\:007A"#, r#"xyz"#);
+  }
+  #[test]
+  fn expression_11() {
+    assert_case(
+      r#"\.78\.79\.7A; \:0078\:0079\:007A; \101\102\103\061\062\063"#,
+      r#"ABC123"#,
+    );
+  }
+  #[test]
+  fn arg() {
+    assert_case(r#"Arg"#, r#"Arg"#);
+  }
+  #[test]
+  fn conjugate() {
+    assert_case(r#"Arg; Conjugate"#, r#"Conjugate"#);
+  }
+  #[test]
+  fn im() {
+    assert_case(r#"Arg; Conjugate; Im"#, r#"Im"#);
+  }
+  #[test]
+  fn re() {
+    assert_case(r#"Arg; Conjugate; Im; Re"#, r#"Re"#);
+  }
+  #[test]
+  fn product() {
+    assert_case(r#"Arg; Conjugate; Im; Re; Product"#, r#"Product"#);
+  }
+  #[test]
+  fn sum() {
+    assert_case(r#"Arg; Conjugate; Im; Re; Product; Sum"#, r#"Sum"#);
+  }
+  #[test]
+  fn assuming() {
+    assert_case(
+      r#"Arg; Conjugate; Im; Re; Product; Sum; Assuming"#,
+      r#"Assuming"#,
+    );
+  }
+  #[test]
+  fn boole() {
+    assert_case(
+      r#"Arg; Conjugate; Im; Re; Product; Sum; Assuming; Boole"#,
+      r#"Boole"#,
+    );
+  }
+  #[test]
+  fn complex_2() {
+    assert_case(
+      r#"Arg; Conjugate; Im; Re; Product; Sum; Assuming; Boole; Complex"#,
+      r#"Complex"#,
+    );
+  }
+  #[test]
+  fn element() {
+    assert_case(
+      r#"Arg; Conjugate; Im; Re; Product; Sum; Assuming; Boole; Complex; Element"#,
+      r#"Element"#,
+    );
+  }
+  #[test]
+  fn rational_2() {
+    assert_case(
+      r#"Arg; Conjugate; Im; Re; Product; Sum; Assuming; Boole; Complex; Element; Rational"#,
+      r#"Rational"#,
+    );
+  }
+  #[test]
+  fn conditional_expression() {
+    assert_case(
+      r#"Arg; Conjugate; Im; Re; Product; Sum; Assuming; Boole; Complex; Element; Rational; ConditionalExpression"#,
+      r#"ConditionalExpression"#,
+    );
+  }
+  #[test]
+  fn apart() {
+    assert_case(r#"Apart"#, r#"Apart"#);
+  }
+  #[test]
+  fn collect() {
+    assert_case(r#"Apart; Collect"#, r#"Collect"#);
+  }
+  #[test]
+  fn expand_denominator() {
+    assert_case(
+      r#"Apart; Collect; ExpandDenominator"#,
+      r#"ExpandDenominator"#,
+    );
+  }
+  #[test]
+  fn exponent() {
+    assert_case(
+      r#"Apart; Collect; ExpandDenominator; Exponent"#,
+      r#"Exponent"#,
+    );
+  }
+  #[test]
+  fn real_literal_1() {
+    assert_case(r#"0; 0."#, r#"0."#);
+  }
+  #[test]
+  fn real_literal_2() {
+    assert_case(r#"0; 0.; 0.00"#, r#"0."#);
+  }
+  #[test]
+  fn expression_12() {
+    assert_case(r#"0; 0.; 0.00; 0.00`"#, r#"0."#);
+  }
+  #[test]
+  fn expression_13() {
+    assert_case(r#"0; 0.; 0.00; 0.00`; 0.00`2"#, r#"0."#);
+  }
+  #[test]
+  fn expression_14() {
+    assert_case(r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20"#, r#"0."#);
+  }
+  #[test]
+  fn real_literal_3() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000"#,
+      r#"0``20."#,
+    );
+  }
+  #[test]
+  fn expression_15() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2"#,
+      r#"0``2."#,
+    );
+  }
+  #[test]
+  fn expression_16() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20"#,
+      r#"0``20."#,
+    );
+  }
+  #[test]
+  fn real_literal_4() {
+    assert_case(r#"0; 0."#, r#"0."#);
+  }
+  #[test]
+  fn real_literal_5() {
+    assert_case(r#"0; 0.; 0.00"#, r#"0."#);
+  }
+  #[test]
+  fn expression_17() {
+    assert_case(r#"0; 0.; 0.00; 0.00`"#, r#"0."#);
+  }
+  #[test]
+  fn expression_18() {
+    assert_case(r#"0; 0.; 0.00; 0.00`; 0.00`2"#, r#"0."#);
+  }
+  #[test]
+  fn expression_19() {
+    assert_case(r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20"#, r#"0."#);
+  }
+  #[test]
+  fn real_literal_6() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000"#,
+      r#"0``20."#,
+    );
+  }
+  #[test]
+  fn expression_20() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2"#,
+      r#"0``2."#,
+    );
+  }
+  #[test]
+  fn expression_21() {
+    assert_case(
+      r#"0; 0.; 0.00; 0.00`; 0.00`2; 0.00`20; 0.00000000000000000000; 0.``2; 0.``20"#,
+      r#"0``20."#,
+    );
+  }
+  #[test]
+  fn full_form_16() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]"#,
+      r#"FullForm[a`b_]"#,
+    );
+  }
+  #[test]
+  fn set_5() {
+    assert_case(
+      r#"x === Global`x; `x === Global`x; a`x === Global`x; a`x === a`x; a`x === b`x; FullForm[a`b_]; a = 2"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn information() {
+    assert_case(r#"Information"#, r#"Information"#);
+  }
+  #[test]
+  fn symbol_2() {
+    assert_case(r#"Information; Symbol"#, r#"Symbol"#);
+  }
+  #[test]
+  fn symbol_name() {
+    assert_case(r#"Information; Symbol; SymbolName"#, r#"SymbolName"#);
+  }
+  #[test]
+  fn value_q_3() {
+    assert_case(r#"Information; Symbol; SymbolName; ValueQ"#, r#"ValueQ"#);
+  }
+  #[test]
+  fn expression_22() {
+    assert_case(r#"1.  2.  3."#, r#"6."#);
+  }
+  #[test]
+  fn head_24() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]"#,
+      r#"Complex"#,
+    );
+  }
+  #[test]
+  fn times_1() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm"#,
+      r#"FullForm[1]"#,
+    );
+  }
+  #[test]
+  fn times_2() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm"#,
+      r#"FullForm[-1]"#,
+    );
+  }
+  #[test]
+  fn times_3() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm"#,
+      r#"FullForm[-5]"#,
+    );
+  }
+  #[test]
+  fn times_4() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm"#,
+      r#"FullForm[-5*a]"#,
+    );
+  }
+  #[test]
+  fn minus_1() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm"#,
+      r#"FullForm[-(a*b)]"#,
+    );
+  }
+  #[test]
+  fn minus_2() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3)"#,
+      r#"2 / 3 - x"#,
+    );
+  }
+  #[test]
+  fn minus_3() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2"#,
+      r#"-2*x"#,
+    );
+  }
+  #[test]
+  fn minus_4() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm"#,
+      r#"FullForm[-1/2*h]"#,
+    );
+  }
+  #[test]
+  fn divide_1() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x"#,
+      r#"1"#,
+    );
+  }
+  #[test]
+  fn divide_2() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2"#,
+      r#"2"#,
+    );
+  }
+  #[test]
+  fn expression_23() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi"#,
+      r#"9.42477796076938"#,
+    );
+  }
+  #[test]
+  fn head_25() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]"#,
+      r#"Complex"#,
+    );
+  }
+  #[test]
+  fn head_26() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]"#,
+      r#"Complex"#,
+    );
+  }
+  #[test]
+  fn head_27() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]"#,
+      r#"Times"#,
+    );
+  }
+  #[test]
+  fn times_5() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm"#,
+      r#"InputForm[3*a]"#,
+    );
+  }
+  #[test]
+  fn times_6() {
+    // OutputForm wrapper now stays — `3 * a // OutputForm` prints as
+    // `OutputForm[3*a]`, matching wolframscript.
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm"#,
+      r#"OutputForm[3*a]"#,
+    );
+  }
+  #[test]
+  fn minus_5() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x"#,
+      r#"-2.123456789*x"#,
+    );
+  }
+  #[test]
+  fn minus_6() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I"#,
+      r#"0. - 2.123456789*I"#,
+    );
+  }
+  #[test]
+  fn n_1() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I"#,
+      r#"3.1415926535897932384626433832795028841971693993751058209749`30.*I"#,
+    );
+  }
+  #[test]
+  fn n_2() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I; N[I Pi, 30]"#,
+      r#"3.1415926535897932384626433832795028841971693993751058209749`30.*I"#,
+    );
+  }
+  #[test]
+  fn n_3() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I; N[I Pi, 30]; N[Pi * E, 30]"#,
+      r#"8.5397342226735670654635508695465744827154188073938928927837`30."#,
+    );
+  }
+  #[test]
+  fn n_4() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I; N[I Pi, 30]; N[Pi * E, 30]; N[Pi, 30] * N[E, 30]"#,
+      r#"8.53973422267356706546355086954657448272`29.69897000433602"#,
+    );
+  }
+  #[test]
+  fn n_5() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I; N[I Pi, 30]; N[Pi * E, 30]; N[Pi, 30] * N[E, 30]; N[Pi, 30] * E//{#1, Precision[#1]}&"#,
+      r#"{8.5397342226735670654635508695465744950348885357651126726713`30., 30.}"#,
+    );
+  }
+  #[test]
+  fn n_6() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I; N[I Pi, 30]; N[Pi * E, 30]; N[Pi, 30] * N[E, 30]; N[Pi, 30] * E//{#1, Precision[#1]}&; N[Pi, 30] + N[E, 30]//{#1, Precision[#1]}&"#,
+      r#"{5.8598744820488384738229308546321653819544164930750646672643`30., 30.}"#,
+    );
+  }
+  #[test]
+  fn n_7() {
+    assert_case(
+      r#"{Conjugate[Pi], Conjugate[E]}; -2/3; -2/3//Head; (-1 + a^n) Sum[a^(k n), {k, 0, m-1}] // Simplify; 1 / 4.0; 10 / 3 // FullForm; a / b // FullForm; -2a - 2b; -4+2x+2*Sqrt[3]; 2a-3b-c; 2a+5d-3b-2c-e; 1 - I * Sqrt[3]; Head[3 + 2 I]; Times[]// FullForm; Times[-1]// FullForm; Times[-5]// FullForm; Times[-5, a]// FullForm; -a*b // FullForm; -(x - 2/3); -x*2; -(h/2) // FullForm; x / x; 2x^2 / x^2; 3. Pi; Head[3 * I]; Head[Times[I, 1/2]]; Head[Pi * I]; 3 * a //InputForm; 3 * a //OutputForm; -2.123456789 x; -2.123456789 I; N[Pi, 30] * I; N[I Pi, 30]; N[Pi * E, 30]; N[Pi, 30] * N[E, 30]; N[Pi, 30] * E//{#1, Precision[#1]}&; N[Pi, 30] + N[E, 30]//{#1, Precision[#1]}&; N[Sqrt[2], 50]"#,
+      r#"1.41421356237309504880168872420969807856967187537694807317667973799073247846211`50."#,
+    );
+  }
+  #[test]
+  fn i_1() {
+    assert_case(r#"I"#, r#"I"#);
+  }
+  #[test]
+  fn integer_literal_3() {
+    assert_case(r#"I; 0"#, r#"0"#);
+  }
+  #[test]
+  fn integer_literal_4() {
+    assert_case(r#"I; 0; 1"#, r#"1"#);
+  }
+  #[test]
+  fn i_2() {
+    assert_case(r#"I"#, r#"I"#);
+  }
+  #[test]
+  fn integer_literal_5() {
+    assert_case(r#"I; 0"#, r#"0"#);
+  }
+  #[test]
+  fn integer_literal_6() {
+    assert_case(r#"I; 0; 1"#, r#"1"#);
+  }
+  #[test]
+  fn composite_q() {
+    assert_case(r#"CompositeQ"#, r#"CompositeQ"#);
+  }
+  #[test]
+  fn divisible() {
+    assert_case(r#"CompositeQ; Divisible"#, r#"Divisible"#);
+  }
+  #[test]
+  fn lcm() {
+    assert_case(r#"CompositeQ; Divisible; LCM"#, r#"LCM"#);
+  }
+  #[test]
+  fn modular_inverse() {
+    assert_case(
+      r#"CompositeQ; Divisible; LCM; ModularInverse"#,
+      r#"ModularInverse"#,
+    );
+  }
+  #[test]
+  fn power_mod() {
+    assert_case(
+      r#"CompositeQ; Divisible; LCM; ModularInverse; PowerMod"#,
+      r#"PowerMod"#,
+    );
+  }
+  #[test]
+  fn quotient() {
+    assert_case(
+      r#"CompositeQ; Divisible; LCM; ModularInverse; PowerMod; Quotient"#,
+      r#"Quotient"#,
+    );
+  }
+  #[test]
+  fn limit() {
+    assert_case(r#"Limit"#, r#"Limit"#);
+  }
+  #[test]
+  fn hold_4() {
+    assert_case(
+      r#"Hold[<< ~/some_example/dir/] // FullForm"#,
+      r#"FullForm[Hold[Get["~/some_example/dir/"]]]"#,
+    );
+  }
+  #[test]
+  fn integer_literal_7() {
+    assert_case(r#"1234567890; 1234567890"#, r#"1234567890"#);
+  }
+  #[test]
+  fn integer_literal_8() {
+    assert_case(r#"1234567890; 1234567890; 1234567890"#, r#"1234567890"#);
+  }
+  #[test]
+  fn integer_literal_9() {
+    assert_case(
+      r#"1234567890; 1234567890; 1234567890; 1234567890"#,
+      r#"1234567890"#,
+    );
+  }
+  #[test]
+  fn integer_literal_10() {
+    assert_case(
+      r#"1234567890; 1234567890; 1234567890; 1234567890; 9934567890"#,
+      r#"9934567890"#,
+    );
+  }
+  #[test]
+  fn integer_literal_11() {
+    assert_case(
+      r#"1234567890; 1234567890; 1234567890; 1234567890; 9934567890; 1234567890"#,
+      r#"1234567890"#,
+    );
+  }
+  #[test]
+  fn integer_literal_12() {
+    assert_case(
+      r#"1234567890; 1234567890; 1234567890; 1234567890; 9934567890; 1234567890; 1234567890"#,
+      r#"1234567890"#,
+    );
+  }
+  #[test]
+  fn expression_24() {
+    assert_case(r#"Symbol_x"#, r#"Symbol_x"#);
+  }
+}
+
+mod comparison_structural_ops {
+  use super::*;
+
+  #[test]
+  fn uniform_chain_applies_flat() {
+    // a == b == c is Equal[a, b, c]; Apply exposes the flat operands.
+    assert_eq!(interpret("List @@ (a == b == c)").unwrap(), "{a, b, c}");
+    assert_eq!(interpret("Apply[List, a == b]").unwrap(), "{a, b}");
+    assert_eq!(interpret("List @@ (a < b < c)").unwrap(), "{a, b, c}");
+    assert_eq!(interpret("List @@ (a >= b >= c)").unwrap(), "{a, b, c}");
+  }
+
+  #[test]
+  fn mixed_chain_is_inequality() {
+    // a < b <= c is Inequality[a, Less, b, LessEqual, c]: operands and
+    // operator symbols interleave. Matches wolframscript.
+    assert_eq!(
+      interpret("List @@ (a < b <= c)").unwrap(),
+      "{a, Less, b, LessEqual, c}"
+    );
+    assert_eq!(interpret("Length[a < b <= c]").unwrap(), "5");
+    assert_eq!(interpret("Part[a < b <= c, 2]").unwrap(), "Less");
+    assert_eq!(interpret("Part[a < b <= c, 3]").unwrap(), "b");
+  }
+
+  #[test]
+  fn uniform_chain_length_and_head() {
+    assert_eq!(interpret("Length[a == b == c]").unwrap(), "3");
+    assert_eq!(interpret("Part[a == b == c, 0]").unwrap(), "Equal");
+    assert_eq!(interpret("Part[a < b <= c, 0]").unwrap(), "Inequality");
+  }
+}
+
+/// `//`, `/.` and `//.` all bind looser than `->`, so a rule written as an
+/// argument or a list item can be handed to a postfix function or replaced
+/// in. Woxi's grammar used to end an argument at the rule, and the whole
+/// input then failed to parse.
+mod rule_argument_suffixes {
+  use super::*;
+
+  #[test]
+  fn a_rule_argument_takes_a_postfix_function() {
+    clear_state();
+    for (code, expected) in [
+      ("f[a -> 5 // Head]", "f[Rule]"),
+      ("{a -> 5 // Head}", "{Rule}"),
+      ("f[a :> 5 // Head]", "f[RuleDelayed]"),
+      ("f[a -> 5 // Head, b -> 6 // Head]", "f[Rule, Rule]"),
+      ("{{a -> 5 // Head}}", "{{Rule}}"),
+      ("f[g[a -> 5 // Head]]", "f[g[Rule]]"),
+      // Chained postfixes still work.
+      ("{a -> 5 // Head // Head}", "{Symbol}"),
+      // and a plain rule argument is unchanged.
+      ("f[a -> 5]", "f[a -> 5]"),
+    ] {
+      assert_eq!(
+        interpret(&format!("ToString[{code}, InputForm]")).unwrap(),
+        expected,
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_rule_argument_takes_a_replacement() {
+    clear_state();
+    for (code, expected) in [
+      ("f[a -> 5 /. 5 -> 6]", "f[a -> 6]"),
+      ("{a -> 5 /. 5 -> 6}", "{a -> 6}"),
+      ("f[a -> 5 //. 5 -> 6]", "f[a -> 6]"),
+      ("f[a -> 5 /. {5 -> 6}]", "f[a -> 6]"),
+    ] {
+      assert_eq!(
+        interpret(&format!("ToString[{code}, InputForm]")).unwrap(),
+        expected,
+        "{code}"
+      );
+    }
+  }
+
+  #[test]
+  fn a_replacement_before_the_trailing_amp_is_absorbed_into_the_function() {
+    // A Wolfram Demonstration's `MapIndexed[... -> ... /. rule &, list]`
+    // idiom: the `/.` sits *before* the trailing `&`, so it must become
+    // part of the pure function's body (`pat -> repl /. rule` as a whole),
+    // rather than applying to the already-built `Function[pat -> repl]`
+    // (which is what `pat -> repl & /. rule` means instead).
+    clear_state();
+    for (code, expected) in [
+      (
+        "ToString[f[a -> 5 /. 5 -> 6 &], InputForm]",
+        "f[a -> 5 /. 5 -> 6 & ]",
+      ),
+      (
+        "ToString[{a -> 5 /. 5 -> 6 &}, InputForm]",
+        "{a -> 5 /. 5 -> 6 & }",
+      ),
+      (
+        "ToString[f[a -> 5 //. 5 -> 6 &], InputForm]",
+        "f[a -> 5 //. 5 -> 6 & ]",
+      ),
+      ("(a -> 5 /. 5 -> 6 &)[x]", "a -> 6"),
+      (
+        "MapIndexed[#1 -> #2[[1]] /. 1 -> 99 &, {10, 20, 30}]",
+        "{10 -> 99, 20 -> 2, 30 -> 3}",
+      ),
+    ] {
+      assert_eq!(interpret(code).unwrap(), expected, "{code}");
+    }
+  }
+}
+
+/// A rule answers to a head replacement the way any other expression does.
+mod rule_head_replacement {
+  use super::*;
+
+  #[test]
+  fn the_head_of_a_rule_can_be_replaced() {
+    clear_state();
+    for (code, expected) in [
+      ("(1 -> 2) /. Rule -> List", "{1, 2}"),
+      ("{1 -> 2} /. Rule -> List", "{{1, 2}}"),
+      ("{a -> 1} /. Rule -> ff", "{ff[a, 1]}"),
+      ("(1 :> 2) /. RuleDelayed -> List", "{1, 2}"),
+      // Replacing something else inside a rule still works.
+      ("{a -> 1} /. a -> b", "{b -> 1}"),
+      ("(a -> b) /. b -> c", "a -> c"),
+    ] {
+      assert_eq!(
+        interpret(&format!("ToString[{code}, InputForm]")).unwrap(),
+        expected,
+        "{code}"
+      );
+    }
+  }
+}
+
+// A held `Not` and a held leading minus are written with their operators, the
+// way wolframscript writes them, and parenthesised wherever the operator would
+// otherwise reach past what it negates. Values verified against wolframscript.
+mod held_prefix_operators {
+  use super::*;
+
+  /// The `InputForm` of `Hold[body]`, which keeps `body` unevaluated.
+  fn held(body: &str) -> String {
+    interpret(&format!("ToString[Hold[{body}], InputForm]")).unwrap()
+  }
+
+  #[test]
+  fn a_held_negation_is_written_with_the_operator() {
+    clear_state();
+    for (body, expected) in [
+      ("Not[a]", "Hold[ !a]"),
+      ("Not[Not[a]]", "Hold[ !( !a)]"),
+      ("Not[a && b]", "Hold[ !(a && b)]"),
+      ("Not[a > 1]", "Hold[ !a > 1]"),
+      ("f[Not[a]]", "Hold[f[ !a]]"),
+      ("{Not[a]}", "Hold[{ !a}]"),
+      ("Xor[Not[a], b]", "Hold[Xor[ !a, b]]"),
+    ] {
+      assert_eq!(held(body), expected, "{body}");
+    }
+  }
+
+  #[test]
+  fn a_negation_is_parenthesised_wherever_it_would_reach_too_far() {
+    clear_state();
+    for (body, expected) in [
+      // Arithmetic, comparison, `;;`, `!` and application all bind tighter
+      // than `!`, so the negation needs bracketing inside them.
+      ("Not[a]^2", "Hold[( !a)^2]"),
+      ("Not[a]*b", "Hold[( !a)*b]"),
+      ("Not[a]/b", "Hold[( !a)/b]"),
+      ("Not[a] + b", "Hold[( !a) + b]"),
+      ("b + Not[a]", "Hold[b + ( !a)]"),
+      ("Not[a] == b", "Hold[( !a) == b]"),
+      ("Not[a] < b < c", "Hold[( !a) < b < c]"),
+      ("Not[a][x]", "Hold[( !a)[x]]"),
+      ("Not[a]!", "Hold[( !a)!]"),
+      ("Not[a] ;; b", "Hold[( !a) ;; b]"),
+      ("Not[a] /@ {1}", "Hold[( !a) /@ {1}]"),
+      ("f /@ Not[a]", "Hold[f /@ ( !a)]"),
+      // And, Or and a rule bind looser, so they need nothing.
+      ("Not[a] && b", "Hold[ !a && b]"),
+      ("Not[a] || b", "Hold[ !a || b]"),
+      ("Not[a] -> b", "Hold[ !a -> b]"),
+    ] {
+      assert_eq!(held(body), expected, "{body}");
+    }
+  }
+
+  #[test]
+  fn a_held_leading_minus_stays_a_leading_minus() {
+    clear_state();
+    for (body, expected) in [
+      ("-x", "Hold[-x]"),
+      ("-x + y", "Hold[-x + y]"),
+      ("-Sin[x]", "Hold[-Sin[x]]"),
+      ("{-a, !b}", "Hold[{-a,  !b}]"),
+      ("-x^2", "Hold[-x^2]"),
+      ("(-x)^2", "Hold[(-x)^2]"),
+      ("-x[[1]]", "Hold[-x[[1]]]"),
+      // A subtraction written out keeps both of its sides.
+      ("0 - x", "Hold[0 - x]"),
+      ("a - b", "Hold[a - b]"),
+      ("1 - x", "Hold[1 - x]"),
+    ] {
+      assert_eq!(held(body), expected, "{body}");
+    }
+  }
+
+  #[test]
+  fn a_leading_minus_is_parenthesised_where_it_would_swallow_a_factor() {
+    clear_state();
+    for (body, expected) in [
+      // `-(a + b)` printed as `-a + b` would re-parse as `(-a) + b`.
+      ("-(a + b)", "Hold[-(a + b)]"),
+      ("-(a b)", "Hold[-(a*b)]"),
+      ("-(-a)", "Hold[-(-a)]"),
+      ("-Not[a]", "Hold[-( !a)]"),
+      ("(-x)!", "Hold[(-x)!]"),
+      // Either side of a product, and a divisor, need bracketing too.
+      ("(-a)*b", "Hold[(-a)*b]"),
+      ("a*(-b)", "Hold[a*(-b)]"),
+      ("a/-b", "Hold[a/(-b)]"),
+      ("a^-b", "Hold[a^(-b)]"),
+      // A dividend, an argument and a list entry do not.
+      ("f[a, -b]", "Hold[f[a, -b]]"),
+      ("{-b}", "Hold[{-b}]"),
+      ("-a == b", "Hold[-a == b]"),
+      ("-a && b", "Hold[-a && b]"),
+    ] {
+      assert_eq!(held(body), expected, "{body}");
+    }
+  }
+
+  #[test]
+  fn a_function_body_is_written_the_same_way() {
+    clear_state();
+    for (code, expected) in [
+      ("!#1 &", " !#1 & "),
+      ("!#1 || !#2 &", " !#1 ||  !#2 & "),
+      ("#1 && !#2 &", "#1 &&  !#2 & "),
+      ("!(#1 && #2) &", " !(#1 && #2) & "),
+      ("(!#1)[x] &", "( !#1)[x] & "),
+      ("Function[u, !u]", "Function[u,  !u]"),
+      ("-#1 &", "-#1 & "),
+      ("-#1 - #2 &", "-#1 - #2 & "),
+      ("Abs[-#1] &", "Abs[-#1] & "),
+      ("-#1^2 &", "-#1^2 & "),
+      ("(-#1)^2 &", "(-#1)^2 & "),
+      // The printed form re-parses to the same function, which `0 - #1 + #2`
+      // would not.
+      ("-(#1 + #2) &", "-(#1 + #2) & "),
+    ] {
+      assert_eq!(
+        interpret(&format!("ToString[{code}, InputForm]")).unwrap(),
+        expected,
+        "{code}"
+      );
+    }
+    // and it really is the same function.
+    assert_eq!(
+      interpret("ToExpression[ToString[-(#1 + #2) &, InputForm]][1, 2]")
+        .unwrap(),
+      "-3"
+    );
+  }
+}
+
+// `expr // f` is `f[expr]`, so a Sequence argument spreads into f's arguments
+// the way it would if the call had been written out. Values verified against
+// wolframscript.
+mod postfix_spreads_a_sequence {
+  use super::*;
+
+  /// The result of `code`, written the way `InputForm` writes it.
+  fn form(code: &str) -> String {
+    interpret(&format!("ToString[{code}, InputForm]")).unwrap()
+  }
+
+  #[test]
+  fn a_sequence_handed_to_a_postfix_head_spreads() {
+    clear_state();
+    for (code, expected) in [
+      ("Sequence[1, 2] // List", "{1, 2}"),
+      ("Sequence[1, 2] // f", "f[1, 2]"),
+      ("Sequence[a, b] // f", "f[a, b]"),
+      ("Sequence[1] // f", "f[1]"),
+      ("Sequence[] // List", "{}"),
+      // The head then sees two arguments, and computes with both.
+      ("Sequence[1, 2] // Plus", "3"),
+      ("Sequence[1, 2] // Times", "2"),
+      ("Sequence[1, 2, 3] // Max", "3"),
+      // Which is what `Sequence @@ list` feeds it.
+      ("Sequence @@ {1, 2} // List", "{1, 2}"),
+    ] {
+      assert_eq!(form(code), expected, "{code}");
+    }
+  }
+
+  // A Sequence one level down is already spread by the head holding it, so
+  // the postfix head sees a single argument.
+  #[test]
+  fn a_sequence_further_in_is_not_the_postfix_argument() {
+    clear_state();
+    for (code, expected) in [
+      ("{Sequence[1, 2]} // Length", "2"),
+      ("g[Sequence[1, 2]] // f", "f[g[1, 2]]"),
+      ("Sequence[{1, 2}] // Length", "2"),
+      // Ordinary postfix is untouched.
+      ("{1, 2} // Length", "2"),
+      ("{1, 2, 3} // Total", "6"),
+      ("{1, 2, 3} // Reverse", "{3, 2, 1}"),
+      ("{1, 2} // f", "f[{1, 2}]"),
+      ("x // f", "f[x]"),
+      // A held postfix surfaces as the call it stands for, with the
+      // Sequence still waiting inside it.
+      ("Hold[Sequence[1, 2] // f]", "Hold[f[Sequence[1, 2]]]"),
+    ] {
+      assert_eq!(form(code), expected, "{code}");
+    }
+  }
+
+  // Spreading can hand the head the wrong number of arguments, and it says so
+  // rather than quietly counting the Sequence as one.
+  #[test]
+  fn spreading_can_overfill_the_head() {
+    clear_state();
+    let result = interpret_with_stdout("Sequence[1, 2] // Length").unwrap();
+    assert_eq!(result.result, "Length[1, 2]");
+    assert!(
+      result.warnings.iter().any(|w| w.contains("Length::argx")),
+      "expected Length::argx, got {:?}",
+      result.warnings
+    );
+  }
+}
+
+// `\[Sqrt]x` and `\[CubeRoot]x` are prefix operators. They bind to the next
+// factor only, but `^`, `!` and `[[…]]` bind tighter than the radical, so
+// those suffixes are part of the operand. The "Sum of the Squares of the
+// Distances from the Vertices to the Orthocenter" Demonstration writes its
+// Heron's-formula area with one, and the cell would not parse at all.
+mod radical_prefix_operators {
+  use super::*;
+
+  #[test]
+  fn sqrt_prefix_binds_to_the_next_factor() {
+    assert_eq!(interpret(r"\[Sqrt]4").unwrap(), "2");
+    assert_eq!(interpret(r"\[Sqrt](2 + 2)").unwrap(), "2");
+    assert_eq!(interpret(r"\[Sqrt]x + 1").unwrap(), "1 + Sqrt[x]");
+    assert_eq!(interpret(r"\[Sqrt]x y").unwrap(), "Sqrt[x]*y");
+    assert_eq!(interpret(r"a \[Sqrt]b").unwrap(), "a*Sqrt[b]");
+    assert_eq!(interpret(r"\[Sqrt]2 3").unwrap(), "3*Sqrt[2]");
+    assert_eq!(interpret(r"\[Sqrt]\[Sqrt]x").unwrap(), "x^(1/4)");
+  }
+
+  #[test]
+  fn power_factorial_and_part_bind_tighter() {
+    assert_eq!(interpret(r"\[Sqrt]x^2").unwrap(), "Sqrt[x^2]");
+    assert_eq!(interpret(r"\[Sqrt]x!").unwrap(), "Sqrt[x!]");
+    assert_eq!(interpret(r"x = {4, 9}; \[Sqrt]x[[1]]").unwrap(), "2");
+    assert_eq!(interpret(r"\[Sqrt]f[4]").unwrap(), "Sqrt[f[4]]");
+  }
+
+  // `\[CubeRoot]x` is `Surd[x, 3]`, the real-valued cube root — so it is
+  // negative for a negative argument, unlike `x^(1/3)`.
+  #[test]
+  fn cube_root_prefix_is_surd() {
+    assert_eq!(interpret(r"\[CubeRoot]8").unwrap(), "2");
+    assert_eq!(interpret(r"\[CubeRoot](-8)").unwrap(), "-2");
+    assert_eq!(interpret(r"Head[\[CubeRoot]y]").unwrap(), "Surd");
+  }
+
+  // The literal Unicode characters parse the same as the `\[Name]` escapes.
+  #[test]
+  fn unicode_radical_characters() {
+    assert_eq!(interpret("√4").unwrap(), "2");
+    assert_eq!(interpret("√x y").unwrap(), "Sqrt[x]*y");
+    assert_eq!(interpret("∛8").unwrap(), "2");
+  }
+}
+
+// `⌊x⌋` / `⌈x⌉` are the typeset bracket forms for `\[LeftFloor]…\[RightFloor]`
+// / `\[LeftCeiling]…\[RightCeiling]`, which the FrontEnd renders around a
+// single enclosed expression — Floor[x] / Ceiling[x]. Regression: the
+// downloaded Wolfram Demonstration "Goldbach Partitions" defines its helper
+// function with `⌊sum/2⌋`, and this used to fail to parse at all.
+mod floor_ceiling_brackets {
+  use super::*;
+
+  #[test]
+  fn floor_brackets_parse_as_floor_call() {
+    assert_eq!(interpret("⌊5.7⌋").unwrap(), "5");
+    assert_eq!(interpret("⌊-2.5⌋").unwrap(), "-3");
+    assert_eq!(interpret("⌊x/2⌋ /. x -> 7").unwrap(), "3");
+    assert_eq!(interpret("Head[⌊x⌋]").unwrap(), "Floor");
+  }
+
+  #[test]
+  fn ceiling_brackets_parse_as_ceiling_call() {
+    assert_eq!(interpret("⌈5.2⌉").unwrap(), "6");
+    assert_eq!(interpret("⌈-2.5⌉").unwrap(), "-2");
+    assert_eq!(interpret("⌈x/2⌉ /. x -> 7").unwrap(), "4");
+    assert_eq!(interpret("Head[⌈x⌉]").unwrap(), "Ceiling");
+  }
+
+  #[test]
+  fn floor_ceiling_brackets_bind_like_a_parenthesized_atom() {
+    // The bracket pair is an atom, not a prefix operator, so an implicit
+    // factor next to it multiplies rather than nests inside the argument.
+    assert_eq!(interpret("2⌊5.7⌋").unwrap(), "10");
+    assert_eq!(interpret("⌊5.7⌋⌈2.1⌉").unwrap(), "15");
+  }
+}
+
+// `\[Piecewise]{{v1,c1},{v2,c2},…}` is the special-character input form for
+// `Piecewise[{{v1,c1},{v2,c2},…}]` that notebooks reconstruct from a
+// `GridBox` for the piecewise brace notation. Regression: a downloaded
+// Wolfram Demonstration ("Pulse Fourier Approximation") defines a function
+// body this way, and it used to parse as the bare symbol `Piecewise`
+// implicitly multiplied by the following list — silently dropping the
+// whole piecewise definition — instead of a `Piecewise[...]` call.
+mod piecewise_prefix_operator {
+  use super::*;
+
+  #[test]
+  fn piecewise_prefix_parses_as_a_function_call() {
+    assert_eq!(
+      interpret(r"\[Piecewise]{{1, x < 0}, {2, True}}").unwrap(),
+      "Piecewise[{{1, x < 0}}, 2]"
+    );
+    assert_eq!(
+      interpret(r"\[Piecewise]{{1, 0 < 1}, {2, True}}").unwrap(),
+      "1"
+    );
+    assert_eq!(
+      interpret(r"\[Piecewise]{{1, 5 < 1}, {2, True}}").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn piecewise_prefix_works_in_a_function_definition() {
+    assert_eq!(
+      interpret(r"f[t_] := \[Piecewise]{{1, t < 1}, {2, True}}; {f[0], f[5]}")
+        .unwrap(),
+      "{1, 2}"
+    );
+  }
+}
+
+// An applied anonymous function may carry `/.` / `//.`, which replace in the
+// *result* of the application. Regression: `f & [x] /. rules` did not parse.
+mod replace_after_applied_anonymous_function {
+  use super::*;
+
+  #[test]
+  fn replace_all_applies_to_the_result() {
+    assert_eq!(interpret("(# + 1) &[2] /. 3 -> 9").unwrap(), "9");
+    assert_eq!(interpret("(# + 1) &[2] /. x_ -> 0").unwrap(), "0");
+    assert_eq!(interpret("(# + 1) &[2] //. 3 -> 9").unwrap(), "9");
+    // Without a replacement the application is unchanged.
+    assert_eq!(interpret("(# + 1) &[2]").unwrap(), "3");
+    // And the parenthesised spelling still agrees.
+    assert_eq!(interpret("((# + 1) &)[2] /. 3 -> 9").unwrap(), "9");
+  }
+
+  #[test]
+  fn a_radical_body_replaces_the_same_way() {
+    assert_eq!(interpret(r"\[Sqrt](#) &[4] /. 2 -> 7").unwrap(), "7");
+  }
+}
+
+/// A comma with nothing beside it stands for an omitted expression,
+/// which Wolfram reads as `Null` — hand-written Demonstration code does
+/// this to leave gaps in a table (`data = {d1, d2, , d4}`).
+mod omitted_arguments {
+  use super::*;
+
+  #[test]
+  fn an_omitted_list_element_is_null() {
+    let full =
+      |s: &str| interpret(&format!("ToString[FullForm[{s}]]")).unwrap();
+    assert_eq!(full("{a,,b}"), "List[a, Null, b]");
+    assert_eq!(full("{,a}"), "List[Null, a]");
+    assert_eq!(full("{a,}"), "List[a, Null]");
+    assert_eq!(full("{,}"), "List[Null, Null]");
+    assert_eq!(full("{a,b,,,}"), "List[a, b, Null, Null, Null]");
+    assert_eq!(interpret("Length[{a,b,,,}]").unwrap(), "5");
+  }
+
+  #[test]
+  fn an_omitted_argument_is_null() {
+    let full =
+      |s: &str| interpret(&format!("ToString[FullForm[{s}]]")).unwrap();
+    assert_eq!(full("f[a,,b]"), "f[a, Null, b]");
+    assert_eq!(full("f[,]"), "f[Null, Null]");
+    assert_eq!(full("f[a,]"), "f[a, Null]");
+  }
+
+  #[test]
+  fn a_missing_comma_is_still_no_element() {
+    // Omission takes a comma to be visible: an empty list stays empty,
+    // and a one-element list keeps its single element.
+    let full =
+      |s: &str| interpret(&format!("ToString[FullForm[{s}]]")).unwrap();
+    assert_eq!(full("{}"), "List[]");
+    assert_eq!(full("f[]"), "f[]");
+    assert_eq!(full("{a}"), "List[a]");
+    assert_eq!(interpret("Length[{}]").unwrap(), "0");
+  }
+
+  #[test]
+  fn omitted_elements_nest() {
+    let full =
+      |s: &str| interpret(&format!("ToString[FullForm[{s}]]")).unwrap();
+    assert_eq!(full("{{1,2},{3,,4}}"), "List[List[1, 2], List[3, Null, 4]]");
+    assert_eq!(interpret("Head[Part[{a,,b}, 2]]").unwrap(), "Symbol");
+  }
+}
+
+/// `⟦…⟧` (and its `〚…〛` spelling) group like `[[…]]`, so the commas and
+/// semicolons inside a part specification belong to it, not to the
+/// surrounding argument list.
+mod unicode_part_brackets {
+  use super::*;
+
+  #[test]
+  fn part_commas_do_not_split_a_compound_argument() {
+    // The `,` of `⟦1,2⟧` used to end the lookahead that decides whether an
+    // argument is a CompoundExpression, so the `;` after it was never seen.
+    let code = "a = {{0, 0}, {0, 0}}; If[True, a⟦1, 2⟧++; x = 1]; a⟦1, 2⟧";
+    assert_eq!(interpret(code).unwrap(), "1");
+    assert_eq!(
+      interpret(&code.replace('\u{27E6}', "[[").replace('\u{27E7}', "]]"))
+        .unwrap(),
+      "1"
+    );
+  }
+
+  #[test]
+  fn part_commas_do_not_split_a_rule_or_span_argument() {
+    assert_eq!(
+      interpret("a = {{1, 2}, {3, 4}}; f[a〚1, 2〛 -> 9]").unwrap(),
+      "f[2 -> 9]"
+    );
+    assert_eq!(
+      interpret("a = {{1, 2}, {3, 4}}; b = {5, 6, 7}; b[[a⟦1, 1⟧ ;; 3]]")
+        .unwrap(),
+      "{5, 6, 7}"
+    );
+  }
+
+  #[test]
+  fn nested_part_brackets_stay_balanced() {
+    assert_eq!(
+      interpret("a = {{1, 2}, {3, 4}}; If[True, a⟦a⟦1, 1⟧, 2⟧; y = 7]; y")
+        .unwrap(),
+      "7"
+    );
+  }
+}
+
+/// Every bracket group of a Part suffix but the last is held in `Part[…]`
+/// call form so `m[[a]][[b]]` stays distinct from `m[[a, b]]`. That is an
+/// internal representation: wolframscript prints a `Part` call with double
+/// brackets, so a chained Part must echo as `m[[a]][[b]]`, not
+/// `Part[m, a][[b]]`.
+mod chained_part_groups_print_with_double_brackets {
+  use super::*;
+
+  #[test]
+  fn a_chain_of_part_groups_keeps_its_brackets() {
+    assert_eq!(interpret("Hold[a[[1]][[2]]]").unwrap(), "Hold[a[[1]][[2]]]");
+    assert_eq!(
+      interpret("Hold[a[[1]][[2]][[3]]]").unwrap(),
+      "Hold[a[[1]][[2]][[3]]]"
+    );
+    // A multi-spec group stays one group; only whole groups chain.
+    assert_eq!(
+      interpret("Hold[a[[1,2]][[3]]]").unwrap(),
+      "Hold[a[[1,2]][[3]]]"
+    );
+  }
+
+  #[test]
+  fn an_explicit_part_call_prints_the_same_way() {
+    assert_eq!(interpret("Hold[Part[a, 1]]").unwrap(), "Hold[a[[1]]]");
+    assert_eq!(
+      interpret("Hold[Part[Part[a, 1], 2]]").unwrap(),
+      "Hold[a[[1]][[2]]]"
+    );
+    assert_eq!(interpret("Hold[Part[a]]").unwrap(), "Hold[a[[]]]");
+  }
+
+  #[test]
+  fn a_chained_part_base_keeps_the_parens_it_needs() {
+    // `[[…]]` binds tighter than every infix operator, so an operator base
+    // must stay parenthesized through the whole chain.
+    assert_eq!(
+      interpret("Hold[({9, 8} /. 8 -> 5)[[1]][[2]]]").unwrap(),
+      "Hold[({9, 8} /. 8 -> 5)[[1]][[2]]]"
+    );
+    assert_eq!(
+      interpret("Hold[Part[a + b, 1]]").unwrap(),
+      "Hold[(a + b)[[1]]]"
+    );
+  }
+
+  #[test]
+  fn input_form_keeps_strings_quoted_in_a_chain() {
+    assert_eq!(
+      interpret("ToString[Hold[{{\"x\"}}[[1]][[1]]], InputForm]").unwrap(),
+      "Hold[{{\"x\"}}[[1]][[1]]]"
+    );
+  }
+}
+
+/// Wolfram reads the two brackets of `[[…]]` as separate tokens, so
+/// whitespace, newlines and comments may sit between them: `m[ [1] ]` is
+/// `Part[m, 1]`. A lone `[…]` can never start an expression, so there is no
+/// ambiguity with a function call taking a bracketed first argument.
+/// Regression for <https://github.com/ad-si/Woxi/issues/458>.
+mod spaced_part_brackets {
+  use super::*;
+
+  #[test]
+  fn spaces_between_the_brackets_still_extract_a_part() {
+    assert_eq!(
+      interpret("myList = {10, 20, 30}; myList[ [ {1, 2} ] ]").unwrap(),
+      "{10, 20}"
+    );
+    assert_eq!(interpret("{10, 20, 30}[ [2] ]").unwrap(), "20");
+    assert_eq!(interpret("{10, 20, 30}[[ 2 ]]").unwrap(), "20");
+  }
+
+  #[test]
+  fn only_one_side_needs_to_be_spaced() {
+    assert_eq!(
+      interpret("Hold[a[ [1]]] // FullForm").unwrap(),
+      "FullForm[Hold[a[[1]]]]"
+    );
+    assert_eq!(
+      interpret("Hold[a[[1] ]] // FullForm").unwrap(),
+      "FullForm[Hold[a[[1]]]]"
+    );
+  }
+
+  #[test]
+  fn newlines_and_comments_may_separate_the_brackets() {
+    assert_eq!(interpret("{1, 2, 3}[\n  [2]\n]").unwrap(), "2");
+    assert_eq!(interpret("{1, 2, 3}[ (* part *) [2] ]").unwrap(), "2");
+  }
+
+  #[test]
+  fn spaced_part_specs_compose_and_nest() {
+    // Two groups in a row are still applied one after the other.
+    assert_eq!(interpret("{{1, 2}, {3, 4}}[ [2] ][ [1] ]").unwrap(), "3");
+    // Multiple specs in one spaced group index into successive levels.
+    assert_eq!(interpret("{{1, 2}, {3, 4}}[ [2, 1] ]").unwrap(), "3");
+    // A spaced Part inside a spaced Part keeps its brackets balanced.
+    assert_eq!(
+      interpret("a = {{1, 2}, {3, 4}}; a[ [ a[ [1, 1] ], 2 ] ]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn a_spaced_nested_function_call_is_still_a_function_call() {
+    // `f[ g[x] ]` closes with `] ]`, which must not read as a Part close.
+    assert_eq!(interpret("Length[ Range[3] ]").unwrap(), "3");
+    assert_eq!(
+      interpret("Hold[ f[ g[1] ] ] // FullForm").unwrap(),
+      "FullForm[Hold[f[g[1]]]]"
+    );
+  }
+}
+
+/// A precision-tagged real may carry a `*^` exponent after its tag —
+/// `1.5`*^-16` is how the Wolfram Language writes a tiny machine real in
+/// InputForm, and a Demonstration's coordinate list is full of them. Each
+/// expectation below matches wolframscript.
+mod precision_mark_with_exponent {
+  use super::*;
+
+  #[test]
+  fn machine_precision_mark_takes_an_exponent() {
+    assert_eq!(interpret("1.5`*^-16").unwrap(), "1.5*^-16");
+    assert_eq!(
+      interpret("-1.1102230246251565`*^-16").unwrap(),
+      "-1.1102230246251565*^-16"
+    );
+    // The exponent scales the value, so ordinary arithmetic sees it.
+    assert_eq!(interpret("1.5`*^3 + 1").unwrap(), "1501.");
+  }
+
+  #[test]
+  fn precision_and_accuracy_tags_take_an_exponent() {
+    // The precision tag itself is unchanged by the exponent...
+    assert_eq!(interpret("1.5`20*^3").unwrap(), "1500.`20.");
+    // ...while an accuracy tag applies to the scaled value, so the implied
+    // precision grows with it: 20 + Log10[1500].
+    assert_eq!(interpret("1.5``20*^3").unwrap(), "1500.`23.17609125905568");
+  }
+
+  #[test]
+  fn a_coordinate_list_of_tiny_reals_parses() {
+    // The shape that made the "Non Placet Net of a Dodecahedron"
+    // Demonstration fail to load: a long list ending in a replacement rule.
+    assert_eq!(
+      interpret(
+        "k = {{1.`, 0.`}, {-1.1102230246251565`*^-16, \
+         2.220446049250313`*^-16}} /. {x_, y_} -> {x, y, 0}; Length[k]"
+      )
+      .unwrap(),
+      "3"
+    );
+  }
+}
+
+mod empty_statements {
+  use super::*;
+
+  /// A notebook writes a commented-out line as a comment standing alone
+  /// between two `;` — "Calculus and Programming" shows `c = 4;
+  /// (* c = 6 *); c` to explain that a comment is not evaluated. What
+  /// stands between the two separators is the empty statement `Null`.
+  #[test]
+  fn a_comment_between_two_semicolons_is_an_empty_statement() {
+    assert_eq!(interpret("c = 4; (* c = 6 *); c").unwrap(), "4");
+  }
+
+  #[test]
+  fn a_bare_empty_statement_evaluates_to_the_next_one() {
+    assert_eq!(interpret("c = 4; ; c + 1").unwrap(), "5");
+  }
+
+  /// `;;` is still a `Span`, not two separators.
+  #[test]
+  fn a_double_semicolon_stays_a_span() {
+    assert_eq!(interpret("1 ;; 4").unwrap(), "Span[1, 4]");
+  }
+}
+
+/// `;;` binds tighter than `->` and `:>` (Wolfram gives Span precedence 305
+/// and Rule 120), so a Span may stand on either side of a rule operator:
+/// `"--" -> 3 ;;` is `Rule["--", Span[3, All]]` and `1 ;; 2 -> b` is
+/// `Rule[Span[1, 2], b]`.
+mod span_as_a_rule_operand {
+  use super::*;
+
+  /// The reported case: `StringExtract` takes `delimiter -> spec`, and the
+  /// spec is a Span picking the parts from the third on.
+  /// https://github.com/ad-si/Woxi/issues/555
+  #[test]
+  fn a_span_on_the_right_of_a_rule_is_a_string_extract_spec() {
+    assert_eq!(
+      interpret(r#"StringExtract["a--bbb--ccc--dddd", "--" -> 3 ;;]"#).unwrap(),
+      "{ccc, dddd}"
+    );
+    assert_eq!(
+      interpret(r#"StringExtract["a--bbb--ccc--dddd", "--" -> 2 ;; 3]"#)
+        .unwrap(),
+      "{bbb, ccc}"
+    );
+    assert_eq!(
+      interpret(r#"StringExtract["a--bbb--ccc--dddd", "--" -> ;; 2]"#).unwrap(),
+      "{a, bbb}"
+    );
+  }
+
+  #[test]
+  fn every_span_form_is_allowed_on_the_right_of_a_rule() {
+    assert_eq!(interpret("a -> 3 ;; 5").unwrap(), "a -> Span[3, 5]");
+    assert_eq!(interpret("a -> 3 ;;").unwrap(), "a -> Span[3, All]");
+    assert_eq!(interpret("a -> ;; 3").unwrap(), "a -> Span[1, 3]");
+    assert_eq!(interpret("a -> ;;").unwrap(), "a -> Span[1, All]");
+    assert_eq!(interpret("a -> 1 ;; 6 ;; 2").unwrap(), "a -> Span[1, 6, 2]");
+    assert_eq!(interpret("a :> 2 ;;").unwrap(), "a :> Span[2, All]");
+  }
+
+  #[test]
+  fn a_span_on_the_left_of_a_rule_is_the_pattern() {
+    assert_eq!(interpret("1 ;; 2 -> b").unwrap(), "Span[1, 2] -> b");
+    assert_eq!(interpret("Head[1 ;; 2 -> b]").unwrap(), "Rule");
+    assert_eq!(interpret("{1 ;; 2 -> b}[[1, 1]]").unwrap(), "Span[1, 2]");
+  }
+
+  /// `->` is right-associative, so the span groups with the rule that
+  /// follows it: `x -> 1 ;; 2 -> c` is `Rule[x, Rule[Span[1, 2], c]]`.
+  #[test]
+  fn a_span_binds_tighter_than_a_chain_of_rules() {
+    assert_eq!(
+      interpret("(x -> 1 ;; 2 -> c)[[2]]").unwrap(),
+      "Span[1, 2] -> c"
+    );
+  }
+
+  #[test]
+  fn a_rule_with_a_span_works_in_every_context() {
+    // List item
+    assert_eq!(
+      interpret("{a -> 1 ;; 3, c}").unwrap(),
+      "{a -> Span[1, 3], c}"
+    );
+    // Function argument
+    assert_eq!(
+      interpret("f[1 ;; 2 -> b, x]").unwrap(),
+      "f[Span[1, 2] -> b, x]"
+    );
+    // Association value and key
+    assert_eq!(
+      interpret(r#"<|"a" -> 1 ;; 2|>["a"]"#).unwrap(),
+      "Span[1, 2]"
+    );
+    assert_eq!(interpret("Keys[<|1 ;; 2 -> b|>]").unwrap(), "{Span[1, 2]}");
+    // Parenthesized
+    assert_eq!(interpret("(1 ;; 2 -> b) // Head").unwrap(), "Rule");
+    // Replacement
+    assert_eq!(interpret("x /. x -> 1 ;; 3").unwrap(), "Span[1, 3]");
+    // Delayed rule in a transformation
+    assert_eq!(
+      interpret("Cases[{1, 2}, x_ :> x ;;]").unwrap(),
+      "{Span[1, All], Span[2, All]}"
+    );
+  }
+
+  /// A Span without a rule keeps its greedy operands: nothing else changes.
+  #[test]
+  fn a_span_without_a_rule_is_unchanged() {
+    assert_eq!(interpret("1 ;; 2 + 3").unwrap(), "Span[1, 5]");
+    assert_eq!(interpret("Range[10][[3 ;; 6]]").unwrap(), "{3, 4, 5, 6}");
+    assert_eq!(interpret("Range[5][[3 ;;]]").unwrap(), "{3, 4, 5}");
+    assert_eq!(interpret("1 ;; 3; y -> 2").unwrap(), "y -> 2");
+  }
+
+  /// A parenthesized Span can be indexed like any other expression —
+  /// `(a ;; b)[[2]]` is the Span's second part.
+  #[test]
+  fn a_parenthesized_span_takes_a_part_index() {
+    assert_eq!(interpret("(1 ;; 3)[[1]]").unwrap(), "1");
+    assert_eq!(interpret("(a ;; b)[[2]]").unwrap(), "b");
+  }
+}
+
+/// `;;` is Wolfram's precedence 305: every operator below it — `=`, `:=`,
+/// `==`, `&&`, `||`, `|`, `~~`, `/;`, `->` — is the *outer* expression, and
+/// every operator above it (`+`, `*`, `^`, `.`, `@`) is part of an operand.
+/// https://github.com/ad-si/Woxi/issues/564
+mod span_precedence {
+  use super::*;
+
+  /// The reported case: the assignment is the outer expression, so the
+  /// symbol holds the whole Span and not just its first operand.
+  #[test]
+  fn an_assignment_stores_the_whole_span() {
+    assert_eq!(interpret("x = 1 ;; 3; Head[x]").unwrap(), "Span");
+    assert_eq!(interpret("x = 1 ;; 3; x").unwrap(), "Span[1, 3]");
+    assert_eq!(interpret("y := 1 ;; 3; y").unwrap(), "Span[1, 3]");
+    assert_eq!(interpret("x = 1 ;; 6 ;; 2; x").unwrap(), "Span[1, 6, 2]");
+    // A stored Span is a Part specification like any other.
+    assert_eq!(
+      interpret("s = 2 ;; ; Range[5][[s]]").unwrap(),
+      "{2, 3, 4, 5}"
+    );
+    assert_eq!(interpret("s = ;; 3; Range[5][[s]]").unwrap(), "{1, 2, 3}");
+  }
+
+  #[test]
+  fn a_comparison_holds_the_span() {
+    assert_eq!(interpret("a == 1 ;; 3").unwrap(), "a == Span[1, 3]");
+    assert_eq!(interpret("Head[a == 1 ;; 3]").unwrap(), "Equal");
+    assert_eq!(interpret("a != 1 ;; 3").unwrap(), "a != Span[1, 3]");
+    assert_eq!(interpret("1 ;; 3 == a").unwrap(), "Span[1, 3] == a");
+  }
+
+  #[test]
+  fn the_logical_operators_hold_the_span() {
+    assert_eq!(interpret("a && 1 ;; 3").unwrap(), "a && Span[1, 3]");
+    assert_eq!(interpret("Head[a && 1 ;; 3]").unwrap(), "And");
+    assert_eq!(interpret("a || 1 ;; 3").unwrap(), "a || Span[1, 3]");
+  }
+
+  #[test]
+  fn alternatives_and_string_expression_hold_the_span() {
+    assert_eq!(interpret("a | 1 ;; 3").unwrap(), "a | Span[1, 3]");
+    assert_eq!(interpret("Head[a | 1 ;; 3]").unwrap(), "Alternatives");
+    assert_eq!(
+      interpret("a ~~ 1 ;; 3").unwrap(),
+      "StringExpression[a, Span[1, 3]]"
+    );
+    assert_eq!(interpret("Head[a ~~ 1 ;; 3]").unwrap(), "StringExpression");
+  }
+
+  #[test]
+  fn a_condition_holds_the_span() {
+    assert_eq!(interpret("x /; y ;; 3").unwrap(), "x /; Span[y, 3]");
+    assert_eq!(interpret("Head[x /; y ;; 3]").unwrap(), "Condition");
+  }
+
+  /// The head form is an OutputForm spelling: `InputForm` prints the Span
+  /// with its own operator inside every one of these looser operators,
+  /// just as wolframscript's `ToString[a | 1 ;; 3, InputForm]` does.
+  #[test]
+  fn input_form_prints_the_span_operator_inside_looser_operators() {
+    assert_eq!(
+      interpret("ToString[a | 1 ;; 3, InputForm]").unwrap(),
+      "a | 1 ;; 3"
+    );
+    assert_eq!(
+      interpret("ToString[x /; y ;; 3, InputForm]").unwrap(),
+      "x /; y ;; 3"
+    );
+    assert_eq!(
+      interpret("ToString[a == 1 ;; 3, InputForm]").unwrap(),
+      "a == 1 ;; 3"
+    );
+    assert_eq!(
+      interpret("ToString[a && 1 ;; 3, InputForm]").unwrap(),
+      "a && 1 ;; 3"
+    );
+    // An operand that binds looser than the operator printing it keeps
+    // its parentheses, so the text re-parses to the same tree.
+    assert_eq!(
+      interpret("ToString[a | (b /; c), InputForm]").unwrap(),
+      "a | (b /; c)"
+    );
+    // `/;` is left-associative, so only the right-nested one needs them.
+    assert_eq!(
+      interpret("ToString[(a /; b) /; c, InputForm]").unwrap(),
+      "a /; b /; c"
+    );
+    assert_eq!(
+      interpret("ToString[a /; (b /; c), InputForm]").unwrap(),
+      "a /; (b /; c)"
+    );
+    assert_eq!(
+      interpret("ToString[x /; a | b, InputForm]").unwrap(),
+      "x /; a | b"
+    );
+  }
+
+  /// `//` and `&` bind looser still, so they wrap the finished Span.
+  #[test]
+  fn postfix_application_and_a_pure_function_wrap_the_span() {
+    assert_eq!(interpret("1 ;; 4 // Head").unwrap(), "Span");
+    assert_eq!(interpret("a ;; b // f").unwrap(), "f[Span[a, b]]");
+    assert_eq!(interpret("(1 ;; 3 &)[]").unwrap(), "Span[1, 3]");
+  }
+
+  /// Operators *above* `;;` stay inside its operands.
+  #[test]
+  fn the_tighter_operators_stay_inside_the_span() {
+    assert_eq!(interpret("1 ;; 2 + 3").unwrap(), "Span[1, 5]");
+    assert_eq!(interpret("2 ;; 3 * 4").unwrap(), "Span[2, 12]");
+    assert_eq!(interpret("1 ;; 2 ^ 3").unwrap(), "Span[1, 8]");
+    assert_eq!(interpret("1 + 1 ;; 3").unwrap(), "Span[2, 3]");
+    assert_eq!(
+      interpret("Range[10][[2 ;; 3 + 4]]").unwrap(),
+      "{2, 3, 4, 5, 6, 7}"
+    );
+  }
+
+  /// Every spelling with an omitted operand keeps its default — `1` for the
+  /// start, `All` for the end — wherever the Span stands.
+  #[test]
+  fn an_omitted_operand_keeps_its_default() {
+    assert_eq!(interpret(";; 3").unwrap(), "Span[1, 3]");
+    assert_eq!(interpret("3 ;;").unwrap(), "Span[3, All]");
+    assert_eq!(interpret(";;").unwrap(), "Span[1, All]");
+    assert_eq!(interpret("1 ;;;; 3").unwrap(), "Span[1, All, 3]");
+    assert_eq!(interpret("a == ;; 3").unwrap(), "a == Span[1, 3]");
+    assert_eq!(interpret("a == 3 ;;").unwrap(), "a == Span[3, All]");
+    assert_eq!(
+      interpret("{;;, 2 ;;}").unwrap(),
+      "{Span[1, All], Span[2, All]}"
+    );
+    assert_eq!(interpret("f[;;]").unwrap(), "f[Span[1, All]]");
+    assert_eq!(interpret("Range[5][[;;]]").unwrap(), "{1, 2, 3, 4, 5}");
+    assert_eq!(interpret("Range[5][[;; 3]]").unwrap(), "{1, 2, 3}");
+    assert_eq!(interpret("Range[5][[3 ;;]]").unwrap(), "{3, 4, 5}");
+    assert_eq!(interpret("Range[6][[;; ;; 2]]").unwrap(), "{1, 3, 5}");
+  }
+
+  /// A `;;` chain is one n-ary Span; parentheses still nest it.
+  #[test]
+  fn a_chain_of_separators_is_a_single_span() {
+    assert_eq!(interpret("1 ;; 6 ;; 2").unwrap(), "Span[1, 6, 2]");
+    assert_eq!(interpret("(1 ;; 2) ;; 3").unwrap(), "Span[Span[1, 2], 3]");
+    assert_eq!(interpret("1 ;; (2 ;; 3)").unwrap(), "Span[1, Span[2, 3]]");
+    assert_eq!(
+      interpret("Range[10][[1 ;; 10 ;; 3]]").unwrap(),
+      "{1, 4, 7, 10}"
+    );
+  }
+}
+
+/// A `&` closing a statement sequence may take the same continuation a `&`
+/// at expression level takes, and statements may go on after it — the shape
+/// `n[#] = a[#]; & /@ list` has when written without the parentheses of
+/// `(n[#] = a[#];) & /@ list`. Issue #603.
+mod trailing_amp_continuation {
+  use super::*;
+
+  #[test]
+  fn the_pure_function_can_be_mapped_over_a_list() {
+    assert_eq!(
+      interpret("FullForm[Hold[(a = #; & /@ {1, 2})]]").unwrap(),
+      "FullForm[Hold[((a = #1; ) & ) /@ {1, 2}]]"
+    );
+    // Both assignments run, in order, once per element.
+    assert_eq!(
+      interpret("r = {}; (AppendTo[r, #]; & /@ {1, 2, 3}); r").unwrap(),
+      "{1, 2, 3}"
+    );
+  }
+
+  #[test]
+  fn statements_continue_after_the_mapped_function() {
+    assert_eq!(
+      interpret("FullForm[Hold[(a = #; & /@ {1, 2}; b)]]").unwrap(),
+      "FullForm[Hold[((a = #1; ) & ) /@ {1, 2}; b]]"
+    );
+    // Everything to the left of the `&` is the function body, so `s` is
+    // rebuilt on each call and the statement after the map still runs.
+    assert_eq!(
+      interpret("With[{v = 7}, s = {}; AppendTo[s, # v]; & /@ {1, 2}; s]")
+        .unwrap(),
+      "{14}"
+    );
+  }
+
+  #[test]
+  fn a_bare_trailing_amp_still_wraps_the_whole_sequence() {
+    // Unchanged behaviour: without a continuation the `&` closes the
+    // sequence, as `TrackingFunction -> (a = #; b = 0; &)` needs.
+    assert_eq!(
+      interpret("FullForm[Hold[(a = #; b = 0; &)]]").unwrap(),
+      "FullForm[Hold[(a = #1; b = 0; ) & ]]"
+    );
+  }
+}
+
+/// A slot used as a function head may be followed by `[[…]]`, and the
+/// extracted value applied in turn: `#["pos"][[1]] &` is how associations
+/// are sorted by a keyed field. Issue #603.
+mod slot_call_part_extraction {
+  use super::*;
+
+  #[test]
+  fn a_part_may_follow_a_slot_call() {
+    assert_eq!(
+      interpret("#[\"pos\"][[1]] & [<|\"pos\" -> {3, 1}|>]").unwrap(),
+      "3"
+    );
+    assert_eq!(
+      interpret(
+        "SortBy[{<|\"pos\" -> {3, 1}|>, <|\"pos\" -> {1, 2}|>}, \
+         #[\"pos\"][[1]] &]"
+      )
+      .unwrap(),
+      "{<|pos -> {1, 2}|>, <|pos -> {3, 1}|>}"
+    );
+  }
+
+  #[test]
+  fn the_extracted_value_may_be_applied() {
+    assert_eq!(
+      interpret("#[\"f\"][[1]][3] & [<|\"f\" -> {Function[x, x^2]}|>]")
+        .unwrap(),
+      "9"
+    );
+  }
+}
+
+/// `[[…]]` and `[…]` alternate freely after a call or a part: nested
+/// associations are walked as `group["a"]["b"][[1]]["c"]`. Issue #603.
+mod alternating_part_and_call_suffixes {
+  use super::*;
+
+  #[test]
+  fn a_call_may_follow_a_part_of_a_call() {
+    assert_eq!(
+      interpret("g = <|\"e\" -> {<|\"d\" -> 9|>}|>; g[\"e\"][[1]][\"d\"]")
+        .unwrap(),
+      "9"
+    );
+    assert_eq!(
+      interpret(
+        "h = <|\"a\" -> <|\"b\" -> {<|\"c\" -> 4|>}|>|>; \
+         h[\"a\"][\"b\"][[1]][\"c\"]"
+      )
+      .unwrap(),
+      "4"
+    );
+  }
+
+  #[test]
+  fn a_part_may_follow_a_call_on_an_extracted_part() {
+    assert_eq!(
+      interpret("t = {<|\"pos\" -> {1, 2}|>}; t[[1]][\"pos\"][[2]]").unwrap(),
+      "2"
+    );
+  }
+
+  #[test]
+  fn chained_part_groups_are_unchanged() {
+    assert_eq!(interpret("m = {{1, 2}, {3, 4}}; m[[1]][[2]]").unwrap(), "2");
+    assert_eq!(interpret("m = {{1, 2}, {3, 4}}; m[[1, 2]]").unwrap(), "2");
+    assert_eq!(
+      interpret("m = {{1, 2}, {3, 4}}; m[[All, 1]]").unwrap(),
+      "{1, 3}"
+    );
+  }
+
+  /// Regression: a `Part` extraction on a function call (`f[x][[i]]`),
+  /// immediately followed by implicit multiplication against a factor that
+  /// itself ends in a `Part` extraction (`g[[j]]`), lost the second
+  /// factor's index. The grammar puts both factors under
+  /// `FunctionCallExtended`'s `FunctionCallImplicitSuffix`, and the AST
+  /// builder for that suffix fed each `PartIndexGroup` pair (the `[[j]]`
+  /// span, delimiters included) straight to the generic expression
+  /// converter instead of extracting its index — falling through to the
+  /// "unknown rule" fallback, which stored the raw bracket text as the
+  /// index and left it to be re-parsed as if it were a whole program on
+  /// its own. That re-parse always fails (`[[j]]` is not a valid
+  /// standalone expression), surfacing as a parse error on code that had
+  /// already parsed successfully.
+  #[test]
+  fn a_call_s_part_may_multiply_another_part() {
+    assert_eq!(
+      interpret("f[x_] := {x, x + 1}; g = {10, 20}; f[1][[1]] g[[2]]").unwrap(),
+      "20"
+    );
+    // The second factor's index need not be a bare integer literal either.
+    assert_eq!(
+      interpret(
+        "f[x_] := {x, x + 1}; g = {10, 20, 30}; n = 3; f[1][[2]] g[[n]]"
+      )
+      .unwrap(),
+      "60"
+    );
+    // A plain (non-function-call) first factor already worked; keep it
+    // covered alongside the call-based case above.
+    assert_eq!(
+      interpret("g = {10, 20}; h = {1, 2}; h[[1]] g[[2]]").unwrap(),
+      "20"
+    );
+  }
+}
+
+/// `+=`, `-=`, `*=` and `/=` also take a function-call target — the shape a
+/// symbol used as a lookup table or a record has. Issue #603.
+mod compound_assignment_to_a_call {
+  use super::*;
+
+  #[test]
+  fn each_operator_updates_the_stored_value() {
+    assert_eq!(interpret("f[1] = 10; f[1] += 5; f[1]").unwrap(), "15");
+    assert_eq!(interpret("g[2] = 10; g[2] -= 4; g[2]").unwrap(), "6");
+    assert_eq!(
+      interpret("h[\"k\"] = 2; h[\"k\"] *= 3; h[\"k\"]").unwrap(),
+      "6"
+    );
+    assert_eq!(interpret("k[1] = 12; k[1] /= 4; k[1]").unwrap(), "3");
+  }
+
+  #[test]
+  fn the_right_hand_side_is_taken_whole() {
+    assert_eq!(interpret("p[1] = 1; p[1] += 2 + 3; p[1]").unwrap(), "6");
+  }
+
+  #[test]
+  fn a_default_definition_supplies_the_starting_value() {
+    assert_eq!(
+      interpret("c[_] := 0; c[x] += 1; c[x] += 1; {c[x], c[y]}").unwrap(),
+      "{2, 0}"
+    );
+  }
+
+  #[test]
+  fn a_curried_call_target_works_too() {
+    assert_eq!(
+      interpret("q[1][2] = 5; q[1][2] += 1; q[1][2]").unwrap(),
+      "6"
+    );
+  }
+
+  #[test]
+  fn a_target_without_a_value_is_left_unevaluated() {
+    // With nothing to read, wolframscript reports `AddTo::rvalue` and
+    // leaves the call alone rather than defining the target.
+    assert_eq!(interpret("ClearAll[z]; z[1] += 5").unwrap(), "z[1] += 5");
+    assert_eq!(interpret("ValueQ[z[1]]").unwrap(), "False");
+  }
+
+  #[test]
+  fn symbol_and_part_targets_are_unchanged() {
+    assert_eq!(interpret("v = 1; v += 2; v").unwrap(), "3");
+    assert_eq!(interpret("w = {1, 2}; w[[1]] += 5; w").unwrap(), "{6, 2}");
+  }
+}
+
+/// A backslash escape inside a string covers the character after it, so an
+/// escaped quote does not end the string — statement boundaries after a
+/// regular expression written as a string literal stay correct. Issue #603.
+mod escaped_quotes_and_statement_boundaries {
+  use super::*;
+
+  #[test]
+  fn an_escaped_quote_does_not_close_the_string() {
+    assert_eq!(
+      interpret("pat = \"a\\\"b\"\nafter = 42\nafter").unwrap(),
+      "42"
+    );
+    assert_eq!(
+      interpret("pat = \"[\\\\w|\\\\\\\"|\\\\d]*\"\nafter = 7\nafter").unwrap(),
+      "7"
+    );
+  }
+
+  #[test]
+  fn an_escaped_backslash_still_lets_the_next_quote_close() {
+    assert_eq!(interpret("pat = \"a\\\\\"\nafter = 5\nafter").unwrap(), "5");
+    assert_eq!(interpret("StringLength[\"a\\\\\"]").unwrap(), "2");
+  }
+}
+
+/// Whitespace separates a pattern from what follows it: `m_ g` is the
+/// product of the pattern `m_` and the symbol `g`, only `m_g` names a head.
+/// Every expectation verified against wolframscript.
+mod pattern_blanks_are_tight {
+  use super::*;
+
+  #[test]
+  fn a_space_after_the_blank_starts_a_new_factor() {
+    assert_eq!(interpret("Hold[m_ g[c]][[1, 0]]").unwrap(), "Times");
+    assert_eq!(interpret("Hold[m_ g][[1, 0]]").unwrap(), "Times");
+    assert_eq!(interpret("Hold[m_g][[1, 0]]").unwrap(), "Pattern");
+    assert_eq!(interpret("Hold[m__ g[c]][[1, 0]]").unwrap(), "Times");
+    assert_eq!(interpret("Hold[m_. g[c]][[1, 0]]").unwrap(), "Times");
+    assert_eq!(interpret("Hold[_ g[c]][[1, 0]]").unwrap(), "Times");
+  }
+
+  #[test]
+  fn two_patterns_side_by_side_are_a_product() {
+    assert_eq!(interpret("Length[Hold[a_ x_][[1]]]").unwrap(), "2");
+    assert_eq!(interpret("Hold[a_ x_][[1, 2, 0]]").unwrap(), "Pattern");
+    assert_eq!(
+      interpret("Hold[a_ x_] /. Times -> List").unwrap(),
+      "Hold[{a_, x_}]"
+    );
+    assert_eq!(
+      interpret("Hold[m_ x_Integer][[1, 2]] // Head").unwrap(),
+      "Pattern"
+    );
+  }
+
+  #[test]
+  fn a_rubi_style_left_hand_side_parses() {
+    assert_eq!(
+      interpret(
+        "Hold[Int[(a_ + b_ x_)^m_ Sin[c_ + d_ x_], x_Symbol] :> 1][[1, 0]]"
+      )
+      .unwrap(),
+      "RuleDelayed"
+    );
+  }
+}
+
+/// `a :> b /; c` puts the guard on the replacement side —
+/// `RuleDelayed[a, Condition[b, c]]` — also as a function argument or list
+/// element, where the rule grammar used to stop at `/;`.
+mod rule_replacement_conditions {
+  use super::*;
+
+  #[test]
+  fn a_guard_after_the_arrow_belongs_to_the_replacement() {
+    assert_eq!(
+      interpret("Hold[f[a :> b /; c]][[1, 1, 2, 0]]").unwrap(),
+      "Condition"
+    );
+    assert_eq!(
+      interpret("Hold[f[a -> b /; c]][[1, 1, 2, 0]]").unwrap(),
+      "Condition"
+    );
+    assert_eq!(
+      interpret("Hold[{a :> b /; c, d}][[1, 1, 2, 0]]").unwrap(),
+      "Condition"
+    );
+    assert_eq!(interpret("Hold[{a :> b /; c, d}][[1, 2]]").unwrap(), "d");
+  }
+
+  #[test]
+  fn guards_chain_and_a_left_guard_stays_on_the_pattern() {
+    assert_eq!(
+      interpret("Hold[f[a :> b /; c /; d]][[1, 1, 2, 1, 0]]").unwrap(),
+      "Condition"
+    );
+    assert_eq!(
+      interpret("Hold[f[a :> b /; c /; d]][[1, 1, 2, 2]]").unwrap(),
+      "d"
+    );
+    assert_eq!(
+      interpret("Hold[f[a /; b :> c]][[1, 1, 1, 0]]").unwrap(),
+      "Condition"
+    );
+    assert_eq!(
+      interpret("Hold[f[a :> b /; c && d]][[1, 1, 2, 2, 0]]").unwrap(),
+      "And"
+    );
+  }
+
+  #[test]
+  fn the_guard_is_honoured_when_the_rule_is_applied() {
+    assert_eq!(interpret("ReplaceAll[3, x_ :> 5 /; x > 2]").unwrap(), "5");
+    assert_eq!(interpret("ReplaceAll[1, x_ :> 5 /; x > 2]").unwrap(), "1");
+  }
+}
+
+/// A parenthesised product is one factor of the implicit chain around it, so
+/// a division in front of it divides by the whole product.
+mod parenthesised_products_in_implicit_chains {
+  use super::*;
+
+  #[test]
+  fn a_division_by_a_bracketed_product_keeps_the_bracket() {
+    assert_eq!(interpret("1/(2 3) 4").unwrap(), "2/3");
+    assert_eq!(interpret("Hold[a/(b c) d][[1, 2]]").unwrap(), "d");
+    // `a/b` is `Times[a, Power[b, -1]]`, so the division answers to a rule
+    // on `Times` even though nothing spells it. Held, the nesting the reader
+    // built survives — `Times` only flattens once it evaluates.
+    assert_eq!(
+      interpret("Hold[a/(b c) d] /. Times -> tt").unwrap(),
+      "Hold[tt[tt[a, tt[b, c]^(-1)], d]]"
+    );
+    assert_eq!(
+      interpret("Hold[a/b] /. Times -> tt").unwrap(),
+      "Hold[tt[a, b^(-1)]]"
+    );
+    assert_eq!(
+      interpret("Hold[a/b/c] /. Times -> tt").unwrap(),
+      "Hold[tt[tt[a, b^(-1)], c^(-1)]]"
+    );
+    // The implicit `Power[b, -1]` answers to a rule on `Power` too.
+    assert_eq!(
+      interpret("Hold[a/b] /. Power -> pp").unwrap(),
+      "Hold[a*pp[b, -1]]"
+    );
+    // An unrelated head leaves the division alone.
+    assert_eq!(interpret("Hold[a/b] /. Plus -> pp").unwrap(), "Hold[a/b]");
+    // The new head may be anything a head replacement accepts.
+    assert_eq!(
+      interpret("Hold[a/b] /. Times -> List").unwrap(),
+      "Hold[{a, b^(-1)}]"
+    );
+    // A plain product still flattens: `Times` is n-ary as the reader built it.
+    assert_eq!(
+      interpret("Hold[a b c] /. Times -> tt").unwrap(),
+      "Hold[tt[a, b, c]]"
+    );
+  }
+}
+
+/// The double-struck letters and digits are named characters in the private
+/// use area, like the script letters; `\[DoubleStruckCapitalZ]` appears in
+/// package usage messages.
+mod double_struck_named_characters {
+  use super::*;
+
+  #[test]
+  fn they_have_wolframs_code_points_and_the_letters_spell_symbols() {
+    assert_eq!(
+      interpret("ToCharacterCode[\"\\[DoubleStruckCapitalZ]\"]").unwrap(),
+      "{63421}"
+    );
+    assert_eq!(
+      interpret("ToCharacterCode[\"\\[DoubleStruckA]\\[DoubleStruckZero]\"]")
+        .unwrap(),
+      "{63206, 63451}"
+    );
+    assert_eq!(
+      interpret("Head[\\[DoubleStruckCapitalR]]").unwrap(),
+      "Symbol"
+    );
+  }
+}
+
+/// The ellipsis characters are letterlike symbols, as in Rubi's display
+/// strings `Int[a*u + b*v + \[CenterEllipsis], x]`. Verified against
+/// wolframscript.
+mod ellipsis_characters_are_symbols {
+  use super::*;
+
+  #[test]
+  fn they_read_and_print_as_symbols() {
+    assert_eq!(
+      interpret("{Head[\\[Ellipsis]], Head[\\[CenterEllipsis]], Head[\\[VerticalEllipsis]]}")
+        .unwrap(),
+      "{Symbol, Symbol, Symbol}"
+    );
+    assert_eq!(
+      interpret("ToString[Hold[\\[Ellipsis], \\[CenterEllipsis]], InputForm]")
+        .unwrap(),
+      "Hold[…, ⋯]"
+    );
+    assert_eq!(interpret("ToExpression[\"f[⋯]\"]").unwrap(), "f[⋯]");
+    assert_eq!(
+      interpret("ToExpression[\"a*u + b*v + \\\\[CenterEllipsis]\"] // Head")
+        .unwrap(),
+      "Plus"
+    );
+  }
+}
+
+/// The symbolic ring operators are ordinary characters as well as operators.
+/// Rubi prints `\[Star]` between a coefficient and an integral, so reading one
+/// inside a string must give the glyph rather than a `Syntax::sntufn` message
+/// and the escape left as written. Verified against wolframscript.
+mod ring_operator_characters {
+  use super::*;
+
+  #[test]
+  fn they_read_as_single_characters_in_strings() {
+    assert_eq!(
+      interpret(
+        "ToCharacterCode[\"\\[CirclePlus]\\[CircleMinus]\\[CircleTimes]\\[CircleDot]\\[Star]\\[Diamond]\\[SmallCircle]\\[Wedge]\\[Vee]\"]"
+      )
+      .unwrap(),
+      "{8853, 8854, 8855, 8857, 8902, 8900, 8728, 8896, 8897}"
+    );
+    assert_eq!(interpret("StringLength[\"\\[Star]\\[Vee]\"]").unwrap(), "2");
+    assert_eq!(
+      interpret("\"2/3 \" <> \"\\[Star]\" <> \" Int\"").unwrap(),
+      "2/3 ⋆ Int"
+    );
+  }
+
+  #[test]
+  fn they_still_parse_as_infix_operators() {
+    assert_eq!(
+      interpret(
+        "{Head[a \\[Star] b], Head[a \\[CirclePlus] b], Head[a \\[SmallCircle] b], Head[a \\[Diamond] b], Head[a \\[CircleDot] b], Head[a \\[CircleMinus] b], Head[a \\[CircleTimes] b], Head[a \\[Vee] b]}"
+      )
+      .unwrap(),
+      "{Star, CirclePlus, SmallCircle, Diamond, CircleDot, CircleMinus, CircleTimes, Vee}"
+    );
+    assert_eq!(interpret("a \\[Wedge] b \\[Wedge] c").unwrap(), "a ⋀ b ⋀ c");
+  }
+}
+
+/// The named-character table is Wolfram's whole table, transcribed from the
+/// `UnicodeCharacters.tr` a Wolfram Engine ships and checked name by name
+/// against `ToCharacterCode` under wolframscript. A package that writes a
+/// character nobody anticipated — WLJS's autocomplete data writes
+/// `\[TwoWayRule]`, `\[Application]` and `\[CupCap]` inside usage strings —
+/// has to get the glyph, not a `Syntax::sntufn` message and the escape left
+/// as written.
+mod complete_named_character_table {
+  use super::*;
+
+  #[test]
+  fn the_names_wljs_writes_are_read() {
+    assert_eq!(
+      interpret(
+        "ToCharacterCode[\"\\[TwoWayRule]\\[Application]\\[CupCap]\\[DoubleStruckCapitalR]\"]"
+      )
+      .unwrap(),
+      "{61728, 62768, 8781, 63413}"
+    );
+    let msgs = woxi::get_captured_messages_raw();
+    assert!(
+      !msgs.iter().any(|m| m.contains("sntufn")),
+      "a known name must not warn, got {msgs:?}"
+    );
+  }
+
+  /// A handful of long names carry a digit, so the reader cannot stop at the
+  /// first non-letter.
+  #[test]
+  fn a_long_name_may_contain_a_digit() {
+    assert_eq!(
+      interpret("ToCharacterCode[\"\\[Mod1Key]\\[Mod2Key]\"]").unwrap(),
+      "{63446, 63447}"
+    );
+  }
+
+  /// The `\[Raw…]` family names the ASCII punctuation, so a notebook can
+  /// write a character it cannot type.
+  #[test]
+  fn the_raw_family_names_ascii_punctuation() {
+    assert_eq!(
+      interpret("ToCharacterCode[\"\\[RawStar]\\[RawPlus]\\[RawDollar]\"]")
+        .unwrap(),
+      "{42, 43, 36}"
+    );
+  }
+
+  /// Names Wolfram has no character for still warn and stay literal.
+  #[test]
+  fn an_unknown_name_still_warns() {
+    assert_eq!(
+      interpret("StringLength[\"\\[Tab]\"]").unwrap(),
+      "6",
+      "the escape stays in the string as written"
+    );
+  }
+}
+
+/// A bracketed pattern body ends the `sym : pat : val` chain: `x : (y : z)`
+/// is `Pattern[x, Pattern[y, z]]`, while the bare `x : y : z` is the
+/// `Optional[Pattern[x, y], z]` the chain rule builds. WLJS's `MakeBoxes`
+/// upvalues are written in the bracketed form.
+mod bracketed_pattern_body {
+  use super::*;
+
+  #[test]
+  fn brackets_end_the_colon_chain() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[x:(y:z)]]]").unwrap(),
+      "Hold[Pattern[x, Pattern[y, z]]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[x:(y:f[_])]]]").unwrap(),
+      "Hold[Pattern[x, Pattern[y, f[Blank[]]]]]"
+    );
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[x:((y:z))]]]").unwrap(),
+      "Hold[Pattern[x, Pattern[y, z]]]"
+    );
+  }
+
+  #[test]
+  fn the_bare_chain_is_unchanged() {
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[x:y:z]]]").unwrap(),
+      "Hold[Optional[Pattern[x, y], z]]"
+    );
+    // The body's own chain is still a chain.
+    assert_eq!(
+      interpret("ToString[FullForm[Hold[x:(y:z:w)]]]").unwrap(),
+      "Hold[Pattern[x, Optional[Pattern[y, z], w]]]"
+    );
+  }
+}
+
+/// A `base^^digits` literal whose base is outside 2–36, or whose digits the
+/// base cannot spell, is refused rather than read: wolframscript reports
+/// `General::base` or `General::digit` and the read yields `$Failed`. Woxi
+/// used to hand the base straight to Rust's radix parser, which panics
+/// outside that range — the fuzzer found `Print[1^^111100010010000000]` —
+/// and silently answered `0` for a digit that was too large.
+mod base_literals {
+  use super::*;
+
+  fn refused(code: &str, message: &str) {
+    let result = interpret_with_stdout(code).unwrap();
+    assert_eq!(result.result, "$Failed", "{code}");
+    assert!(
+      result.warnings.iter().any(|w| w.contains(message)),
+      "expected {message:?} for {code}, got {:?}",
+      result.warnings
+    );
+  }
+
+  #[test]
+  fn a_base_outside_two_to_thirty_six_is_refused() {
+    for (code, base) in [
+      ("1^^111", "1"),
+      ("0^^101", "0"),
+      ("37^^abc", "37"),
+      ("100^^5", "100"),
+      // A base too large to read at all is reported as 0, as it is there.
+      ("99999999999999999999^^1", "0"),
+    ] {
+      refused(
+        code,
+        &format!(
+          "General::base: Requested base {base} in {code} should be between 2 and 36."
+        ),
+      );
+    }
+  }
+
+  /// The offending digit is named by its 1-based position in the digits as
+  /// written, the point of a fractional literal included.
+  #[test]
+  fn a_digit_the_base_cannot_spell_is_refused() {
+    for (code, position, digits, base) in [
+      ("2^^1012", 4, "1012", 2),
+      ("2^^1021", 3, "1021", 2),
+      ("16^^gg", 1, "gg", 16),
+      ("8^^19", 2, "19", 8),
+      ("2^^1.012", 5, "1.012", 2),
+      ("10^^12a", 3, "12a", 10),
+    ] {
+      refused(
+        code,
+        &format!(
+          "General::digit: Digit at position {position} in {digits} is too large to be used in base {base}."
+        ),
+      );
+    }
+  }
+
+  #[test]
+  fn a_well_formed_literal_still_reads() {
+    assert_eq!(interpret("2^^11").unwrap(), "3");
+    assert_eq!(interpret("16^^FF").unwrap(), "255");
+    assert_eq!(interpret("36^^zz").unwrap(), "1295");
+    assert_eq!(interpret("2^^1.01").unwrap(), "1.25");
+    assert_eq!(interpret("16^^FF.A").unwrap(), "255.625");
+    assert_eq!(
+      interpret("19^^91g5dcg2h6da7260a9f3c4a").unwrap(),
+      "123456789012345678901234567890"
+    );
+  }
+}

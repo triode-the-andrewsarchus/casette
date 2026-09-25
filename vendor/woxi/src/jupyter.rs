@@ -1,0 +1,380 @@
+use anyhow::Result;
+use jupyter_protocol::{
+  CodeMirrorMode, ConnectionInfo, ExecuteResult, ExecutionCount, HelpLink,
+  JupyterMessage, JupyterMessageContent, KernelInfoReply, LanguageInfo,
+  ReplyStatus, ShutdownReply, Status, connection_info::Transport,
+};
+use log::{debug, error, info, trace, warn};
+use runtimelib::{
+  KernelIoPubConnection, RouterRecvConnection, RouterSendConnection,
+};
+use std::path::Path;
+use uuid::Uuid;
+
+pub(crate) fn run(connection_file: Option<&std::path::Path>) -> Result<()> {
+  env_logger::Builder::from_env(
+    env_logger::Env::default().default_filter_or("warn"),
+  )
+  .init();
+
+  tokio::runtime::Runtime::new()?
+    .block_on(async { run_impl(connection_file).await })
+}
+
+struct WoxiKernel {
+  execution_count: ExecutionCount,
+  iopub: KernelIoPubConnection,
+  shell: RouterSendConnection,
+}
+
+impl WoxiKernel {
+  pub(crate) async fn start(connection_info: &ConnectionInfo) -> Result<()> {
+    let session_id = Uuid::new_v4().to_string();
+    debug!("Starting kernel with session ID: {session_id}");
+
+    // Create all connections
+    let mut heartbeat =
+      runtimelib::create_kernel_heartbeat_connection(connection_info).await?;
+    let shell_connection =
+      runtimelib::create_kernel_shell_connection(connection_info, &session_id)
+        .await?;
+    let (shell_writer, mut shell_reader) = shell_connection.split();
+    let mut control_connection = runtimelib::create_kernel_control_connection(
+      connection_info,
+      &session_id,
+    )
+    .await?;
+    let _stdin_connection =
+      runtimelib::create_kernel_stdin_connection(connection_info, &session_id)
+        .await?;
+    let iopub_connection =
+      runtimelib::create_kernel_iopub_connection(connection_info, &session_id)
+        .await?;
+
+    let mut kernel = Self {
+      execution_count: ExecutionCount::default(),
+      iopub: iopub_connection,
+      shell: shell_writer,
+    };
+
+    // Send initial status: idle
+    kernel
+      .iopub
+      .send(JupyterMessage::new(Status::idle(), None))
+      .await?;
+
+    // Heartbeat task
+    let heartbeat_handle = tokio::spawn(async move {
+      while let Ok(()) = heartbeat.single_heartbeat().await {}
+    });
+
+    // Control task
+    let control_handle = tokio::spawn(async move {
+      while let Ok(message) = control_connection.read().await {
+        match &message.content {
+          JupyterMessageContent::KernelInfoRequest(_) => {
+            let reply = Self::kernel_info().as_child_of(&message);
+            if let Err(err) = control_connection.send(reply).await {
+              error!("Error on control: {err}");
+            }
+          }
+          JupyterMessageContent::ShutdownRequest(req) => {
+            let reply = ShutdownReply {
+              restart: req.restart,
+              status: ReplyStatus::Ok,
+              error: None,
+            }
+            .as_child_of(&message);
+            let _ = control_connection.send(reply).await;
+            std::process::exit(0);
+          }
+          _ => {}
+        }
+      }
+    });
+
+    // Shell task
+    let shell_handle = tokio::spawn(async move {
+      if let Err(err) = kernel.handle_shell(&mut shell_reader).await {
+        error!("Shell error: {err}");
+      }
+    });
+
+    // Wait for all tasks
+    tokio::select! {
+      _ = heartbeat_handle => {}
+      _ = control_handle => {}
+      _ = shell_handle => {}
+    }
+
+    Ok(())
+  }
+
+  async fn handle_shell(
+    &mut self,
+    reader: &mut RouterRecvConnection,
+  ) -> Result<()> {
+    loop {
+      let msg = reader.read().await?;
+      if let Err(err) = self.handle_shell_message(&msg).await {
+        error!("Error handling shell message: {err}");
+      }
+    }
+  }
+
+  async fn handle_shell_message(
+    &mut self,
+    parent: &JupyterMessage,
+  ) -> Result<()> {
+    // Always send busy at the start
+    self.iopub.send(Status::busy().as_child_of(parent)).await?;
+
+    match &parent.content {
+      JupyterMessageContent::ExecuteRequest(req) => {
+        self.execution_count.0 += 1;
+        self.execute(parent, req).await?;
+      }
+      JupyterMessageContent::KernelInfoRequest(_) => {
+        self
+          .shell
+          .send(Self::kernel_info().as_child_of(parent))
+          .await?;
+      }
+      JupyterMessageContent::IsCompleteRequest(req) => {
+        trace!("is_complete_request: {}", req.code);
+        let reply = jupyter_protocol::IsCompleteReply {
+          status: jupyter_protocol::IsCompleteReplyStatus::Complete,
+          indent: String::new(),
+        };
+        self.shell.send(reply.as_child_of(parent)).await?;
+      }
+      JupyterMessageContent::CommInfoRequest(_) => {
+        self
+          .shell
+          .send(jupyter_protocol::CommInfoReply::default().as_child_of(parent))
+          .await?;
+      }
+      JupyterMessageContent::HistoryRequest(_) => {
+        self
+          .shell
+          .send(jupyter_protocol::HistoryReply::default().as_child_of(parent))
+          .await?;
+      }
+      JupyterMessageContent::CompleteRequest(req) => {
+        let reply = jupyter_protocol::CompleteReply {
+          cursor_start: req.cursor_pos,
+          cursor_end: req.cursor_pos,
+          ..Default::default()
+        };
+        self.shell.send(reply.as_child_of(parent)).await?;
+      }
+      JupyterMessageContent::ShutdownRequest(req) => {
+        info!("Shutdown request received");
+        let reply = ShutdownReply {
+          restart: req.restart,
+          status: ReplyStatus::Ok,
+          error: None,
+        };
+        self.shell.send(reply.as_child_of(parent)).await?;
+        self.iopub.send(Status::idle().as_child_of(parent)).await?;
+        std::process::exit(0);
+      }
+      _ => {
+        warn!("Unhandled shell message: {:?}", parent.header.msg_type);
+      }
+    }
+
+    // Always send idle at the end
+    self.iopub.send(Status::idle().as_child_of(parent)).await?;
+
+    Ok(())
+  }
+
+  async fn execute(
+    &mut self,
+    parent: &JupyterMessage,
+    req: &jupyter_protocol::ExecuteRequest,
+  ) -> Result<()> {
+    debug!("Execute[{}]: {}", self.execution_count.0, req.code);
+
+    // Keep `$Line` in step with the cell number so `In[]` / `Out[]` and the
+    // `%` shortcuts address the same lines the notebook shows, and record
+    // the cell source so `In[n]` can re-run it.
+    woxi::set_system_variable("$Line", &self.execution_count.0.to_string());
+    woxi::record_input_line(self.execution_count.0 as i128, &req.code);
+
+    // Send execute_input
+    let execute_input = jupyter_protocol::ExecuteInput {
+      code: req.code.clone(),
+      execution_count: self.execution_count,
+    };
+    self.iopub.send(execute_input.as_child_of(parent)).await?;
+
+    // Execute each statement separately (like the playground)
+    let statements = woxi::split_into_statements(&req.code);
+
+    for stmt in &statements {
+      match woxi::interpret_with_stdout(stmt) {
+        Ok(result) => {
+          // Print output → stream to stdout
+          let trimmed_stdout = result.stdout.trim_end();
+          if !trimmed_stdout.is_empty() {
+            self
+              .iopub
+              .send(
+                jupyter_protocol::StreamContent::stdout(&format!(
+                  "{trimmed_stdout}\n"
+                ))
+                .as_child_of(parent),
+              )
+              .await?;
+          }
+
+          // Warnings → stream to stderr
+          for w in &result.warnings {
+            self
+              .iopub
+              .send(
+                jupyter_protocol::StreamContent::stderr(&format!("{w}\n"))
+                  .as_child_of(parent),
+              )
+              .await?;
+          }
+
+          // Graphics result
+          if let Some(ref svg) = result.graphics {
+            if result.result != "\0" {
+              let mut media = jupyter_protocol::media::Media::default();
+              media
+                .content
+                .push(jupyter_protocol::MediaType::Svg(svg.clone()));
+              media
+                .content
+                .push(jupyter_protocol::MediaType::Plain(String::new()));
+              let execute_result = ExecuteResult {
+                execution_count: self.execution_count,
+                data: media,
+                metadata: serde_json::Map::default(),
+                transient: None,
+              };
+              self.iopub.send(execute_result.as_child_of(parent)).await?;
+            }
+          } else if result.result != "\0" {
+            // Text result with optional SVG rendering
+            let mut media = jupyter_protocol::media::Media::default();
+            media
+              .content
+              .push(jupyter_protocol::MediaType::Plain(result.result));
+            if let Some(svg) = result.output_svg {
+              media.content.push(jupyter_protocol::MediaType::Svg(svg));
+            }
+            let execute_result = ExecuteResult {
+              execution_count: self.execution_count,
+              data: media,
+              metadata: serde_json::Map::default(),
+              transient: None,
+            };
+            self.iopub.send(execute_result.as_child_of(parent)).await?;
+          }
+        }
+        Err(woxi::InterpreterError::EmptyInput) => {
+          // Function definitions etc. produce no output
+        }
+        Err(e) => {
+          self
+            .iopub
+            .send(
+              jupyter_protocol::StreamContent::stderr(&format!("Error: {e}\n"))
+                .as_child_of(parent),
+            )
+            .await?;
+        }
+      }
+    }
+
+    // Send execute_reply
+    let execute_reply = jupyter_protocol::ExecuteReply {
+      status: ReplyStatus::Ok,
+      execution_count: self.execution_count,
+      payload: vec![],
+      user_expressions: Option::default(),
+      error: None,
+    };
+    self.shell.send(execute_reply.as_child_of(parent)).await?;
+
+    Ok(())
+  }
+
+  fn kernel_info() -> KernelInfoReply {
+    KernelInfoReply {
+      status: ReplyStatus::Ok,
+      protocol_version: "5.3".to_string(),
+      implementation: "woxi".to_string(),
+      implementation_version: env!("CARGO_PKG_VERSION").to_string(),
+      language_info: LanguageInfo {
+        name: "wolfram".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        mimetype: Some("application/vnd.wolfram.mathematica".to_string()),
+        file_extension: Some(".wls".to_string()),
+        pygments_lexer: Some("mathematica".to_string()),
+        codemirror_mode: Some(CodeMirrorMode::Simple(
+          "mathematica".to_string(),
+        )),
+        nbconvert_exporter: Some("text".to_string()),
+      },
+      banner: "Woxi Jupyter Kernel - Wolfram Language Interpreter".to_string(),
+      help_links: vec![HelpLink {
+        text: "Woxi Documentation".to_string(),
+        url: "https://github.com/ad-si/Woxi".to_string(),
+      }],
+      debugger: false,
+      error: None,
+    }
+  }
+}
+
+async fn run_impl(connection_file: Option<&Path>) -> Result<()> {
+  let connection_info = if let Some(file_path) = connection_file {
+    debug!("Loading connection info from: {}", file_path.display());
+    let content = tokio::fs::read_to_string(file_path).await?;
+    serde_json::from_str(&content)?
+  } else {
+    // Create a new connection on localhost with random ports
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let ports = runtimelib::peek_ports(ip, 5).await?;
+    assert_eq!(ports.len(), 5);
+
+    let connection_info = ConnectionInfo {
+      transport: Transport::TCP,
+      ip: ip.to_string(),
+      stdin_port: ports[0],
+      control_port: ports[1],
+      hb_port: ports[2],
+      shell_port: ports[3],
+      iopub_port: ports[4],
+      signature_scheme: "hmac-sha256".to_string(),
+      key: Uuid::new_v4().to_string(),
+      kernel_name: Some("woxi".to_string()),
+    };
+
+    // Write connection file for clients to connect
+    let runtime_dir = runtimelib::dirs::runtime_dir();
+    tokio::fs::create_dir_all(&runtime_dir).await?;
+    let connection_path = runtime_dir.join("kernel-woxi.json");
+    let content = serde_json::to_string(&connection_info)?;
+    tokio::fs::write(&connection_path, content).await?;
+
+    info!(
+      "Started kernel with connection file: {}",
+      connection_path.display()
+    );
+    info!(
+      "Connect using: jupyter console --existing {}",
+      connection_path.display()
+    );
+
+    connection_info
+  };
+
+  WoxiKernel::start(&connection_info).await
+}
