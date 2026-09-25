@@ -5,7 +5,6 @@ Each entry preserves the verified operational lesson for the SageMath worker, pr
 
 | # | Problem | Intersects |
 | ---: | --- | --- |
-| 10 | [`posix_spawn` children INHERIT the parent's signal dispositions — spawn the worker with `POSIX_SPAWN_SETSIGDEF` + `SETSIGMASK` or interrupts silently die](problems/010-posix-spawn-children-inherit-the-parent-s-signal-dispositions.md) | POSIX signal inheritance, SIGINT delivery, worker signal masks. |
 | 11 | [Session persistence: a missing artifact is the NORMAL case, paths aren't identity, and peek the schema before decoding](problems/011-session-persistence-a-missing-artifact-is-the-normal-case.md) | Session artifact liveness, path identity, schema peek-before-decode. |
 | 13 | [Exactness: the Symbolic Ring is uniformly `is_exact()==False` — decide per-kind, and tree-walk symbolic](problems/013-exactness-the-symbolic-ring-is-uniformly-is-exact-false.md) | Exactness policy, Symbolic Ring behavior, tree-walked exactness. |
 | 14 | [Numeric precision: clamp the request to the value's own `prec()` or `.n(bits)` raises](problems/014-numeric-precision-clamp-the-request-to-the-value-s.md) | Numeric precision bounds, value precision, safe numeric requests. |

@@ -7,7 +7,7 @@
 use crate::discovery::SageDiscovery;
 use crate::error::KernelError;
 use crate::protocol::{SymbolPayload, WorkerRequest, WorkerResponse};
-use nix::sys::signal::{self, Signal};
+use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow, Signal};
 use nix::unistd::Pid;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -362,6 +362,18 @@ impl WorkerProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Problem 010: Reset signal dispositions and unmask signals so child worker
+        // does not inherit parent's SIG_IGN or blocked mask, allowing Python/cysignals
+        // to install SIGINT handlers reliably.
+        unsafe {
+            cmd.pre_exec(|| {
+                let empty_set = SigSet::empty();
+                let _ = signal::sigprocmask(SigmaskHow::SIG_SETMASK, Some(&empty_set), None);
+                let _ = signal::signal(Signal::SIGINT, SigHandler::SigDfl);
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             KernelError::SpawnFailed(format!(
