@@ -1815,6 +1815,263 @@ pub(super) fn thread_list_equation(eq: &Expr) -> Option<Vec<Expr>> {
   )
 }
 
+fn expr_uses_var(expr: &Expr, var: &str) -> bool {
+  match expr {
+    Expr::Identifier(s) => s == var,
+    Expr::List(items) => items.iter().any(|e| expr_uses_var(e, var)),
+    Expr::BinaryOp { left, right, .. } => {
+      expr_uses_var(left, var) || expr_uses_var(right, var)
+    }
+    Expr::UnaryOp { operand, .. } => expr_uses_var(operand, var),
+    Expr::Comparison { operands, .. } => {
+      operands.iter().any(|e| expr_uses_var(e, var))
+    }
+    Expr::FunctionCall { args, .. } => {
+      args.iter().any(|e| expr_uses_var(e, var))
+    }
+    Expr::CurriedCall { func, args } => {
+      expr_uses_var(func, var) || args.iter().any(|e| expr_uses_var(e, var))
+    }
+    _ => false,
+  }
+}
+
+fn expr_contains_quantity(expr: &Expr) -> bool {
+  match expr {
+    Expr::FunctionCall { name, args } => {
+      name == "Quantity" || args.iter().any(expr_contains_quantity)
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      expr_contains_quantity(left) || expr_contains_quantity(right)
+    }
+    Expr::UnaryOp { operand, .. } => expr_contains_quantity(operand),
+    Expr::Comparison { operands, .. } => operands.iter().any(expr_contains_quantity),
+    Expr::List(items) => items.iter().any(expr_contains_quantity),
+    Expr::Rule { pattern, replacement } => {
+      expr_contains_quantity(pattern) || expr_contains_quantity(replacement)
+    }
+    _ => false,
+  }
+}
+
+fn get_quantity_unit(expr: &Expr) -> Option<Expr> {
+  if let Expr::FunctionCall { name, args } = expr {
+    if name == "Quantity" && args.len() == 2 {
+      return Some(args[1].clone());
+    }
+  }
+  None
+}
+
+fn find_var_quantity_unit(expr: &Expr, var: &str) -> Option<Expr> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Quantity" && args.len() == 2 => {
+      if expr_uses_var(&args[0], var) {
+        return Some(args[1].clone());
+      }
+      None
+    }
+    Expr::BinaryOp { op: BinaryOperator::Times, left, right } => {
+      if expr_uses_var(left, var) {
+        if let Some(u) = get_quantity_unit(right) {
+          return Some(u);
+        }
+      }
+      if expr_uses_var(right, var) {
+        if let Some(u) = get_quantity_unit(left) {
+          return Some(u);
+        }
+      }
+      find_var_quantity_unit(left, var).or_else(|| find_var_quantity_unit(right, var))
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      find_var_quantity_unit(left, var).or_else(|| find_var_quantity_unit(right, var))
+    }
+    Expr::UnaryOp { operand, .. } => find_var_quantity_unit(operand, var),
+    Expr::FunctionCall { args, .. } => {
+      for a in args {
+        if let Some(u) = find_var_quantity_unit(a, var) {
+          return Some(u);
+        }
+      }
+      None
+    }
+    _ => None,
+  }
+}
+
+fn find_any_quantity_unit(expr: &Expr) -> Option<Expr> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Quantity" && args.len() == 2 => {
+      Some(args[1].clone())
+    }
+    Expr::BinaryOp { left, right, .. } => {
+      find_any_quantity_unit(left).or_else(|| find_any_quantity_unit(right))
+    }
+    Expr::UnaryOp { operand, .. } => find_any_quantity_unit(operand),
+    Expr::FunctionCall { args, .. } => {
+      for a in args {
+        if let Some(u) = find_any_quantity_unit(a) {
+          return Some(u);
+        }
+      }
+      None
+    }
+    _ => None,
+  }
+}
+
+fn strip_quantities_to_target_unit(
+  expr: &Expr,
+  target_unit: &Expr,
+  var: &str,
+) -> Result<Expr, InterpreterError> {
+  match expr {
+    Expr::FunctionCall { name, args } if name == "Quantity" && args.len() == 2 => {
+      if expr_uses_var(&args[0], var) {
+        if expr_to_string(&args[1]) == expr_to_string(target_unit) {
+          return Ok(args[0].clone());
+        }
+        let conv = crate::functions::quantity_ast::unit_convert_ast(&[
+          expr.clone(),
+          target_unit.clone(),
+        ])?;
+        if let Expr::FunctionCall { name: cname, args: cargs } = &conv {
+          if cname == "Quantity" && cargs.len() == 2 {
+            return Ok(cargs[0].clone());
+          }
+        }
+        return Ok(conv);
+      }
+      let conv = crate::functions::quantity_ast::unit_convert_ast(&[
+        expr.clone(),
+        target_unit.clone(),
+      ])?;
+      if let Expr::FunctionCall { name: cname, args: cargs } = &conv {
+        if cname == "Quantity" && cargs.len() == 2 {
+          return Ok(cargs[0].clone());
+        }
+      }
+      Ok(conv)
+    }
+    Expr::BinaryOp { op, left, right } => {
+      let l = strip_quantities_to_target_unit(left, target_unit, var)?;
+      let r = strip_quantities_to_target_unit(right, target_unit, var)?;
+      Ok(Expr::BinaryOp {
+        op: *op,
+        left: Box::new(l),
+        right: Box::new(r),
+      })
+    }
+    Expr::UnaryOp { op, operand } => {
+      let op_converted = strip_quantities_to_target_unit(operand, target_unit, var)?;
+      Ok(Expr::UnaryOp {
+        op: *op,
+        operand: Box::new(op_converted),
+      })
+    }
+    Expr::FunctionCall { name, args } => {
+      let mut new_args = Vec::with_capacity(args.len());
+      for a in args {
+        new_args.push(strip_quantities_to_target_unit(a, target_unit, var)?);
+      }
+      Ok(Expr::FunctionCall {
+        name: name.clone(),
+        args: new_args.into(),
+      })
+    }
+    _ => Ok(expr.clone()),
+  }
+}
+
+fn wrap_rules_in_quantity(solution: &Expr, var: &str, target_unit: &Expr) -> Expr {
+  match solution {
+    Expr::List(items) => {
+      let mapped: Vec<Expr> = items
+        .iter()
+        .map(|item| wrap_rules_in_quantity(item, var, target_unit))
+        .collect();
+      Expr::List(mapped.into())
+    }
+    Expr::Rule { pattern, replacement } => {
+      if let Expr::Identifier(ref name) = **pattern {
+        if name == var {
+          return Expr::Rule {
+            pattern: pattern.clone(),
+            replacement: Box::new(Expr::FunctionCall {
+              name: "Quantity".into(),
+              args: vec![*replacement.clone(), target_unit.clone()].into(),
+            }),
+          };
+        }
+      }
+      solution.clone()
+    }
+    _ => solution.clone(),
+  }
+}
+
+fn try_solve_quantity_equation(
+  args: &[Expr],
+  var_str: &str,
+) -> Option<Result<Expr, InterpreterError>> {
+  if !expr_contains_quantity(&args[0]) {
+    return None;
+  }
+
+  let (lhs, rhs) = match &args[0] {
+    Expr::Comparison {
+      operands,
+      operators,
+    } if operands.len() == 2
+      && operators.len() == 1
+      && operators[0] == ComparisonOp::Equal =>
+    {
+      (&operands[0], &operands[1])
+    }
+    Expr::FunctionCall { name, args: fargs }
+      if name == "Equal" && fargs.len() == 2 =>
+    {
+      (&fargs[0], &fargs[1])
+    }
+    _ => return None,
+  };
+
+  let target_unit = find_var_quantity_unit(lhs, var_str)
+    .or_else(|| find_var_quantity_unit(rhs, var_str))
+    .or_else(|| find_any_quantity_unit(lhs))
+    .or_else(|| find_any_quantity_unit(rhs))?;
+
+  let lhs_scalar = match strip_quantities_to_target_unit(lhs, &target_unit, var_str) {
+    Ok(e) => e,
+    Err(e) => return Some(Err(e)),
+  };
+  let rhs_scalar = match strip_quantities_to_target_unit(rhs, &target_unit, var_str) {
+    Ok(e) => e,
+    Err(e) => return Some(Err(e)),
+  };
+
+  let scalar_eq = Expr::Comparison {
+    operands: vec![lhs_scalar, rhs_scalar],
+    operators: vec![ComparisonOp::Equal],
+  };
+
+  let mut new_args = args.to_vec();
+  new_args[0] = scalar_eq;
+
+  let scalar_solution = match solve_ast(&new_args) {
+    Ok(s) => s,
+    Err(e) => return Some(Err(e)),
+  };
+
+  if matches!(&scalar_solution, Expr::FunctionCall { name, .. } if name == "Solve") {
+    return None;
+  }
+
+  let wrapped = wrap_rules_in_quantity(&scalar_solution, var_str, &target_unit);
+  Some(Ok(wrapped))
+}
+
 fn solve_core(args: &[Expr]) -> Result<Expr, InterpreterError> {
   let _constrained = SuppressIfun::new(
     args.first().is_some_and(has_inequality)
@@ -2132,26 +2389,6 @@ fn solve_core(args: &[Expr]) -> Result<Expr, InterpreterError> {
   // We can't reuse calculus_ast::is_constant_wrt because it doesn't
   // recurse into Comparison nodes — the equations here are
   // x^2 == 1 etc.
-  fn expr_uses_var(expr: &Expr, var: &str) -> bool {
-    match expr {
-      Expr::Identifier(s) => s == var,
-      Expr::List(items) => items.iter().any(|e| expr_uses_var(e, var)),
-      Expr::BinaryOp { left, right, .. } => {
-        expr_uses_var(left, var) || expr_uses_var(right, var)
-      }
-      Expr::UnaryOp { operand, .. } => expr_uses_var(operand, var),
-      Expr::Comparison { operands, .. } => {
-        operands.iter().any(|e| expr_uses_var(e, var))
-      }
-      Expr::FunctionCall { args, .. } => {
-        args.iter().any(|e| expr_uses_var(e, var))
-      }
-      Expr::CurriedCall { func, args } => {
-        expr_uses_var(func, var) || args.iter().any(|e| expr_uses_var(e, var))
-      }
-      _ => false,
-    }
-  }
   let svars_args_owned: Vec<Expr>;
   let args = if let (Expr::List(eqs), Expr::List(vars)) = (&args[0], &args[1]) {
     let used: Vec<usize> = vars
@@ -2343,6 +2580,9 @@ fn solve_core(args: &[Expr]) -> Result<Expr, InterpreterError> {
       })
       .collect();
     if var_names.len() == vars_exprs.len() && !var_names.is_empty() {
+      if eqs.len() == 1 && var_names.len() == 1 && expr_contains_quantity(&eqs[0]) {
+        return solve_ast(&[eqs[0].clone(), Expr::Identifier(var_names[0].clone())]);
+      }
       // Try symbolic Gaussian elimination for linear systems (handles underdetermined case)
       if let Some(result) = solve_linear_symbolic(eqs, &var_names) {
         return Ok(result);
@@ -2747,6 +2987,10 @@ fn solve_core(args: &[Expr]) -> Result<Expr, InterpreterError> {
       "Solve::ivar: {var} is not a valid variable."
     ));
     return Ok(unevaluated("Solve", args));
+  }
+
+  if let Some(res) = try_solve_quantity_equation(args, var) {
+    return res;
   }
 
   // Extract equation: lhs == rhs → lhs - rhs

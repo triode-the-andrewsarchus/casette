@@ -136,6 +136,17 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
     - Added integration test suite [`woxi_kernel_tests.rs`](crates/casette-kernel/tests/woxi_kernel_tests.rs) testing boot, ping, algebra, calculus, matrices, units, precision config, and restarts.
     - Fixed output artifact classification: Woxi internal `res.output_svg` (text typesetting SVG) was previously being treated as an image plot artifact, triggering `render_plot_card`'s white background frame for every row. Restricting image artifact emission strictly to `res.graphics` (actual `Plot`/`Graphics` output) removed the white squares across all mathematical and unit rows. Also refined `determine_kind` to treat `Solve` rule-lists as lists rather than matrices, and updated `render_matrix_view` to natively parse Wolfram `{{a, b}, {c, d}}` matrix syntax.
     - All 53 workspace tests passing cleanly across `casette-gui`, `casette-kernel`, and `friendly-compiler`.
+  - **Phase 12 (Dimensional Equation Solving with Units in Woxi):**
+    - Implemented physical unit equation solving in `vendor/woxi/src/functions/polynomial_ast/solve.rs`:
+      - Previously, `Solve` in Woxi returned unevaluated `Solve[...]` when equations contained `Quantity[...]` because polynomial power extraction (`max_power_int`) returned `None` on unit wrappers.
+      - Added `try_solve_quantity_equation`: identifies the unknown variable, determines its target unit from the equation (e.g. `ft` in `3 mi + x ft = 5 km`), converts all dimensional terms to the target unit with `unit_convert_ast`, strips `Quantity` wrappers to yield an algebraic scalar equation, solves it with `solve_ast`, and wraps solutions back into `Quantity[val, target_unit]`.
+      - Solves `solve 3 mi + x ft = 5 km` to `{{x -> 214960/381 ft}}` (LaTeX: `x \to \frac{214960}{381}\text{ ft}`, decimal approx `≈ 564.199475... ft`).
+      - Solves `solve 3 hr + x sec = 12 days` to `{{x -> 1026000 s}}`.
+    - Made `quantity_unit_to_abbrev` public in `vendor/woxi/src/syntax.rs` and updated `format_expr_impl` for `Quantity` in OutputForm to render abbreviated visual strings (`214960/381 ft` instead of `Quantity[...]`), ensuring clean list-of-rules display.
+    - Updated `tex_function_call` in `vendor/woxi/src/functions/string_ast.rs` to format `Quantity[val, unit]` as `{val}\text{ {unit}}`.
+    - Enhanced `crates/friendly-compiler/src/compiler.rs`: added bare dimensional equation detection (`3 mi + x ft = 5 km`) routing to `solve(...)` to prevent `Set::write: Tag Plus in ... is Protected` errors.
+    - Enhanced `crates/casette-kernel/src/woxi_kernel.rs`: enabled decimal approximation for `kind == "list"` so equation solutions compute `approx` (e.g. `{{x -> 564.199475 ft}}`), and added `clean_approx_text` helper to remove Wolfram Language precision tags.
+    - Added automated tests in `crates/friendly-compiler/tests/friendly_compiler_tests.rs` and `crates/casette-kernel/tests/woxi_kernel_tests.rs`. All workspace tests green.
 
 
 

@@ -369,6 +369,32 @@ fn test_solve_with_units() {
     } else {
         panic!("expected success for time equation with x sec, got: {:?}", res_time);
     }
+
+    // Explicit solve command with units (feet unknown)
+    let res_feet = compile("solve 3 mi + x ft = 5 km");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res_feet
+    {
+        assert_eq!(generated_sage, "solve((3*mi) + (x*ft) == (5*km), x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for solve 3 mi + x ft = 5 km, got: {:?}", res_feet);
+    }
+
+    // Bare equation without explicit solve keyword
+    let res_bare = compile("3 mi + x ft = 5 km");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res_bare
+    {
+        assert_eq!(generated_sage, "solve((3*mi) + (x*ft) == (5*km), x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for bare equation 3 mi + x ft = 5 km, got: {:?}", res_bare);
+    }
 }
 
 #[test]

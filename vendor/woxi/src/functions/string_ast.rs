@@ -7684,6 +7684,11 @@ fn tex_set_domain(expr: &Expr) -> Option<&'static str> {
 /// Handle function calls in TeX
 fn tex_function_call(name: &str, args: &[Expr]) -> String {
   match name {
+    "Quantity" if args.len() == 2 => {
+      let mag_tex = expr_to_tex(&args[0]);
+      let unit_str = crate::syntax::quantity_unit_to_abbrev(&args[1]);
+      format!("{mag_tex}\\text{{ {unit_str}}}")
+    }
     // Logical operators (infix) with precedence-aware parenthesization.
     "And" if args.len() >= 2 => args
       .iter()

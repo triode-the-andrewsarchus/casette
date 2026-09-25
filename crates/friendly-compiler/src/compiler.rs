@@ -77,6 +77,14 @@ pub fn compile(raw_input: &str) -> CompileResult {
             if let Some(assignment) = simple_assignment_echo(input) {
                 return assignment;
             }
+            if let Some(eq) = split_equation(input) {
+                if !variables::is_plausible_variable(&eq.lhs) {
+                    let vars = variables::free_variables(&format!("{} {}", eq.lhs, eq.rhs), &[]);
+                    if !vars.is_empty() {
+                        return solve(input);
+                    }
+                }
+            }
             if crate::units::contains_any_unit(input) {
                 return CompileResult::Success {
                     generated_sage: format!("__casette_convert({input})"),

@@ -7075,7 +7075,7 @@ fn quantity_unit_to_string(unit: &Expr) -> String {
 
 /// Format a Quantity unit expression using abbreviated unit names for visual display.
 /// E.g. `"Meters"/"Seconds"` → `m/s`, `"Meters"/"Seconds"^2` → `m/s^2`.
-fn quantity_unit_to_abbrev(unit: &Expr) -> String {
+pub fn quantity_unit_to_abbrev(unit: &Expr) -> String {
   use crate::functions::quantity_ast::unit_to_abbreviation;
   match unit {
     Expr::Identifier(s) | Expr::String(s) => {
@@ -8267,8 +8267,11 @@ fn format_expr_impl(expr: &Expr, form: ExprForm) -> String {
       if is_output && name == "Sequence" && args.is_empty() {
         return String::new();
       }
-      // Special case: Quantity[n, unit] — unit shown as quoted string(s)
+      // Special case: Quantity[n, unit] — visual display in OutputForm
       if name == "Quantity" && args.len() == 2 {
+        if is_output {
+          return quantity_to_visual_string(&args[0], &args[1]);
+        }
         let mag_str = fmt(&args[0]);
         // A MixedUnit[{…}] holds one unit name per magnitude part. Only
         // OutputForm drops their quotes, like it does for any other

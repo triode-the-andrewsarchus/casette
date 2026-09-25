@@ -20,6 +20,12 @@ Woxi could not previously be dropped in as-is because it lacked the `UnitSimplif
    - Compound unit simplification and recursive expression traversal (simplifying units inside equations, lists, rules, and arithmetic trees).
    - Quantity unwrapping in unit arguments so `Quantity[1, "Kilometers"]` can be used interchangeably with `"Kilometers"`.
    - Verified with unit tests (`vendor/woxi/tests/interpreter_tests/quantity.rs: unit_simplify_tests`).
+3. **Dimensional Equation Solving (`Solve` with Units):**
+   - Implemented in `vendor/woxi/src/functions/polynomial_ast/solve.rs` (`try_solve_quantity_equation`).
+   - Automatically determines the target unit for the unknown variable from the equation (e.g. `ft` in `3 mi + x ft = 5 km`, `s` in `3 hr + x sec = 12 days`).
+   - Converts all dimensional terms to the target unit via `unit_convert_ast`, strips `Quantity` wrappers to yield an algebraic scalar polynomial equation, solves the equation via `solve_ast`, and re-wraps solutions into `Quantity[solution, target_unit]`.
+   - Visual output form renders unit rules cleanly as `{{x -> 214960/381 ft}}`.
+   - LaTeX output formats `Quantity` values with `\text{ <unit>}` (e.g. `\frac{214960}{381}\text{ ft}`).
 
 ## 3. Kernel Architecture (`casette-kernel`)
 

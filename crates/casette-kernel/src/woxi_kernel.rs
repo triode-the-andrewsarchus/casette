@@ -214,11 +214,18 @@ impl WoxiKernel {
 
                                     // If exact, compute decimal approximation for approx field
                                     let mut approx = None;
-                                    if !numeric && (kind == "rational" || kind == "integer" || kind == "symbolic" || kind == "quantity") {
+                                    if !numeric
+                                        && (kind == "rational"
+                                            || kind == "integer"
+                                            || kind == "symbolic"
+                                            || kind == "quantity"
+                                            || kind == "list")
+                                    {
                                         let approx_code = format!("N[{}, {}]", normalized_code, prec);
-                                        if let Ok(approx_res) = woxi::interpret(&approx_code) {
-                                            if approx_res != res.result && !approx_res.is_empty() {
-                                                approx = Some(approx_res);
+                                        if let Ok(approx_res) = woxi::interpret_with_stdout(&approx_code) {
+                                            let cleaned = clean_approx_text(&approx_res.result);
+                                            if cleaned != res.result && !cleaned.is_empty() {
+                                                approx = Some(cleaned);
                                             }
                                         }
                                     }
@@ -764,6 +771,30 @@ fn extract_matrix_properties(code: &str) -> Option<Vec<MatrixPropertyPayload>> {
     });
 
     Some(props)
+}
+
+fn clean_approx_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '.' {
+                j += 1;
+            }
+            if j > i + 1 {
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]

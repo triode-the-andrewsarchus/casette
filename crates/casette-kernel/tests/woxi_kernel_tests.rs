@@ -86,3 +86,29 @@ async fn test_woxi_boot_eval_ping() {
     kernel.shutdown().await.expect("shutdown");
     assert!(!kernel.is_alive());
 }
+
+#[tokio::test]
+async fn test_woxi_solve_equation_with_units() {
+    let kernel = WoxiKernel::launch().await.expect("launch woxi kernel");
+    let resp = kernel
+        .eval("solve((3*mi) + (x*ft) == (5*km), x)", false, None)
+        .await
+        .expect("eval");
+    assert!(resp.ok);
+    assert_eq!(resp.plain.as_deref(), Some("{{x -> 214960/381 ft}}"));
+    let latex = resp.latex.as_deref().unwrap();
+    assert!(latex.contains("214960") && latex.contains("381") && latex.contains("ft"));
+
+    // Approx field is populated with converted numeric feet
+    assert!(resp.approx.as_deref().unwrap().contains("564.199475") && resp.approx.as_deref().unwrap().contains("ft"));
+
+    // Time equation solve in seconds
+    let time_resp = kernel
+        .eval("solve((3*hr) + (x*sec) == (12*days), x)", false, None)
+        .await
+        .expect("eval time");
+    assert!(time_resp.ok);
+    assert_eq!(time_resp.plain.as_deref(), Some("{{x -> 1026000 s}}"));
+
+    kernel.shutdown().await.expect("shutdown");
+}
