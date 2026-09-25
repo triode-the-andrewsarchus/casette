@@ -517,7 +517,134 @@ def _install_casette_preloads(ns):
     ns["PHI"] = (1 + sqrt(5)) / 2  # noqa: F405
 
 
+def _install_casette_units(ns):
+    """Register physical unit shortcuts and the __casette_convert runtime helper."""
+    try:
+        import sage.symbolic.units as _u
+
+        unit_map = {
+            # Length
+            "m": _u.units.length.meter,
+            "meter": _u.units.length.meter,
+            "meters": _u.units.length.meter,
+            "km": _u.units.length.kilometer,
+            "kilometer": _u.units.length.kilometer,
+            "kilometers": _u.units.length.kilometer,
+            "cm": _u.units.length.centimeter,
+            "centimeter": _u.units.length.centimeter,
+            "mm": _u.units.length.millimeter,
+            "millimeter": _u.units.length.millimeter,
+            "mi": _u.units.length.mile,
+            "mile": _u.units.length.mile,
+            "miles": _u.units.length.mile,
+            "ft": _u.units.length.foot,
+            "foot": _u.units.length.foot,
+            "feet": _u.units.length.foot,
+            "inch": _u.units.length.inch,
+            "inches": _u.units.length.inch,
+            "yd": _u.units.length.yard,
+            "yard": _u.units.length.yard,
+            "yards": _u.units.length.yard,
+            # Time
+            "s": _u.units.time.second,
+            "sec": _u.units.time.second,
+            "second": _u.units.time.second,
+            "seconds": _u.units.time.second,
+            "ms": _u.units.time.second * (1 / 1000),
+            "min": _u.units.time.minute,
+            "minute": _u.units.time.minute,
+            "minutes": _u.units.time.minute,
+            "hr": _u.units.time.hour,
+            "hour": _u.units.time.hour,
+            "hours": _u.units.time.hour,
+            "day": _u.units.time.day,
+            "days": _u.units.time.day,
+            "yr": _u.units.time.year,
+            "year": _u.units.time.year,
+            # Mass
+            "kg": _u.units.mass.kilogram,
+            "kilogram": _u.units.mass.kilogram,
+            "kilograms": _u.units.mass.kilogram,
+            "g": _u.units.mass.gram,
+            "gram": _u.units.mass.gram,
+            "grams": _u.units.mass.gram,
+            "mg": _u.units.mass.gram * (1 / 1000),
+            "lb": _u.units.mass.pound,
+            "lbs": _u.units.mass.pound,
+            "pound": _u.units.mass.pound,
+            "pounds": _u.units.mass.pound,
+            "oz": _u.units.mass.avoirdupois_ounce,
+            "ounce": _u.units.mass.avoirdupois_ounce,
+            # Force, Work, Power, Pressure
+            "N": _u.units.force.newton,
+            "newton": _u.units.force.newton,
+            "J": _u.units.energy.joule,
+            "joule": _u.units.energy.joule,
+            "W": _u.units.power.watt,
+            "watt": _u.units.power.watt,
+            "kW": _u.units.power.watt * 1000,
+            "Pa": _u.units.pressure.pascal,
+            "pascal": _u.units.pressure.pascal,
+            "bar": _u.units.pressure.bar,
+            "atm": _u.units.pressure.atmosphere,
+            "psi": _u.units.pressure.psi,
+            # Speed & Angles
+            "mph": _u.units.length.mile / _u.units.time.hour,
+            "kph": _u.units.length.kilometer / _u.units.time.hour,
+            "deg": _u.units.angles.degree,
+            "degree": _u.units.angles.degree,
+            "degrees": _u.units.angles.degree,
+            "rad": _u.units.angles.radian,
+            "radian": _u.units.angles.radian,
+            "radians": _u.units.angles.radian,
+        }
+        ns.update(unit_map)
+        ns["__casette_units"] = unit_map
+
+        _SI_BASE = {
+            "length": _u.units.length.meter,
+            "time": _u.units.time.second,
+            "mass": _u.units.mass.kilogram,
+            "electric_current": _u.units.current.ampere,
+            "temperature": _u.units.temperature.kelvin,
+            "amount_of_substance": _u.units.amount_of_substance.mole,
+            "luminous_intensity": _u.units.luminous_intensity.candela,
+            "angles": _u.units.angles.radian,
+        }
+
+        def __casette_convert(expr, target=None):
+            if target is not None:
+                if isinstance(target, str):
+                    target = unit_map.get(target, target)
+                return _u.convert(expr, target)
+            try:
+                if hasattr(expr, "variables"):
+                    unit_symbols = [v for v in expr.variables() if str(v) in _u.unit_to_type]
+                    if unit_symbols:
+                        base_subs = {}
+                        for v in unit_symbols:
+                            cat = _u.unit_to_type[str(v)]
+                            if cat in _SI_BASE:
+                                base_subs[v] = _u.convert(v, _SI_BASE[cat])
+                        if base_subs:
+                            reduced = expr.subs(base_subs)
+                            if not any(str(v) in _u.unit_to_type for v in reduced.variables()):
+                                return reduced
+                        cats = {_u.unit_to_type[str(v)] for v in unit_symbols}
+                        if len(cats) == 1:
+                            target = unit_symbols[0]
+                            return _u.convert(expr, target)
+            except Exception:
+                pass
+            return expr
+
+        ns["__casette_convert"] = __casette_convert
+    except Exception as exc:
+        _log("warning: failed to initialize units preload: %s" % exc)
+
+
 _install_casette_preloads(NS)
+_install_casette_units(NS)
 
 # V0.6 — Live symbol-table baseline.
 # ----------------------------------

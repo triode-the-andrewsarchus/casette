@@ -9,6 +9,8 @@ description = "Fast, pure friendly input compiler and command shim for Casette"
 [dependencies]
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
+logos = { workspace = true }
+nom = { workspace = true }
 
 [features]
 default = []
