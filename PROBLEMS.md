@@ -5,7 +5,6 @@ Each entry preserves the verified operational lesson for the SageMath worker, pr
 
 | # | Problem | Intersects |
 | ---: | --- | --- |
-| 20 | [Classifying Sage results: type module lies in three specific ways](problems/020-classifying-sage-results-type-module-lies-in-three-specific.md) | Sage type classification, module-name traps, result-kind mapping. |
 | 21 | [Numeric approximation: respect the value's native precision; `digits=` can raise](problems/021-numeric-approximation-respect-the-value-s-native-precision-digits.md) | Approximation API behavior, native precision, digits pitfalls. |
 | 22 | [Interrupting Sage: cysignals owns SIGINT and makes C code abortable — don't clobber it](problems/022-interrupting-sage-cysignals-owns-sigint-and-makes-c-code.md) | Interrupt semantics, cysignals, abortable C/Sage computations. |
 | 23 | [Restart race: give each worker generation its own reader queue + EOF event](problems/023-restart-race-give-each-worker-generation-its-own-reader.md) | Worker generations, reader queues, restart/EOF race isolation. |

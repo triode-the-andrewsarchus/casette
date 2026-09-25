@@ -50,6 +50,25 @@ async fn test_kernel_boot_eval_ping() {
     let prec = kernel.config_precision(20).await.expect("config precision");
     assert_eq!(prec, 20);
 
+    // 4b. Test Problem 020 classification traps:
+    // (a) Gaussian integer (3 + 4*I) is classified as "complex", not unknown
+    let gauss_resp = kernel
+        .eval("3 + 4*I", false, None)
+        .await
+        .expect("eval 3 + 4*I");
+    assert_eq!(gauss_resp.kind.as_deref(), Some("complex"));
+
+    // (b) solve(...) returns Sequence_generic which subclasses list -> classified as "list"
+    let solve_resp = kernel
+        .eval("solve(x^2 == 1, x)", false, None)
+        .await
+        .expect("eval solve");
+    assert_eq!(solve_resp.kind.as_deref(), Some("list"));
+
+    // (c) bool is int subclass -> True must classify as "boolean"
+    let bool_resp = kernel.eval("True", false, None).await.expect("eval True");
+    assert_eq!(bool_resp.kind.as_deref(), Some("boolean"));
+
     // 5. Test math artifact generation on integration
     let math_resp = kernel
         .eval("integrate(1/(1-x^2), x)", false, None)
