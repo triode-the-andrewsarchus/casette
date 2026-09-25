@@ -487,6 +487,13 @@ impl WorkerProcess {
     }
 
     async fn kill_and_reap(&mut self) {
+        if let Some(pid) = self.child.id() {
+            // Problem 024: Kill the entire process group (-pid) because `cmd.process_group(0)`
+            // established a new process group with this child as group leader. If python was
+            // launched via a wrapper script (e.g. `sage -python`), this ensures both the
+            // wrapper script and its child Python worker are cleanly reaped without leaking orphans.
+            let _ = signal::kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
