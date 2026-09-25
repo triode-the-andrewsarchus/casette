@@ -5,7 +5,6 @@ Each entry preserves the verified operational lesson for the SageMath worker, pr
 
 | # | Problem | Intersects |
 | ---: | --- | --- |
-| 13 | [Exactness: the Symbolic Ring is uniformly `is_exact()==False` — decide per-kind, and tree-walk symbolic](problems/013-exactness-the-symbolic-ring-is-uniformly-is-exact-false.md) | Exactness policy, Symbolic Ring behavior, tree-walked exactness. |
 | 14 | [Numeric precision: clamp the request to the value's own `prec()` or `.n(bits)` raises](problems/014-numeric-precision-clamp-the-request-to-the-value-s.md) | Numeric precision bounds, value precision, safe numeric requests. |
 | 15 | [Friendly compiler: the bypass rule is a SPACE boundary, and a definite integral is `symbolic`](problems/015-friendly-compiler-the-bypass-rule-is-a-space-boundary.md) | Friendly compiler parsing edges, bypass boundaries, definite integral kind. |
 | 16 | [Symbol table: diff the baseline by OBJECT IDENTITY, not name — Sage exports `n`/`N`/`i`](problems/016-symbol-table-diff-the-baseline-by-object-identity-not.md) | Sage symbol snapshots, baseline diffing, object identity vs names. |
