@@ -616,8 +616,19 @@ def _install_casette_units(ns):
             if target is not None:
                 if isinstance(target, str):
                     target = unit_map.get(target, target)
-                return _u.convert(expr, target)
+                if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)):
+                    return [__casette_convert(item, target) for item in expr]
+                if hasattr(expr, "is_relational") and expr.is_relational():
+                    return expr.lhs() == __casette_convert(expr.rhs(), target)
+                try:
+                    return _u.convert(expr, target)
+                except Exception:
+                    return expr
             try:
+                if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)):
+                    return [__casette_convert(item, target) for item in expr]
+                if hasattr(expr, "is_relational") and expr.is_relational():
+                    return expr.lhs() == __casette_convert(expr.rhs(), target)
                 if hasattr(expr, "variables"):
                     unit_symbols = [v for v in expr.variables() if str(v) in _u.unit_to_type]
                     if unit_symbols:
@@ -633,7 +644,10 @@ def _install_casette_units(ns):
                         cats = {_u.unit_to_type[str(v)] for v in unit_symbols}
                         if len(cats) == 1:
                             target = unit_symbols[0]
-                            return _u.convert(expr, target)
+                            try:
+                                return _u.convert(expr, target)
+                            except Exception:
+                                pass
             except Exception:
                 pass
             return expr
@@ -1861,6 +1875,11 @@ def _handle_eval(req):
     # same so `print("hello")` reports value=False with its text in stdout.
     # A plot that was `.show()`n (not echoed) still carries its artifacts here.
     if has_value and value is not None:
+        try:
+            if "__casette_convert" in NS:
+                value = NS["__casette_convert"](value)
+        except Exception:
+            pass
         env = _build_envelope(value, artifacts=artifacts,
                               digits=digits, numeric=numeric)
     else:

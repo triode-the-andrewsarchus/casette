@@ -356,6 +356,19 @@ fn test_solve_with_units() {
     } else {
         panic!("expected success for juxtaposition solve, got: {:?}", res_jux);
     }
+
+    // Variable juxtaposed with unit (x sec)
+    let res_time = compile("solve 3 hr + x sec = 12 days");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res_time
+    {
+        assert_eq!(generated_sage, "solve((3*hr) + (x*sec) == (12*days), x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for time equation with x sec, got: {:?}", res_time);
+    }
 }
 
 #[test]

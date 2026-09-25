@@ -102,10 +102,103 @@ pub fn is_valid_target_unit(target: &str) -> bool {
     !pieces.is_empty() && pieces.iter().all(|p| units::is_known_unit(p))
 }
 
-/// Transforms natural unit juxtaposition (e.g. `32 mi`, `52 mi^2`, `9.8 m/s^2`)
-/// into explicit multiplication expressions (`(32*mi)`, `(52*mi^2)`).
+/// Returns true if an identifier is a command keyword, clause keyword, or common function name,
+/// which should not be treated as an algebraic factor juxtaposed with a unit.
+fn is_command_or_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "solve"
+            | "factor"
+            | "expand"
+            | "simplify"
+            | "derivative"
+            | "diff"
+            | "integral"
+            | "int"
+            | "double_integral"
+            | "dint"
+            | "limit"
+            | "taylor"
+            | "plot"
+            | "implicit_plot"
+            | "parametric_plot"
+            | "sum"
+            | "product"
+            | "matrix"
+            | "vector"
+            | "eigenvalues"
+            | "rref"
+            | "det"
+            | "inverse"
+            | "inv"
+            | "transpose"
+            | "rank"
+            | "eigenvectors"
+            | "gradient"
+            | "hessian"
+            | "jacobian"
+            | "subs"
+            | "numeric"
+            | "eval"
+            | "latex"
+            | "var"
+            | "assume"
+            | "forget"
+            | "choose"
+            | "gcd"
+            | "lcm"
+            | "factorial"
+            | "is_prime"
+            | "factor_integer"
+            | "mean"
+            | "normal_pdf"
+            | "normal_cdf"
+            | "normal_between"
+            | "normal_inv"
+            | "binomial_pmf"
+            | "binomial_cdf"
+            | "binomial_between"
+            | "binomial_at_most"
+            | "binomial_at_least"
+            | "poisson_pmf"
+            | "poisson_cdf"
+            | "poisson_between"
+            | "poisson_at_most"
+            | "poisson_at_least"
+            | "exponential_pdf"
+            | "exponential_cdf"
+            | "exponential_between"
+            | "exponential_inv"
+            | "uniform_pdf"
+            | "uniform_cdf"
+            | "uniform_between"
+            | "uniform_inv"
+            | "for"
+            | "to"
+            | "in"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "exp"
+            | "log"
+            | "ln"
+            | "sqrt"
+            | "abs"
+    )
+}
+
+fn is_multiplier_token(tok: &Token) -> bool {
+    match tok {
+        Token::Number(_) => true,
+        Token::Ident(name) => !is_command_or_keyword(name),
+        _ => false,
+    }
+}
+
+/// Transforms natural unit juxtaposition (e.g. `32 mi`, `x sec`, `52 mi^2`, `9.8 m/s^2`)
+/// into explicit multiplication expressions (`(32*mi)`, `(x*sec)`, `(52*mi^2)`).
 ///
-/// Also wraps explicit quantities after division (`/ 2*hr`) into `/(2*hr)`
+/// Also wraps explicit quantities after division (`/ 2*hr`, `/ x*sec`) into `/(2*hr)`
 /// so operator precedence does not invert division into multiplication.
 #[must_use]
 pub fn desugar_unit_juxtaposition(input: &str) -> String {
@@ -129,8 +222,8 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
     while i < tokens.len() {
         let is_after_slash = i > 0 && matches!(tokens[i - 1].0, Token::Slash);
 
-        if let Token::Number(_) = tokens[i].0 {
-            // Case 1: Number [whitespace] Ident (where Ident is a known unit, e.g. "32 mi", "2 hr")
+        if is_multiplier_token(&tokens[i].0) {
+            // Case 1: Multiplier (Number or Variable) [whitespace] Ident (where Ident is a known unit, e.g. "32 mi", "x sec")
             if i + 1 < tokens.len() {
                 if let Token::Ident(name) = tokens[i + 1].0 {
                     if units::is_known_unit(name) {
@@ -144,13 +237,13 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
                         };
 
                         let start_pos = tokens[i].1.start;
-                        let num_end = tokens[i].1.end;
+                        let left_end = tokens[i].1.end;
                         let unit_start = tokens[i + 1].1.start;
                         let end_pos = tokens[end_tok_idx].1.end;
 
                         result.push_str(&input[last_idx..start_pos]);
                         result.push('(');
-                        result.push_str(&input[start_pos..num_end]);
+                        result.push_str(&input[start_pos..left_end]);
                         result.push('*');
                         result.push_str(&input[unit_start..end_pos]);
                         result.push(')');
@@ -162,7 +255,7 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
                 }
             }
 
-            // Case 2: After slash, Number * Ident (e.g. / 2*hr)
+            // Case 2: After slash, Multiplier * Ident (e.g. / 2*hr or / x*sec)
             if is_after_slash && i + 2 < tokens.len() && matches!(tokens[i + 1].0, Token::Star) {
                 if let Token::Ident(name) = tokens[i + 2].0 {
                     if units::is_known_unit(name) {
@@ -191,6 +284,36 @@ pub fn desugar_unit_juxtaposition(input: &str) -> String {
             }
         }
 
+        // Case 3: Parenthesized expression followed by unit: (expr) unit -> (expr)*(unit)
+        if matches!(tokens[i].0, Token::RParen) && i + 1 < tokens.len() {
+            if let Token::Ident(name) = tokens[i + 1].0 {
+                if units::is_known_unit(name) {
+                    let end_tok_idx = if i + 3 < tokens.len()
+                        && matches!(tokens[i + 2].0, Token::Caret)
+                        && matches!(tokens[i + 3].0, Token::Number(_))
+                    {
+                        i + 3
+                    } else {
+                        i + 1
+                    };
+
+                    let rparen_end = tokens[i].1.end;
+                    let unit_start = tokens[i + 1].1.start;
+                    let end_pos = tokens[end_tok_idx].1.end;
+
+                    result.push_str(&input[last_idx..rparen_end]);
+                    result.push('*');
+                    result.push('(');
+                    result.push_str(&input[unit_start..end_pos]);
+                    result.push(')');
+
+                    last_idx = end_pos;
+                    i = end_tok_idx + 1;
+                    continue;
+                }
+            }
+        }
+
         i += 1;
     }
 
@@ -214,6 +337,11 @@ mod tests {
             desugar_unit_juxtaposition("solve 32 mi * x^2 = 52 mi^2"),
             "solve (32*mi) * x^2 = (52*mi^2)"
         );
+        assert_eq!(
+            desugar_unit_juxtaposition("solve 3 hr + x sec = 12 days"),
+            "solve (3*hr) + (x*sec) = (12*days)"
+        );
+        assert_eq!(desugar_unit_juxtaposition("(x + 1) hr"), "(x + 1)*(hr)");
     }
 
     #[test]

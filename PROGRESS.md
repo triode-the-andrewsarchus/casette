@@ -51,9 +51,10 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
     - Preloaded 69 standard SI and Imperial units in `v0/01-worker-protocol/worker.py` (`mi`, `km`, `ft`, `s`, `hr`, `kg`, `mph`, etc.) and added `__casette_convert` for automatic dimensionless cancellation (e.g. `50*km / (32*mi)` -> `390625/402336`), compatible unit sum unification, and explicit conversion clauses (`to miles`, `in mph`).
     - Added `units.rs` and `unit_parser.rs` in `friendly-compiler` powered by `logos`:
       - Disambiguates units from unknown algebraic variables in `free_variables` so `solve 32*mi*x^2 = 52*mi^2` and `solve 32 mi * x^2 = 52 mi^2` automatically isolate `x` without ambiguity.
-      - Desugars natural unit juxtaposition (`32 mi`, `52 mi^2`, `9.8 m/s^2`) into parenthesized mathematical multiplication expressions (`(32*mi)`, `(52*mi^2)`).
+      - Desugars natural unit juxtaposition for both numbers (`32 mi`, `52 mi^2`, `9.8 m/s^2`) and algebraic variables / parenthesized terms (`x sec`, `t hr`, `(x + 1) hr`) into explicit parenthesized expressions (`(32*mi)`, `(x*sec)`, `(x + 1)*(hr)`), eliminating Python `SyntaxError: Invalid Syntax` on multi-word variable-unit terms.
       - Fixed division precedence so expressions with units in denominators (`100 km / 2 hr in mph` or `/ 2*hr`) parenthesize as `/(2*hr)` rather than inverting into multiplication `((100*km) / 2) * hr = 50 * km * hr`, eliminating Sage `ValueError: Incompatible units`.
       - Unwraps redundant single-argument `__casette_convert(...)` calls during conversion clause compilation, ensuring clean single-layer `__casette_convert((100*km) / (2*hr), mph)` lowering.
+      - Added sequence and relation recursion in worker runtime `__casette_convert`: equations and solve results involving units automatically evaluate compatible units (e.g. `solve 3 hr + x sec = 12 days` simplifies to `[x == 1026000]` rather than unreduced dimensional fractions like `3*(4*day - hour)/second`).
       - Parses conversion clauses (`... to <unit>` / `... in <unit>`).
     - Added comprehensive unit tests in `friendly_compiler_tests.rs` and integration tests in `kernel_integration_tests.rs`. All 45 workspace tests green with 0 clippy warnings.
 
