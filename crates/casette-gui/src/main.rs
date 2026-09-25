@@ -78,31 +78,37 @@ fn main() -> anyhow::Result<()> {
                     let row_num = row_counter;
                     row_counter += 1;
 
-                    // Expand tape references (e.g. #1 -> __casette_tape_refs[1])
-                    let expanded_input = match tape_refs.expand_references(&input) {
-                        Ok(exp) => exp,
-                        Err(compile_err) => {
-                            let err_resp = casette_kernel::WorkerResponse::new_error(
-                                "CompileError".into(),
-                                compile_err.message,
-                                compile_err.suggestion,
-                            );
-                            let _ = msg_tx_clone.send(AsyncMessage::EvalFinished {
-                                row_number: row_num,
-                                response: Box::new(err_resp),
-                                duration: Duration::from_millis(0),
-                            });
-                            continue;
-                        }
-                    };
+                    // Problem 009: Multiline input is raw Sage by definition.
+                    // Gate on newline presence so raw Python/Sage newlines are never flattened to spaces.
+                    let (_expanded_input, compiled_code) = if input.contains('\n') {
+                        (input.clone(), input.clone())
+                    } else {
+                        // Expand tape references (e.g. #1 -> __casette_tape_refs[1])
+                        let exp = match tape_refs.expand_references(&input) {
+                            Ok(exp) => exp,
+                            Err(compile_err) => {
+                                let err_resp = casette_kernel::WorkerResponse::new_error(
+                                    "CompileError".into(),
+                                    compile_err.message,
+                                    compile_err.suggestion,
+                                );
+                                let _ = msg_tx_clone.send(AsyncMessage::EvalFinished {
+                                    row_number: row_num,
+                                    response: Box::new(err_resp),
+                                    duration: Duration::from_millis(0),
+                                });
+                                continue;
+                            }
+                        };
 
-                    // Compile friendly input to Sage
-                    let compiled_code = match friendly_compiler::compile(&expanded_input) {
-                        friendly_compiler::CompileResult::Success { generated_sage, .. } => {
-                            generated_sage
-                        }
-                        friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
-                        _ => expanded_input.clone(),
+                        let comp = match friendly_compiler::compile(&exp) {
+                            friendly_compiler::CompileResult::Success { generated_sage, .. } => {
+                                generated_sage
+                            }
+                            friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
+                            _ => exp.clone(),
+                        };
+                        (exp, comp)
                     };
 
                     let start_time = Instant::now();

@@ -278,3 +278,28 @@ fn test_action_buttons_and_approx_compilation() {
     }
 }
 
+#[test]
+fn test_multiline_raw_sage_preserves_newlines() {
+    let mut state = SessionState::default();
+    let multiline_input = "a = 5\nb = 10\na * b".to_string();
+
+    // Problem 009: When submitting multiline input, bypass friendly single-line compiler
+    // so newlines are strictly preserved rather than flattened to spaces.
+    let compiled = if multiline_input.contains('\n') {
+        multiline_input.clone()
+    } else {
+        let refs = state.tape_references();
+        match friendly_compiler::compile_with_refs(&multiline_input, &refs) {
+            friendly_compiler::CompileResult::Success { generated_sage, .. } => generated_sage,
+            friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
+            _ => multiline_input.clone(),
+        }
+    };
+
+    let row_num = state.push_row(multiline_input.clone(), compiled);
+    assert_eq!(row_num, 1);
+    assert_eq!(state.rows[0].compiled_sage, "a = 5\nb = 10\na * b");
+    assert!(state.rows[0].compiled_sage.contains('\n'));
+}
+
+

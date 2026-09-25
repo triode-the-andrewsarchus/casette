@@ -132,7 +132,7 @@ fn render_live_lowering_preview(
     refs: &friendly_compiler::TapeReferenceTable,
 ) {
     let trimmed = draft.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.contains('\n') {
         return;
     }
 
