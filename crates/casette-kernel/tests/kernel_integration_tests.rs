@@ -33,6 +33,15 @@ async fn test_kernel_boot_eval_ping() {
     let plain = resp.plain.as_deref().unwrap();
     assert!(plain.contains("x - 1") && plain.contains("x + 1"));
 
+    // 2b. Test implicit multiplication: solve(x^2 + 5x + 6 == 0, x)
+    let solve_resp = kernel
+        .eval("solve(x^2 + 5x + 6 == 0, x)", false, None)
+        .await
+        .expect("eval solve with 5x");
+    assert!(solve_resp.ok);
+    let solve_plain = solve_resp.plain.as_deref().unwrap();
+    assert!(solve_plain.contains("x == -3") && solve_plain.contains("x == -2"));
+
     // 3. Test symbols query (including shadowed Sage builtin like n)
     kernel
         .eval("n = 104729", false, None)

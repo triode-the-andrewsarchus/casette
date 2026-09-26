@@ -140,7 +140,11 @@ signal.signal(signal.SIGINT, _sigint_handler)
 # ---------------------------------------------------------------------------
 
 from sage.all import *  # noqa: E402,F401,F403  (the whole point is the star)
-from sage.repl.preparse import preparse  # noqa: E402
+from sage.repl.preparse import preparse, implicit_multiplication  # noqa: E402
+
+# Enable Sage's implicit multiplication preparser so expressions like
+# `5x`, `2pi`, and `solve x^2 + 5x + 6 = 0` preparse without decimal literal syntax errors.
+implicit_multiplication(True)
 
 # The persistent user namespace. Seeded with everything `from sage.all import *`
 # exposes, exactly like an interactive Sage session, so unqualified names such
