@@ -134,6 +134,9 @@ fn render_symbols_tab(
         .symbols
         .iter()
         .filter(|sym| {
+            if sym.name.starts_with('_') {
+                return false;
+            }
             if !*show_builtins && BOOT_VARIABLE_NAMES.contains(&sym.name.as_str()) {
                 // Hide default boot variables unless reassigned
                 return false;
@@ -146,11 +149,21 @@ fn render_symbols_tab(
         .collect();
 
     if visible_symbols.is_empty() {
-        ui.label(
-            RichText::new("No user symbols in session")
-                .color(Colors::TEXT_MUTED)
-                .italics(),
-        );
+        ui.vertical_centered(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("No user symbols in session")
+                    .color(Colors::TEXT_MUTED)
+                    .font(FontId::new(12.0, FontFamily::Proportional))
+                    .italics(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Assign variables like a = 5 or define functions like f(x) = x^2 to inspect them here.")
+                    .color(Colors::TEXT_MUTED)
+                    .font(FontId::new(10.5, FontFamily::Proportional)),
+            );
+        });
         return;
     }
 

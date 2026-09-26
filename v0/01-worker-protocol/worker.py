@@ -1763,7 +1763,7 @@ def _handle_symbols(req):
     their current value (we read NS live). Sorted by name for a stable sidebar."""
     syms = []
     for name in sorted(NS.keys()):
-        if name.startswith("__") and name.endswith("__"):
+        if name.startswith("_"):
             continue
         value = NS[name]
         # User-created iff the name is new, OR it shadows a baseline name but is
