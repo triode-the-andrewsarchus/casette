@@ -617,6 +617,20 @@ def _install_casette_units(ns):
         }
 
         def _casette_approx(expr, *args, **kwargs):
+            if isinstance(expr, (list, tuple)):
+                try:
+                    items = [_casette_approx(item, *args, **kwargs) for item in expr]
+                    return tuple(items) if (isinstance(expr, tuple) and not isinstance(expr, list)) else items
+                except Exception:
+                    pass
+            if hasattr(expr, "is_relational") and expr.is_relational():
+                try:
+                    op = expr.operator()
+                    if op is not None:
+                        return op(expr.lhs(), _casette_approx(expr.rhs(), *args, **kwargs))
+                    return expr.lhs() == _casette_approx(expr.rhs(), *args, **kwargs)
+                except Exception:
+                    pass
             try:
                 if hasattr(expr, "variables"):
                     unit_symbols = [v for v in expr.variables() if str(v) in _u.unit_to_type]
@@ -639,7 +653,7 @@ def _install_casette_units(ns):
             if target is not None:
                 if isinstance(target, str):
                     target = unit_map.get(target, target)
-                if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)):
+                if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)) and "sage.matrix" not in (type(expr).__module__ or "") and "sage.plot" not in (type(expr).__module__ or ""):
                     return [__casette_convert(item, target) for item in expr]
                 if hasattr(expr, "is_relational") and expr.is_relational():
                     return expr.lhs() == __casette_convert(expr.rhs(), target)
@@ -648,9 +662,20 @@ def _install_casette_units(ns):
                 except Exception:
                     return expr
             try:
-                if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)):
+                if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)) and "sage.matrix" not in (type(expr).__module__ or "") and "sage.plot" not in (type(expr).__module__ or ""):
                     return [__casette_convert(item, target) for item in expr]
                 if hasattr(expr, "is_relational") and expr.is_relational():
+                    rhs = expr.rhs()
+                    if hasattr(rhs, "denominator") and hasattr(rhs, "numerator"):
+                        denom = rhs.denominator()
+                        numer = rhs.numerator()
+                        denom_units = [v for v in denom.variables() if str(v) in _u.unit_to_type] if hasattr(denom, "variables") else []
+                        numer_units = [v for v in numer.variables() if str(v) in _u.unit_to_type] if hasattr(numer, "variables") else []
+                        if denom_units and numer_units:
+                            try:
+                                return expr.lhs() == _u.convert(numer, denom)
+                            except Exception:
+                                pass
                     return expr.lhs() == __casette_convert(expr.rhs(), target)
                 if hasattr(expr, "variables"):
                     unit_symbols = [v for v in expr.variables() if str(v) in _u.unit_to_type]
@@ -1458,17 +1483,46 @@ def _is_exact(value, kind):
     return None
 
 
-def _napprox_string(value, kind, digits):
-    """Numeric approximation of `value` to ~`digits` decimal digits, as a string.
+def _napprox_object(value, digits):
+    """Numerically approximate a Sage object (scalar, unit expression, relation, or list/tuple).
 
-    Clamps the requested precision to a concrete value's OWN precision so
-    `.n(bits)` never raises the Sage "cannot approximate to N bits, use at most
-    M" error (PROBLEMS.md). Exact values (rational / symbolic-constant) get the
-    full requested precision. Returns None when no scalar approximation applies.
+    Returns the approximated object if any component was approximated, else None.
     """
-    if kind not in ("rational", "real", "complex", "symbolic"):
+    if value is None:
         return None
-    # A symbolic with free variables has no single numeric value, unless they are physical units.
+    mod = type(value).__module__ or ""
+    if "sage.matrix" in mod:
+        return None
+
+    # 1. Lists and tuples (including Sage Sequence)
+    if isinstance(value, (list, tuple)):
+        approx_items = []
+        any_changed = False
+        for item in value:
+            item_approx = _napprox_object(item, digits)
+            if item_approx is not None:
+                approx_items.append(item_approx)
+                any_changed = True
+            else:
+                approx_items.append(item)
+        if any_changed:
+            return tuple(approx_items) if (isinstance(value, tuple) and not isinstance(value, list)) else approx_items
+        return None
+
+    # 2. Relational expressions (e.g. x == 2714960/381*foot)
+    if hasattr(value, "is_relational") and value.is_relational():
+        rhs_approx = _napprox_object(value.rhs(), digits)
+        if rhs_approx is not None:
+            try:
+                op = value.operator()
+                if op is not None:
+                    return op(value.lhs(), rhs_approx)
+            except Exception:
+                pass
+            return value.lhs() == rhs_approx
+        return None
+
+    # 3. Symbolic expression with free variables: only approximate if ALL variables are physical units
     try:
         if hasattr(value, "variables") and len(value.variables()) > 0:
             import sage.symbolic.units as _u
@@ -1477,37 +1531,52 @@ def _napprox_string(value, kind, digits):
             if unit_symbols and not non_unit_vars:
                 subs_one = {v: 1 for v in unit_symbols}
                 coeff = value.subs(subs_one)
-                approx_coeff = _napprox_string(coeff, "rational", digits)
+                approx_coeff = _napprox_object(coeff, digits)
                 if approx_coeff is not None:
                     unit_part = value / coeff
-                    return f"{approx_coeff}*{unit_part}"
+                    return approx_coeff * unit_part
             return None
     except Exception:
         pass
+
+    # 4. Scalar values
     bits_wanted = _digits_to_bits(digits)
-    # Concrete real/complex: it has a fixed native precision. Clamp the request
-    # to it (asking for MORE bits than it holds raises), then approximate. This
-    # keeps `N(sqrt(2),digits=50)` (170 bits) showing 10 digits cleanly and
-    # never downcasts below what was asked when fewer digits are wanted.
     try:
         own = value.prec()
         bits = min(bits_wanted, own)
-        return str(value.n(bits))
+        return value.n(bits)
     except (AttributeError, TypeError):
         pass
-    # Exact value (rational / symbolic-constant): full requested precision.
     try:
-        return str(value.n(digits=digits))
+        return value.n(digits=digits)
     except Exception:
         pass
     try:
-        return str(value.n(bits_wanted))
+        return value.n(bits_wanted)
     except Exception:
         pass
     try:
-        return repr(round(float(value), max(0, digits)))
+        f = float(value)
+        return round(f, max(0, digits))
     except Exception:
         return None
+
+
+def _napprox_string(value, kind, digits):
+    """Numeric approximation of `value` to ~`digits` decimal digits, as a string.
+
+    Clamps the requested precision to a concrete value's OWN precision so
+    `.n(bits)` never raises the Sage "cannot approximate to N bits, use at most
+    M" error (PROBLEMS.md). Exact values (rational / symbolic-constant / units /
+    relations / lists) get the full requested precision. Returns None when no
+    scalar or component approximation applies.
+    """
+    if kind not in ("rational", "real", "complex", "symbolic", "relation", "list"):
+        return None
+    obj = _napprox_object(value, digits)
+    if obj is None:
+        return None
+    return str(obj)
 
 
 def _approx(value, kind, digits=None):
@@ -1548,7 +1617,8 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
     plain_full = _safe_str(value)
     repr_full = _safe_repr(value)
     latex_str = _safe_latex(value)
-    approx_str = _napprox_string(value, kind, digits)
+    approx_obj = _napprox_object(value, digits) if kind in ("rational", "real", "complex", "symbolic", "relation", "list") else None
+    approx_str = _safe_str(approx_obj) if approx_obj is not None else None
 
     # primary_is_approx: does the "≈" belong on the PRIMARY value?
     #   * force-numeric request -> yes (we're replacing the primary with N()).
@@ -1566,7 +1636,10 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
         exact_value = plain_full
         plain_full = approx_str
         repr_full = approx_str
-        latex_str = approx_str
+        if approx_obj is not None:
+            latex_str = _safe_latex(approx_obj)
+        else:
+            latex_str = approx_str
         approx_str = None  # primary already carries the number; no secondary.
 
     plain, plain_trunc = _cap(plain_full, _MAX_PLAIN)

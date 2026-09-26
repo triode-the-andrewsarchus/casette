@@ -146,6 +146,44 @@ async fn test_kernel_boot_eval_ping() {
     assert!(ratio_resp.ok);
     assert_eq!(ratio_resp.plain.as_deref(), Some("390625/402336"));
 
+    // 6a. Test solve with unit preservation and numeric approximation
+    let solve_ft_exact = kernel
+        .eval("solve(3*mi + x*ft == 7*km, x)", false, None)
+        .await
+        .expect("eval solve with foot unit");
+    assert!(solve_ft_exact.ok);
+    let exact_plain = solve_ft_exact.plain.as_deref().unwrap_or("");
+    assert!(
+        exact_plain.contains("2714960/381*foot"),
+        "expected exact plain to have foot unit and fraction, got: {}",
+        exact_plain
+    );
+    assert!(
+        solve_ft_exact.approx.as_deref().unwrap_or("").contains("7125.87"),
+        "expected exact response to provide numeric approx with foot unit, got: {:?}",
+        solve_ft_exact.approx
+    );
+    assert_eq!(solve_ft_exact.primary_is_approx, Some(false));
+
+    // Force-numeric mode on solve with units
+    let solve_ft_num = kernel
+        .eval("solve(3*mi + x*ft == 7*km, x)", true, Some(10))
+        .await
+        .expect("eval solve with foot unit numeric");
+    assert!(solve_ft_num.ok);
+    let num_plain = solve_ft_num.plain.as_deref().unwrap_or("");
+    assert!(
+        num_plain.contains("7125.87") && num_plain.contains("foot"),
+        "expected numeric plain to contain approximation with foot unit, got: {}",
+        num_plain
+    );
+    assert_eq!(solve_ft_num.primary_is_approx, Some(true));
+    assert!(
+        solve_ft_num.exact_value.as_deref().unwrap_or("").contains("2714960/381*foot"),
+        "expected exact_value to preserve original exact fraction with unit, got: {:?}",
+        solve_ft_num.exact_value
+    );
+
     // 6b. Test Problem 025: private dup'd fd for protocol stream and OS-level fd 1/2 redirection
     let raw_fd_resp = kernel
         .eval(
