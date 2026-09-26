@@ -174,8 +174,23 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Root cause: When `last-session.json` was restored, `SessionState.next_row_number` advanced to `N + 1`, but the Tokio actor in `main.rs` maintained an independent `row_counter` initialized to `1`. When evaluating new expressions, `app.rs` allocated row `N + 1` in the UI as evaluating, while `main.rs` processed it as row `1` and emitted `AsyncMessage::EvalFinished { row_number: 1, ... }`. The UI updated row 1 (the restored row) and left row `N + 1` spinning indefinitely. Restarting the worker also reset `row_counter = 1`, failing to recover.
       - Fixed `GuiAction::Evaluate` to pass the explicit `row_number` allocated by `SessionState`.
       - Added `GuiAction::SyncTapeRefs` dispatched on `WorkerReady` to synchronize all restored tape references (`__casette_tape_refs[i] = (...)`) into Sage, ensuring `#1`, `#2`, etc. are immediately usable in subsequent evaluations.
-      - Handled `friendly_compiler::CompileResult::Ambiguous` explicitly with descriptive suggestions.
       - Added automated test `test_restored_session_row_number_continuity` in `gui_tests.rs`. All workspace tests green (47/47).
+    - **Issue 9 (Implicit Multiplication in Sage Preparser):**
+      - Root cause: Input forms like `solve x^2 + 5x + 6 = 0` and `5x` raised `SyntaxError: invalid decimal literal` in Python because Sage's preparser disabled implicit multiplication by default (`implicit_multiplication` set to level 0).
+      - Enabled `from sage.repl.preparse import implicit_multiplication; implicit_multiplication(True)` in `worker.py`. Expressions like `5x`, `2pi`, and `solve x^2 + 5x + 6 = 0` now preparse cleanly to `Integer(5)*x` and solve properly.
+      - Added automated integration test in `kernel_integration_tests.rs`.
+    - **Issue 10 (Plot Scroll Isolation from Outer Tape View):**
+      - Root cause: `egui_plot::Plot` did not consume or clear `smooth_scroll_delta` after handling scroll interactions, allowing mouse-wheel scroll events over the plot canvas to leak into the outer tape `ScrollArea`, causing both the plot and the whole tape to scroll simultaneously.
+      - Intercepted scroll events when the pointer is over the plot canvas (`plot_resp.response.contains_pointer() || plot_resp.response.hovered()`) and cleared `smooth_scroll_delta = Vec2::ZERO` and `raw_scroll_delta = Vec2::ZERO`. Scrolling over a plot now exclusively navigates the plot.
+    - **Issue 11 (Zero-Crossing / Root Detection and Snapping):**
+      - Added `ExtremumKind::ZeroCrossing` to `protocol.rs` and upgraded `compute_local_extrema` to detect zero crossings via linear interpolation across sign changes ($(y_{i-1} < 0 \land y_i > 0)$ or $(y_{i-1} > 0 \land y_i < 0)$) and exact zeros, with asymptote guarding ($|y_i - y_{i-1}| < 50$) and deduplication.
+      - Rendered distinct emerald circle markers for zero-crossings (`Colors::EXACT_GREEN`) and added card badge reporting (`⨁ Zero / Root: x = ..., y = 0`).
+      - Updated snap toggle button to `"🧲 Snap (Extrema & Zeros): ON/OFF"`.
+      - Added unit test `test_compute_local_extrema_and_zero_crossings` in `casette-kernel`.
+    - **Issue 12 (Snapped Coordinate Readout in Bottom Left):**
+      - Replaced `CoordinatesFormatter::default()` with custom `CoordinatesFormatter::new` backed by a shared cell tracking the active snapped point.
+      - When snapped, the bottom-left coordinate display renders the exact **snapped value** (`x: ..., y: ... (Zero/Max/Min)`), rather than the raw hovering cursor coordinate.
+      - All workspace tests green (48/48); release binary compiled and verified.
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift

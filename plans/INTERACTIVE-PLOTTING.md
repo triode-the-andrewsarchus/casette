@@ -52,8 +52,9 @@ Defined in `crates/casette-kernel/src/protocol.rs`:
 ```rust
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExtremumKind {
-    Maximum,
     Minimum,
+    Maximum,
+    ZeroCrossing,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -87,37 +88,53 @@ The payload is carried in `WorkerResponse.plot_data`.
 
 ---
 
-## Kernel Extrema Detection Algorithm
+## Kernel Extrema & Zero-Crossing Detection Algorithm
 
 In `crates/casette-kernel/src/protocol.rs`, `compute_local_extrema(points: &[[f64; 2]])`:
-- Iterates over sampled interior points $p_i = (x_i, y_i)$ with neighbors $p_{i-1}$ and $p_{i+1}$.
-- Checks finite differences:
+- **Local Extrema (Peaks/Valleys):**
+  - Iterates over sampled interior points $p_i = (x_i, y_i)$ with neighbors $p_{i-1}$ and $p_{i+1}$.
   - If $y_i > y_{i-1}$ and $y_i > y_{i+1}$, classifies as `ExtremumKind::Maximum`.
   - If $y_i < y_{i-1}$ and $y_i < y_{i+1}$, classifies as `ExtremumKind::Minimum`.
-- Boundary edge cases: ignores endpoints to avoid false edge extrema.
+- **Zero-Crossings (Roots):**
+  - Evaluates consecutive sampled points $(p_{i-1}, p_i)$.
+  - If $y_{i-1} == 0$, records exact root at $(x_{i-1}, 0.0)$.
+  - If sign changes occur ($(y_{i-1} < 0 \land y_i > 0)$ or $(y_{i-1} > 0 \land y_i < 0)$) without singularity jumps ($|y_i - y_{i-1}| < 50$), calculates linearly interpolated root $x^* = x_{i-1} + \frac{-y_{i-1}}{y_i - y_{i-1}}(x_i - x_{i-1})$ and records `ExtremumKind::ZeroCrossing` at $(x^*, 0.0)$.
+  - Deduplicates adjacent roots against existing points within $10^{-5}$ tolerance.
+  - Sorts all key points along the horizontal X-axis.
 
 ---
 
-## GUI Interaction & Snapping Pipeline
+## GUI Interaction, Snapping & Scroll Isolation
 
 In `crates/casette-gui/src/render/interactive_plot.rs`:
 1. **Screen Proximity Metric:**
-   Extremum coordinate $x_{ext}$ is projected to screen coordinates via `plot_ui.screen_from_plot(PlotPoint::new(x, 0.0)).x`.
+   Key point coordinate $x_{ext}$ is projected to screen coordinates via `plot_ui.screen_from_plot(PlotPoint::new(x, 0.0)).x`.
    Screen distance $|x_{ext,screen} - x_{mouse,screen}|$ is measured against `SNAP_THRESHOLD_PX = 18.0`.
 2. **Snapping State & Feedback:**
-   - When snapped, the vertical crosshair aligns directly to the extremum.
+   - Snaps to peaks (`▲ Max`), valleys (`▼ Min`), and zero-crossings (`⨁ Zero`).
    - The intersection point radius expands from `4.5px` to `6.0px`.
-   - The coordinate pill displays `▲ Local Max: x = ..., y = ...` or `▼ Local Min: x = ..., y = ...`.
+   - Distinct marker glyphs and colors: Amber diamond for Maximum, Blue triangle for Minimum, Emerald circle for ZeroCrossing.
+   - The card coordinate badge displays:
+     - `▲ Local Max: x = ..., y = ...`
+     - `▼ Local Min: x = ..., y = ...`
+     - `⨁ Zero / Root: x = ..., y = 0`
    - An on-screen toggle button allows turning snapping ON or OFF.
-3. **Continuous Interpolation:**
+3. **Corner Readout Format:**
+   - Custom `CoordinatesFormatter` reads the active snapped target via a shared cell.
+   - When snapped to a point, the bottom-left coordinate display renders the **snapped value** (e.g. `x: 0.0000\ny: 0.0000 (Zero)` or `x: 1.5708\ny: 1.0000 (Max)`), rather than the raw hovering cursor coordinates.
+   - When not snapped, it renders the raw pointer coordinates `x: ..., y: ...`.
+4. **Scroll Isolation:**
+   - When the pointer is positioned over the plot canvas (`plot_resp.response.contains_pointer() || plot_resp.response.hovered()`), the plot consumes `smooth_scroll_delta` and `raw_scroll_delta` (`ui.ctx().input_mut(|i| ...)`).
+   - This prevents scroll wheel events over the plot from bubbling up and fighting with the outer tape `ScrollArea`.
+5. **Continuous Interpolation:**
    `interpolate_y(points, target_x)` uses binary search to locate the surrounding interval $[x_j, x_{j+1}]$ and performs linear interpolation for precise intersection coordinates, filtering out any non-finite sample values.
-4. **Intuitive Navigation & Zoom Controls:**
-   - `plot.allow_scroll(true)` enables natural mouse-wheel and trackpad pinch zooming directly over the plot.
+6. **Intuitive Navigation & Zoom Controls:**
+   - `plot.allow_scroll(true)` enables natural mouse-wheel and trackpad pinch navigation directly over the plot.
    - `plot.allow_double_click_reset(true)` resets bounds back to initial domain and range on double-click.
    - On-screen `[ ➕ ]` (zoom in 1.3x) and `[ ➖ ]` (zoom out 0.77x) buttons provide discoverable touch/click controls.
    - `[ ↺ Reset ]` button restores default view.
    - Header hints guide the user: `"Pan: drag · Zoom: scroll/[+][−] · Reset: double-click"`.
-5. **High-Contrast Dark-Mode Palette:**
+7. **High-Contrast Dark-Mode Palette:**
    - Curve line widths are rendered at `2.5px` for crisp HiDPI rendering.
    - Automatically detects and replaces Sage's default white-background dark blue (`[0, 0, 204]`) with vivid `#38BDF8` sky blue, emerald `#34D399`, amber `#FBBF24`, and lilac `#C084FC`.
 
