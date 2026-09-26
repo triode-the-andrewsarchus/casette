@@ -23,6 +23,7 @@ pub struct InteractivePlotState {
     pub initialized: bool,
     pub snap_enabled: bool,
     pub reset_requested: bool,
+    pub zoom_delta: Option<f32>,
 }
 
 impl Default for InteractivePlotState {
@@ -31,6 +32,7 @@ impl Default for InteractivePlotState {
             initialized: false,
             snap_enabled: true,
             reset_requested: false,
+            zoom_delta: None,
         }
     }
 }
@@ -135,6 +137,32 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                     state.snap_enabled = !state.snap_enabled;
                 }
 
+                // Zoom in button
+                if ui
+                    .button(
+                        RichText::new("➕")
+                            .font(FontId::new(11.0, FontFamily::Proportional))
+                            .color(Colors::TEXT_PRIMARY),
+                    )
+                    .on_hover_text("Zoom in (or scroll wheel up / pinch)")
+                    .clicked()
+                {
+                    state.zoom_delta = Some(1.3_f32);
+                }
+
+                // Zoom out button
+                if ui
+                    .button(
+                        RichText::new("➖")
+                            .font(FontId::new(11.0, FontFamily::Proportional))
+                            .color(Colors::TEXT_PRIMARY),
+                    )
+                    .on_hover_text("Zoom out (or scroll wheel down / pinch)")
+                    .clicked()
+                {
+                    state.zoom_delta = Some(0.77_f32);
+                }
+
                 // Reset view button
                 if ui
                     .button(
@@ -142,7 +170,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                             .font(FontId::new(11.0, FontFamily::Proportional))
                             .color(Colors::TEXT_SECONDARY),
                     )
-                    .on_hover_text("Reset plot view to initial domain and range")
+                    .on_hover_text("Reset plot view to initial domain and range (or double-click canvas)")
                     .clicked()
                 {
                     state.reset_requested = true;
@@ -161,7 +189,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         );
                     } else {
                         ui.label(
-                            RichText::new("Hover to inspect coordinates & extrema")
+                            RichText::new("Pan: drag · Zoom: scroll/[+][−] · Reset: double-click")
                                 .font(FontId::new(11.0, FontFamily::Proportional))
                                 .color(Colors::TEXT_MUTED)
                                 .italics(),
@@ -182,8 +210,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                 .width(available_width)
                 .allow_drag(true)
                 .allow_zoom(true)
+                .allow_scroll(true)
+                .allow_double_click_reset(true)
                 .allow_boxed_zoom(true)
-                .allow_scroll(false) // Keep session tape scroll responsive
                 .legend(Legend::default().position(Corner::RightTop))
                 .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default());
 
@@ -213,6 +242,16 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                     ));
                     state.initialized = true;
                     state.reset_requested = false;
+                } else if let Some(factor) = state.zoom_delta.take() {
+                    let bounds = plot_ui.plot_bounds();
+                    let center_x = (bounds.min()[0] + bounds.max()[0]) / 2.0;
+                    let center_y = (bounds.min()[1] + bounds.max()[1]) / 2.0;
+                    let half_w = (bounds.max()[0] - bounds.min()[0]) / 2.0 / (factor as f64);
+                    let half_h = (bounds.max()[1] - bounds.min()[1]) / 2.0 / (factor as f64);
+                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                        [center_x - half_w, center_y - half_h],
+                        [center_x + half_w, center_y + half_h],
+                    ));
                 }
 
                 // 2a. Draw curve lines & points
