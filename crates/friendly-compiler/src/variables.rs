@@ -55,6 +55,21 @@ pub fn is_plausible_variable(name: &str) -> bool {
     }
 }
 
+/// Returns true if `name` is a valid identifier that can be assigned to on the LHS of an assignment.
+///
+/// Unlike `is_plausible_variable`, this permits assigning to identifiers that match physical units
+/// (such as matrices named `A`, volumes named `V`, or custom variable names).
+#[must_use]
+pub fn is_assignable_variable(name: &str) -> bool {
+    if name.starts_with("__") || name == "__casette_tape_refs" {
+        return false;
+    }
+    match name.chars().next() {
+        Some(first) if is_ident_start(first) => !is_reserved(name),
+        _ => false,
+    }
+}
+
 /// Identifiers that are explicitly bound by the command (e.g. integration variable)
 /// are passed in `bound` so they are reported even though we'd otherwise also find
 /// them in the body — and so a plain `x` bound variable is always required even if

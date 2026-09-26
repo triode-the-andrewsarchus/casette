@@ -137,7 +137,11 @@ async fn test_kernel_boot_eval_ping() {
         .expect("eval solve units");
     assert!(solve_units.ok);
     let solve_plain = solve_units.plain.as_deref().unwrap_or("");
-    assert!(solve_plain.contains("sqrt(mile)"), "expected solve output to contain sqrt(mile), got: {}", solve_plain);
+    assert!(
+        solve_plain.contains("sqrt(mi)") || solve_plain.contains("sqrt(mile)"),
+        "expected solve output to contain sqrt(mi) or sqrt(mile), got: {}",
+        solve_plain
+    );
 
     let ratio_resp = kernel
         .eval("__casette_convert(50*km / (32*mi))", false, None)
@@ -154,7 +158,7 @@ async fn test_kernel_boot_eval_ping() {
     assert!(solve_ft_exact.ok);
     let exact_plain = solve_ft_exact.plain.as_deref().unwrap_or("");
     assert!(
-        exact_plain.contains("2714960/381*foot"),
+        exact_plain.contains("2714960/381*foot") || exact_plain.contains("2714960/381*ft"),
         "expected exact plain to have foot unit and fraction, got: {}",
         exact_plain
     );
@@ -173,13 +177,14 @@ async fn test_kernel_boot_eval_ping() {
     assert!(solve_ft_num.ok);
     let num_plain = solve_ft_num.plain.as_deref().unwrap_or("");
     assert!(
-        num_plain.contains("7125.87") && num_plain.contains("foot"),
+        num_plain.contains("7125.87") && (num_plain.contains("foot") || num_plain.contains("ft")),
         "expected numeric plain to contain approximation with foot unit, got: {}",
         num_plain
     );
     assert_eq!(solve_ft_num.primary_is_approx, Some(true));
     assert!(
-        solve_ft_num.exact_value.as_deref().unwrap_or("").contains("2714960/381*foot"),
+        solve_ft_num.exact_value.as_deref().unwrap_or("").contains("2714960/381*foot")
+            || solve_ft_num.exact_value.as_deref().unwrap_or("").contains("2714960/381*ft"),
         "expected exact_value to preserve original exact fraction with unit, got: {:?}",
         solve_ft_num.exact_value
     );
@@ -361,6 +366,131 @@ async fn test_kernel_interactive_plot_data() {
 
     // Also verify static artifacts are still produced for persistence/export
     assert!(resp.artifacts.iter().any(|a| a.r#type == "image"));
+
+    kernel.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn test_kernel_expanded_units_and_ohms_law() {
+    let env = SageDiscovery::discover().await.expect("discover sage");
+    let config = KernelConfig {
+        python_path: env.python_path,
+        worker_script: env.worker_script,
+        startup_timeout: Duration::from_secs(15),
+        default_eval_timeout: Duration::from_secs(30),
+        ..Default::default()
+    };
+
+    let kernel = SageKernel::launch(config).await.expect("launch kernel");
+
+    // 1. Ohm's Law: V / I = R (12V / 3A to ohm)
+    let resp = kernel
+        .eval("__casette_convert(12*V / (3*A), ohm)", false, None)
+        .await
+        .expect("eval 12V / 3A to ohm");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("4*ohm"));
+
+    // 2. Ohm's Law scaled: 10V / 2mA in kohm
+    let resp = kernel
+        .eval("__casette_convert(10*V / (2*mA), kohm)", false, None)
+        .await
+        .expect("eval 10V / 2mA in kohm");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("5*kohm"));
+
+    // 3. Ohm's Law: I * R = V (2A * 50ohm in V)
+    let resp = kernel
+        .eval("__casette_convert(2*A * 50*ohm, V)", false, None)
+        .await
+        .expect("eval 2A * 50ohm in V");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("100*V"));
+
+    // 4. Power: V * I = P (120V * 15A to kW)
+    let resp = kernel
+        .eval("__casette_convert(120*V * 15*A, kW)", false, None)
+        .await
+        .expect("eval 120V * 15A to kW");
+    assert!(resp.ok);
+    let plain = resp.plain.as_deref().unwrap_or("");
+    assert!(plain.contains("9/5*kW") || plain.contains("1.8*kW"));
+
+    // 5. Ohm's Law: V / R = I (10V / 2kohm in mA)
+    let resp = kernel
+        .eval("__casette_convert(10*V / (2*kohm), mA)", false, None)
+        .await
+        .expect("eval 10V / 2kohm in mA");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("5*mA"));
+
+    // 6. Automatic derived SI unit simplification without explicit target
+    let resp = kernel
+        .eval("__casette_convert(12*V / (3*A))", false, None)
+        .await
+        .expect("eval 12V / 3A auto simplify");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("4*ohm"));
+
+    let resp = kernel
+        .eval("__casette_convert(120*V * 15*A)", false, None)
+        .await
+        .expect("eval 120V * 15A auto simplify");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("1800*watt"));
+
+    // 7. Solving Ohm's law with units
+    let resp = kernel
+        .eval("var('R'); __casette_convert(solve(10*V == 2*A*R, R))", false, None)
+        .await
+        .expect("eval solve 10V = 2A * R");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("5*ohm"));
+
+    // 8. Volume conversions
+    let resp = kernel
+        .eval("__casette_convert(1*gal, L)", false, None)
+        .await
+        .expect("eval 1 gal in L");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("473176473/125000000000*L"));
+
+    let resp = kernel
+        .eval("__casette_convert(500*mL, L)", false, None)
+        .await
+        .expect("eval 500 mL in L");
+    assert!(resp.ok);
+    let plain = resp.plain.as_deref().unwrap_or("");
+    assert!(plain.contains("1/2*L") || plain.contains("1/2*liter") || plain.contains("0.5*L"));
+
+    let resp = kernel
+        .eval("__casette_convert(1*qt, pt)", false, None)
+        .await
+        .expect("eval 1 qt in pt");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("2*pt"));
+
+    // 9. Temperature conversions
+    let resp = kernel
+        .eval("__casette_convert(300*K, degC)", false, None)
+        .await
+        .expect("eval 300 K to degC");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("26.85"));
+
+    let resp = kernel
+        .eval("__casette_convert(100*degC, degF)", false, None)
+        .await
+        .expect("eval 100 degC in degF");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("212*fahrenheit"));
+
+    let resp = kernel
+        .eval("__casette_convert(212*degF, degC)", false, None)
+        .await
+        .expect("eval 212 degF to degC");
+    assert!(resp.ok);
+    assert!(resp.plain.as_deref().unwrap_or("").contains("100*celsius"));
 
     kernel.shutdown().await.expect("shutdown");
 }

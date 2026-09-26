@@ -1935,7 +1935,7 @@ fn bracketed_variable_list(text: &str) -> Option<Vec<String>> {
 
 fn matlab_matrix_shorthand(input: &str) -> Option<CompileResult> {
     if let Some(assignment) = split_equation(input) {
-        if variables::is_plausible_variable(&assignment.lhs) {
+        if variables::is_assignable_variable(&assignment.lhs) {
             let offset = utf8_offset(&assignment.rhs, input);
             let lhs = assignment.lhs.clone();
             if let Some(res) = matlab_matrix_generated_sage(&assignment.rhs, offset, &|m| {
@@ -1981,7 +1981,7 @@ fn matlab_matrix_generated_sage(
 
 fn simple_assignment_echo(input: &str) -> Option<CompileResult> {
     let assignment = split_equation(input)?;
-    if !variables::is_plausible_variable(&assignment.lhs) {
+    if !variables::is_assignable_variable(&assignment.lhs) {
         return None;
     }
     Some(CompileResult::Success {

@@ -524,84 +524,246 @@ def _install_casette_preloads(ns):
 def _install_casette_units(ns):
     """Register physical unit shortcuts and the __casette_convert runtime helper."""
     try:
+        import keyword
         import sage.symbolic.units as _u
 
-        unit_map = {
+        _u.evalunitdict()
+        unit_map = {}
+
+        # 1. Dynamically pull all base units from Sage's unitdict across all categories
+        for cat_name, u_dict in _u.unitdict.items():
+            if cat_name in ("si_prefixes", "unit_multipliers"):
+                continue
+            cat_obj = getattr(_u.units, cat_name, None)
+            if cat_obj is None:
+                continue
+            for u_name in u_dict:
+                if u_name == "1/second" or keyword.iskeyword(u_name):
+                    continue
+                try:
+                    u_obj = getattr(cat_obj, u_name)
+                    unit_map[u_name] = u_obj
+                    if not u_name.endswith("s") and not keyword.iskeyword(u_name + "s"):
+                        unit_map[u_name + "s"] = u_obj
+                        _u.unit_to_type[u_name + "s"] = cat_name
+                except Exception:
+                    pass
+
+        from sage.rings.rational_field import QQ
+
+        milli = QQ(1) / 1000
+        micro = QQ(1) / 1000000
+        nano = QQ(1) / 1000000000
+        pico = QQ(1) / 1000000000000
+        centi = QQ(1) / 100
+        deci = QQ(1) / 10
+        kilo = QQ(1000)
+        mega = QQ(1000000)
+        giga = QQ(1000000000)
+        tera = QQ(1000000000000)
+
+        # 2. Register standard SI prefixes and custom shorthands
+        custom_specs = [
+            # Electric Potential (volt)
+            ("electric_potential", [
+                ("V", 1), ("Volt", 1), ("Volts", 1), ("volts", 1),
+                ("nV", nano), ("uV", micro), ("microvolt", micro), ("microvolts", micro),
+                ("mV", milli), ("millivolt", milli), ("millivolts", milli),
+                ("kV", kilo), ("kilovolt", kilo), ("kilovolts", kilo),
+                ("MV", mega), ("megavolt", mega), ("megavolts", mega),
+            ]),
+            # Current (ampere)
+            ("current", [
+                ("A", 1), ("Amp", 1), ("Amps", 1), ("amp", 1), ("amps", 1), ("amperes", 1),
+                ("pA", pico), ("nA", nano), ("uA", micro), ("microamp", micro), ("microamps", micro),
+                ("mA", milli), ("milliamp", milli), ("milliamps", milli), ("milliampere", milli),
+                ("kA", kilo), ("kiloamp", kilo), ("kiloamps", kilo),
+            ]),
+            # Resistance (ohm)
+            ("resistance", [
+                ("Ohm", 1), ("Ohms", 1), ("ohms", 1),
+                ("mohm", milli), ("milliohm", milli), ("milliohms", milli),
+                ("kohm", kilo), ("kiloohm", kilo), ("kiloohms", kilo), ("kOhm", kilo), ("kOhms", kilo),
+                ("Mohm", mega), ("megaohm", mega), ("megaohms", mega), ("MOhm", mega), ("MOhms", mega),
+                ("Gohm", giga), ("gigaohm", giga), ("gigaohms", giga), ("GOhm", giga), ("GOhms", giga),
+            ]),
+            # Power (watt)
+            ("power", [
+                ("W", 1), ("Watt", 1), ("Watts", 1), ("watts", 1),
+                ("uW", micro), ("microwatt", micro), ("microwatts", micro),
+                ("mW", milli), ("milliwatt", milli), ("milliwatts", milli),
+                ("kW", kilo), ("kilowatt", kilo), ("kilowatts", kilo),
+                ("MW", mega), ("megawatt", mega), ("megawatts", mega),
+                ("GW", giga), ("gigawatt", giga), ("gigawatts", giga),
+                ("TW", tera), ("terawatt", tera),
+                ("hp", _u.unitdict["power"]["horsepower"]),
+            ]),
+            # Energy (joule)
+            ("energy", [
+                ("J", 1), ("Joule", 1), ("Joules", 1), ("joules", 1),
+                ("mJ", milli), ("millijoule", milli), ("millijoules", milli),
+                ("kJ", kilo), ("kilojoule", kilo), ("kilojoules", kilo),
+                ("MJ", mega), ("megajoule", mega), ("megajoules", mega),
+                ("GJ", giga), ("gigajoule", giga), ("gigajoules", giga),
+                ("Wh", 3600), ("watt_hour", 3600), ("watt_hours", 3600),
+                ("kWh", 3600000), ("kilowatt_hour", 3600000), ("kilowatt_hours", 3600000),
+                ("MWh", 3600000000), ("megawatt_hour", 3600000000),
+                ("cal", QQ(10467) / 2500), ("calorie", QQ(10467) / 2500), ("calories", QQ(10467) / 2500),
+                ("kcal", QQ(20934) / 5), ("kilocalorie", QQ(20934) / 5), ("kilocalories", QQ(20934) / 5),
+                ("eV", _u.unitdict["energy"]["electron_volt"]),
+            ]),
+            # Volume (liter)
+            ("volume", [
+                ("L", 1), ("l", 1), ("Liter", 1), ("Liters", 1), ("liters", 1), ("litre", 1), ("litres", 1),
+                ("uL", micro), ("ul", micro), ("microliter", micro), ("microliters", micro),
+                ("mL", milli), ("ml", milli), ("milliliter", milli), ("milliliters", milli),
+                ("cL", centi), ("cl", centi), ("centiliter", centi), ("centiliters", centi),
+                ("dL", deci), ("dl", deci), ("deciliter", deci), ("deciliters", deci),
+                ("gal", _u.unitdict["volume"]["gallon"]), ("gals", _u.unitdict["volume"]["gallon"]),
+                ("Gallon", _u.unitdict["volume"]["gallon"]), ("Gallons", _u.unitdict["volume"]["gallon"]), ("gallons", _u.unitdict["volume"]["gallon"]),
+                ("qt", _u.unitdict["volume"]["quart"]), ("qts", _u.unitdict["volume"]["quart"]), ("quarts", _u.unitdict["volume"]["quart"]),
+                ("pt", _u.unitdict["volume"]["pint"]), ("pts", _u.unitdict["volume"]["pint"]), ("pints", _u.unitdict["volume"]["pint"]),
+                ("cups", _u.unitdict["volume"]["cup"]),
+                ("floz", _u.unitdict["volume"]["fluid_ounce"]), ("fluid_ounces", _u.unitdict["volume"]["fluid_ounce"]),
+                ("tbsp", _u.unitdict["volume"]["tablespoon"]), ("tablespoons", _u.unitdict["volume"]["tablespoon"]),
+                ("tsp", _u.unitdict["volume"]["teaspoon"]), ("teaspoons", _u.unitdict["volume"]["teaspoon"]),
+            ]),
+            # Frequency (hertz)
+            ("frequency", [
+                ("Hz", 1),
+                ("kHz", kilo), ("kilohertz", kilo),
+                ("MHz", mega), ("megahertz", mega),
+                ("GHz", giga), ("gigahertz", giga),
+                ("THz", tera), ("terahertz", tera),
+            ]),
+            # Capacitance (farad)
+            ("capacitance", [
+                ("F", 1), ("farads", 1),
+                ("mF", milli), ("millifarad", milli), ("millifarads", milli),
+                ("uF", micro), ("microfarad", micro), ("microfarads", micro),
+                ("nF", nano), ("nanofarad", nano), ("nanofarads", nano),
+                ("pF", pico), ("picofarad", pico), ("picofarads", pico),
+            ]),
+            # Inductance (henry)
+            ("inductance", [
+                ("H", 1), ("henries", 1), ("henrys", 1),
+                ("mH", milli), ("millihenry", milli), ("millihenries", milli),
+                ("uH", micro), ("microhenry", micro), ("microhenries", micro),
+                ("nH", nano), ("nanohenry", nano), ("nanohenries", nano),
+            ]),
+            # Charge (coulomb)
+            ("charge", [
+                ("C", 1), ("coulombs", 1),
+                ("mC", milli), ("millicoulomb", milli),
+                ("uC", micro), ("microcoulomb", micro),
+                ("nC", nano), ("nanocoulomb", nano),
+                ("pC", pico), ("picocoulomb", pico),
+            ]),
+            # Conductance (siemens)
+            ("conductance", [
+                ("S", 1), ("mho", 1), ("mhos", 1),
+            ]),
+            # Magnetic
+            ("magnetic_field", [
+                ("T", 1), ("teslas", 1),
+                ("mT", milli), ("uT", micro),
+                ("G", _u.unitdict["magnetic_field"]["gauss"]),
+            ]),
+            ("magnetic_flux", [
+                ("Wb", 1), ("webers", 1),
+            ]),
+            # Force & Pressure
+            ("force", [
+                ("N", 1), ("newtons", 1),
+                ("mN", milli), ("kN", kilo), ("kilonewton", kilo), ("kilonewtons", kilo),
+                ("MN", mega),
+            ]),
+            ("pressure", [
+                ("Pa", 1), ("pascals", 1),
+                ("hPa", 100), ("hectopascal", 100),
+                ("kPa", kilo), ("kilopascal", kilo), ("kilopascals", kilo),
+                ("MPa", mega), ("megapascal", mega), ("megapascals", mega),
+                ("GPa", giga), ("gigapascal", giga),
+                ("bars", 100000), ("mbar", 100), ("millibar", 100), ("millibars", 100),
+            ]),
             # Length
-            "m": _u.units.length.meter,
-            "meter": _u.units.length.meter,
-            "meters": _u.units.length.meter,
-            "km": _u.units.length.kilometer,
-            "kilometer": _u.units.length.kilometer,
-            "kilometers": _u.units.length.kilometer,
-            "cm": _u.units.length.centimeter,
-            "centimeter": _u.units.length.centimeter,
-            "mm": _u.units.length.millimeter,
-            "millimeter": _u.units.length.millimeter,
-            "mi": _u.units.length.mile,
-            "mile": _u.units.length.mile,
-            "miles": _u.units.length.mile,
-            "ft": _u.units.length.foot,
-            "foot": _u.units.length.foot,
-            "feet": _u.units.length.foot,
-            "inch": _u.units.length.inch,
-            "inches": _u.units.length.inch,
-            "yd": _u.units.length.yard,
-            "yard": _u.units.length.yard,
-            "yards": _u.units.length.yard,
-            # Time
-            "s": _u.units.time.second,
-            "sec": _u.units.time.second,
-            "second": _u.units.time.second,
-            "seconds": _u.units.time.second,
-            "ms": _u.units.time.second * (1 / 1000),
-            "min": _u.units.time.minute,
-            "minute": _u.units.time.minute,
-            "minutes": _u.units.time.minute,
-            "hr": _u.units.time.hour,
-            "hour": _u.units.time.hour,
-            "hours": _u.units.time.hour,
-            "day": _u.units.time.day,
-            "days": _u.units.time.day,
-            "yr": _u.units.time.year,
-            "year": _u.units.time.year,
+            ("length", [
+                ("m", 1), ("meters", 1), ("metre", 1), ("metres", 1),
+                ("km", kilo), ("kilometers", kilo),
+                ("cm", centi), ("centimeters", centi),
+                ("mm", milli), ("millimeters", milli),
+                ("um", micro), ("micron", micro), ("microns", micro),
+                ("nm", nano), ("nanometer", nano), ("nanometers", nano),
+                ("pm", pico),
+                ("inch", _u.unitdict["length"]["inch"]), ("inches", _u.unitdict["length"]["inch"]),
+                ("ft", _u.unitdict["length"]["foot"]), ("feet", _u.unitdict["length"]["foot"]),
+                ("yd", _u.unitdict["length"]["yard"]), ("yards", _u.unitdict["length"]["yard"]),
+                ("mi", _u.unitdict["length"]["mile"]), ("miles", _u.unitdict["length"]["mile"]),
+                ("nmi", _u.unitdict["length"]["nautical_mile"]),
+                ("ly", _u.unitdict["length"]["light_year"]), ("light_year", _u.unitdict["length"]["light_year"]), ("light_years", _u.unitdict["length"]["light_year"]),
+                ("au", _u.unitdict["length"]["astronomical_unit"]), ("astronomical_unit", _u.unitdict["length"]["astronomical_unit"]),
+            ]),
             # Mass
-            "kg": _u.units.mass.kilogram,
-            "kilogram": _u.units.mass.kilogram,
-            "kilograms": _u.units.mass.kilogram,
-            "g": _u.units.mass.gram,
-            "gram": _u.units.mass.gram,
-            "grams": _u.units.mass.gram,
-            "mg": _u.units.mass.gram * (1 / 1000),
-            "lb": _u.units.mass.pound,
-            "lbs": _u.units.mass.pound,
-            "pound": _u.units.mass.pound,
-            "pounds": _u.units.mass.pound,
-            "oz": _u.units.mass.avoirdupois_ounce,
-            "ounce": _u.units.mass.avoirdupois_ounce,
-            # Force, Work, Power, Pressure
-            "newton": _u.units.force.newton,
-            "newtons": _u.units.force.newton,
-            "J": _u.units.energy.joule,
-            "joule": _u.units.energy.joule,
-            "W": _u.units.power.watt,
-            "watt": _u.units.power.watt,
-            "kW": _u.units.power.watt * 1000,
-            "Pa": _u.units.pressure.pascal,
-            "pascal": _u.units.pressure.pascal,
-            "bar": _u.units.pressure.bar,
-            "atm": _u.units.pressure.atmosphere,
-            "psi": _u.units.pressure.psi,
-            # Speed & Angles
-            "mph": _u.units.length.mile / _u.units.time.hour,
-            "kph": _u.units.length.kilometer / _u.units.time.hour,
-            "deg": _u.units.angles.degree,
-            "degree": _u.units.angles.degree,
-            "degrees": _u.units.angles.degree,
-            "rad": _u.units.angles.radian,
-            "radian": _u.units.angles.radian,
-            "radians": _u.units.angles.radian,
-        }
+            ("mass", [
+                ("g", 1), ("grams", 1),
+                ("kg", kilo), ("kilograms", kilo),
+                ("mg", milli), ("milligram", milli), ("milligrams", milli),
+                ("ug", micro), ("microgram", micro), ("micrograms", micro),
+                ("lb", _u.unitdict["mass"]["pound"]), ("lbs", _u.unitdict["mass"]["pound"]), ("pounds", _u.unitdict["mass"]["pound"]),
+                ("oz", _u.unitdict["mass"]["avoirdupois_ounce"]), ("ounces", _u.unitdict["mass"]["avoirdupois_ounce"]),
+                ("ton", _u.unitdict["mass"]["short_ton"]), ("tons", _u.unitdict["mass"]["short_ton"]),
+                ("tonne", _u.unitdict["mass"]["metric_ton"]), ("tonnes", _u.unitdict["mass"]["metric_ton"]),
+            ]),
+            # Time
+            ("time", [
+                ("s", 1), ("sec", 1), ("seconds", 1),
+                ("ms", milli), ("millisecond", milli), ("milliseconds", milli),
+                ("us", micro), ("microsecond", micro), ("microseconds", micro),
+                ("ns", nano), ("nanosecond", nano), ("nanoseconds", nano),
+                ("min", 60), ("minutes", 60),
+                ("hr", 3600), ("hours", 3600),
+                ("day", 86400), ("days", 86400),
+                ("wk", 604800), ("week", 604800),
+                ("yr", 31557600), ("years", 31557600),
+            ]),
+            # Amount of substance
+            ("amount_of_substance", [
+                ("mol", 1), ("moles", 1), ("mmol", 1 / 1000),
+            ]),
+            # Luminous
+            ("luminous_intensity", [
+                ("cd", 1), ("candelas", 1),
+            ]),
+            ("luminous_flux", [
+                ("lm", 1), ("lumens", 1),
+            ]),
+            ("illuminance", [
+                ("lx", 1),
+            ]),
+            # Angles
+            ("angles", [
+                ("rad", 1), ("radians", 1),
+                ("deg", "1/180*pi"), ("degree", "1/180*pi"), ("degrees", "1/180*pi"),
+            ]),
+        ]
+
+        for cat_name, aliases in custom_specs:
+            for alias, scale in aliases:
+                if keyword.iskeyword(alias):
+                    continue
+                _u.unitdict[cat_name][alias] = scale
+                _u.unit_to_type[alias] = cat_name
+                unit_map[alias] = _u.str_to_unit(alias)
+
+        unit_map["in"] = unit_map["inch"]
+        unit_map["mph"] = unit_map["mile"] / unit_map["hour"]
+        unit_map["kph"] = unit_map["kilometer"] / unit_map["hour"]
+        unit_map["K"] = _u.units.temperature.kelvin
+        unit_map["Kelvin"] = _u.units.temperature.kelvin
+        unit_map["kelvins"] = _u.units.temperature.kelvin
+        unit_map["degC"] = _u.units.temperature.celsius
+        unit_map["degF"] = _u.units.temperature.fahrenheit
+
         ns.update(unit_map)
         ns["__casette_units"] = unit_map
 
@@ -609,12 +771,29 @@ def _install_casette_units(ns):
             "length": _u.units.length.meter,
             "time": _u.units.time.second,
             "mass": _u.units.mass.kilogram,
-            "electric_current": _u.units.current.ampere,
+            "current": _u.units.current.ampere,
             "temperature": _u.units.temperature.kelvin,
             "amount_of_substance": _u.units.amount_of_substance.mole,
             "luminous_intensity": _u.units.luminous_intensity.candela,
             "angles": _u.units.angles.radian,
         }
+
+        _DERIVED_SI_TARGETS = [
+            _u.units.resistance.ohm,
+            _u.units.electric_potential.volt,
+            _u.units.current.ampere,
+            _u.units.power.watt,
+            _u.units.energy.joule,
+            _u.units.force.newton,
+            _u.units.pressure.pascal,
+            _u.units.charge.coulomb,
+            _u.units.capacitance.farad,
+            _u.units.frequency.hertz,
+            _u.units.inductance.henry,
+            _u.units.conductance.siemens,
+            _u.units.magnetic_flux.weber,
+            _u.units.magnetic_field.tesla,
+        ]
 
         def _casette_approx(expr, *args, **kwargs):
             if isinstance(expr, (list, tuple)):
@@ -696,6 +875,12 @@ def _install_casette_units(ns):
                                 return _u.convert(expr, target)
                             except Exception:
                                 pass
+                        else:
+                            for tgt in _DERIVED_SI_TARGETS:
+                                try:
+                                    return _u.convert(expr, tgt)
+                                except Exception:
+                                    pass
             except Exception:
                 pass
             return expr

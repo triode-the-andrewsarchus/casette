@@ -414,3 +414,82 @@ fn test_bare_unit_expressions() {
         panic!("expected success for bare unit ratio, got: {:?}", res);
     }
 }
+
+#[test]
+fn test_ohms_law_and_electric_units() {
+    // V / I to ohm
+    let res1 = compile("12V / 3A to ohm");
+    if let CompileResult::Success { generated_sage, .. } = res1 {
+        assert_eq!(generated_sage, "__casette_convert((12*V) / (3*A), ohm)");
+    } else {
+        panic!("expected success for 12V / 3A to ohm, got: {:?}", res1);
+    }
+
+    // 10V / 2mA in kohm
+    let res2 = compile("10V / 2mA in kohm");
+    if let CompileResult::Success { generated_sage, .. } = res2 {
+        assert_eq!(generated_sage, "__casette_convert((10*V) / (2*mA), kohm)");
+    } else {
+        panic!("expected success for 10V / 2mA in kohm, got: {:?}", res2);
+    }
+
+    // 2A * 50ohm in V
+    let res3 = compile("2A * 50ohm in V");
+    if let CompileResult::Success { generated_sage, .. } = res3 {
+        assert_eq!(generated_sage, "__casette_convert((2*A) * (50*ohm), V)");
+    } else {
+        panic!("expected success for 2A * 50ohm in V, got: {:?}", res3);
+    }
+
+    // 120V * 15A to kW
+    let res4 = compile("120V * 15A to kW");
+    if let CompileResult::Success { generated_sage, .. } = res4 {
+        assert_eq!(generated_sage, "__casette_convert((120*V) * (15*A), kW)");
+    } else {
+        panic!("expected success for 120V * 15A to kW, got: {:?}", res4);
+    }
+
+    // solve 10V = 2A * R for R
+    let res5 = compile("solve 10V = 2A * R for R");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res5
+    {
+        assert_eq!(generated_sage, "solve((10*V) == (2*A) * R, R)");
+        assert_eq!(required_variables, vec!["R"]);
+    } else {
+        panic!("expected success for solve 10V = 2A * R for R, got: {:?}", res5);
+    }
+}
+
+#[test]
+fn test_volume_and_temperature_units() {
+    let res_gal = compile("1 gal in L");
+    if let CompileResult::Success { generated_sage, .. } = res_gal {
+        assert_eq!(generated_sage, "__casette_convert((1*gal), L)");
+    } else {
+        panic!("expected success for 1 gal in L, got: {:?}", res_gal);
+    }
+
+    let res_ml = compile("500 mL in L");
+    if let CompileResult::Success { generated_sage, .. } = res_ml {
+        assert_eq!(generated_sage, "__casette_convert((500*mL), L)");
+    } else {
+        panic!("expected success for 500 mL in L, got: {:?}", res_ml);
+    }
+
+    let res_temp = compile("300 K to degC");
+    if let CompileResult::Success { generated_sage, .. } = res_temp {
+        assert_eq!(generated_sage, "__casette_convert((300*K), degC)");
+    } else {
+        panic!("expected success for 300 K to degC, got: {:?}", res_temp);
+    }
+
+    let res_temp2 = compile("100 degC in degF");
+    if let CompileResult::Success { generated_sage, .. } = res_temp2 {
+        assert_eq!(generated_sage, "__casette_convert((100*degC), degF)");
+    } else {
+        panic!("expected success for 100 degC in degF, got: {:?}", res_temp2);
+    }
+}
