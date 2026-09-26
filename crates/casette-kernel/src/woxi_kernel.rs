@@ -890,17 +890,31 @@ fn desugar_bare_plot(body: &str) -> Option<String> {
         }
     };
 
-    if let Some(eq_idx) = range_part.find('=') {
+    let (var, min, max) = if let Some(eq_idx) = range_part.find('=') {
         let var = range_part[..eq_idx].trim();
         let rest = &range_part[eq_idx + 1..];
         if let Some(dot_idx) = rest.find("..") {
             let min = rest[..dot_idx].trim();
             let max = rest[dot_idx + 2..].trim();
-            if !var.is_empty() && !min.is_empty() && !max.is_empty() {
-                let converted_expr = convert_function_calls(expr);
-                return Some(format!("Plot[{}, {{{}, {}, {}}}]", converted_expr, var, min, max));
-            }
+            (var, min, max)
+        } else {
+            return None;
         }
+    } else if let Some(dot_idx) = range_part.find("..") {
+        let min = range_part[..dot_idx].trim();
+        let max = range_part[dot_idx + 2..].trim();
+        ("x", min, max)
+    } else {
+        return None;
+    };
+
+    if !var.is_empty() && !min.is_empty() && !max.is_empty() {
+        let converted_expr = if expr.starts_with('#') && expr[1..].chars().all(|c| c.is_ascii_digit()) {
+            format!("__casette_tape_refs[{}]", &expr[1..])
+        } else {
+            convert_function_calls(expr)
+        };
+        return Some(format!("Plot[{}, {{{}, {}, {}}}]", converted_expr, var, min, max));
     }
 
     None
@@ -912,6 +926,10 @@ fn convert_plot_args(inner: &str) -> String {
 
     for arg in args {
         let trimmed = arg.trim();
+        if trimmed.starts_with('#') && trimmed[1..].chars().all(|c| c.is_ascii_digit()) {
+            converted_args.push(format!("__casette_tape_refs[{}]", &trimmed[1..]));
+            continue;
+        }
         if trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() >= 2 {
             let inner_arg = &trimmed[1..trimmed.len() - 1];
             // Check if inner_arg contains a comma at depth 0 (meaning it was a tuple)

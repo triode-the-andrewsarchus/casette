@@ -162,5 +162,59 @@ async fn test_woxi_interactive_plot_data() {
     assert_eq!(bare_resp.kind.as_deref(), Some("plot"));
     assert!(bare_resp.plot_data.is_some(), "expected plot_data from bare plot command");
 
+    // Test plotting a prior result via tape reference:
+    // 1. Evaluate integrate
+    let int_resp = kernel
+        .eval("integrate(1/(1-x^2), x)", false, None)
+        .await
+        .expect("int eval");
+    assert!(int_resp.ok);
+    let _int_expr = int_resp.plain.unwrap();
+    // 2. Assign to __casette_tape_refs[3] using normalize_for_woxi output
+    let norm = casette_kernel::normalize_for_woxi("integrate(1/(1-x^2), x)");
+    let assign_code = format!("__casette_tape_refs[3] = ({norm});");
+    let assign_resp = kernel.eval(&assign_code, false, None).await.expect("assign");
+    assert!(assign_resp.ok);
+    let check_ref = kernel.eval("__casette_tape_refs[3]", false, None).await.expect("check ref");
+    println!("__casette_tape_refs[3] value: {:?}", check_ref.plain);
+    // 3. Plot __casette_tape_refs[3]
+    let plot_tape_resp = kernel
+        .eval("plot(__casette_tape_refs[3], (x, -10, 10))", false, None)
+        .await
+        .expect("plot tape ref");
+    assert!(plot_tape_resp.ok, "plot tape ref failed: {:?}", plot_tape_resp);
+    assert_eq!(plot_tape_resp.kind.as_deref(), Some("plot"));
+    let plot_data = plot_tape_resp.plot_data.as_ref().unwrap();
+    println!("Series count: {}", plot_data.series.len());
+    println!("Points count: {}", plot_data.series[0].points.len());
+    println!("x_range: {:?}, y_range: {:?}", plot_data.x_range, plot_data.y_range);
+    let finite_points: Vec<_> = plot_data.series[0].points.iter().filter(|p| p[1].is_finite()).collect();
+    println!("Finite points count: {}", finite_points.len());
+    if !finite_points.is_empty() {
+        println!("Sample finite point: {:?}", finite_points[0]);
+    }
+    assert!(
+        plot_tape_resp.plot_data.is_some(),
+        "expected plot_data when plotting tape reference"
+    );
+
+    // 4. Test plotting with direct #3 syntax: "plot #3, x=-10..10"
+    let bare_resp = kernel
+        .eval("plot #3, x=-10..10", false, None)
+        .await
+        .expect("bare #3 plot");
+    assert!(bare_resp.ok, "bare #3 plot failed: {:?}", bare_resp);
+    assert_eq!(bare_resp.kind.as_deref(), Some("plot"));
+    assert!(bare_resp.plot_data.is_some());
+
+    // 5. Test plotting with comma-free #3 syntax: "plot #3 x=-10..10"
+    let commafree_resp = kernel
+        .eval("plot #3 x=-10..10", false, None)
+        .await
+        .expect("commafree #3 plot");
+    assert!(commafree_resp.ok, "commafree #3 plot failed: {:?}", commafree_resp);
+    assert_eq!(commafree_resp.kind.as_deref(), Some("plot"));
+    assert!(commafree_resp.plot_data.is_some());
+
     kernel.shutdown().await.expect("shutdown");
 }

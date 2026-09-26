@@ -46,13 +46,18 @@ pub fn interpolate_y(points: &[[f64; 2]], target_x: f64) -> Option<f64> {
 
     // Binary search for the segment enclosing target_x
     let idx = match points.binary_search_by(|p| p[0].partial_cmp(&target_x).unwrap_or(std::cmp::Ordering::Equal)) {
-        Ok(exact) => return Some(points[exact][1]),
+        Ok(exact) => {
+            let y = points[exact][1];
+            return if y.is_finite() { Some(y) } else { None };
+        }
         Err(insert_idx) => {
             if insert_idx == 0 {
-                return Some(points[0][1]);
+                let y = points[0][1];
+                return if y.is_finite() { Some(y) } else { None };
             }
             if insert_idx >= points.len() {
-                return Some(points[points.len() - 1][1]);
+                let y = points[points.len() - 1][1];
+                return if y.is_finite() { Some(y) } else { None };
             }
             insert_idx - 1
         }
@@ -60,12 +65,24 @@ pub fn interpolate_y(points: &[[f64; 2]], target_x: f64) -> Option<f64> {
 
     let p0 = points[idx];
     let p1 = points[idx + 1];
+    if !p0[1].is_finite() || !p1[1].is_finite() {
+        return None;
+    }
     let dx = p1[0] - p0[0];
     if dx.abs() < 1e-12 {
-        Some(p0[1])
+        if p0[1].is_finite() {
+            Some(p0[1])
+        } else {
+            None
+        }
     } else {
         let t = (target_x - p0[0]) / dx;
-        Some(p0[1] + t * (p1[1] - p0[1]))
+        let y = p0[1] + t * (p1[1] - p0[1]);
+        if y.is_finite() {
+            Some(y)
+        } else {
+            None
+        }
     }
 }
 
@@ -172,9 +189,27 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
 
             plot.show(ui, |plot_ui| {
                 if !state.initialized || state.reset_requested {
+                    let min_x = if plot_data.x_range[0].is_finite() {
+                        plot_data.x_range[0]
+                    } else {
+                        -10.0
+                    };
+                    let max_x = if plot_data.x_range[1].is_finite() {
+                        plot_data.x_range[1]
+                    } else {
+                        10.0
+                    };
+                    let (min_y, max_y) = if plot_data.y_range[0].is_finite()
+                        && plot_data.y_range[1].is_finite()
+                        && plot_data.y_range[0] < plot_data.y_range[1]
+                    {
+                        (plot_data.y_range[0], plot_data.y_range[1])
+                    } else {
+                        (-5.0, 5.0)
+                    };
                     plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                        [plot_data.x_range[0], plot_data.y_range[0]],
-                        [plot_data.x_range[1], plot_data.y_range[1]],
+                        [min_x, min_y],
+                        [max_x, max_y],
                     ));
                     state.initialized = true;
                     state.reset_requested = false;
@@ -200,21 +235,68 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         .unwrap_or_else(|| format!("y_{{{}}}", s_idx + 1));
 
                     if series.is_scatter {
-                        plot_ui.points(
-                            Points::new(series.points.clone())
-                                .name(line_name)
-                                .color(line_color)
-                                .radius(3.0_f32)
-                                .shape(MarkerShape::Circle),
-                        );
+                        let finite_pts: Vec<[f64; 2]> = series
+                            .points
+                            .iter()
+                            .copied()
+                            .filter(|pt| pt[0].is_finite() && pt[1].is_finite())
+                            .collect();
+                        if !finite_pts.is_empty() {
+                            plot_ui.points(
+                                Points::new(finite_pts)
+                                    .name(line_name)
+                                    .color(line_color)
+                                    .radius(3.0_f32)
+                                    .shape(MarkerShape::Circle),
+                            );
+                        }
                     } else {
-                        let line_points = PlotPoints::new(series.points.clone());
-                        plot_ui.line(
-                            Line::new(line_points)
-                                .name(line_name)
-                                .color(line_color)
-                                .width(2.0_f32),
-                        );
+                        // Split into contiguous segments of finite points so NaN coordinates never
+                        // break tessellation or cull the entire curve!
+                        let mut current_segment = Vec::new();
+                        let mut drawn_any = false;
+                        for pt in &series.points {
+                            if pt[0].is_finite() && pt[1].is_finite() {
+                                current_segment.push(*pt);
+                            } else if !current_segment.is_empty() {
+                                let seg = std::mem::take(&mut current_segment);
+                                if seg.len() >= 2 {
+                                    let mut line = Line::new(PlotPoints::new(seg))
+                                        .color(line_color)
+                                        .width(2.0_f32);
+                                    if !drawn_any {
+                                        line = line.name(line_name.clone());
+                                        drawn_any = true;
+                                    }
+                                    plot_ui.line(line);
+                                } else if seg.len() == 1 {
+                                    plot_ui.points(
+                                        Points::new(seg)
+                                            .color(line_color)
+                                            .radius(2.0_f32)
+                                            .shape(MarkerShape::Circle),
+                                    );
+                                }
+                            }
+                        }
+                        if !current_segment.is_empty() {
+                            if current_segment.len() >= 2 {
+                                let mut line = Line::new(PlotPoints::new(current_segment))
+                                    .color(line_color)
+                                    .width(2.0_f32);
+                                if !drawn_any {
+                                    line = line.name(line_name.clone());
+                                }
+                                plot_ui.line(line);
+                            } else if current_segment.len() == 1 {
+                                plot_ui.points(
+                                    Points::new(current_segment)
+                                        .color(line_color)
+                                        .radius(2.0_f32)
+                                        .shape(MarkerShape::Circle),
+                                );
+                            }
+                        }
                     }
 
                     // 2b. Draw subtle markers for local extrema

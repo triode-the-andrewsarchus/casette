@@ -194,6 +194,13 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
         - Initialized initial domain and range bounds on first frame (`!state.initialized`).
         - Replaced crosshair guidelines with native `egui_plot::VLine` and `egui_plot::HLine` infinite reference items which are explicitly ignored in auto-bounding.
         - Excluded plot commands from `extract_reusable_expression` in `crates/casette-gui/src/main.rs`, eliminating Woxi `Set::write: Tag Times ... is Protected` warnings.
+      - Supported plotting prior results via `#ROW` tape references (e.g. `plot #3, x=-10..10`, `plot #3 x=-10..10`):
+        - Resolved missing curve rendering caused by coarse tessellation culling: functions with complex branch cuts (such as $\int \frac{1}{1-x^2} dx = \frac{1}{2}\log(1+x) - \frac{1}{2}\log(1-x)$ evaluated on $|x| > 1$) return `NaN` outside their real domain. Passing `NaN` vertices into `egui_plot::Line` caused egui's path bounding rect to evaluate to `NaN`, failing coarse intersection culling and dropping the entire line.
+        - Segmented sampled curves into contiguous finite slices (`x.is_finite() && y.is_finite()`), allowing all real domain sections to render cleanly while cleanly skipping out-of-domain regions.
+        - Hardened `interpolate_y` to reject non-finite samples so cursor crosshairs and coordinate badges never display `NaN`.
+        - Added `#ROW` reference desugaring to `casette-kernel::desugar_bare_plot` and `convert_plot_args` (`#3` -> `__casette_tape_refs[3]`), providing direct kernel-level execution alongside compiler-level lowering.
+        - Synchronized `TapeRow::reusable_expression` in `casette-gui::model` to exclude graphical plot commands, preventing plots from polluting tape reference tables.
+        - Added automated end-to-end integration tests for `integrate` followed by `#ROW` plotting in `woxi_kernel_tests.rs`. All workspace tests pass.
       - Documented complete architecture in [`plans/INTERACTIVE-PLOTTING.md`](plans/INTERACTIVE-PLOTTING.md) and indexed in `PLAN.md`.
       - Added automated tests in `crates/casette-kernel/tests/woxi_kernel_tests.rs` and `friendly_compiler_tests.rs`. All workspace tests pass cleanly.
 

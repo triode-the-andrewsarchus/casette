@@ -104,6 +104,20 @@ In `crates/casette-gui/src/render/interactive_plot.rs`:
    - The coordinate pill displays `▲ Local Max: x = ..., y = ...` or `▼ Local Min: x = ..., y = ...`.
    - An on-screen toggle button allows turning snapping ON or OFF.
 3. **Continuous Interpolation:**
-   `interpolate_y(points, target_x)` uses binary search to locate the surrounding interval $[x_j, x_{j+1}]$ and performs linear interpolation for precise intersection coordinates.
+   `interpolate_y(points, target_x)` uses binary search to locate the surrounding interval $[x_j, x_{j+1}]$ and performs linear interpolation for precise intersection coordinates, filtering out any non-finite sample values.
 4. **Tape Scroll Harmony:**
    `plot.allow_scroll(false)` ensures the session tape scrolls smoothly without the cursor getting caught in the plot widget during normal page scrolling. Zooming can still be done via boxed zoom or drag.
+
+---
+
+## Tape Reference Plotting & Domain Singularity Slicing
+
+When referencing prior row results (e.g. `plot #3, x=-10..10` where row #3 was `integrate 1/(1-x^2)`):
+1. **Tape Lowering:**
+   - Tape references `#ROW` are expanded into `__casette_tape_refs[ROW]` via `friendly_compiler::compile_with_refs` and `casette_kernel::desugar_bare_plot`.
+   - The evaluated result of row #3 (or its algebraic definition) is registered as a native Woxi DownValue `__casette_tape_refs[3] = (...)`.
+   - Woxi's `Plot` resolves held DownValues symbolically before sampling (`eval_body_var_symbolic`).
+2. **Contiguous Finite Segment Slicing:**
+   - Functions like $\int \frac{1}{1-x^2} dx = \frac{1}{2}\log(1+x) - \frac{1}{2}\log(1-x)$ have a real domain restricted to $(-1, 1)$. For $|x| > 1$, function values are complex and evaluate to `NaN` in real sampling.
+   - Passing vertices with `NaN` coordinates directly into `egui_plot::Line` causes `epaint`'s `coarse_tessellation_culling` to cull the entire shape due to `NaN` bounding boxes.
+   - `render_interactive_plot_card` partitions sampled points into contiguous finite segments (`x.is_finite() && y.is_finite()`). Only valid real segments are drawn, faithfully rendering the curve within its real domain while cleanly omitting out-of-domain regions.
