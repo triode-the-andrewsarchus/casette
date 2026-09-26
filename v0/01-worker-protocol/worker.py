@@ -859,12 +859,12 @@ def _extract_plot_data(plot_obj):
         xmin, xmax, ymin, ymax = -10.0, 10.0, -10.0, 10.0
 
     palette = [
-        [56, 139, 255],   # Primary Accent Blue (#388BFF)
-        [63, 185, 80],    # Emerald Green (#3FB950)
-        [210, 153, 34],   # Amber (#D29922)
-        [188, 140, 255],  # Purple (#BC8CFF)
-        [248, 81, 73],    # Coral Red (#F85149)
-        [88, 166, 255],   # Light Blue (#58A6FF)
+        [56, 189, 248],   # Sky blue (#38BDF8)
+        [52, 211, 153],   # Emerald green (#34D399)
+        [251, 191, 36],   # Amber (#FBBF24)
+        [192, 132, 252],  # Lilac purple (#C084FC)
+        [251, 113, 133],  # Coral pink (#FB7185)
+        [96, 165, 250],   # Bright blue (#60A5FA)
     ]
 
     series = []
@@ -889,7 +889,15 @@ def _extract_plot_data(plot_obj):
                 try:
                     vals = list(c)
                     if len(vals) >= 3:
-                        color = [int(max(0, min(255, round(v * 255)))) for v in vals[:3]]
+                        r, g, b = [int(max(0, min(255, round(v * 255)))) for v in vals[:3]]
+                        lum = (r * 299 + g * 587 + b * 114) // 1000
+                        # Sage default line color is dark navy (0.0, 0.0, 0.8) -> [0, 0, 204],
+                        # which is almost invisible on dark themes. Replace it or any low-luminance
+                        # color with a bright vibrant palette color.
+                        if (r <= 30 and g <= 30 and b >= 150) or lum < 70:
+                            color = palette[curve_idx % len(palette)]
+                        else:
+                            color = [r, g, b]
                 except Exception:
                     pass
             label = opts.get("legend_label")

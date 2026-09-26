@@ -223,11 +223,17 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         Colors::NUMERIC_AMBER,
                         Colors::ACCENT_PURPLE,
                     ];
-                    let line_color = if series.color != [0, 0, 0] {
+                    let mut line_color = if series.color != [0, 0, 0] {
                         Color32::from_rgb(series.color[0], series.color[1], series.color[2])
                     } else {
                         default_colors[s_idx % default_colors.len()]
                     };
+
+                    // Detect Sage's default dark blue [0, 0, 204] or any low-contrast dark color on dark theme
+                    let lum = (line_color.r() as u32 * 299 + line_color.g() as u32 * 587 + line_color.b() as u32 * 114) / 1000;
+                    if (line_color.r() <= 30 && line_color.g() <= 30 && line_color.b() >= 150) || lum < 70 {
+                        line_color = default_colors[s_idx % default_colors.len()];
+                    }
 
                     let line_name = series
                         .label
@@ -246,7 +252,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                 Points::new(finite_pts)
                                     .name(line_name)
                                     .color(line_color)
-                                    .radius(3.0_f32)
+                                    .radius(3.5_f32)
                                     .shape(MarkerShape::Circle),
                             );
                         }
@@ -263,7 +269,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                 if seg.len() >= 2 {
                                     let mut line = Line::new(PlotPoints::new(seg))
                                         .color(line_color)
-                                        .width(2.0_f32);
+                                        .width(2.5_f32);
                                     if !drawn_any {
                                         line = line.name(line_name.clone());
                                         drawn_any = true;
@@ -273,7 +279,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                     plot_ui.points(
                                         Points::new(seg)
                                             .color(line_color)
-                                            .radius(2.0_f32)
+                                            .radius(2.5_f32)
                                             .shape(MarkerShape::Circle),
                                     );
                                 }
@@ -283,7 +289,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                             if current_segment.len() >= 2 {
                                 let mut line = Line::new(PlotPoints::new(current_segment))
                                     .color(line_color)
-                                    .width(2.0_f32);
+                                    .width(2.5_f32);
                                 if !drawn_any {
                                     line = line.name(line_name.clone());
                                 }
@@ -292,7 +298,7 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                 plot_ui.points(
                                     Points::new(current_segment)
                                         .color(line_color)
-                                        .radius(2.0_f32)
+                                        .radius(2.5_f32)
                                         .shape(MarkerShape::Circle),
                                 );
                             }
@@ -361,11 +367,15 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                 Colors::NUMERIC_AMBER,
                                 Colors::ACCENT_PURPLE,
                             ];
-                            let color = if series.color != [0, 0, 0] {
+                            let mut color = if series.color != [0, 0, 0] {
                                 Color32::from_rgb(series.color[0], series.color[1], series.color[2])
                             } else {
                                 default_colors[s_idx % default_colors.len()]
                             };
+                            let lum = (color.r() as u32 * 299 + color.g() as u32 * 587 + color.b() as u32 * 114) / 1000;
+                            if (color.r() <= 30 && color.g() <= 30 && color.b() >= 150) || lum < 70 {
+                                color = default_colors[s_idx % default_colors.len()];
+                            }
 
                             // Horizontal guideline to Y axis using HLine
                             plot_ui.hline(
