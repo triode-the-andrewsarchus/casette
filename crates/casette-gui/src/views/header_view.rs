@@ -3,7 +3,8 @@
 use crate::model::{SessionState, WorkerStatus};
 use crate::theme::Colors;
 use egui::{
-    vec2, Align, Button, ComboBox, CornerRadius, FontFamily, FontId, Frame, Layout, RichText, Ui,
+    vec2, Align, Button, ComboBox, CornerRadius, FontFamily, FontId, Frame, Layout, RichText,
+    Stroke, Ui,
 };
 
 /// Renders the top toolbar header.
@@ -55,15 +56,33 @@ pub fn render_header(
                     }
 
                     // Sage Doctor button
+                    let doc_btn = Button::new(
+                        RichText::new("🩺 Doctor")
+                            .color(if *doctor_open {
+                                Colors::ACCENT_PRIMARY
+                            } else {
+                                Colors::TEXT_SECONDARY
+                            })
+                            .font(FontId::new(12.0, FontFamily::Proportional)),
+                    )
+                    .fill(if *doctor_open {
+                        Colors::CARD_BG_SELECTED
+                    } else {
+                        Colors::CARD_BG
+                    })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if *doctor_open {
+                            Colors::ACCENT_PRIMARY
+                        } else {
+                            Colors::BORDER_SUBTLE
+                        },
+                    ))
+                    .corner_radius(5);
+
                     if ui
-                        .add(
-                            Button::new(
-                                RichText::new("Doctor")
-                                    .color(Colors::TEXT_SECONDARY)
-                                    .font(FontId::new(12.0, FontFamily::Proportional)),
-                            )
-                            .corner_radius(5),
-                        )
+                        .add(doc_btn)
+                        .on_hover_text("View Sage environment diagnostics and worker controls")
                         .clicked()
                     {
                         *doctor_open = !*doctor_open;

@@ -2,10 +2,13 @@
 
 use crate::model::{AsyncMessage, GuiAction, SessionState, WorkerStatus};
 use crate::render::TextureCache;
-use crate::theme::apply_theme;
+use crate::theme::{apply_theme, Colors};
 use crate::views::{render_header, render_input_pane, render_sidebar, render_tape, SidebarTab};
 use eframe::App;
-use egui::{CentralPanel, Context, SidePanel, TopBottomPanel};
+use egui::{
+    Button, CentralPanel, Context, FontFamily, FontId, RichText, SidePanel, Stroke,
+    TopBottomPanel, Window,
+};
 use std::sync::mpsc::{Receiver, Sender};
 use tracing::{error, info};
 
@@ -228,6 +231,133 @@ impl App for CasetteApp {
                 self.submit_evaluation(snippet, is_numeric);
             }
         });
+
+        // 5. Sage Doctor Diagnostics Window (when doctor_open is active)
+        if self.doctor_open {
+            let mut restart = false;
+            let mut open_sidebar_tab = false;
+
+            Window::new("🩺 Sage Doctor")
+                .open(&mut self.doctor_open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(340.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("SageMath Environment Diagnostics")
+                            .color(Colors::TEXT_PRIMARY)
+                            .font(FontId::new(14.0, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
+
+                    // Version
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Sage Version:")
+                                .color(Colors::TEXT_MUTED)
+                                .font(FontId::new(12.0, FontFamily::Proportional)),
+                        );
+                        ui.label(
+                            RichText::new(if self.state.sage_version.is_empty() {
+                                "Detecting / Not running"
+                            } else {
+                                &self.state.sage_version
+                            })
+                            .color(Colors::TEXT_PRIMARY)
+                            .font(FontId::new(12.0, FontFamily::Monospace)),
+                        );
+                    });
+
+                    // Worker PID
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Worker PID:")
+                                .color(Colors::TEXT_MUTED)
+                                .font(FontId::new(12.0, FontFamily::Proportional)),
+                        );
+                        ui.label(
+                            RichText::new(
+                                self.state
+                                    .worker_pid
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "None".to_string()),
+                            )
+                            .color(Colors::TEXT_PRIMARY)
+                            .font(FontId::new(12.0, FontFamily::Monospace)),
+                        );
+                    });
+
+                    // Worker Status
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Worker Status:")
+                                .color(Colors::TEXT_MUTED)
+                                .font(FontId::new(12.0, FontFamily::Proportional)),
+                        );
+                        let (status_text, status_color) = match self.state.worker_status {
+                            WorkerStatus::Ready => ("● Ready", Colors::EXACT_GREEN),
+                            WorkerStatus::Starting => ("◌ Starting", Colors::NUMERIC_AMBER),
+                            WorkerStatus::Busy => ("◐ Busy", Colors::ACCENT_PRIMARY),
+                            WorkerStatus::Restarting => ("◌ Restarting", Colors::NUMERIC_AMBER),
+                            WorkerStatus::Error => ("✕ Disconnected", Colors::ERROR_RED),
+                        };
+                        ui.label(
+                            RichText::new(status_text)
+                                .color(status_color)
+                                .font(FontId::new(12.0, FontFamily::Proportional))
+                                .strong(),
+                        );
+                    });
+
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                Button::new(
+                                    RichText::new("Restart Sage Worker")
+                                        .color(Colors::TEXT_PRIMARY)
+                                        .font(FontId::new(12.0, FontFamily::Proportional)),
+                                )
+                                .fill(Colors::CARD_BG)
+                                .stroke(Stroke::new(1.0_f32, Colors::ACCENT_PRIMARY))
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
+                            restart = true;
+                        }
+
+                        if ui
+                            .add(
+                                Button::new(
+                                    RichText::new("Show in Sidebar")
+                                        .color(Colors::TEXT_SECONDARY)
+                                        .font(FontId::new(12.0, FontFamily::Proportional)),
+                                )
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
+                            open_sidebar_tab = true;
+                        }
+                    });
+                });
+
+            if restart {
+                let _ = self.action_tx.send(GuiAction::RestartWorker);
+            }
+            if open_sidebar_tab {
+                self.sidebar_visible = true;
+                self.current_sidebar_tab = SidebarTab::Doctor;
+                self.doctor_open = false;
+            }
+        }
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
