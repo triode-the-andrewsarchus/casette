@@ -142,6 +142,35 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Routed interactive plots in `crates/casette-gui/src/render/math_view.rs`.
     - Documented subsystem in `plans/INTERACTIVE-PLOTTING.md` and indexed in `PLAN.md`.
     - All 45 tests green with 0 clippy warnings; release binary built.
+  - **Phase 12 (Resolution of 7 User-Reported Issues — One Commit Per Issue):**
+    - **Issue 1 (`6a746e5` - Symbols Tab Plumbing Leak):**
+      - Filtered out `name.startswith("_")` in `worker.py` (`_handle_symbols`) and hardened `crates/casette-gui/src/views/sidebar_view.rs` to ignore symbols starting with `_`, completely eliminating internal `__casette_tape_refs` leaks.
+      - Added clear empty state guidance explaining how to declare variables (`a = 5`).
+    - **Issue 2 (`41804f3` - Automatic Session & History Persistence):**
+      - Added `default_session_path()` respecting `$CASETTE_CONFIG_DIR`, `$XDG_CONFIG_HOME`, and `$HOME/.config/casette/sessions/last-session.json`.
+      - Extended `SessionEnvelope` to serialize and restore calculation history (`state.history`).
+      - Wired automatic loading in `CasetteApp::new` and auto-save on evaluation completion, tape clear, `App::save`, and application drop.
+      - Added automated tests in `gui_tests.rs`.
+    - **Issue 3 (`05ebee5` - Ineffective Approximate Toggle):**
+      - Root cause: In force-numeric mode (`numeric=True`), `worker.py` failed to update `latex_str = approx_str`, causing the worker to generate a math SVG artifact of the exact symbolic expression which the GUI then rendered.
+      - Updated `worker.py` to set `latex_str = approx_str` and suppress exact math SVG artifacts in numeric mode.
+      - Updated `math_view.rs` to render primary approximate results with a prominent `≈` prefix in numeric amber and display the exact fallback (`exact: <expr>`) when available.
+      - Added unit tests in `gui_tests.rs` and live integration test in `kernel_integration_tests.rs`.
+    - **Issue 4 (`1a58dfd` - Connected Sage Doctor Header Button):**
+      - Connected the header Doctor button to an interactive diagnostics modal window (`Window::new("🩺 Sage Doctor")`) displaying live SageMath version, worker PID, color-coded status badge, worker restart action, and a button to focus the sidebar Doctor tab.
+      - Styled the toolbar Doctor button with active selection feedback and hover tooltips.
+    - **Issue 5 (`901cc64` - Clear Tape Button Visual Affordance):**
+      - Replaced flat unstyled `.frame(false)` text with a modern macOS-styled toolbar button featuring rounded card fill (`Colors::CARD_BG`), subtle border stroke (`Colors::BORDER_SUBTLE`), corner radius (5), trash icon (`🗑 Clear Tape`), readable text color, and hover feedback.
+    - **Issue 6 (`eb6aeee` - High-Contrast Plot Curve Palette on Dark Theme):**
+      - Root cause: SageMath's default curve option `opts["rgbcolor"]` is `(0.0, 0.0, 0.8)` (`[0, 0, 204]`), rendering as dark navy blue on dark backgrounds.
+      - Updated `worker.py` and `interactive_plot.rs` to detect and replace Sage's default navy blue or low-luminance colors with a bright, vibrant dark-mode palette (`#38BDF8` sky blue, `#34D399` emerald green, `#FBBF24` amber, `#C084FC` lilac purple).
+      - Increased curve stroke width to `2.5px` for crisp visibility.
+    - **Issue 7 (`bb2bc34` - Intuitive Plot Navigation Controls):**
+      - Enabled `allow_scroll(true)` for mouse-wheel and trackpad zoom centered at the cursor.
+      - Enabled `allow_double_click_reset(true)` for quick reset on canvas double-click.
+      - Added on-screen `[ ➕ ]` (zoom in 1.3x) and `[ ➖ ]` (zoom out 0.77x) toolbar buttons alongside `[ ↺ Reset ]`.
+      - Added explicit gesture hints in the plot card header: `"Pan: drag · Zoom: scroll/[+][−] · Reset: double-click"`.
+    - All workspace tests passing cleanly (**46/46** across all suites); release binary compiled and verified.
 
 
 

@@ -111,8 +111,15 @@ In `crates/casette-gui/src/render/interactive_plot.rs`:
    - An on-screen toggle button allows turning snapping ON or OFF.
 3. **Continuous Interpolation:**
    `interpolate_y(points, target_x)` uses binary search to locate the surrounding interval $[x_j, x_{j+1}]$ and performs linear interpolation for precise intersection coordinates, filtering out any non-finite sample values.
-4. **Tape Scroll Harmony:**
-   `plot.allow_scroll(false)` ensures the session tape scrolls smoothly without the cursor getting caught in the plot widget during normal page scrolling. Zooming can still be done via boxed zoom or drag.
+4. **Intuitive Navigation & Zoom Controls:**
+   - `plot.allow_scroll(true)` enables natural mouse-wheel and trackpad pinch zooming directly over the plot.
+   - `plot.allow_double_click_reset(true)` resets bounds back to initial domain and range on double-click.
+   - On-screen `[ ➕ ]` (zoom in 1.3x) and `[ ➖ ]` (zoom out 0.77x) buttons provide discoverable touch/click controls.
+   - `[ ↺ Reset ]` button restores default view.
+   - Header hints guide the user: `"Pan: drag · Zoom: scroll/[+][−] · Reset: double-click"`.
+5. **High-Contrast Dark-Mode Palette:**
+   - Curve line widths are rendered at `2.5px` for crisp HiDPI rendering.
+   - Automatically detects and replaces Sage's default white-background dark blue (`[0, 0, 204]`) with vivid `#38BDF8` sky blue, emerald `#34D399`, amber `#FBBF24`, and lilac `#C084FC`.
 
 ---
 
