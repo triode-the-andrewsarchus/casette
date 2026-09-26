@@ -65,6 +65,8 @@ fn test_spec_forms() {
     expect_success("limit sin(x)/x, x->0", "limit(sin(x)/x, x=0)");
     expect_success("taylor sin(x), x=0, order=7", "taylor(sin(x), x, 0, 7)");
     expect_success("plot sin(x), x=-pi..pi", "plot(sin(x), (x, -pi, pi))");
+    expect_success("plot sin(x) x=-pi..pi", "plot(sin(x), (x, -pi, pi))");
+    expect_success("plot sin(x) -pi..pi", "plot(sin(x), (x, -pi, pi))");
     expect_success("matrix [[1,2],[3,4]]", "matrix([[1,2],[3,4]])");
     expect_success("matrix [1, 2, 3 ; 2, 3, 4 ]", "matrix([[1,2,3],[2,3,4]])");
     expect_success("[1, 2, 3 ; 2, 3, 4 ]", "matrix([[1,2,3],[2,3,4]])");

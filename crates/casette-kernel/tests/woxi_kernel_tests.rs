@@ -153,5 +153,14 @@ async fn test_woxi_interactive_plot_data() {
     assert!(has_max, "expected local maximum near y=1");
     assert!(has_min, "expected local minimum near y=-1");
 
+    // Evaluate 2D sine plot with bare command without comma: "plot sin(x) x=-pi..pi"
+    let bare_resp = kernel
+        .eval("plot sin(x) x=-pi..pi", false, None)
+        .await
+        .expect("bare plot eval");
+    assert!(bare_resp.ok);
+    assert_eq!(bare_resp.kind.as_deref(), Some("plot"));
+    assert!(bare_resp.plot_data.is_some(), "expected plot_data from bare plot command");
+
     kernel.shutdown().await.expect("shutdown");
 }

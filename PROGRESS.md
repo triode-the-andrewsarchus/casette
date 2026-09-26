@@ -184,8 +184,13 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
         - Magnetic extrema snapping: automatically detects when mouse screen X is within `SNAP_THRESHOLD_PX` (18 screen pixels) of any local minimum or maximum, snapping the active X crosshair to the exact extremum, enlarging the target dot, and presenting an active pill badge (`▲ Local Max: x = ..., y = ...` or `▼ Local Min: x = ..., y = ...`). Includes an on-screen toggle button (`🧲 Snap Extrema: ON/OFF`).
         - Dark macOS styling matching Casette typography hierarchy, `#141418` frame, `#26262C` controls, and `allow_scroll(false)` to keep session tape scrolling smooth.
       - Routed interactive plots in `crates/casette-gui/src/render/math_view.rs`.
+      - Enhanced command syntax flexibility:
+        - Added `split_trailing_range` in `friendly-compiler`: natural commands without separating commas (e.g. `plot sin(x) x=-pi..pi`, `plot sin(x) -pi..pi`) now parse seamlessly alongside comma-separated forms (`plot sin(x), x=-pi..pi`).
+        - Updated `PlotFormulaIR::parse` to recognize comma-free range clauses, correctly populating formula bar chips.
+        - Added `desugar_bare_plot` and `var=min..max` clause conversion to `normalize_for_woxi` in `casette-kernel` for defense-in-depth on bare plot inputs.
+        - Surfaced `CompileResult::Error` diagnostics directly on the session tape with suggestions in `crates/casette-gui/src/main.rs`.
       - Documented complete architecture in [`plans/INTERACTIVE-PLOTTING.md`](plans/INTERACTIVE-PLOTTING.md) and indexed in `PLAN.md`.
-      - Added automated tests in `crates/casette-kernel/tests/woxi_kernel_tests.rs` and `woxi_kernel.rs`. All workspace tests pass cleanly.
+      - Added automated tests in `crates/casette-kernel/tests/woxi_kernel_tests.rs` and `friendly_compiler_tests.rs`. All workspace tests pass cleanly.
 
 
 

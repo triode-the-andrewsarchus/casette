@@ -106,6 +106,19 @@ fn main() -> anyhow::Result<()> {
                                 generated_sage
                             }
                             friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
+                            friendly_compiler::CompileResult::Error(compile_err) => {
+                                let err_resp = casette_kernel::WorkerResponse::new_error(
+                                    "CompileError".into(),
+                                    compile_err.message,
+                                    compile_err.suggestion,
+                                );
+                                let _ = msg_tx_clone.send(AsyncMessage::EvalFinished {
+                                    row_number: row_num,
+                                    response: Box::new(err_resp),
+                                    duration: Duration::from_millis(0),
+                                });
+                                continue;
+                            }
                             _ => exp.clone(),
                         };
                         (exp, comp)

@@ -467,6 +467,13 @@ pub fn normalize_for_woxi(input: &str) -> String {
         return "Clear[__casette_tape_refs];".to_string();
     }
 
+    // 2b. Bare plot command: "plot sin(x) x=-pi..pi" or "plot sin(x), x=-pi..pi"
+    if trimmed.to_lowercase().starts_with("plot ") {
+        if let Some(desugared) = desugar_bare_plot(&trimmed[5..]) {
+            return desugared;
+        }
+    }
+
     let mut result = trimmed.to_string();
 
     // 3. Exponentiation syntax: replace Python `**` with `^` outside quotes
@@ -849,6 +856,56 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     args
 }
 
+fn desugar_bare_plot(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parts = split_top_level_commas(trimmed);
+    let (expr, range_part) = if parts.len() >= 2 {
+        (parts[0].trim(), parts[1].trim())
+    } else {
+        let dot_idx = trimmed.rfind("..")?;
+        let before_dots = &trimmed[..dot_idx];
+        if let Some(eq_idx) = before_dots.rfind('=') {
+            let before_eq = before_dots[..eq_idx].trim_end();
+            let mut var_start = before_eq.len();
+            for (i, ch) in before_eq.char_indices().rev() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    var_start = i;
+                } else {
+                    break;
+                }
+            }
+            if var_start < before_eq.len() {
+                let expr = trimmed[..var_start].trim_end_matches(',').trim();
+                let range = trimmed[var_start..].trim();
+                (expr, range)
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    };
+
+    if let Some(eq_idx) = range_part.find('=') {
+        let var = range_part[..eq_idx].trim();
+        let rest = &range_part[eq_idx + 1..];
+        if let Some(dot_idx) = rest.find("..") {
+            let min = rest[..dot_idx].trim();
+            let max = rest[dot_idx + 2..].trim();
+            if !var.is_empty() && !min.is_empty() && !max.is_empty() {
+                let converted_expr = convert_function_calls(expr);
+                return Some(format!("Plot[{}, {{{}, {}, {}}}]", converted_expr, var, min, max));
+            }
+        }
+    }
+
+    None
+}
+
 fn convert_plot_args(inner: &str) -> String {
     let args = split_top_level_commas(inner);
     let mut converted_args = Vec::with_capacity(args.len());
@@ -885,6 +942,21 @@ fn convert_plot_args(inner: &str) -> String {
                 continue;
             }
         }
+
+        // Also convert "var=min..max" -> "{var, min, max}"
+        if let Some(eq_idx) = trimmed.find('=') {
+            let var = trimmed[..eq_idx].trim();
+            let rest = &trimmed[eq_idx + 1..];
+            if let Some(dot_idx) = rest.find("..") {
+                let min = rest[..dot_idx].trim();
+                let max = rest[dot_idx + 2..].trim();
+                if !var.is_empty() && !min.is_empty() && !max.is_empty() {
+                    converted_args.push(format!("{{{var}, {min}, {max}}}"));
+                    continue;
+                }
+            }
+        }
+
         converted_args.push(trimmed.to_string());
     }
 
@@ -1020,6 +1092,18 @@ mod tests {
         assert_eq!(
             normalize_for_woxi("plot((sin(x), cos(x)), (x, -10, 10))"),
             "Plot[{Sin[x], Cos[x]}, {x, -10, 10}]"
+        );
+        assert_eq!(
+            normalize_for_woxi("plot sin(x) x=-pi..pi"),
+            "Plot[Sin[x], {x, -pi, pi}]"
+        );
+        assert_eq!(
+            normalize_for_woxi("plot sin(x), x=-pi..pi"),
+            "Plot[Sin[x], {x, -pi, pi}]"
+        );
+        assert_eq!(
+            normalize_for_woxi("plot(sin(x), x=-pi..pi)"),
+            "Plot[Sin[x], {x, -pi, pi}]"
         );
     }
 
