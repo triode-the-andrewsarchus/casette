@@ -154,6 +154,10 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Removed enclosing `$` wrapping so `math_to_image` renders clean LaTeX math SVGs.
       - Added negative result caching (`failed_hashes: HashSet<u64>`) to `TextureCache` so that any unsupported or failed LaTeX never re-triggers Python process spawns on subsequent frames.
     - Fixed `Set::write: Tag Plus in ... is Protected` error by replacing Sage Python dictionary assignment code (`__casette_tape_refs = globals().get(...)`) with native Wolfram DownValue assignments (`__casette_tape_refs[{row}] = ({norm});`) in `crates/casette-gui/src/main.rs`.
+    - Fixed LaTeX mathematical rendering of equation solutions:
+      - `tex_matrix_rows` in `vendor/woxi/src/functions/string_ast.rs` previously treated any rectangular list as a matrix, erroneously converting lists of replacement rules like `{{x -> 12 in}}` into `\begin{array}{c} x\to 12\text{ in} \\ \end{array}`.
+      - Excluded `Expr::Rule` and `Expr::RuleDelayed` in `tex_matrix_rows`, properly rendering solution sets with TeX braces (`\left\{\left\{x\to 12\text{ in}\right\}\right\}`).
+      - Guarded `render_latex_to_svg` in `crates/casette-gui/src/render/texture_cache.rs` against `\begin{...}` environments which are unsupported in matplotlib mathtext.
     - Added automated unit and kernel integration tests verifying `solve 2 ft + x in = 1 yard`. All 53 workspace tests passing.
 
 

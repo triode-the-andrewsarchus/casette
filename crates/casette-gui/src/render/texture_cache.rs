@@ -98,6 +98,10 @@ impl TextureCache {
     }
 
     fn render_latex_to_svg(latex: &str, out_path: &Path) -> Option<()> {
+        if latex.contains(r"\begin{") {
+            return None;
+        }
+
         let script = r##"
 import sys, io, re, matplotlib
 matplotlib.rcParams['mathtext.fontset'] = 'cm'

@@ -226,6 +226,13 @@ fn test_math_rendering_and_texture_cache() {
     let size = texture.size_vec2();
     assert!(size.x > 50.0);
     assert!(size.y > 10.0);
+
+    // Test on-the-fly LaTeX rendering of solve result
+    let solve_latex = r"\left\{\left\{x\to 12\text{ in}\right\}\right\}";
+    let handle_solve = cache.get_or_render_latex(&ctx, solve_latex);
+    assert!(handle_solve.is_some(), "Solve LaTeX should be rendered to a texture");
+    let solve_texture = handle_solve.unwrap();
+    assert!(solve_texture.size_vec2().x > 20.0);
 }
 
 #[test]

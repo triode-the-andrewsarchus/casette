@@ -5827,6 +5827,9 @@ fn tex_matrix_rows(items: &[Expr]) -> Option<Vec<Vec<Expr>>> {
     let Expr::List(row) = item else {
       return None;
     };
+    if row.iter().any(|e| matches!(e, Expr::Rule { .. } | Expr::RuleDelayed { .. })) {
+      return None;
+    }
     rows.push(row.to_vec());
   }
   let width = rows[0].len();

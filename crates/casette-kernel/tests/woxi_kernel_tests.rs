@@ -117,6 +117,9 @@ async fn test_woxi_solve_equation_with_units() {
         .expect("eval yard");
     assert!(yd_resp.ok);
     assert_eq!(yd_resp.plain.as_deref(), Some("{{x -> 12 in}}"));
+    let yd_latex = yd_resp.latex.as_deref().unwrap();
+    assert!(yd_latex.contains("12") && yd_latex.contains("in"));
+    assert!(!yd_latex.contains("begin{array}"));
 
     kernel.shutdown().await.expect("shutdown");
 }
