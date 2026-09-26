@@ -110,5 +110,13 @@ async fn test_woxi_solve_equation_with_units() {
     assert!(time_resp.ok);
     assert_eq!(time_resp.plain.as_deref(), Some("{{x -> 1026000 s}}"));
 
+    // Feet, inches, yard equation: 2 ft + x in = 1 yard -> x = 12 in
+    let yd_resp = kernel
+        .eval("solve((2*ft) + (x*in) == (1*yard), x)", false, None)
+        .await
+        .expect("eval yard");
+    assert!(yd_resp.ok);
+    assert_eq!(yd_resp.plain.as_deref(), Some("{{x -> 12 in}}"));
+
     kernel.shutdown().await.expect("shutdown");
 }

@@ -4,7 +4,7 @@
 //! `egui::TextureHandle`s cached in memory.
 
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{error, warn};
@@ -12,6 +12,7 @@ use tracing::{error, warn};
 /// In-memory cache for loaded plot and graphics textures.
 pub struct TextureCache {
     textures: HashMap<PathBuf, TextureHandle>,
+    failed_hashes: HashSet<u64>,
 }
 
 impl Default for TextureCache {
@@ -26,6 +27,7 @@ impl TextureCache {
     pub fn new() -> Self {
         Self {
             textures: HashMap::new(),
+            failed_hashes: HashSet::new(),
         }
     }
 
@@ -78,10 +80,18 @@ impl TextureCache {
             trimmed.hash(&mut hasher);
             hasher.finish()
         };
+
+        if self.failed_hashes.contains(&hash) {
+            return None;
+        }
+
         let path = std::env::temp_dir().join(format!("casette_math_{:016x}.svg", hash));
 
         if !path.exists() {
-            Self::render_latex_to_svg(trimmed, &path)?;
+            if Self::render_latex_to_svg(trimmed, &path).is_none() {
+                self.failed_hashes.insert(hash);
+                return None;
+            }
         }
 
         self.get_or_load(ctx, &path)
@@ -98,7 +108,7 @@ latex = " ".join(sys.argv[1].strip().strip("$").split())
 out_file = sys.argv[2]
 buf = io.BytesIO()
 prop = FontProperties(size=20)
-mathtext.math_to_image(f"${latex}$", buf, prop=prop, dpi=180, format="svg", color="#F0F6FC")
+mathtext.math_to_image(latex, buf, prop=prop, dpi=180, format="svg", color="#F0F6FC")
 svg = buf.getvalue().decode("utf-8")
 svg_clean = re.sub(r'(<g id="patch_1">\s*<path [^>]*style=")[^"]*"', r'\1fill: none;"', svg)
 with open(out_file, "w", encoding="utf-8") as f:

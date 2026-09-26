@@ -25,6 +25,7 @@ pub fn is_known_unit(name: &str) -> bool {
             | "ft"
             | "foot"
             | "feet"
+            | "in"
             | "inch"
             | "inches"
             | "yd"

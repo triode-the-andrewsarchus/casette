@@ -2055,6 +2055,7 @@ fn try_solve_quantity_equation(
     operands: vec![lhs_scalar, rhs_scalar],
     operators: vec![ComparisonOp::Equal],
   };
+  let scalar_eq = crate::evaluator::evaluate_value(&scalar_eq).unwrap_or(scalar_eq);
 
   let mut new_args = args.to_vec();
   new_args[0] = scalar_eq;

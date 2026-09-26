@@ -395,6 +395,19 @@ fn test_solve_with_units() {
     } else {
         panic!("expected success for bare equation 3 mi + x ft = 5 km, got: {:?}", res_bare);
     }
+
+    // Solve with inches and yards
+    let res_inch = compile("solve 2 ft + x in = 1 yard");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res_inch
+    {
+        assert_eq!(generated_sage, "solve((2*ft) + (x*in) == (1*yard), x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for solve 2 ft + x in = 1 yard, got: {:?}", res_inch);
+    }
 }
 
 #[test]

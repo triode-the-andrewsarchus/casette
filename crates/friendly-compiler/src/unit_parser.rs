@@ -14,12 +14,6 @@ pub enum Token<'a> {
     #[regex(r"[0-9]+(\.[0-9]+)?", |lex| lex.slice())]
     Number(&'a str),
 
-    #[token("to")]
-    To,
-
-    #[token("in")]
-    In,
-
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
     Ident(&'a str),
 

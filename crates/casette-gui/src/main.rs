@@ -126,10 +126,10 @@ fn main() -> anyhow::Result<()> {
                             // If execution succeeded, register reference in worker dictionary
                             if is_ok {
                                 if let Some(expr) = extract_reusable_expression(&compiled_code) {
-                                    tape_refs.insert(row_num, expr);
-                                    if let Some(assign_code) = tape_refs.assignment_code(row_num) {
-                                        let _ = kernel.eval(&assign_code, false, None).await;
-                                    }
+                                    tape_refs.insert(row_num, expr.clone());
+                                    let norm = casette_kernel::normalize_for_woxi(&expr);
+                                    let assign_code = format!("__casette_tape_refs[{row_num}] = ({norm});");
+                                    let _ = kernel.eval(&assign_code, false, None).await;
                                 }
                             }
                         }

@@ -146,7 +146,15 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
     - Updated `tex_function_call` in `vendor/woxi/src/functions/string_ast.rs` to format `Quantity[val, unit]` as `{val}\text{ {unit}}`.
     - Enhanced `crates/friendly-compiler/src/compiler.rs`: added bare dimensional equation detection (`3 mi + x ft = 5 km`) routing to `solve(...)` to prevent `Set::write: Tag Plus in ... is Protected` errors.
     - Enhanced `crates/casette-kernel/src/woxi_kernel.rs`: enabled decimal approximation for `kind == "list"` so equation solutions compute `approx` (e.g. `{{x -> 564.199475 ft}}`), and added `clean_approx_text` helper to remove Wolfram Language precision tags.
-    - Added automated tests in `crates/friendly-compiler/tests/friendly_compiler_tests.rs` and `crates/casette-kernel/tests/woxi_kernel_tests.rs`. All workspace tests green.
+    - Added unit definitions and abbreviations for inches (`in`, `inch`, `inches`) and yards (`yd`, `yard`, `yards`) across `crates/friendly-compiler/src/units.rs`, `unit_parser.rs`, and `crates/casette-kernel/src/woxi_kernel.rs`.
+    - Solves `solve 2 ft + x in = 1 yard` to `{{x -> 12 in}}`.
+    - Evaluates `scalar_eq` in `try_solve_quantity_equation` before algebraic solving to reduce coefficient expressions.
+    - Fixed UI input lag in `crates/casette-gui/src/render/texture_cache.rs`:
+      - Discovered `mathtext.math_to_image` failed when passed `f"${latex}$"` on equation LaTeX, causing `render_latex_to_svg` to fail and re-spawn a `python3` process 60 times a second on every frame.
+      - Removed enclosing `$` wrapping so `math_to_image` renders clean LaTeX math SVGs.
+      - Added negative result caching (`failed_hashes: HashSet<u64>`) to `TextureCache` so that any unsupported or failed LaTeX never re-triggers Python process spawns on subsequent frames.
+    - Fixed `Set::write: Tag Plus in ... is Protected` error by replacing Sage Python dictionary assignment code (`__casette_tape_refs = globals().get(...)`) with native Wolfram DownValue assignments (`__casette_tape_refs[{row}] = ({norm});`) in `crates/casette-gui/src/main.rs`.
+    - Added automated unit and kernel integration tests verifying `solve 2 ft + x in = 1 yard`. All 53 workspace tests passing.
 
 
 
