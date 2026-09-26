@@ -159,6 +159,17 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Excluded `Expr::Rule` and `Expr::RuleDelayed` in `tex_matrix_rows`, properly rendering solution sets with TeX braces (`\left\{\left\{x\to 12\text{ in}\right\}\right\}`).
       - Guarded `render_latex_to_svg` in `crates/casette-gui/src/render/texture_cache.rs` against `\begin{...}` environments which are unsupported in matplotlib mathtext.
     - Added automated unit and kernel integration tests verifying `solve 2 ft + x in = 1 yard`. All 53 workspace tests passing.
+  - **Phase 13 (Calculus & Integration LaTeX Typography Consistency):**
+    - Fixed TeX formatting of calculus integration expressions (e.g. `integrate 1/(1-x^2)`):
+      - Previously, `Integrate[1/(1-x^2), x]` rendered inconsistently as `\frac{\log(x+1)}{2} - \frac{1}{2}\log(1-x)` because:
+        1. In `tex_box_weight` (`vendor/woxi/src/functions/string_ast.rs`), single-argument function calls `f(arg)` did not account for the bracket box around sum arguments (`is_tex_sum`), assigning `Log[1+x]` a weight of 2, whereas `1-x` had an internal `Times[-1, x]` adding +1 to box weight, yielding weight 3 for `Log[1-x]`.
+        2. In `tex_times_nary_with`, `fold = other_denominators || weight + usize::from(negate != (*p < 0)) <= 2` introduced sign asymmetry: positive terms with weight 2 folded into the fraction numerator (`\frac{\log(x+1)}{2}`), while negative terms with weight 2 added 1 for the minus sign (weight 3 > 2) and stayed as a standalone coefficient (`-\frac{1}{2}\log(...)`).
+      - Corrected `tex_box_weight` in `vendor/woxi/src/functions/string_ast.rs`:
+        - Added box weight for function calls whose arguments are sums (`is_tex_sum`) to account for enclosing brackets, ensuring `Log[1+x]` has weight 3 (matching `Log[1-x]`) and stays beside its rational coefficient.
+        - Treated `Times[-1, atom]` in `tex_box_weight` as having the weight of `atom` so that `1 - x` and `1 + x` have identical box weight.
+      - Removed sign asymmetry from `fold = other_denominators || weight <= 2` in `tex_times_nary_with`, and extracted negative signs from `Rational(p, q)` so that standalone rational coefficients always format as positive fractions (`\frac{|p|}{|q|}`) with the negative sign placed cleanly in front.
+      - Result: `integrate 1/(1-x^2)` now produces consistent, beautiful mathematical typography: `\frac{1}{2} \log (x+1)-\frac{1}{2} \log (1-x)`.
+      - Added automated test in `crates/casette-kernel/tests/woxi_kernel_tests.rs`. All 53 workspace tests pass.
 
 
 

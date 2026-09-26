@@ -7018,6 +7018,9 @@ fn tex_box_weight(expr: &Expr) -> usize {
       // `x'` is a script on `x`; `f'(x)` a script on `f` in a row.
       "Derivative" if args.len() == 2 => 1 + tex_box_weight(&args[1]),
       "Derivative" if args.len() > 2 => 2 + sum_of(&args[2..]),
+      "Times" if args.len() == 2 && matches!(args[0], Expr::Integer(-1)) => {
+        tex_box_weight(&args[1])
+      }
       "Plus" | "Times" | "Star" | "Sqrt" | "Abs" => 1 + sum_of(args),
       // An inverse function is written with a script on its name
       // (`\tan ^{-1}`), one box more than a plain call.
@@ -7026,7 +7029,7 @@ fn tex_box_weight(expr: &Expr) -> usize {
       | "ArcCsch" => 2 + sum_of(args),
       // A call with several arguments is a row of rows, with separators.
       _ if args.len() >= 2 => 3 + sum_of(args),
-      _ => 1 + sum_of(args),
+      _ => 1 + usize::from(args.iter().any(is_tex_sum)) + sum_of(args),
     },
     Expr::CurriedCall { func, args } => 1 + tex_box_weight(func) + sum_of(args),
     _ => 1,
@@ -7148,6 +7151,7 @@ fn tex_times_nary_with(args: &[Expr], distribute_sign: bool) -> String {
   // fold everything into one fraction (`\frac{a+b}{3 c}`).
   let mut rat_num: Option<i128> = None; // |p|, folded into the numerator
   let mut rat_den: Option<i128> = None; // q, folded into the denominator
+  let mut leading_rational_owned: Option<Expr> = None;
   let mut leading_rational: Option<&Expr> = None;
   let factors: &[Expr] = if let Some(
     first @ Expr::FunctionCall { name, args: ra },
@@ -7172,18 +7176,21 @@ fn tex_times_nary_with(args: &[Expr], distribute_sign: bool) -> String {
           .sum::<usize>()
       }
     };
-    let fold =
-      other_denominators || weight + usize::from(negate != (*p < 0)) <= 2;
+    let fold = other_denominators || weight <= 2;
+    if *p < 0 {
+      negate = !negate;
+    }
     if fold {
-      if *p < 0 {
-        negate = !negate;
-      }
       rat_num = Some(p.abs());
       rat_den = Some(q.abs());
       rest
     } else {
-      // Keep the coefficient as a standalone \frac{p}{q} factor.
-      leading_rational = Some(first);
+      // Keep the coefficient as a standalone \frac{|p|}{|q|} factor.
+      if *p < 0 {
+        leading_rational_owned = Some(call("Rational", vec![Expr::Integer(p.abs()), Expr::Integer(q.abs())]));
+      } else {
+        leading_rational = Some(first);
+      }
       rest
     }
   } else {
@@ -7310,10 +7317,10 @@ fn tex_times_nary_with(args: &[Expr], distribute_sign: bool) -> String {
   // A folded integer coefficient (rat_num > 1) or a standalone \frac coefficient
   // counts as another factor for this decision.
   let extra_lead =
-    matches!(rat_num, Some(n) if n > 1) || leading_rational.is_some();
+    matches!(rat_num, Some(n) if n > 1) || leading_rational.is_some() || leading_rational_owned.is_some();
   let multi = numer_args.len() > 1 || (extra_lead && !numer_args.is_empty());
   let mut numer: Vec<String> = Vec::new();
-  if let Some(r) = leading_rational {
+  if let Some(r) = leading_rational_owned.as_ref().or(leading_rational) {
     numer.push(expr_to_tex(r));
   } else if let Some(n) = rat_num
     && n > 1
