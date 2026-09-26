@@ -37,7 +37,7 @@ async fn test_woxi_boot_eval_ping() {
     assert!(int_plain.contains("Log"));
     assert_eq!(
         int_resp.latex.as_deref(),
-        Some(r"\frac{1}{2} \log (x+1)-\frac{1}{2} \log (1-x)")
+        Some(r"\frac{1}{2} \log (x+1)-\frac{1}{2} \log (x-1)")
     );
 
     // 4. Test matrices and matrix properties

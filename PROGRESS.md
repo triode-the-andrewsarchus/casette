@@ -201,6 +201,9 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
         - Added `#ROW` reference desugaring to `casette-kernel::desugar_bare_plot` and `convert_plot_args` (`#3` -> `__casette_tape_refs[3]`), providing direct kernel-level execution alongside compiler-level lowering.
         - Synchronized `TapeRow::reusable_expression` in `casette-gui::model` to exclude graphical plot commands, preventing plots from polluting tape reference tables.
         - Added automated end-to-end integration tests for `integrate` followed by `#ROW` plotting in `woxi_kernel_tests.rs`. All workspace tests pass.
+      - Fixed rational integration partial fractions to output standard linear factors $(d \cdot x - n)$ rather than inverted constants $(n - d \cdot x)$:
+        - In `vendor/woxi/src/functions/calculus_ast.rs` (`rational_root_partial_fractions`), integration of quadratics with real rational roots previously favored positive constant terms (producing e.g. $\log(1-x)$).
+        - Updated to standard polynomial factor convention $(x - r)$, so $\int \frac{1}{1-x^2} dx$ produces $\frac{1}{2}\log(x+1) - \frac{1}{2}\log(x-1)$ (matching SageMath and standard calculus notation, with real domain extending across $x > 1$).
       - Documented complete architecture in [`plans/INTERACTIVE-PLOTTING.md`](plans/INTERACTIVE-PLOTTING.md) and indexed in `PLAN.md`.
       - Added automated tests in `crates/casette-kernel/tests/woxi_kernel_tests.rs` and `friendly_compiler_tests.rs`. All workspace tests pass cleanly.
 

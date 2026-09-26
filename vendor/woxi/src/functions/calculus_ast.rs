@@ -6139,8 +6139,9 @@ fn rational_root_partial_fractions(
     if denom == 0 {
       return None;
     }
-    // Log argument, written with a positive constant term.
-    let (q, p) = if n > 0 { (n, -d) } else { (-n, d) };
+    // Log argument, written as the standard linear factor (d*x - n)
+    let p = d;
+    let q = -n;
     let p_term = if p == 1 {
       var_expr.clone()
     } else {
@@ -6148,8 +6149,10 @@ fn rational_root_partial_fractions(
     };
     let argument = if q == 0 {
       p_term
+    } else if q < 0 {
+      minus2(p_term, Expr::Integer(-q))
     } else {
-      plus2(Expr::Integer(q), p_term)
+      plus2(p_term, Expr::Integer(q))
     };
     terms.push(times2(
       div2(Expr::Integer(numer), Expr::Integer(denom)),
