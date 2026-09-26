@@ -303,11 +303,12 @@ pub struct ArtifactPayload {
     pub error: Option<String>,
 }
 
-/// Category of a local extremum on a curve.
+/// Category of a local extremum or key point on a curve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExtremumKind {
     Minimum,
     Maximum,
+    ZeroCrossing,
 }
 
 /// A detected local extremum (peak or valley) on a plot series.
@@ -345,34 +346,88 @@ pub struct PlotDataPayload {
     pub y_range: [f64; 2],
 }
 
-/// Detects local extrema (peaks and valleys) along a sequence of 2D sampled points.
+/// Detects local extrema (peaks and valleys) and zero-crossings along a sequence of 2D sampled points.
 #[must_use]
 pub fn compute_local_extrema(points: &[[f64; 2]]) -> Vec<LocalExtremum> {
-    if points.len() < 3 {
+    if points.len() < 2 {
         return Vec::new();
     }
     let mut extrema = Vec::new();
-    for i in 1..points.len() - 1 {
-        let prev_y = points[i - 1][1];
-        let curr_y = points[i][1];
-        let next_y = points[i + 1][1];
-        if !prev_y.is_finite() || !curr_y.is_finite() || !next_y.is_finite() {
+
+    // 1. Detect peaks and valleys (local extrema)
+    if points.len() >= 3 {
+        for i in 1..points.len() - 1 {
+            let prev_y = points[i - 1][1];
+            let curr_y = points[i][1];
+            let next_y = points[i + 1][1];
+            if !prev_y.is_finite() || !curr_y.is_finite() || !next_y.is_finite() {
+                continue;
+            }
+            if curr_y > prev_y && curr_y > next_y {
+                extrema.push(LocalExtremum {
+                    x: points[i][0],
+                    y: curr_y,
+                    kind: ExtremumKind::Maximum,
+                });
+            } else if curr_y < prev_y && curr_y < next_y {
+                extrema.push(LocalExtremum {
+                    x: points[i][0],
+                    y: curr_y,
+                    kind: ExtremumKind::Minimum,
+                });
+            }
+        }
+    }
+
+    // 2. Detect zero-crossings (roots)
+    for i in 1..points.len() {
+        let p0 = points[i - 1];
+        let p1 = points[i];
+        if !p0[0].is_finite() || !p0[1].is_finite() || !p1[0].is_finite() || !p1[1].is_finite() {
             continue;
         }
-        if curr_y > prev_y && curr_y > next_y {
+
+        let y0 = p0[1];
+        let y1 = p1[1];
+
+        // Check if an exact zero occurs at p0
+        if y0.abs() < 1e-12 {
+            if !extrema.iter().any(|e| (e.x - p0[0]).abs() < 1e-5 && e.y.abs() < 1e-5) {
+                extrema.push(LocalExtremum {
+                    x: p0[0],
+                    y: 0.0,
+                    kind: ExtremumKind::ZeroCrossing,
+                });
+            }
+        } else if (y0 < 0.0 && y1 > 0.0) || (y0 > 0.0 && y1 < 0.0) {
+            // Sign change between p0 and p1. Guard against asymptotic jumps (e.g. 1/x, tan(x))
+            let dy = (y1 - y0).abs();
+            if dy < 50.0 {
+                let t = -y0 / (y1 - y0);
+                let root_x = p0[0] + t * (p1[0] - p0[0]);
+                if !extrema.iter().any(|e| (e.x - root_x).abs() < 1e-5) {
+                    extrema.push(LocalExtremum {
+                        x: root_x,
+                        y: 0.0,
+                        kind: ExtremumKind::ZeroCrossing,
+                    });
+                }
+            }
+        }
+    }
+
+    // Check if last point is an exact zero
+    if let Some(last) = points.last() {
+        if last[1].abs() < 1e-12 && !extrema.iter().any(|e| (e.x - last[0]).abs() < 1e-5) {
             extrema.push(LocalExtremum {
-                x: points[i][0],
-                y: curr_y,
-                kind: ExtremumKind::Maximum,
-            });
-        } else if curr_y < prev_y && curr_y < next_y {
-            extrema.push(LocalExtremum {
-                x: points[i][0],
-                y: curr_y,
-                kind: ExtremumKind::Minimum,
+                x: last[0],
+                y: 0.0,
+                kind: ExtremumKind::ZeroCrossing,
             });
         }
     }
+
+    extrema.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
     extrema
 }
 
@@ -510,5 +565,48 @@ mod tests {
         }"#;
         let resp: WorkerResponse = serde_json::from_str(raw).expect("deserialize");
         assert!(resp.is_interrupted());
+    }
+
+    #[test]
+    fn test_compute_local_extrema_and_zero_crossings() {
+        // Sampled parabola: y = x^2 - 4 on [-3, 3] with step 1
+        // x: -3  -2  -1   0   1   2   3
+        // y:  5   0  -3  -4  -3   0   5
+        let points = vec![
+            [-3.0, 5.0],
+            [-2.0, 0.0],
+            [-1.0, -3.0],
+            [0.0, -4.0],
+            [1.0, -3.0],
+            [2.0, 0.0],
+            [3.0, 5.0],
+        ];
+
+        let ext = compute_local_extrema(&points);
+
+        // Should detect:
+        // 1. Zero crossing at x = -2.0
+        // 2. Minimum at x = 0.0, y = -4.0
+        // 3. Zero crossing at x = 2.0
+        assert_eq!(ext.len(), 3);
+        assert_eq!(ext[0].kind, ExtremumKind::ZeroCrossing);
+        assert!((ext[0].x - (-2.0)).abs() < 1e-5);
+        assert_eq!(ext[0].y, 0.0);
+
+        assert_eq!(ext[1].kind, ExtremumKind::Minimum);
+        assert!((ext[1].x - 0.0).abs() < 1e-5);
+        assert!((ext[1].y - (-4.0)).abs() < 1e-5);
+
+        assert_eq!(ext[2].kind, ExtremumKind::ZeroCrossing);
+        assert!((ext[2].x - 2.0).abs() < 1e-5);
+        assert_eq!(ext[2].y, 0.0);
+
+        // Interpolated zero crossing: y = 2x on [-1, 1]
+        let line = vec![[-1.0, -2.0], [1.0, 2.0]];
+        let line_ext = compute_local_extrema(&line);
+        assert_eq!(line_ext.len(), 1);
+        assert_eq!(line_ext[0].kind, ExtremumKind::ZeroCrossing);
+        assert!((line_ext[0].x - 0.0).abs() < 1e-5);
+        assert_eq!(line_ext[0].y, 0.0);
     }
 }
