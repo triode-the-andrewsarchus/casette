@@ -286,6 +286,27 @@ fn test_action_buttons_and_approx_compilation() {
 }
 
 #[test]
+fn test_force_numeric_result_handling() {
+    let resp: WorkerResponse = serde_json::from_str(
+        r#"{
+            "ok": true,
+            "kind": "symbolic",
+            "plain": "1.41421356237310",
+            "latex": "1.41421356237310",
+            "repr": "1.41421356237310",
+            "exact": true,
+            "primary_is_approx": true,
+            "exact_value": "sqrt(2)"
+        }"#,
+    )
+    .expect("deserialize");
+
+    assert_eq!(resp.primary_is_approx, Some(true));
+    assert_eq!(resp.exact_value.as_deref(), Some("sqrt(2)"));
+    assert_eq!(resp.plain.as_deref(), Some("1.41421356237310"));
+}
+
+#[test]
 fn test_multiline_raw_sage_preserves_newlines() {
     let mut state = SessionState::default();
     let multiline_input = "a = 5\nb = 10\na * b".to_string();

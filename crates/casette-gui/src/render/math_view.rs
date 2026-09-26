@@ -81,12 +81,40 @@ pub fn render_result(
         });
     }
 
+    // Secondary exact value line if in force-numeric mode
+    if let Some(exact_val) = &result.exact_value {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("exact:")
+                    .color(Colors::TEXT_MUTED)
+                    .font(FontId::new(12.0, FontFamily::Proportional)),
+            );
+            ui.label(
+                RichText::new(exact_val)
+                    .color(Colors::TEXT_SECONDARY)
+                    .font(FontId::new(12.5, FontFamily::Monospace)),
+            );
+        });
+    }
+
     // Action buttons bar
     render_action_bar(ui, row, result, on_action);
 }
 
 fn render_primary_math(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut TextureCache) {
     let ctx = ui.ctx().clone();
+    let is_primary_approx = result.primary_is_approx.unwrap_or(false);
+
+    // If primary result is approximate, render directly as crisp numeric text with ≈ prefix
+    if is_primary_approx {
+        if let Some(plain) = &result.plain {
+            if !plain.is_empty() {
+                render_primary_text(ui, plain, true);
+                return;
+            }
+        }
+    }
 
     // 1. Try to display pre-rendered math SVG artifact from worker
     let math_art_path = result
@@ -124,17 +152,29 @@ fn render_primary_math(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut
         ui.add_space(4.0);
     } else if let Some(plain) = &result.plain {
         if !plain.is_empty() {
-            render_primary_text(ui, plain, result.latex.as_deref());
+            render_primary_text(ui, plain, false);
         }
     }
 }
 
-fn render_primary_text(ui: &mut Ui, plain: &str, _latex: Option<&str>) {
+fn render_primary_text(ui: &mut Ui, plain: &str, is_approx: bool) {
     ui.horizontal_wrapped(|ui| {
+        if is_approx {
+            ui.label(
+                RichText::new("≈")
+                    .color(Colors::NUMERIC_AMBER)
+                    .font(FontId::new(16.0, FontFamily::Proportional))
+                    .strong(),
+            );
+        }
         ui.label(
             RichText::new(plain)
-                .color(Colors::TEXT_PRIMARY)
-                .font(FontId::new(16.0, FontFamily::Proportional))
+                .color(if is_approx {
+                    Colors::NUMERIC_AMBER
+                } else {
+                    Colors::TEXT_PRIMARY
+                })
+                .font(FontId::new(16.0, FontFamily::Monospace))
                 .strong(),
         );
     });

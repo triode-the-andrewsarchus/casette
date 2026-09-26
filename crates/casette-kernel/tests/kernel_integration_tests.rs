@@ -95,6 +95,16 @@ async fn test_kernel_boot_eval_ping() {
     assert!(mat_resp.ok);
     assert_eq!(mat_resp.approx, None);
 
+    // (d) Force-numeric mode on sqrt(2) makes decimal primary, exact_value preserved
+    let num_resp = kernel
+        .eval("sqrt(2)", true, Some(10))
+        .await
+        .expect("eval sqrt(2) force-numeric");
+    assert!(num_resp.ok);
+    assert_eq!(num_resp.primary_is_approx, Some(true));
+    assert_eq!(num_resp.exact_value.as_deref(), Some("sqrt(2)"));
+    assert!(num_resp.plain.as_deref().unwrap().starts_with("1.414213562"));
+
     // 5. Test math artifact generation on integration
     let math_resp = kernel
         .eval("integrate(1/(1-x^2), x)", false, None)

@@ -1554,6 +1554,7 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
         exact_value = plain_full
         plain_full = approx_str
         repr_full = approx_str
+        latex_str = approx_str
         approx_str = None  # primary already carries the number; no secondary.
 
     plain, plain_trunc = _cap(plain_full, _MAX_PLAIN)
@@ -1563,7 +1564,7 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
     actions = _actions_for(value, kind)
 
     artifacts_list = list(artifacts) if artifacts else []
-    if latex_str and kind not in ("plot", "matrix", "error", "interrupted"):
+    if latex_str and kind not in ("plot", "matrix", "error", "interrupted") and not (numeric and exact_value is not None):
         math_art = _render_math_artifact(latex_str)
         if math_art:
             artifacts_list.append(math_art)
