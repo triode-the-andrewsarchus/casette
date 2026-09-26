@@ -349,23 +349,23 @@ fn test_interactive_plot_model_and_reusable_expression() {
             y_label: None,
             series: vec![PlotSeriesPayload {
                 label: Some("sin(x)".into()),
-                points: vec![[-3.14, 0.0], [-1.57, -1.0], [0.0, 0.0], [1.57, 1.0], [3.14, 0.0]],
+                points: vec![[-3.0, 0.0], [-1.5, -1.0], [0.0, 0.0], [1.5, 1.0], [3.0, 0.0]],
                 color: [56, 139, 255],
                 is_scatter: false,
                 extrema: vec![
                     LocalExtremum {
-                        x: -1.57,
+                        x: -1.5,
                         y: -1.0,
                         kind: ExtremumKind::Minimum,
                     },
                     LocalExtremum {
-                        x: 1.57,
+                        x: 1.5,
                         y: 1.0,
                         kind: ExtremumKind::Maximum,
                     },
                 ],
             }],
-            x_range: [-3.14, 3.14],
+            x_range: [-3.0, 3.0],
             y_range: [-1.0, 1.0],
         }),
         ..Default::default()
