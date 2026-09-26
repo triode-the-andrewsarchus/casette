@@ -186,6 +186,10 @@ pub struct WorkerResponse {
     #[serde(default)]
     pub artifacts: Vec<ArtifactPayload>,
 
+    /// Structured 2D plot data for interactive rendering, panning, zooming, and snapping.
+    #[serde(default)]
+    pub plot_data: Option<PlotDataPayload>,
+
     /// Whether `plain` or `repr` output was truncated to prevent wire exhaustion.
     #[serde(default)]
     pub truncated: Option<bool>,
@@ -297,6 +301,48 @@ pub struct ArtifactPayload {
     /// Error message if this specific format failed to save.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Classification of local extremum for interactive plotting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExtremumKind {
+    Minimum,
+    Maximum,
+}
+
+/// A local minimum or maximum on a curve.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalExtremum {
+    pub x: f64,
+    pub y: f64,
+    pub kind: ExtremumKind,
+}
+
+/// Data for an individual plot curve or series.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlotSeriesPayload {
+    #[serde(default)]
+    pub label: Option<String>,
+    pub points: Vec<[f64; 2]>,
+    pub color: [u8; 3],
+    #[serde(default)]
+    pub is_scatter: bool,
+    #[serde(default)]
+    pub extrema: Vec<LocalExtremum>,
+}
+
+/// Structured 2D plot data payload for interactive plotting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlotDataPayload {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub x_label: Option<String>,
+    #[serde(default)]
+    pub y_label: Option<String>,
+    pub series: Vec<PlotSeriesPayload>,
+    pub x_range: [f64; 2],
+    pub y_range: [f64; 2],
 }
 
 /// Truncation metrics when output string caps are applied.

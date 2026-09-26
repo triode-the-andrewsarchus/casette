@@ -39,10 +39,14 @@ pub fn render_result(
         return;
     }
 
-    // Check if this row produced plot artifacts
-    let has_plot_artifact = result.artifacts.iter().any(|a| a.r#type == "image");
-    if has_plot_artifact || result.kind.as_deref() == Some("plot") {
-        render_plot_card(ui, result, texture_cache);
+    // Check if this row produced interactive plot data or plot artifacts
+    if let Some(plot_data) = &result.plot_data {
+        crate::render::interactive_plot::render_interactive_plot_card(ui, plot_data, row.row_number);
+    } else {
+        let has_plot_artifact = result.artifacts.iter().any(|a| a.r#type == "image");
+        if has_plot_artifact || result.kind.as_deref() == Some("plot") {
+            render_plot_card(ui, result, texture_cache);
+        }
     }
 
     // Render matrix or primary math/plain text

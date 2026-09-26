@@ -127,3 +127,31 @@ async fn test_woxi_solve_equation_with_units() {
 
     kernel.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn test_woxi_interactive_plot_data() {
+    let kernel = WoxiKernel::launch().await.expect("launch woxi kernel");
+
+    // Evaluate 2D sine plot
+    let resp = kernel
+        .eval("plot(sin(x), (x, -pi, pi))", false, None)
+        .await
+        .expect("plot eval");
+    assert!(resp.ok);
+    assert_eq!(resp.kind.as_deref(), Some("plot"));
+    assert!(resp.plot_data.is_some(), "expected plot_data payload");
+
+    let plot_data = resp.plot_data.unwrap();
+    assert_eq!(plot_data.series.len(), 1);
+    let series = &plot_data.series[0];
+    assert!(series.points.len() >= 50, "expected dense sampled points, got {}", series.points.len());
+
+    // Check that extrema (minimum near -pi/2, maximum near pi/2) were detected
+    assert!(series.extrema.len() >= 2, "expected at least 2 extrema, got {:?}", series.extrema);
+    let has_max = series.extrema.iter().any(|e| e.kind == casette_kernel::ExtremumKind::Maximum && (e.y - 1.0).abs() < 0.05);
+    let has_min = series.extrema.iter().any(|e| e.kind == casette_kernel::ExtremumKind::Minimum && (e.y - -1.0).abs() < 0.05);
+    assert!(has_max, "expected local maximum near y=1");
+    assert!(has_min, "expected local minimum near y=-1");
+
+    kernel.shutdown().await.expect("shutdown");
+}

@@ -170,6 +170,23 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Removed sign asymmetry from `fold = other_denominators || weight <= 2` in `tex_times_nary_with`, and extracted negative signs from `Rational(p, q)` so that standalone rational coefficients always format as positive fractions (`\frac{|p|}{|q|}`) with the negative sign placed cleanly in front.
       - Result: `integrate 1/(1-x^2)` now produces consistent, beautiful mathematical typography: `\frac{1}{2} \log (x+1)-\frac{1}{2} \log (1-x)`.
       - Added automated test in `crates/casette-kernel/tests/woxi_kernel_tests.rs`. All 53 workspace tests pass.
+  - **Phase 14 (Interactive 2D Plotting with Extrema Snapping):**
+    - Implemented interactive 2D Cartesian plotting subsystem using `egui_plot` 0.31:
+      - Integrated `egui_plot` in workspace dependencies and `crates/casette-gui/Cargo.toml`.
+      - Extended kernel protocol in `crates/casette-kernel/src/protocol.rs` with `PlotDataPayload`, `PlotSeriesPayload`, `LocalExtremum`, and `ExtremumKind`.
+      - Enhanced `crates/casette-kernel/src/woxi_kernel.rs`:
+        - Added `split_top_level_commas` and `convert_plot_args` to desugar range arguments `(x, -pi, pi)` or `{x, -pi, pi}` into Wolfram Language list iterators inside `Plot[...]`.
+        - Implemented `compute_local_extrema` analyzing first and second differences of sampled curve points to detect local maxima and minima.
+        - Implemented `extract_plot_data` to extract sampled points, bounding boxes, labels, and local extrema from Woxi `Expr::Graphics { source: PlotSource, .. }`.
+      - Implemented [`render_interactive_plot_card`](crates/casette-gui/src/render/interactive_plot.rs):
+        - Smooth canvas navigation: panning (dragging), zooming (boxed zoom / drag), and a "↺ Reset" button restoring initial domain and range bounds.
+        - Continuous cursor inspection: moving the mouse horizontally projects dotted horizontal guidelines to the Y axis and draws intersection dots across all curves.
+        - Magnetic extrema snapping: automatically detects when mouse screen X is within `SNAP_THRESHOLD_PX` (18 screen pixels) of any local minimum or maximum, snapping the active X crosshair to the exact extremum, enlarging the target dot, and presenting an active pill badge (`▲ Local Max: x = ..., y = ...` or `▼ Local Min: x = ..., y = ...`). Includes an on-screen toggle button (`🧲 Snap Extrema: ON/OFF`).
+        - Dark macOS styling matching Casette typography hierarchy, `#141418` frame, `#26262C` controls, and `allow_scroll(false)` to keep session tape scrolling smooth.
+      - Routed interactive plots in `crates/casette-gui/src/render/math_view.rs`.
+      - Documented complete architecture in [`plans/INTERACTIVE-PLOTTING.md`](plans/INTERACTIVE-PLOTTING.md) and indexed in `PLAN.md`.
+      - Added automated tests in `crates/casette-kernel/tests/woxi_kernel_tests.rs` and `woxi_kernel.rs`. All workspace tests pass cleanly.
+
 
 
 

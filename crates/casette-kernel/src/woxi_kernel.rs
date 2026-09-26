@@ -7,7 +7,8 @@
 
 use crate::error::KernelError;
 use crate::protocol::{
-    ArtifactPayload, MatrixPropertyPayload, SymbolPayload, WorkerResponse,
+    ArtifactPayload, ExtremumKind, LocalExtremum, MatrixPropertyPayload, PlotDataPayload,
+    PlotSeriesPayload, SymbolPayload, WorkerResponse,
 };
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -94,6 +95,8 @@ integrate[f_, x_] := Integrate[f, x];
 solve[eq_, x_] := Solve[eq, x];
 det[m_] := Det[m];
 matrix[m_] := m;
+pi = Pi;
+e = E;
 "#;
 
 enum WoxiCommand {
@@ -207,7 +210,13 @@ impl WoxiKernel {
                                         }
                                     }
 
-                                    let kind = if !artifacts.is_empty() {
+                                    let plot_data = if let Some(Expr::Graphics { source: Some(source), .. }) = res.expr.as_ref() {
+                                        Some(extract_plot_data(source))
+                                    } else {
+                                        None
+                                    };
+
+                                    let kind = if plot_data.is_some() || !artifacts.is_empty() {
                                         "plot".to_string()
                                     } else {
                                         determine_kind(res.expr.as_ref(), &res.result)
@@ -270,6 +279,7 @@ impl WoxiKernel {
                                         exact_value: if numeric { Some(normalized_code) } else { None },
                                         actions,
                                         artifacts,
+                                        plot_data,
                                         truncated: Some(false),
                                         truncation: None,
                                         matrix_properties,
@@ -575,7 +585,10 @@ fn convert_function_calls(input: &str) -> String {
             let open_paren_idx = idx + src.len();
             if let Some(close_paren_idx) = find_matching_delimiter(&s, open_paren_idx, '(', ')') {
                 let inner = &s[open_paren_idx + 1..close_paren_idx];
-                let converted_inner = convert_function_calls(inner);
+                let mut converted_inner = convert_function_calls(inner);
+                if dst == "Plot" {
+                    converted_inner = convert_plot_args(&converted_inner);
+                }
                 let replacement = format!("{}[{}]", dst, converted_inner);
                 s.replace_range(idx..=close_paren_idx, &replacement);
             } else {
@@ -616,6 +629,7 @@ fn determine_kind(expr_opt: Option<&Expr>, plain: &str) -> String {
         match expr {
             Expr::Integer(_) | Expr::BigInteger(_) => "integer".to_string(),
             Expr::Real(_) | Expr::BigFloat(..) => "real".to_string(),
+            Expr::Graphics { .. } => "plot".to_string(),
             Expr::FunctionCall { name, args } => {
                 if name == "Rational" && args.len() == 2 {
                     "rational".to_string()
@@ -799,6 +813,180 @@ fn clean_approx_text(s: &str) -> String {
     out
 }
 
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut start = 0;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut in_quote: Option<char> = None;
+
+    for (idx, ch) in s.char_indices() {
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        } else if ch == '(' {
+            paren_depth += 1;
+        } else if ch == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        } else if ch == '[' {
+            bracket_depth += 1;
+        } else if ch == ']' {
+            bracket_depth = bracket_depth.saturating_sub(1);
+        } else if ch == '{' {
+            brace_depth += 1;
+        } else if ch == '}' {
+            brace_depth = brace_depth.saturating_sub(1);
+        } else if ch == ',' && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            args.push(&s[start..idx]);
+            start = idx + 1;
+        }
+    }
+    args.push(&s[start..]);
+    args
+}
+
+fn convert_plot_args(inner: &str) -> String {
+    let args = split_top_level_commas(inner);
+    let mut converted_args = Vec::with_capacity(args.len());
+
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() >= 2 {
+            let inner_arg = &trimmed[1..trimmed.len() - 1];
+            // Check if inner_arg contains a comma at depth 0 (meaning it was a tuple)
+            let mut has_comma = false;
+            let mut p_depth = 0usize;
+            let mut b_depth = 0usize;
+            let mut br_depth = 0usize;
+            for ch in inner_arg.chars() {
+                if ch == '(' {
+                    p_depth += 1;
+                } else if ch == ')' {
+                    p_depth = p_depth.saturating_sub(1);
+                } else if ch == '[' {
+                    b_depth += 1;
+                } else if ch == ']' {
+                    b_depth = b_depth.saturating_sub(1);
+                } else if ch == '{' {
+                    br_depth += 1;
+                } else if ch == '}' {
+                    br_depth = br_depth.saturating_sub(1);
+                } else if ch == ',' && p_depth == 0 && b_depth == 0 && br_depth == 0 {
+                    has_comma = true;
+                    break;
+                }
+            }
+            if has_comma {
+                converted_args.push(format!("{{{inner_arg}}}"));
+                continue;
+            }
+        }
+        converted_args.push(trimmed.to_string());
+    }
+
+    converted_args.join(", ")
+}
+
+/// Computes local minima and maxima from a series of sampled points.
+pub fn compute_local_extrema(points: &[[f64; 2]]) -> Vec<LocalExtremum> {
+    let mut extrema = Vec::new();
+    if points.len() < 3 {
+        return extrema;
+    }
+
+    let mut i = 1;
+    while i + 1 < points.len() {
+        let prev_y = points[i - 1][1];
+        let curr_y = points[i][1];
+        let next_y = points[i + 1][1];
+
+        if !curr_y.is_finite() || !prev_y.is_finite() || !next_y.is_finite() {
+            i += 1;
+            continue;
+        }
+
+        if curr_y > prev_y && curr_y >= next_y {
+            // Plateau check for maximum
+            let mut j = i + 1;
+            while j < points.len() && points[j][1] == curr_y {
+                j += 1;
+            }
+            if j < points.len() && points[j][1] < curr_y {
+                let mid_x = (points[i][0] + points[j - 1][0]) * 0.5;
+                extrema.push(LocalExtremum {
+                    x: mid_x,
+                    y: curr_y,
+                    kind: ExtremumKind::Maximum,
+                });
+                i = j;
+                continue;
+            } else if curr_y > next_y {
+                extrema.push(LocalExtremum {
+                    x: points[i][0],
+                    y: curr_y,
+                    kind: ExtremumKind::Maximum,
+                });
+            }
+        } else if curr_y < prev_y && curr_y <= next_y {
+            // Plateau check for minimum
+            let mut j = i + 1;
+            while j < points.len() && points[j][1] == curr_y {
+                j += 1;
+            }
+            if j < points.len() && points[j][1] > curr_y {
+                let mid_x = (points[i][0] + points[j - 1][0]) * 0.5;
+                extrema.push(LocalExtremum {
+                    x: mid_x,
+                    y: curr_y,
+                    kind: ExtremumKind::Minimum,
+                });
+                i = j;
+                continue;
+            } else if curr_y < next_y {
+                extrema.push(LocalExtremum {
+                    x: points[i][0],
+                    y: curr_y,
+                    kind: ExtremumKind::Minimum,
+                });
+            }
+        }
+        i += 1;
+    }
+
+    extrema
+}
+
+fn extract_plot_data(source: &woxi::syntax::PlotSource) -> PlotDataPayload {
+    let series = source
+        .series
+        .iter()
+        .map(|s| {
+            let points: Vec<[f64; 2]> = s.points.iter().map(|&(x, y)| [x, y]).collect();
+            let extrema = compute_local_extrema(&points);
+            PlotSeriesPayload {
+                label: None,
+                points,
+                color: [s.color.0, s.color.1, s.color.2],
+                is_scatter: s.is_scatter,
+                extrema,
+            }
+        })
+        .collect();
+
+    PlotDataPayload {
+        title: None,
+        x_label: None,
+        y_label: None,
+        series,
+        x_range: [source.x_range.0, source.x_range.1],
+        y_range: [source.y_range.0, source.y_range.1],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +1009,36 @@ mod tests {
             normalize_for_woxi("(matrix([[1, 2], [3, 4]])).det()"),
             "Det[{{1, 2}, {3, 4}}]"
         );
+    }
+
+    #[test]
+    fn test_normalize_plot_args() {
+        assert_eq!(
+            normalize_for_woxi("plot(sin(x), (x, -pi, pi))"),
+            "Plot[Sin[x], {x, -pi, pi}]"
+        );
+        assert_eq!(
+            normalize_for_woxi("plot((sin(x), cos(x)), (x, -10, 10))"),
+            "Plot[{Sin[x], Cos[x]}, {x, -10, 10}]"
+        );
+    }
+
+    #[test]
+    fn test_compute_local_extrema() {
+        let pts = vec![
+            [-2.0, 0.0],
+            [-1.0, 2.0], // max
+            [0.0, 0.0],
+            [1.0, -2.0], // min
+            [2.0, 0.0],
+        ];
+        let ext = compute_local_extrema(&pts);
+        assert_eq!(ext.len(), 2);
+        assert_eq!(ext[0].kind, ExtremumKind::Maximum);
+        assert_eq!(ext[0].x, -1.0);
+        assert_eq!(ext[0].y, 2.0);
+        assert_eq!(ext[1].kind, ExtremumKind::Minimum);
+        assert_eq!(ext[1].x, 1.0);
+        assert_eq!(ext[1].y, -2.0);
     }
 }

@@ -16,7 +16,8 @@ pub use client::{boot_prelude, KernelConfig, SageKernel, BOOT_VARIABLE_NAMES};
 pub use discovery::{SageDiscovery, SageEnvironment};
 pub use error::KernelError;
 pub use protocol::{
-    ArtifactPayload, ErrorPayload, MatrixPropertyPayload, SymbolPayload, TruncationPayload,
-    WorkerRequest, WorkerResponse,
+    ArtifactPayload, ErrorPayload, ExtremumKind, LocalExtremum, MatrixPropertyPayload,
+    PlotDataPayload, PlotSeriesPayload, SymbolPayload, TruncationPayload, WorkerRequest,
+    WorkerResponse,
 };
 pub use woxi_kernel::{normalize_for_woxi, WoxiKernel};
