@@ -117,9 +117,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
 
                 // Snap toggle button
                 let snap_text = if state.snap_enabled {
-                    "🧲 Snap Extrema: ON"
+                    "🧲 Snap (Extrema & Zeros): ON"
                 } else {
-                    "🧲 Snap Extrema: OFF"
+                    "🧲 Snap (Extrema & Zeros): OFF"
                 };
                 let snap_color = if state.snap_enabled {
                     Colors::ACCENT_PRIMARY
@@ -204,6 +204,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
             let plot_height = 280.0_f32;
             let available_width = ui.available_width().max(200.0);
 
+            let snapped_coords = std::rc::Rc::new(std::cell::Cell::new(None::<(f64, f64, Option<&'static str>)>));
+            let snapped_coords_clone = snapped_coords.clone();
+
             let plot_id = ui.make_persistent_id(format!("egui_plot_{row_id}"));
             let plot = Plot::new(plot_id)
                 .height(plot_height)
@@ -214,9 +217,19 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                 .allow_double_click_reset(true)
                 .allow_boxed_zoom(true)
                 .legend(Legend::default().position(Corner::RightTop))
-                .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default());
+                .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::new(move |point, _bounds| {
+                    if let Some((sx, sy, label)) = snapped_coords_clone.get() {
+                        if let Some(lbl) = label {
+                            format!("x: {:.4}\ny: {:.4} ({})", sx, sy, lbl)
+                        } else {
+                            format!("x: {:.4}\ny: {:.4}", sx, sy)
+                        }
+                    } else {
+                        format!("x: {:.4}\ny: {:.4}", point.x, point.y)
+                    }
+                }));
 
-            plot.show(ui, |plot_ui| {
+            let plot_resp = plot.show(ui, |plot_ui| {
                 if !state.initialized || state.reset_requested {
                     let min_x = if plot_data.x_range[0].is_finite() {
                         plot_data.x_range[0]
@@ -344,15 +357,17 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         }
                     }
 
-                    // 2b. Draw subtle markers for local extrema
+                    // 2b. Draw subtle markers for local extrema & zero crossings
                     for ext in &series.extrema {
                         let ext_color = match ext.kind {
                             ExtremumKind::Maximum => Colors::NUMERIC_AMBER,
                             ExtremumKind::Minimum => Colors::ACCENT_PRIMARY,
+                            ExtremumKind::ZeroCrossing => Colors::EXACT_GREEN,
                         };
                         let shape = match ext.kind {
                             ExtremumKind::Maximum => MarkerShape::Diamond,
                             ExtremumKind::Minimum => MarkerShape::Down,
+                            ExtremumKind::ZeroCrossing => MarkerShape::Circle,
                         };
                         plot_ui.points(
                             Points::new(vec![[ext.x, ext.y]])
@@ -363,12 +378,12 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                     }
                 }
 
-                // 2c. Pointer interaction & Extrema Snapping
+                // 2c. Pointer interaction & Extrema / Zero Snapping
                 if let Some(pointer_coord) = plot_ui.pointer_coordinate() {
                     let mouse_x = pointer_coord.x;
                     let mouse_screen_x = plot_ui.screen_from_plot(PlotPoint::new(mouse_x, 0.0)).x;
 
-                    // Search for closest extremum within horizontal screen threshold
+                    // Search for closest extremum or zero crossing within horizontal screen threshold
                     let mut closest_ext: Option<LocalExtremum> = None;
                     let mut min_screen_dist = SNAP_THRESHOLD_PX;
 
@@ -383,6 +398,17 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                 }
                             }
                         }
+                    }
+
+                    if let Some(ref ext) = closest_ext {
+                        let tag = match ext.kind {
+                            ExtremumKind::Maximum => Some("Max"),
+                            ExtremumKind::Minimum => Some("Min"),
+                            ExtremumKind::ZeroCrossing => Some("Zero"),
+                        };
+                        snapped_coords.set(Some((ext.x, ext.y, tag)));
+                    } else {
+                        snapped_coords.set(None);
                     }
 
                     let active_x = if let Some(ref ext) = closest_ext {
@@ -448,6 +474,14 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                 }
             });
 
+            // Consume scroll delta if pointer is over the plot canvas so parent tape doesn't scroll
+            if plot_resp.response.contains_pointer() || plot_resp.response.hovered() {
+                ui.ctx().input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    i.raw_scroll_delta = egui::Vec2::ZERO;
+                });
+            }
+
             // 3. Update persistent coordinate readout badge
             let temp_coord_id = ui.make_persistent_id(format!("plot_last_coord_{row_id}"));
             if let Some((x, ys)) = active_coords {
@@ -458,6 +492,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         }
                         ExtremumKind::Minimum => {
                             format!("▼ Local Min: x = {:.4}, y = {:.4}", ext.x, ext.y)
+                        }
+                        ExtremumKind::ZeroCrossing => {
+                            format!("⨁ Zero / Root: x = {:.4}, y = 0", ext.x)
                         }
                     }
                 } else if !ys.is_empty() {

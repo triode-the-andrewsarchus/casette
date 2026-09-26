@@ -359,6 +359,11 @@ fn test_interactive_plot_model_and_reusable_expression() {
                         kind: ExtremumKind::Minimum,
                     },
                     LocalExtremum {
+                        x: 0.0,
+                        y: 0.0,
+                        kind: ExtremumKind::ZeroCrossing,
+                    },
+                    LocalExtremum {
                         x: 1.5,
                         y: 1.0,
                         kind: ExtremumKind::Maximum,
