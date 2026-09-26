@@ -41,17 +41,16 @@ pub fn render_header(
                     } else {
                         "Sidebar"
                     };
-                    if ui
-                        .add(
-                            Button::new(
-                                RichText::new(sidebar_text)
-                                    .color(Colors::TEXT_SECONDARY)
-                                    .font(FontId::new(12.0, FontFamily::Proportional)),
-                            )
-                            .corner_radius(5),
-                        )
-                        .clicked()
-                    {
+                    let sidebar_btn = Button::new(
+                        RichText::new(sidebar_text)
+                            .color(Colors::TEXT_SECONDARY)
+                            .font(FontId::new(12.0, FontFamily::Proportional)),
+                    )
+                    .fill(Colors::CARD_BG)
+                    .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
+                    .corner_radius(5);
+
+                    if ui.add(sidebar_btn).clicked() {
                         *sidebar_visible = !*sidebar_visible;
                     }
 
@@ -89,15 +88,17 @@ pub fn render_header(
                     }
 
                     // Clear tape button
+                    let clear_btn = Button::new(
+                        RichText::new("🗑 Clear Tape")
+                            .color(Colors::TEXT_SECONDARY)
+                            .font(FontId::new(12.0, FontFamily::Proportional)),
+                    )
+                    .fill(Colors::CARD_BG)
+                    .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
+                    .corner_radius(5);
+
                     if ui
-                        .add(
-                            Button::new(
-                                RichText::new("Clear Tape")
-                                    .color(Colors::TEXT_MUTED)
-                                    .font(FontId::new(12.0, FontFamily::Proportional)),
-                            )
-                            .frame(false),
-                        )
+                        .add(clear_btn)
                         .on_hover_text("Clear all rows from session tape")
                         .clicked()
                     {
