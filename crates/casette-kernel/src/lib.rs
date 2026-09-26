@@ -15,6 +15,7 @@ pub use client::{boot_prelude, KernelConfig, SageKernel, BOOT_VARIABLE_NAMES};
 pub use discovery::{SageDiscovery, SageEnvironment};
 pub use error::KernelError;
 pub use protocol::{
-    ArtifactPayload, ErrorPayload, MatrixPropertyPayload, SymbolPayload, TruncationPayload,
+    compute_local_extrema, ArtifactPayload, ErrorPayload, ExtremumKind, LocalExtremum,
+    MatrixPropertyPayload, PlotDataPayload, PlotSeriesPayload, SymbolPayload, TruncationPayload,
     WorkerRequest, WorkerResponse,
 };

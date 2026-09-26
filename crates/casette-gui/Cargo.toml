@@ -16,6 +16,7 @@ casette-kernel = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
+egui_plot = { workspace = true }
 image = { workspace = true }
 resvg = { workspace = true }
 tiny-skia = { workspace = true }

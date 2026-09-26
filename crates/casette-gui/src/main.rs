@@ -10,7 +10,11 @@ use tracing::{error, info};
 
 fn extract_reusable_expression(compiled_sage: &str) -> Option<String> {
     let sage = compiled_sage.trim();
-    if sage.is_empty() {
+    if sage.is_empty()
+        || sage.starts_with("plot(")
+        || sage.starts_with("implicit_plot(")
+        || sage.starts_with("parametric_plot(")
+    {
         return None;
     }
 

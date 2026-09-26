@@ -42,16 +42,30 @@ impl PlotFormulaIR {
 
         let body = scanner::trimmed_shim(&input[command.matched_prefix.len()..]);
         let parts = scanner::split_top_level_commas(body);
-        let expression = parts
-            .first()
-            .map(|s| scanner::trimmed_shim(s))
-            .unwrap_or("")
-            .to_string();
-
-        let range = parts
-            .iter()
-            .skip(1)
-            .find_map(|s| compiler::parse_partial_range(s));
+        let (expression, range) = if parts.len() >= 2 {
+            let expr = parts
+                .first()
+                .map(|s| scanner::trimmed_shim(s))
+                .unwrap_or("")
+                .to_string();
+            let r = parts
+                .iter()
+                .skip(1)
+                .find_map(|s| compiler::parse_partial_range(s));
+            (expr, r)
+        } else if let Some((e, r_str)) = compiler::split_trailing_range(body) {
+            let r = compiler::parse_partial_range(&r_str);
+            (e, r)
+        } else {
+            (
+                parts
+                    .first()
+                    .map(|s| scanner::trimmed_shim(s))
+                    .unwrap_or("")
+                    .to_string(),
+                None,
+            )
+        };
         let free_variables = variables::free_variables(&expression, &[]);
         let inferred_variable = if free_variables.len() == 1 {
             free_variables[0].clone()

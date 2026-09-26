@@ -5,3 +5,6 @@ dist/
 .DS_Store
 .agents/
 /target
+vendor/
+__pycache__/
+*.pyc

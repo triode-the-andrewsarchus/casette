@@ -119,6 +119,31 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - **Problem 025 (`a6d4a39`):** Maintained private dup'd file descriptors (`os.dup(1)`, `os.dup(2)`) for JSONL protocol communication, redirecting both Python `sys.stdout` and OS-level fds 1/2 to capture buffers without stream desynchronization. Verified in `kernel_integration_tests.rs`.
       - **Problem 026 (`2888fb4`):** Evaluated preparsed AST and suppressed `None` returns in `_eval_code` to prevent bare prints or assignments from returning `None` values, and verified unordered factor terms. Verified in `kernel_integration_tests.rs`.
     - Removed all 28 individual problem markdown files from `problems/` and updated master `PROBLEMS.md` and `PLAN.md`.
+  - **Phase 11 (Interactive 2D Plotting with SageMath Backend):**
+    - Created branch `feat/sage-interactive-plotting` branched cleanly off `feat/units-and-parser` (`5579fb5`), git-ignoring `vendor/` and bytecode artifacts.
+    - Preserved SageMath's canonical calculus and algebra engine (`integrate(1/(1-x^2), x)` natively yields $\frac{1}{2}\log(x+1) - \frac{1}{2}\log(x-1)$).
+    - Extended `v0/01-worker-protocol/worker.py`:
+      - Implemented `_extract_plot_data` extracting sampled curves (`p.xdata`, `p.ydata`), bounding ranges, colors, and labels from Sage `Graphics` objects.
+      - Attached structured `plot_data` to `WorkerResponse` while continuing to save SVG and PNG image artifacts for notebook export and session persistence.
+    - Extended `crates/casette-kernel`:
+      - Added `PlotDataPayload`, `PlotSeriesPayload`, `LocalExtremum`, and `ExtremumKind` to `protocol.rs`.
+      - Implemented `compute_local_extrema` analyzing discrete difference signs across sampled curve points to detect peaks and valleys.
+      - Enriched responses in `read_response` to populate extrema automatically.
+      - Added integration test `test_kernel_interactive_plot_data` in `kernel_integration_tests.rs`.
+    - Enhanced `crates/friendly-compiler`:
+      - Implemented `split_trailing_range` in `compiler.rs` to support comma-free plot commands (e.g. `plot sin(x) x=-pi..pi` and `plot sin(x) -pi..pi`).
+      - Updated `PlotFormulaIR::parse` to parse comma-free ranges into formula chips.
+      - Preserved `#ROW` tape reference compilation (`plot #1, x=-10..10` -> `plot(__casette_tape_refs[1], (x, -10, 10))`).
+    - Enhanced `crates/casette-gui`:
+      - Added `egui_plot` 0.31 to workspace and `casette-gui`.
+      - Implemented `crates/casette-gui/src/render/interactive_plot.rs` featuring panning, zooming, 18px magnetic extrema snapping (`🧲 Snap Extrema: ON/OFF`), cursor crosshair inspection, and "↺ Reset" button.
+      - Sliced curve points into contiguous finite segments (`x.is_finite() && y.is_finite()`) to prevent `epaint` coarse tessellation culling from dropping lines on discontinuous or singular functions.
+      - Excluded plot commands and kind `"plot"` from `TapeRow::reusable_expression` and `extract_reusable_expression`.
+      - Routed interactive plots in `crates/casette-gui/src/render/math_view.rs`.
+    - Documented subsystem in `plans/INTERACTIVE-PLOTTING.md` and indexed in `PLAN.md`.
+    - All 45 tests green with 0 clippy warnings; release binary built.
+
+
 
 
 

@@ -981,11 +981,28 @@ fn series_range(payload: &str, func: &str, command: &str) -> CompileResult {
 }
 
 fn plot(payload: &str) -> CompileResult {
-    let parts = scanner::split_top_level_commas(payload);
-    let expr = parts
-        .first()
-        .map(|s| scanner::trimmed_shim(s))
-        .unwrap_or("");
+    let trimmed = scanner::trimmed_shim(payload);
+    if trimmed.is_empty() {
+        return CompileResult::Error(CompileError::new(
+            "`plot` needs an expression.",
+            None,
+            Some("Try: plot sin(x), x=-pi..pi".to_string()),
+        ));
+    }
+
+    let parts = scanner::split_top_level_commas(trimmed);
+    let (expr, range_str) = if parts.len() >= 2 {
+        (scanner::trimmed_shim(&parts[0]).to_string(), scanner::trimmed_shim(&parts[1]).to_string())
+    } else if let Some((e, r)) = split_trailing_range(trimmed) {
+        (e, r)
+    } else {
+        return CompileResult::Error(CompileError::new(
+            "`plot` needs a range `var=a..b`.",
+            None,
+            Some("Try: plot sin(x), x=-pi..pi".to_string()),
+        ));
+    };
+
     if expr.is_empty() {
         return CompileResult::Error(CompileError::new(
             "`plot` needs an expression.",
@@ -993,16 +1010,29 @@ fn plot(payload: &str) -> CompileResult {
             Some("Try: plot sin(x), x=-pi..pi".to_string()),
         ));
     }
-    if parts.len() < 2 {
-        return CompileResult::Error(CompileError::new(
-            "`plot` needs a range `var=a..b`.",
-            None,
-            Some("Try: plot sin(x), x=-pi..pi".to_string()),
-        ));
-    }
-    let r = match parse_range(&parts[1]) {
-        Some(r) => r,
-        None => return CompileResult::Error(range_error(&parts[1], "x=-pi..pi")),
+
+    let r = if let Some(parsed) = parse_range(&range_str) {
+        parsed
+    } else if let Some(dot_idx) = range_str.find("..") {
+        let lower = scanner::trimmed_shim(&range_str[..dot_idx]);
+        let upper = scanner::trimmed_shim(&range_str[dot_idx + 2..]);
+        if !lower.is_empty() && !upper.is_empty() {
+            let vars = variables::free_variables(&expr, &[]);
+            let v = if vars.len() == 1 {
+                vars[0].clone()
+            } else {
+                "x".to_string()
+            };
+            Range {
+                variable: v,
+                lower: lower.to_string(),
+                upper: upper.to_string(),
+            }
+        } else {
+            return CompileResult::Error(range_error(&range_str, "x=-pi..pi"));
+        }
+    } else {
+        return CompileResult::Error(range_error(&range_str, "x=-pi..pi"));
     };
 
     let sage = format!("plot({expr}, ({}, {}, {}))", r.variable, r.lower, r.upper);
@@ -2043,6 +2073,53 @@ pub fn parse_range(clause: &str) -> Option<Range> {
         lower: lower.to_string(),
         upper: upper.to_string(),
     })
+}
+
+/// Splits an input string into an expression and a trailing range clause,
+/// even when no separating comma is present (e.g. "sin(x) x=-pi..pi" or "sin(x) -pi..pi").
+pub fn split_trailing_range(s: &str) -> Option<(String, String)> {
+    let dot_idx = s.rfind("..")?;
+    let before_dots = &s[..dot_idx];
+
+    // Case A: look for '=' before '..'
+    if let Some(eq_idx) = before_dots.rfind('=') {
+        let before_eq = before_dots[..eq_idx].trim_end();
+        let mut var_start = before_eq.len();
+        for (i, ch) in before_eq.char_indices().rev() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                var_start = i;
+            } else {
+                break;
+            }
+        }
+        if var_start < before_eq.len() {
+            let var = &before_eq[var_start..];
+            if variables::is_plausible_variable(var) {
+                let is_boundary = var_start == 0
+                    || before_dots.as_bytes()[var_start - 1].is_ascii_whitespace()
+                    || before_dots.as_bytes()[var_start - 1] == b',';
+                if is_boundary {
+                    let expr = s[..var_start].trim_end_matches(',').trim();
+                    let range_part = s[var_start..].trim();
+                    if !expr.is_empty() && !range_part.is_empty() {
+                        return Some((expr.to_string(), range_part.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Case B: bare range without '=' e.g. "sin(x) -pi..pi"
+    let before_dots_trimmed = before_dots.trim_end();
+    if let Some(space_idx) = before_dots_trimmed.rfind(|c: char| c.is_ascii_whitespace() || c == ',') {
+        let expr = s[..space_idx].trim_end_matches(',').trim();
+        let range_part = s[space_idx + 1..].trim();
+        if !expr.is_empty() && !range_part.is_empty() {
+            return Some((expr.to_string(), range_part.to_string()));
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

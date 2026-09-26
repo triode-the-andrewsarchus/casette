@@ -259,3 +259,52 @@ async fn test_kernel_restart_chains_preludes() {
     kernel.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test]
+async fn test_kernel_interactive_plot_data() {
+    let env = SageDiscovery::discover().await.expect("discover sage");
+    let config = KernelConfig {
+        python_path: env.python_path,
+        worker_script: env.worker_script,
+        startup_timeout: Duration::from_secs(15),
+        default_eval_timeout: Duration::from_secs(30),
+        initial_precision: Some(10),
+        ..Default::default()
+    };
+
+    let kernel = SageKernel::launch(config).await.expect("launch kernel");
+
+    // Evaluate a plot command in Sage
+    let resp = kernel
+        .eval("plot(sin(x), (x, -pi, pi))", false, None)
+        .await
+        .expect("eval plot");
+    assert!(resp.ok);
+    assert_eq!(resp.kind.as_deref(), Some("plot"));
+
+    // Verify structured plot_data payload
+    let pd = resp.plot_data.expect("plot_data payload must be present");
+    assert!(!pd.series.is_empty(), "must have at least one series");
+    let s0 = &pd.series[0];
+    assert!(s0.points.len() > 50, "series should have sampled points");
+    assert!(pd.x_range[0] <= -3.0 && pd.x_range[1] >= 3.0);
+    assert!(pd.y_range[0] <= -0.9 && pd.y_range[1] >= 0.9);
+
+    // Verify local extrema were detected on the sine curve
+    assert!(!s0.extrema.is_empty(), "sine wave must have detected extrema");
+    let has_max = s0
+        .extrema
+        .iter()
+        .any(|e| matches!(e.kind, casette_kernel::ExtremumKind::Maximum));
+    let has_min = s0
+        .extrema
+        .iter()
+        .any(|e| matches!(e.kind, casette_kernel::ExtremumKind::Minimum));
+    assert!(has_max, "must detect local maximum");
+    assert!(has_min, "must detect local minimum");
+
+    // Also verify static artifacts are still produced for persistence/export
+    assert!(resp.artifacts.iter().any(|a| a.r#type == "image"));
+
+    kernel.shutdown().await.expect("shutdown");
+}
+

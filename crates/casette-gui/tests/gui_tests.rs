@@ -302,4 +302,52 @@ fn test_multiline_raw_sage_preserves_newlines() {
     assert!(state.rows[0].compiled_sage.contains('\n'));
 }
 
+#[test]
+fn test_interactive_plot_model_and_reusable_expression() {
+    use casette_kernel::{ExtremumKind, LocalExtremum, PlotDataPayload, PlotSeriesPayload};
+
+    let mut state = SessionState::default();
+    let row_num = state.push_row(
+        "plot sin(x), x=-pi..pi".into(),
+        "plot(sin(x), (x, -pi, pi))".into(),
+    );
+
+    let resp = WorkerResponse {
+        ok: true,
+        kind: Some("plot".into()),
+        plot_data: Some(PlotDataPayload {
+            title: None,
+            x_label: None,
+            y_label: None,
+            series: vec![PlotSeriesPayload {
+                label: Some("sin(x)".into()),
+                points: vec![[-3.14, 0.0], [-1.57, -1.0], [0.0, 0.0], [1.57, 1.0], [3.14, 0.0]],
+                color: [56, 139, 255],
+                is_scatter: false,
+                extrema: vec![
+                    LocalExtremum {
+                        x: -1.57,
+                        y: -1.0,
+                        kind: ExtremumKind::Minimum,
+                    },
+                    LocalExtremum {
+                        x: 1.57,
+                        y: 1.0,
+                        kind: ExtremumKind::Maximum,
+                    },
+                ],
+            }],
+            x_range: [-3.14, 3.14],
+            y_range: [-1.0, 1.0],
+        }),
+        ..Default::default()
+    };
+
+    state.rows[row_num - 1].complete(resp, Duration::from_millis(100));
+
+    // A plot row must NOT provide a reusable expression for arithmetic tape references
+    assert_eq!(state.rows[row_num - 1].reusable_expression(), None);
+}
+
+
 

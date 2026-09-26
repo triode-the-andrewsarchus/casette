@@ -84,12 +84,17 @@ impl TapeRow {
         if !res.ok
             || res.kind.as_deref() == Some("error")
             || res.kind.as_deref() == Some("interrupted")
+            || res.kind.as_deref() == Some("plot")
         {
             return None;
         }
 
         let sage = self.compiled_sage.trim();
-        if sage.is_empty() {
+        if sage.is_empty()
+            || sage.starts_with("plot(")
+            || sage.starts_with("implicit_plot(")
+            || sage.starts_with("parametric_plot(")
+        {
             return None;
         }
 

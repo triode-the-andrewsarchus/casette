@@ -845,6 +845,85 @@ def _save_plot_artifact(plot_obj):
     return artifacts
 
 
+def _extract_plot_data(plot_obj):
+    """Extract interactive 2D curve coordinates and bounding data from a Sage Graphics object."""
+    if not hasattr(plot_obj, "__getitem__"):
+        return None
+    try:
+        minmax = plot_obj.get_minmax_data()
+        xmin = float(minmax.get("xmin", -10.0))
+        xmax = float(minmax.get("xmax", 10.0))
+        ymin = float(minmax.get("ymin", -10.0))
+        ymax = float(minmax.get("ymax", 10.0))
+    except Exception:
+        xmin, xmax, ymin, ymax = -10.0, 10.0, -10.0, 10.0
+
+    palette = [
+        [56, 139, 255],   # Primary Accent Blue (#388BFF)
+        [63, 185, 80],    # Emerald Green (#3FB950)
+        [210, 153, 34],   # Amber (#D29922)
+        [188, 140, 255],  # Purple (#BC8CFF)
+        [248, 81, 73],    # Coral Red (#F85149)
+        [88, 166, 255],   # Light Blue (#58A6FF)
+    ]
+
+    series = []
+    curve_idx = 0
+    for p in plot_obj:
+        if hasattr(p, "xdata") and hasattr(p, "ydata"):
+            pts = []
+            for x_val, y_val in zip(p.xdata, p.ydata):
+                try:
+                    fx = float(x_val)
+                    fy = float(y_val)
+                    if fx == fx and fy == fy and abs(fx) < 1e15 and abs(fy) < 1e15:
+                        pts.append([fx, fy])
+                except Exception:
+                    continue
+            if not pts:
+                continue
+            opts = p.options() if hasattr(p, "options") else {}
+            color = palette[curve_idx % len(palette)]
+            if "rgbcolor" in opts and opts["rgbcolor"]:
+                c = opts["rgbcolor"]
+                try:
+                    vals = list(c)
+                    if len(vals) >= 3:
+                        color = [int(max(0, min(255, round(v * 255)))) for v in vals[:3]]
+                except Exception:
+                    pass
+            label = opts.get("legend_label")
+            series.append({
+                "label": label,
+                "points": pts,
+                "color": color,
+                "is_scatter": False,
+                "extrema": [],
+            })
+            curve_idx += 1
+
+    if not series:
+        return None
+
+    if not (xmin == xmin and abs(xmin) < 1e9):
+        xmin = -10.0
+    if not (xmax == xmax and abs(xmax) < 1e9):
+        xmax = 10.0
+    if not (ymin == ymin and abs(ymin) < 1e9):
+        ymin = -10.0
+    if not (ymax == ymax and abs(ymax) < 1e9):
+        ymax = 10.0
+
+    return {
+        "title": None,
+        "x_label": None,
+        "y_label": None,
+        "series": series,
+        "x_range": [xmin, xmax],
+        "y_range": [ymin, ymax],
+    }
+
+
 def _render_math_artifact(latex_str):
     """Save a LaTeX math expression to an SVG image artifact.
 
@@ -1505,6 +1584,13 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
     matrix_properties = _matrix_properties(value)
     if matrix_properties is not None:
         env["matrix_properties"] = matrix_properties
+    if _is_plot(value):
+        try:
+            plot_data = _extract_plot_data(value)
+            if plot_data:
+                env["plot_data"] = plot_data
+        except Exception:
+            pass
     if exact_value is not None:
         env["exact_value"] = exact_value
     if truncated:
@@ -1913,6 +1999,12 @@ def _handle_eval(req):
                               digits=digits, numeric=numeric)
     else:
         has_value = False
+        plot_data = None
+        if _SHOWN_PLOTS:
+            try:
+                plot_data = _extract_plot_data(_SHOWN_PLOTS[0])
+            except Exception:
+                pass
         env = {
             "kind": "plot" if artifacts else "none",
             "plain": "",
@@ -1926,6 +2018,8 @@ def _handle_eval(req):
             "artifacts": artifacts,
             "truncated": False,
         }
+        if plot_data:
+            env["plot_data"] = plot_data
 
     resp = {
         "id": rid,

@@ -462,7 +462,14 @@ impl WorkerProcess {
 
         match line_result {
             Ok(Ok(Some(line))) => {
-                let resp: WorkerResponse = serde_json::from_str(&line)?;
+                let mut resp: WorkerResponse = serde_json::from_str(&line)?;
+                if let Some(pd) = &mut resp.plot_data {
+                    for s in &mut pd.series {
+                        if s.extrema.is_empty() {
+                            s.extrema = crate::protocol::compute_local_extrema(&s.points);
+                        }
+                    }
+                }
                 Ok(resp)
             }
             Ok(Ok(None)) => {
