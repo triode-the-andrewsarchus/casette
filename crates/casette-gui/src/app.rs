@@ -12,6 +12,7 @@ use tracing::{error, info};
 /// Main Casette GUI application structure.
 pub struct CasetteApp {
     state: SessionState,
+    session_path: std::path::PathBuf,
     texture_cache: TextureCache,
     action_tx: Sender<GuiAction>,
     message_rx: Receiver<AsyncMessage>,
@@ -32,8 +33,23 @@ impl CasetteApp {
     ) -> Self {
         apply_theme(&_cc.egui_ctx);
 
+        let session_path = crate::persistence::default_session_path();
+        let mut state = SessionState::default();
+        if session_path.exists() {
+            if let Err(e) = crate::persistence::load_session(&mut state, &session_path) {
+                tracing::warn!("Failed to load previous session from {:?}: {}", session_path, e);
+            } else {
+                tracing::info!(
+                    "Loaded previous session: {} tape rows, {} history items",
+                    state.rows.len(),
+                    state.history.len()
+                );
+            }
+        }
+
         Self {
-            state: SessionState::default(),
+            state,
+            session_path,
             texture_cache: TextureCache::new(),
             action_tx,
             message_rx,
@@ -70,6 +86,9 @@ impl CasetteApp {
                     }
                     self.state.worker_status = WorkerStatus::Ready;
                     let _ = self.action_tx.send(GuiAction::FetchSymbols);
+                    if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+                        tracing::warn!("Failed to auto-save session: {}", e);
+                    }
                 }
                 AsyncMessage::SymbolsUpdated(symbols) => {
                     self.state.symbols = symbols;
@@ -132,6 +151,9 @@ impl App for CasetteApp {
             if clear_tape {
                 self.state.clear_tape();
                 let _ = self.action_tx.send(GuiAction::ClearTape);
+                if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+                    tracing::warn!("Failed to auto-save session after clear tape: {}", e);
+                }
             }
         });
 
@@ -206,5 +228,19 @@ impl App for CasetteApp {
                 self.submit_evaluation(snippet, is_numeric);
             }
         });
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+            tracing::warn!("Failed to save session in App::save: {}", e);
+        }
+    }
+}
+
+impl Drop for CasetteApp {
+    fn drop(&mut self) {
+        if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+            tracing::warn!("Failed to save session in Drop: {}", e);
+        }
     }
 }

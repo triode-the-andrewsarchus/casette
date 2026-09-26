@@ -77,6 +77,7 @@ fn test_session_persistence_roundtrip() {
         Some("(x - 1)*(x + 1)")
     );
     assert!(!restored_state.rows[0].is_live); // Restored rows start as not live
+    assert_eq!(restored_state.history, vec!["factor(x^2 - 1)"]);
 
     // Test markdown export
     let md = export_to_markdown(&restored_state);
@@ -85,6 +86,12 @@ fn test_session_persistence_roundtrip() {
     assert!(md.contains("(x - 1)*(x + 1)"));
 
     let _ = std::fs::remove_file(file_path);
+}
+
+#[test]
+fn test_default_session_path_resolution() {
+    let p = casette_gui::persistence::default_session_path();
+    assert!(p.to_string_lossy().contains("last-session.json") || p.to_string_lossy().contains("casette_last_session.json"));
 }
 
 #[test]

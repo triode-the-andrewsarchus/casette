@@ -15,6 +15,8 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub struct SessionEnvelope {
     pub schema_version: u32,
     pub rows: Vec<TapeRow>,
+    #[serde(default)]
+    pub history: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -22,11 +24,34 @@ struct SchemaPeek {
     schema_version: Option<u32>,
 }
 
+/// Resolves the default persistent session file path according to the session storage policy.
+#[must_use]
+pub fn default_session_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("CASETTE_CONFIG_DIR") {
+        return std::path::PathBuf::from(dir).join("sessions").join("last-session.json");
+    }
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return std::path::PathBuf::from(xdg).join("casette").join("sessions").join("last-session.json");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home)
+            .join(".config")
+            .join("casette")
+            .join("sessions")
+            .join("last-session.json");
+    }
+    std::env::temp_dir().join("casette_last_session.json")
+}
+
 /// Saves the session tape entries and settings to a JSON file.
 pub fn save_session(state: &SessionState, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create session directory")?;
+    }
     let envelope = SessionEnvelope {
         schema_version: CURRENT_SCHEMA_VERSION,
         rows: state.rows.clone(),
+        history: state.history.clone(),
     };
     let json =
         serde_json::to_string_pretty(&envelope).context("failed to serialize session envelope")?;
@@ -55,14 +80,22 @@ pub fn load_session(state: &mut SessionState, path: &Path) -> Result<()> {
     }
 
     // 2. Decode either structured SessionEnvelope or legacy raw Vec<TapeRow>
-    let rows = if let Ok(envelope) = serde_json::from_str::<SessionEnvelope>(&json) {
-        envelope.rows
+    let (rows, history) = if let Ok(envelope) = serde_json::from_str::<SessionEnvelope>(&json) {
+        let hist = if envelope.history.is_empty() {
+            envelope.rows.iter().map(|r| r.input_raw.clone()).collect()
+        } else {
+            envelope.history
+        };
+        (envelope.rows, hist)
     } else {
-        serde_json::from_str::<Vec<TapeRow>>(&json)
-            .context("failed to deserialize session tape rows")?
+        let r: Vec<TapeRow> = serde_json::from_str(&json)
+            .context("failed to deserialize session tape rows")?;
+        let hist = r.iter().map(|row| row.input_raw.clone()).collect();
+        (r, hist)
     };
 
     state.rows = rows;
+    state.history = history;
     state.next_row_number = state
         .rows
         .iter()
