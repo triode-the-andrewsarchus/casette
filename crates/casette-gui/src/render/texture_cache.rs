@@ -85,7 +85,7 @@ impl TextureCache {
             return None;
         }
 
-        let path = std::env::temp_dir().join(format!("casette_math_{:016x}.svg", hash));
+        let path = std::env::temp_dir().join(format!("casette_math_v3_{:016x}.svg", hash));
 
         if !path.exists() {
             if Self::render_latex_to_svg(trimmed, &path).is_none() {
@@ -112,7 +112,7 @@ latex = " ".join(sys.argv[1].strip().strip("$").split())
 out_file = sys.argv[2]
 buf = io.BytesIO()
 prop = FontProperties(size=20)
-mathtext.math_to_image(latex, buf, prop=prop, dpi=180, format="svg", color="#F0F6FC")
+mathtext.math_to_image(f"${latex}$", buf, prop=prop, dpi=180, format="svg", color="#F0F6FC")
 svg = buf.getvalue().decode("utf-8")
 svg_clean = re.sub(r'(<g id="patch_1">\s*<path [^>]*style=")[^"]*"', r'\1fill: none;"', svg)
 with open(out_file, "w", encoding="utf-8") as f:
