@@ -34,6 +34,12 @@ fn extract_reusable_expression(compiled_sage: &str) -> Option<String> {
         return None;
     }
 
+    // Graphical plot commands do not produce algebraic values for tape reuse
+    let lower = sage.to_lowercase();
+    if lower.starts_with("plot(") || lower.starts_with("plot[") || lower.starts_with("implicit_plot") {
+        return None;
+    }
+
     Some(sage.to_string())
 }
 

@@ -10,8 +10,8 @@ use egui::{
     RichText, Stroke, Ui,
 };
 use egui_plot::{
-    CoordinatesFormatter, Corner, Legend, Line, LineStyle, MarkerShape, Plot, PlotBounds,
-    PlotPoint, PlotPoints, Points,
+    CoordinatesFormatter, Corner, HLine, Legend, Line, LineStyle, MarkerShape, Plot, PlotBounds,
+    PlotPoint, PlotPoints, Points, VLine,
 };
 
 /// Distance in screen pixels within which mouse X snaps to a local extremum.
@@ -20,6 +20,7 @@ const SNAP_THRESHOLD_PX: f32 = 18.0;
 /// State for an interactive plot card stored in egui persistent memory.
 #[derive(Clone, Copy, Debug)]
 pub struct InteractivePlotState {
+    pub initialized: bool,
     pub snap_enabled: bool,
     pub reset_requested: bool,
 }
@@ -27,6 +28,7 @@ pub struct InteractivePlotState {
 impl Default for InteractivePlotState {
     fn default() -> Self {
         Self {
+            initialized: false,
             snap_enabled: true,
             reset_requested: false,
         }
@@ -169,11 +171,12 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                 .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::default());
 
             plot.show(ui, |plot_ui| {
-                if state.reset_requested {
+                if !state.initialized || state.reset_requested {
                     plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                         [plot_data.x_range[0], plot_data.y_range[0]],
                         [plot_data.x_range[1], plot_data.y_range[1]],
                     ));
+                    state.initialized = true;
                     state.reset_requested = false;
                 }
 
@@ -265,7 +268,6 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
 
                     // Evaluate Y on all curves at active_x
                     let mut y_values = Vec::new();
-                    let bounds = plot_ui.plot_bounds();
 
                     for (s_idx, series) in plot_data.series.iter().enumerate() {
                         if let Some(y) = interpolate_y(&series.points, active_x) {
@@ -283,9 +285,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                                 default_colors[s_idx % default_colors.len()]
                             };
 
-                            // Horizontal guideline to Y axis
-                            plot_ui.line(
-                                Line::new(vec![[bounds.min()[0], y], [active_x, y]])
+                            // Horizontal guideline to Y axis using HLine
+                            plot_ui.hline(
+                                HLine::new(y)
                                     .color(Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 70))
                                     .style(LineStyle::Dotted { spacing: 4.0_f32 })
                                     .width(1.0_f32),
@@ -303,9 +305,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         }
                     }
 
-                    // Vertical crosshair guideline across plot Y bounds
-                    plot_ui.line(
-                        Line::new(vec![[active_x, bounds.min()[1]], [active_x, bounds.max()[1]]])
+                    // Vertical crosshair guideline across plot Y bounds using VLine
+                    plot_ui.vline(
+                        VLine::new(active_x)
                             .color(Color32::from_rgba_unmultiplied(220, 220, 240, 110))
                             .style(LineStyle::Dashed { length: 5.0_f32 })
                             .width(1.2_f32),

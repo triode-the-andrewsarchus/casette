@@ -189,6 +189,11 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
         - Updated `PlotFormulaIR::parse` to recognize comma-free range clauses, correctly populating formula bar chips.
         - Added `desugar_bare_plot` and `var=min..max` clause conversion to `normalize_for_woxi` in `casette-kernel` for defense-in-depth on bare plot inputs.
         - Surfaced `CompileResult::Error` diagnostics directly on the session tape with suggestions in `crates/casette-gui/src/main.rs`.
+      - Fixed runaway auto-zoom feedback loop:
+        - Identified that `plot_ui.line` crosshairs spanning `bounds.min()` to `bounds.max()` were triggering `egui_plot`'s auto-bounds engine to add 10% padding on every frame, causing exponential runaway zoom-out on mouse movement.
+        - Initialized initial domain and range bounds on first frame (`!state.initialized`).
+        - Replaced crosshair guidelines with native `egui_plot::VLine` and `egui_plot::HLine` infinite reference items which are explicitly ignored in auto-bounding.
+        - Excluded plot commands from `extract_reusable_expression` in `crates/casette-gui/src/main.rs`, eliminating Woxi `Set::write: Tag Times ... is Protected` warnings.
       - Documented complete architecture in [`plans/INTERACTIVE-PLOTTING.md`](plans/INTERACTIVE-PLOTTING.md) and indexed in `PLAN.md`.
       - Added automated tests in `crates/casette-kernel/tests/woxi_kernel_tests.rs` and `friendly_compiler_tests.rs`. All workspace tests pass cleanly.
 
