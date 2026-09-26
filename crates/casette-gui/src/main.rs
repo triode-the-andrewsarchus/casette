@@ -5,7 +5,7 @@ use casette_gui::model::{AsyncMessage, GuiAction, WorkerStatus};
 use casette_kernel::SageKernel;
 use eframe::NativeOptions;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{error, info};
 
 fn extract_reusable_expression(compiled_sage: &str) -> Option<String> {
@@ -73,48 +73,15 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-        let mut row_counter = 1usize;
-        let mut tape_refs = friendly_compiler::TapeReferenceTable::empty();
-
         while let Ok(action) = action_rx.recv() {
             match action {
-                GuiAction::Evaluate { input, numeric } => {
-                    let row_num = row_counter;
-                    row_counter += 1;
-
-                    // Problem 009: Multiline input is raw Sage by definition.
-                    // Gate on newline presence so raw Python/Sage newlines are never flattened to spaces.
-                    let (_expanded_input, compiled_code) = if input.contains('\n') {
-                        (input.clone(), input.clone())
-                    } else {
-                        // Expand tape references (e.g. #1 -> __casette_tape_refs[1])
-                        let exp = match tape_refs.expand_references(&input) {
-                            Ok(exp) => exp,
-                            Err(compile_err) => {
-                                let err_resp = casette_kernel::WorkerResponse::new_error(
-                                    "CompileError".into(),
-                                    compile_err.message,
-                                    compile_err.suggestion,
-                                );
-                                let _ = msg_tx_clone.send(AsyncMessage::EvalFinished {
-                                    row_number: row_num,
-                                    response: Box::new(err_resp),
-                                    duration: Duration::from_millis(0),
-                                });
-                                continue;
-                            }
-                        };
-
-                        let comp = match friendly_compiler::compile(&exp) {
-                            friendly_compiler::CompileResult::Success { generated_sage, .. } => {
-                                generated_sage
-                            }
-                            friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
-                            _ => exp.clone(),
-                        };
-                        (exp, comp)
-                    };
-
+                GuiAction::Evaluate {
+                    row_number,
+                    input: _,
+                    compiled_code,
+                    numeric,
+                } => {
+                    let row_num = row_number;
                     let start_time = Instant::now();
                     match kernel.eval(&compiled_code, numeric, None).await {
                         Ok(response) => {
@@ -127,13 +94,14 @@ fn main() -> anyhow::Result<()> {
                                 duration,
                             });
 
-                            // If execution succeeded, register reference in worker dictionary
+                            // If execution succeeded, register reference in Sage worker dictionary
                             if is_ok {
                                 if let Some(expr) = extract_reusable_expression(&compiled_code) {
-                                    tape_refs.insert(row_num, expr);
-                                    if let Some(assign_code) = tape_refs.assignment_code(row_num) {
-                                        let _ = kernel.eval(&assign_code, false, None).await;
-                                    }
+                                    let assign_code = format!(
+                                        "__casette_tape_refs[{}] = ({})\n",
+                                        row_num, expr
+                                    );
+                                    let _ = kernel.eval(&assign_code, false, None).await;
                                 }
                             }
                         }
@@ -143,9 +111,14 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                GuiAction::SyncTapeRefs(refs) => {
+                    let mut code = String::from("__casette_tape_refs = {}\n");
+                    for (num, expr) in refs {
+                        code.push_str(&format!("__casette_tape_refs[{}] = ({})\n", num, expr));
+                    }
+                    let _ = kernel.eval(&code, false, None).await;
+                }
                 GuiAction::ClearTape => {
-                    tape_refs.clear();
-                    row_counter = 1;
                     let _ = kernel.eval("__casette_tape_refs = {}\n", false, None).await;
                 }
                 GuiAction::Ping => {
@@ -165,8 +138,6 @@ fn main() -> anyhow::Result<()> {
                     let _ = kernel.interrupt();
                 }
                 GuiAction::RestartWorker => {
-                    tape_refs.clear();
-                    row_counter = 1;
                     let _ =
                         msg_tx_clone.send(AsyncMessage::StatusChanged(WorkerStatus::Restarting));
                     if let Ok(()) = kernel.restart().await {

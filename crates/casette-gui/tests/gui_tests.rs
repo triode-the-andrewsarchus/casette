@@ -377,5 +377,77 @@ fn test_interactive_plot_model_and_reusable_expression() {
     assert_eq!(state.rows[row_num - 1].reusable_expression(), None);
 }
 
+#[test]
+fn test_restored_session_row_number_continuity() {
+    let temp_dir = std::env::temp_dir();
+    let session_path = temp_dir.join(format!("casette_continuity_test_{}.json", std::process::id()));
+
+    let json = r#"{
+        "schema_version": 1,
+        "rows": [
+            {
+                "row_number": 1,
+                "input_raw": "2 + 2",
+                "compiled_sage": "2 + 2",
+                "result": {
+                    "ok": true,
+                    "kind": "integer",
+                    "plain": "4"
+                },
+                "is_evaluating": false,
+                "duration": { "secs": 0, "nanos": 5000000 },
+                "is_live": false,
+                "timestamp_secs": 1000
+            },
+            {
+                "row_number": 2,
+                "input_raw": "3 * 3",
+                "compiled_sage": "3 * 3",
+                "result": {
+                    "ok": true,
+                    "kind": "integer",
+                    "plain": "9"
+                },
+                "is_evaluating": false,
+                "duration": { "secs": 0, "nanos": 6000000 },
+                "is_live": false,
+                "timestamp_secs": 1001
+            }
+        ]
+    }"#;
+    std::fs::write(&session_path, json).expect("write session");
+
+    let mut state = SessionState::default();
+    load_session(&mut state, &session_path).expect("load session");
+    let _ = std::fs::remove_file(session_path);
+
+    assert_eq!(state.rows.len(), 2);
+    assert_eq!(state.next_row_number, 3, "next row must be 3");
+
+    // Tape references from restored rows must be available
+    let refs = state.tape_references();
+    assert_eq!(refs.entries().len(), 2);
+    assert_eq!(refs.entries().get(&1).map(String::as_str), Some("2 + 2"));
+    assert_eq!(refs.entries().get(&2).map(String::as_str), Some("3 * 3"));
+
+    // New evaluation pushes row 3
+    let new_row_num = state.push_row("#1 + #2".into(), "__casette_tape_refs[1] + __casette_tape_refs[2]".into());
+    assert_eq!(new_row_num, 3, "new row number must match state.next_row_number");
+    assert!(state.rows[2].is_evaluating, "new row should be marked evaluating");
+
+    // When worker returns EvalFinished for row 3, it correctly completes row 3
+    let finish_resp = WorkerResponse {
+        ok: true,
+        kind: Some("integer".into()),
+        plain: Some("13".into()),
+        ..Default::default()
+    };
+    let row = state.rows.iter_mut().find(|r| r.row_number == new_row_num).expect("find row 3");
+    row.complete(finish_resp, Duration::from_millis(15));
+
+    assert!(!state.rows[2].is_evaluating, "row 3 must no longer be evaluating");
+    assert_eq!(state.rows[2].result.as_ref().unwrap().plain.as_deref(), Some("13"));
+}
+
 
 

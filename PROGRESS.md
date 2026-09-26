@@ -170,11 +170,12 @@ newest first. Hard-won bug lessons live in [`PROBLEMS.md`](PROBLEMS.md).
       - Enabled `allow_double_click_reset(true)` for quick reset on canvas double-click.
       - Added on-screen `[ ➕ ]` (zoom in 1.3x) and `[ ➖ ]` (zoom out 0.77x) toolbar buttons alongside `[ ↺ Reset ]`.
       - Added explicit gesture hints in the plot card header: `"Pan: drag · Zoom: scroll/[+][−] · Reset: double-click"`.
-    - All workspace tests passing cleanly (**46/46** across all suites); release binary compiled and verified.
-
-
-
-
+    - **Issue 8 (Session Restore Row Numbering & Tape Reference Desync):**
+      - Root cause: When `last-session.json` was restored, `SessionState.next_row_number` advanced to `N + 1`, but the Tokio actor in `main.rs` maintained an independent `row_counter` initialized to `1`. When evaluating new expressions, `app.rs` allocated row `N + 1` in the UI as evaluating, while `main.rs` processed it as row `1` and emitted `AsyncMessage::EvalFinished { row_number: 1, ... }`. The UI updated row 1 (the restored row) and left row `N + 1` spinning indefinitely. Restarting the worker also reset `row_counter = 1`, failing to recover.
+      - Fixed `GuiAction::Evaluate` to pass the explicit `row_number` allocated by `SessionState`.
+      - Added `GuiAction::SyncTapeRefs` dispatched on `WorkerReady` to synchronize all restored tape references (`__casette_tape_refs[i] = (...)`) into Sage, ensuring `#1`, `#2`, etc. are immediately usable in subsequent evaluations.
+      - Handled `friendly_compiler::CompileResult::Ambiguous` explicitly with descriptive suggestions.
+      - Added automated test `test_restored_session_row_number_continuity` in `gui_tests.rs`. All workspace tests green (47/47).
 
 **Latest matrix-inspector work:** Matrix result envelopes now carry additive
 `matrix_properties` metadata from Sage's no-argument `is_*()` methods. Swift

@@ -127,7 +127,14 @@ impl TapeRow {
 #[derive(Debug)]
 pub enum GuiAction {
     /// Submit expression to evaluate.
-    Evaluate { input: String, numeric: bool },
+    Evaluate {
+        row_number: usize,
+        input: String,
+        compiled_code: String,
+        numeric: bool,
+    },
+    /// Synchronize valid reusable tape references to Sage worker dictionary.
+    SyncTapeRefs(Vec<(usize, String)>),
     /// Clear all tape references and reset row numbering.
     ClearTape,
     /// Probe worker responsiveness.

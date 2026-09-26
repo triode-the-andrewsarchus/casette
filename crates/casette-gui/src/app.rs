@@ -73,6 +73,16 @@ impl CasetteApp {
                     self.state.sage_version = version;
                     self.state.worker_status = WorkerStatus::Ready;
                     let _ = self.action_tx.send(GuiAction::FetchSymbols);
+
+                    let valid_refs: Vec<(usize, String)> = self
+                        .state
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.reusable_expression().map(|expr| (r.row_number, expr)))
+                        .collect();
+                    if !valid_refs.is_empty() {
+                        let _ = self.action_tx.send(GuiAction::SyncTapeRefs(valid_refs));
+                    }
                 }
                 AsyncMessage::EvalFinished {
                     row_number,
@@ -113,20 +123,56 @@ impl CasetteApp {
 
     fn submit_evaluation(&mut self, input: String, numeric: bool) {
         let refs = self.state.tape_references();
-        let compiled = if input.contains('\n') {
-            input.clone()
+        let (compiled, compile_err) = if input.contains('\n') {
+            (input.clone(), None)
         } else {
             match friendly_compiler::compile_with_refs(&input, &refs) {
-                friendly_compiler::CompileResult::Success { generated_sage, .. } => generated_sage,
-                friendly_compiler::CompileResult::Bypass { raw_sage } => raw_sage,
-                _ => input.clone(),
+                friendly_compiler::CompileResult::Success { generated_sage, .. } => {
+                    (generated_sage, None)
+                }
+                friendly_compiler::CompileResult::Bypass { raw_sage } => (raw_sage, None),
+                friendly_compiler::CompileResult::Error(err) => (input.clone(), Some(err)),
+                friendly_compiler::CompileResult::Ambiguous { candidates } => {
+                    let msg = format!("Ambiguous expression. Did you mean:\n{}", candidates.join("\n"));
+                    (
+                        input.clone(),
+                        Some(friendly_compiler::CompileError::new(msg, None, None)),
+                    )
+                }
             }
         };
 
-        let _row_num = self.state.push_row(input.clone(), compiled);
+        let row_num = self.state.push_row(input.clone(), compiled.clone());
+
+        if let Some(err) = compile_err {
+            let err_resp = casette_kernel::WorkerResponse::new_error(
+                "CompileError".into(),
+                err.message,
+                err.suggestion,
+            );
+            if let Some(row) = self
+                .state
+                .rows
+                .iter_mut()
+                .find(|r| r.row_number == row_num)
+            {
+                row.complete(err_resp, std::time::Duration::from_millis(0));
+            }
+            self.state.worker_status = WorkerStatus::Ready;
+            if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+                tracing::warn!("Failed to auto-save session: {}", e);
+            }
+            return;
+        }
+
         self.state.worker_status = WorkerStatus::Busy;
 
-        let _ = self.action_tx.send(GuiAction::Evaluate { input, numeric });
+        let _ = self.action_tx.send(GuiAction::Evaluate {
+            row_number: row_num,
+            input,
+            compiled_code: compiled,
+            numeric,
+        });
     }
 }
 
