@@ -3,7 +3,7 @@
 The stable contract between the parent app (`SessionController` / `SageKernel`)
 and the Sage worker (`sage -python worker.py`). V0.4+ and V1 build against this.
 
-Source of truth for the implementation: `v0/01-worker-protocol/worker.py` (the
+Source of truth for the implementation: `worker-protocol/worker.py` (the
 canonical worker). This doc describes its behavior as of **V0.8** (exact/numeric
 policy added; symbols op V0.6; artifacts V0.5; everything else unchanged since
 V0.3).
@@ -537,4 +537,4 @@ same first-three / final-entry `\cdots` abbreviation as wide matrices.
 The `SessionController` maps worker envelopes + its own timeouts to:
 `idle / running / completed / error / interrupted / timed_out / crashed /
 restarting`. SIGINT (to the real pid) escalates to a hard process-group kill if
-the worker won't yield. See `v0/02-lifecycle/` and PROBLEMS.md.
+the worker won't yield (handled in `casette-kernel`).

@@ -181,6 +181,9 @@ impl SageDiscovery {
         }
 
         let candidates = [
+            PathBuf::from("worker-protocol/worker.py"),
+            PathBuf::from("../worker-protocol/worker.py"),
+            PathBuf::from("../../worker-protocol/worker.py"),
             PathBuf::from("v0/01-worker-protocol/worker.py"),
             PathBuf::from("../v0/01-worker-protocol/worker.py"),
             PathBuf::from("../../v0/01-worker-protocol/worker.py"),

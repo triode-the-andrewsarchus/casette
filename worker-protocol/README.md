@@ -10,15 +10,12 @@ wire.
 | File | Role | Survives into app? |
 | --- | --- | --- |
 | `worker.py` | The Sage worker. Reads JSONL requests on stdin, writes JSONL responses on stdout. Run as `sage -python worker.py`. | **Yes** — this is real app code. |
-| `harness.py` | Parent-side test driver (plain Python 3). Boots one worker, runs all spec test cases sequentially, kills it, checks every exit criterion. | No (test scaffold). |
 
 ## Run it
 
 ```bash
-cd v0/01-worker-protocol
-python3 harness.py            # boots `sage -python worker.py`, runs all checks
-python3 harness.py --json     # also dumps each full response envelope
-python3 harness.py --sage /path/to/sage   # override Sage binary
+cd worker-protocol
+sage -python worker.py            # boots `worker.py` in standalone REPL mode
 ```
 
 Exit status is 0 iff every exit criterion passes. Verified against **SageMath

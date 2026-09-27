@@ -58,7 +58,7 @@ impl Default for KernelConfig {
     fn default() -> Self {
         Self {
             python_path: PathBuf::from("python3"),
-            worker_script: PathBuf::from("v0/01-worker-protocol/worker.py"),
+            worker_script: PathBuf::from("worker-protocol/worker.py"),
             startup_timeout: Duration::from_secs(30),
             default_eval_timeout: Duration::from_secs(60),
             initial_precision: Some(10),
