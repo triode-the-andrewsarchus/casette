@@ -461,6 +461,19 @@ fn test_ohms_law_and_electric_units() {
     } else {
         panic!("expected success for solve 10V = 2A * R for R, got: {:?}", res5);
     }
+
+    // solve 100 ohms * ( x * A) = 10 V
+    let res6 = compile("solve 100 ohms * ( x * A) = 10 V");
+    if let CompileResult::Success {
+        generated_sage,
+        required_variables,
+    } = res6
+    {
+        assert_eq!(generated_sage, "solve((100*ohms) * ( x * A) == (10*V), x)");
+        assert_eq!(required_variables, vec!["x"]);
+    } else {
+        panic!("expected success for solve 100 ohms * ( x * A) = 10 V, got: {:?}", res6);
+    }
 }
 
 #[test]

@@ -123,6 +123,99 @@ impl TapeRow {
     }
 }
 
+/// A persistent user-defined variable, function, or symbol definition statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserDefinition {
+    /// Identifier name of the defined variable/function (e.g. `"a"`, `"f"`, `"M"`).
+    pub name: String,
+    /// Statement used to define the variable in Sage (e.g. `"a = 5"`, `"f(x) = x^2"`).
+    pub statement: String,
+}
+
+/// Extracts user variable, matrix, function, or symbol definition statements from input and compiled Sage.
+#[must_use]
+pub fn extract_definitions(input_raw: &str, compiled_sage: &str) -> Vec<UserDefinition> {
+    let raw_trimmed = input_raw.trim();
+    let sage_trimmed = compiled_sage.trim();
+
+    // 1. var declarations: var a b c or var('a b c') or var('a, b')
+    if sage_trimmed.starts_with("var(") && sage_trimmed.ends_with(')') {
+        let inside = sage_trimmed[4..sage_trimmed.len() - 1].trim();
+        let unquoted = inside.trim_matches(|c| c == '\'' || c == '"');
+        let names: Vec<&str> = unquoted
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        return names
+            .into_iter()
+            .map(|n| UserDefinition {
+                name: n.to_string(),
+                statement: format!("var('{n}')"),
+            })
+            .collect();
+    }
+
+    // 2. Echoed assignment from compiler: "name = ...\nname"
+    let lines: Vec<&str> = sage_trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if lines.len() == 2 {
+        if let Some((lhs, _)) = lines[0].split_once('=') {
+            let target = lhs.trim();
+            if lines[1] == target && friendly_compiler::variables::is_assignable_variable(target) {
+                return vec![UserDefinition {
+                    name: target.to_string(),
+                    statement: lines[0].to_string(),
+                }];
+            }
+        }
+    }
+
+    // 3. Single-line function definition or assignment: "f(x) = ..." or "name = ..."
+    let first_line = lines.first().copied().unwrap_or(raw_trimmed);
+    if let Some((lhs, _)) = first_line.split_once('=') {
+        let lhs_trim = lhs.trim();
+        // Function signature: f(x) or g(x, y)
+        if let Some(paren_idx) = lhs_trim.find('(') {
+            if lhs_trim.ends_with(')') {
+                let func_name = lhs_trim[..paren_idx].trim();
+                if friendly_compiler::variables::is_assignable_variable(func_name) {
+                    return vec![UserDefinition {
+                        name: func_name.to_string(),
+                        statement: first_line.to_string(),
+                    }];
+                }
+            }
+        } else if friendly_compiler::variables::is_assignable_variable(lhs_trim) {
+            return vec![UserDefinition {
+                name: lhs_trim.to_string(),
+                statement: first_line.to_string(),
+            }];
+        }
+    }
+
+    // 4. Raw Python function definition: "def func_name(...):"
+    if first_line.starts_with("def ") {
+        if let Some(rest) = first_line.strip_prefix("def ") {
+            if let Some(paren_idx) = rest.find('(') {
+                let func_name = rest[..paren_idx].trim();
+                if friendly_compiler::variables::is_assignable_variable(func_name) {
+                    return vec![UserDefinition {
+                        name: func_name.to_string(),
+                        statement: sage_trimmed.to_string(),
+                    }];
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
 /// Actions dispatched from the UI thread to the asynchronous kernel task.
 #[derive(Debug)]
 pub enum GuiAction {
@@ -135,6 +228,10 @@ pub enum GuiAction {
     },
     /// Synchronize valid reusable tape references to Sage worker dictionary.
     SyncTapeRefs(Vec<(usize, String)>),
+    /// Synchronize persistent user definitions to Sage worker.
+    SyncDefinitions(Vec<UserDefinition>),
+    /// Delete a variable or symbol from Sage and persistent definitions.
+    DeleteSymbol(String),
     /// Clear all tape references and reset row numbering.
     ClearTape,
     /// Probe worker responsiveness.
@@ -188,6 +285,8 @@ pub struct SessionState {
     pub sage_version: String,
     /// Active symbols in session.
     pub symbols: Vec<SymbolPayload>,
+    /// Persistent user-defined variable and function definitions that survive resets.
+    pub user_definitions: Vec<UserDefinition>,
     /// Chronological input history.
     pub history: Vec<String>,
     /// Current history browsing pointer.
@@ -211,6 +310,7 @@ impl Default for SessionState {
             worker_pid: None,
             sage_version: String::new(),
             symbols: Vec::new(),
+            user_definitions: Vec::new(),
             history: Vec::new(),
             history_pointer: None,
             draft_input: String::new(),
@@ -232,6 +332,36 @@ impl SessionState {
         self.history_pointer = None;
         self.selected_row_index = Some(self.rows.len() - 1);
         row_num
+    }
+
+    /// Adds or updates a user definition for the given symbol name.
+    pub fn set_definition(&mut self, name: impl Into<String>, statement: impl Into<String>) {
+        let name_str = name.into();
+        let stmt_str = statement.into();
+        if let Some(existing) = self.user_definitions.iter_mut().find(|d| d.name == name_str) {
+            existing.statement = stmt_str;
+        } else {
+            self.user_definitions.push(UserDefinition {
+                name: name_str,
+                statement: stmt_str,
+            });
+        }
+    }
+
+    /// Removes a user definition by name.
+    pub fn remove_definition(&mut self, name: &str) -> Option<UserDefinition> {
+        self.symbols.retain(|s| s.name != name);
+        if let Some(pos) = self.user_definitions.iter().position(|d| d.name == name) {
+            Some(self.user_definitions.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Checks if a definition exists for the given name.
+    #[must_use]
+    pub fn has_definition(&self, name: &str) -> bool {
+        self.user_definitions.iter().any(|d| d.name == name)
     }
 
     /// Clears all entries from the tape and resets row numbering.

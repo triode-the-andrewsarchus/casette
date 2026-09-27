@@ -1,6 +1,6 @@
 //! Session persistence and export functions for Casette sessions.
 
-use crate::model::{SessionState, TapeRow};
+use crate::model::{extract_definitions, SessionState, TapeRow, UserDefinition};
 use anyhow::{bail, Context, Result};
 use casette_kernel::WorkerResponse;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,8 @@ pub struct SessionEnvelope {
     pub rows: Vec<TapeRow>,
     #[serde(default)]
     pub history: Vec<String>,
+    #[serde(default)]
+    pub definitions: Vec<UserDefinition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +54,7 @@ pub fn save_session(state: &SessionState, path: &Path) -> Result<()> {
         schema_version: CURRENT_SCHEMA_VERSION,
         rows: state.rows.clone(),
         history: state.history.clone(),
+        definitions: state.user_definitions.clone(),
     };
     let json =
         serde_json::to_string_pretty(&envelope).context("failed to serialize session envelope")?;
@@ -80,22 +83,42 @@ pub fn load_session(state: &mut SessionState, path: &Path) -> Result<()> {
     }
 
     // 2. Decode either structured SessionEnvelope or legacy raw Vec<TapeRow>
-    let (rows, history) = if let Ok(envelope) = serde_json::from_str::<SessionEnvelope>(&json) {
+    let (rows, history, definitions) = if let Ok(envelope) = serde_json::from_str::<SessionEnvelope>(&json) {
         let hist = if envelope.history.is_empty() {
             envelope.rows.iter().map(|r| r.input_raw.clone()).collect()
         } else {
             envelope.history
         };
-        (envelope.rows, hist)
+        (envelope.rows, hist, envelope.definitions)
     } else {
         let r: Vec<TapeRow> = serde_json::from_str(&json)
             .context("failed to deserialize session tape rows")?;
         let hist = r.iter().map(|row| row.input_raw.clone()).collect();
-        (r, hist)
+        (r, hist, Vec::new())
     };
 
     state.rows = rows;
     state.history = history;
+    state.user_definitions = if !definitions.is_empty() {
+        definitions
+    } else {
+        // Fallback: extract definitions from successful rows in legacy sessions
+        let mut extracted: Vec<UserDefinition> = Vec::new();
+        for row in &state.rows {
+            if let Some(resp) = &row.result {
+                if resp.ok {
+                    for def in extract_definitions(&row.input_raw, &row.compiled_sage) {
+                        if let Some(idx) = extracted.iter().position(|d| d.name == def.name) {
+                            extracted[idx] = def;
+                        } else {
+                            extracted.push(def);
+                        }
+                    }
+                }
+            }
+        }
+        extracted
+    };
     state.next_row_number = state
         .rows
         .iter()

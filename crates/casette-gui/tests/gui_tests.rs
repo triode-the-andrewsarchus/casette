@@ -454,5 +454,72 @@ fn test_restored_session_row_number_continuity() {
     assert_eq!(state.rows[2].result.as_ref().unwrap().plain.as_deref(), Some("13"));
 }
 
+#[test]
+fn test_user_definition_extraction_and_state_management() {
+    use casette_gui::model::extract_definitions;
 
+    // 1. Variable assignment
+    let defs = extract_definitions("a = 5", "a = 5\na");
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].name, "a");
+    assert_eq!(defs[0].statement, "a = 5");
 
+    // 2. Function definition
+    let f_defs = extract_definitions("f(x) = x^2", "f(x) = x^2\nf");
+    assert_eq!(f_defs.len(), 1);
+    assert_eq!(f_defs[0].name, "f");
+    assert_eq!(f_defs[0].statement, "f(x) = x^2");
+
+    // 3. Symbolic var declaration
+    let var_defs = extract_definitions("var('t, s')", "var('t, s')");
+    assert_eq!(var_defs.len(), 2);
+    assert_eq!(var_defs[0].name, "t");
+    assert_eq!(var_defs[0].statement, "var('t')");
+    assert_eq!(var_defs[1].name, "s");
+    assert_eq!(var_defs[1].statement, "var('s')");
+
+    // 4. SessionState set and remove
+    let mut state = SessionState::default();
+    state.set_definition("a", "a = 5");
+    state.set_definition("b", "b = 10");
+    state.set_definition("a", "a = 42"); // overwrite preserves position or updates
+    assert_eq!(state.user_definitions.len(), 2);
+    assert_eq!(state.user_definitions[0].statement, "a = 42");
+
+    state.remove_definition("a");
+    assert_eq!(state.user_definitions.len(), 1);
+    assert_eq!(state.user_definitions[0].name, "b");
+}
+
+#[test]
+fn test_definition_persistence_across_resets_and_tape_clears() {
+    let mut state = SessionState::default();
+    state.set_definition("x_init", "x_init = 100");
+    state.set_definition("k", "k = 5");
+
+    let row1 = state.push_row("x_init = 100".into(), "x_init = 100\nx_init".into());
+    let resp: WorkerResponse = serde_json::from_str(r#"{"ok": true, "plain": "100", "kind": "integer"}"#).unwrap();
+    state.rows[row1 - 1].complete(resp, Duration::from_millis(5));
+
+    // Clear tape must preserve definitions!
+    state.clear_tape();
+    assert_eq!(state.rows.len(), 0);
+    assert_eq!(state.user_definitions.len(), 2);
+    assert_eq!(state.user_definitions[0].name, "x_init");
+
+    // Persistence roundtrip
+    let temp_dir = std::env::temp_dir();
+    let file_path = temp_dir.join(format!("casette_def_test_{}.json", std::process::id()));
+
+    save_session(&state, &file_path).expect("save session");
+
+    let mut restored = SessionState::default();
+    load_session(&mut restored, &file_path).expect("load session");
+    let _ = std::fs::remove_file(file_path);
+
+    assert_eq!(restored.user_definitions.len(), 2);
+    assert_eq!(restored.user_definitions[0].name, "x_init");
+    assert_eq!(restored.user_definitions[0].statement, "x_init = 100");
+    assert_eq!(restored.user_definitions[1].name, "k");
+    assert_eq!(restored.user_definitions[1].statement, "k = 5");
+}

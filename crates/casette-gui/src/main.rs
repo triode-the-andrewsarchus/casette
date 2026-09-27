@@ -118,6 +118,23 @@ fn main() -> anyhow::Result<()> {
                     }
                     let _ = kernel.eval(&code, false, None).await;
                 }
+                GuiAction::SyncDefinitions(defs) => {
+                    if !defs.is_empty() {
+                        let combined_code: String = defs
+                            .iter()
+                            .map(|d| d.statement.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = kernel.eval(&combined_code, false, None).await;
+                    }
+                }
+                GuiAction::DeleteSymbol(name) => {
+                    let cmd = format!("_casette_delete_symbol('{}')\n", name);
+                    let _ = kernel.eval(&cmd, false, None).await;
+                    if let Ok(syms) = kernel.symbols().await {
+                        let _ = msg_tx_clone.send(AsyncMessage::SymbolsUpdated(syms));
+                    }
+                }
                 GuiAction::ClearTape => {
                     let _ = kernel.eval("__casette_tape_refs = {}\n", false, None).await;
                 }

@@ -835,7 +835,13 @@ def _install_casette_units(ns):
                 if hasattr(expr, "__iter__") and not hasattr(expr, "variables") and not isinstance(expr, (str, bytes)) and "sage.matrix" not in (type(expr).__module__ or "") and "sage.plot" not in (type(expr).__module__ or ""):
                     return [__casette_convert(item, target) for item in expr]
                 if hasattr(expr, "is_relational") and expr.is_relational():
-                    return expr.lhs() == __casette_convert(expr.rhs(), target)
+                    rhs = expr.rhs()
+                    try:
+                        qty = rhs * target
+                        return expr.lhs() == _u.convert(qty, target)
+                    except Exception:
+                        pass
+                    return expr.lhs() == __casette_convert(rhs, target)
                 try:
                     return _u.convert(expr, target)
                 except Exception:
@@ -845,25 +851,39 @@ def _install_casette_units(ns):
                     return [__casette_convert(item, target) for item in expr]
                 if hasattr(expr, "is_relational") and expr.is_relational():
                     rhs = expr.rhs()
-                    if hasattr(rhs, "denominator") and hasattr(rhs, "numerator"):
+                    if hasattr(rhs, "denominator"):
                         denom = rhs.denominator()
-                        numer = rhs.numerator()
-                        denom_units = [v for v in denom.variables() if str(v) in _u.unit_to_type] if hasattr(denom, "variables") else []
-                        numer_units = [v for v in numer.variables() if str(v) in _u.unit_to_type] if hasattr(numer, "variables") else []
-                        if denom_units and numer_units:
-                            try:
-                                return expr.lhs() == _u.convert(numer, denom)
-                            except Exception:
-                                pass
+                        denom_vars = denom.variables() if hasattr(denom, "variables") else []
+                        denom_units = [v for v in denom_vars if str(v) in _u.unit_to_type]
+                        if denom_units:
+                            base_units_cand = [u for u in denom_units if _u.unit_to_type.get(str(u)) in _SI_BASE]
+                            candidates = base_units_cand if base_units_cand else denom_units
+                            for u in candidates:
+                                try:
+                                    qty = rhs * u
+                                    conv = _u.convert(qty, u)
+                                    return expr.lhs() == conv
+                                except Exception:
+                                    pass
+                            unit_symbols = [v for v in rhs.variables() if str(v) in _u.unit_to_type] if hasattr(rhs, "variables") else []
+                            if unit_symbols:
+                                try:
+                                    base_subs = {v: _u.base_units(v) for v in unit_symbols}
+                                    reduced = rhs.subs(base_subs)
+                                    if not any(str(v) in _u.unit_to_type for v in reduced.variables()):
+                                        return expr.lhs() == reduced
+                                except Exception:
+                                    pass
                     return expr.lhs() == __casette_convert(expr.rhs(), target)
                 if hasattr(expr, "variables"):
                     unit_symbols = [v for v in expr.variables() if str(v) in _u.unit_to_type]
                     if unit_symbols:
                         base_subs = {}
                         for v in unit_symbols:
-                            cat = _u.unit_to_type[str(v)]
-                            if cat in _SI_BASE:
-                                base_subs[v] = _u.convert(v, _SI_BASE[cat])
+                            try:
+                                base_subs[v] = _u.base_units(v)
+                            except Exception:
+                                pass
                         if base_subs:
                             reduced = expr.subs(base_subs)
                             if not any(str(v) in _u.unit_to_type for v in reduced.variables()):
@@ -917,6 +937,21 @@ _install_casette_units(NS)
 # stored object is exact.
 _SYMBOL_BASELINE = dict(NS)
 _SYMBOL_BASELINE_MISS = object()  # sentinel: "name not in baseline"
+
+
+def _casette_delete_symbol(name):
+    try:
+        from sage.all import forget
+        forget(name)
+    except Exception:
+        pass
+    if name in _SYMBOL_BASELINE:
+        NS[name] = _SYMBOL_BASELINE[name]
+    elif name in NS:
+        del NS[name]
+
+
+NS["_casette_delete_symbol"] = _casette_delete_symbol
 
 
 # ---------------------------------------------------------------------------

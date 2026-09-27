@@ -72,6 +72,11 @@ impl CasetteApp {
                     self.state.worker_pid = Some(pid);
                     self.state.sage_version = version;
                     self.state.worker_status = WorkerStatus::Ready;
+
+                    if !self.state.user_definitions.is_empty() {
+                        let _ = self.action_tx.send(GuiAction::SyncDefinitions(self.state.user_definitions.clone()));
+                    }
+
                     let _ = self.action_tx.send(GuiAction::FetchSymbols);
 
                     let valid_refs: Vec<(usize, String)> = self
@@ -89,6 +94,10 @@ impl CasetteApp {
                     response,
                     duration,
                 } => {
+                    let mut is_success = false;
+                    let mut input_raw = String::new();
+                    let mut compiled_sage = String::new();
+
                     if let Some(row) = self
                         .state
                         .rows
@@ -96,7 +105,26 @@ impl CasetteApp {
                         .find(|r| r.row_number == row_number)
                     {
                         row.complete(*response, duration);
+                        is_success = row.result.as_ref().map(|r| r.ok).unwrap_or(false);
+                        input_raw = row.input_raw.clone();
+                        compiled_sage = row.compiled_sage.clone();
                     }
+
+                    if is_success {
+                        let trimmed = input_raw.trim();
+                        if let Some(rest) = trimmed.strip_prefix("del ") {
+                            let sym_to_del = rest.trim();
+                            if !sym_to_del.is_empty() {
+                                self.state.remove_definition(sym_to_del);
+                            }
+                        } else {
+                            let new_defs = crate::model::extract_definitions(&input_raw, &compiled_sage);
+                            for def in new_defs {
+                                self.state.set_definition(def.name, def.statement);
+                            }
+                        }
+                    }
+
                     self.state.worker_status = WorkerStatus::Ready;
                     let _ = self.action_tx.send(GuiAction::FetchSymbols);
                     if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
@@ -235,6 +263,7 @@ impl App for CasetteApp {
                     let mut refresh_syms = false;
                     let mut restart_worker = false;
                     let mut draft_to_load = None;
+                    let mut delete_sym = None;
 
                     render_sidebar(
                         ui,
@@ -245,7 +274,17 @@ impl App for CasetteApp {
                         &mut || refresh_syms = true,
                         &mut || restart_worker = true,
                         &mut |s| draft_to_load = Some(s),
+                        &mut |name| delete_sym = Some(name),
                     );
+
+                    if let Some(sym_name) = delete_sym {
+                        self.state.remove_definition(&sym_name);
+                        self.state.symbols.retain(|s| s.name != sym_name);
+                        let _ = self.action_tx.send(GuiAction::DeleteSymbol(sym_name));
+                        if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+                            tracing::warn!("Failed to auto-save session after symbol deletion: {}", e);
+                        }
+                    }
 
                     if refresh_syms {
                         let _ = self.action_tx.send(GuiAction::FetchSymbols);

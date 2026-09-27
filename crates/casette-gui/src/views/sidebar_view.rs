@@ -28,6 +28,7 @@ pub fn render_sidebar(
     on_refresh_symbols: &mut dyn FnMut(),
     on_restart_worker: &mut dyn FnMut(),
     on_load_draft: &mut dyn FnMut(String),
+    on_delete_symbol: &mut dyn FnMut(String),
 ) {
     Frame::new()
         .fill(Colors::SIDEBAR_BG)
@@ -80,6 +81,7 @@ pub fn render_sidebar(
                         show_builtin_symbols,
                         on_refresh_symbols,
                         on_load_draft,
+                        on_delete_symbol,
                     );
                 }
                 SidebarTab::History => {
@@ -102,6 +104,7 @@ fn render_symbols_tab(
     show_builtins: &mut bool,
     on_refresh: &mut dyn FnMut(),
     on_load_draft: &mut dyn FnMut(String),
+    on_delete_symbol: &mut dyn FnMut(String),
 ) {
     ui.horizontal(|ui| {
         ui.add(
@@ -193,6 +196,24 @@ fn render_symbols_tab(
                                 .color(Colors::TEXT_MUTED)
                                 .font(FontId::new(10.5, FontFamily::Proportional)),
                         );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let delete_btn = Button::new(
+                                RichText::new("🗑")
+                                    .color(Colors::TEXT_MUTED)
+                                    .font(FontId::new(11.0, FontFamily::Proportional)),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .corner_radius(4);
+
+                            if ui
+                                .add(delete_btn)
+                                .on_hover_text(format!("Delete definition for '{}'", sym.name))
+                                .clicked()
+                            {
+                                on_delete_symbol(sym.name.clone());
+                            }
+                        });
                     });
 
                     if !sym.summary.is_empty() {

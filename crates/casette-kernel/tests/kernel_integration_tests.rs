@@ -492,6 +492,26 @@ async fn test_kernel_expanded_units_and_ohms_law() {
     assert!(resp.ok);
     assert!(resp.plain.as_deref().unwrap_or("").contains("100*celsius"));
 
+    // 10. Solve for variable with unit: solve 100 ohms * ( x * A) = 10 V -> [x == 1/10*A]
+    let resp = kernel
+        .eval("solve(100*ohms * (x * A) == 10*V, x)", false, None)
+        .await
+        .expect("eval solve 100 ohms * ( x * A) = 10 V");
+    assert!(resp.ok);
+    let plain = resp.plain.as_deref().unwrap_or("");
+    assert!(
+        plain.contains("1/10*A") || plain.contains("1/10*ampere"),
+        "expected plain to contain 1/10*A or 1/10*ampere, got: {}",
+        plain
+    );
+    let latex = resp.latex.as_deref().unwrap_or("");
+    assert!(
+        latex.contains("A") || latex.contains("ampere"),
+        "expected latex to show Amps, got: {}",
+        latex
+    );
+    assert!(!plain.contains("ohms"), "plain should not contain ohms: {}", plain);
+
     kernel.shutdown().await.expect("shutdown");
 }
 
