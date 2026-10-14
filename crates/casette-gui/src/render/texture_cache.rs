@@ -87,6 +87,29 @@ impl TextureCache {
         self.get_or_load(ctx, &path)
     }
 
+    fn find_python_cmd() -> String {
+        if let Ok(p) = std::env::var("CASETTE_SAGE_PYTHON") {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let candidates = [
+                format!("{}/miniforge3/envs/sage/bin/python", home),
+                format!("{}/miniforge3/envs/sage/bin/python3", home),
+                format!("{}/miniconda3/envs/sage/bin/python", home),
+                format!("{}/miniconda3/envs/sage/bin/python3", home),
+                format!("{}/.conda/envs/sage/bin/python", home),
+            ];
+            for cand in candidates {
+                if Path::new(&cand).exists() {
+                    return cand;
+                }
+            }
+        }
+        "python3".to_string()
+    }
+
     fn render_latex_to_svg(latex: &str, out_path: &Path) -> Option<()> {
         let script = r##"
 import sys, io, re, matplotlib
@@ -104,7 +127,8 @@ svg_clean = re.sub(r'(<g id="patch_1">\s*<path [^>]*style=")[^"]*"', r'\1fill: n
 with open(out_file, "w", encoding="utf-8") as f:
     f.write(svg_clean)
 "##;
-        let output = std::process::Command::new("python3")
+        let py_cmd = Self::find_python_cmd();
+        let output = std::process::Command::new(py_cmd)
             .arg("-c")
             .arg(script)
             .arg(latex)
@@ -131,7 +155,11 @@ with open(out_file, "w", encoding="utf-8") as f:
         let height = ((pixmap_size.height() as f32 * scale).round() as u32).clamp(1, 4096);
 
         let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
-        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
 
         let pixels = pixmap
             .data()

@@ -2,6 +2,7 @@
 #
 # Quick start:
 #   make           # debug build of all workspace crates
+#   make setup     # detect distro and install SageMath dependencies
 #   make run       # build + launch the Casette GUI
 #   make test      # run unit, lowering, and kernel integration tests
 #   make check     # compiler check + clippy static analysis
@@ -13,11 +14,33 @@ BINDIR ?= $(PREFIX)/bin
 APPDIR ?= $(PREFIX)/share/applications
 ICONDIR ?= $(PREFIX)/share/icons/hicolor/512x512/apps
 
-.PHONY: all build run test check fmt release clean install uninstall help
+# Automatically detect Conda Sage python if not already set in environment
+export CASETTE_SAGE_PYTHON ?= $(shell \
+	if [ -x "$(HOME)/miniforge3/envs/sage/bin/python" ]; then echo "$(HOME)/miniforge3/envs/sage/bin/python"; \
+	elif [ -x "$(HOME)/miniconda3/envs/sage/bin/python" ]; then echo "$(HOME)/miniconda3/envs/sage/bin/python"; \
+	elif [ -x "$(HOME)/.conda/envs/sage/bin/python" ]; then echo "$(HOME)/.conda/envs/sage/bin/python"; \
+	fi)
+
+.PHONY: all build run test check fmt release clean install uninstall help setup deps check-sage
 
 all: build
 
-build:
+setup:
+	@chmod +x scripts/setup-deps.sh
+	@./scripts/setup-deps.sh
+
+deps: setup
+
+check-sage:
+	@if ! command -v sage >/dev/null 2>&1 \
+	    && ! [ -x "$$HOME/miniforge3/envs/sage/bin/sage" ] \
+	    && ! [ -x "$$HOME/miniconda3/envs/sage/bin/sage" ] \
+	    && ! [ -x "$$HOME/.conda/envs/sage/bin/sage" ] \
+	    && ! python3 -c "import sage.all" >/dev/null 2>&1; then \
+	    echo "Note: SageMath runtime not detected. Run 'make setup' to install dependencies for your distribution."; \
+	fi
+
+build: check-sage
 	cargo build
 
 run:
@@ -61,6 +84,7 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make          Build all workspace crates in debug mode"
+	@echo "  make setup    Detect distro and install dependencies (pacman on Arch, conda on Ubuntu)"
 	@echo "  make run      Launch the Casette desktop GUI"
 	@echo "  make test     Run entire unit and integration test suite"
 	@echo "  make check    Run cargo check and cargo clippy on workspace"

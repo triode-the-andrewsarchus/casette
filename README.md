@@ -27,6 +27,7 @@ Importantly: this fork is written in **Rust** using **egui** (`eframe`) for high
 Requires Rust (1.80+) and SageMath (Sage 10+ / Python 3 with `sage.all`).
 
 ```bash
+make setup    # Detect distro and install dependencies (pacman on Arch, conda on Ubuntu)
 make run      # Build and launch the Casette GUI
 make test     # Run all unit, lowering, and kernel integration tests
 make check    # Run compiler checks and clippy

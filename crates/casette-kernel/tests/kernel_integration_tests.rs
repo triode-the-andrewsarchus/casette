@@ -128,7 +128,10 @@ async fn test_kernel_boot_eval_ping() {
         .expect("should produce a math artifact");
     assert_eq!(math_art.format, "svg");
     let art_path = math_art.path.as_deref().expect("artifact path");
-    assert!(std::path::Path::new(art_path).exists(), "SVG artifact file should exist");
+    assert!(
+        std::path::Path::new(art_path).exists(),
+        "SVG artifact file should exist"
+    );
 
     // 6. Test units: solve with units and conversion
     let solve_units = kernel

@@ -95,16 +95,56 @@ impl SageDiscovery {
             }
         }
 
-        // 3. Search standard Linux candidates
-        let candidates = [
+        // 3. Search standard Linux candidates & Conda environments
+        let mut candidates = vec![
+            PathBuf::from("sage"),
             PathBuf::from("python3"),
+            PathBuf::from("/usr/bin/sage"),
+            PathBuf::from("/usr/local/bin/sage"),
+            PathBuf::from("/opt/sagemath/sage"),
             PathBuf::from("/usr/bin/python3"),
             PathBuf::from("/usr/local/bin/python3"),
-            PathBuf::from("/opt/sagemath/sage"),
-            PathBuf::from("/usr/bin/sage"),
         ];
 
+        if let Ok(home) = std::env::var("HOME") {
+            let home_p = PathBuf::from(home);
+            candidates.push(home_p.join("miniforge3/envs/sage/bin/python3"));
+            candidates.push(home_p.join("miniforge3/envs/sage/bin/python"));
+            candidates.push(home_p.join("miniconda3/envs/sage/bin/python3"));
+            candidates.push(home_p.join("miniconda3/envs/sage/bin/python"));
+            candidates.push(home_p.join(".conda/envs/sage/bin/python3"));
+            candidates.push(home_p.join(".conda/envs/sage/bin/python"));
+            candidates.push(home_p.join("anaconda3/envs/sage/bin/python3"));
+            candidates.push(home_p.join("anaconda3/envs/sage/bin/python"));
+            candidates.push(home_p.join("miniforge3/envs/sage/bin/sage"));
+            candidates.push(home_p.join("miniconda3/envs/sage/bin/sage"));
+            candidates.push(home_p.join(".conda/envs/sage/bin/sage"));
+            candidates.push(home_p.join("anaconda3/envs/sage/bin/sage"));
+        }
+        candidates.push(PathBuf::from("/opt/conda/envs/sage/bin/python3"));
+        candidates.push(PathBuf::from("/opt/conda/envs/sage/bin/python"));
+        candidates.push(PathBuf::from("/opt/miniforge3/envs/sage/bin/python3"));
+        candidates.push(PathBuf::from("/opt/miniforge3/envs/sage/bin/python"));
+        candidates.push(PathBuf::from("/opt/conda/envs/sage/bin/sage"));
+        candidates.push(PathBuf::from("/opt/miniforge3/envs/sage/bin/sage"));
+
         for candidate in &candidates {
+            // If the candidate is a 'sage' binary, prefer its sibling 'python3' or 'python'
+            if candidate.file_name().and_then(|n| n.to_str()) == Some("sage") {
+                if let Some(parent) = candidate.parent() {
+                    for py in &["python3", "python"] {
+                        let sibling = parent.join(py);
+                        if let Some(ver) = Self::probe_python_candidate(&sibling).await {
+                            return Ok(SageEnvironment {
+                                python_path: sibling,
+                                sage_version: ver,
+                                worker_script,
+                            });
+                        }
+                    }
+                }
+            }
+
             if let Some(ver) = Self::probe_python_candidate(candidate).await {
                 return Ok(SageEnvironment {
                     python_path: candidate.clone(),
@@ -121,6 +161,10 @@ impl SageDiscovery {
 
     /// Probes a candidate Python or Sage binary to verify it can import `sage.all`.
     async fn probe_python_candidate(candidate: &Path) -> Option<String> {
+        if (candidate.is_absolute() || candidate.components().count() > 1) && !candidate.exists() {
+            return None;
+        }
+
         // Fast probe: run python3 -c "import sage.all, sage.version; print(sage.version.version)"
         let child = Command::new(candidate)
             .args([
