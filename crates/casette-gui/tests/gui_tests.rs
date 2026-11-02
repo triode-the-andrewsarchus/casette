@@ -91,13 +91,19 @@ fn test_session_persistence_roundtrip() {
 #[test]
 fn test_default_session_path_resolution() {
     let p = casette_gui::persistence::default_session_path();
-    assert!(p.to_string_lossy().contains("last-session.json") || p.to_string_lossy().contains("casette_last_session.json"));
+    assert!(
+        p.to_string_lossy().contains("last-session.json")
+            || p.to_string_lossy().contains("casette_last_session.json")
+    );
 }
 
 #[test]
 fn test_persistence_refuses_newer_schema_and_recovers_running_rows() {
     let temp_dir = std::env::temp_dir();
-    let future_path = temp_dir.join(format!("casette_future_session_{}.json", std::process::id()));
+    let future_path = temp_dir.join(format!(
+        "casette_future_session_{}.json",
+        std::process::id()
+    ));
 
     // 1. Future schema refusal
     let future_json = r#"{
@@ -110,13 +116,18 @@ fn test_persistence_refuses_newer_schema_and_recovers_running_rows() {
     let res = load_session(&mut state, &future_path);
     assert!(res.is_err(), "should refuse newer schema version");
     assert!(
-        res.unwrap_err().to_string().contains("refused session schema version 999"),
+        res.unwrap_err()
+            .to_string()
+            .contains("refused session schema version 999"),
         "error message should cite refused schema version"
     );
     let _ = std::fs::remove_file(future_path);
 
     // 2. Restoring a row that was saved while evaluating (running)
-    let running_path = temp_dir.join(format!("casette_running_session_{}.json", std::process::id()));
+    let running_path = temp_dir.join(format!(
+        "casette_running_session_{}.json",
+        std::process::id()
+    ));
     let running_json = r#"{
         "schema_version": 1,
         "rows": [
@@ -137,15 +148,27 @@ fn test_persistence_refuses_newer_schema_and_recovers_running_rows() {
     let mut state2 = SessionState::default();
     load_session(&mut state2, &running_path).expect("load running session");
     assert_eq!(state2.rows.len(), 1);
-    assert!(!state2.rows[0].is_evaluating, "restored row must not be evaluating/spinning");
-    assert!(!state2.rows[0].is_live, "restored row must not be marked live");
-    let result = state2.rows[0].result.as_ref().expect("result must be populated");
+    assert!(
+        !state2.rows[0].is_evaluating,
+        "restored row must not be evaluating/spinning"
+    );
+    assert!(
+        !state2.rows[0].is_live,
+        "restored row must not be marked live"
+    );
+    let result = state2.rows[0]
+        .result
+        .as_ref()
+        .expect("result must be populated");
     assert_eq!(result.kind.as_deref(), Some("interrupted"));
-    assert!(result.plain.as_deref().unwrap().contains("quit before this evaluation finished"));
+    assert!(result
+        .plain
+        .as_deref()
+        .unwrap()
+        .contains("quit before this evaluation finished"));
 
     let _ = std::fs::remove_file(running_path);
 }
-
 
 #[test]
 fn test_tape_references_expansion_and_reusable_expression() {
@@ -273,7 +296,10 @@ fn test_action_buttons_and_approx_compilation() {
     if let friendly_compiler::CompileResult::Bypass { raw_sage } = int_compiled {
         assert_eq!(raw_sage, "integral(__casette_tape_refs[1], x)");
     } else {
-        panic!("expected bypass for integral(#1, x), got {:?}", int_compiled);
+        panic!(
+            "expected bypass for integral(#1, x), got {:?}",
+            int_compiled
+        );
     }
 
     // 4. Simplify action snippet: "simplify(#1)"
@@ -349,7 +375,13 @@ fn test_interactive_plot_model_and_reusable_expression() {
             y_label: None,
             series: vec![PlotSeriesPayload {
                 label: Some("sin(x)".into()),
-                points: vec![[-3.0, 0.0], [-1.5, -1.0], [0.0, 0.0], [1.5, 1.0], [3.0, 0.0]],
+                points: vec![
+                    [-3.0, 0.0],
+                    [-1.5, -1.0],
+                    [0.0, 0.0],
+                    [1.5, 1.0],
+                    [3.0, 0.0],
+                ],
                 color: [56, 139, 255],
                 is_scatter: false,
                 extrema: vec![
@@ -385,7 +417,10 @@ fn test_interactive_plot_model_and_reusable_expression() {
 #[test]
 fn test_restored_session_row_number_continuity() {
     let temp_dir = std::env::temp_dir();
-    let session_path = temp_dir.join(format!("casette_continuity_test_{}.json", std::process::id()));
+    let session_path = temp_dir.join(format!(
+        "casette_continuity_test_{}.json",
+        std::process::id()
+    ));
 
     let json = r#"{
         "schema_version": 1,
@@ -436,9 +471,18 @@ fn test_restored_session_row_number_continuity() {
     assert_eq!(refs.entries().get(&2).map(String::as_str), Some("3 * 3"));
 
     // New evaluation pushes row 3
-    let new_row_num = state.push_row("#1 + #2".into(), "__casette_tape_refs[1] + __casette_tape_refs[2]".into());
-    assert_eq!(new_row_num, 3, "new row number must match state.next_row_number");
-    assert!(state.rows[2].is_evaluating, "new row should be marked evaluating");
+    let new_row_num = state.push_row(
+        "#1 + #2".into(),
+        "__casette_tape_refs[1] + __casette_tape_refs[2]".into(),
+    );
+    assert_eq!(
+        new_row_num, 3,
+        "new row number must match state.next_row_number"
+    );
+    assert!(
+        state.rows[2].is_evaluating,
+        "new row should be marked evaluating"
+    );
 
     // When worker returns EvalFinished for row 3, it correctly completes row 3
     let finish_resp = WorkerResponse {
@@ -447,11 +491,21 @@ fn test_restored_session_row_number_continuity() {
         plain: Some("13".into()),
         ..Default::default()
     };
-    let row = state.rows.iter_mut().find(|r| r.row_number == new_row_num).expect("find row 3");
+    let row = state
+        .rows
+        .iter_mut()
+        .find(|r| r.row_number == new_row_num)
+        .expect("find row 3");
     row.complete(finish_resp, Duration::from_millis(15));
 
-    assert!(!state.rows[2].is_evaluating, "row 3 must no longer be evaluating");
-    assert_eq!(state.rows[2].result.as_ref().unwrap().plain.as_deref(), Some("13"));
+    assert!(
+        !state.rows[2].is_evaluating,
+        "row 3 must no longer be evaluating"
+    );
+    assert_eq!(
+        state.rows[2].result.as_ref().unwrap().plain.as_deref(),
+        Some("13")
+    );
 }
 
 #[test]
@@ -498,7 +552,8 @@ fn test_definition_persistence_across_resets_and_tape_clears() {
     state.set_definition("k", "k = 5");
 
     let row1 = state.push_row("x_init = 100".into(), "x_init = 100\nx_init".into());
-    let resp: WorkerResponse = serde_json::from_str(r#"{"ok": true, "plain": "100", "kind": "integer"}"#).unwrap();
+    let resp: WorkerResponse =
+        serde_json::from_str(r#"{"ok": true, "plain": "100", "kind": "integer"}"#).unwrap();
     state.rows[row1 - 1].complete(resp, Duration::from_millis(5));
 
     // Clear tape must preserve definitions!
@@ -522,4 +577,37 @@ fn test_definition_persistence_across_resets_and_tape_clears() {
     assert_eq!(restored.user_definitions[0].statement, "x_init = 100");
     assert_eq!(restored.user_definitions[1].name, "k");
     assert_eq!(restored.user_definitions[1].statement, "k = 5");
+}
+
+#[test]
+fn test_template_chips_produce_valid_friendly_syntax() {
+    use casette_gui::views::input_view::apply_template_chip;
+
+    let chips = [
+        "factor", "expand", "diff", "integral", "solve", "matrix", "plot", "taylor", "sum", "limit",
+    ];
+
+    for label in chips {
+        let empty_out = apply_template_chip(label, "");
+        assert!(
+            matches!(
+                friendly_compiler::compile(&empty_out),
+                friendly_compiler::CompileResult::Success { .. }
+            ),
+            "chip `{label}` on empty draft produced invalid command: {empty_out}"
+        );
+
+        let wrapped_out = if label == "matrix" {
+            apply_template_chip(label, "[1 2; 3 4]")
+        } else {
+            apply_template_chip(label, "x^2 - 1")
+        };
+        assert!(
+            matches!(
+                friendly_compiler::compile(&wrapped_out),
+                friendly_compiler::CompileResult::Success { .. }
+            ),
+            "chip `{label}` on non-empty draft produced invalid command: {wrapped_out}"
+        );
+    }
 }

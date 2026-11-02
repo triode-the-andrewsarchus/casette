@@ -36,7 +36,7 @@ pub fn render_input_pane(
             let response = ui.add(
                 TextEdit::multiline(&mut state.draft_input)
                     .id_salt("casette_main_input_editor")
-                    .hint_text("Type math or command (e.g. diff(#1, x), factor, matrix) - Enter to evaluate")
+                    .hint_text("Type math or command (e.g. derivative #1 wrt x, factor x^4 - 1, [1 2; 3 4]) - Enter to evaluate")
                     .font(FontId::new(14.0, FontFamily::Proportional))
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
@@ -193,17 +193,56 @@ fn render_live_lowering_preview(
     }
 }
 
+/// Builds the friendly command string when a quick-template chip is clicked.
+#[must_use]
+pub fn apply_template_chip(label: &str, current_draft: &str) -> String {
+    let expr = current_draft.trim();
+    if expr.is_empty() {
+        return match label {
+            "factor" => "factor x^4 - 1".to_string(),
+            "expand" => "expand (x + 1)^3".to_string(),
+            "diff" => "derivative sin(x) wrt x".to_string(),
+            "integral" => "integral x^2, x=0..1".to_string(),
+            "solve" => "solve x^2 + 5*x + 6 = 0 for x".to_string(),
+            "matrix" => "matrix [1, 2; 3, 4]".to_string(),
+            "plot" => "plot sin(x), x=-pi..pi".to_string(),
+            "taylor" => "taylor sin(x), x=0, order=5".to_string(),
+            "sum" => "sum k^2, k=1..10".to_string(),
+            "limit" => "limit sin(x)/x, x->0".to_string(),
+            other => format!("{other} x"),
+        };
+    }
+
+    match label {
+        "factor" => format!("factor {expr}"),
+        "expand" => format!("expand {expr}"),
+        "diff" => format!("derivative {expr} wrt x"),
+        "integral" => format!("integral {expr}, x=0..1"),
+        "solve" => {
+            if expr.contains('=') {
+                format!("solve {expr} for x")
+            } else {
+                format!("solve {expr} = 0 for x")
+            }
+        }
+        "matrix" => {
+            if expr.starts_with('[') {
+                format!("matrix {expr}")
+            } else {
+                format!("matrix [{expr}]")
+            }
+        }
+        "plot" => format!("plot {expr}, x=-pi..pi"),
+        "taylor" => format!("taylor {expr}, x=0, order=5"),
+        "sum" => format!("sum {expr}, k=1..10"),
+        "limit" => format!("limit {expr}, x->0"),
+        other => format!("{other} {expr}"),
+    }
+}
+
 fn render_formula_chips(ui: &mut Ui, draft: &mut String) -> bool {
     let chips = [
-        ("factor", "factor(EXPR)"),
-        ("expand", "expand(EXPR)"),
-        ("diff", "diff(EXPR, x)"),
-        ("integral", "integral(EXPR, x)"),
-        ("solve", "solve(EXPR == 0, x)"),
-        ("matrix", "[1 2; 3 4]"),
-        ("plot", "plot(sin(x), -pi..pi)"),
-        ("taylor", "taylor(EXPR, x, 0, 5)"),
-        ("sum", "sum(k^2, k, 1..10)"),
+        "factor", "expand", "diff", "integral", "solve", "matrix", "plot", "taylor", "sum", "limit",
     ];
 
     let mut clicked = false;
@@ -215,7 +254,7 @@ fn render_formula_chips(ui: &mut Ui, draft: &mut String) -> bool {
                 .font(FontId::new(10.5, FontFamily::Proportional)),
         );
 
-        for (label, snippet) in chips {
+        for label in chips {
             if ui
                 .add(
                     Button::new(
@@ -229,11 +268,7 @@ fn render_formula_chips(ui: &mut Ui, draft: &mut String) -> bool {
                 .clicked()
             {
                 clicked = true;
-                if draft.is_empty() {
-                    *draft = snippet.to_string();
-                } else {
-                    *draft = format!("{}({})", label, draft.trim());
-                }
+                *draft = apply_template_chip(label, draft);
             }
         }
     });
