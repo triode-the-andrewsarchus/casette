@@ -52,11 +52,16 @@ pub fn render_input_pane(
             if response.has_focus() {
                 let input_state = ui.input(|i| i.clone());
 
+                let is_single_line = !state.draft_input.contains('\n');
                 if input_state.key_pressed(Key::Enter) && !input_state.modifiers.shift {
                     submit_pressed = true;
-                } else if input_state.key_pressed(Key::ArrowUp) {
+                } else if input_state.key_pressed(Key::ArrowUp)
+                    && (is_single_line || input_state.modifiers.ctrl)
+                {
                     navigate_history(state, true);
-                } else if input_state.key_pressed(Key::ArrowDown) {
+                } else if input_state.key_pressed(Key::ArrowDown)
+                    && (is_single_line || input_state.modifiers.ctrl)
+                {
                     navigate_history(state, false);
                 } else if input_state.key_pressed(Key::Escape) {
                     state.draft_input.clear();

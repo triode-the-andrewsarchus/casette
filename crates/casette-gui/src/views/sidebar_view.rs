@@ -97,6 +97,20 @@ pub fn render_sidebar(
         });
 }
 
+fn insert_symbol_into_draft(draft: &str, symbol: &str) -> String {
+    if draft.is_empty() {
+        return symbol.to_string();
+    }
+    let needs_space = !draft.ends_with(|c: char| {
+        c.is_whitespace() || matches!(c, '(' | '[' | '{' | '+' | '-' | '*' | '/' | '^' | ',' | '=')
+    });
+    if needs_space {
+        format!("{draft} {symbol}")
+    } else {
+        format!("{draft}{symbol}")
+    }
+}
+
 fn render_symbols_tab(
     ui: &mut Ui,
     state: &SessionState,
@@ -188,7 +202,7 @@ fn render_symbols_tab(
                             .on_hover_text("Insert symbol name into draft")
                             .clicked()
                         {
-                            on_load_draft(sym.name.clone());
+                            on_load_draft(insert_symbol_into_draft(&state.draft_input, &sym.name));
                         }
 
                         ui.label(

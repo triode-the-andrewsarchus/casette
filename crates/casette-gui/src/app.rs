@@ -338,6 +338,7 @@ impl App for CasetteApp {
                     }
                     if let Some(text) = draft_to_load {
                         self.state.draft_input = text;
+                        self.state.request_input_focus = true;
                     }
                 });
         }
