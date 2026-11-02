@@ -14,6 +14,7 @@ pub fn render_header(
     state: &mut SessionState,
     sidebar_visible: &mut bool,
     doctor_open: &mut bool,
+    help_open: &mut bool,
     md_exported_recently: bool,
     on_precision_change: &mut dyn FnMut(u32),
     on_clear_tape: &mut dyn FnMut(),
@@ -55,6 +56,39 @@ pub fn render_header(
 
                     if ui.add(sidebar_btn).clicked() {
                         *sidebar_visible = !*sidebar_visible;
+                    }
+
+                    // Help / Reference button
+                    let help_btn = Button::new(
+                        RichText::new("❓ Help")
+                            .color(if *help_open {
+                                Colors::ACCENT_PRIMARY
+                            } else {
+                                Colors::TEXT_SECONDARY
+                            })
+                            .font(FontId::new(12.0, FontFamily::Proportional)),
+                    )
+                    .fill(if *help_open {
+                        Colors::CARD_BG_SELECTED
+                    } else {
+                        Colors::CARD_BG
+                    })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if *help_open {
+                            Colors::ACCENT_PRIMARY
+                        } else {
+                            Colors::BORDER_SUBTLE
+                        },
+                    ))
+                    .corner_radius(5);
+
+                    if ui
+                        .add(help_btn)
+                        .on_hover_text("Open Casette command syntax, units, and shortcut reference")
+                        .clicked()
+                    {
+                        *help_open = !*help_open;
                     }
 
                     // Sage Doctor button

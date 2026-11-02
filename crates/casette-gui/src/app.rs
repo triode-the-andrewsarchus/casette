@@ -24,6 +24,7 @@ pub struct CasetteApp {
     symbol_filter: String,
     show_builtin_symbols: bool,
     doctor_open: bool,
+    help_open: bool,
     last_md_export: Option<std::time::Instant>,
 }
 
@@ -66,6 +67,7 @@ impl CasetteApp {
             symbol_filter: String::new(),
             show_builtin_symbols: false,
             doctor_open: false,
+            help_open: false,
             last_md_export: None,
         }
     }
@@ -263,6 +265,7 @@ impl App for CasetteApp {
                 &mut self.state,
                 &mut self.sidebar_visible,
                 &mut self.doctor_open,
+                &mut self.help_open,
                 md_exported_recently,
                 &mut |digits| prec_change = Some(digits),
                 &mut || clear_tape = true,
@@ -505,6 +508,192 @@ impl App for CasetteApp {
                 self.sidebar_visible = true;
                 self.current_sidebar_tab = SidebarTab::Doctor;
                 self.doctor_open = false;
+            }
+        }
+
+        // 6. Reference & Help Window (when help_open is active)
+        if self.help_open {
+            let mut example_to_load: Option<String> = None;
+
+            Window::new("❓ Casette Reference & Help")
+                .open(&mut self.help_open)
+                .resizable(true)
+                .collapsible(false)
+                .default_width(540.0)
+                .default_height(460.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Click any example below to load it directly into the input bar.",
+                        )
+                        .color(Colors::TEXT_SECONDARY)
+                        .font(FontId::new(12.0, FontFamily::Proportional)),
+                    );
+                    ui.add_space(6.0);
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let sections: &[(&str, &[(&str, &str)])] = &[
+                                (
+                                    "Algebra & Calculus",
+                                    &[
+                                        ("factor x^4 - 1", "Factor polynomial or integer"),
+                                        ("expand (x + y)^3", "Expand symbolic product"),
+                                        ("simplify (x^2 - 1)/(x - 1)", "Simplify expression"),
+                                        ("solve x^2 + 5*x + 6 = 0 for x", "Solve equation(s)"),
+                                        ("derivative sin(x)^2 wrt x", "Symbolic derivative"),
+                                        (
+                                            "integral x * exp(-x^2), x=0..infinity",
+                                            "Definite or indefinite integral",
+                                        ),
+                                        ("limit sin(x)/x, x->0", "Symbolic limit (supports + / -)"),
+                                        (
+                                            "taylor cos(x), x=0, order=6",
+                                            "Taylor / Maclaurin series",
+                                        ),
+                                        ("sum 1/k^2, k=1..infinity", "Symbolic summation"),
+                                    ],
+                                ),
+                                (
+                                    "Linear Algebra & Vector Calculus",
+                                    &[
+                                        ("[1 2; 3 4]", "MATLAB-style matrix literal"),
+                                        ("det [1, 2; 3, 4]", "Determinant of a matrix"),
+                                        ("rref [1, 2, 3; 4, 5, 6]", "Reduced row echelon form"),
+                                        ("eigenvalues [2, 1; 1, 2]", "Matrix eigenvalues"),
+                                        ("inverse [1, 2; 3, 5]", "Matrix inverse"),
+                                        (
+                                            "gradient x^2 + x*y^3, [x, y]",
+                                            "Symbolic gradient vector",
+                                        ),
+                                        ("hessian x^3 + y^3 - 3*x*y", "Hessian matrix"),
+                                    ],
+                                ),
+                                (
+                                    "Interactive Plotting",
+                                    &[
+                                        (
+                                            "plot sin(x) * cos(2*x), x=-pi..pi",
+                                            "2D Cartesian function plot",
+                                        ),
+                                        (
+                                            "implicit_plot x^2 + y^2 = 4, x=-3..3, y=-3..3",
+                                            "2D implicit curve plot",
+                                        ),
+                                        (
+                                            "parametric_plot (cos(3*t), sin(2*t)), t=0..2*pi",
+                                            "2D parametric curve plot",
+                                        ),
+                                    ],
+                                ),
+                                (
+                                    "Physical Units & Conversions",
+                                    &[
+                                        ("32 mi + 5 km to miles", "Length addition and conversion"),
+                                        ("12V / 3A to ohm", "Ohm's law electrical unit conversion"),
+                                        ("100 degC in degF", "Affine temperature conversion"),
+                                        ("50 N * 10 m to J", "Mechanical work to Joules"),
+                                    ],
+                                ),
+                                (
+                                    "Probability & Statistics",
+                                    &[
+                                        (
+                                            "normal_cdf 1.96, mean=0, sd=1",
+                                            "Normal cumulative distribution",
+                                        ),
+                                        (
+                                            "binomial_pmf 3, n=10, p=0.5",
+                                            "Binomial probability mass",
+                                        ),
+                                        ("mean [4, 8, 15, 16, 23, 42]", "Sample mean"),
+                                    ],
+                                ),
+                                (
+                                    "Session Tape References",
+                                    &[
+                                        ("derivative #1 wrt x", "Reference output of row #1"),
+                                        ("subs #1, x=2", "Substitute into output of row #1"),
+                                    ],
+                                ),
+                            ];
+
+                            for (title, items) in sections {
+                                ui.label(
+                                    RichText::new(*title)
+                                        .color(Colors::ACCENT_PRIMARY)
+                                        .font(FontId::new(13.0, FontFamily::Proportional))
+                                        .strong(),
+                                );
+                                ui.add_space(3.0);
+
+                                for (example, desc) in *items {
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(
+                                                Button::new(
+                                                    RichText::new(*example)
+                                                        .color(Colors::TEXT_PRIMARY)
+                                                        .font(FontId::new(
+                                                            11.5,
+                                                            FontFamily::Monospace,
+                                                        )),
+                                                )
+                                                .fill(Colors::INPUT_BG)
+                                                .corner_radius(4),
+                                            )
+                                            .on_hover_text("Click to insert into input editor")
+                                            .clicked()
+                                        {
+                                            example_to_load = Some((*example).to_string());
+                                        }
+                                        ui.label(
+                                            RichText::new(*desc)
+                                                .color(Colors::TEXT_MUTED)
+                                                .font(FontId::new(11.5, FontFamily::Proportional)),
+                                        );
+                                    });
+                                }
+                                ui.add_space(10.0);
+                            }
+
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Keyboard Shortcuts")
+                                    .color(Colors::ACCENT_PRIMARY)
+                                    .font(FontId::new(13.0, FontFamily::Proportional))
+                                    .strong(),
+                            );
+                            for (key, desc) in [
+                                ("Enter", "Evaluate current input"),
+                                ("Shift + Enter", "Insert newline (multi-line raw Sage)"),
+                                ("Tab", "Autocomplete command or session symbol"),
+                                ("Up / Down (or Ctrl+Up/Down)", "Navigate evaluation history"),
+                                ("Esc", "Clear input draft"),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{key:<28}"))
+                                            .color(Colors::TEXT_PRIMARY)
+                                            .font(FontId::new(11.5, FontFamily::Monospace)),
+                                    );
+                                    ui.label(
+                                        RichText::new(desc)
+                                            .color(Colors::TEXT_MUTED)
+                                            .font(FontId::new(11.5, FontFamily::Proportional)),
+                                    );
+                                });
+                            }
+                        });
+                });
+
+            if let Some(ex) = example_to_load {
+                self.state.draft_input = ex;
+                self.state.request_input_focus = true;
+                self.help_open = false;
             }
         }
     }
