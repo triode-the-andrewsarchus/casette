@@ -18,6 +18,20 @@ pub fn render_tape(
         return;
     }
 
+    let scroll_state_id = ui.id().with("casette_tape_scroll_sig");
+    let current_sig = (
+        state.rows.len(),
+        state.rows.last().map(|r| r.is_evaluating).unwrap_or(false),
+    );
+    let prev_sig = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<(usize, bool)>(scroll_state_id));
+    let should_scroll_to_bottom = prev_sig != Some(current_sig);
+    if should_scroll_to_bottom {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(scroll_state_id, current_sig));
+    }
+
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
@@ -32,6 +46,7 @@ pub fn render_tape(
                     Stroke::new(1.0_f32, Colors::BORDER_SUBTLE)
                 };
 
+                let mut action_triggered = false;
                 let card_response = Frame::new()
                     .fill(Colors::CARD_BG)
                     .stroke(border_stroke)
@@ -115,16 +130,26 @@ pub fn render_tape(
                         ui.add_space(8.0);
 
                         // 4. Result output
-                        render_result(ui, row, texture_cache, on_action);
+                        render_result(ui, row, texture_cache, &mut |act, snip| {
+                            action_triggered = true;
+                            on_action(act, snip);
+                        });
                     });
 
-                // Clicking on row card selects it for inspector without intercepting child buttons
+                // Clicking on row card selects it for inspector without overriding a triggered child action
                 let card_rect = card_response.response.rect;
-                if ui.rect_contains_pointer(card_rect) && ui.input(|i| i.pointer.primary_clicked()) {
+                if !action_triggered
+                    && ui.rect_contains_pointer(card_rect)
+                    && ui.input(|i| i.pointer.primary_clicked())
+                {
                     state.selected_row_index = Some(idx);
                 }
 
                 ui.add_space(10.0);
+            }
+
+            if should_scroll_to_bottom {
+                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
             }
         });
 }
@@ -142,7 +167,7 @@ fn render_empty_tape_placeholder(ui: &mut Ui) {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "Type mathematical expressions below. Use #1, #2 to reference earlier rows.\nTry 'diff(sin(x), x)', 'factor(x^4 - 1)', '[1 2; 3 4]', or 'plot(sin(x), -pi..pi)'.",
+                    "Type mathematical expressions below. Use #1, #2 to reference earlier rows.\nTry 'derivative sin(x) wrt x', 'factor x^4 - 1', '[1 2; 3 4]', or 'plot sin(x), x=-pi..pi'.",
                 )
                 .color(Colors::TEXT_MUTED)
                 .font(FontId::new(13.0, FontFamily::Proportional)),
