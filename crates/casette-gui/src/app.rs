@@ -24,6 +24,7 @@ pub struct CasetteApp {
     symbol_filter: String,
     show_builtin_symbols: bool,
     doctor_open: bool,
+    last_md_export: Option<std::time::Instant>,
 }
 
 impl CasetteApp {
@@ -65,6 +66,7 @@ impl CasetteApp {
             symbol_filter: String::new(),
             show_builtin_symbols: false,
             doctor_open: false,
+            last_md_export: None,
         }
     }
 
@@ -251,14 +253,20 @@ impl App for CasetteApp {
         TopBottomPanel::top("top_header_panel").show(ctx, |ui| {
             let mut prec_change = None;
             let mut clear_tape = false;
+            let mut export_md = false;
+            let md_exported_recently = self
+                .last_md_export
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(2500));
 
             render_header(
                 ui,
                 &mut self.state,
                 &mut self.sidebar_visible,
                 &mut self.doctor_open,
+                md_exported_recently,
                 &mut |digits| prec_change = Some(digits),
                 &mut || clear_tape = true,
+                &mut || export_md = true,
             );
 
             if let Some(digits) = prec_change {
@@ -270,6 +278,17 @@ impl App for CasetteApp {
                 if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
                     tracing::warn!("Failed to auto-save session after clear tape: {}", e);
                 }
+            }
+            if export_md {
+                let md = crate::persistence::export_to_markdown(&self.state);
+                ctx.copy_text(md.clone());
+                let md_path = self.session_path.with_extension("md");
+                if let Err(e) = std::fs::write(&md_path, &md) {
+                    tracing::warn!("Failed to write Markdown export to {:?}: {}", md_path, e);
+                } else {
+                    info!("Exported session Markdown to {:?}", md_path);
+                }
+                self.last_md_export = Some(std::time::Instant::now());
             }
         });
 

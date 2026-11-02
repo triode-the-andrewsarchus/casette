@@ -8,13 +8,16 @@ use egui::{
 };
 
 /// Renders the top toolbar header.
+#[allow(clippy::too_many_arguments)]
 pub fn render_header(
     ui: &mut Ui,
     state: &mut SessionState,
     sidebar_visible: &mut bool,
     doctor_open: &mut bool,
+    md_exported_recently: bool,
     on_precision_change: &mut dyn FnMut(u32),
     on_clear_tape: &mut dyn FnMut(),
+    on_export_markdown: &mut dyn FnMut(),
 ) {
     Frame::new()
         .fill(Colors::CARD_BG)
@@ -103,6 +106,42 @@ pub fn render_header(
                         .clicked()
                     {
                         on_clear_tape();
+                    }
+
+                    // Export Markdown button
+                    let md_label = if md_exported_recently {
+                        "✓ Exported MD"
+                    } else {
+                        "📄 Export MD"
+                    };
+                    let md_btn = Button::new(
+                        RichText::new(md_label)
+                            .color(if md_exported_recently {
+                                Colors::EXACT_GREEN
+                            } else {
+                                Colors::TEXT_SECONDARY
+                            })
+                            .font(FontId::new(12.0, FontFamily::Proportional)),
+                    )
+                    .fill(Colors::CARD_BG)
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if md_exported_recently {
+                            Colors::EXACT_GREEN
+                        } else {
+                            Colors::BORDER_SUBTLE
+                        },
+                    ))
+                    .corner_radius(5);
+
+                    if ui
+                        .add(md_btn)
+                        .on_hover_text(
+                            "Export session tape as Markdown (copies to clipboard and saves session.md)",
+                        )
+                        .clicked()
+                    {
+                        on_export_markdown();
                     }
 
                     ui.separator();
