@@ -52,6 +52,9 @@ pub struct KernelConfig {
 
     /// Whether to evaluate the standard boot prelude (`var('u, v, w, x, ...')`) on launch.
     pub run_boot_prelude: bool,
+
+    /// Discovered SageMath version string for display in diagnostics.
+    pub sage_version: String,
 }
 
 impl Default for KernelConfig {
@@ -63,6 +66,7 @@ impl Default for KernelConfig {
             default_eval_timeout: Duration::from_secs(60),
             initial_precision: Some(10),
             run_boot_prelude: true,
+            sage_version: "SageMath (Linux)".to_string(),
         }
     }
 }
@@ -105,6 +109,7 @@ pub struct SageKernel {
     is_running: Arc<AtomicBool>,
     next_req_id: Arc<AtomicU64>,
     default_timeout: Duration,
+    sage_version: Arc<String>,
 }
 
 impl SageKernel {
@@ -118,6 +123,7 @@ impl SageKernel {
         Self::launch(KernelConfig {
             python_path: env.python_path,
             worker_script: env.worker_script,
+            sage_version: env.sage_version,
             ..Default::default()
         })
         .await
@@ -156,6 +162,7 @@ impl SageKernel {
             is_running,
             next_req_id,
             default_timeout: config.default_eval_timeout,
+            sage_version: Arc::new(config.sage_version),
         };
 
         // If an initial precision was specified, configure it now
@@ -337,6 +344,12 @@ impl SageKernel {
         } else {
             None
         }
+    }
+
+    /// Returns the discovered SageMath version string for this kernel.
+    #[must_use]
+    pub fn sage_version(&self) -> &str {
+        &self.sage_version
     }
 }
 

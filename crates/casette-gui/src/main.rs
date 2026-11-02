@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 let pid = k.worker_pid().unwrap_or(0);
                 let _ = msg_tx_clone.send(AsyncMessage::WorkerReady {
                     pid,
-                    version: "SageMath (Linux)".into(),
+                    version: k.sage_version().to_string(),
                 });
                 k
             }
@@ -165,7 +165,7 @@ fn main() -> anyhow::Result<()> {
                         let pid = kernel.worker_pid().unwrap_or(0);
                         let _ = msg_tx_clone.send(AsyncMessage::WorkerReady {
                             pid,
-                            version: "SageMath (Linux)".into(),
+                            version: kernel.sage_version().to_string(),
                         });
                     }
                 }
