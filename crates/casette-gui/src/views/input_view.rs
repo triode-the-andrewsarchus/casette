@@ -3,6 +3,8 @@
 use crate::model::{SessionState, WorkerStatus};
 use crate::theme::Colors;
 use egui::{Align, Button, FontFamily, FontId, Frame, Key, Layout, RichText, Stroke, TextEdit, Ui};
+use friendly_compiler::ir::limit::LimitDirection;
+use friendly_compiler::ir::FormulaIR;
 
 /// Renders the bottom input editor pane.
 pub fn render_input_pane(
@@ -19,6 +21,9 @@ pub fn render_input_pane(
             // 1. Live "Generated Sage" preview bar
             let tape_refs = state.tape_references();
             render_live_lowering_preview(ui, &state.draft_input, &tape_refs);
+
+            // 1b. Interactive FormulaIR structured parameter expander
+            render_formula_ir_expander(ui, &mut state.draft_input);
 
             ui.add_space(6.0);
 
@@ -195,6 +200,326 @@ fn render_live_lowering_preview(
                 );
             });
         }
+    }
+}
+
+fn ir_field(ui: &mut Ui, label: &str, value: &mut String, width: f32, hint: &str) -> bool {
+    ui.label(
+        RichText::new(label)
+            .color(Colors::TEXT_MUTED)
+            .font(FontId::new(10.5, FontFamily::Proportional)),
+    );
+    ui.add(
+        TextEdit::singleline(value)
+            .desired_width(width)
+            .hint_text(hint)
+            .font(FontId::new(11.5, FontFamily::Monospace)),
+    )
+    .changed()
+}
+
+fn ir_opt_field(
+    ui: &mut Ui,
+    label: &str,
+    value: &mut Option<String>,
+    width: f32,
+    hint: &str,
+) -> bool {
+    let mut text = value.clone().unwrap_or_default();
+    if ir_field(ui, label, &mut text, width, hint) {
+        if text.trim().is_empty() {
+            *value = None;
+        } else {
+            *value = Some(text);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn render_formula_ir_expander(ui: &mut Ui, draft: &mut String) {
+    if draft.contains('\n') {
+        return;
+    }
+    let Some(mut ir) = FormulaIR::parse(draft) else {
+        return;
+    };
+
+    let mut changed = false;
+
+    Frame::new()
+        .fill(Colors::INPUT_BG)
+        .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| match &mut ir {
+                FormulaIR::Integral(int_ir) => {
+                    ui.label(
+                        RichText::new("∫ INTEGRAL")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "f:", &mut int_ir.expression, 120.0, "x^2");
+                    if ir_field(ui, "var:", &mut int_ir.variable, 36.0, "x") {
+                        int_ir.has_explicit_variable = !int_ir.variable.trim().is_empty();
+                        changed = true;
+                    }
+                    changed |= ir_opt_field(ui, "from:", &mut int_ir.lower_bound, 48.0, "0");
+                    changed |= ir_opt_field(ui, "to:", &mut int_ir.upper_bound, 48.0, "1");
+                }
+                FormulaIR::Derivative(der_ir) => {
+                    ui.label(
+                        RichText::new("d/dx DERIVATIVE")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut der_ir.expression, 130.0, "sin(x)");
+                    if ir_field(ui, "wrt:", &mut der_ir.variable, 40.0, "x") {
+                        der_ir.has_explicit_variable = !der_ir.variable.trim().is_empty();
+                        changed = true;
+                    }
+                    changed |= ir_opt_field(ui, "order:", &mut der_ir.order, 36.0, "1");
+                }
+                FormulaIR::Solve(solve_ir) => {
+                    ui.label(
+                        RichText::new("SOLVE")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "eq:", &mut solve_ir.equation, 140.0, "x^2 - 4 = 0");
+                    if ir_field(ui, "for:", &mut solve_ir.variable, 60.0, "x") {
+                        solve_ir.has_explicit_variable = !solve_ir.variable.trim().is_empty();
+                        changed = true;
+                    }
+                }
+                FormulaIR::Limit(lim_ir) => {
+                    ui.label(
+                        RichText::new("lim LIMIT")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut lim_ir.expression, 120.0, "sin(x)/x");
+                    changed |= ir_field(ui, "var:", &mut lim_ir.variable, 36.0, "x");
+                    changed |= ir_field(ui, "→", &mut lim_ir.point, 48.0, "0");
+                    let dir_label = match lim_ir.direction {
+                        LimitDirection::Both => "two-sided",
+                        LimitDirection::Right => "from right (+)",
+                        LimitDirection::Left => "from left (-)",
+                    };
+                    if ui
+                        .add(
+                            Button::new(
+                                RichText::new(dir_label)
+                                    .color(Colors::TEXT_SECONDARY)
+                                    .font(FontId::new(10.5, FontFamily::Proportional)),
+                            )
+                            .fill(Colors::CARD_BG)
+                            .corner_radius(4),
+                        )
+                        .clicked()
+                    {
+                        lim_ir.direction = match lim_ir.direction {
+                            LimitDirection::Both => LimitDirection::Right,
+                            LimitDirection::Right => LimitDirection::Left,
+                            LimitDirection::Left => LimitDirection::Both,
+                        };
+                        changed = true;
+                    }
+                }
+                FormulaIR::Taylor(tay_ir) => {
+                    ui.label(
+                        RichText::new("TAYLOR")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut tay_ir.expression, 110.0, "sin(x)");
+                    changed |= ir_field(ui, "var:", &mut tay_ir.variable, 36.0, "x");
+                    changed |= ir_field(ui, "at:", &mut tay_ir.center, 44.0, "0");
+                    changed |= ir_field(ui, "order:", &mut tay_ir.order, 36.0, "5");
+                }
+                FormulaIR::SeriesRange(ser_ir) => {
+                    ui.label(
+                        RichText::new(ser_ir.kind.title())
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "term:", &mut ser_ir.expression, 110.0, "k^2");
+                    changed |= ir_field(ui, "index:", &mut ser_ir.index_variable, 36.0, "k");
+                    changed |= ir_field(ui, "from:", &mut ser_ir.lower_bound, 44.0, "1");
+                    changed |= ir_field(ui, "to:", &mut ser_ir.upper_bound, 48.0, "10");
+                }
+                FormulaIR::Plot(plot_ir) => {
+                    ui.label(
+                        RichText::new("PLOT")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "f:", &mut plot_ir.expression, 120.0, "sin(x)");
+                    if ir_field(ui, "var:", &mut plot_ir.variable, 36.0, "x") {
+                        plot_ir.has_explicit_variable = !plot_ir.variable.trim().is_empty();
+                        changed = true;
+                    }
+                    changed |= ir_opt_field(ui, "min:", &mut plot_ir.lower_bound, 48.0, "-pi");
+                    changed |= ir_opt_field(ui, "max:", &mut plot_ir.upper_bound, 48.0, "pi");
+                }
+                FormulaIR::ImplicitPlot(imp_ir) => {
+                    ui.label(
+                        RichText::new("IMPLICIT PLOT")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "eq:", &mut imp_ir.equation, 110.0, "x^2 + y^2 = 1");
+                    changed |= ir_field(ui, "x:", &mut imp_ir.x_variable, 30.0, "x");
+                    changed |= ir_opt_field(ui, "xmin:", &mut imp_ir.x_lower, 40.0, "-2");
+                    changed |= ir_opt_field(ui, "xmax:", &mut imp_ir.x_upper, 40.0, "2");
+                    changed |= ir_field(ui, "y:", &mut imp_ir.y_variable, 30.0, "y");
+                    changed |= ir_opt_field(ui, "ymin:", &mut imp_ir.y_lower, 40.0, "-2");
+                    changed |= ir_opt_field(ui, "ymax:", &mut imp_ir.y_upper, 40.0, "2");
+                }
+                FormulaIR::ParametricPlot(par_ir) => {
+                    ui.label(
+                        RichText::new("PARAMETRIC PLOT")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "x(t):", &mut par_ir.x_expression, 85.0, "cos(t)");
+                    changed |= ir_field(ui, "y(t):", &mut par_ir.y_expression, 85.0, "sin(t)");
+                    if ir_field(ui, "param:", &mut par_ir.variable, 32.0, "t") {
+                        par_ir.has_explicit_variable = !par_ir.variable.trim().is_empty();
+                        changed = true;
+                    }
+                    changed |= ir_opt_field(ui, "min:", &mut par_ir.lower_bound, 44.0, "0");
+                    changed |= ir_opt_field(ui, "max:", &mut par_ir.upper_bound, 44.0, "2*pi");
+                }
+                FormulaIR::Unary(un_ir) => {
+                    ui.label(
+                        RichText::new(un_ir.kind.title())
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut un_ir.expression, 180.0, "x^4 - 1");
+                }
+                FormulaIR::MatrixOp(mat_ir) => {
+                    ui.label(
+                        RichText::new(mat_ir.kind.title())
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |=
+                        ir_field(ui, "matrix:", &mut mat_ir.expression, 180.0, "[1, 2; 3, 4]");
+                }
+                FormulaIR::VectorCalculus(vc_ir) => {
+                    ui.label(
+                        RichText::new(vc_ir.kind.title())
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut vc_ir.expression, 140.0, "x^2 + y^2");
+                    if vc_ir.kind
+                        != friendly_compiler::ir::vector_calculus::VectorCalculusKind::Hessian
+                    {
+                        changed |= ir_field(ui, "vars:", &mut vc_ir.variables, 70.0, "[x, y]");
+                    }
+                }
+                FormulaIR::Subs(subs_ir) => {
+                    ui.label(
+                        RichText::new("SUBS")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut subs_ir.expression, 130.0, "x^2 + y");
+                    changed |= ir_field(ui, "where:", &mut subs_ir.bindings, 110.0, "x=2, y=3");
+                }
+                FormulaIR::Numeric(num_ir) => {
+                    ui.label(
+                        RichText::new("NUMERIC")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "expr:", &mut num_ir.expression, 140.0, "pi");
+                    changed |= ir_field(ui, "digits:", &mut num_ir.digits, 48.0, "50");
+                }
+                FormulaIR::VarDeclaration(var_ir) => {
+                    ui.label(
+                        RichText::new("VAR")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "symbols:", &mut var_ir.names, 160.0, "x, y, z");
+                }
+                FormulaIR::Assume(ass_ir) => {
+                    ui.label(
+                        RichText::new("ASSUME")
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "condition:", &mut ass_ir.condition, 160.0, "x > 0");
+                }
+                FormulaIR::Binary(bin_ir) => {
+                    ui.label(
+                        RichText::new(bin_ir.kind.title())
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    changed |= ir_field(ui, "a:", &mut bin_ir.first, 80.0, "10");
+                    changed |= ir_field(ui, "b:", &mut bin_ir.second, 80.0, "3");
+                }
+                FormulaIR::Stats(stats_ir) => {
+                    ui.label(
+                        RichText::new(stats_ir.kind.command())
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(10.5, FontFamily::Proportional))
+                            .strong(),
+                    );
+                    if stats_ir.positional.is_empty() {
+                        stats_ir.positional.push(String::new());
+                    }
+                    for (idx, pos) in stats_ir.positional.iter_mut().enumerate() {
+                        let lbl = if idx == 0 { "arg:" } else { "arg2:" };
+                        changed |= ir_field(ui, lbl, pos, 54.0, "0");
+                    }
+                    for field in stats_ir.kind.named_fields() {
+                        let mut val = stats_ir.named.get(field.key).cloned().unwrap_or_default();
+                        if ir_field(
+                            ui,
+                            &format!("{}:", field.title),
+                            &mut val,
+                            48.0,
+                            field.prompt,
+                        ) {
+                            if val.trim().is_empty() {
+                                stats_ir.named.remove(field.key);
+                            } else {
+                                stats_ir.named.insert(field.key.to_string(), val);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            });
+        });
+
+    if changed {
+        *draft = ir.friendly_input();
     }
 }
 
