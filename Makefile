@@ -11,6 +11,7 @@
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share/casette
 APPDIR ?= $(PREFIX)/share/applications
 ICONDIR ?= $(PREFIX)/share/icons/hicolor/512x512/apps
 
@@ -65,6 +66,8 @@ clean:
 install: release
 	install -d $(BINDIR)
 	install -m 755 target/release/casette $(BINDIR)/casette
+	install -d $(DATADIR)
+	install -m 644 worker-protocol/worker.py $(DATADIR)/worker.py
 	install -d $(APPDIR)
 	@echo "[Desktop Entry]" > $(APPDIR)/casette.desktop
 	@echo "Type=Application" >> $(APPDIR)/casette.desktop
@@ -73,10 +76,11 @@ install: release
 	@echo "Exec=$(BINDIR)/casette" >> $(APPDIR)/casette.desktop
 	@echo "Terminal=false" >> $(APPDIR)/casette.desktop
 	@echo "Categories=Science;Math;Education;" >> $(APPDIR)/casette.desktop
-	@echo "Installed casette to $(BINDIR)/casette and desktop file to $(APPDIR)/casette.desktop"
+	@echo "Installed casette to $(BINDIR)/casette, worker to $(DATADIR)/worker.py, and desktop file to $(APPDIR)/casette.desktop"
 
 uninstall:
 	rm -f $(BINDIR)/casette
+	rm -f $(DATADIR)/worker.py
 	rm -f $(APPDIR)/casette.desktop
 
 help:
