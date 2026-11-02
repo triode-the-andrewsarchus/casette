@@ -98,7 +98,7 @@ fn main() -> anyhow::Result<()> {
                             if is_ok {
                                 if let Some(expr) = extract_reusable_expression(&compiled_code) {
                                     let assign_code = format!(
-                                        "__casette_tape_refs[{}] = ({})\n",
+                                        "__casette_tape_refs = globals().setdefault('__casette_tape_refs', {{}})\n__casette_tape_refs[{}] = ({})\n",
                                         row_num, expr
                                     );
                                     let _ = kernel.eval(&assign_code, false, None).await;
@@ -112,7 +112,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 GuiAction::SyncTapeRefs(refs) => {
-                    let mut code = String::from("__casette_tape_refs = {}\n");
+                    let mut code = String::from(
+                        "__casette_tape_refs = globals().setdefault('__casette_tape_refs', {})\n__casette_tape_refs.clear()\n",
+                    );
                     for (num, expr) in refs {
                         code.push_str(&format!("__casette_tape_refs[{}] = ({})\n", num, expr));
                     }

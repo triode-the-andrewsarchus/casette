@@ -912,6 +912,7 @@ def _install_casette_units(ns):
 
 _install_casette_preloads(NS)
 _install_casette_units(NS)
+NS["__casette_tape_refs"] = {}
 
 # V0.6 — Live symbol-table baseline.
 # ----------------------------------
