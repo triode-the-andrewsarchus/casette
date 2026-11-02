@@ -304,6 +304,21 @@ fn render_inspector_tab(ui: &mut Ui, state: &SessionState) {
                 .font(FontId::new(12.5, FontFamily::Monospace)),
         );
 
+        if row.compiled_sage.trim() != row.input_raw.trim() && !row.compiled_sage.trim().is_empty()
+        {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Compiled Sage:")
+                    .color(Colors::TEXT_MUTED)
+                    .font(FontId::new(11.0, FontFamily::Proportional)),
+            );
+            ui.label(
+                RichText::new(&row.compiled_sage)
+                    .color(Colors::ACCENT_PURPLE)
+                    .font(FontId::new(12.0, FontFamily::Monospace)),
+            );
+        }
+
         if let Some(res) = &row.result {
             ui.add_space(8.0);
             ui.label(
@@ -318,17 +333,53 @@ fn render_inspector_tab(ui: &mut Ui, state: &SessionState) {
             );
 
             if let Some(plain) = &res.plain {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Plain Text:")
-                        .color(Colors::TEXT_MUTED)
-                        .font(FontId::new(11.0, FontFamily::Proportional)),
-                );
-                ui.label(
-                    RichText::new(plain)
-                        .color(Colors::TEXT_PRIMARY)
-                        .font(FontId::new(12.0, FontFamily::Monospace)),
-                );
+                if !plain.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Plain Text:")
+                            .color(Colors::TEXT_MUTED)
+                            .font(FontId::new(11.0, FontFamily::Proportional)),
+                    );
+                    ui.label(
+                        RichText::new(plain)
+                            .color(Colors::TEXT_PRIMARY)
+                            .font(FontId::new(12.0, FontFamily::Monospace)),
+                    );
+                }
+            }
+
+            if let Some(stdout) = &res.stdout {
+                let trimmed = stdout.trim_end();
+                if !trimmed.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Standard Output (stdout):")
+                            .color(Colors::TEXT_MUTED)
+                            .font(FontId::new(11.0, FontFamily::Proportional)),
+                    );
+                    ui.label(
+                        RichText::new(trimmed)
+                            .color(Colors::TEXT_SECONDARY)
+                            .font(FontId::new(11.5, FontFamily::Monospace)),
+                    );
+                }
+            }
+
+            if let Some(stderr) = &res.stderr {
+                let trimmed = stderr.trim_end();
+                if !trimmed.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Standard Error (stderr):")
+                            .color(Colors::TEXT_MUTED)
+                            .font(FontId::new(11.0, FontFamily::Proportional)),
+                    );
+                    ui.label(
+                        RichText::new(trimmed)
+                            .color(Colors::NUMERIC_AMBER)
+                            .font(FontId::new(11.5, FontFamily::Monospace)),
+                    );
+                }
             }
 
             if let Some(latex) = &res.latex {

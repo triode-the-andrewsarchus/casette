@@ -35,6 +35,7 @@ pub fn render_result(
     };
 
     if !result.ok {
+        render_captured_streams(ui, result);
         render_error_card(ui, result);
         return;
     }
@@ -55,6 +56,9 @@ pub fn render_result(
     } else if result.kind.as_deref() != Some("plot") {
         render_primary_math(ui, result, texture_cache);
     }
+
+    // Captured stdout / stderr output
+    render_captured_streams(ui, result);
 
     // Secondary approximation line if available
     if let Some(approx) = &result.approx {
@@ -153,6 +157,56 @@ fn render_primary_math(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut
     } else if let Some(plain) = &result.plain {
         if !plain.is_empty() {
             render_primary_text(ui, plain, false);
+        } else if result.kind.as_deref() == Some("none")
+            && result.stdout.as_deref().unwrap_or("").trim().is_empty()
+            && result.stderr.as_deref().unwrap_or("").trim().is_empty()
+        {
+            ui.label(
+                RichText::new("✓ Statement executed")
+                    .color(Colors::TEXT_MUTED)
+                    .font(FontId::new(12.5, FontFamily::Proportional))
+                    .italics(),
+            );
+        }
+    }
+}
+
+fn render_captured_streams(ui: &mut Ui, result: &WorkerResponse) {
+    if let Some(stdout) = &result.stdout {
+        let trimmed = stdout.trim_end();
+        if !trimmed.is_empty() {
+            ui.add_space(4.0);
+            Frame::new()
+                .fill(Colors::INPUT_BG)
+                .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(trimmed)
+                            .color(Colors::TEXT_SECONDARY)
+                            .font(FontId::new(12.5, FontFamily::Monospace)),
+                    );
+                });
+        }
+    }
+
+    if let Some(stderr) = &result.stderr {
+        let trimmed = stderr.trim_end();
+        if !trimmed.is_empty() {
+            ui.add_space(4.0);
+            Frame::new()
+                .fill(Colors::NUMERIC_AMBER_BG)
+                .stroke(Stroke::new(1.0_f32, Colors::NUMERIC_AMBER))
+                .corner_radius(CornerRadius::same(5))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(trimmed)
+                            .color(Colors::NUMERIC_AMBER)
+                            .font(FontId::new(12.0, FontFamily::Monospace)),
+                    );
+                });
         }
     }
 }
