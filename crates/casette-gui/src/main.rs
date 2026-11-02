@@ -133,8 +133,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 GuiAction::DeleteSymbol(name) => {
-                    let cmd = format!("_casette_delete_symbol('{}')\n", name);
-                    let _ = kernel.eval(&cmd, false, None).await;
+                    if let Ok(quoted) = serde_json::to_string(&name) {
+                        let cmd = format!("_casette_delete_symbol({quoted})\n");
+                        let _ = kernel.eval(&cmd, false, None).await;
+                    }
                     if let Ok(syms) = kernel.symbols().await {
                         let _ = msg_tx_clone.send(AsyncMessage::SymbolsUpdated(syms));
                     }

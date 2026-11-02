@@ -123,9 +123,11 @@ impl CasetteApp {
                     if is_success {
                         let trimmed = input_raw.trim();
                         if let Some(rest) = trimmed.strip_prefix("del ") {
-                            let sym_to_del = rest.trim();
-                            if !sym_to_del.is_empty() {
-                                self.state.remove_definition(sym_to_del);
+                            for part in rest.split(',') {
+                                let sym_to_del = part.trim();
+                                if !sym_to_del.is_empty() {
+                                    self.state.remove_definition(sym_to_del);
+                                }
                             }
                         } else {
                             let new_defs =

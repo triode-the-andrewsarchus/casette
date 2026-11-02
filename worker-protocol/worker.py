@@ -999,8 +999,9 @@ def _casette_ensure_vars(names):
 
 def _casette_delete_symbol(name):
     try:
-        from sage.all import forget
-        forget(name)
+        if name in NS:
+            from sage.all import forget
+            forget(NS[name])
     except Exception:
         pass
     if name in _SYMBOL_BASELINE:
@@ -2180,6 +2181,9 @@ def _eval_code(src):
 
     # Pure statement(s): run for side effects, no echoed value.
     exec(compile(tree, "<casette>", "exec"), NS)
+    for _base_k, _base_v in _SYMBOL_BASELINE.items():
+        if _base_k not in NS:
+            NS[_base_k] = _base_v
     return (False, None)
 
 
