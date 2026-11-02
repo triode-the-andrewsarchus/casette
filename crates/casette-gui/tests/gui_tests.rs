@@ -696,3 +696,23 @@ fn test_input_tab_completion_commands_and_symbols() {
         complete_input_prefix("det my_", &symbols).expect("completes my_matrix");
     assert_eq!(completed_mat, "det my_matrix");
 }
+
+#[test]
+fn test_plot_resample_command_generation() {
+    use casette_gui::render::interactive_plot::build_resampled_plot_command;
+
+    let cmd = build_resampled_plot_command("plot sin(x), x=-pi..pi", [-10.0, 10.0], [-1.0, 1.0])
+        .expect("resamples 2D plot");
+    assert_eq!(cmd, "plot sin(x), x=-10.0000..10.0000");
+
+    let imp = build_resampled_plot_command(
+        "implicit_plot x^2 + y^2 = 1, x=-2..2, y=-2..2",
+        [-5.0, 5.0],
+        [-4.0, 4.0],
+    )
+    .expect("resamples implicit plot");
+    assert_eq!(
+        imp,
+        "implicit_plot x^2 + y^2 = 1, x=-5.0000..5.0000, y=-4.0000..4.0000"
+    );
+}

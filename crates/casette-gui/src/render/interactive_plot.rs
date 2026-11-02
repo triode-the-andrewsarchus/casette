@@ -5,10 +5,7 @@
 
 use crate::theme::Colors;
 use casette_kernel::{ExtremumKind, LocalExtremum, PlotDataPayload};
-use egui::{
-    Color32, CornerRadius, FontFamily, FontId, Frame, Margin,
-    RichText, Stroke, Ui,
-};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Frame, Margin, RichText, Stroke, Ui};
 use egui_plot::{
     CoordinatesFormatter, Corner, HLine, Legend, Line, LineStyle, MarkerShape, Plot, PlotBounds,
     PlotPoint, PlotPoints, Points, VLine,
@@ -24,6 +21,7 @@ pub struct InteractivePlotState {
     pub snap_enabled: bool,
     pub reset_requested: bool,
     pub zoom_delta: Option<f32>,
+    pub last_bounds: Option<([f64; 2], [f64; 2])>,
 }
 
 impl Default for InteractivePlotState {
@@ -33,8 +31,51 @@ impl Default for InteractivePlotState {
             snap_enabled: true,
             reset_requested: false,
             zoom_delta: None,
+            last_bounds: None,
         }
     }
+}
+
+/// Builds a friendly plot command re-sampled over the given visible `view_x` / `view_y` bounds
+/// when `input_raw` is a `plot` or `implicit_plot` command.
+#[must_use]
+pub fn build_resampled_plot_command(
+    input_raw: &str,
+    view_x: [f64; 2],
+    view_y: [f64; 2],
+) -> Option<String> {
+    if !view_x[0].is_finite() || !view_x[1].is_finite() || view_x[0] >= view_x[1] {
+        return None;
+    }
+
+    if let Some(mut ir) = friendly_compiler::ir::PlotFormulaIR::parse(input_raw) {
+        if ir.variable.trim().is_empty() {
+            ir.variable = "x".to_string();
+        }
+        ir.has_explicit_variable = true;
+        ir.lower_bound = Some(format!("{:.4}", view_x[0]));
+        ir.upper_bound = Some(format!("{:.4}", view_x[1]));
+        return Some(ir.friendly_input());
+    }
+
+    if let Some(mut ir) = friendly_compiler::ir::ImplicitPlotFormulaIR::parse(input_raw) {
+        if !view_y[0].is_finite() || !view_y[1].is_finite() || view_y[0] >= view_y[1] {
+            return None;
+        }
+        if ir.x_variable.trim().is_empty() {
+            ir.x_variable = "x".to_string();
+        }
+        if ir.y_variable.trim().is_empty() {
+            ir.y_variable = "y".to_string();
+        }
+        ir.x_lower = Some(format!("{:.4}", view_x[0]));
+        ir.x_upper = Some(format!("{:.4}", view_x[1]));
+        ir.y_lower = Some(format!("{:.4}", view_y[0]));
+        ir.y_upper = Some(format!("{:.4}", view_y[1]));
+        return Some(ir.friendly_input());
+    }
+
+    None
 }
 
 /// Linearly interpolates the Y coordinate for a given X from a sorted slice of points.
@@ -47,7 +88,10 @@ pub fn interpolate_y(points: &[[f64; 2]], target_x: f64) -> Option<f64> {
     }
 
     // Binary search for the segment enclosing target_x
-    let idx = match points.binary_search_by(|p| p[0].partial_cmp(&target_x).unwrap_or(std::cmp::Ordering::Equal)) {
+    let idx = match points.binary_search_by(|p| {
+        p[0].partial_cmp(&target_x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
         Ok(exact) => {
             let y = points[exact][1];
             return if y.is_finite() { Some(y) } else { None };
@@ -89,7 +133,13 @@ pub fn interpolate_y(points: &[[f64; 2]], target_x: f64) -> Option<f64> {
 }
 
 /// Renders an interactive 2D Cartesian plot card.
-pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, row_id: usize) {
+pub fn render_interactive_plot_card(
+    ui: &mut Ui,
+    plot_data: &PlotDataPayload,
+    row_id: usize,
+    input_raw: &str,
+    on_action: &mut dyn FnMut(&str, &str),
+) {
     let state_id = ui.make_persistent_id(format!("interactive_plot_state_{row_id}"));
     let mut state = ui.data_mut(|d| *d.get_temp_mut_or_default::<InteractivePlotState>(state_id));
 
@@ -170,10 +220,39 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                             .font(FontId::new(11.0, FontFamily::Proportional))
                             .color(Colors::TEXT_SECONDARY),
                     )
-                    .on_hover_text("Reset plot view to initial domain and range (or double-click canvas)")
+                    .on_hover_text(
+                        "Reset plot view to initial domain and range (or double-click canvas)",
+                    )
                     .clicked()
                 {
                     state.reset_requested = true;
+                }
+
+                // Live domain re-sample button when user pans/zooms away from sampled x_range
+                if let Some((vx, vy)) = state.last_bounds {
+                    let orig_span = (plot_data.x_range[1] - plot_data.x_range[0])
+                        .abs()
+                        .max(1e-9);
+                    let dx_left = (vx[0] - plot_data.x_range[0]).abs() / orig_span;
+                    let dx_right = (vx[1] - plot_data.x_range[1]).abs() / orig_span;
+                    if dx_left > 0.05 || dx_right > 0.05 {
+                        if let Some(resample_cmd) = build_resampled_plot_command(input_raw, vx, vy)
+                        {
+                            if ui
+                                .button(
+                                    RichText::new("⟳ Re-sample View")
+                                        .font(FontId::new(11.0, FontFamily::Proportional))
+                                        .color(Colors::ACCENT_PRIMARY),
+                                )
+                                .on_hover_text(format!(
+                                    "Re-evaluate plot over visible domain ({resample_cmd})"
+                                ))
+                                .clicked()
+                            {
+                                on_action("plot_resample", &resample_cmd);
+                            }
+                        }
+                    }
                 }
 
                 // Right-aligned status / coordinate readout
@@ -204,7 +283,9 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
             let plot_height = 280.0_f32;
             let available_width = ui.available_width().max(200.0);
 
-            let snapped_coords = std::rc::Rc::new(std::cell::Cell::new(None::<(f64, f64, Option<&'static str>)>));
+            let snapped_coords = std::rc::Rc::new(std::cell::Cell::new(
+                None::<(f64, f64, Option<&'static str>)>,
+            ));
             let snapped_coords_clone = snapped_coords.clone();
 
             let plot_id = ui.make_persistent_id(format!("egui_plot_{row_id}"));
@@ -217,17 +298,20 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                 .allow_double_click_reset(true)
                 .allow_boxed_zoom(true)
                 .legend(Legend::default().position(Corner::RightTop))
-                .coordinates_formatter(Corner::LeftBottom, CoordinatesFormatter::new(move |point, _bounds| {
-                    if let Some((sx, sy, label)) = snapped_coords_clone.get() {
-                        if let Some(lbl) = label {
-                            format!("x: {:.4}\ny: {:.4} ({})", sx, sy, lbl)
+                .coordinates_formatter(
+                    Corner::LeftBottom,
+                    CoordinatesFormatter::new(move |point, _bounds| {
+                        if let Some((sx, sy, label)) = snapped_coords_clone.get() {
+                            if let Some(lbl) = label {
+                                format!("x: {:.4}\ny: {:.4} ({})", sx, sy, lbl)
+                            } else {
+                                format!("x: {:.4}\ny: {:.4}", sx, sy)
+                            }
                         } else {
-                            format!("x: {:.4}\ny: {:.4}", sx, sy)
+                            format!("x: {:.4}\ny: {:.4}", point.x, point.y)
                         }
-                    } else {
-                        format!("x: {:.4}\ny: {:.4}", point.x, point.y)
-                    }
-                }));
+                    }),
+                );
 
             let plot_resp = plot.show(ui, |plot_ui| {
                 if !state.initialized || state.reset_requested {
@@ -249,10 +333,8 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                     } else {
                         (-5.0, 5.0)
                     };
-                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                        [min_x, min_y],
-                        [max_x, max_y],
-                    ));
+                    plot_ui
+                        .set_plot_bounds(PlotBounds::from_min_max([min_x, min_y], [max_x, max_y]));
                     state.initialized = true;
                     state.reset_requested = false;
                 } else if let Some(factor) = state.zoom_delta.take() {
@@ -266,6 +348,12 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                         [center_x + half_w, center_y + half_h],
                     ));
                 }
+
+                let cur_bounds = plot_ui.plot_bounds();
+                state.last_bounds = Some((
+                    [cur_bounds.min()[0], cur_bounds.max()[0]],
+                    [cur_bounds.min()[1], cur_bounds.max()[1]],
+                ));
 
                 // 2a. Draw curve lines & points
                 for (s_idx, series) in plot_data.series.iter().enumerate() {
@@ -282,8 +370,13 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                     };
 
                     // Detect Sage's default dark blue [0, 0, 204] or any low-contrast dark color on dark theme
-                    let lum = (line_color.r() as u32 * 299 + line_color.g() as u32 * 587 + line_color.b() as u32 * 114) / 1000;
-                    if (line_color.r() <= 30 && line_color.g() <= 30 && line_color.b() >= 150) || lum < 70 {
+                    let lum = (line_color.r() as u32 * 299
+                        + line_color.g() as u32 * 587
+                        + line_color.b() as u32 * 114)
+                        / 1000;
+                    if (line_color.r() <= 30 && line_color.g() <= 30 && line_color.b() >= 150)
+                        || lum < 70
+                    {
                         line_color = default_colors[s_idx % default_colors.len()];
                     }
 
@@ -390,7 +483,8 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                     if state.snap_enabled {
                         for series in &plot_data.series {
                             for ext in &series.extrema {
-                                let ext_screen_x = plot_ui.screen_from_plot(PlotPoint::new(ext.x, 0.0)).x;
+                                let ext_screen_x =
+                                    plot_ui.screen_from_plot(PlotPoint::new(ext.x, 0.0)).x;
                                 let dist = (ext_screen_x - mouse_screen_x).abs();
                                 if dist < min_screen_dist {
                                     min_screen_dist = dist;
@@ -437,15 +531,24 @@ pub fn render_interactive_plot_card(ui: &mut Ui, plot_data: &PlotDataPayload, ro
                             } else {
                                 default_colors[s_idx % default_colors.len()]
                             };
-                            let lum = (color.r() as u32 * 299 + color.g() as u32 * 587 + color.b() as u32 * 114) / 1000;
-                            if (color.r() <= 30 && color.g() <= 30 && color.b() >= 150) || lum < 70 {
+                            let lum = (color.r() as u32 * 299
+                                + color.g() as u32 * 587
+                                + color.b() as u32 * 114)
+                                / 1000;
+                            if (color.r() <= 30 && color.g() <= 30 && color.b() >= 150) || lum < 70
+                            {
                                 color = default_colors[s_idx % default_colors.len()];
                             }
 
                             // Horizontal guideline to Y axis using HLine
                             plot_ui.hline(
                                 HLine::new(y)
-                                    .color(Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 70))
+                                    .color(Color32::from_rgba_unmultiplied(
+                                        color.r(),
+                                        color.g(),
+                                        color.b(),
+                                        70,
+                                    ))
                                     .style(LineStyle::Dotted { spacing: 4.0_f32 })
                                     .width(1.0_f32),
                             );

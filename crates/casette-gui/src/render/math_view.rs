@@ -42,7 +42,13 @@ pub fn render_result(
 
     // Check if this row produced interactive plot data or plot artifacts
     if let Some(plot_data) = &result.plot_data {
-        super::interactive_plot::render_interactive_plot_card(ui, plot_data, row.row_number);
+        super::interactive_plot::render_interactive_plot_card(
+            ui,
+            plot_data,
+            row.row_number,
+            &row.input_raw,
+            on_action,
+        );
     } else {
         let has_plot_artifact = result.artifacts.iter().any(|a| a.r#type == "image");
         if has_plot_artifact || result.kind.as_deref() == Some("plot") {
