@@ -428,6 +428,45 @@ def __casette_matrix_table_json_close(handle):
     return True
 
 
+def _matrix_data(value):
+    """Return structured dimensions and cell strings for a Sage matrix."""
+    if "sage.matrix" not in (type(value).__module__ or ""):
+        return None
+    try:
+        nrows = int(value.nrows())
+        ncols = int(value.ncols())
+        max_cells = 400
+        if nrows * ncols <= max_cells:
+            rows = [
+                [str(value[r, c]) for c in range(ncols)]
+                for r in range(nrows)
+            ]
+            abbreviated = False
+        else:
+            row_keys = _matrix_preview_keys(nrows)
+            col_keys = _matrix_preview_keys(ncols)
+            rows = []
+            for r in row_keys:
+                cell_row = []
+                for c in col_keys:
+                    if r is None:
+                        cell_row.append("⋮")
+                    elif c is None:
+                        cell_row.append("⋯")
+                    else:
+                        cell_row.append(str(value[r, c]))
+                rows.append(cell_row)
+            abbreviated = True
+        return {
+            "row_count": nrows,
+            "column_count": ncols,
+            "rows": rows,
+            "abbreviated": abbreviated,
+        }
+    except Exception:
+        return None
+
+
 def _matrix_properties(value):
     """Return every no-argument Sage matrix is_* property we can inspect.
 
@@ -1912,6 +1951,9 @@ def _build_envelope(value, artifacts=None, digits=None, numeric=False):
     matrix_properties = _matrix_properties(value)
     if matrix_properties is not None:
         env["matrix_properties"] = matrix_properties
+    matrix_data = _matrix_data(value)
+    if matrix_data is not None:
+        env["matrix_data"] = matrix_data
     if _is_plot(value):
         try:
             plot_data = _extract_plot_data(value)

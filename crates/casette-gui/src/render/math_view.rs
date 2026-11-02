@@ -51,7 +51,7 @@ pub fn render_result(
 
     // Render matrix or primary math/plain text
     if result.kind.as_deref() == Some("matrix") {
-        render_matrix_view(ui, result);
+        render_matrix_view(ui, row.row_number, result);
     } else if result.kind.as_deref() != Some("plot") {
         render_primary_math(ui, result, texture_cache);
     }
@@ -180,26 +180,83 @@ fn render_primary_text(ui: &mut Ui, plain: &str, is_approx: bool) {
     });
 }
 
-fn render_matrix_view(ui: &mut Ui, result: &WorkerResponse) {
-    let plain = result.plain.as_deref().unwrap_or("");
-    let lines: Vec<&str> = plain.lines().filter(|l| !l.trim().is_empty()).collect();
+fn parse_matrix_row_fallback(line: &str) -> Vec<String> {
+    let trimmed = line.trim().trim_start_matches('[').trim_end_matches(']');
+    let raw_tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut cells: Vec<String> = Vec::new();
 
-    if lines.is_empty() {
-        return;
+    for tok in raw_tokens {
+        let prev_ends_with_op = cells.last().is_some_and(|prev| {
+            prev.ends_with(" +")
+                || prev.ends_with(" -")
+                || prev.ends_with(" *")
+                || prev.ends_with(" /")
+                || prev.ends_with(" =")
+                || prev.ends_with(" ==")
+                || prev == "+"
+                || prev == "-"
+                || prev == "*"
+                || prev == "/"
+        });
+        let tok_is_binary_op = matches!(tok, "+" | "-" | "*" | "/" | "=" | "==");
+
+        if let Some(last) = cells.last_mut() {
+            if prev_ends_with_op || tok_is_binary_op {
+                last.push(' ');
+                last.push_str(tok);
+                continue;
+            }
+        }
+        cells.push(tok.to_string());
     }
 
-    // Parse matrix lines like "[1  2]\n[3  4]"
+    cells
+}
+
+/// Extracts `(row_count, column_count, rows)` from a matrix [`WorkerResponse`],
+/// preferring structured `matrix_data` and falling back to operator-aware line parsing.
+#[must_use]
+pub fn extract_matrix_grid(result: &WorkerResponse) -> (usize, usize, Vec<Vec<String>>) {
+    if let Some(md) = &result.matrix_data {
+        return (md.row_count, md.column_count, md.rows.clone());
+    }
+
+    let plain = result.plain.as_deref().unwrap_or("");
+    let lines: Vec<&str> = plain.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut matrix_rows: Vec<Vec<String>> = Vec::new();
     for line in &lines {
-        let trimmed = line.trim().trim_start_matches('[').trim_end_matches(']');
-        let cells: Vec<String> = trimmed.split_whitespace().map(|s| s.to_string()).collect();
+        let cells = parse_matrix_row_fallback(line);
         if !cells.is_empty() {
             matrix_rows.push(cells);
         }
     }
-
     let num_rows = matrix_rows.len();
     let num_cols = matrix_rows.first().map(|r| r.len()).unwrap_or(0);
+    (num_rows, num_cols, matrix_rows)
+}
+
+fn preview_indices(len: usize) -> Vec<Option<usize>> {
+    if len <= 5 {
+        (0..len).map(Some).collect()
+    } else {
+        vec![Some(0), Some(1), Some(2), None, Some(len - 1)]
+    }
+}
+
+fn render_matrix_view(ui: &mut Ui, row_number: usize, result: &WorkerResponse) {
+    let (total_rows, total_cols, matrix_rows) = extract_matrix_grid(result);
+    if matrix_rows.is_empty() {
+        return;
+    }
+
+    let table_open_id = egui::Id::new(("casette_matrix_table_open", row_number));
+    let mut is_table_open = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<bool>(table_open_id).unwrap_or(false));
+
+    let row_idxs = preview_indices(matrix_rows.len());
+    let col_count_in_data = matrix_rows.first().map(|r| r.len()).unwrap_or(0);
+    let col_idxs = preview_indices(col_count_in_data);
 
     // Draw stylized matrix box
     Frame::new()
@@ -216,21 +273,31 @@ fn render_matrix_view(ui: &mut Ui, result: &WorkerResponse) {
                         .font(FontId::new(18.0, FontFamily::Proportional)),
                 );
 
-                // Grid of cells
-                egui::Grid::new(format!("matrix_grid_{}", plain.len()))
+                // Grid of cells (abbreviated to 5x5 inline if larger)
+                egui::Grid::new(format!("matrix_grid_row_{}", row_number))
                     .spacing(vec2(16.0, 6.0))
                     .show(ui, |ui| {
-                        for row in &matrix_rows {
-                            for cell in row {
-                                let is_zero = cell == "0";
-                                let text_color = if is_zero {
+                        for &r_opt in &row_idxs {
+                            for &c_opt in &col_idxs {
+                                let cell_text = match (r_opt, c_opt) {
+                                    (None, _) => "⋮",
+                                    (_, None) => "⋯",
+                                    (Some(r), Some(c)) => matrix_rows
+                                        .get(r)
+                                        .and_then(|row| row.get(c))
+                                        .map(String::as_str)
+                                        .unwrap_or(""),
+                                };
+                                let is_muted =
+                                    cell_text == "0" || cell_text == "⋮" || cell_text == "⋯";
+                                let text_color = if is_muted {
                                     Colors::TEXT_MUTED
                                 } else {
                                     Colors::TEXT_PRIMARY
                                 };
 
                                 ui.label(
-                                    RichText::new(cell)
+                                    RichText::new(cell_text)
                                         .color(text_color)
                                         .font(FontId::new(13.5, FontFamily::Monospace)),
                                 );
@@ -249,12 +316,111 @@ fn render_matrix_view(ui: &mut Ui, result: &WorkerResponse) {
                 ui.add_space(8.0);
                 render_pill(
                     ui,
-                    &format!("{}×{} matrix", num_rows, num_cols),
+                    &format!("{}×{} matrix", total_rows, total_cols),
                     Colors::BADGE_BG,
                     Colors::TEXT_MUTED,
                 );
+
+                if ui
+                    .add(
+                        Button::new(
+                            RichText::new(if is_table_open {
+                                "Hide Table"
+                            } else {
+                                "Inspect Table"
+                            })
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(11.0, FontFamily::Proportional)),
+                        )
+                        .fill(Colors::BADGE_BG)
+                        .corner_radius(4),
+                    )
+                    .clicked()
+                {
+                    is_table_open = !is_table_open;
+                    ui.ctx()
+                        .data_mut(|d| d.insert_temp(table_open_id, is_table_open));
+                }
             });
         });
+
+    if is_table_open {
+        let mut window_open = true;
+        egui::Window::new(format!(
+            "Matrix Table — #{} ({}×{})",
+            row_number, total_rows, total_cols
+        ))
+        .id(egui::Id::new(("casette_matrix_table_window", row_number)))
+        .open(&mut window_open)
+        .default_size([480.0, 320.0])
+        .resizable(true)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} rows × {} columns", total_rows, total_cols))
+                        .color(Colors::TEXT_SECONDARY)
+                        .font(FontId::new(11.5, FontFamily::Proportional)),
+                );
+                if ui.small_button("Copy CSV").clicked() {
+                    let csv = matrix_rows
+                        .iter()
+                        .map(|r| r.join(","))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.ctx().copy_text(csv);
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new(format!("matrix_popup_grid_{}", row_number))
+                        .striped(true)
+                        .spacing(vec2(14.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("#")
+                                    .color(Colors::TEXT_MUTED)
+                                    .font(FontId::new(11.0, FontFamily::Monospace)),
+                            );
+                            for c in 0..col_count_in_data {
+                                ui.label(
+                                    RichText::new(format!("C{}", c + 1))
+                                        .color(Colors::TEXT_MUTED)
+                                        .font(FontId::new(11.0, FontFamily::Monospace))
+                                        .strong(),
+                                );
+                            }
+                            ui.end_row();
+
+                            for (r, row) in matrix_rows.iter().enumerate() {
+                                ui.label(
+                                    RichText::new(format!("R{}", r + 1))
+                                        .color(Colors::TEXT_MUTED)
+                                        .font(FontId::new(11.0, FontFamily::Monospace))
+                                        .strong(),
+                                );
+                                for cell in row {
+                                    ui.label(
+                                        RichText::new(cell)
+                                            .color(if cell == "0" {
+                                                Colors::TEXT_MUTED
+                                            } else {
+                                                Colors::TEXT_PRIMARY
+                                            })
+                                            .font(FontId::new(12.5, FontFamily::Monospace)),
+                                    );
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+
+        if !window_open {
+            ui.ctx().data_mut(|d| d.insert_temp(table_open_id, false));
+        }
+    }
 }
 
 fn render_plot_card(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut TextureCache) {
@@ -343,37 +509,47 @@ fn render_action_bar(
         ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
 
         // Helper for consistent macOS-styled action buttons
-        let make_btn = |ui: &mut Ui, icon: &str, label: &str, text_color: Color32, hover_tip: &str| -> bool {
-            let label_text = if icon.is_empty() {
-                RichText::new(label)
-            } else {
-                RichText::new(format!("{icon} {label}"))
-            }
-            .color(text_color)
-            .font(FontId::new(11.5, FontFamily::Proportional));
+        let make_btn =
+            |ui: &mut Ui, icon: &str, label: &str, text_color: Color32, hover_tip: &str| -> bool {
+                let label_text = if icon.is_empty() {
+                    RichText::new(label)
+                } else {
+                    RichText::new(format!("{icon} {label}"))
+                }
+                .color(text_color)
+                .font(FontId::new(11.5, FontFamily::Proportional));
 
-            ui.add(
-                Button::new(label_text)
-                    .fill(Color32::from_rgb(38, 38, 44))
-                    .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
-                    .corner_radius(CornerRadius::same(5))
-                    .min_size(vec2(0.0, 24.0)),
-            )
-            .on_hover_text(hover_tip)
-            .clicked()
-        };
+                ui.add(
+                    Button::new(label_text)
+                        .fill(Color32::from_rgb(38, 38, 44))
+                        .stroke(Stroke::new(1.0_f32, Colors::BORDER_SUBTLE))
+                        .corner_radius(CornerRadius::same(5))
+                        .min_size(vec2(0.0, 24.0)),
+                )
+                .on_hover_text(hover_tip)
+                .clicked()
+            };
 
         // 1. Copy Plain Text
         if let Some(plain) = &result.plain {
             let copied_id = ui.id().with(("copied_plain", row.row_number));
-            let is_copied = ui.ctx().data(|d| d.get_temp::<bool>(copied_id)).unwrap_or(false);
+            let is_copied = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(copied_id))
+                .unwrap_or(false);
             let (icon, label, color) = if is_copied {
                 ("✓", "Copied", Colors::EXACT_GREEN)
             } else {
                 ("📋", "Copy", Colors::TEXT_SECONDARY)
             };
 
-            if make_btn(ui, icon, label, color, "Copy plain text output to clipboard") {
+            if make_btn(
+                ui,
+                icon,
+                label,
+                color,
+                "Copy plain text output to clipboard",
+            ) {
                 ui.ctx().copy_text(plain.clone());
                 ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
             }
@@ -382,7 +558,10 @@ fn render_action_bar(
         // 2. Copy LaTeX
         if let Some(latex) = &result.latex {
             let copied_id = ui.id().with(("copied_latex", row.row_number));
-            let is_copied = ui.ctx().data(|d| d.get_temp::<bool>(copied_id)).unwrap_or(false);
+            let is_copied = ui
+                .ctx()
+                .data(|d| d.get_temp::<bool>(copied_id))
+                .unwrap_or(false);
             let (icon, label, color) = if is_copied {
                 ("✓", "Copied LaTeX", Colors::EXACT_GREEN)
             } else {

@@ -611,3 +611,43 @@ fn test_template_chips_produce_valid_friendly_syntax() {
         );
     }
 }
+
+#[test]
+fn test_matrix_grid_extraction_preserves_spaced_expressions() {
+    use casette_gui::render::math_view::extract_matrix_grid;
+    use casette_kernel::MatrixDataPayload;
+
+    // 1. Structured matrix_data from worker
+    let resp_structured = WorkerResponse {
+        ok: true,
+        kind: Some("matrix".into()),
+        plain: Some("[x + 1     2]\n[    3 x - 1]".into()),
+        matrix_data: Some(MatrixDataPayload {
+            row_count: 2,
+            column_count: 2,
+            rows: vec![
+                vec!["x + 1".into(), "2".into()],
+                vec!["3".into(), "x - 1".into()],
+            ],
+            abbreviated: false,
+        }),
+        ..Default::default()
+    };
+    let (r, c, rows) = extract_matrix_grid(&resp_structured);
+    assert_eq!((r, c), (2, 2));
+    assert_eq!(rows[0], vec!["x + 1", "2"]);
+    assert_eq!(rows[1], vec!["3", "x - 1"]);
+
+    // 2. Fallback parser for legacy sessions without matrix_data
+    let resp_legacy = WorkerResponse {
+        ok: true,
+        kind: Some("matrix".into()),
+        plain: Some("[x + 1     2]\n[    3 x - 1]".into()),
+        matrix_data: None,
+        ..Default::default()
+    };
+    let (r2, c2, rows2) = extract_matrix_grid(&resp_legacy);
+    assert_eq!((r2, c2), (2, 2));
+    assert_eq!(rows2[0], vec!["x + 1", "2"]);
+    assert_eq!(rows2[1], vec!["3", "x - 1"]);
+}

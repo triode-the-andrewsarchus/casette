@@ -202,6 +202,10 @@ pub struct WorkerResponse {
     #[serde(default)]
     pub matrix_properties: Option<Vec<MatrixPropertyPayload>>,
 
+    /// Structured matrix dimensions and cell strings if the result is a Sage matrix.
+    #[serde(default)]
+    pub matrix_data: Option<MatrixDataPayload>,
+
     /// Captured standard output from user `print(...)` statements or Sage routines.
     #[serde(default)]
     pub stdout: Option<String>,
@@ -392,7 +396,10 @@ pub fn compute_local_extrema(points: &[[f64; 2]]) -> Vec<LocalExtremum> {
 
         // Check if an exact zero occurs at p0
         if y0.abs() < 1e-12 {
-            if !extrema.iter().any(|e| (e.x - p0[0]).abs() < 1e-5 && e.y.abs() < 1e-5) {
+            if !extrema
+                .iter()
+                .any(|e| (e.x - p0[0]).abs() < 1e-5 && e.y.abs() < 1e-5)
+            {
                 extrema.push(LocalExtremum {
                     x: p0[0],
                     y: 0.0,
@@ -467,6 +474,23 @@ pub struct MatrixPropertyPayload {
     /// Error description if inspecting this property raised an exception.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// Structured matrix dimensions and cell strings for matrix results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MatrixDataPayload {
+    /// Total number of rows in the matrix.
+    pub row_count: usize,
+
+    /// Total number of columns in the matrix.
+    pub column_count: usize,
+
+    /// Matrix cell strings arranged row-by-row.
+    pub rows: Vec<Vec<String>>,
+
+    /// Whether `rows` is an abbreviated preview for a very large matrix.
+    #[serde(default)]
+    pub abbreviated: bool,
 }
 
 /// Structured error payload when evaluation or operation fails.

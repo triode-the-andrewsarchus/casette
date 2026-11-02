@@ -16,6 +16,6 @@ pub use discovery::{SageDiscovery, SageEnvironment};
 pub use error::KernelError;
 pub use protocol::{
     compute_local_extrema, ArtifactPayload, ErrorPayload, ExtremumKind, LocalExtremum,
-    MatrixPropertyPayload, PlotDataPayload, PlotSeriesPayload, SymbolPayload, TruncationPayload,
-    WorkerRequest, WorkerResponse,
+    MatrixDataPayload, MatrixPropertyPayload, PlotDataPayload, PlotSeriesPayload, SymbolPayload,
+    TruncationPayload, WorkerRequest, WorkerResponse,
 };
