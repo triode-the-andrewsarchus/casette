@@ -77,6 +77,10 @@ impl CasetteApp {
                     self.state.sage_version = version;
                     self.state.worker_status = WorkerStatus::Ready;
 
+                    let _ = self
+                        .action_tx
+                        .send(GuiAction::SetPrecision(self.state.precision_digits));
+
                     if !self.state.user_definitions.is_empty() {
                         let _ = self.action_tx.send(GuiAction::SyncDefinitions(
                             self.state.user_definitions.clone(),
@@ -145,6 +149,11 @@ impl CasetteApp {
                 }
                 AsyncMessage::PrecisionUpdated(digits) => {
                     self.state.precision_digits = digits;
+                    if let Err(e) =
+                        crate::persistence::save_session(&self.state, &self.session_path)
+                    {
+                        tracing::warn!("Failed to auto-save session after precision update: {}", e);
+                    }
                 }
                 AsyncMessage::StatusChanged(status) => {
                     self.state.worker_status = status;

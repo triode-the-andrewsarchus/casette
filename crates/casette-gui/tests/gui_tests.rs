@@ -43,7 +43,10 @@ fn test_session_state_push_and_clear() {
 
 #[test]
 fn test_session_persistence_roundtrip() {
-    let mut state = SessionState::default();
+    let mut state = SessionState {
+        precision_digits: 20,
+        ..Default::default()
+    };
     let row1 = state.push_row("factor(x^2 - 1)".into(), "factor(x^2 - 1)".into());
     let resp: WorkerResponse = serde_json::from_str(
         r#"{
@@ -64,6 +67,7 @@ fn test_session_persistence_roundtrip() {
     let mut restored_state = SessionState::default();
     load_session(&mut restored_state, &file_path).expect("load session");
 
+    assert_eq!(restored_state.precision_digits, 20);
     assert_eq!(restored_state.rows.len(), 1);
     assert_eq!(restored_state.rows[0].row_number, 1);
     assert_eq!(restored_state.rows[0].input_raw, "factor(x^2 - 1)");

@@ -19,6 +19,8 @@ pub struct SessionEnvelope {
     pub history: Vec<String>,
     #[serde(default)]
     pub definitions: Vec<UserDefinition>,
+    #[serde(default)]
+    pub precision_digits: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,10 +32,15 @@ struct SchemaPeek {
 #[must_use]
 pub fn default_session_path() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("CASETTE_CONFIG_DIR") {
-        return std::path::PathBuf::from(dir).join("sessions").join("last-session.json");
+        return std::path::PathBuf::from(dir)
+            .join("sessions")
+            .join("last-session.json");
     }
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return std::path::PathBuf::from(xdg).join("casette").join("sessions").join("last-session.json");
+        return std::path::PathBuf::from(xdg)
+            .join("casette")
+            .join("sessions")
+            .join("last-session.json");
     }
     if let Ok(home) = std::env::var("HOME") {
         return std::path::PathBuf::from(home)
@@ -55,6 +62,7 @@ pub fn save_session(state: &SessionState, path: &Path) -> Result<()> {
         rows: state.rows.clone(),
         history: state.history.clone(),
         definitions: state.user_definitions.clone(),
+        precision_digits: Some(state.precision_digits),
     };
     let json =
         serde_json::to_string_pretty(&envelope).context("failed to serialize session envelope")?;
@@ -83,22 +91,31 @@ pub fn load_session(state: &mut SessionState, path: &Path) -> Result<()> {
     }
 
     // 2. Decode either structured SessionEnvelope or legacy raw Vec<TapeRow>
-    let (rows, history, definitions) = if let Ok(envelope) = serde_json::from_str::<SessionEnvelope>(&json) {
-        let hist = if envelope.history.is_empty() {
-            envelope.rows.iter().map(|r| r.input_raw.clone()).collect()
+    let (rows, history, definitions, precision_digits) =
+        if let Ok(envelope) = serde_json::from_str::<SessionEnvelope>(&json) {
+            let hist = if envelope.history.is_empty() {
+                envelope.rows.iter().map(|r| r.input_raw.clone()).collect()
+            } else {
+                envelope.history
+            };
+            (
+                envelope.rows,
+                hist,
+                envelope.definitions,
+                envelope.precision_digits,
+            )
         } else {
-            envelope.history
+            let r: Vec<TapeRow> =
+                serde_json::from_str(&json).context("failed to deserialize session tape rows")?;
+            let hist = r.iter().map(|row| row.input_raw.clone()).collect();
+            (r, hist, Vec::new(), None)
         };
-        (envelope.rows, hist, envelope.definitions)
-    } else {
-        let r: Vec<TapeRow> = serde_json::from_str(&json)
-            .context("failed to deserialize session tape rows")?;
-        let hist = r.iter().map(|row| row.input_raw.clone()).collect();
-        (r, hist, Vec::new())
-    };
 
     state.rows = rows;
     state.history = history;
+    if let Some(p) = precision_digits {
+        state.precision_digits = p;
+    }
     state.user_definitions = if !definitions.is_empty() {
         definitions
     } else {
