@@ -552,6 +552,292 @@ fn render_error_card(ui: &mut Ui, result: &WorkerResponse) {
         });
 }
 
+/// Maps a worker action identifier (from `result.actions`) and a `#ROW` reference
+/// into `(icon, button_label, color, tooltip, sage_or_friendly_command)`.
+#[must_use]
+pub fn action_descriptor(
+    action_name: &str,
+    row_ref: &str,
+) -> Option<(&'static str, &'static str, Color32, &'static str, String)> {
+    let desc = match action_name {
+        "approx" => (
+            "≈",
+            "Approximate",
+            Colors::NUMERIC_AMBER,
+            "Evaluate decimal approximation of this result",
+            format!("approx {row_ref}"),
+        ),
+        "approx_more_digits" => (
+            "≈+",
+            "50 Digits",
+            Colors::NUMERIC_AMBER,
+            "Approximate to 50 decimal digits",
+            format!("numeric {row_ref}, 50"),
+        ),
+        "simplify" => (
+            "✦",
+            "Simplify",
+            Colors::EXACT_GREEN,
+            "Simplify mathematical expression",
+            format!("simplify {row_ref}"),
+        ),
+        "trig_simplify" => (
+            "∿",
+            "Trig Simplify",
+            Colors::EXACT_GREEN,
+            "Simplify trigonometric expression",
+            format!("({row_ref}).trig_simplify()"),
+        ),
+        "factor" => (
+            "()",
+            "Factor",
+            Colors::ACCENT_PRIMARY,
+            "Factor expression or integer",
+            format!("factor {row_ref}"),
+        ),
+        "expand" => (
+            "⇔",
+            "Expand",
+            Colors::ACCENT_PRIMARY,
+            "Expand algebraic expression",
+            format!("expand {row_ref}"),
+        ),
+        "diff" => (
+            "∂/∂x",
+            "Differentiate",
+            Colors::ACCENT_PRIMARY,
+            "Differentiate expression with respect to x",
+            format!("derivative {row_ref} wrt x"),
+        ),
+        "integrate" | "integral" => (
+            "∫",
+            "Integrate",
+            Colors::ACCENT_PURPLE,
+            "Integrate expression with respect to x",
+            format!("integral {row_ref}, wrt x"),
+        ),
+        "is_prime" => (
+            "ℙ?",
+            "Is Prime",
+            Colors::ACCENT_PRIMARY,
+            "Check whether integer is prime",
+            format!("is_prime {row_ref}"),
+        ),
+        "next_prime" => (
+            "ℙ+",
+            "Next Prime",
+            Colors::ACCENT_PURPLE,
+            "Find the next prime number",
+            format!("next_prime({row_ref})"),
+        ),
+        "hex" => (
+            "0x",
+            "Hex",
+            Colors::TEXT_SECONDARY,
+            "Convert integer to hexadecimal",
+            format!("hex({row_ref})"),
+        ),
+        "numerator" => (
+            "N/",
+            "Numerator",
+            Colors::ACCENT_PRIMARY,
+            "Extract numerator of rational",
+            format!("({row_ref}).numerator()"),
+        ),
+        "denominator" => (
+            "/D",
+            "Denominator",
+            Colors::ACCENT_PRIMARY,
+            "Extract denominator of rational",
+            format!("({row_ref}).denominator()"),
+        ),
+        "continued_fraction" => (
+            "[;]",
+            "Cont. Fraction",
+            Colors::ACCENT_PURPLE,
+            "Compute continued fraction expansion",
+            format!("continued_fraction({row_ref})"),
+        ),
+        "round" => (
+            "⌊⌉",
+            "Round",
+            Colors::TEXT_SECONDARY,
+            "Round real number to nearest integer",
+            format!("round({row_ref})"),
+        ),
+        "real_part" => (
+            "Re",
+            "Real Part",
+            Colors::ACCENT_PRIMARY,
+            "Extract real part of complex number",
+            format!("real_part({row_ref})"),
+        ),
+        "imag_part" => (
+            "Im",
+            "Imag Part",
+            Colors::ACCENT_PURPLE,
+            "Extract imaginary part of complex number",
+            format!("imag_part({row_ref})"),
+        ),
+        "abs" => (
+            "|z|",
+            "Magnitude",
+            Colors::EXACT_GREEN,
+            "Compute absolute value / modulus",
+            format!("abs({row_ref})"),
+        ),
+        "arg" => (
+            "∠",
+            "Argument",
+            Colors::NUMERIC_AMBER,
+            "Compute complex phase angle (arg)",
+            format!("arg({row_ref})"),
+        ),
+        "conjugate" => (
+            "z*",
+            "Conjugate",
+            Colors::TEXT_SECONDARY,
+            "Compute complex conjugate",
+            format!("conjugate({row_ref})"),
+        ),
+        "solve" => (
+            "=",
+            "Solve",
+            Colors::ACCENT_PRIMARY,
+            "Solve relation for x",
+            format!("solve({row_ref}, x)"),
+        ),
+        "lhs" => (
+            "L=",
+            "LHS",
+            Colors::TEXT_SECONDARY,
+            "Extract left-hand side of relation",
+            format!("({row_ref}).lhs()"),
+        ),
+        "rhs" => (
+            "=R",
+            "RHS",
+            Colors::TEXT_SECONDARY,
+            "Extract right-hand side of relation",
+            format!("({row_ref}).rhs()"),
+        ),
+        "subtract_sides" => (
+            "L-R",
+            "LHS - RHS",
+            Colors::ACCENT_PURPLE,
+            "Subtract right-hand side from left-hand side",
+            format!("({row_ref}).lhs() - ({row_ref}).rhs()"),
+        ),
+        "det" => (
+            "|A|",
+            "Det",
+            Colors::ACCENT_PRIMARY,
+            "Compute matrix determinant",
+            format!("det {row_ref}"),
+        ),
+        "rank" => (
+            "rk",
+            "Rank",
+            Colors::ACCENT_PRIMARY,
+            "Compute matrix rank",
+            format!("rank {row_ref}"),
+        ),
+        "rref" => (
+            "⊞",
+            "RREF",
+            Colors::EXACT_GREEN,
+            "Compute reduced row echelon form",
+            format!("rref {row_ref}"),
+        ),
+        "eigenvalues" => (
+            "λ",
+            "Eigenvalues",
+            Colors::ACCENT_PURPLE,
+            "Compute matrix eigenvalues",
+            format!("eigenvalues {row_ref}"),
+        ),
+        "transpose" => (
+            "Aᵀ",
+            "Transpose",
+            Colors::TEXT_SECONDARY,
+            "Transpose matrix",
+            format!("transpose {row_ref}"),
+        ),
+        "inverse" => (
+            "A⁻¹",
+            "Inverse",
+            Colors::NUMERIC_AMBER,
+            "Compute matrix inverse",
+            format!("inverse {row_ref}"),
+        ),
+        "column_space" => (
+            "Col",
+            "Col Space",
+            Colors::TEXT_SECONDARY,
+            "Compute column space basis",
+            format!("({row_ref}).column_space().basis()"),
+        ),
+        "row_space" => (
+            "Row",
+            "Row Space",
+            Colors::TEXT_SECONDARY,
+            "Compute row space basis",
+            format!("({row_ref}).row_space().basis()"),
+        ),
+        "right_kernel" => (
+            "Ker",
+            "Nullspace",
+            Colors::TEXT_SECONDARY,
+            "Compute right kernel (nullspace) basis",
+            format!("({row_ref}).right_kernel().basis()"),
+        ),
+        "change_ring_RDF" => (
+            "RDF",
+            "Float Ring",
+            Colors::NUMERIC_AMBER,
+            "Convert matrix to Real Double Field (RDF)",
+            format!("({row_ref}).change_ring(RDF)"),
+        ),
+        "svd" => (
+            "SVD",
+            "SVD",
+            Colors::ACCENT_PURPLE,
+            "Compute Singular Value Decomposition",
+            format!("__casette_svd_labeled(({row_ref}).SVD())"),
+        ),
+        "length" => (
+            "#",
+            "Length",
+            Colors::ACCENT_PRIMARY,
+            "Count number of items in list",
+            format!("len({row_ref})"),
+        ),
+        "sort" => (
+            "⇅",
+            "Sort",
+            Colors::TEXT_SECONDARY,
+            "Sort elements in ascending order",
+            format!("sorted({row_ref})"),
+        ),
+        "sum" => (
+            "Σ",
+            "Sum",
+            Colors::EXACT_GREEN,
+            "Sum elements of list",
+            format!("sum({row_ref})"),
+        ),
+        "set" => (
+            "{}",
+            "Unique",
+            Colors::ACCENT_PURPLE,
+            "Extract unique elements",
+            format!("list(set({row_ref}))"),
+        ),
+        _ => return None,
+    };
+    Some(desc)
+}
+
 fn render_action_bar(
     ui: &mut Ui,
     row: &TapeRow,
@@ -586,111 +872,84 @@ fn render_action_bar(
 
         // 1. Copy Plain Text
         if let Some(plain) = &result.plain {
-            let copied_id = ui.id().with(("copied_plain", row.row_number));
-            let is_copied = ui
-                .ctx()
-                .data(|d| d.get_temp::<bool>(copied_id))
-                .unwrap_or(false);
-            let (icon, label, color) = if is_copied {
-                ("✓", "Copied", Colors::EXACT_GREEN)
-            } else {
-                ("📋", "Copy", Colors::TEXT_SECONDARY)
-            };
+            if !plain.is_empty() {
+                let copied_id = ui.id().with(("copied_plain", row.row_number));
+                let is_copied = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(copied_id))
+                    .unwrap_or(false);
+                let (icon, label, color) = if is_copied {
+                    ("✓", "Copied", Colors::EXACT_GREEN)
+                } else {
+                    ("📋", "Copy", Colors::TEXT_SECONDARY)
+                };
 
-            if make_btn(
-                ui,
-                icon,
-                label,
-                color,
-                "Copy plain text output to clipboard",
-            ) {
-                ui.ctx().copy_text(plain.clone());
-                ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
+                if make_btn(
+                    ui,
+                    icon,
+                    label,
+                    color,
+                    "Copy plain text output to clipboard",
+                ) {
+                    ui.ctx().copy_text(plain.clone());
+                    ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
+                }
             }
         }
 
         // 2. Copy LaTeX
         if let Some(latex) = &result.latex {
-            let copied_id = ui.id().with(("copied_latex", row.row_number));
-            let is_copied = ui
-                .ctx()
-                .data(|d| d.get_temp::<bool>(copied_id))
-                .unwrap_or(false);
-            let (icon, label, color) = if is_copied {
-                ("✓", "Copied LaTeX", Colors::EXACT_GREEN)
-            } else {
-                ("TeX", "Copy LaTeX", Colors::TEXT_SECONDARY)
-            };
+            if !latex.is_empty() {
+                let copied_id = ui.id().with(("copied_latex", row.row_number));
+                let is_copied = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(copied_id))
+                    .unwrap_or(false);
+                let (icon, label, color) = if is_copied {
+                    ("✓", "Copied LaTeX", Colors::EXACT_GREEN)
+                } else {
+                    ("TeX", "Copy LaTeX", Colors::TEXT_SECONDARY)
+                };
 
-            if make_btn(ui, icon, label, color, "Copy LaTeX expression to clipboard") {
-                ui.ctx().copy_text(latex.clone());
-                ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
+                if make_btn(ui, icon, label, color, "Copy LaTeX expression to clipboard") {
+                    ui.ctx().copy_text(latex.clone());
+                    ui.ctx().data_mut(|d| d.insert_temp(copied_id, true));
+                }
             }
         }
 
         // Mathematical quick transformations for valid results
         let is_ok = result.ok
             && result.kind.as_deref() != Some("error")
-            && result.kind.as_deref() != Some("interrupted");
+            && result.kind.as_deref() != Some("interrupted")
+            && result.kind.as_deref() != Some("none");
 
         if is_ok {
             let row_ref = format!("#{}", row.row_number);
             let is_plot = result.kind.as_deref() == Some("plot")
                 || result.artifacts.iter().any(|a| a.r#type == "image");
-            let is_matrix = result.kind.as_deref() == Some("matrix");
 
-            // 3. Approximate (Decimal representation)
-            if !is_plot
-                && make_btn(
-                    ui,
-                    "≈",
-                    "Approximate",
-                    Colors::NUMERIC_AMBER,
-                    "Evaluate decimal approximation of this result (approx #...)",
-                )
-            {
-                on_action("approx", &format!("approx {}", row_ref));
-            }
+            if !is_plot {
+                let fallback_symbolic = ["approx", "diff", "integrate", "simplify"];
+                let fallback_matrix =
+                    ["det", "rank", "rref", "eigenvalues", "transpose", "inverse"];
+                let action_names: Vec<&str> = if !result.actions.is_empty() {
+                    result.actions.iter().map(String::as_str).collect()
+                } else if result.kind.as_deref() == Some("matrix") {
+                    fallback_matrix.to_vec()
+                } else {
+                    fallback_symbolic.to_vec()
+                };
 
-            // 4. Differentiate
-            if !is_plot
-                && !is_matrix
-                && make_btn(
-                    ui,
-                    "∂/∂x",
-                    "Differentiate",
-                    Colors::ACCENT_PRIMARY,
-                    "Differentiate expression with respect to x",
-                )
-            {
-                on_action("diff", &format!("diff({}, x)", row_ref));
-            }
-
-            // 5. Integrate
-            if !is_plot
-                && !is_matrix
-                && make_btn(
-                    ui,
-                    "∫",
-                    "Integrate",
-                    Colors::ACCENT_PURPLE,
-                    "Integrate expression with respect to x",
-                )
-            {
-                on_action("integral", &format!("integral({}, x)", row_ref));
-            }
-
-            // 6. Simplify
-            if !is_plot
-                && make_btn(
-                    ui,
-                    "✦",
-                    "Simplify",
-                    Colors::EXACT_GREEN,
-                    "Simplify mathematical expression",
-                )
-            {
-                on_action("simplify", &format!("simplify({})", row_ref));
+                for action_name in action_names {
+                    if let Some((icon, label, color, tip, cmd)) =
+                        action_descriptor(action_name, &row_ref)
+                    {
+                        if make_btn(ui, icon, label, color, tip) {
+                            on_action(action_name, &cmd);
+                        }
+                    }
+                }
             }
         }
     });
