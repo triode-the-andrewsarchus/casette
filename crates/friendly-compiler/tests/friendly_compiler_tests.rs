@@ -69,11 +69,14 @@ fn test_spec_forms() {
     expect_success("plot sin(x) -pi..pi", "plot(sin(x), (x, -pi, pi))");
     expect_success("matrix [[1,2],[3,4]]", "matrix([[1,2],[3,4]])");
     expect_success("matrix [1, 2, 3 ; 2, 3, 4 ]", "matrix([[1,2,3],[2,3,4]])");
+    expect_success("matrix [1 2 3; 2 3 4]", "matrix([[1,2,3],[2,3,4]])");
     expect_success("[1, 2, 3 ; 2, 3, 4 ]", "matrix([[1,2,3],[2,3,4]])");
+    expect_success("[1 2 3; 2 3 4]", "matrix([[1,2,3],[2,3,4]])");
     expect_success(
         "A = [1, 2, 3 ; 2, 3, 4 ]",
         "A = matrix([[1,2,3],[2,3,4]])\nA",
     );
+    expect_success("A = [1 2 3; 2 3 4]", "A = matrix([[1,2,3],[2,3,4]])\nA");
     expect_success(
         "eigenvalues [[1,2],[3,4]]",
         "matrix([[1,2],[3,4]]).eigenvalues()",
@@ -82,8 +85,13 @@ fn test_spec_forms() {
         "eigenvalues [1,2;3,4]",
         "matrix([[1,2],[3,4]]).eigenvalues()",
     );
+    expect_success(
+        "eigenvalues [1 2; 3 4]",
+        "matrix([[1,2],[3,4]]).eigenvalues()",
+    );
     expect_success("rref [[1,2],[3,4]]", "matrix([[1,2],[3,4]]).rref()");
     expect_success("rref [1,2,3;4,5,6]", "matrix([[1,2,3],[4,5,6]]).rref()");
+    expect_success("rref [1 2 3; 4 5 6]", "matrix([[1,2,3],[4,5,6]]).rref()");
 }
 
 // MARK: - Double integral nesting
@@ -356,7 +364,10 @@ fn test_solve_with_units() {
         assert_eq!(generated_sage, "solve((32*mi) * x^2 == (52*mi^2), x)");
         assert_eq!(required_variables, vec!["x"]);
     } else {
-        panic!("expected success for juxtaposition solve, got: {:?}", res_jux);
+        panic!(
+            "expected success for juxtaposition solve, got: {:?}",
+            res_jux
+        );
     }
 
     // Variable juxtaposed with unit (x sec)
@@ -369,7 +380,10 @@ fn test_solve_with_units() {
         assert_eq!(generated_sage, "solve((3*hr) + (x*sec) == (12*days), x)");
         assert_eq!(required_variables, vec!["x"]);
     } else {
-        panic!("expected success for time equation with x sec, got: {:?}", res_time);
+        panic!(
+            "expected success for time equation with x sec, got: {:?}",
+            res_time
+        );
     }
 }
 
@@ -459,7 +473,10 @@ fn test_ohms_law_and_electric_units() {
         assert_eq!(generated_sage, "solve((10*V) == (2*A) * R, R)");
         assert_eq!(required_variables, vec!["R"]);
     } else {
-        panic!("expected success for solve 10V = 2A * R for R, got: {:?}", res5);
+        panic!(
+            "expected success for solve 10V = 2A * R for R, got: {:?}",
+            res5
+        );
     }
 
     // solve 100 ohms * ( x * A) = 10 V
@@ -472,7 +489,10 @@ fn test_ohms_law_and_electric_units() {
         assert_eq!(generated_sage, "solve((100*ohms) * ( x * A) == (10*V), x)");
         assert_eq!(required_variables, vec!["x"]);
     } else {
-        panic!("expected success for solve 100 ohms * ( x * A) = 10 V, got: {:?}", res6);
+        panic!(
+            "expected success for solve 100 ohms * ( x * A) = 10 V, got: {:?}",
+            res6
+        );
     }
 }
 
@@ -503,6 +523,9 @@ fn test_volume_and_temperature_units() {
     if let CompileResult::Success { generated_sage, .. } = res_temp2 {
         assert_eq!(generated_sage, "__casette_convert((100*degC), degF)");
     } else {
-        panic!("expected success for 100 degC in degF, got: {:?}", res_temp2);
+        panic!(
+            "expected success for 100 degC in degF, got: {:?}",
+            res_temp2
+        );
     }
 }

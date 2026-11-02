@@ -89,6 +89,36 @@ pub fn split_top_level_semicolons(s: &str) -> Vec<String> {
     split_top_level(s, ';')
 }
 
+/// Splits `s` on runs of top-level whitespace (spaces/tabs at depth 0 w.r.t. (), [], {}).
+pub fn split_top_level_whitespace(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth: isize = 0;
+    let mut current = String::new();
+
+    for ch in s.chars() {
+        if matching_close(ch).is_some() {
+            depth += 1;
+            current.push(ch);
+        } else if is_closer(ch) {
+            depth -= 1;
+            current.push(ch);
+        } else if (ch == ' ' || ch == '\t') && depth == 0 {
+            let trimmed = trimmed_shim(&current);
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    let trimmed = trimmed_shim(&current);
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+    parts
+}
+
 fn split_top_level(s: &str, delimiter: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut depth: isize = 0;

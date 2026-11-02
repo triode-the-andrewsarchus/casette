@@ -14,7 +14,10 @@ use std::collections::{HashMap, HashSet};
 /// If a compiled Sage string was already wrapped in single-argument `__casette_convert(...)`,
 /// unwrap its contents so conversion clauses don't double-wrap.
 fn unwrap_single_arg_casette_convert(s: &str) -> &str {
-    if let Some(inner) = s.strip_prefix("__casette_convert(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = s
+        .strip_prefix("__casette_convert(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let mut depth = 0;
         let mut has_top_comma = false;
         for c in inner.chars() {
@@ -992,7 +995,10 @@ fn plot(payload: &str) -> CompileResult {
 
     let parts = scanner::split_top_level_commas(trimmed);
     let (expr, range_str) = if parts.len() >= 2 {
-        (scanner::trimmed_shim(&parts[0]).to_string(), scanner::trimmed_shim(&parts[1]).to_string())
+        (
+            scanner::trimmed_shim(&parts[0]).to_string(),
+            scanner::trimmed_shim(&parts[1]).to_string(),
+        )
     } else if let Some((e, r)) = split_trailing_range(trimmed) {
         (e, r)
     } else {
@@ -1176,12 +1182,12 @@ fn matrix_form(payload: &str) -> CompileResult {
     match normalize_matrix_payload(payload, false) {
         Some(body) => CompileResult::Success {
             generated_sage: format!("matrix({body})"),
-            required_variables: Vec::new(),
+            required_variables: variables::free_variables(&body, &[]),
         },
         None => CompileResult::Error(CompileError::new(
             "`matrix` needs a bracketed list of rows.",
             None,
-            Some("Try: matrix [1,2; 3,4]".to_string()),
+            Some("Try: matrix [1,2; 3,4] or matrix [1 2; 3 4]".to_string()),
         )),
     }
 }
@@ -1192,12 +1198,12 @@ fn matrix_method(payload: &str, method: &str) -> CompileResult {
         match normalize_matrix_payload(body, false) {
             Some(normalized) => CompileResult::Success {
                 generated_sage: format!("matrix({normalized}).{method}()"),
-                required_variables: Vec::new(),
+                required_variables: variables::free_variables(&normalized, &[]),
             },
             None => CompileResult::Error(CompileError::new(
                 format!("`{method}` needs a bracketed list of rows."),
                 None,
-                Some(format!("Try: {method} [1,2; 3,4]")),
+                Some(format!("Try: {method} [1,2; 3,4] or {method} [1 2; 3 4]")),
             )),
         }
     } else {
@@ -1210,10 +1216,21 @@ fn matrix_method(payload: &str, method: &str) -> CompileResult {
 
 fn vector_form(payload: &str) -> CompileResult {
     let body = scanner::trimmed_shim(payload);
-    if body.starts_with('[') && body.ends_with(']') && single_outer_bracket_body(body).is_some() {
+    if let Some(inside) = single_outer_bracket_body(body) {
+        let comma_cells = scanner::split_top_level_commas(inside);
+        let normalized_body = if comma_cells.len() == 1 {
+            let space_cells = scanner::split_top_level_whitespace(&comma_cells[0]);
+            if space_cells.len() > 1 {
+                format!("[{}]", space_cells.join(", "))
+            } else {
+                body.to_string()
+            }
+        } else {
+            body.to_string()
+        };
         CompileResult::Success {
-            generated_sage: format!("vector({body})"),
-            required_variables: variables::free_variables(body, &[]),
+            generated_sage: format!("vector({normalized_body})"),
+            required_variables: variables::free_variables(&normalized_body, &[]),
         }
     } else {
         CompileResult::Error(CompileError::new(
@@ -2018,10 +2035,26 @@ fn normalize_matrix_payload(payload: &str, requires_top_level_semicolon: bool) -
     }
 
     let mut sage_rows = Vec::new();
+    let mut expected_cols: Option<usize> = None;
     for row in rows {
-        let cells = scanner::split_top_level_commas(&row);
+        let comma_cells = scanner::split_top_level_commas(&row);
+        if comma_cells.is_empty() || !comma_cells.iter().all(|c| !c.is_empty()) {
+            return None;
+        }
+        let cells = if comma_cells.len() == 1 {
+            scanner::split_top_level_whitespace(&comma_cells[0])
+        } else {
+            comma_cells
+        };
         if cells.is_empty() || !cells.iter().all(|c| !c.is_empty()) {
             return None;
+        }
+        if let Some(cols) = expected_cols {
+            if cells.len() != cols {
+                return None;
+            }
+        } else {
+            expected_cols = Some(cells.len());
         }
         sage_rows.push(format!("[{}]", cells.join(",")));
     }
@@ -2111,7 +2144,9 @@ pub fn split_trailing_range(s: &str) -> Option<(String, String)> {
 
     // Case B: bare range without '=' e.g. "sin(x) -pi..pi"
     let before_dots_trimmed = before_dots.trim_end();
-    if let Some(space_idx) = before_dots_trimmed.rfind(|c: char| c.is_ascii_whitespace() || c == ',') {
+    if let Some(space_idx) =
+        before_dots_trimmed.rfind(|c: char| c.is_ascii_whitespace() || c == ',')
+    {
         let expr = s[..space_idx].trim_end_matches(',').trim();
         let range_part = s[space_idx + 1..].trim();
         if !expr.is_empty() && !range_part.is_empty() {
