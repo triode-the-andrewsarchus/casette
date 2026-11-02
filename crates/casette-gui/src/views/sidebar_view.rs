@@ -410,6 +410,41 @@ fn render_inspector_tab(ui: &mut Ui, state: &SessionState) {
                 );
             }
 
+            if res.truncated == Some(true) {
+                ui.add_space(8.0);
+                let trunc_text = if let Some(t) = &res.truncation {
+                    format!(
+                        "Truncated (plain: {:?}/{:?} chars)",
+                        t.plain_cap, t.plain_len
+                    )
+                } else {
+                    "Output was truncated".to_string()
+                };
+                ui.label(
+                    RichText::new(trunc_text)
+                        .color(Colors::NUMERIC_AMBER)
+                        .font(FontId::new(11.5, FontFamily::Proportional)),
+                );
+            }
+
+            if let Some(err) = &res.error {
+                if let Some(tb) = &err.traceback {
+                    if !tb.trim().is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("Traceback / Diagnostic:")
+                                .color(Colors::TEXT_MUTED)
+                                .font(FontId::new(11.0, FontFamily::Proportional)),
+                        );
+                        ui.label(
+                            RichText::new(tb.trim())
+                                .color(Colors::ERROR_RED)
+                                .font(FontId::new(11.0, FontFamily::Monospace)),
+                        );
+                    }
+                }
+            }
+
             // Matrix Properties section
             if let Some(props) = &res.matrix_properties {
                 ui.add_space(10.0);

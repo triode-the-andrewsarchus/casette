@@ -36,7 +36,7 @@ pub fn render_result(
 
     if !result.ok {
         render_captured_streams(ui, result);
-        render_error_card(ui, result);
+        render_error_card(ui, row.row_number, result);
         return;
     }
 
@@ -100,6 +100,21 @@ pub fn render_result(
                     .font(FontId::new(12.5, FontFamily::Monospace)),
             );
         });
+    }
+
+    // Truncation notice badge if output exceeded wire limits
+    if result.truncated == Some(true) {
+        ui.add_space(4.0);
+        let notice = if let Some(trunc) = &result.truncation {
+            if let (Some(len), Some(cap)) = (trunc.plain_len, trunc.plain_cap) {
+                format!("Output truncated (showing {cap} of {len} chars)")
+            } else {
+                "Output truncated to fit display limits".to_string()
+            }
+        } else {
+            "Output truncated to fit display limits".to_string()
+        };
+        render_pill(ui, &notice, Colors::NUMERIC_AMBER_BG, Colors::NUMERIC_AMBER);
     }
 
     // Action buttons bar
@@ -519,7 +534,7 @@ fn render_plot_card(ui: &mut Ui, result: &WorkerResponse, texture_cache: &mut Te
     }
 }
 
-fn render_error_card(ui: &mut Ui, result: &WorkerResponse) {
+fn render_error_card(ui: &mut Ui, row_number: usize, result: &WorkerResponse) {
     let err_type = result
         .error
         .as_ref()
@@ -530,6 +545,12 @@ fn render_error_card(ui: &mut Ui, result: &WorkerResponse) {
         .as_ref()
         .map(|e| e.message.as_str())
         .unwrap_or_else(|| result.plain.as_deref().unwrap_or("Evaluation failed"));
+    let traceback = result
+        .error
+        .as_ref()
+        .and_then(|e| e.traceback.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     Frame::new()
         .fill(Colors::ERROR_RED_BG)
@@ -537,7 +558,7 @@ fn render_error_card(ui: &mut Ui, result: &WorkerResponse) {
         .corner_radius(CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new("⚠")
                         .color(Colors::ERROR_RED)
@@ -548,6 +569,60 @@ fn render_error_card(ui: &mut Ui, result: &WorkerResponse) {
                         .color(Colors::TEXT_PRIMARY)
                         .font(FontId::new(13.0, FontFamily::Monospace)),
                 );
+            });
+
+            if let Some(tb) = traceback {
+                ui.add_space(4.0);
+                if err_type == "CompileError" {
+                    ui.label(
+                        RichText::new(tb)
+                            .color(Colors::NUMERIC_AMBER)
+                            .font(FontId::new(12.0, FontFamily::Proportional))
+                            .italics(),
+                    );
+                } else {
+                    egui::CollapsingHeader::new(
+                        RichText::new("Show Traceback")
+                            .color(Colors::TEXT_SECONDARY)
+                            .font(FontId::new(11.5, FontFamily::Proportional)),
+                    )
+                    .id_salt(("error_tb_collapse", row_number))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(tb)
+                                .color(Colors::TEXT_SECONDARY)
+                                .font(FontId::new(11.0, FontFamily::Monospace)),
+                        );
+                    });
+                }
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let copy_label = if traceback.is_some() && err_type != "CompileError" {
+                    "📋 Copy Traceback"
+                } else {
+                    "📋 Copy Error"
+                };
+                if ui
+                    .add(
+                        Button::new(
+                            RichText::new(copy_label)
+                                .color(Colors::TEXT_SECONDARY)
+                                .font(FontId::new(11.0, FontFamily::Proportional)),
+                        )
+                        .fill(Color32::from_rgb(38, 38, 44))
+                        .corner_radius(CornerRadius::same(4)),
+                    )
+                    .clicked()
+                {
+                    let to_copy = if let Some(tb) = traceback {
+                        format!("{err_type}: {err_msg}\n{tb}")
+                    } else {
+                        format!("{err_type}: {err_msg}")
+                    };
+                    ui.ctx().copy_text(to_copy);
+                }
             });
         });
 }
