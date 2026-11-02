@@ -4,7 +4,7 @@
 //! `egui::TextureHandle`s cached in memory.
 
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{error, warn};
@@ -12,6 +12,7 @@ use tracing::{error, warn};
 /// In-memory cache for loaded plot and graphics textures.
 pub struct TextureCache {
     textures: HashMap<PathBuf, TextureHandle>,
+    failed_paths: HashSet<PathBuf>,
 }
 
 impl Default for TextureCache {
@@ -26,14 +27,21 @@ impl TextureCache {
     pub fn new() -> Self {
         Self {
             textures: HashMap::new(),
+            failed_paths: HashSet::new(),
         }
     }
 
     /// Gets or loads a texture from a filesystem path (SVG or PNG).
     pub fn get_or_load(&mut self, ctx: &Context, path: impl AsRef<Path>) -> Option<&TextureHandle> {
         let path_buf = path.as_ref().to_path_buf();
+        if self.failed_paths.contains(&path_buf) {
+            return None;
+        }
         if !self.textures.contains_key(&path_buf) {
-            let texture = Self::load_texture(ctx, &path_buf)?;
+            let Some(texture) = Self::load_texture(ctx, &path_buf) else {
+                self.failed_paths.insert(path_buf);
+                return None;
+            };
             self.textures.insert(path_buf.clone(), texture);
         }
         self.textures.get(&path_buf)
@@ -78,10 +86,19 @@ impl TextureCache {
             trimmed.hash(&mut hasher);
             hasher.finish()
         };
-        let path = std::env::temp_dir().join(format!("casette_math_{:016x}.svg", hash));
+        let cache_dir = std::env::temp_dir().join("sagecalc").join("math-cache");
+        let _ = fs::create_dir_all(&cache_dir);
+        let path = cache_dir.join(format!("casette_math_{:016x}.svg", hash));
 
-        if !path.exists() {
-            Self::render_latex_to_svg(trimmed, &path)?;
+        if self.failed_paths.contains(&path) {
+            return None;
+        }
+        if !self.textures.contains_key(&path)
+            && !path.exists()
+            && Self::render_latex_to_svg(trimmed, &path).is_none()
+        {
+            self.failed_paths.insert(path);
+            return None;
         }
 
         self.get_or_load(ctx, &path)
