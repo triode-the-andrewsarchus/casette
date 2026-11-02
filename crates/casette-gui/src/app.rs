@@ -6,8 +6,8 @@ use crate::theme::{apply_theme, Colors};
 use crate::views::{render_header, render_input_pane, render_sidebar, render_tape, SidebarTab};
 use eframe::App;
 use egui::{
-    Button, CentralPanel, Context, FontFamily, FontId, RichText, SidePanel, Stroke,
-    TopBottomPanel, Window,
+    Button, CentralPanel, Context, FontFamily, FontId, RichText, SidePanel, Stroke, TopBottomPanel,
+    Window,
 };
 use std::sync::mpsc::{Receiver, Sender};
 use tracing::{error, info};
@@ -40,7 +40,11 @@ impl CasetteApp {
         let mut state = SessionState::default();
         if session_path.exists() {
             if let Err(e) = crate::persistence::load_session(&mut state, &session_path) {
-                tracing::warn!("Failed to load previous session from {:?}: {}", session_path, e);
+                tracing::warn!(
+                    "Failed to load previous session from {:?}: {}",
+                    session_path,
+                    e
+                );
             } else {
                 tracing::info!(
                     "Loaded previous session: {} tape rows, {} history items",
@@ -74,7 +78,9 @@ impl CasetteApp {
                     self.state.worker_status = WorkerStatus::Ready;
 
                     if !self.state.user_definitions.is_empty() {
-                        let _ = self.action_tx.send(GuiAction::SyncDefinitions(self.state.user_definitions.clone()));
+                        let _ = self.action_tx.send(GuiAction::SyncDefinitions(
+                            self.state.user_definitions.clone(),
+                        ));
                     }
 
                     let _ = self.action_tx.send(GuiAction::FetchSymbols);
@@ -118,7 +124,8 @@ impl CasetteApp {
                                 self.state.remove_definition(sym_to_del);
                             }
                         } else {
-                            let new_defs = crate::model::extract_definitions(&input_raw, &compiled_sage);
+                            let new_defs =
+                                crate::model::extract_definitions(&input_raw, &compiled_sage);
                             for def in new_defs {
                                 self.state.set_definition(def.name, def.statement);
                             }
@@ -127,7 +134,9 @@ impl CasetteApp {
 
                     self.state.worker_status = WorkerStatus::Ready;
                     let _ = self.action_tx.send(GuiAction::FetchSymbols);
-                    if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
+                    if let Err(e) =
+                        crate::persistence::save_session(&self.state, &self.session_path)
+                    {
                         tracing::warn!("Failed to auto-save session: {}", e);
                     }
                 }
@@ -151,19 +160,28 @@ impl CasetteApp {
 
     fn submit_evaluation(&mut self, input: String, numeric: bool) {
         let refs = self.state.tape_references();
-        let (compiled, compile_err) = if input.contains('\n') {
-            (input.clone(), None)
+        let (compiled, required_vars, compile_err) = if input.contains('\n') {
+            (input.clone(), Vec::new(), None)
         } else {
             match friendly_compiler::compile_with_refs(&input, &refs) {
-                friendly_compiler::CompileResult::Success { generated_sage, .. } => {
-                    (generated_sage, None)
+                friendly_compiler::CompileResult::Success {
+                    generated_sage,
+                    required_variables,
+                } => (generated_sage, required_variables, None),
+                friendly_compiler::CompileResult::Bypass { raw_sage } => {
+                    (raw_sage, Vec::new(), None)
                 }
-                friendly_compiler::CompileResult::Bypass { raw_sage } => (raw_sage, None),
-                friendly_compiler::CompileResult::Error(err) => (input.clone(), Some(err)),
+                friendly_compiler::CompileResult::Error(err) => {
+                    (input.clone(), Vec::new(), Some(err))
+                }
                 friendly_compiler::CompileResult::Ambiguous { candidates } => {
-                    let msg = format!("Ambiguous expression. Did you mean:\n{}", candidates.join("\n"));
+                    let msg = format!(
+                        "Ambiguous expression. Did you mean:\n{}",
+                        candidates.join("\n")
+                    );
                     (
                         input.clone(),
+                        Vec::new(),
                         Some(friendly_compiler::CompileError::new(msg, None, None)),
                     )
                 }
@@ -178,12 +196,7 @@ impl CasetteApp {
                 err.message,
                 err.suggestion,
             );
-            if let Some(row) = self
-                .state
-                .rows
-                .iter_mut()
-                .find(|r| r.row_number == row_num)
-            {
+            if let Some(row) = self.state.rows.iter_mut().find(|r| r.row_number == row_num) {
                 row.complete(err_resp, std::time::Duration::from_millis(0));
             }
             self.state.worker_status = WorkerStatus::Ready;
@@ -195,10 +208,25 @@ impl CasetteApp {
 
         self.state.worker_status = WorkerStatus::Busy;
 
+        let non_boot_vars: Vec<String> = required_vars
+            .into_iter()
+            .filter(|v| !casette_kernel::BOOT_VARIABLE_NAMES.contains(&v.as_str()))
+            .collect();
+        let eval_code = if non_boot_vars.is_empty() {
+            compiled
+        } else {
+            let quoted = non_boot_vars
+                .iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("_casette_ensure_vars([{quoted}])\n{compiled}")
+        };
+
         let _ = self.action_tx.send(GuiAction::Evaluate {
             row_number: row_num,
             input,
-            compiled_code: compiled,
+            compiled_code: eval_code,
             numeric,
         });
     }
@@ -281,8 +309,13 @@ impl App for CasetteApp {
                         self.state.remove_definition(&sym_name);
                         self.state.symbols.retain(|s| s.name != sym_name);
                         let _ = self.action_tx.send(GuiAction::DeleteSymbol(sym_name));
-                        if let Err(e) = crate::persistence::save_session(&self.state, &self.session_path) {
-                            tracing::warn!("Failed to auto-save session after symbol deletion: {}", e);
+                        if let Err(e) =
+                            crate::persistence::save_session(&self.state, &self.session_path)
+                        {
+                            tracing::warn!(
+                                "Failed to auto-save session after symbol deletion: {}",
+                                e
+                            );
                         }
                     }
 

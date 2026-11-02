@@ -9,21 +9,23 @@ use std::time::Instant;
 use tracing::{error, info};
 
 fn extract_reusable_expression(compiled_sage: &str) -> Option<String> {
-    let sage = compiled_sage.trim();
-    if sage.is_empty()
-        || sage.starts_with("plot(")
+    // Echoed assignment check: "A = ...\nA"
+    let lines: Vec<&str> = compiled_sage
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("_casette_ensure_vars("))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let sage = lines.join("\n");
+    if sage.starts_with("plot(")
         || sage.starts_with("implicit_plot(")
         || sage.starts_with("parametric_plot(")
     {
         return None;
     }
 
-    // Echoed assignment check: "A = ...\nA"
-    let lines: Vec<&str> = sage
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
     if lines.len() == 2 {
         if let Some((lhs, _)) = lines[0].split_once('=') {
             let target = lhs.trim();
@@ -38,7 +40,7 @@ fn extract_reusable_expression(compiled_sage: &str) -> Option<String> {
         return None;
     }
 
-    Some(sage.to_string())
+    Some(lines[0].to_string())
 }
 
 fn main() -> anyhow::Result<()> {

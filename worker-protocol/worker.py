@@ -940,6 +940,24 @@ _SYMBOL_BASELINE = dict(NS)
 _SYMBOL_BASELINE_MISS = object()  # sentinel: "name not in baseline"
 
 
+def _casette_ensure_vars(names):
+    """Ensure each identifier in `names` is declared as a symbolic variable
+    unless the user has already bound it or it is a preloaded unit/object."""
+    units = NS.get("__casette_units", {})
+    for name in names:
+        if not isinstance(name, str) or not name.isidentifier():
+            continue
+        if name not in NS:
+            NS[name] = var(name)  # noqa: F405
+        elif (
+            name in _SYMBOL_BASELINE
+            and NS[name] is _SYMBOL_BASELINE[name]
+            and name not in units
+            and callable(NS[name])
+        ):
+            NS[name] = var(name)  # noqa: F405
+
+
 def _casette_delete_symbol(name):
     try:
         from sage.all import forget
@@ -952,7 +970,10 @@ def _casette_delete_symbol(name):
         del NS[name]
 
 
+NS["_casette_ensure_vars"] = _casette_ensure_vars
 NS["_casette_delete_symbol"] = _casette_delete_symbol
+_SYMBOL_BASELINE["_casette_ensure_vars"] = _casette_ensure_vars
+_SYMBOL_BASELINE["_casette_delete_symbol"] = _casette_delete_symbol
 
 
 # ---------------------------------------------------------------------------
