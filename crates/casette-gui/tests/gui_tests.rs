@@ -655,3 +655,44 @@ fn test_matrix_grid_extraction_preserves_spaced_expressions() {
     assert_eq!(rows2[0], vec!["x + 1", "2"]);
     assert_eq!(rows2[1], vec!["3", "x - 1"]);
 }
+
+#[test]
+fn test_input_tab_completion_commands_and_symbols() {
+    use casette_gui::views::input_view::complete_input_prefix;
+    use casette_kernel::SymbolPayload;
+
+    let symbols = vec![
+        SymbolPayload {
+            name: "omega_0".into(),
+            kind: "integer".into(),
+            summary: "42".into(),
+        },
+        SymbolPayload {
+            name: "my_matrix".into(),
+            kind: "matrix".into(),
+            summary: "2x2".into(),
+        },
+    ];
+
+    // 1. Leading command prefix completes to command with trailing space
+    let (completed, cands) = complete_input_prefix("deriv", &symbols).expect("completes deriv");
+    assert_eq!(completed, "derivative ");
+    assert_eq!(cands, vec!["derivative"]);
+
+    // 2. Multi-candidate prefix completes longest common prefix
+    let (completed_eig, cands_eig) = complete_input_prefix("eig", &symbols).expect("completes eig");
+    assert_eq!(completed_eig, "eigenv");
+    assert!(cands_eig.contains(&"eigenvalues".to_string()));
+    assert!(cands_eig.contains(&"eigenvectors".to_string()));
+
+    // 3. Defined session symbol completion inside expression
+    let (completed_sym, cands_sym) =
+        complete_input_prefix("2 * ome", &symbols).expect("completes omega_0");
+    assert_eq!(completed_sym, "2 * omega_0");
+    assert_eq!(cands_sym, vec!["omega_0"]);
+
+    // 4. Matrix command + session symbol completion
+    let (completed_mat, _) =
+        complete_input_prefix("det my_", &symbols).expect("completes my_matrix");
+    assert_eq!(completed_mat, "det my_matrix");
+}

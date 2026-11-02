@@ -32,6 +32,11 @@ pub fn render_input_pane(
                 state.request_input_focus = true;
             }
 
+            // 2b. Live autocomplete suggestions bar (Tab to complete)
+            if render_completion_suggestions(ui, &mut state.draft_input, &state.symbols) {
+                state.request_input_focus = true;
+            }
+
             ui.add_space(6.0);
 
             // 3. Multi-line Input Editor
@@ -53,12 +58,19 @@ pub fn render_input_pane(
                 state.request_input_focus = false;
             }
 
-            // Keyboard navigation: Enter to submit, Up/Down for history
+            // Keyboard navigation: Enter to submit, Tab to complete, Up/Down for history
             if response.has_focus() {
                 let input_state = ui.input(|i| i.clone());
 
                 let is_single_line = !state.draft_input.contains('\n');
-                if input_state.key_pressed(Key::Enter) && !input_state.modifiers.shift {
+                if input_state.key_pressed(Key::Tab) {
+                    state.draft_input = state.draft_input.replace('\t', "");
+                    if let Some((completed, _)) =
+                        complete_input_prefix(&state.draft_input, &state.symbols)
+                    {
+                        state.draft_input = completed;
+                    }
+                } else if input_state.key_pressed(Key::Enter) && !input_state.modifiers.shift {
                     submit_pressed = true;
                 } else if input_state.key_pressed(Key::ArrowUp)
                     && (is_single_line || input_state.modifiers.ctrl)
@@ -82,7 +94,7 @@ pub fn render_input_pane(
                 ui.checkbox(&mut state.force_numeric, "Approximate (≈)");
 
                 ui.label(
-                    RichText::new("Enter: evaluate · Shift+Enter: newline · Esc: clear")
+                    RichText::new("Enter: evaluate · Tab: complete · Shift+Enter: newline · Esc: clear")
                         .color(Colors::TEXT_MUTED)
                         .font(FontId::new(10.5, FontFamily::Proportional)),
                 );
@@ -599,6 +611,154 @@ fn render_formula_chips(ui: &mut Ui, draft: &mut String) -> bool {
             {
                 clicked = true;
                 *draft = apply_template_chip(label, draft);
+            }
+        }
+    });
+
+    clicked
+}
+
+/// Completes the trailing identifier token in `draft` against friendly command keywords
+/// (when completing the leading command word) and defined session symbols.
+///
+/// Returns `Some((completed_draft, all_candidates))` when at least one candidate matches.
+#[must_use]
+pub fn complete_input_prefix(
+    draft: &str,
+    symbols: &[casette_kernel::SymbolPayload],
+) -> Option<(String, Vec<String>)> {
+    if draft.is_empty() || draft.ends_with(char::is_whitespace) {
+        return None;
+    }
+
+    let token_start = draft
+        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let prefix = &draft[token_start..];
+    if prefix.is_empty() || prefix.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let before_token = &draft[..token_start];
+    let is_leading_word = before_token.trim().is_empty();
+    let lower_prefix = prefix.to_ascii_lowercase();
+
+    let mut candidates: Vec<(String, bool)> = Vec::new();
+
+    if is_leading_word {
+        for kw in friendly_compiler::Keyword::ALL {
+            let canon = kw.canonical();
+            if canon.starts_with(&lower_prefix) {
+                candidates.push((canon.to_string(), true));
+            }
+        }
+    }
+
+    for sym in symbols {
+        if sym.name.to_ascii_lowercase().starts_with(&lower_prefix)
+            && !candidates.iter().any(|(c, _)| c == &sym.name)
+        {
+            candidates.push((sym.name.clone(), false));
+        }
+    }
+
+    if !is_leading_word {
+        for builtin in [
+            "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "log",
+            "sqrt", "abs", "pi", "infinity",
+        ] {
+            if builtin.starts_with(&lower_prefix) && !candidates.iter().any(|(c, _)| c == builtin) {
+                candidates.push((builtin.to_string(), false));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let names: Vec<String> = candidates.iter().map(|(c, _)| c.clone()).collect();
+
+    if candidates.len() == 1 {
+        let (chosen, is_cmd) = &candidates[0];
+        let suffix = if *is_cmd { " " } else { "" };
+        return Some((format!("{before_token}{chosen}{suffix}"), names));
+    }
+
+    // Compute longest common prefix across candidates
+    let first = &candidates[0].0;
+    let mut lcp_len = first.len();
+    for (cand, _) in &candidates[1..] {
+        lcp_len = first
+            .chars()
+            .zip(cand.chars())
+            .take(lcp_len)
+            .take_while(|(a, b)| a == b)
+            .count();
+    }
+    let lcp: String = first.chars().take(lcp_len).collect();
+
+    let completed = if lcp.len() > prefix.len() {
+        format!("{before_token}{lcp}")
+    } else {
+        let (chosen, is_cmd) = &candidates[0];
+        let suffix = if *is_cmd { " " } else { "" };
+        format!("{before_token}{chosen}{suffix}")
+    };
+
+    Some((completed, names))
+}
+
+fn render_completion_suggestions(
+    ui: &mut Ui,
+    draft: &mut String,
+    symbols: &[casette_kernel::SymbolPayload],
+) -> bool {
+    let Some((_, candidates)) = complete_input_prefix(draft, symbols) else {
+        return false;
+    };
+
+    let token_start = draft
+        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let prefix = &draft[token_start..];
+    if candidates.len() == 1 && candidates[0] == prefix {
+        return false;
+    }
+
+    let before_token = draft[..token_start].to_string();
+    let is_leading_word = before_token.trim().is_empty();
+    let mut clicked = false;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("Tab ↹:")
+                .color(Colors::TEXT_MUTED)
+                .font(FontId::new(10.5, FontFamily::Proportional)),
+        );
+
+        for cand in candidates.iter().take(8) {
+            if ui
+                .add(
+                    Button::new(
+                        RichText::new(cand)
+                            .color(Colors::ACCENT_PRIMARY)
+                            .font(FontId::new(11.0, FontFamily::Monospace)),
+                    )
+                    .fill(Colors::INPUT_BG)
+                    .corner_radius(4),
+                )
+                .clicked()
+            {
+                let is_cmd = is_leading_word
+                    && friendly_compiler::Keyword::ALL
+                        .iter()
+                        .any(|kw| kw.canonical() == cand);
+                let suffix = if is_cmd { " " } else { "" };
+                *draft = format!("{before_token}{cand}{suffix}");
+                clicked = true;
             }
         }
     });
